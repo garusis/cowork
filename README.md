@@ -49,6 +49,8 @@ and record sign-off.
 - No third-party Python packages are required.
 - A skill-capable agent environment that can load `SKILL.md`.
 - Optional: a ClickUp MCP server if the goal references ClickUp tickets.
+- Optional manual installs: [`rtk`](https://github.com/rtk-ai/rtk) and
+  [`caveman`](https://github.com/JuliusBrussee/caveman).
 
 ## Install
 
@@ -156,6 +158,12 @@ Inspect chat state:
 python3 scripts/co_plan_file.py inspect --file ./agent-chat.md
 ```
 
+Inspect optional dependency status:
+
+```bash
+python3 scripts/co_plan_file.py deps-status
+```
+
 Ask a ledger question:
 
 ```bash
@@ -193,6 +201,25 @@ python3 -m unittest scripts/test_co_plan_file.py
 The tests exercise the helper through subprocess calls to match how agents use
 it in practice.
 
+## Optional rtk and caveman
+
+Co-plan can use `rtk` and `caveman` when they are already installed, but it does
+not install or initialize them.
+
+- If `rtk` is available, planner/advisor agents must prefer `rtk`-wrapped shell
+  exploration commands where practical.
+- If `caveman` is available, planner/advisor back-and-forth should use terse
+  caveman style while preserving technical accuracy.
+- If either tool is missing, co-plan continues normally.
+- Marcos-facing messages stay normal: escalations, ledger answers, resolves,
+  sign-off recaps, final consensus, and direct user status.
+
+Use `deps-status` to see what co-plan detects:
+
+```bash
+python3 scripts/co_plan_file.py deps-status
+```
+
 ## Operating Rules
 
 - Treat the chat file as append-only after initialization.
@@ -201,4 +228,3 @@ it in practice.
 - Do not implement code while operating inside a co-plan session.
 - Keep the plan file focused on the current plan, not prior revisions or chat
   summaries.
-

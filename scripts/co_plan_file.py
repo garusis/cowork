@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -183,6 +184,90 @@ def acquire_lock(chat_file: Path, timeout: float = 10.0) -> Iterator[None]:
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def _existing_paths(paths: list[Path]) -> list[str]:
+    seen: set[str] = set()
+    existing: list[str] = []
+    for path in paths:
+        expanded = path.expanduser()
+        if expanded.exists():
+            resolved = str(expanded)
+            if resolved not in seen:
+                seen.add(resolved)
+                existing.append(resolved)
+    return existing
+
+
+def _caveman_candidate_paths() -> list[Path]:
+    home = Path.home()
+    candidates = [
+        home / ".claude" / "skills" / "caveman" / "SKILL.md",
+        home / ".claude" / "skills" / "cavecrew" / "SKILL.md",
+        home / ".claude" / "plugins" / "caveman" / "SKILL.md",
+        home / ".claude" / "plugins" / "caveman" / ".claude-plugin" / "plugin.json",
+        home / ".codex" / "skills" / "caveman" / "SKILL.md",
+        home / ".codex" / "skills" / "cavecrew" / "SKILL.md",
+        home / ".codex" / "plugins" / "caveman" / "SKILL.md",
+        home / ".codex" / "plugins" / "caveman" / ".codex-plugin" / "plugin.json",
+        home / ".agents" / "skills" / "caveman" / "SKILL.md",
+        home / ".agents" / "skills" / "cavecrew" / "SKILL.md",
+        home / ".config" / "caveman",
+    ]
+
+    extra = os.environ.get("COPLAN_CAVEMAN_PATHS", "")
+    for value in extra.split(os.pathsep):
+        value = value.strip()
+        if value:
+            candidates.append(Path(value))
+
+    for base, pattern in (
+        (home / ".claude" / "skills", "*caveman*/SKILL.md"),
+        (home / ".claude" / "skills", "*cavecrew*/SKILL.md"),
+        (home / ".codex" / "skills", "*caveman*/SKILL.md"),
+        (home / ".codex" / "skills", "*cavecrew*/SKILL.md"),
+        (home / ".agents" / "skills", "*caveman*/SKILL.md"),
+        (home / ".agents" / "skills", "*cavecrew*/SKILL.md"),
+    ):
+        if base.exists():
+            candidates.extend(base.glob(pattern))
+
+    return candidates
+
+
+def dependency_status() -> dict[str, object]:
+    """Return optional compression dependency status without installing anything."""
+    rtk_path = shutil.which("rtk")
+    caveman_commands = [
+        command
+        for command in ("caveman", "caveman-compress", "caveman-shrink")
+        if shutil.which(command) is not None
+    ]
+    caveman_paths = _existing_paths(_caveman_candidate_paths())
+    caveman_available = bool(caveman_commands or caveman_paths)
+
+    return {
+        "policy": {
+            "auto_install": False,
+            "missing_tools_block": False,
+            "required_when_available": True,
+            "human_facing_messages": "normal",
+            "agent_to_agent_messages": "use installed optional tools",
+        },
+        "rtk": {
+            "available": rtk_path is not None,
+            "path": rtk_path,
+            "required_when_available": True,
+            "usage": "Use rtk-wrapped shell exploration commands where practical.",
+        },
+        "caveman": {
+            "available": caveman_available,
+            "commands": caveman_commands,
+            "paths": caveman_paths,
+            "required_when_available": True,
+            "usage": "Use terse caveman style for planner/advisor back-and-forth only.",
+        },
+    }
 
 
 def read_body_file(path: Path) -> tuple[str | None, int | None]:
@@ -401,6 +486,7 @@ def turn_payload(chat_file: Path, self_role: str, next_action: dict[str, object]
         "open_question_ids": next_action.get("open_question_ids", []),
         "open_question_count": next_action.get("open_question_count", 0),
         "plan_file": str(default_plan_file(chat_file)),
+        "optional_dependencies": dependency_status(),
     }
 
     if low_action == "post":
@@ -855,6 +941,11 @@ def command_inspect(args: argparse.Namespace) -> int:
     if error is not None:
         return error
     print(json.dumps(inspect_chat(chat_file), indent=2, sort_keys=True))
+    return 0
+
+
+def command_deps_status(args: argparse.Namespace) -> int:
+    print(json.dumps(dependency_status(), indent=2, sort_keys=True))
     return 0
 
 
@@ -2021,6 +2112,12 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = subparsers.add_parser("inspect", help="print chat state as JSON")
     inspect_parser.add_argument("--file", required=True)
     inspect_parser.set_defaults(func=command_inspect)
+
+    deps_parser = subparsers.add_parser(
+        "deps-status",
+        help="print optional rtk/caveman dependency status as JSON",
+    )
+    deps_parser.set_defaults(func=command_deps_status)
 
     turn_parser = subparsers.add_parser(
         "turn",

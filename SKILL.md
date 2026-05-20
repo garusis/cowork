@@ -47,6 +47,7 @@ Agent-facing helper commands:
 
 ```bash
 python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py turn --file ./agent-chat.md --self planner
+python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py deps-status
 python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py question --file ./agent-chat.md --self planner --question "..."
 python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py post --file ./agent-chat.md --self planner --body-file "$SCRATCH"
 ```
@@ -69,6 +70,30 @@ SCRATCH=$(mktemp -t coplan.XXXXXX)
 
 Never reuse fixed paths like `/tmp/coplan-msg.md`; stale scratch files can
 silently append old content.
+
+## Optional rtk and caveman
+
+`rtk` and `caveman` are optional manual installs. Co-plan must not install,
+clone, initialize, or modify global agent configuration for them. If they are
+not installed, continue the normal workflow without warning.
+
+When they are installed, planner/advisor agents must use them for agent-to-agent
+work:
+
+- Run `deps-status` at the start of each planner/advisor session, or read the
+  `optional_dependencies` object returned by `turn`.
+- If `optional_dependencies.rtk.available` is true, use `rtk`-wrapped shell
+  exploration commands where practical so command output is compact.
+- If `optional_dependencies.caveman.available` is true, write normal
+  planner/advisor back-and-forth turns in terse caveman style at **ultra**
+  intensity (regardless of the global default mode) while preserving technical
+  accuracy, file/symbol citations, ledger IDs, and required receipt structure.
+  Do not invoke `/caveman ultra` (that would change the user-visible global
+  level); just apply ultra-level compression to your own agent-to-agent
+  messages.
+- Do not use caveman style for Marcos-facing content: escalations, ledger
+  answers, non-ledger resolves, sign-off recap, final consensus, or direct user
+  status. Those messages must stay clear, complete, and readable.
 
 ## File Protocol
 
@@ -325,7 +350,9 @@ normal way to stop waiting when the protocol says to wait.
 
 Loop algorithm:
 
-1. Run `turn --self <role>`.
+1. Run `turn --self <role>` and inspect `optional_dependencies`. Installed
+   optional tools are mandatory for the relevant planner/advisor work; missing
+   tools are ignored.
 2. If it returns `compose_initial_plan`, the planner creates
    `<chat-stem>.plan.md` before posting. The helper refuses the first planner
    post if the plan file is missing or lacks `Goal Coverage`, `Decisions`,

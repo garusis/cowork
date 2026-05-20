@@ -13,6 +13,7 @@ Exercises the CLI via subprocess to match how agents invoke it. Covers:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -24,13 +25,18 @@ from tempfile import TemporaryDirectory
 SCRIPT = Path(__file__).resolve().parent / "co_plan_file.py"
 
 
-def run(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+def run(
+    *args: str,
+    check: bool = False,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Invoke the helper. Returns the completed process; doesn't raise by default."""
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         capture_output=True,
         text=True,
         check=check,
+        env=env,
     )
 
 
@@ -135,6 +141,25 @@ class CoPlanCLITests(unittest.TestCase):
             body = self.valid_plan_body()
         plan_path.write_text(body, encoding="utf-8")
         return plan_path
+
+    def isolated_deps_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        bin_dir = self.tmp / "empty-bin"
+        home_dir = self.tmp / "home"
+        bin_dir.mkdir(exist_ok=True)
+        home_dir.mkdir(exist_ok=True)
+        env["PATH"] = str(bin_dir)
+        env["HOME"] = str(home_dir)
+        env.pop("COPLAN_CAVEMAN_PATHS", None)
+        return env
+
+    def make_executable(self, name: str) -> Path:
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        path = bin_dir / name
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
 
     def receipt_body(self, note: str = "looks good") -> str:
         return (
@@ -246,6 +271,83 @@ class CoPlanCLITests(unittest.TestCase):
         result = run("init", "--file", str(self.chat), "--body-file", str(body_path))
         self.assertEqual(result.returncode, 2)
         self.assertFalse(self.chat.exists())
+
+    def test_deps_status_reports_absent_optional_tools(self) -> None:
+        result = run("deps-status", env=self.isolated_deps_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertFalse(payload["rtk"]["available"])
+        self.assertIsNone(payload["rtk"]["path"])
+        self.assertFalse(payload["caveman"]["available"])
+        self.assertEqual(payload["caveman"]["commands"], [])
+        self.assertEqual(payload["caveman"]["paths"], [])
+        self.assertFalse(payload["policy"]["auto_install"])
+        self.assertFalse(payload["policy"]["missing_tools_block"])
+        self.assertTrue(payload["policy"]["required_when_available"])
+
+    def test_deps_status_detects_rtk_on_path(self) -> None:
+        env = self.isolated_deps_env()
+        rtk = self.make_executable("rtk")
+        env["PATH"] = str(rtk.parent)
+
+        result = run("deps-status", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertTrue(payload["rtk"]["available"])
+        self.assertEqual(payload["rtk"]["path"], str(rtk))
+        self.assertFalse(payload["caveman"]["available"])
+
+    def test_deps_status_detects_caveman_skill_path(self) -> None:
+        env = self.isolated_deps_env()
+        skill = Path(env["HOME"]) / ".agents" / "skills" / "caveman" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: caveman\n---\n", encoding="utf-8")
+
+        result = run("deps-status", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertFalse(payload["rtk"]["available"])
+        self.assertTrue(payload["caveman"]["available"])
+        self.assertEqual(payload["caveman"]["paths"], [str(skill)])
+
+    def test_deps_status_detects_caveman_from_explicit_paths(self) -> None:
+        env = self.isolated_deps_env()
+        skill = self.tmp / "custom-caveman" / "SKILL.md"
+        skill.parent.mkdir()
+        skill.write_text("---\nname: caveman\n---\n", encoding="utf-8")
+        env["COPLAN_CAVEMAN_PATHS"] = str(skill)
+
+        result = run("deps-status", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertTrue(payload["caveman"]["available"])
+        self.assertEqual(payload["caveman"]["paths"], [str(skill)])
+
+    def test_turn_payload_includes_optional_dependency_status(self) -> None:
+        self.init_fresh()
+        result = run(
+            "turn",
+            "--file",
+            str(self.chat),
+            "--self",
+            "planner",
+            "--timeout",
+            "0",
+            "--poll-interval",
+            "0.1",
+            env=self.isolated_deps_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["action"], "compose_initial_plan")
+        self.assertIn("optional_dependencies", payload)
+        self.assertFalse(payload["optional_dependencies"]["rtk"]["available"])
+        self.assertFalse(payload["optional_dependencies"]["caveman"]["available"])
 
     def test_add_question_assigns_sequential_ids(self) -> None:
         self.init_fresh()
