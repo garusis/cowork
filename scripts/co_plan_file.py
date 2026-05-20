@@ -68,6 +68,19 @@ def extract_plan_headings(plan_text: str) -> list[str]:
     return [_normalize_heading_text(m.group(1)) for m in PLAN_HEADING_RE.finditer(cleaned)]
 
 
+def missing_receipt_headings(
+    receipt_body: str,
+    receipt_header_match: re.Match[str],
+    plan_headings: list[str],
+) -> list[str]:
+    """Return normalized plan headings not mentioned in a receipt section."""
+    receipt_section = _normalize_heading_text(receipt_body[receipt_header_match.end() :])
+    return [
+        heading for heading in plan_headings
+        if heading and heading not in receipt_section
+    ]
+
+
 def validate_plan_text(plan_text: str, state: dict[str, object]) -> list[str]:
     """Return human-readable reasons the plan is not ready for consensus."""
     reasons: list[str] = []
@@ -327,6 +340,98 @@ def open_question_ids(state: dict[str, object]) -> list[str]:
     return [str(question["id"]) for question in open_questions(state)]
 
 
+def default_activity_entry(timestamp: str | None = None) -> dict[str, object]:
+    return {
+        "state": "idle",
+        "detail": "No activity recorded.",
+        "updated_at": timestamp,
+        "waiting_for": None,
+    }
+
+
+def activity_view(state: dict[str, object]) -> dict[str, dict[str, object]]:
+    activity = state.get("activity")
+    if not isinstance(activity, dict):
+        activity = {}
+
+    viewed: dict[str, dict[str, object]] = {}
+    for role in sorted(POLL_ROLES):
+        entry = activity.get(role)
+        if not isinstance(entry, dict):
+            viewed[role] = default_activity_entry(state.get("created_at"))
+            continue
+        viewed[role] = {
+            "state": str(entry.get("state") or "idle"),
+            "detail": str(entry.get("detail") or "No activity recorded."),
+            "updated_at": entry.get("updated_at"),
+            "waiting_for": entry.get("waiting_for"),
+        }
+    return viewed
+
+
+def set_activity_unsafe(
+    state: dict[str, object],
+    role: str,
+    activity_state: str,
+    detail: str,
+    waiting_for: str | None = None,
+    timestamp: str | None = None,
+) -> None:
+    if role not in POLL_ROLES:
+        return
+    activity = activity_view(state)
+    activity[role] = {
+        "state": activity_state,
+        "detail": detail,
+        "updated_at": timestamp or utc_timestamp(),
+        "waiting_for": waiting_for,
+    }
+    state["activity"] = activity
+
+
+def update_activity(
+    chat_file: Path,
+    role: str,
+    activity_state: str,
+    detail: str,
+    waiting_for: str | None = None,
+    lock_timeout: float = 10.0,
+) -> None:
+    if role not in POLL_ROLES or not StateFile.exists(chat_file):
+        return
+    with acquire_lock(chat_file, timeout=lock_timeout):
+        state = StateFile.load(chat_file)
+        if state is None:
+            return
+        set_activity_unsafe(state, role, activity_state, detail, waiting_for)
+        StateFile.save(chat_file, state)
+
+
+def waiting_for_from_action(self_role: str, next_action: dict[str, object]) -> str | None:
+    reason = str(next_action.get("reason", ""))
+    last_role = next_action.get("last_role")
+    if reason == "open_questions_wait_for_planner":
+        return "planner"
+    if last_role == "marcos-signoff":
+        return "planner"
+    if last_role == "planner":
+        if next_action.get("last_message_contains_escalation"):
+            return "marcos"
+        return "advisor" if self_role == "planner" else "planner"
+    if last_role == "advisor":
+        return "planner" if self_role == "advisor" else "advisor"
+    if last_role == "goal":
+        return "planner"
+    return None
+
+
+def wait_detail(self_role: str, next_action: dict[str, object]) -> str:
+    waiting_for = waiting_for_from_action(self_role, next_action)
+    if waiting_for is None:
+        return "Waiting for another role to post."
+    return f"Waiting for {waiting_for}."
+
+
 def mentions_question_id(body: str, question_id: str) -> bool:
     return re.search(rf"\b{re.escape(question_id)}\b", body) is not None
 
@@ -378,11 +483,14 @@ def decide_next_action(chat_file: Path, self_role: str) -> dict[str, object]:
     derived = state.get("derived", {})
     plan_file_intact = bool(derived.get("plan_file_intact"))
     signoff_present = bool(derived.get("signoff_present"))
+    last_body = last["body"] if last else ""
+    last_has_escalation = ESCALATION_MARKER in last_body
 
     base: dict[str, object] = {
         "file": str(chat_file),
         "role": self_role,
         "last_role": last["role"] if last else None,
+        "last_message_contains_escalation": last_has_escalation,
         "open_question_ids": ids,
         "open_question_count": len(ids),
         "should_poll": False,
@@ -410,8 +518,6 @@ def decide_next_action(chat_file: Path, self_role: str) -> dict[str, object]:
         }
 
     last_role = last["role"] if last else None
-    last_body = last["body"] if last else ""
-    last_has_escalation = ESCALATION_MARKER in last_body
     both_proposed = has_both_consensus_proposals(messages)
 
     proposals_ready_for_signoff = (
@@ -550,7 +656,24 @@ def await_turn(
         if low_action == "post_consensus" and self_role == "planner":
             return write_consensus_for_turn(chat_file, lock_timeout)
         if low_action != "wait":
-            return 0, turn_payload(chat_file, self_role, next_action)
+            payload = turn_payload(chat_file, self_role, next_action)
+            update_activity(
+                chat_file,
+                self_role,
+                "composing",
+                f"Actionable turn: {payload['action']}.",
+                lock_timeout=lock_timeout,
+            )
+            return 0, payload
+
+        update_activity(
+            chat_file,
+            self_role,
+            "waiting",
+            wait_detail(self_role, next_action),
+            waiting_for_from_action(self_role, next_action),
+            lock_timeout=lock_timeout,
+        )
 
         initial = inspect_chat(chat_file)
         initial_count = initial["message_count"]
@@ -559,6 +682,14 @@ def await_turn(
         while True:
             now = time.monotonic()
             if now >= deadline:
+                update_activity(
+                    chat_file,
+                    self_role,
+                    "timed_out",
+                    "Timed out while waiting.",
+                    waiting_for_from_action(self_role, next_action),
+                    lock_timeout=lock_timeout,
+                )
                 return 2, {
                     "action": "timeout",
                     "file": str(chat_file),
@@ -571,6 +702,13 @@ def await_turn(
             time.sleep(min(poll_interval, deadline - now))
             current = inspect_chat(chat_file)
             if current["consensus_exists"]:
+                update_activity(
+                    chat_file,
+                    self_role,
+                    "closed",
+                    "Consensus exists.",
+                    lock_timeout=lock_timeout,
+                )
                 return 0, {
                     "action": "closed",
                     "file": str(chat_file),
@@ -627,6 +765,20 @@ class StateFile:
             }
           },
           "signoff": null | {"signed_at": "<iso>"},
+          "activity": {
+            "planner": {
+              "state": "idle",
+              "detail": "...",
+              "updated_at": "<iso>",
+              "waiting_for": null
+            },
+            "advisor": {
+              "state": "idle",
+              "detail": "...",
+              "updated_at": "<iso>",
+              "waiting_for": null
+            }
+          },
           "derived": {
             "open_question_count": 0,
             "answered_question_count": 0,
@@ -659,6 +811,10 @@ class StateFile:
                 "questions": [],
                 "proposed_plan": None,
                 "signoff": None,
+                "activity": {
+                    role: default_activity_entry(created_at)
+                    for role in sorted(POLL_ROLES)
+                },
                 "derived": {},
             }
         )
@@ -673,6 +829,7 @@ class StateFile:
     @classmethod
     def save(cls, chat_file: Path, state: dict[str, object]) -> None:
         sidecar = cls.path(chat_file)
+        state["activity"] = activity_view(state)
         state = cls._recompute_derived(state)
         payload = json.dumps(state, indent=2, sort_keys=False) + "\n"
         tmp = Path(f"{sidecar}.tmp")
@@ -777,8 +934,25 @@ def inspect_chat(chat_file: Path) -> dict[str, object]:
         "proposed_plan_hashes_match": derived.get("proposed_plan_hashes_match", False),
         "plan_file_current_hash": plan_file_current_hash,
         "plan_file_intact": derived.get("plan_file_intact", plan_file_intact),
+        "activity": activity_view(state),
         "mtime_ns": stat.st_mtime_ns if stat else None,
         "sha256": sha256_file(chat_file),
+    }
+
+
+def status_payload(chat_file: Path) -> dict[str, object]:
+    snapshot = inspect_chat(chat_file)
+    return {
+        "file": str(chat_file),
+        "activity": snapshot["activity"],
+        "last_role": snapshot["last_role"],
+        "last_timestamp": snapshot["last_timestamp"],
+        "open_question_count": snapshot["open_question_count"],
+        "consensus_exists": snapshot["consensus_exists"],
+        "next_actions": {
+            role: decide_next_action(chat_file, role)
+            for role in sorted(POLL_ROLES)
+        },
     }
 
 
@@ -944,6 +1118,15 @@ def command_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_status(args: argparse.Namespace) -> int:
+    chat_file = expand_path(args.file)
+    error = _check_chat_and_sidecar(chat_file)
+    if error is not None:
+        return error
+    print(json.dumps(status_payload(chat_file), indent=2, sort_keys=True))
+    return 0
+
+
 def command_deps_status(args: argparse.Namespace) -> int:
     print(json.dumps(dependency_status(), indent=2, sort_keys=True))
     return 0
@@ -1011,6 +1194,7 @@ def command_post_turn(args: argparse.Namespace) -> int:
             state = StateFile.load(chat_file)
             _write_message_unsafe(chat_file, role, body, utc_timestamp())
             withdraw_role_proposal_unsafe(state, role)
+            set_activity_unsafe(state, role, "posted", "Posted turn.")
             StateFile.save(chat_file, state)
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -1064,7 +1248,16 @@ def command_post_signoff_recap(args: argparse.Namespace) -> int:
                 print(json.dumps(next_action, indent=2, sort_keys=True))
                 return 3
 
+            state = StateFile.load(chat_file)
             _write_message_unsafe(chat_file, "planner", body, utc_timestamp())
+            set_activity_unsafe(
+                state,
+                "planner",
+                "ready_for_signoff",
+                "Posted sign-off recap; waiting for Marcos sign-off.",
+                "marcos",
+            )
+            StateFile.save(chat_file, state)
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1124,18 +1317,15 @@ def _record_proposal_from_body_unsafe(
 
     plan_headings = extract_plan_headings(plan_text)
     if plan_headings:
-        receipt_section = body[receipt_header_match.end() :].lower()
-        missing = [
-            heading for heading in plan_headings
-            if heading and heading not in receipt_section
-        ]
+        missing = missing_receipt_headings(body, receipt_header_match, plan_headings)
         if missing:
             listed = "; ".join(f'"{h}"' for h in missing[:5])
             suffix = "" if len(missing) <= 5 else f" (+ {len(missing) - 5} more)"
             return (
                 None,
                 "Plan Review Receipt does not enumerate every plan-file "
-                f"`##` / `###` heading. Missing: {listed}{suffix}.",
+                f"`##` / `###` heading after normalization. "
+                f"Missing: {listed}{suffix}.",
             )
 
     timestamp = utc_timestamp()
@@ -1156,6 +1346,7 @@ def _record_proposal_from_body_unsafe(
 
     proposed["hashes"][role] = plan_hash
     state["proposed_plan"] = proposed
+    set_activity_unsafe(state, role, "posted", "Posted consensus proposal.")
     StateFile.save(chat_file, state)
 
     other = "advisor" if role == "planner" else "planner"
@@ -1235,6 +1426,7 @@ def command_post(args: argparse.Namespace) -> int:
                             return 3
                     _write_message_unsafe(chat_file, role, body, utc_timestamp())
                     withdraw_role_proposal_unsafe(state, role)
+                    set_activity_unsafe(state, role, "posted", "Posted turn.")
                     StateFile.save(chat_file, state)
                     posted = {"posted": True, "kind": "turn", "role": role}
             elif low_action == "escalate_open_questions" and role == "planner":
@@ -1259,6 +1451,13 @@ def command_post(args: argparse.Namespace) -> int:
                     body = f"{body.rstrip()}\n\n{ESCALATION_MARKER}"
                 _write_message_unsafe(chat_file, "planner", body, utc_timestamp())
                 clear_all_proposals_unsafe(state)
+                set_activity_unsafe(
+                    state,
+                    "planner",
+                    "blocked_for_marcos",
+                    "Posted escalation; waiting for Marcos.",
+                    "marcos",
+                )
                 StateFile.save(chat_file, state)
                 posted = {
                     "posted": True,
@@ -1276,7 +1475,15 @@ def command_post(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                     return 3
+                set_activity_unsafe(
+                    state,
+                    "planner",
+                    "ready_for_signoff",
+                    "Posted sign-off recap; waiting for Marcos sign-off.",
+                    "marcos",
+                )
                 _write_message_unsafe(chat_file, "planner", body, utc_timestamp())
+                StateFile.save(chat_file, state)
                 posted = {
                     "posted": True,
                     "kind": "signoff_recap",
@@ -1364,6 +1571,13 @@ def command_add_question(args: argparse.Namespace) -> int:
                 }
             )
             clear_all_proposals_unsafe(state)
+            set_activity_unsafe(
+                state,
+                role,
+                "question_opened",
+                f"Opened ledger question {question_id}.",
+                "marcos",
+            )
             StateFile.save(chat_file, state)
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -1432,6 +1646,13 @@ def command_escalate_open_questions(args: argparse.Namespace) -> int:
                 body = f"{body.rstrip()}\n\n{ESCALATION_MARKER}"
 
             _write_message_unsafe(chat_file, "planner", body, utc_timestamp())
+            set_activity_unsafe(
+                state,
+                "planner",
+                "blocked_for_marcos",
+                "Posted escalation; waiting for Marcos.",
+                "marcos",
+            )
             StateFile.save(chat_file, state)
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -1744,13 +1965,11 @@ def command_propose_consensus(args: argparse.Namespace) -> int:
             plan_hash = sha256_file(plan_file)
             plan_headings = extract_plan_headings(plan_text)
             if plan_headings:
-                receipt_section = latest_self_message["body"][
-                    receipt_header_match.end() :
-                ].lower()
-                missing = [
-                    heading for heading in plan_headings
-                    if heading and heading not in receipt_section
-                ]
+                missing = missing_receipt_headings(
+                    latest_self_message["body"],
+                    receipt_header_match,
+                    plan_headings,
+                )
                 if missing:
                     listed = "; ".join(f'"{h}"' for h in missing[:5])
                     suffix = (
@@ -1762,8 +1981,9 @@ def command_propose_consensus(args: argparse.Namespace) -> int:
                         "refusing to propose: Plan Review Receipt does not "
                         "enumerate every plan-file `##` / `###` heading. "
                         f"Missing: {listed}{suffix}. The receipt must mention "
-                        "each heading by name (case-insensitive substring "
-                        "match within the section that follows "
+                        "each heading by name after heading normalization "
+                        "(case, Markdown emphasis, underscores, and whitespace "
+                        "are normalized within the section that follows "
                         "`## Plan Review Receipt`).",
                         file=sys.stderr,
                     )
@@ -1782,6 +2002,7 @@ def command_propose_consensus(args: argparse.Namespace) -> int:
 
             proposed["hashes"][role] = plan_hash
             state["proposed_plan"] = proposed
+            set_activity_unsafe(state, role, "posted", "Posted consensus proposal.")
             StateFile.save(chat_file, state)
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -1896,6 +2117,12 @@ def command_signoff(args: argparse.Namespace) -> int:
                 "Ready for consensus."
             )
             _write_message_unsafe(chat_file, "marcos-signoff", body, timestamp)
+            set_activity_unsafe(
+                state,
+                "planner",
+                "composing",
+                "Marcos signed off; planner can write consensus.",
+            )
             StateFile.save(chat_file, state)
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -1950,6 +2177,8 @@ def command_write_consensus(args: argparse.Namespace) -> int:
 
             body = f"Final agreed implementation plan lives at `{plan_path}`."
             _write_message_unsafe(chat_file, "consensus", body, utc_timestamp())
+            set_activity_unsafe(state, "planner", "closed", "Consensus written.")
+            set_activity_unsafe(state, "advisor", "closed", "Consensus written.")
             StateFile.save(chat_file, state)
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -2006,6 +2235,8 @@ def write_consensus_for_turn(
 
             body = f"Final agreed implementation plan lives at `{plan_path}`."
             _write_message_unsafe(chat_file, "consensus", body, utc_timestamp())
+            set_activity_unsafe(state, "planner", "closed", "Consensus written.")
+            set_activity_unsafe(state, "advisor", "closed", "Consensus written.")
             StateFile.save(chat_file, state)
     except TimeoutError as exc:
         return 1, {
@@ -2037,6 +2268,7 @@ def command_poll_for_other(args: argparse.Namespace) -> int:
 
     next_action = decide_next_action(chat_file, self_role)
     if next_action["action"] == "summarize_exit":
+        update_activity(chat_file, self_role, "closed", "Consensus exists.")
         print(json.dumps(next_action, indent=2, sort_keys=True))
         return 0
     if next_action["action"] != "wait":
@@ -2050,6 +2282,13 @@ def command_poll_for_other(args: argparse.Namespace) -> int:
 
     timeout = max(args.timeout, 0.0)
     poll_interval = max(args.poll_interval, 0.1)
+    update_activity(
+        chat_file,
+        self_role,
+        "waiting",
+        wait_detail(self_role, next_action),
+        waiting_for_from_action(self_role, next_action),
+    )
 
     initial = inspect_chat(chat_file)
     initial_count = initial["message_count"]
@@ -2059,6 +2298,13 @@ def command_poll_for_other(args: argparse.Namespace) -> int:
     while True:
         now = time.monotonic()
         if now >= deadline:
+            update_activity(
+                chat_file,
+                self_role,
+                "timed_out",
+                "Timed out while waiting.",
+                waiting_for_from_action(self_role, next_action),
+            )
             payload = {
                 "timeout": True,
                 "file": str(chat_file),
@@ -2072,6 +2318,7 @@ def command_poll_for_other(args: argparse.Namespace) -> int:
 
         current = inspect_chat(chat_file)
         if current["consensus_exists"]:
+            update_activity(chat_file, self_role, "closed", "Consensus exists.")
             print(json.dumps(current, indent=2, sort_keys=True))
             return 0
 
@@ -2112,6 +2359,13 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = subparsers.add_parser("inspect", help="print chat state as JSON")
     inspect_parser.add_argument("--file", required=True)
     inspect_parser.set_defaults(func=command_inspect)
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="print helper-managed planner/advisor activity and next actions",
+    )
+    status_parser.add_argument("--file", required=True)
+    status_parser.set_defaults(func=command_status)
 
     deps_parser = subparsers.add_parser(
         "deps-status",

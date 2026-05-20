@@ -100,7 +100,7 @@ agent-chat.md.lock/
 planning and should contain only the latest plan.
 
 `agent-chat.md.state.json` stores ledger questions, proposal hashes, sign-off
-state, and derived readiness checks.
+state, planner/advisor activity, and derived readiness checks.
 
 `agent-chat.md.lock/` is a temporary lock directory used by the helper while it
 updates files.
@@ -162,6 +162,12 @@ Inspect optional dependency status:
 
 ```bash
 python3 scripts/co_plan_file.py deps-status
+```
+
+Inspect planner/advisor activity:
+
+```bash
+python3 scripts/co_plan_file.py status --file ./agent-chat.md
 ```
 
 Ask a ledger question:

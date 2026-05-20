@@ -68,6 +68,11 @@ class CoPlanCLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def status(self) -> dict:
+        result = run("status", "--file", str(self.chat))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
     def post_turn(self, role: str, body: str) -> subprocess.CompletedProcess[str]:
         body_path = write_body(self.tmp / f"body-{role}-{id(body)}.md", body)
         return run("post-turn", "--file", str(self.chat), "--self", role, "--body-file", str(body_path))
@@ -224,9 +229,20 @@ class CoPlanCLITests(unittest.TestCase):
         self.assertEqual(sidecar["questions"], [])
         self.assertIsNone(sidecar["signoff"])
         self.assertIsNone(sidecar["proposed_plan"])
+        self.assertEqual(sidecar["activity"]["planner"]["state"], "idle")
+        self.assertEqual(sidecar["activity"]["advisor"]["state"], "idle")
         self.assertEqual(sidecar["derived"]["open_question_count"], 0)
         self.assertFalse(sidecar["derived"]["proposed_plan_hashes_match"])
         self.assertIsNone(sidecar["derived"]["proposed_plan_path"])
+
+    def test_status_reports_activity_and_next_actions(self) -> None:
+        self.init_fresh()
+        snapshot = self.status()
+
+        self.assertEqual(snapshot["activity"]["planner"]["state"], "idle")
+        self.assertEqual(snapshot["activity"]["advisor"]["state"], "idle")
+        self.assertEqual(snapshot["next_actions"]["planner"]["action"], "post")
+        self.assertEqual(snapshot["next_actions"]["advisor"]["action"], "wait")
 
     def test_init_accepts_body_file(self) -> None:
         body = "Multi-paragraph goal.\n\nWith `backticks`, em-dashes — and \"quotes\".\n"
@@ -508,6 +524,7 @@ class CoPlanCLITests(unittest.TestCase):
         self.assertEqual(payload["action"], "compose_initial_plan")
         self.assertTrue(payload["must_create_plan_file"])
         self.assertEqual(payload["plan_file"], str(self.tmp / "chat.plan.md"))
+        self.assertEqual(self.status()["activity"]["planner"]["state"], "composing")
 
     def test_post_refuses_initial_planner_turn_without_plan_file(self) -> None:
         self.init_fresh()
@@ -525,6 +542,9 @@ class CoPlanCLITests(unittest.TestCase):
         self.assertEqual(payload["kind"], "turn")
         self.assertEqual(payload["turn"]["action"], "timeout")
         self.assertEqual(self.inspect()["last_role"], "planner")
+        activity = self.status()["activity"]["planner"]
+        self.assertEqual(activity["state"], "timed_out")
+        self.assertEqual(activity["waiting_for"], "advisor")
 
     def test_question_alias_adds_open_question(self) -> None:
         self.init_fresh()
@@ -830,6 +850,27 @@ class CoPlanCLITests(unittest.TestCase):
             "  - Risks and Verification: confirmed\n"
             "  - Assumptions: confirmed\n"
             "  - Phase 1 - Setup: confirmed\n\n"
+            "--- proposing consensus ---\n"
+        )
+        propose = self.propose_plan("planner", plan, body)
+        self.assertEqual(propose.returncode, 0, propose.stderr)
+
+    def test_propose_consensus_normalizes_receipt_heading_mentions_symmetrically(self) -> None:
+        self.init_fresh()
+        plan_body = self.valid_plan_body() + "\n### @@USER_MESSAGE@@\n\nTemplate token.\n"
+        plan = self.write_plan(plan_body)
+        body = (
+            "## Plan Review Receipt\n\n"
+            "- Status by section:\n"
+            "  - Summary: confirmed\n"
+            "  - Goal Coverage: confirmed\n"
+            "  - Decisions: confirmed\n"
+            "  - Approach: confirmed\n"
+            "  - Implementation Changes: confirmed\n"
+            "  - Tests: confirmed\n"
+            "  - Risks and Verification: confirmed\n"
+            "  - Assumptions: confirmed\n"
+            "  - @@user_message@@: confirmed\n\n"
             "--- proposing consensus ---\n"
         )
         propose = self.propose_plan("planner", plan, body)

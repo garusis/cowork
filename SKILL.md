@@ -48,6 +48,7 @@ Agent-facing helper commands:
 ```bash
 python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py turn --file ./agent-chat.md --self planner
 python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py deps-status
+python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py status --file ./agent-chat.md
 python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py question --file ./agent-chat.md --self planner --question "..."
 python3 /Users/marcos/.claude/skills/co-plan/scripts/co_plan_file.py post --file ./agent-chat.md --self planner --body-file "$SCRATCH"
 ```
@@ -320,6 +321,11 @@ include:
 - Changes since last review, if any.
 - Remaining risks or assumptions being accepted.
 
+Heading mentions are matched through the helper's normal heading normalizer:
+case, Markdown emphasis characters, underscores, and repeated whitespace do not
+matter. The receipt may still use normal prose, but every plan heading must be
+recognizable after that normalization.
+
 After both roles propose the same plan-file hash, the planner posts a
 "Ready for sign-off - Question Ledger recap" message naming the plan file and
 each Q-id's answer, then exits.
@@ -341,6 +347,9 @@ role has not proposed, hashes differ, or the plan file changed after proposal.
 `/co-plan planner` and `/co-plan advisor` are long-running role loops. Joining
 again is the resume path. The helper owns waiting; agents do not call
 `next-action`, `poll-for-other`, or low-level append commands in normal use.
+Agents may call `status --file <chat>` while waiting or after a timeout to see
+helper-managed planner/advisor activity and deterministic next actions. Status
+is operational sidecar state, not part of the append-only chat.
 
 Role isolation is mandatory. An agent running one co-plan role must never spawn,
 delegate to, simulate, or otherwise create an agent to act as the opposite role
@@ -377,6 +386,9 @@ Helper-enforced gates:
 
 - `turn` and `post` block internally when the role must wait; the model does not
   decide whether waiting is worth it.
+- The helper records role activity in `<chat-file>.state.json` at natural
+  boundaries such as actionable turns, posts, waits, timeouts, escalations,
+  sign-off recap, and consensus. Do not append waiting/status notes to the chat.
 - Waiting must not be bypassed by spawning or delegating to the opposite role.
 - `question` records open ledger questions. When any question is open, planner's
   next actionable state is `compose_escalation`; advisor keeps waiting.
@@ -415,6 +427,11 @@ consensus until they are answered.
 - Advisor-raised questions are not escalated by the advisor. The advisor waits
   for the next planner turn to end; that planner turn performs the escalation.
 - Only Marcos answers ledger questions via `/co-plan answer <Q-id> "<answer>"`.
+- If Marcos clearly answers one or more ledger questions in normal chat instead
+  of using `/co-plan answer`, record those explicit answers with
+  `answer-question` on his behalf. Do this only when the answer text and Q-id
+  mapping are unambiguous. If the answer is ambiguous, ask for clarification
+  rather than guessing.
 - Latest answer wins; prior answers remain in chat history.
 - The advisor must raise omitted ledger questions when the planner guessed on
   Marcos's behalf.
