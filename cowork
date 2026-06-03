@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""cowork — multi-role CLI orchestration entry point.
+
+Thin shim that dispatches to scripts/cowork.py. Run from a terminal:
+
+    ./cowork           # full 3-step entry flow + scout
+    ./cowork --check   # preflight dependency check only
+"""
+
+import os
+import sys
+
+_SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+sys.path.insert(0, _SCRIPTS)
+
+import cowork  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(cowork.main())
