@@ -616,6 +616,22 @@ class FramingTest(unittest.TestCase):
         ev2 = {"type": "stream_event", "event": {"delta": {"type": "input_json"}}}
         self.assertEqual(bridge.parse_claude_event(ev2)["kind"], "partial")
 
+    def test_parse_claude_tool_use_block(self):
+        ev = {"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "content_block": {"type": "tool_use", "name": "Bash"}}}
+        self.assertEqual(bridge.parse_claude_event(ev),
+                         {"kind": "tool", "name": "Bash"})
+        # a missing tool name falls back to 'tool' (never 'using …')
+        ev2 = {"type": "stream_event", "event": {
+            "type": "content_block_start", "content_block": {"type": "tool_use"}}}
+        self.assertEqual(bridge.parse_claude_event(ev2)["name"], "tool")
+        # a text block start stays a no-text partial (spacing logic relies on it)
+        ev3 = {"type": "stream_event", "event": {
+            "type": "content_block_start", "content_block": {"type": "text"}}}
+        self.assertEqual(bridge.parse_claude_event(ev3),
+                         {"kind": "partial", "text": ""})
+
     def test_speaker_label(self):
         self.assertEqual(bridge.speaker_label("scout"), "scout › ")
         self.assertEqual(bridge.USER_LABEL, "you › ")
@@ -632,6 +648,31 @@ class FramingTest(unittest.TestCase):
             {"type": "item.completed", "item": {"type": "agent_message",
                                                 "text": "context map"}})
         self.assertEqual(msg, {"kind": "message", "text": "context map"})
+
+    def test_parse_codex_tool_items(self):
+        started = bridge.parse_codex_event(
+            {"type": "item.started", "item": {"type": "command_execution",
+                                              "command": "ls"}})
+        self.assertEqual(started["kind"], "tool")
+        self.assertEqual(started["label"], "running a command")
+        mcp = bridge.parse_codex_event(
+            {"type": "item.started", "item": {"type": "mcp_tool_call",
+                                              "tool": "search"}})
+        self.assertEqual(mcp["label"], "calling search")
+        done = bridge.parse_codex_event(
+            {"type": "item.completed", "item": {"type": "command_execution"}})
+        self.assertEqual(done["kind"], "tool_done")
+        # unknown item types stay 'other' — future codex events must not be
+        # able to flip the activity label
+        for etype in ("item.started", "item.completed"):
+            other = bridge.parse_codex_event(
+                {"type": etype, "item": {"type": "reasoning"}})
+            self.assertEqual(other["kind"], "other")
+        # rejected status still wins over the tool classification
+        rej = bridge.parse_codex_event(
+            {"type": "item.started", "item": {"type": "command_execution",
+                                              "status": "rejected"}})
+        self.assertEqual(rej["kind"], "denied")
 
     def test_capture_thread_id(self):
         events = [
@@ -976,6 +1017,56 @@ class SessionClassTest(unittest.TestCase):
         self.assertIn("first.", out.getvalue())
         self.assertIn("Second.", out.getvalue())
 
+    def test_claude_session_non_tty_ignores_tool_events(self):
+        # Tool/user events interleaved between tokens must leave the non-TTY
+        # output byte-identical — exact assertion, not just same-as-other-run.
+        import unittest.mock as mock
+
+        class FakeStdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = FakeStdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        lines = [
+            json.dumps({"type": "stream_event", "event": {
+                "delta": {"type": "text_delta", "text": "hi"}}}),
+            json.dumps({"type": "stream_event", "event": {
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "Bash"}}}),
+            json.dumps({"type": "user", "message": {"content": []}}),
+            json.dumps({"type": "stream_event", "event": {
+                "delta": {"type": "text_delta", "text": " there"}}}),
+            json.dumps({"type": "result", "subtype": "success", "result": ""}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=FakeProc(lines)):
+            out = io.StringIO()
+            s = bridge.ClaudeSession("roles/scout.md", "implement", True, io_out=out)
+            s.send("go")
+        self.assertEqual(out.getvalue(), "\nscout › hi there\n")
+
     def test_codex_session_first_then_resume(self):
         recorded = {"cmds": [], "tid": None}
 
@@ -996,6 +1087,68 @@ class SessionClassTest(unittest.TestCase):
             ["codex", "exec", "resume", "--json", "--skip-git-repo-check",
              "T1", "second"])
         self.assertEqual(recorded["tid"], "T1")
+
+    def test_codex_tool_activity_retitles_spinner(self):
+        import unittest.mock as mock
+
+        class RecSpinner:
+            insts = []
+
+            def __init__(self, out, label="working"):
+                self.labels = [label]
+                self.stops = 0
+                RecSpinner.insts.append(self)
+
+            def __enter__(self):
+                return self
+
+            def set_label(self, text):
+                self.labels.append(text)
+
+            def stop(self):
+                self.stops += 1
+
+            def __exit__(self, *exc):
+                self.stop()
+
+        class FakeProc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": "T1"}),
+            json.dumps({"type": "item.started",
+                        "item": {"type": "command_execution"}}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "command_execution"}}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "agent_message", "text": "done"}}),
+        ]
+        RecSpinner.insts.clear()
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=FakeProc(lines)), \
+                mock.patch.object(bridge, "_Spinner", RecSpinner):
+            out = io.StringIO()
+            s = bridge.CodexSession("implement", True, io_out=out)
+            s.send("go")
+        spin = RecSpinner.insts[0]
+        self.assertEqual(spin.labels, ["scout working",
+                                       "scout running a command",
+                                       "scout working"])
+        self.assertGreaterEqual(spin.stops, 1)  # stopped on the emitted message
+        self.assertIn("scout › done", out.getvalue())
 
 
 class AdditiveTest(unittest.TestCase):
@@ -1793,6 +1946,15 @@ class UiBasicsTest(unittest.TestCase):
         self.assertIsNone(s._thread)        # never spawns a thread off a TTY
         s.stop()
 
+    def test_spinner_set_label(self):
+        out = io.StringIO()
+        s = ui.Spinner(out, "scout working")
+        s.start()
+        s.set_label("scout using Bash")
+        s.stop()
+        self.assertEqual(s.label, "scout using Bash")
+        self.assertEqual(out.getvalue(), "")  # off-TTY: zero bytes, ever
+
 
 class PromptUserFallbackTest(unittest.TestCase):
     """The non-TTY readline fallback — unchanged from before, runs without deps."""
@@ -1893,6 +2055,19 @@ class StreamingMarkdownTest(unittest.TestCase):
         region.__exit__(None, None, None)
         self.assertEqual(out.getvalue(), "\nscout › hello world\n")
 
+    def test_non_tty_status_is_silent(self):
+        # set_status/clear_status interleaved with feed must not change one
+        # byte of the non-TTY stream — THE contract the test suite relies on.
+        out = io.StringIO()
+        region = ui.StreamingMarkdown(out, "scout › ")
+        region.__enter__()
+        region.feed("hello ")
+        region.set_status("scout using Bash…")
+        region.feed("world")
+        region.clear_status()
+        region.__exit__(None, None, None)
+        self.assertEqual(out.getvalue(), "\nscout › hello world\n")
+
     @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
     def test_tty_renders_buffer(self):
         out = FakeTTY()
@@ -1901,6 +2076,26 @@ class StreamingMarkdownTest(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("scout › ", text)
         self.assertIn("bold", text)
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_status_row_renders_and_clears(self):
+        import unittest.mock as mock
+        out = FakeTTY()
+        # Test runners often set TERM=dumb; Rich intentionally suppresses live
+        # frames there. This test is for the TTY render path, so pin a capable
+        # terminal name around the Live console construction.
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            region = ui.StreamingMarkdown(out, "scout › ")
+            region.__enter__()
+            try:
+                region.feed("hello")
+                region.set_status("scout using Bash")
+                region._live.refresh()  # force a frame (auto-refresh is time-based)
+                self.assertIn("using Bash", out.getvalue())
+                region.clear_status()
+            finally:
+                region.__exit__(None, None, None)
+        self.assertIsNone(region._status)  # final render carries no status row
 
 
 class BannerTest(unittest.TestCase):
@@ -2167,6 +2362,91 @@ class ClaudeSessionTtyTest(unittest.TestCase):
         self.assertEqual("".join(region.buf), "**hi** there")  # streamed in order
         self.assertEqual(region.label, "scout › ")             # plain label
         self.assertEqual(got.get("id"), "S1")
+
+    def test_tool_activity_drives_spinner_and_status(self):
+        # The loading-state contract: tool calls before the first token retitle
+        # the spinner; tool calls mid-stream show a status row in the region;
+        # text resuming clears it.
+        import unittest.mock as mock
+
+        class RecSpinner:
+            insts = []
+
+            def __init__(self, out, label="working"):
+                self.labels = [label]
+                self.stopped = False
+                RecSpinner.insts.append(self)
+
+            def start(self):
+                return self
+
+            def set_label(self, text):
+                self.labels.append(text)
+
+            def stop(self):
+                self.stopped = True
+
+        class FakeRegion:
+            log = []
+
+            def __init__(self, io_out, label):
+                self.buf = []
+                self.status_calls = []
+                self.clears = 0
+                FakeRegion.log.append(self)
+
+            def __enter__(self):
+                return self
+
+            def feed(self, chunk):
+                self.buf.append(chunk)
+
+            def set_status(self, text):
+                self.status_calls.append(text)
+
+            def clear_status(self):
+                self.clears += 1
+
+            def __exit__(self, *exc):
+                pass
+
+        def tool_use(name):
+            return json.dumps({"type": "stream_event", "event": {
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": name}}})
+
+        def token(text):
+            return json.dumps({"type": "stream_event", "event": {
+                "delta": {"type": "text_delta", "text": text}}})
+
+        user = json.dumps({"type": "user", "message": {"content": []}})
+        lines = [
+            tool_use("Bash"),   # pre-token: spinner label flips
+            user,               # tool done: spinner back to working
+            token("hi"),        # region opens, spinner stops
+            tool_use("Grep"),   # mid-stream: status row
+            user,               # tool done: status back to working
+            token(" there"),    # text resumes: status cleared
+            json.dumps({"type": "result", "subtype": "success", "result": ""}),
+        ]
+        FakeRegion.log.clear()
+        RecSpinner.insts.clear()
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=self._Proc(lines)), \
+                mock.patch.object(bridge.ui, "Spinner", RecSpinner):
+            s = bridge.ClaudeSession(
+                "roles/scout.md", "implement", True, io_out=FakeTTY(),
+                region_factory=FakeRegion)
+            s.send("go")
+        spin = RecSpinner.insts[0]
+        self.assertEqual(spin.labels, ["scout working", "scout using Bash",
+                                       "scout working"])
+        self.assertTrue(spin.stopped)
+        region = FakeRegion.log[0]
+        self.assertEqual("".join(region.buf), "hi there")
+        self.assertEqual(region.status_calls,
+                         ["scout using Grep…", "scout working…"])
+        self.assertEqual(region.clears, 1)  # cleared when text resumed
 
 
 # --------------------------------------------------------------------------- #

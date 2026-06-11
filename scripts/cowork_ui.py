@@ -109,11 +109,18 @@ class Spinner:
 
     __enter__ = start
 
+    def set_label(self, text):
+        """Swap the label while spinning (e.g. 'scout working' -> 'scout using
+        Bash'). The spin thread re-reads the label every frame; off a TTY this
+        is a pure attribute write (no thread, no bytes)."""
+        self.label = text
+
     def _spin(self):
         i = 0
         while not self._stop.is_set():
+            # \033[K clears to end-of-line so a shrinking label leaves no residue.
             self.out.write(
-                "\r%s %s…" % (self.FRAMES[i % len(self.FRAMES)], self.label))
+                "\r\033[K%s %s…" % (self.FRAMES[i % len(self.FRAMES)], self.label))
             self.out.flush()
             i += 1
             self._stop.wait(0.1)
@@ -169,6 +176,7 @@ class StreamingMarkdown:
         self.tty = is_tty(io_out)
         self.buf = []
         self._live = None
+        self._status = None  # transient activity line ('scout using Bash…')
         self._started = False  # non-TTY: have we written the label yet
 
     def __enter__(self):
@@ -182,11 +190,39 @@ class StreamingMarkdown:
             self._live.__enter__()
         return self
 
+    def _render(self):
+        """The Live renderable: the markdown so far, plus an animated dim status
+        row while the agent is busy between text blocks (tool calls). The spinner
+        is built fresh per render — Live's auto-refresh animates it against
+        console time, and not storing it keeps the state surface minimal."""
+        from rich.markdown import Markdown
+        md = Markdown("".join(self.buf))
+        if self._status is None:
+            return md
+        from rich.console import Group
+        from rich.spinner import Spinner as RichSpinner
+        from rich.text import Text
+        return Group(md, RichSpinner("dots", text=Text(self._status, style="dim")))
+
+    def set_status(self, text):
+        """Show an activity row under the markdown (TTY only; no-op otherwise so
+        the non-TTY byte contract is untouched)."""
+        if not self.tty or self._live is None:
+            return
+        self._status = text
+        self._live.update(self._render())
+
+    def clear_status(self):
+        if self._status is None:
+            return
+        self._status = None
+        if self.tty and self._live is not None:
+            self._live.update(self._render())
+
     def feed(self, chunk):
         self.buf.append(chunk)
         if self.tty:
-            from rich.markdown import Markdown
-            self._live.update(Markdown("".join(self.buf)))
+            self._live.update(self._render())
         else:
             if not self._started:
                 self.io_out.write("\n" + self.label_text)
@@ -196,8 +232,8 @@ class StreamingMarkdown:
 
     def __exit__(self, *exc):
         if self.tty and self._live is not None:
-            from rich.markdown import Markdown
-            self._live.update(Markdown("".join(self.buf)))
+            self._status = None  # never leave a tool label in the final render
+            self._live.update(self._render())
             self._live.__exit__(*exc)
         else:
             self.io_out.write("\n")

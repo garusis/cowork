@@ -218,17 +218,40 @@ def parse_claude_event(obj):
         delta = event.get("delta") or {}
         if delta.get("type") == "text_delta":
             return {"kind": "partial", "text": delta.get("text", "")}
+        block = event.get("content_block") or {}
+        if (event.get("type") == "content_block_start"
+                and block.get("type") == "tool_use"):
+            # Fallback to 'tool' so the activity line never reads 'using …'.
+            return {"kind": "tool", "name": block.get("name") or "tool"}
         return {"kind": "partial", "text": ""}
     if etype == "user":
         return {"kind": "user_replay"}
     return {"kind": "other", "type": etype}
 
 
+# Codex item types that mean "the agent is using a tool", with the spinner
+# label each one shows. Only these flip the activity label; unknown item types
+# stay "other" so future codex events can't reset the label incorrectly.
+_CODEX_TOOL_LABELS = {
+    "command_execution": "running a command",
+    "mcp_tool_call": "calling a tool",
+    "file_change": "editing files",
+    "patch_apply": "editing files",
+    "web_search": "searching the web",
+}
+
+
+def _codex_tool_label(itype, item):
+    if itype == "mcp_tool_call" and item.get("tool"):
+        return "calling %s" % item["tool"]
+    return _CODEX_TOOL_LABELS[itype]
+
+
 def parse_codex_event(obj):
     """Classify one codex --json (JSONL) event.
 
     Kinds: thread_started (thread_id), turn_started, turn_completed, message
-    (text), denied, error, other.
+    (text), denied, error, tool (label), tool_done, other.
     """
     etype = obj.get("type")
     if etype == "thread.started":
@@ -247,6 +270,11 @@ def parse_codex_event(obj):
             return {"kind": "denied", "text": item.get("text", "") or itype or ""}
         if itype in ("agent_message", "message", "assistant_message"):
             return {"kind": "message", "text": item.get("text", "")}
+        if itype in _CODEX_TOOL_LABELS:
+            if etype == "item.started":
+                return {"kind": "tool", "item_type": itype,
+                        "label": _codex_tool_label(itype, item)}
+            return {"kind": "tool_done", "item_type": itype}
         return {"kind": "other", "item_type": itype}
     return {"kind": "other", "type": etype}
 
@@ -418,9 +446,29 @@ class ClaudeSession:
         any_text = False
         denied = False
         region = None
-        spinner = ui.Spinner(self.io_out, "%s working" % self.speaker) if tty else None
+        idle = "%s working" % self.speaker
+        status_active = False  # the region currently shows a tool-activity row
+        spinner = ui.Spinner(self.io_out, idle) if tty else None
         if spinner:
             spinner.start()
+
+        def _set_status(text):
+            # Show/refresh the activity row; guarded so injected/custom regions
+            # without status support keep working.
+            nonlocal status_active
+            st = getattr(region, "set_status", None)
+            if st:
+                st(text)
+                status_active = True
+
+        def _clear_status():
+            nonlocal status_active
+            if not status_active:
+                return
+            cs = getattr(region, "clear_status", None)
+            if cs:
+                cs()
+            status_active = False
 
         def _feed(chunk):
             # Open the render region on the first token (after stopping the
@@ -432,6 +480,8 @@ class ClaudeSession:
                 region = self._region_factory(
                     self.io_out, ui.label(self.speaker, tty))
                 region.__enter__()
+            else:
+                _clear_status()  # text resumed: drop the tool-activity row
             region.feed(chunk)
 
         for line in self.proc.stdout:
@@ -467,9 +517,26 @@ class ClaudeSession:
             elif kind == "assistant" and parsed.get("text") and not any_text:
                 _feed(parsed["text"])
                 any_text = True
+            elif kind == "tool":
+                # The model is calling a tool — keep the UI alive (#loading-state).
+                busy = "%s using %s" % (self.speaker, parsed.get("name") or "tool")
+                if region is None:
+                    if spinner:
+                        spinner.set_label(busy)
+                else:
+                    _set_status(busy + "…")
+            elif kind == "user_replay":
+                # A tool_result came back; back to plain "working" until the
+                # next text token or tool call.
+                if region is None:
+                    if spinner:
+                        spinner.set_label(idle)
+                elif status_active:
+                    _set_status(idle + "…")
             elif kind == "denied":
                 if spinner:
                     spinner.stop()
+                _clear_status()  # never leave a tool label over the raw write
                 denied = True
                 if self.trace:
                     self.trace.event("controller.denied", controller="claude",
@@ -478,6 +545,7 @@ class ClaudeSession:
             elif kind == "result":
                 if spinner:
                     spinner.stop()
+                _clear_status()
                 if region is not None:
                     region.__exit__(None, None, None)  # finalize the render
                 elif denied:
@@ -563,6 +631,13 @@ class CodexSession:
                         _emit(denial_message(), render=False)
                     elif parsed["kind"] == "error":
                         _emit("[error] " + (parsed.get("text") or ""), render=False)
+                    elif parsed["kind"] == "tool" and not wrote_label["done"]:
+                        # Reflect tool activity in the spinner while it's live
+                        # (it stops on the first emitted message and never
+                        # restarts — codex emits its message at turn end).
+                        spin.set_label("%s %s" % (self.speaker, parsed["label"]))
+                    elif parsed["kind"] == "tool_done" and not wrote_label["done"]:
+                        spin.set_label("%s working" % self.speaker)
             proc.wait()
         except KeyboardInterrupt:
             _terminate(proc)
