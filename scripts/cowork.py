@@ -42,7 +42,7 @@ PLANNING_ADVISOR_PROMPT_PATH = os.path.join(
 # reviewer passes without approval, cowork falls through to the user review gate
 # with the reviewer's last dissent attached. Never hard-blocks. Shared by the
 # scout-reviewer and the planning-advisor.
-REVIEW_ROUND_CAP = 2
+REVIEW_ROUND_CAP = 5
 
 # Role order matches the user's vision: context-gather, scout-reviewer,
 # plan-revisor, planner, planning-advisor, implementer. `scout`/`scout-reviewer`
@@ -414,19 +414,24 @@ def assemble_reviewer_handoff(verdict, review, artifact="intel"):
     return ""
 
 
-def scout_reviewed_text(verdict=None):
+def scout_reviewed_text(verdict=None, round_index=None, round_cap=None):
     """Marker shown to the user so they can see a review happened (D7).
 
     It exposes only the verdict class, never reviewer findings or questions. The
-    substring 'reviewed' is asserted by tests."""
+    substring 'reviewed' is asserted by tests. With `round_index`/`round_cap` it
+    appends a round counter so the user can see review-budget progress and spot
+    resets (a fresh '(round 1/N)' after they re-engage)."""
     v = verdict.get("verdict") if isinstance(verdict, dict) else verdict
+    counter = ""
+    if round_index is not None and round_cap:
+        counter = " (round %d/%d)" % (round_index, round_cap)
     if v == "approve":
-        return "reviewed: approved"
+        return "reviewed: approved" + counter
     if v == "revise":
-        return "reviewed: changes requested"
+        return "reviewed: changes requested" + counter
     if v == "needs_user":
-        return "reviewed: needs user input"
-    return "reviewed"
+        return "reviewed: needs user input" + counter
+    return "reviewed" + counter
 
 
 class _QuietSink:
@@ -786,6 +791,11 @@ def handoff_gate_text(payload):
 # explicit /quit), distinct from a blank line (which re-prompts).
 _END = object()
 
+# Returned by the dissent review gate to mean "hand the reviewer's unresolved
+# findings back to the role for another pass" — the user opted to keep
+# iterating without writing their own feedback.
+_ITERATE = object()
+
 
 def _read_turn(io_in, io_out):
     """Read one working-turn reply. Blank input and a cancelled editor re-prompt;
@@ -825,16 +835,50 @@ def _read_review(io_in, io_out):
     return line.rstrip("\n")
 
 
+def _read_review_dissent(io_in, io_out):
+    """The `ready_for_review` gate when the reviewer's round cap was exhausted
+    without approval. On a TTY a 3-way questionary select — the safe default
+    (Enter) keeps iterating on the reviewer's feedback, so unresolved dissent is
+    never approved by accident. 'Tell it what to do' prompts for custom
+    instructions; blank/dismissed input also falls back to iterating, never
+    approval. Off a TTY it keeps the historical blank=finish / text=revise
+    contract so the scripted/test path is unchanged.
+
+    Returns _END to approve & finish, _ITERATE to hand the reviewer's unresolved
+    findings back to the role, or the custom feedback text."""
+    if ui.is_tty(io_in) and ui.is_tty(io_out):
+        choice = ui.select(
+            "Reviewer still requests changes — what now?",
+            [("iterate", "Keep iterating on the reviewer's feedback"),
+             ("tell", "Tell it what to do"),
+             ("approve", "Approve & finish anyway")])
+        if choice == "approve":
+            return _END
+        if choice == "tell":
+            fb = ui.prompt_user(io_in, io_out, header="Your instructions")
+            if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
+                return _ITERATE
+            return fb
+        # 'iterate' or a dismissed select: the safe non-approving default.
+        return _ITERATE
+    line = io_in.readline()
+    if line == "" or line.strip() == "":
+        return _END
+    return line.rstrip("\n")
+
+
 def _dissent_suffix(verdict):
     """A short, user-visible note attached to the review gate when the reviewer's
     concerns were not resolved within the round cap."""
+    header = ("\nreview cap reached (%d rounds) — reviewer still requests "
+              "changes; you are the tiebreaker." % REVIEW_ROUND_CAP)
     findings = (verdict or {}).get("findings") or []
     if not findings:
         # No specific findings (e.g. a missing/unreadable review): still tell the
         # user the reviewer did not sign off, rather than implying a clean pass.
-        return "\nreviewer's unresolved notes:\n  - reviewer did not approve " \
-               "within the review round cap."
-    return "\nreviewer's unresolved notes:\n" + "\n".join(
+        return header + "\nreviewer's unresolved notes:\n  - reviewer did not " \
+               "approve within the review round cap."
+    return header + "\nreviewer's unresolved notes:\n" + "\n".join(
         "  - " + str(f) for f in findings)
 
 
@@ -944,6 +988,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 status = "needs_input"
             if status == "ready_for_review":
                 dissent = ""
+                dissent_verdict = None
                 # Reviewer gate (topology D): runs transparently before the user.
                 if review_fn is not None and review_rounds < REVIEW_ROUND_CAP:
                     review_rounds += 1
@@ -960,7 +1005,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 verdict.get("user_question") or "").strip()),
                             findings_count=len(verdict.get("findings") or []),
                             malformed=bool(verdict.get("malformed")))
-                    ui.banner(io_out, scout_reviewed_text(verdict), "info")
+                    ui.banner(io_out, scout_reviewed_text(
+                        verdict, review_rounds, REVIEW_ROUND_CAP), "info")
                     v = verdict.get("verdict")
                     has_question = bool(str(verdict.get("user_question") or "").strip())
                     if v == "approve":
@@ -991,6 +1037,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         # Cap reached without approval: fall through to the user
                         # with the reviewer's unresolved dissent attached (D5).
                         dissent = _dissent_suffix(verdict)
+                        dissent_verdict = verdict
                         review_rounds = 0
                         if trace:
                             trace.event("review.round_cap", role=reviewer_role,
@@ -999,8 +1046,24 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     trace.event("gate.show", role=role,
                                 gate="ready_for_review", path=status_path,
                                 has_dissent=bool(dissent))
-                ui.banner(io_out, review_text(status_path) + dissent, "review")
-                outcome = _read_review(io_in, io_out)
+                ui.banner(io_out, review_text(status_path) + dissent,
+                          "dissent" if dissent else "review")
+                if dissent:
+                    outcome = _read_review_dissent(io_in, io_out)
+                else:
+                    outcome = _read_review(io_in, io_out)
+                if outcome is _ITERATE:
+                    # Hand the reviewer's unresolved findings straight back to
+                    # the role — the user shouldn't have to retype them.
+                    pending = assemble_reviewer_handoff(
+                        "revise", dissent_verdict, artifact=artifact_noun)
+                    if trace:
+                        trace.event("user.action", role=role,
+                                    action="iterate_review",
+                                    gate="ready_for_review")
+                    pending_reopens_work = True
+                    review_rounds = 0  # user re-engaged: fresh review budget
+                    continue
                 if outcome is _END:
                     if trace:
                         trace.event("user.action", role=role,

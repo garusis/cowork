@@ -1225,21 +1225,30 @@ class ScoutLoopReviewTest(unittest.TestCase):
 
     def test_round_cap_falls_through_to_user_with_dissent(self):
         intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "ready_for_review",
-                                     "ready_for_review"])
-        rfn = self._review_fn([
-            {"verdict": "revise", "findings": ["first concern"]},
-            {"verdict": "revise", "findings": ["still not aligned"]},
-            {"verdict": "revise", "findings": ["should not be reached"]},
-        ])
+        # Fixture sizes derive from the constant so cap changes don't break it:
+        # cap revise verdicts, the last with a distinctive finding, plus one
+        # sentinel that must never be consumed.
+        cap = cowork.REVIEW_ROUND_CAP
+        sess = self._session(intel, ["ready_for_review"] * (cap + 1))
+        rfn = self._review_fn(
+            [{"verdict": "revise", "findings": ["concern %d" % i]}
+             for i in range(1, cap)]
+            + [{"verdict": "revise", "findings": ["still not aligned"]},
+               {"verdict": "revise", "findings": ["should not be reached"]}])
         out = io.StringIO()
         rc = cowork._scout_loop(sess, "seed", intel, context="",
                                 io_in=io.StringIO(""), io_out=out, review_fn=rfn)
         self.assertEqual(rc, 0)
-        # cap=2 -> reviewer called at most twice, then user gate with dissent
+        # reviewer called at most cap times, then user gate with dissent
         self.assertEqual(rfn.calls["n"], cowork.REVIEW_ROUND_CAP)
-        self.assertIn("reviewer's unresolved notes", out.getvalue())
-        self.assertIn("still not aligned", out.getvalue())
+        text = out.getvalue()
+        self.assertIn("review cap reached (%d rounds)" % cap, text)
+        self.assertIn("reviewer's unresolved notes", text)
+        self.assertIn("still not aligned", text)
+        # the badge counter shows budget progress up to the cap
+        self.assertIn("reviewed: changes requested (round 1/%d)" % cap, text)
+        self.assertIn("reviewed: changes requested (round %d/%d)" % (cap, cap),
+                      text)
 
     def test_needs_user_drives_scout_back_to_user_question(self):
         intel = self._intel()
@@ -1920,6 +1929,14 @@ class ConfirmTest(unittest.TestCase):
         self.assertFalse(ui.confirm("ok?", ask_fn=lambda: None))  # cancel -> False
 
 
+class SelectTest(unittest.TestCase):
+    def test_injected_ask_fn(self):
+        choices = [("a", "Option A"), ("b", "Option B")]
+        self.assertEqual(ui.select("pick", choices, ask_fn=lambda: "b"), "b")
+        # dismissed -> None passes through; callers pick their safe fallback
+        self.assertIsNone(ui.select("pick", choices, ask_fn=lambda: None))
+
+
 class ScoutLoopTtyTest(unittest.TestCase):
     """The review gate uses an explicit confirm on a TTY (#8). ui.confirm /
     ui.prompt_user / ui.banner are patched so no real prompt/library is needed."""
@@ -1972,6 +1989,107 @@ class ScoutLoopTtyTest(unittest.TestCase):
                                     io_in=FakeTTY(), io_out=FakeTTY())
         self.assertEqual(rc, 0)
         self.assertEqual(sess.sent, ["seed", "please tweak X"])
+
+    def _always_revise_fn(self, finding="still not aligned"):
+        """Revise for exactly REVIEW_ROUND_CAP rounds (hitting the dissent
+        gate), then approve."""
+        calls = {"n": 0}
+
+        def review_fn(intel_path, round_index):
+            calls["n"] += 1
+            if calls["n"] <= cowork.REVIEW_ROUND_CAP:
+                return {"verdict": "revise", "findings": [finding]}
+            return {"verdict": "approve"}
+        review_fn.calls = calls
+        return review_fn
+
+    def test_dissent_gate_iterate_hands_findings_back(self):
+        import unittest.mock as mock
+        intel = self._intel()
+        cap = cowork.REVIEW_ROUND_CAP
+        sess = self._session(intel, [])  # always ready_for_review
+        rfn = self._always_revise_fn()
+        banners = []
+        with mock.patch.object(cowork.ui, "banner",
+                               side_effect=lambda _io, text, kind="info",
+                               **kw: banners.append((text, kind))), \
+                mock.patch.object(cowork.ui, "select",
+                                  return_value="iterate") as sel, \
+                mock.patch.object(cowork.ui, "confirm", return_value=True):
+            rc = cowork._scout_loop(sess, "seed", intel, context="",
+                                    io_in=FakeTTY(), io_out=FakeTTY(),
+                                    review_fn=rfn)
+        self.assertEqual(rc, 0)
+        sel.assert_called_once()
+        # iterate injected the reviewer's unresolved findings as the next turn
+        self.assertIn("[reviewer handoff]", sess.sent[-1])
+        self.assertIn("still not aligned", sess.sent[-1])
+        # fresh budget after iterate: reviewer ran once more and approved
+        self.assertEqual(rfn.calls["n"], cap + 1)
+        texts = [t for t, _k in banners]
+        # dissent banner used the dissent kind and the cap-reached header
+        self.assertTrue(any(k == "dissent" and "review cap reached" in t
+                            for t, k in banners))
+        # the badge counter climbed to the cap, then visibly reset to 1
+        self.assertIn("reviewed: changes requested (round %d/%d)" % (cap, cap),
+                      texts)
+        self.assertIn("reviewed: approved (round 1/%d)" % cap, texts)
+
+    def test_dissent_gate_tell_blank_falls_back_to_iterate(self):
+        import unittest.mock as mock
+        intel = self._intel()
+        sess = self._session(intel, [])
+        rfn = self._always_revise_fn()
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "select",
+                                  return_value="tell"), \
+                mock.patch.object(cowork.ui, "prompt_user",
+                                  return_value="") as pu, \
+                mock.patch.object(cowork.ui, "confirm", return_value=True):
+            rc = cowork._scout_loop(sess, "seed", intel, context="",
+                                    io_in=FakeTTY(), io_out=FakeTTY(),
+                                    review_fn=rfn)
+        self.assertEqual(rc, 0)
+        pu.assert_called_once()
+        # blank instructions never approve: the reviewer handoff was injected
+        self.assertIn("[reviewer handoff]", sess.sent[-1])
+        self.assertEqual(rfn.calls["n"], cowork.REVIEW_ROUND_CAP + 1)
+
+    def test_dissent_gate_tell_sends_custom_instructions(self):
+        import unittest.mock as mock
+        intel = self._intel()
+        sess = self._session(intel, [])
+        rfn = self._always_revise_fn()
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "select", return_value="tell"), \
+                mock.patch.object(cowork.ui, "prompt_user",
+                                  return_value="focus on the schema"), \
+                mock.patch.object(cowork.ui, "confirm", return_value=True):
+            rc = cowork._scout_loop(sess, "seed", intel, context="",
+                                    io_in=FakeTTY(), io_out=FakeTTY(),
+                                    review_fn=rfn)
+        self.assertEqual(rc, 0)
+        self.assertIn("focus on the schema", sess.sent)
+
+    def test_dissent_gate_approve_finishes(self):
+        import unittest.mock as mock
+        intel = self._intel()
+        cap = cowork.REVIEW_ROUND_CAP
+        sess = self._session(intel, [])
+        rfn = self._always_revise_fn()
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "select",
+                                  return_value="approve"), \
+                mock.patch.object(cowork.ui, "confirm") as conf:
+            rc = cowork._scout_loop(sess, "seed", intel, context="",
+                                    io_in=FakeTTY(), io_out=FakeTTY(),
+                                    review_fn=rfn)
+        self.assertEqual(rc, 0)
+        # approved straight from the dissent gate: no extra reviewer rounds,
+        # no plain confirm gate
+        self.assertEqual(rfn.calls["n"], cap)
+        self.assertEqual(len(sess.sent), cap)  # seed + (cap-1) revise handoffs
+        conf.assert_not_called()
 
 
 class ClaudeSessionTtyTest(unittest.TestCase):

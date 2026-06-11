@@ -210,7 +210,7 @@ class StreamingMarkdown:
 
 # border styles per banner kind (Rich color names).
 _BANNER_STYLE = {"start": "blue", "review": "green", "done": "green",
-                 "needs_input": "yellow", "info": "white"}
+                 "needs_input": "yellow", "dissent": "yellow", "info": "white"}
 
 
 def banner(io_out, text, kind="info", enabled=None):
@@ -324,3 +324,17 @@ def confirm(prompt, ask_fn=None):
         import questionary
         ask_fn = lambda: questionary.confirm(prompt, default=True).ask()
     return bool(ask_fn())
+
+
+def select(prompt, choices, ask_fn=None):
+    """Single-choice gate. `choices` is a list of (key, label) pairs; the first
+    choice is the highlighted default. On a TTY: questionary.select. `ask_fn` is
+    injectable for tests and returns a key. Returns the chosen key, or None when
+    the prompt was dismissed (callers pick their own safe fallback)."""
+    if ask_fn is None:
+        import questionary
+        ask_fn = lambda: questionary.select(
+            prompt,
+            choices=[questionary.Choice(label, value=key)
+                     for key, label in choices]).ask()
+    return ask_fn()
