@@ -2862,7 +2862,8 @@ class PhaseChainFlowTest(unittest.TestCase):
                 "context": context, "resume_id": resume_id,
                 "plan_json_path": kw.get("plan_json_path"),
                 "plan_md_path": kw.get("plan_md_path"),
-                "review_path": kw.get("review_path")})
+                "review_path": kw.get("review_path"),
+                "planning_epoch": kw.get("planning_epoch")})
             if on_session and resume_id is None:
                 on_session("claude", "planner-%d" % len(calls["planner"]))
             if on_outcome:
@@ -2961,6 +2962,13 @@ class PhaseChainFlowTest(unittest.TestCase):
         self.assertIn("intel changed", calls["planner"][1]["context"])
         self.assertEqual(state_store.get_phase(state_store.load(spath)),
                          "planning")
+        # each scouting -> planning transition is a NEW planning phase: the
+        # epoch bumps and is handed to the planner (the ->scout consumed-intel
+        # evals re-run for the new phase, even on byte-identical intel)
+        self.assertEqual(calls["planner"][0]["planning_epoch"], 1)
+        self.assertEqual(calls["planner"][1]["planning_epoch"], 2)
+        self.assertEqual(state_store.get_planning_epoch(
+            state_store.load(spath)), 2)
 
     def test_resume_into_planning_skips_scout(self):
         spath = self._tmp_session()
@@ -3086,6 +3094,1128 @@ class PhaseChainFlowTest(unittest.TestCase):
         self.assertTrue(any(e["event"] == "phase.change"
                             and e["from"] == "scouting"
                             and e["to"] == "planning" for e in events))
+
+
+# --------------------------------------------------------------------------- #
+# Peer evaluations: scratch/aggregate state helpers, the private eval prompt,   #
+# output muting, the role-side and reviewer-side eval turns, and the            #
+# observational invariant (verdict handling unchanged by eval).                 #
+# --------------------------------------------------------------------------- #
+
+
+class _EvalEnvMixin:
+    """Shared fixtures: a temp .cowork dir + a temp COWORK_SESSIONS_ROOT so
+    tests never touch the real home dir."""
+
+    def _tmpdir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def _cowork_dir(self):
+        d = os.path.join(self._tmpdir(), ".cowork")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _scores_root(self):
+        root = self._tmpdir()
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+        return root
+
+    def _trace(self, cowork_dir):
+        return trace_store.Trace(os.path.join(cowork_dir, "trace.X.jsonl"),
+                                 session_uuid="X", run_id="R")
+
+    def _trace_events(self, cowork_dir):
+        path = os.path.join(cowork_dir, "trace.X.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _scores(self, session_uuid):
+        path = state_store.scores_path_for(session_uuid)
+        if not os.path.exists(path):
+            return None
+        with open(path, "r") as fh:
+            return json.load(fh)
+
+
+class EvalStateStoreTest(_EvalEnvMixin, unittest.TestCase):
+    def test_eval_scratch_path_shape(self):
+        self.assertEqual(
+            state_store.eval_scratch_path_for("/tmp/.cowork", "scout", "S1"),
+            "/tmp/.cowork/eval.scout.S1.json")
+
+    def test_scores_path_honors_env_root(self):
+        root = self._scores_root()
+        self.assertEqual(state_store.scores_path_for("S1"),
+                         os.path.join(root, "S1", "scores.json"))
+
+    def test_scores_path_defaults_to_home(self):
+        old = os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        if old is not None:
+            self.addCleanup(
+                lambda: os.environ.__setitem__("COWORK_SESSIONS_ROOT", old))
+        path = state_store.scores_path_for("S1")
+        self.assertEqual(path, os.path.join(
+            os.path.expanduser(os.path.join("~", ".cowork", "sessions")),
+            "S1", "scores.json"))
+
+    def test_read_eval_missing_and_malformed(self):
+        d = self._cowork_dir()
+        path = os.path.join(d, "eval.scout.X.json")
+        self.assertEqual(state_store.read_eval(None), [])
+        self.assertEqual(state_store.read_eval(path), [])      # missing
+        with open(path, "w") as fh:
+            fh.write("not json")
+        self.assertEqual(state_store.read_eval(path), [])      # non-JSON
+        with open(path, "w") as fh:
+            json.dump(["wrong shape"], fh)
+        self.assertEqual(state_store.read_eval(path), [])      # not a dict
+        with open(path, "w") as fh:
+            json.dump({"evaluations": "nope"}, fh)
+        self.assertEqual(state_store.read_eval(path), [])      # not a list
+
+    def test_read_eval_normalizes_and_clamps(self):
+        d = self._cowork_dir()
+        path = os.path.join(d, "eval.scout.X.json")
+        with open(path, "w") as fh:
+            json.dump({"evaluations": [
+                {"evaluatee": "scout-reviewer",
+                 "criteria": [
+                     {"name": "accuracy", "score": 7, "feedback": "high"},
+                     {"name": "helpfulness", "score": 0},
+                     {"name": "noise", "score": "4", "feedback": 12},
+                     {"name": "", "score": 3},          # nameless: dropped
+                     {"name": "bad", "score": "x"},     # unscorable: dropped
+                     "not a dict",
+                 ],
+                 "enhancement_suggestions": "tighten findings"},
+                {"evaluatee": "ghost", "criteria": []},  # no criteria: dropped
+                {"evaluatee": "ghost2"},                 # no criteria: dropped
+                "not a dict",
+            ]}, fh)
+        entries = state_store.read_eval(path)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["evaluatee"], "scout-reviewer")
+        self.assertEqual(entry["enhancement_suggestions"], "tighten findings")
+        crits = {c["name"]: c for c in entry["criteria"]}
+        self.assertEqual(set(crits), {"accuracy", "helpfulness", "noise"})
+        self.assertEqual(crits["accuracy"]["score"], 5)    # clamped down
+        self.assertEqual(crits["helpfulness"]["score"], 1)  # clamped up
+        self.assertEqual(crits["noise"]["score"], 4)        # coerced
+        self.assertEqual(crits["noise"]["feedback"], "12")  # stringified
+
+    def test_append_score_entries_fresh_then_append(self):
+        self._scores_root()
+        path = state_store.scores_path_for("S1")
+        entry = {"evaluatee": "scout", "criteria": [], "evaluator": "x"}
+        self.assertTrue(state_store.append_score_entries(path, "S1", [entry]))
+        self.assertTrue(state_store.append_score_entries(path, "S1", [entry]))
+        data = self._scores("S1")
+        self.assertEqual(data["session"], "S1")
+        self.assertEqual(len(data["evaluations"]), 2)
+
+    def test_append_score_entries_resets_malformed_existing(self):
+        self._scores_root()
+        path = state_store.scores_path_for("S1")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("not json")
+        self.assertTrue(state_store.append_score_entries(
+            path, "S1", [{"evaluatee": "scout"}]))
+        data = self._scores("S1")
+        self.assertEqual(data["session"], "S1")
+        self.assertEqual(len(data["evaluations"]), 1)
+
+    def test_append_score_entries_unwritable_returns_false(self):
+        d = self._tmpdir()
+        blocker = os.path.join(d, "blocker")
+        with open(blocker, "w") as fh:
+            fh.write("a file, not a dir")
+        path = os.path.join(blocker, "S1", "scores.json")
+        self.assertFalse(state_store.append_score_entries(
+            path, "S1", [{"evaluatee": "scout"}]))
+
+    def test_has_eval_entry_matches_and_tolerates(self):
+        self._scores_root()
+        path = state_store.scores_path_for("S1")
+        # missing / malformed aggregate reads as "not yet"
+        self.assertFalse(state_store.has_eval_entry(
+            None, "planner", "scout", "consumed-intel"))
+        self.assertFalse(state_store.has_eval_entry(
+            path, "planner", "scout", "consumed-intel"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("not json")
+        self.assertFalse(state_store.has_eval_entry(
+            path, "planner", "scout", "consumed-intel"))
+        state_store.append_score_entries(path, "S1", [
+            {"evaluator": "planner", "evaluatee": "scout",
+             "context": "consumed-intel", "planning_epoch": 1},
+            {"evaluator": "planner", "evaluatee": "planning-advisor",
+             "context": "review-round"},
+        ])
+        self.assertTrue(state_store.has_eval_entry(
+            path, "planner", "scout", "consumed-intel"))
+        # all three fields must match
+        self.assertFalse(state_store.has_eval_entry(
+            path, "planning-advisor", "scout", "consumed-intel"))
+        self.assertFalse(state_store.has_eval_entry(
+            path, "planner", "scout", "review-round"))
+        # the planning epoch scopes the match to one planning phase
+        self.assertTrue(state_store.has_eval_entry(
+            path, "planner", "scout", "consumed-intel", planning_epoch=1))
+        self.assertFalse(state_store.has_eval_entry(
+            path, "planner", "scout", "consumed-intel", planning_epoch=2))
+
+    def test_planning_epoch_persisted_and_bumped(self):
+        d = self._tmpdir()
+        spath = os.path.join(d, ".cowork", "session.json")
+        self.assertEqual(state_store.get_planning_epoch(None), 0)
+        self.assertEqual(state_store.get_planning_epoch({}), 0)
+        self.assertEqual(state_store.get_planning_epoch(
+            {"planning_epoch": "junk"}), 0)
+        state = state_store.bump_planning_epoch(spath)
+        self.assertEqual(state_store.get_planning_epoch(state), 1)
+        state = state_store.bump_planning_epoch(spath, prior=state)
+        self.assertEqual(state_store.get_planning_epoch(state), 2)
+        # persisted: a fresh load sees the bumped epoch
+        self.assertEqual(state_store.get_planning_epoch(
+            state_store.load(spath)), 2)
+
+    def test_append_score_entries_empty_is_noop(self):
+        self._scores_root()
+        path = state_store.scores_path_for("S1")
+        self.assertFalse(state_store.append_score_entries(path, "S1", []))
+        self.assertFalse(os.path.exists(path))
+
+
+class EvalPromptTest(unittest.TestCase):
+    def test_criteria_matrix_covers_the_six_pairs(self):
+        self.assertEqual(set(cowork.EVAL_CRITERIA), {
+            ("scout", "scout-reviewer"), ("scout-reviewer", "scout"),
+            ("planner", "planning-advisor"), ("planning-advisor", "planner"),
+            ("planner", "scout"), ("planning-advisor", "scout"),
+        })
+        for criteria in cowork.EVAL_CRITERIA.values():
+            self.assertTrue(criteria)
+
+    def test_prompt_carries_scratch_path_criteria_and_rules(self):
+        specs = [{"evaluatee": "scout-reviewer",
+                  "criteria": ["accuracy of findings"],
+                  "artifact_block": "VERDICT-JSON-HERE"}]
+        prompt = cowork.assemble_eval_prompt(
+            "scout", "/tmp/.cowork/eval.scout.S.json", specs)
+        self.assertIn("[private evaluation turn]", prompt)
+        self.assertIn("/tmp/.cowork/eval.scout.S.json", prompt)
+        self.assertIn("Evaluatee: scout-reviewer", prompt)
+        self.assertIn("accuracy of findings", prompt)
+        self.assertIn("VERDICT-JSON-HERE", prompt)
+        self.assertIn("enhancement_suggestions", prompt)
+        self.assertIn("never mention this evaluation to the user", prompt)
+        self.assertIn("never read any other role's evaluation file", prompt)
+
+    def test_prompt_bundles_multiple_specs(self):
+        specs = [
+            {"evaluatee": "planning-advisor", "criteria": ["signal-to-noise"],
+             "artifact_block": "VERDICT"},
+            {"evaluatee": "scout", "criteria": ["goal alignment of intel"],
+             "artifact_block": "INTEL-JSON"},
+        ]
+        prompt = cowork.assemble_eval_prompt("planner", "/x/eval.json", specs)
+        self.assertIn("Evaluatee: planning-advisor", prompt)
+        self.assertIn("Evaluatee: scout", prompt)
+        self.assertIn("INTEL-JSON", prompt)
+
+
+class MutedSessionTest(unittest.TestCase):
+    class _Session:
+        def __init__(self, out):
+            self.io_out = out
+
+        def send(self, text):
+            self.io_out.write("LEAK:" + text)
+
+    def test_send_is_muted_and_io_out_restored(self):
+        out = io.StringIO()
+        sess = self._Session(out)
+        with cowork._muted_session(sess):
+            sess.send("secret eval prompt")
+        self.assertEqual(out.getvalue(), "")          # nothing leaked
+        self.assertIs(sess.io_out, out)               # restored
+        sess.send("normal turn")                      # later turns render
+        self.assertIn("normal turn", out.getvalue())
+
+    def test_io_out_restored_on_exception(self):
+        out = io.StringIO()
+        sess = self._Session(out)
+        with self.assertRaises(RuntimeError):
+            with cowork._muted_session(sess):
+                raise RuntimeError("boom")
+        self.assertIs(sess.io_out, out)
+
+
+class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
+    """The role-side eval closure built by _make_evaluate_fn."""
+
+    def _session(self, scratch_writer=None):
+        class FakeSession:
+            def __init__(self):
+                self.io_out = io.StringIO()
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                # The bridge streams the reply to io_out at send time — the
+                # canary the leak test asserts never reaches the real out.
+                self.io_out.write("EVAL-REPLY-CANARY " + text)
+                if scratch_writer:
+                    scratch_writer(text)
+        return FakeSession()
+
+    def _scratch_writer(self, path, evaluatees=("scout-reviewer",)):
+        def write(_text):
+            with open(path, "w") as fh:
+                json.dump({"evaluations": [
+                    {"evaluatee": e,
+                     "criteria": [{"name": "c1", "score": 4,
+                                   "feedback": "solid"}],
+                     "enhancement_suggestions": "more depth"}
+                    for e in evaluatees]}, fh)
+        return write
+
+    def test_none_without_paths(self):
+        self.assertIsNone(cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", None, "/s", "S"))
+        self.assertIsNone(cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", "/p", None, "S"))
+        self.assertIsNone(cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", "/p", "/s", None))
+
+    def test_eval_turn_is_muted_and_aggregated_with_stamps(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        scratch = state_store.eval_scratch_path_for(d, "scout", "S")
+        sess = self._session(self._scratch_writer(scratch))
+        real_out = sess.io_out
+        fn = cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", scratch,
+            state_store.scores_path_for("S"), "S")
+        verdict = {"verdict": "approve", "findings": ["minor note"]}
+        fn(sess, verdict, 1)
+        # LEAK TEST: no eval prompt or reply text reached the session's real
+        # io_out, and io_out is restored for later normal turns.
+        self.assertEqual(real_out.getvalue(), "")
+        self.assertIs(sess.io_out, real_out)
+        # the verdict JSON is embedded even on approve (evidence invariant)
+        self.assertIn('"verdict": "approve"', sess.sent[0])
+        self.assertIn("minor note", sess.sent[0])
+        # privacy: the aggregate scores path never appears in the prompt
+        self.assertNotIn(state_store.scores_path_for("S"), sess.sent[0])
+        self.assertNotIn("scores.json", sess.sent[0])
+        data = self._scores("S")
+        self.assertEqual(len(data["evaluations"]), 1)
+        entry = data["evaluations"][0]
+        self.assertEqual(entry["evaluator"], "scout")
+        self.assertEqual(entry["evaluatee"], "scout-reviewer")
+        self.assertEqual(entry["phase"], "scouting")
+        self.assertEqual(entry["round"], 1)
+        self.assertEqual(entry["context"], "review-round")
+        self.assertIn("T", entry["timestamp"])
+        self.assertEqual(entry["criteria"][0]["score"], 4)
+
+    def test_stale_scratch_cleared_before_send(self):
+        # STALE-SCRATCH REGRESSION: a valid scratch from a prior round exists,
+        # the current eval turn writes nothing -> cleared before the send,
+        # nothing appended, traced eval.written found=false.
+        self._scores_root()
+        d = self._cowork_dir()
+        scratch = state_store.eval_scratch_path_for(d, "scout", "S")
+        self._scratch_writer(scratch)("prior round")   # stale but valid
+        sess = self._session(scratch_writer=None)      # writes nothing
+        trace = self._trace(d)
+        fn = cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", scratch,
+            state_store.scores_path_for("S"), "S", trace=trace)
+        fn(sess, {"verdict": "revise"}, 2)
+        self.assertFalse(os.path.exists(scratch))      # cleared, not re-read
+        self.assertIsNone(self._scores("S"))           # nothing appended
+        events = self._trace_events(d)
+        self.assertTrue(any(e["event"] == "eval.scratch.cleared"
+                            for e in events))
+        self.assertTrue(any(e["event"] == "eval.written"
+                            and e["found"] is False for e in events))
+        self.assertFalse(any(e["event"] == "eval.aggregated" for e in events))
+
+    def test_malformed_scratch_traced_and_dropped(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        scratch = state_store.eval_scratch_path_for(d, "scout", "S")
+
+        def bad_writer(_text):
+            with open(scratch, "w") as fh:
+                fh.write("not json")
+        sess = self._session(bad_writer)
+        trace = self._trace(d)
+        fn = cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", scratch,
+            state_store.scores_path_for("S"), "S", trace=trace)
+        fn(sess, {"verdict": "approve"}, 1)
+        self.assertIsNone(self._scores("S"))
+        events = self._trace_events(d)
+        self.assertTrue(any(e["event"] == "eval.aggregated"
+                            and e["result"] == "malformed" for e in events))
+
+    def test_planner_first_turn_bundles_scout_eval_once(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"finding": "F-INTEL"}}, fh)
+        scratch = state_store.eval_scratch_path_for(d, "planner", "S")
+        writers = {"evaluatees": ("planning-advisor", "scout")}
+
+        def writer(text):
+            self._scratch_writer(scratch, writers["evaluatees"])(text)
+        sess = self._session(writer)
+        fn = cowork._make_evaluate_fn(
+            "planner", "planning-advisor", "planning", scratch,
+            state_store.scores_path_for("S"), "S", intel_path=intel)
+        fn(sess, {"verdict": "revise"}, 1)
+        # first turn: bundled prompt names both evaluatees + embeds the intel
+        self.assertIn("Evaluatee: planning-advisor", sess.sent[0])
+        self.assertIn("Evaluatee: scout", sess.sent[0])
+        self.assertIn("F-INTEL", sess.sent[0])
+        writers["evaluatees"] = ("planning-advisor",)
+        fn(sess, {"verdict": "approve"}, 2)
+        fn(sess, {"verdict": "approve"}, 1)   # round reset: still no re-bundle
+        self.assertNotIn("Evaluatee: scout", sess.sent[1])
+        self.assertNotIn("Evaluatee: scout", sess.sent[2])
+        data = self._scores("S")
+        self.assertEqual(len(data["evaluations"]), 4)  # 2 + 1 + 1
+        scout_entries = [e for e in data["evaluations"]
+                         if e["evaluatee"] == "scout"]
+        self.assertEqual(len(scout_entries), 1)        # exactly once per phase
+        self.assertEqual(scout_entries[0]["context"], "consumed-intel")
+        self.assertEqual(scout_entries[0]["evaluator"], "planner")
+
+    def test_scout_bundle_not_repeated_across_resume(self):
+        # The once-per-phase flag must survive a resume/restart: a FRESH
+        # closure (new run_planner invocation) must not re-emit the
+        # consumed-intel eval already recorded in the aggregate.
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        with open(intel, "w") as fh:
+            json.dump({"result": {"finding": "F-INTEL"}}, fh)
+        scratch = state_store.eval_scratch_path_for(d, "planner", "S")
+
+        def make_fn():
+            return cowork._make_evaluate_fn(
+                "planner", "planning-advisor", "planning", scratch,
+                state_store.scores_path_for("S"), "S", intel_path=intel,
+                planning_epoch=1)
+
+        sess = self._session(self._scratch_writer(
+            scratch, ("planning-advisor", "scout")))
+        make_fn()(sess, {"verdict": "revise"}, 1)   # run 1: bundles
+        self.assertIn("Evaluatee: scout", sess.sent[0])
+        sess2 = self._session(self._scratch_writer(
+            scratch, ("planning-advisor",)))
+        make_fn()(sess2, {"verdict": "approve"}, 1)  # run 2 (resume): no bundle
+        self.assertNotIn("Evaluatee: scout", sess2.sent[0])
+        data = self._scores("S")
+        scout_entries = [e for e in data["evaluations"]
+                         if e["evaluatee"] == "scout"]
+        self.assertEqual(len(scout_entries), 1)
+
+    def test_no_scout_bundle_when_intel_missing(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        scratch = state_store.eval_scratch_path_for(d, "planner", "S")
+        sess = self._session(self._scratch_writer(
+            scratch, ("planning-advisor",)))
+        fn = cowork._make_evaluate_fn(
+            "planner", "planning-advisor", "planning", scratch,
+            state_store.scores_path_for("S"), "S",
+            intel_path=os.path.join(d, "missing.json"))
+        fn(sess, {"verdict": "approve"}, 1)
+        self.assertNotIn("Evaluatee: scout", sess.sent[0])
+
+    def test_late_intel_waits_for_a_fresh_round_one(self):
+        # The ->scout bundle rides only round-1 eval turns: intel that
+        # appears mid-cycle is not bundled on round 2, only on the next
+        # round-1 turn (after the user re-engages and rounds reset).
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        scratch = state_store.eval_scratch_path_for(d, "planner", "S")
+        sess = self._session(self._scratch_writer(
+            scratch, ("planning-advisor",)))
+        fn = cowork._make_evaluate_fn(
+            "planner", "planning-advisor", "planning", scratch,
+            state_store.scores_path_for("S"), "S", intel_path=intel)
+        fn(sess, {"verdict": "revise"}, 1)          # intel missing: no bundle
+        with open(intel, "w") as fh:
+            json.dump({"result": {"finding": "F-LATE"}}, fh)
+        fn(sess, {"verdict": "revise"}, 2)          # round 2: still no bundle
+        self.assertNotIn("Evaluatee: scout", sess.sent[0])
+        self.assertNotIn("Evaluatee: scout", sess.sent[1])
+        sess3 = self._session(self._scratch_writer(
+            scratch, ("planning-advisor", "scout")))
+        fn(sess3, {"verdict": "approve"}, 1)        # fresh round 1: bundles
+        self.assertIn("Evaluatee: scout", sess3.sent[0])
+
+    def test_scout_bundle_repeats_for_new_planning_phase(self):
+        # A hand-back round trip starts a NEW planning phase (the epoch
+        # bumps), so the scout is evaluated again — even when the re-approved
+        # intel is byte-identical (once per phase, not once per session or
+        # per intel content).
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        with open(intel, "w") as fh:
+            json.dump({"result": {"finding": "F-SAME"}}, fh)
+        scratch = state_store.eval_scratch_path_for(d, "planner", "S")
+
+        def make_fn(epoch):
+            return cowork._make_evaluate_fn(
+                "planner", "planning-advisor", "planning", scratch,
+                state_store.scores_path_for("S"), "S", intel_path=intel,
+                planning_epoch=epoch)
+
+        sess = self._session(self._scratch_writer(
+            scratch, ("planning-advisor", "scout")))
+        make_fn(1)(sess, {"verdict": "approve"}, 1)   # phase 1: bundles
+        sess2 = self._session(self._scratch_writer(
+            scratch, ("planning-advisor", "scout")))
+        make_fn(2)(sess2, {"verdict": "approve"}, 1)  # phase 2: bundles again
+        self.assertIn("Evaluatee: scout", sess2.sent[0])
+        data = self._scores("S")
+        scout_entries = [e for e in data["evaluations"]
+                         if e["evaluatee"] == "scout"]
+        self.assertEqual(len(scout_entries), 2)
+        self.assertEqual(sorted(e["planning_epoch"] for e in scout_entries),
+                         [1, 2])
+
+
+class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
+    """evaluate_fn fires per review round, for every verdict kind, and never
+    affects the flow (observational invariant)."""
+
+    def _intel(self):
+        return os.path.join(self._cowork_dir(), "scout.intel.X.json")
+
+    def _session(self, intel_path, statuses):
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                st = statuses.pop(0) if statuses else "ready_for_review"
+                with open(intel_path, "w") as fh:
+                    json.dump({"status": st}, fh)
+
+            def close(self):
+                self.closed = True
+        return FakeSession()
+
+    def _review_fn(self, verdicts):
+        def review_fn(intel_path, round_index):
+            return verdicts.pop(0) if verdicts else {"verdict": "approve"}
+        return review_fn
+
+    def _recording_eval(self):
+        calls = []
+
+        def evaluate_fn(session, verdict, round_index):
+            calls.append(((verdict or {}).get("verdict"), round_index))
+        evaluate_fn.calls = calls
+        return evaluate_fn
+
+    def test_eval_fires_for_revise_and_approve_rounds(self):
+        intel = self._intel()
+        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
+        efn = self._recording_eval()
+        rc = cowork._scout_loop(
+            sess, "seed", intel, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(),
+            review_fn=self._review_fn([
+                {"verdict": "revise", "findings": ["gap"]},
+                {"verdict": "approve"}]),
+            evaluate_fn=efn)
+        self.assertEqual(rc, 0)
+        self.assertEqual(efn.calls, [("revise", 1), ("approve", 2)])
+
+    def test_eval_fires_for_needs_user_round(self):
+        intel = self._intel()
+        sess = self._session(intel, ["ready_for_review", "needs_input"])
+        efn = self._recording_eval()
+        cowork._scout_loop(
+            sess, "seed", intel, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(),
+            review_fn=self._review_fn([
+                {"verdict": "needs_user", "user_question": "scope?"}]),
+            evaluate_fn=efn)
+        self.assertEqual(efn.calls, [("needs_user", 1)])
+
+    def test_eval_fires_on_every_round_up_to_the_cap(self):
+        intel = self._intel()
+        cap = cowork.REVIEW_ROUND_CAP
+        sess = self._session(intel, ["ready_for_review"] * (cap + 1))
+        efn = self._recording_eval()
+        cowork._scout_loop(
+            sess, "seed", intel, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(),
+            review_fn=self._review_fn(
+                [{"verdict": "revise", "findings": ["no"]}] * (cap + 1)),
+            evaluate_fn=efn)
+        # round-cap dissent rounds are evaluated too: one eval per round
+        self.assertEqual(efn.calls,
+                         [("revise", i) for i in range(1, cap + 1)])
+
+    def test_eval_failure_is_traced_and_flow_unchanged(self):
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.X.json")
+        statuses = ["ready_for_review", "ready_for_review"]
+        verdicts = [{"verdict": "revise", "findings": ["fix the cited path"]},
+                    {"verdict": "approve"}]
+
+        def run(evaluate_fn, trace=None):
+            sess = self._session(intel, list(statuses))
+            out = io.StringIO()
+            rc = cowork._scout_loop(
+                sess, "seed", intel, context="", io_in=io.StringIO(""),
+                io_out=out, review_fn=self._review_fn(list(verdicts)),
+                trace=trace, evaluate_fn=evaluate_fn)
+            return rc, sess, out.getvalue()
+
+        def boom(session, verdict, round_index):
+            raise RuntimeError("eval exploded")
+
+        trace = self._trace(d)
+        rc_off, sess_off, out_off = run(None)
+        rc_on, sess_on, out_on = run(boom, trace=trace)
+        # observational invariant: identical rc, handoffs, and user output
+        self.assertEqual(rc_on, rc_off)
+        self.assertEqual(sess_on.sent, sess_off.sent)
+        self.assertEqual(out_on, out_off)
+        self.assertTrue(any(e["event"] == "eval.error"
+                            for e in self._trace_events(d)))
+
+    def test_eval_output_never_reaches_the_user_channel(self):
+        # End-to-end mute check at the loop level: the eval turn rides the
+        # real session (whose send streams to io_out) and the user output must
+        # contain no eval prompt or reply text — only the role's own replies.
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.X.json")
+        scratch = state_store.eval_scratch_path_for(d, "scout", "X")
+        out = io.StringIO()
+
+        class FakeSession:
+            def __init__(self):
+                self.io_out = out
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                self.io_out.write("[reply to] " + text[:40] + "\n")
+                if "[private evaluation turn]" in text:
+                    with open(scratch, "w") as fh:
+                        json.dump({"evaluations": [
+                            {"evaluatee": "scout-reviewer",
+                             "criteria": [{"name": "c", "score": 5,
+                                           "feedback": "SECRET-FEEDBACK"}],
+                             "enhancement_suggestions": "SECRET-SUGGESTION"},
+                        ]}, fh)
+                else:
+                    with open(intel, "w") as fh:
+                        json.dump({"status": "ready_for_review"}, fh)
+
+            def close(self):
+                pass
+
+        sess = FakeSession()
+        efn = cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", scratch,
+            state_store.scores_path_for("X"), "X")
+        rc = cowork._scout_loop(
+            sess, "seed", intel, context="", io_in=io.StringIO(""),
+            io_out=out, review_fn=self._review_fn([{"verdict": "approve"}]),
+            evaluate_fn=efn)
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("[reply to] seed", text)              # normal turn shown
+        self.assertNotIn("[private evaluation turn]", text)  # prompt muted
+        self.assertNotIn("SECRET-FEEDBACK", text)
+        self.assertNotIn("SECRET-SUGGESTION", text)
+        # io_out restored after the eval turn (the swap did not stick)
+        self.assertIs(sess.io_out, out)
+        data = self._scores("X")
+        self.assertEqual(len(data["evaluations"]), 1)
+
+
+class RunReviewerOnceEvalTest(_EvalEnvMixin, unittest.TestCase):
+    """The reviewer-side eval turn rides the session run_reviewer_once already
+    holds: send -> read -> eval-send -> close."""
+
+    def _paths(self):
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.X.json")
+        review = os.path.join(d, "scout-review.X.json")
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review", "result": {}}, fh)
+        return d, intel, review
+
+    def _factory(self, review_path, scratch_path=None, scratch_payload=None):
+        record = {"sends": [], "closed_after": None}
+
+        def factory(controller, io_out):
+            class FakeRevSession:
+                def send(self, text):
+                    record["sends"].append(text)
+                    if len(record["sends"]) == 1:
+                        with open(review_path, "w") as fh:
+                            json.dump({"verdict": "approve"}, fh)
+                    elif scratch_path and scratch_payload is not None:
+                        with open(scratch_path, "w") as fh:
+                            json.dump(scratch_payload, fh)
+
+                def close(self):
+                    record["closed_after"] = len(record["sends"])
+            return FakeRevSession()
+        return factory, record
+
+    def test_eval_sent_on_open_session_after_verdict_before_close(self):
+        d, intel, review = self._paths()
+        scratch = state_store.eval_scratch_path_for(d, "scout-reviewer", "X")
+        payload = {"evaluations": [{"evaluatee": "scout",
+                                    "criteria": [{"name": "c", "score": 3,
+                                                  "feedback": "ok"}]}]}
+        factory, record = self._factory(review, scratch, payload)
+        specs = [{"evaluatee": "scout",
+                  "criteria": ["intel quality/completeness"],
+                  "artifact_block": "see your review file",
+                  "context": "review-round", "phase": "scouting", "round": 1}]
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        verdict = cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory, eval_scratch_path=scratch,
+            eval_specs=specs)
+        self.assertEqual(verdict["verdict"], "approve")   # verdict unaffected
+        self.assertEqual(len(record["sends"]), 2)         # review + eval turn
+        self.assertIn("[private evaluation turn]", record["sends"][1])
+        self.assertIn("Evaluatee: scout", record["sends"][1])
+        self.assertEqual(record["closed_after"], 2)       # closed after eval
+        self.assertEqual(len(state_store.read_eval(scratch)), 1)
+
+    def test_stale_reviewer_scratch_cleared_before_eval_send(self):
+        # Reviewer-side stale regression: a valid prior-round scratch exists,
+        # this eval turn writes nothing -> the file was cleared before the
+        # send, so a later read finds no entry (never the prior round's).
+        d, intel, review = self._paths()
+        scratch = state_store.eval_scratch_path_for(d, "scout-reviewer", "X")
+        with open(scratch, "w") as fh:
+            json.dump({"evaluations": [
+                {"evaluatee": "scout",
+                 "criteria": [{"name": "c", "score": 5}]}]}, fh)
+        factory, record = self._factory(review)  # eval turn writes nothing
+        specs = [{"evaluatee": "scout", "criteria": ["c"],
+                  "artifact_block": "x", "context": "review-round",
+                  "phase": "scouting", "round": 2}]
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory, eval_scratch_path=scratch,
+            eval_specs=specs)
+        self.assertEqual(len(record["sends"]), 2)
+        self.assertFalse(os.path.exists(scratch))
+        self.assertEqual(state_store.read_eval(scratch), [])
+
+    def test_no_eval_specs_keeps_single_send(self):
+        d, intel, review = self._paths()
+        factory, record = self._factory(review)
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        verdict = cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory)
+        self.assertEqual(verdict["verdict"], "approve")
+        self.assertEqual(len(record["sends"]), 1)
+
+    def test_eval_send_failure_does_not_break_the_verdict(self):
+        d, intel, review = self._paths()
+        scratch = state_store.eval_scratch_path_for(d, "scout-reviewer", "X")
+        record = {"sends": 0}
+
+        def factory(controller, io_out):
+            class FlakyRevSession:
+                def send(self, text):
+                    record["sends"] += 1
+                    if record["sends"] == 1:
+                        with open(review, "w") as fh:
+                            json.dump({"verdict": "approve"}, fh)
+                    else:
+                        raise RuntimeError("eval send died")
+
+                def close(self):
+                    pass
+            return FlakyRevSession()
+
+        specs = [{"evaluatee": "scout", "criteria": ["c"],
+                  "artifact_block": "x", "context": "review-round",
+                  "phase": "scouting", "round": 1}]
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        verdict = cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory, eval_scratch_path=scratch,
+            eval_specs=specs)
+        self.assertEqual(verdict["verdict"], "approve")
+        self.assertEqual(record["sends"], 2)
+
+
+class MakeReviewFnEvalTest(_EvalEnvMixin, unittest.TestCase):
+    """review_fn computes the reviewer's eval specs, hands them to the runner,
+    and aggregates the reviewer's scratch after the pass."""
+
+    def _runner(self, scratch_entries=None):
+        seen = []
+
+        def runner(config, context, selected, intel_path, review_path,
+                   resume_id=None, on_session=None, context_update=None,
+                   eval_scratch_path=None, eval_specs=None):
+            seen.append({"eval_scratch_path": eval_scratch_path,
+                         "eval_specs": eval_specs})
+            if eval_scratch_path and scratch_entries is not None:
+                with open(eval_scratch_path, "w") as fh:
+                    json.dump({"evaluations": [
+                        {"evaluatee": e,
+                         "criteria": [{"name": "c", "score": 5,
+                                       "feedback": "good"}],
+                         "enhancement_suggestions": "s"}
+                        for e in scratch_entries(eval_specs)]}, fh)
+            return {"verdict": "approve"}
+        runner.seen = seen
+        return runner
+
+    def test_back_compat_runner_without_eval_params(self):
+        # No eval wiring -> the runner is called WITHOUT eval kwargs, so
+        # strict-signature runners (the existing tests' fakes) keep working.
+        def strict_runner(config, context, selected, intel_path, review_path,
+                          resume_id=None, on_session=None,
+                          context_update=None):
+            return {"verdict": "approve"}
+
+        fn = cowork.make_review_fn(
+            cowork.default_config(["scout", "scout-reviewer"]), "ctx",
+            ["scout", "scout-reviewer"], ".cowork/scout-review.X.json",
+            reviewer_runner=strict_runner)
+        self.assertEqual(fn(".cowork/scout.intel.X.json", 1)["verdict"],
+                         "approve")
+
+    def test_specs_passed_every_round_and_scratch_aggregated(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        scratch = state_store.eval_scratch_path_for(d, "scout-reviewer", "S")
+        runner = self._runner(
+            scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
+        fn = cowork.make_review_fn(
+            cowork.default_config(["scout", "scout-reviewer"]), "ctx",
+            ["scout", "scout-reviewer"], os.path.join(d, "scout-review.S.json"),
+            reviewer_runner=runner, phase="scouting",
+            eval_scratch_path=scratch,
+            scores_path=state_store.scores_path_for("S"), session_uuid="S")
+        fn(os.path.join(d, "scout.intel.S.json"), 1)
+        fn(os.path.join(d, "scout.intel.S.json"), 2)
+        for call in runner.seen:
+            self.assertEqual(call["eval_scratch_path"], scratch)
+            self.assertEqual(
+                [s["evaluatee"] for s in call["eval_specs"]], ["scout"])
+        data = self._scores("S")
+        self.assertEqual(len(data["evaluations"]), 2)
+        for i, entry in enumerate(data["evaluations"]):
+            self.assertEqual(entry["evaluator"], "scout-reviewer")
+            self.assertEqual(entry["evaluatee"], "scout")
+            self.assertEqual(entry["phase"], "scouting")
+            self.assertEqual(entry["round"], i + 1)
+            self.assertEqual(entry["context"], "review-round")
+        # Q3a: the scratch remains in .cowork after aggregation (overwritten
+        # per round; staleness is handled by clearing BEFORE each eval send)
+        self.assertTrue(os.path.exists(scratch))
+
+    def test_planning_first_round_bundles_scout_spec_once(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        with open(intel, "w") as fh:
+            json.dump({"result": {"finding": "F-INTEL"}}, fh)
+        scratch = state_store.eval_scratch_path_for(d, "planning-advisor", "S")
+        runner = self._runner(
+            scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
+        fn = cowork.make_review_fn(
+            cowork.default_config(["planner", "planning-advisor"]), "ctx",
+            ["planner", "planning-advisor"],
+            os.path.join(d, "planner-review.S.json"),
+            reviewer_runner=runner, reviewer_role="planning-advisor",
+            phase="planning", eval_scratch_path=scratch,
+            scores_path=state_store.scores_path_for("S"), session_uuid="S",
+            intel_path=intel)
+        fn(os.path.join(d, "planner.plan.S.json"), 1)
+        fn(os.path.join(d, "planner.plan.S.json"), 2)
+        fn(os.path.join(d, "planner.plan.S.json"), 1)   # reset: no re-bundle
+        first = [s["evaluatee"] for s in runner.seen[0]["eval_specs"]]
+        self.assertEqual(first, ["planner", "scout"])
+        # the ->scout spec embeds the intel JSON read at eval time
+        scout_spec = runner.seen[0]["eval_specs"][1]
+        self.assertIn("F-INTEL", scout_spec["artifact_block"])
+        self.assertEqual(scout_spec["context"], "consumed-intel")
+        for later in runner.seen[1:]:
+            self.assertEqual(
+                [s["evaluatee"] for s in later["eval_specs"]], ["planner"])
+        data = self._scores("S")
+        self.assertEqual(len(data["evaluations"]), 4)   # 2 + 1 + 1
+        scout_entries = [e for e in data["evaluations"]
+                         if e["evaluatee"] == "scout"]
+        self.assertEqual(len(scout_entries), 1)
+        self.assertEqual(scout_entries[0]["evaluator"], "planning-advisor")
+        self.assertEqual(scout_entries[0]["context"], "consumed-intel")
+
+    def test_scout_spec_not_repeated_across_resume(self):
+        # A FRESH review_fn (new make_review_fn construction, e.g. a cowork
+        # resume within the planning phase) must not re-emit the ->scout
+        # consumed-intel eval already recorded in the aggregate.
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        with open(intel, "w") as fh:
+            json.dump({"result": {"finding": "F-INTEL"}}, fh)
+        scratch = state_store.eval_scratch_path_for(d, "planning-advisor", "S")
+
+        def make_fn(runner, epoch=1):
+            return cowork.make_review_fn(
+                cowork.default_config(["planner", "planning-advisor"]), "ctx",
+                ["planner", "planning-advisor"],
+                os.path.join(d, "planner-review.S.json"),
+                reviewer_runner=runner, reviewer_role="planning-advisor",
+                phase="planning", eval_scratch_path=scratch,
+                scores_path=state_store.scores_path_for("S"),
+                session_uuid="S", intel_path=intel, planning_epoch=epoch)
+
+        runner1 = self._runner(
+            scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
+        make_fn(runner1)(os.path.join(d, "planner.plan.S.json"), 1)
+        self.assertEqual([s["evaluatee"] for s in runner1.seen[0]["eval_specs"]],
+                         ["planner", "scout"])
+        runner2 = self._runner(
+            scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
+        make_fn(runner2)(os.path.join(d, "planner.plan.S.json"), 1)  # resume
+        self.assertEqual([s["evaluatee"] for s in runner2.seen[0]["eval_specs"]],
+                         ["planner"])
+        data = self._scores("S")
+        scout_entries = [e for e in data["evaluations"]
+                         if e["evaluatee"] == "scout"]
+        self.assertEqual(len(scout_entries), 1)
+        # ...but a NEW planning phase (hand-back round trip bumps the epoch)
+        # is evaluated again, even with byte-identical re-approved intel.
+        runner3 = self._runner(
+            scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
+        make_fn(runner3, epoch=2)(os.path.join(d, "planner.plan.S.json"), 1)
+        self.assertEqual([s["evaluatee"] for s in runner3.seen[0]["eval_specs"]],
+                         ["planner", "scout"])
+        self.assertEqual(runner3.seen[0]["eval_specs"][1]["planning_epoch"], 2)
+
+
+class EvalEndToEndTest(_EvalEnvMixin, unittest.TestCase):
+    """Fake-session end-to-end: both sides of a pairing land in scores.json
+    with correct stamps, and no eval content reaches the user output."""
+
+    def test_scout_phase_two_evals_per_round(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        review = os.path.join(d, "scout-review.S.json")
+        scout_scratch = state_store.eval_scratch_path_for(d, "scout", "S")
+        rev_scratch = state_store.eval_scratch_path_for(
+            d, "scout-reviewer", "S")
+        scores_path = state_store.scores_path_for("S")
+        config = cowork.default_config(["scout", "scout-reviewer"])
+        config["scout"]["controller"] = "codex"
+        prompts = []
+
+        def factory(controller, resume_thread_id=None, on_thread_id=None):
+            class FakeScout:
+                def __init__(self):
+                    self.io_out = io.StringIO()
+
+                def send(self, text):
+                    prompts.append(text)
+                    # The role spec itself mentions the eval-turn marker, and
+                    # the codex first prompt embeds the role spec — detect an
+                    # eval turn by its scratch path, which only the eval
+                    # prompt carries.
+                    if scout_scratch in text:
+                        with open(scout_scratch, "w") as fh:
+                            json.dump({"evaluations": [
+                                {"evaluatee": "scout-reviewer",
+                                 "criteria": [{"name": "accuracy of findings",
+                                               "score": 4,
+                                               "feedback": "on point"}],
+                                 "enhancement_suggestions": "cite more"}]}, fh)
+                    else:
+                        with open(intel, "w") as fh:
+                            json.dump({"status": "ready_for_review"}, fh)
+
+                def close(self):
+                    pass
+            return FakeScout()
+
+        def reviewer_runner(config, context, selected, intel_path, review_path,
+                            resume_id=None, on_session=None,
+                            context_update=None, eval_scratch_path=None,
+                            eval_specs=None):
+            prompts.extend(s.get("artifact_block", "") for s in eval_specs or [])
+            with open(review_path, "w") as fh:
+                json.dump({"verdict": "approve"}, fh)
+            if eval_scratch_path and eval_specs:
+                with open(eval_scratch_path, "w") as fh:
+                    json.dump({"evaluations": [
+                        {"evaluatee": s["evaluatee"],
+                         "criteria": [{"name": s["criteria"][0], "score": 5,
+                                       "feedback": "complete"}],
+                         "enhancement_suggestions": "none"}
+                        for s in eval_specs]}, fh)
+            return {"verdict": "approve"}
+
+        out = io.StringIO()
+        rc = cowork.run_scout(
+            config, "the goal", ["scout", "scout-reviewer"],
+            io_in=io.StringIO(""), io_out=out, intel_path=intel,
+            session_factory=factory, review_path=review,
+            reviewer_runner=reviewer_runner,
+            eval_scratch_path=scout_scratch,
+            reviewer_eval_scratch_path=rev_scratch,
+            scores_path=scores_path, session_uuid="S")
+        self.assertEqual(rc, 0)
+        data = self._scores("S")
+        self.assertEqual(len(data["evaluations"]), 2)   # one per side
+        by_evaluator = {e["evaluator"]: e for e in data["evaluations"]}
+        self.assertEqual(set(by_evaluator),
+                         {"scout", "scout-reviewer"})
+        self.assertEqual(by_evaluator["scout"]["evaluatee"], "scout-reviewer")
+        self.assertEqual(by_evaluator["scout-reviewer"]["evaluatee"], "scout")
+        for entry in data["evaluations"]:
+            self.assertEqual(entry["phase"], "scouting")
+            self.assertEqual(entry["round"], 1)
+            self.assertEqual(entry["context"], "review-round")
+            self.assertIn("timestamp", entry)
+        # privacy: no eval text in the user output; no scores path in prompts
+        text = out.getvalue()
+        self.assertNotIn("on point", text)
+        self.assertNotIn("[private evaluation turn]", text)
+        for prompt in prompts:
+            self.assertNotIn(scores_path, prompt)
+
+    def test_planning_phase_first_round_produces_four_entries(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        intel = os.path.join(d, "scout.intel.S.json")
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"finding": "F-INTEL"}}, fh)
+        plan_json = os.path.join(d, "planner.plan.S.json")
+        plan_md = os.path.join(d, "planner.plan.S.md")
+        review = os.path.join(d, "planner-review.S.json")
+        planner_scratch = state_store.eval_scratch_path_for(d, "planner", "S")
+        advisor_scratch = state_store.eval_scratch_path_for(
+            d, "planning-advisor", "S")
+        scores_path = state_store.scores_path_for("S")
+        config = cowork.default_config(["planner", "planning-advisor"])
+        config["planner"]["controller"] = "codex"
+
+        def factory(controller, resume_thread_id=None, on_thread_id=None):
+            class FakePlanner:
+                def __init__(self):
+                    self.io_out = io.StringIO()
+
+                def send(self, text):
+                    # Detect an eval turn by its scratch path (the codex first
+                    # prompt embeds the role spec, which mentions the marker).
+                    if planner_scratch in text:
+                        evaluatees = [r for r in ("planning-advisor", "scout")
+                                      if "Evaluatee: %s" % r in text]
+                        with open(planner_scratch, "w") as fh:
+                            json.dump({"evaluations": [
+                                {"evaluatee": e,
+                                 "criteria": [{"name": "c", "score": 4,
+                                               "feedback": "fb"}],
+                                 "enhancement_suggestions": "es"}
+                                for e in evaluatees]}, fh)
+                    else:
+                        with open(plan_json, "w") as fh:
+                            json.dump({"status": "ready_for_review"}, fh)
+
+                def close(self):
+                    pass
+            return FakePlanner()
+
+        def reviewer_runner(config, context, selected, artifact_path,
+                            review_path, resume_id=None, on_session=None,
+                            context_update=None, eval_scratch_path=None,
+                            eval_specs=None):
+            with open(review_path, "w") as fh:
+                json.dump({"verdict": "approve"}, fh)
+            if eval_scratch_path and eval_specs:
+                with open(eval_scratch_path, "w") as fh:
+                    json.dump({"evaluations": [
+                        {"evaluatee": s["evaluatee"],
+                         "criteria": [{"name": s["criteria"][0], "score": 5,
+                                       "feedback": "fb"}],
+                         "enhancement_suggestions": "es"}
+                        for s in eval_specs]}, fh)
+            return {"verdict": "approve"}
+
+        outcomes = []
+        rc = cowork.run_planner(
+            config, "seed", ["planner", "planning-advisor"],
+            io_in=io.StringIO(""), io_out=io.StringIO(),
+            plan_json_path=plan_json, plan_md_path=plan_md,
+            session_factory=factory, review_path=review,
+            reviewer_runner=reviewer_runner,
+            eval_scratch_path=planner_scratch,
+            reviewer_eval_scratch_path=advisor_scratch,
+            scores_path=scores_path, session_uuid="S", intel_path=intel,
+            on_outcome=lambda o, p: outcomes.append(o))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcomes, ["approved"])
+        data = self._scores("S")
+        # first planning round: 2 counterpart evals + 2 ->scout evals
+        self.assertEqual(len(data["evaluations"]), 4)
+        pairs = sorted((e["evaluator"], e["evaluatee"], e["context"])
+                       for e in data["evaluations"])
+        self.assertEqual(pairs, [
+            ("planner", "planning-advisor", "review-round"),
+            ("planner", "scout", "consumed-intel"),
+            ("planning-advisor", "planner", "review-round"),
+            ("planning-advisor", "scout", "consumed-intel"),
+        ])
+        for entry in data["evaluations"]:
+            self.assertEqual(entry["phase"], "planning")
+            self.assertEqual(entry["round"], 1)
 
 
 if __name__ == "__main__":

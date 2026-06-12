@@ -19,6 +19,10 @@ import or modify co_plan_file.py.
 """
 
 import argparse
+import contextlib
+import datetime
+import hashlib
+import json
 import os
 import sys
 import uuid
@@ -450,6 +454,254 @@ class _QuietSink:
         return False
 
 
+# --------------------------------------------------------------------------- #
+# Peer evaluations: after every review round both sides of the active pairing  #
+# privately score each other (1-5 per criterion + feedback + enhancement       #
+# suggestions); planner and planning-advisor additionally evaluate the scout    #
+# once per planning phase. Each evaluator writes only its own scratch file;    #
+# the orchestrator stamps metadata and aggregates into the per-session         #
+# scores.json. Purely observational: failures are traced and skipped, and no   #
+# evaluation content ever reaches the user or the evaluated role.              #
+# --------------------------------------------------------------------------- #
+
+# The criteria are part of the orchestration contract, not role-spec prose:
+# the role specs reference "the criteria supplied in the prompt". Keyed by
+# (evaluator, evaluatee). Every evaluation additionally carries free-text
+# enhancement_suggestions.
+EVAL_CRITERIA = {
+    ("scout", SCOUT_REVIEWER): [
+        "accuracy of findings",
+        "helpfulness/actionability",
+        "false-positive rate (nitpicks vs real gaps)",
+    ],
+    (SCOUT_REVIEWER, "scout"): [
+        "intel quality/completeness",
+        "requirement-gathering quality (questions asked vs assumptions buried)",
+        "goal alignment",
+    ],
+    ("planner", PLANNING_ADVISOR): [
+        "accuracy of findings",
+        "helpfulness toward a better plan",
+        "signal-to-noise",
+    ],
+    (PLANNING_ADVISOR, "planner"): [
+        "plan quality/feasibility",
+        "responsiveness to feedback",
+        "goal alignment",
+    ],
+    ("planner", "scout"): [
+        "usefulness/sufficiency of intel for planning",
+        "accuracy of cited code/constraints",
+    ],
+    (PLANNING_ADVISOR, "scout"): [
+        "intel quality from planning lens",
+        "goal alignment of intel",
+    ],
+}
+
+# Which user-facing role a paired reviewer evaluates on its eval turn.
+_REVIEWER_EVALUATEE = {SCOUT_REVIEWER: "scout", PLANNING_ADVISOR: "planner"}
+
+
+def assemble_eval_prompt(evaluator, scratch_path, specs):
+    """The private evaluation request sent to `evaluator` on its own session.
+
+    `specs` is a list of {evaluatee, criteria, artifact_block} dicts — the
+    artifact_block embeds the evidence (the full verdict JSON for
+    role->reviewer evals; the full approved scout intel JSON for ->scout
+    evals) so the prompt is self-contained for every verdict kind. The
+    aggregate scores path is deliberately never part of this prompt."""
+    blocks = []
+    for spec in specs:
+        criteria = "\n".join("- " + c for c in spec["criteria"])
+        blocks.append(
+            "Evaluatee: %s\nCriteria (score each 1-5):\n%s\nEvidence:\n%s"
+            % (spec["evaluatee"], criteria,
+               (spec.get("artifact_block") or "").strip()))
+    return (
+        "[private evaluation turn] This is a private evaluation request from "
+        "the cowork orchestrator. It is NOT part of the task conversation: it "
+        "is never shown to the user, and the roles you evaluate never see "
+        "your scores.\n\n"
+        "Evaluate the following peer(s) on this session:\n\n%s\n\n"
+        "Write your evaluation as a single JSON object to exactly this file:\n"
+        "  %s\n"
+        "For this turn only, that scratch file is an additional, exceptional "
+        "write target. Use exactly this shape:\n"
+        "{\"evaluations\": [{\"evaluatee\": \"<role>\", \"criteria\": "
+        "[{\"name\": \"<criterion>\", \"score\": <1-5>, \"feedback\": "
+        "\"<concrete feedback>\"}], \"enhancement_suggestions\": "
+        "\"<free text>\"}]}\n"
+        "One evaluations[] entry per evaluatee above. Score each listed "
+        "criterion 1-5 with honest, concrete feedback, and always include "
+        "enhancement_suggestions.\n"
+        "Rules: do NOT modify your status/intel/plan/review files or any "
+        "other file on this turn; never read any other role's evaluation "
+        "file or any scores file; never mention this evaluation to the user. "
+        "Keep your reply text minimal — the scratch file is the deliverable."
+        % ("\n\n".join(blocks), scratch_path)
+    )
+
+
+@contextlib.contextmanager
+def _muted_session(session):
+    """Temporarily swap a role session's io_out for a quiet sink.
+
+    The scout/planner session is user-facing: both bridges stream assistant
+    text, spinners, and denial messages to `session.io_out`, resolved at send
+    time — so a temporary swap suppresses all of it for the duration of an
+    eval send with zero bridge changes. Restored in finally."""
+    saved = session.io_out
+    session.io_out = _QuietSink()
+    try:
+        yield session
+    finally:
+        session.io_out = saved
+
+
+def _eval_timestamp():
+    return datetime.datetime.now().astimezone().isoformat()
+
+
+def _intel_sha256(intel_text):
+    return hashlib.sha256((intel_text or "").encode("utf-8")).hexdigest()
+
+
+def _eval_spec_stamp(spec):
+    """The orchestrator-stamped fields one eval spec contributes to its
+    aggregate entry: the context, plus — on consumed-intel specs — the
+    planning epoch (it scopes the once-per-phase dedupe: a hand-back round
+    trip bumps it even when the re-approved intel is byte-identical) and the
+    approved-intel hash (provenance: which intel revision was scored)."""
+    stamp = {"context": spec.get("context") or "review-round"}
+    if spec.get("planning_epoch") is not None:
+        stamp["planning_epoch"] = spec["planning_epoch"]
+    if spec.get("intel_sha256"):
+        stamp["intel_sha256"] = spec["intel_sha256"]
+    return stamp
+
+
+def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
+                    round_index, stamp_by_evaluatee, trace=None):
+    """Read an evaluator's scratch file, stamp metadata, and append the
+    entries to the per-session aggregate. Evaluators only provide evaluatee,
+    criteria scores/feedback, and enhancement_suggestions — the orchestrator
+    stamps evaluator, phase, round, context, and timestamp here so they cannot
+    be misattributed or forged. A turn that wrote nothing yields 'no entry'
+    (traced and skipped), never a re-read of a previous round's scores.
+
+    The scratch file is left in place after aggregation (Q3a: gitignored,
+    overwritten per round) — staleness is prevented by the clearing BEFORE
+    every eval send, on both sides."""
+    entries = state_store.read_eval(scratch_path)
+    existed = os.path.exists(scratch_path)
+    if trace:
+        trace.event("eval.written", evaluator=evaluator, found=bool(entries),
+                    malformed=bool(existed and not entries))
+    if not entries:
+        if existed and trace:
+            trace.event("eval.aggregated", evaluator=evaluator, phase=phase,
+                        round=round_index, count=0, result="malformed")
+        return False
+    stamp = _eval_timestamp()
+    stamped = []
+    for entry in entries:
+        entry = dict(entry)
+        entry["evaluator"] = evaluator
+        entry["phase"] = phase
+        entry["round"] = round_index
+        entry["context"] = "review-round"
+        entry.update(stamp_by_evaluatee.get(entry.get("evaluatee")) or {})
+        entry["timestamp"] = stamp
+        stamped.append(entry)
+    ok = state_store.append_score_entries(scores_path, session_uuid, stamped)
+    if trace:
+        trace.event("eval.aggregated", evaluator=evaluator, phase=phase,
+                    round=round_index, count=len(stamped),
+                    result="ok" if ok else "write_failed")
+    return ok
+
+
+def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
+                      session_uuid, intel_path=None, planning_epoch=None,
+                      trace=None):
+    """Build the role-side `evaluate_fn(session, verdict, round_index)` for
+    `_role_loop`, or None when eval is not wired (missing paths).
+
+    The closure sends the eval prompt on the role's own persistent session
+    with its output muted (the eval is private), reads the role's scratch
+    back, and aggregates. The verdict JSON is always embedded — on approve the
+    findings never reach the role via the reviewer handoff, so embedding keeps
+    the prompt self-contained for every verdict kind. In the planning phase
+    the FIRST eval turn additionally bundles the ->scout eval with the
+    approved intel JSON embedded (the once-per-phase consumed-intel eval)."""
+    if not (scratch_path and scores_path and session_uuid):
+        return None
+    scout_evaled = {"done": phase != "planning"}
+
+    def evaluate_fn(session, verdict, round_index):
+        # The scratch is per-turn output, not durable state: clear any prior
+        # round's file BEFORE the send so a turn that writes nothing yields
+        # 'no entry', never a re-read of the previous round's scores.
+        try:
+            os.remove(scratch_path)
+            if trace:
+                trace.event("eval.scratch.cleared", role=role,
+                            path=scratch_path)
+        except OSError:
+            pass
+        specs = [{
+            "evaluatee": reviewer_role,
+            "criteria": EVAL_CRITERIA[(role, reviewer_role)],
+            "artifact_block":
+                "The reviewer's full verdict JSON for this round:\n%s"
+                % json.dumps(verdict or {}, indent=2, sort_keys=True),
+            "context": "review-round",
+        }]
+        # The ->scout bundle rides only the FIRST eval turn of the phase
+        # (round_index == 1, per the plan): intel that appears mid-cycle
+        # waits for the next round-1 turn.
+        if (not scout_evaled["done"] and round_index == 1 and intel_path
+                and os.path.exists(intel_path)
+                and (role, "scout") in EVAL_CRITERIA):
+            # Once per phase survives a resume/restart: the in-memory flag
+            # only covers this closure, so the aggregate itself is the
+            # durable record — scoped by the planning epoch, which bumps on
+            # every scouting -> planning transition, so a hand-back round
+            # trip (a new planning phase) is evaluated again even when the
+            # re-approved intel is byte-identical.
+            intel_text = _read_text(intel_path)
+            if state_store.has_eval_entry(scores_path, role, "scout",
+                                          "consumed-intel",
+                                          planning_epoch=planning_epoch):
+                scout_evaled["done"] = True
+            else:
+                specs.append({
+                    "evaluatee": "scout",
+                    "criteria": EVAL_CRITERIA[(role, "scout")],
+                    "artifact_block":
+                        "The approved scout intel JSON this phase consumed:"
+                        "\n%s" % intel_text.strip(),
+                    "context": "consumed-intel",
+                    "planning_epoch": planning_epoch,
+                    "intel_sha256": _intel_sha256(intel_text),
+                })
+        if trace:
+            trace.event("eval.request", evaluator=role,
+                        evaluatees=[s["evaluatee"] for s in specs],
+                        phase=phase, round=round_index)
+        prompt = assemble_eval_prompt(role, scratch_path, specs)
+        with _muted_session(session):
+            session.send(prompt)
+        if len(specs) > 1:
+            scout_evaled["done"] = True
+        _aggregate_eval(
+            scratch_path, scores_path, session_uuid, role, phase, round_index,
+            {s["evaluatee"]: _eval_spec_stamp(s) for s in specs}, trace=trace)
+
+    return evaluate_fn
+
+
 def context_update_block(text):
     """Wake block for any role resuming a CLI session that has not acknowledged
     the current session context revision. Role-agnostic: scout, scout-reviewer,
@@ -582,11 +834,13 @@ def make_planning_advisor_runner(plan_md_path, trace=None):
     `run_reviewer_once` closure carrying the advisor role, prompt, and the
     dual-artifact context assemblers."""
     def runner(config, context, selected, plan_json_path, review_path,
-               resume_id=None, on_session=None, context_update=None):
+               resume_id=None, on_session=None, context_update=None,
+               eval_scratch_path=None, eval_specs=None):
         return run_reviewer_once(
             config, context, selected, plan_json_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
+            eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
             reviewer_role=PLANNING_ADVISOR,
             prompt_path=PLANNING_ADVISOR_PROMPT_PATH,
             protected="the planner's plan files",
@@ -598,13 +852,46 @@ def make_planning_advisor_runner(plan_md_path, trace=None):
     return runner
 
 
+def _run_reviewer_eval(session, reviewer_role, eval_scratch_path, eval_specs,
+                       trace=None):
+    """Send the reviewer its private evaluation turn on the still-open session
+    (after its verdict was read back, before close — no resume round-trip).
+
+    The reviewer already streams to a quiet sink, so no muting wrapper is
+    needed. Failures are traced and swallowed: the eval is observational and
+    must never affect the verdict."""
+    if not (eval_specs and eval_scratch_path):
+        return
+    # Per-turn output, not durable state: clear any prior round's scratch
+    # BEFORE the send (mirrors the review-file clearing above).
+    try:
+        os.remove(eval_scratch_path)
+        if trace:
+            trace.event("eval.scratch.cleared", role=reviewer_role,
+                        path=eval_scratch_path)
+    except OSError:
+        pass
+    if trace:
+        trace.event("eval.request", evaluator=reviewer_role,
+                    evaluatees=[s.get("evaluatee") for s in eval_specs],
+                    phase=eval_specs[0].get("phase"),
+                    round=eval_specs[0].get("round"))
+    try:
+        session.send(assemble_eval_prompt(
+            reviewer_role, eval_scratch_path, eval_specs))
+    except Exception:  # noqa: BLE001 - eval must never break the review pass
+        if trace:
+            trace.event("eval.send.error", evaluator=reviewer_role)
+
+
 def run_reviewer_once(config, context, selected, intel_path, review_path,
                       session_factory=None, claude_spawn=None,
                       resume_id=None, on_session=None, context_update=None,
                       trace=None, reviewer_role=SCOUT_REVIEWER,
                       prompt_path=None, context_fn=None,
                       resume_context_fn=None,
-                      protected="the scout intel file"):
+                      protected="the scout intel file",
+                      eval_scratch_path=None, eval_specs=None):
     """Spawn (or resume) a paired reviewer for one pass and return its verdict.
 
     Role-generic: by default this is the scout-reviewer reviewing the scout
@@ -686,9 +973,11 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         first = (brief + "\n\n" + ctx_block).strip()
         try:
             session.send(first)
+            verdict = state_store.read_review(review_path)
+            _run_reviewer_eval(session, reviewer_role, eval_scratch_path,
+                               eval_specs, trace=trace)
         finally:
             session.close()
-        verdict = state_store.read_review(review_path)
         if trace:
             trace.event("review.run.end", role=reviewer_role,
                         result="ok", verdict=(verdict or {}).get("verdict"),
@@ -709,9 +998,11 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
     try:
         session.send(prompt)
+        verdict = state_store.read_review(review_path)
+        _run_reviewer_eval(session, reviewer_role, eval_scratch_path,
+                           eval_specs, trace=trace)
     finally:
         session.close()
-    verdict = state_store.read_review(review_path)
     if trace:
         trace.event("review.run.end", role=reviewer_role, result="ok",
                     verdict=(verdict or {}).get("verdict"),
@@ -899,7 +1190,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                review_text=scout_review_text,
                done_text=scout_done_text,
                artifact_noun="intel",
-               handoff_enabled=False, handoff_confirm=None):
+               handoff_enabled=False, handoff_confirm=None,
+               evaluate_fn=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -920,6 +1212,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     the reviewer's dissent attached. The reviewer never writes to the user
     channel; only the content-free `reviewed` marker and the role's own replies
     appear.
+
+    When `evaluate_fn(session, verdict, round_index)` is provided, it runs
+    right after each verdict readback and BEFORE branching on the verdict kind
+    — one seam that covers approve, revise, needs_user, and round-cap rounds
+    identically. It is purely observational: failures are traced and skipped,
+    and the only user-visible sign is a content-free 'Handoff in progress'
+    spinner (no-op off a TTY).
 
     When `handoff_enabled`, a `handoff_back` status with a payload shows the
     user confirmation gate: confirmed → the loop returns the "handoff" outcome;
@@ -1007,6 +1306,15 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             malformed=bool(verdict.get("malformed")))
                     ui.banner(io_out, scout_reviewed_text(
                         verdict, review_rounds, REVIEW_ROUND_CAP), "info")
+                    if evaluate_fn is not None:
+                        try:
+                            with ui.Spinner(io_out,
+                                            label="Handoff in progress"):
+                                evaluate_fn(session, verdict, review_rounds)
+                        except Exception:  # noqa: BLE001 - observational only
+                            if trace:
+                                trace.event("eval.error", evaluator=role,
+                                            round=review_rounds)
                     v = verdict.get("verdict")
                     has_question = bool(str(verdict.get("user_question") or "").strip())
                     if v == "approve":
@@ -1109,14 +1417,15 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
 
 
 def _scout_loop(session, first, intel_path, context, io_in, io_out,
-                review_fn=None, trace=None, on_outcome=None):
+                review_fn=None, trace=None, on_outcome=None,
+                evaluate_fn=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
     `run_flow` can chain into the planning phase on approval."""
     rc, outcome, _payload = _role_loop(
         session, first, intel_path, context, io_in, io_out,
         role="scout", review_fn=review_fn, trace=trace,
-        reviewer_role=SCOUT_REVIEWER)
+        reviewer_role=SCOUT_REVIEWER, evaluate_fn=evaluate_fn)
     if on_outcome:
         on_outcome(outcome)
     return rc
@@ -1125,7 +1434,9 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
 def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    reviewer_resume_id=None, on_reviewer_session=None,
                    context_update=None, on_context_ack=None, trace=None,
-                   reviewer_role=SCOUT_REVIEWER):
+                   reviewer_role=SCOUT_REVIEWER, phase=None,
+                   eval_scratch_path=None, scores_path=None,
+                   session_uuid=None, intel_path=None, planning_epoch=None):
     """Build the `review_fn` passed to `_role_loop` when the paired reviewer
     (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
     not. The closure runs one reviewer pass and returns its verdict dict.
@@ -1139,15 +1450,27 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     current revision receives it as a `context_update` wake block on its first
     pass. After the first successful pass, `on_context_ack()` records the
     acknowledgment (and the block is not repeated on later rounds).
-    `reviewer_runner` is injectable for tests."""
+    `reviewer_runner` is injectable for tests.
+
+    Peer evaluation (when `eval_scratch_path`/`scores_path`/`session_uuid` are
+    wired): every pass also carries the reviewer's eval specs into the runner —
+    always the reviewer->role spec, plus the once-per-phase ->scout spec (the
+    approved intel JSON embedded, read at eval time) in the planning phase.
+    After the runner returns, the reviewer's scratch is read back, stamped,
+    and appended to the aggregate — the evaluator is never given the
+    aggregate path (the scratch itself stays in .cowork, overwritten per
+    round; it is cleared before each eval send, not after)."""
     if reviewer_role not in selected or not review_path:
         return None
     runner = reviewer_runner or run_reviewer_once
+    eval_enabled = bool(eval_scratch_path and scores_path and session_uuid)
+    evaluatee = _REVIEWER_EVALUATEE.get(reviewer_role)
     holder = {"resume_id": reviewer_resume_id,
               "context_update": context_update,
-              "ack": on_context_ack}
+              "ack": on_context_ack,
+              "scout_evaled": phase != "planning"}
 
-    def review_fn(intel_path, _round_index):
+    def review_fn(artifact_path, round_index):
         def capture(controller, sid):
             if sid:
                 holder["resume_id"] = sid
@@ -1161,8 +1484,61 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
         }
         if trace is not None and reviewer_runner is None:
             kwargs["trace"] = trace
-        verdict = runner(config, context, selected, intel_path, review_path,
+        specs = None
+        if eval_enabled and evaluatee:
+            specs = [{
+                "evaluatee": evaluatee,
+                "criteria": EVAL_CRITERIA[(reviewer_role, evaluatee)],
+                "artifact_block":
+                    "The verdict you just wrote for this round is your own "
+                    "review file:\n  %s\nEvaluate the %s's artifact you just "
+                    "reviewed:\n  %s" % (review_path, evaluatee, artifact_path),
+                "context": "review-round",
+                "phase": phase, "round": round_index,
+            }]
+            # The ->scout bundle rides only the FIRST eval turn of the phase
+            # (round_index == 1, per the plan).
+            if (not holder["scout_evaled"] and round_index == 1 and intel_path
+                    and os.path.exists(intel_path)
+                    and (reviewer_role, "scout") in EVAL_CRITERIA):
+                # Once per phase survives a resume/restart: the aggregate
+                # itself is the durable record (the holder flag only covers
+                # this closure) — scoped by the planning epoch, which bumps
+                # on every scouting -> planning transition, so a hand-back
+                # round trip (a new planning phase) is evaluated again even
+                # when the re-approved intel is byte-identical.
+                intel_text = _read_text(intel_path)
+                if state_store.has_eval_entry(scores_path, reviewer_role,
+                                              "scout", "consumed-intel",
+                                              planning_epoch=planning_epoch):
+                    holder["scout_evaled"] = True
+                else:
+                    # The advisor never consumed the intel through its review
+                    # context, so the orchestrator reads the intel file at
+                    # eval time and embeds it — self-contained evidence.
+                    specs.append({
+                        "evaluatee": "scout",
+                        "criteria": EVAL_CRITERIA[(reviewer_role, "scout")],
+                        "artifact_block":
+                            "The approved scout intel JSON this phase "
+                            "consumed:\n%s" % intel_text.strip(),
+                        "context": "consumed-intel",
+                        "planning_epoch": planning_epoch,
+                        "intel_sha256": _intel_sha256(intel_text),
+                        "phase": phase, "round": round_index,
+                    })
+            kwargs["eval_scratch_path"] = eval_scratch_path
+            kwargs["eval_specs"] = specs
+        verdict = runner(config, context, selected, artifact_path, review_path,
                          **kwargs)
+        if specs:
+            if len(specs) > 1:
+                holder["scout_evaled"] = True
+            _aggregate_eval(
+                eval_scratch_path, scores_path, session_uuid, reviewer_role,
+                phase, round_index,
+                {s["evaluatee"]: _eval_spec_stamp(s) for s in specs},
+                trace=trace)
         if verdict is not None:
             # The reviewer ran against the current context: acknowledge the
             # revision once and stop repeating the wake block.
@@ -1181,7 +1557,9 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               reviewer_runner=None, reviewer_resume_id=None,
               on_reviewer_session=None, reviewer_context=None,
               reviewer_context_update=None, on_reviewer_context_ack=None,
-              trace=None, on_outcome=None):
+              trace=None, on_outcome=None,
+              eval_scratch_path=None, reviewer_eval_scratch_path=None,
+              scores_path=None, session_uuid=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -1196,6 +1574,9 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     resumed reviewer has not acknowledged the current context revision (it is
     delivered as a wake block) and `on_reviewer_context_ack` records the
     acknowledgment after the first successful pass.
+    `eval_scratch_path`/`reviewer_eval_scratch_path` + `scores_path` +
+    `session_uuid` wire the per-round peer evaluations (scout <->
+    scout-reviewer); absent, no evaluations happen.
     """
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
@@ -1209,7 +1590,14 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         on_reviewer_session=on_reviewer_session,
         context_update=reviewer_context_update,
         on_context_ack=on_reviewer_context_ack,
-        trace=trace)
+        trace=trace, phase="scouting",
+        eval_scratch_path=reviewer_eval_scratch_path,
+        scores_path=scores_path, session_uuid=session_uuid)
+    evaluate_fn = None
+    if review_fn is not None:
+        evaluate_fn = _make_evaluate_fn(
+            "scout", SCOUT_REVIEWER, "scouting", eval_scratch_path,
+            scores_path, session_uuid, trace=trace)
     if resume_id and not context.strip():
         context = "Continue the session."
     if trace:
@@ -1253,7 +1641,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         first = (brief + "\n\n" + context).strip()
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
-                           on_outcome=on_outcome)
+                           on_outcome=on_outcome, evaluate_fn=evaluate_fn)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -1268,7 +1656,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="scout",
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
     return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
-                       review_fn=review_fn, trace=trace, on_outcome=on_outcome)
+                       review_fn=review_fn, trace=trace, on_outcome=on_outcome,
+                       evaluate_fn=evaluate_fn)
 
 
 def run_planner(config, context, selected, io_in=None, io_out=None,
@@ -1278,7 +1667,10 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 reviewer_runner=None, reviewer_resume_id=None,
                 on_reviewer_session=None, reviewer_context=None,
                 reviewer_context_update=None, on_reviewer_context_ack=None,
-                trace=None, handoff_confirm=None, on_outcome=None):
+                trace=None, handoff_confirm=None, on_outcome=None,
+                eval_scratch_path=None, reviewer_eval_scratch_path=None,
+                scores_path=None, session_uuid=None, intel_path=None,
+                planning_epoch=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -1288,6 +1680,10 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     the planner's status channel; `plan_md_path` is the user's review surface.
     `review_path` + the planning-advisor being on the team enable the advisor
     gate; `reviewer_runner` overrides the advisor pass (for tests).
+    `eval_scratch_path`/`reviewer_eval_scratch_path` + `scores_path` +
+    `session_uuid` wire the per-round peer evaluations (planner <->
+    planning-advisor, each bundling a one-time ->scout eval of the approved
+    intel at `intel_path`); absent, no evaluations happen.
     `on_outcome(outcome, payload)` reports how the loop ended so `run_flow` can
     execute a confirmed hand-back ("handoff" outcome) or finish the session."""
     io_in = io_in or sys.stdin
@@ -1304,7 +1700,16 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         on_reviewer_session=on_reviewer_session,
         context_update=reviewer_context_update,
         on_context_ack=on_reviewer_context_ack,
-        reviewer_role=PLANNING_ADVISOR)
+        reviewer_role=PLANNING_ADVISOR, phase="planning",
+        eval_scratch_path=reviewer_eval_scratch_path,
+        scores_path=scores_path, session_uuid=session_uuid,
+        intel_path=intel_path, planning_epoch=planning_epoch)
+    evaluate_fn = None
+    if review_fn is not None:
+        evaluate_fn = _make_evaluate_fn(
+            "planner", PLANNING_ADVISOR, "planning", eval_scratch_path,
+            scores_path, session_uuid, intel_path=intel_path,
+            planning_epoch=planning_epoch, trace=trace)
     if resume_id and not context.strip():
         context = "Continue the session."
     if trace:
@@ -1326,7 +1731,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         review_text=lambda _p: planner_review_text(plan_md_path or ""),
         done_text=lambda _p: planner_done_text(plan_md_path or ""),
         artifact_noun="plan",
-        handoff_enabled=True, handoff_confirm=handoff_confirm)
+        handoff_enabled=True, handoff_confirm=handoff_confirm,
+        evaluate_fn=evaluate_fn)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -1623,6 +2029,28 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     plan_md_path = state_store.planner_plan_md_path_for(intel_dir, session_uuid)
     planner_review_path = state_store.planner_review_path_for(
         intel_dir, session_uuid)
+    # Peer-evaluation assets: a per-role scratch file (each evaluator's only
+    # eval write target) and the orchestrator-only aggregate scores file.
+    eval_scratch = {
+        role: state_store.eval_scratch_path_for(intel_dir, role, session_uuid)
+        for role in ("scout", SCOUT_REVIEWER, "planner", PLANNING_ADVISOR)
+    }
+    scores_path = state_store.scores_path_for(session_uuid)
+    # Planning-phase epoch: bumped on every scouting -> planning transition so
+    # the once-per-phase ->scout evals re-run after a hand-back round trip,
+    # even when the re-approved intel is byte-identical. Resuming into the
+    # planning phase keeps the persisted epoch.
+    epoch_box = {"epoch": state_store.get_planning_epoch(holder["state"])
+                 if session_enabled else 0}
+
+    def bump_planning_epoch():
+        if session_enabled:
+            holder["state"] = state_store.bump_planning_epoch(
+                spath, prior=holder["state"])
+            epoch_box["epoch"] = state_store.get_planning_epoch(
+                holder["state"])
+        else:
+            epoch_box["epoch"] += 1
 
     # Phase loop: scouting -> (on intel approval, planner on team) planning ->
     # (on a user-confirmed hand-back) scouting -> ... Plan approval, EOF, or an
@@ -1665,12 +2093,16 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 if SCOUT_REVIEWER in selected else None,
                 on_reviewer_context_ack=context_acker(SCOUT_REVIEWER),
                 trace=trace,
+                eval_scratch_path=eval_scratch["scout"],
+                reviewer_eval_scratch_path=eval_scratch[SCOUT_REVIEWER],
+                scores_path=scores_path, session_uuid=session_uuid,
                 on_outcome=lambda o: outcome_box.update(outcome=o))
             if rc == 0:
                 ack_lead("scout")
             if (rc == 0 and outcome_box["outcome"] == "approved"
                     and planner_on_team):
                 phase = set_phase("planning")
+                bump_planning_epoch()
                 # A planner session that already exists (hand-back round trip,
                 # or a crash after planning started) digests the updated intel;
                 # a fresh one is seeded with the approved intel + context.
@@ -1700,6 +2132,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             if PLANNING_ADVISOR in selected else None,
             on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
             trace=trace,
+            eval_scratch_path=eval_scratch["planner"],
+            reviewer_eval_scratch_path=eval_scratch[PLANNING_ADVISOR],
+            scores_path=scores_path, session_uuid=session_uuid,
+            intel_path=intel_path, planning_epoch=epoch_box["epoch"],
             on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
         if rc == 0:
             ack_lead("planner")
