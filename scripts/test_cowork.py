@@ -1757,7 +1757,13 @@ class StaleNoOpTest(unittest.TestCase):
 
     def test_t3c_stuck_gate_inspect_is_read_only(self):
         path = self._path()
-        sess = self._session(path, [dict(self._READY), None, None])
+        # A distinctive marker in the artifact's result survives the
+        # ready->needs_input invalidation (invalidate preserves result), so we
+        # can prove the RAW file content — not just the path/status labels — was
+        # emitted by inspect.
+        marker = "INSPECT_MARKER_9F3A"
+        first = {"status": "ready_for_review", "result": {"marker": marker}}
+        sess = self._session(path, [first, None, None])
         trace = self._trace(path)
         out = io.StringIO()
         rc, outcome, _ = cowork._role_loop(
@@ -1767,9 +1773,12 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(outcome, "ended")
         text = out.getvalue()
-        # Inspect emitted the artifact path + on-disk status + content.
+        # Inspect emitted the artifact path + on-disk status + raw content.
         self.assertIn("status file:", text)
         self.assertIn("on-disk status:", text)
+        # The raw artifact body itself was printed (the marker only appears in
+        # the file content dump, never in the labels).
+        self.assertIn(marker, text)
         # Inspect ran NO role turn: only seed, revise, and the single repair
         # send happened — inspect added no 4th send.
         self.assertEqual(len(sess.sent), 3)
@@ -1813,45 +1822,55 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertEqual(inv[0]["before_status"], "ready_for_review")
         self.assertEqual(inv[0]["after_status"], "needs_input")
 
+    # A genuinely-new artifact written on the reopened turn (different raw
+    # bytes) — used for the content-changing no-false-positive half of T7.
+    _DIFF = {"status": "needs_input", "result": {"q": "genuinely new question"}}
+
     def test_t7_general_invariant_reopen_sources(self):
-        # The general invariant (D1/D9): a stale no-op is detected after EVERY
-        # work-reopening source, not just the answer-at-needs_input path. Each
-        # source sets pending_reopen_reason and funnels through the same send
-        # seam. user_iterate funnels through the IDENTICAL seam
-        # (pending_reopens_work + reason='user_iterate') and is exercised
-        # separately in test_t7_user_iterate_source (it requires the TTY dissent
-        # gate to emit _ITERATE). Here: the off-TTY-drivable sources.
+        # The general invariant (D1/D9): for EVERY work-reopening source, assert
+        # BOTH halves — a byte-identical role turn triggers exactly one repair
+        # (stale_noop with the matching reopen_reason), AND a content-changing
+        # turn does NOT (no false positive). user_iterate is exercised the same
+        # way in test_t7_user_iterate_source (it needs the TTY dissent gate to
+        # emit _ITERATE); handoff_declined in test_t7_handoff_declined_source.
+        # review_fn is single-use (pops), so each scenario gets a fresh one via
+        # the factory.
         cases = [
-            # (reason, setup) where setup configures the kwargs + first writes so
-            # the FIRST reopened turn is a no-op.
-            ("user_revise", {
-                "review_fn": None,
-                "writes": [dict(self._READY), None, None],
-                "io": "feedback\nend\n"}),
-            ("reviewer_revise", {
-                "review_fn": self._review_fn(
-                    [{"verdict": "revise", "findings": ["x"]}]),
-                "writes": [dict(self._READY), None, None],
-                "io": "end\n"}),
-            ("reviewer_needs_user", {
-                "review_fn": self._review_fn(
-                    [{"verdict": "needs_user", "user_question": "which?"}]),
-                "writes": [dict(self._READY), None, None],
-                "io": "end\n"}),
+            # (reason, review_fn_factory, noop_io, content_io)
+            ("user_revise", lambda: None, "feedback\nend\n", "feedback\n"),
+            ("reviewer_revise",
+             lambda: self._review_fn([{"verdict": "revise", "findings": ["x"]}]),
+             "end\n", ""),
+            ("reviewer_needs_user",
+             lambda: self._review_fn(
+                 [{"verdict": "needs_user", "user_question": "which?"}]),
+             "end\n", ""),
         ]
-        for reason, cfg in cases:
-            with self.subTest(reason=reason):
+        for reason, rfn_factory, noop_io, content_io in cases:
+            with self.subTest(reason=reason, mode="noop"):
                 path = self._path()
-                sess = self._session(path, list(cfg["writes"]))
+                sess = self._session(path, [dict(self._READY), None, None])
                 trace = self._trace(path)
                 cowork._role_loop(
                     sess, "seed", path, context="",
-                    io_in=io.StringIO(cfg["io"]), io_out=io.StringIO(),
-                    review_fn=cfg["review_fn"], trace=trace)
+                    io_in=io.StringIO(noop_io), io_out=io.StringIO(),
+                    review_fn=rfn_factory(), trace=trace)
                 events = self._events(path)
                 sn = [e for e in events if e["event"] == "stale_noop"]
                 self.assertEqual(len(sn), 1, "exactly one repair for %s" % reason)
                 self.assertEqual(sn[0]["reopen_reason"], reason)
+            with self.subTest(reason=reason, mode="content"):
+                path = self._path()
+                sess = self._session(path, [dict(self._READY), dict(self._DIFF)])
+                trace = self._trace(path)
+                cowork._role_loop(
+                    sess, "seed", path, context="",
+                    io_in=io.StringIO(content_io), io_out=io.StringIO(),
+                    review_fn=rfn_factory(), trace=trace)
+                events = self._events(path)
+                self.assertFalse(
+                    any(e["event"] == "stale_noop" for e in events),
+                    "no false positive for content-changing %s" % reason)
 
     def test_t7_handoff_declined_source(self):
         path = self._path()
@@ -1873,6 +1892,23 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertEqual(len(sn), 1)
         self.assertEqual(sn[0]["reopen_reason"], "handoff_declined")
 
+    def test_t7_handoff_declined_content_change_no_false_positive(self):
+        path = self._path()
+        # Declined hand-back, then the role genuinely rewrites the artifact
+        # (different bytes) -> progress, NOT a stale no-op.
+        sess = self._session(path, [
+            {"status": "handoff_back", "handoff": "re-plan auth"},
+            dict(self._DIFF)])
+        trace = self._trace(path)
+        cowork._role_loop(
+            sess, "seed", path, context="",
+            io_in=io.StringIO(""), io_out=io.StringIO(),
+            handoff_enabled=True,
+            handoff_confirm=lambda io_in, io_out: False,  # decline
+            trace=trace)
+        events = self._events(path)
+        self.assertFalse(any(e["event"] == "stale_noop" for e in events))
+
     def test_t7_user_iterate_source(self):
         # user_iterate reaches the reopen seam only via the TTY dissent gate
         # (_read_review_dissent -> _ITERATE). Force the dissent path with a
@@ -1893,6 +1929,55 @@ class StaleNoOpTest(unittest.TestCase):
         sn = [e for e in events if e["event"] == "stale_noop"]
         self.assertEqual(len(sn), 1)
         self.assertEqual(sn[0]["reopen_reason"], "user_iterate")
+
+        # Content-changing half: an iterate that genuinely rewrites the artifact
+        # is progress, NOT a stale no-op.
+        path2 = self._path()
+        sess2 = self._session(path2, [dict(self._READY), dict(self._DIFF)])
+        rfn2 = self._review_fn([{"verdict": "revise", "findings": ["y"]}])
+        trace2 = self._trace(path2)
+        with mock.patch.object(cowork, "REVIEW_ROUND_CAP", 1), \
+                mock.patch.object(cowork, "_read_review_dissent",
+                                  return_value=cowork._ITERATE):
+            cowork._role_loop(
+                sess2, "seed", path2, context="",
+                io_in=io.StringIO(""), io_out=io.StringIO(),
+                review_fn=rfn2, trace=trace2)
+        events2 = self._events(path2)
+        self.assertFalse(any(e["event"] == "stale_noop" for e in events2))
+
+    def test_t7_user_answer_source(self):
+        # The ORIGINALLY-reported deadlock path: the role is at the needs_input
+        # gate, the user answers, and the role consumes the answer but leaves
+        # the artifact byte-identical. This is the source the whole feature was
+        # motivated by, so it gets explicit both-halves coverage.
+        first = {"status": "needs_input", "result": {"q": "first"}}
+
+        # No-op half: a byte-identical answer turn -> exactly one repair tagged
+        # user_answer.
+        path = self._path()
+        sess = self._session(path, [dict(first), None, None])
+        trace = self._trace(path)
+        cowork._role_loop(
+            sess, "seed", path, context="",
+            io_in=io.StringIO("my answer\nend\n"), io_out=io.StringIO(),
+            trace=trace)
+        events = self._events(path)
+        sn = [e for e in events if e["event"] == "stale_noop"]
+        self.assertEqual(len(sn), 1)
+        self.assertEqual(sn[0]["reopen_reason"], "user_answer")
+
+        # Content-changing half: an answer turn that rewrites the artifact with
+        # new bytes is progress, NOT a stale no-op.
+        path2 = self._path()
+        sess2 = self._session(path2, [dict(first), dict(self._DIFF)])
+        trace2 = self._trace(path2)
+        cowork._role_loop(
+            sess2, "seed", path2, context="",
+            io_in=io.StringIO("my answer\n"), io_out=io.StringIO(),
+            trace=trace2)
+        events2 = self._events(path2)
+        self.assertFalse(any(e["event"] == "stale_noop" for e in events2))
 
 
 class MakeReviewFnTest(unittest.TestCase):
