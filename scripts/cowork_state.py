@@ -263,12 +263,12 @@ def build_review_path_for(intel_dir, session_uuid):
 # Peer evaluations.                                                            #
 #                                                                              #
 # After each review round both sides of the active pairing privately score     #
-# each other. Each evaluator writes a per-turn scratch file in .cowork (its    #
-# ONLY eval write target); the orchestrator reads it back, stamps metadata,    #
-# and appends the entries to a per-session aggregate scores.json under         #
-# ~/.cowork/sessions/<uuid>/ (orchestrator-written only — evaluators are       #
-# never given that path). Purely observational: a missing or malformed         #
-# scratch is skipped, never an error.                                          #
+# each other. Each evaluator writes a per-turn scratch file under the           #
+# session-assets home (its ONLY eval write target); the orchestrator reads it   #
+# back, stamps metadata, and appends the entries to a per-session aggregate     #
+# scores.json under ~/.cowork/sessions/<uuid>/ (orchestrator-written only —     #
+# evaluators are never given that path). Purely observational: a missing or     #
+# malformed scratch is skipped, never an error.                                 #
 # --------------------------------------------------------------------------- #
 
 
@@ -278,12 +278,22 @@ def eval_scratch_path_for(intel_dir, role, session_uuid):
     return os.path.join(intel_dir, "eval.%s.%s.json" % (role, session_uuid))
 
 
+def session_assets_dir(session_uuid):
+    """Directory holding a session's produced assets (intel, reviews, plans,
+    build status, eval scratch) — the home for every per-session artifact,
+    alongside the aggregate scores.json and the trace already kept here. The
+    root is overridable via COWORK_SESSIONS_ROOT so tests never write to the
+    real home dir. (`session.json` is the one exception: it stays project-local
+    as the per-directory anchor — see `session_path`.)"""
+    root = (os.environ.get("COWORK_SESSIONS_ROOT")
+            or os.path.expanduser(os.path.join("~", ".cowork", "sessions")))
+    return os.path.join(root, session_uuid)
+
+
 def scores_path_for(session_uuid):
     """Path of the per-session aggregate scores file. The root is overridable
     via COWORK_SESSIONS_ROOT so tests never write to the real home dir."""
-    root = (os.environ.get("COWORK_SESSIONS_ROOT")
-            or os.path.expanduser(os.path.join("~", ".cowork", "sessions")))
-    return os.path.join(root, session_uuid, "scores.json")
+    return os.path.join(session_assets_dir(session_uuid), "scores.json")
 
 
 def read_eval(path):

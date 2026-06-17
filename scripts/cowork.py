@@ -461,6 +461,24 @@ class _QuietSink:
         return False
 
 
+def _with_status_spinner(io_out, label, fn):
+    """Run `fn()` while a labeled `ui.Spinner` turns on `io_out`, ALWAYS
+    stopping the spinner before returning (and therefore before any real
+    io_out write `fn`'s caller makes next). Single chokepoint for the
+    otherwise-silent background windows (reviewer/advisor pass, phase-boot
+    probe, build-baseline git snapshot): because the spinner is torn down in a
+    `finally`, the CR-frame loop can never interleave with a subsequent io_out
+    write. Off a TTY `ui.Spinner` is a no-op, so scripted/test paths stay
+    byte-identical. The `label` argument must NOT end in '…' — the primitive
+    appends one itself."""
+    spin = ui.Spinner(io_out, label=label)
+    spin.start()
+    try:
+        return fn()
+    finally:
+        spin.stop()
+
+
 # --------------------------------------------------------------------------- #
 # Peer evaluations: after every review round both sides of the active pairing  #
 # privately score each other (1-5 per criterion + feedback + enhancement       #
@@ -1026,10 +1044,13 @@ def assemble_advisor_resume_context(plan_json_path, plan_md_path,
     return body
 
 
-def make_planning_advisor_runner(plan_md_path, trace=None):
+def make_planning_advisor_runner(plan_md_path, trace=None,
+                                 extra_writable_dir=None):
     """Build the real (non-test) reviewer runner for the planning phase: a
     `run_reviewer_once` closure carrying the advisor role, prompt, and the
-    dual-artifact context assemblers."""
+    dual-artifact context assemblers. `extra_writable_dir` is the relocated
+    session-assets root, granted to the advisor CLI so its review/eval writes
+    (now outside cwd) succeed on the no-yolo path."""
     def runner(config, context, selected, plan_json_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None):
@@ -1038,6 +1059,7 @@ def make_planning_advisor_runner(plan_md_path, trace=None):
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
+            extra_writable_dir=extra_writable_dir,
             reviewer_role=PLANNING_ADVISOR,
             prompt_path=PLANNING_ADVISOR_PROMPT_PATH,
             protected="the planner's plan files",
@@ -1340,7 +1362,8 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
 
 
 def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
-                               baseline_repos=None, trace=None):
+                               baseline_repos=None, trace=None,
+                               extra_writable_dir=None):
     """Build the real (non-test) reviewer runner for the building phase: a
     `run_reviewer_once` closure carrying the build-reviewer role, prompt, and
     the full-delta context assemblers. The reviewed artifact passed to the
@@ -1357,6 +1380,7 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
+            extra_writable_dir=extra_writable_dir,
             reviewer_role=BUILD_REVIEWER,
             prompt_path=BUILD_REVIEWER_PROMPT_PATH,
             protected="the builder's working-tree delta and status file",
@@ -1410,7 +1434,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                       prompt_path=None, context_fn=None,
                       resume_context_fn=None,
                       protected="the scout intel file",
-                      eval_scratch_path=None, eval_specs=None):
+                      eval_scratch_path=None, eval_specs=None,
+                      extra_writable_dir=None):
     """Spawn (or resume) a paired reviewer for one pass and return its verdict.
 
     Role-generic: by default this is the scout-reviewer reviewing the scout
@@ -1467,13 +1492,14 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
             session = bridge.ClaudeSession(
                 prompt_path, cfg["mode"], cfg["yolo"],
                 io_out=quiet, speaker=reviewer_role,
-                resume_id=resume_id, on_session_id=cb, trace=trace)
+                resume_id=resume_id, on_session_id=cb, trace=trace,
+                extra_writable_dir=extra_writable_dir)
         else:
             spawn = claude_spawn or bridge._real_claude_spawn
             ok, _alert = bridge.probe_claude_stream_json(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=prompt_path, trace=trace,
-                role=reviewer_role)
+                role=reviewer_role, extra_writable_dir=extra_writable_dir)
             if not ok:
                 verdict = state_store.read_review(review_path)
                 if trace:
@@ -1488,7 +1514,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
             session = bridge.ClaudeSession(
                 prompt_path, cfg["mode"], cfg["yolo"],
                 io_out=quiet, speaker=reviewer_role,
-                session_id=sid, on_session_id=cb, trace=trace)
+                session_id=sid, on_session_id=cb, trace=trace,
+                extra_writable_dir=extra_writable_dir)
         first = (brief + "\n\n" + ctx_block).strip()
         try:
             session.send(first)
@@ -1514,7 +1541,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     else:
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=quiet, speaker=reviewer_role,
-            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
+            extra_writable_dir=extra_writable_dir)
     try:
         session.send(prompt)
         verdict = state_store.read_review(review_path)
@@ -2027,7 +2055,14 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         trace.event("review.round.start", role=reviewer_role,
                                     round=review_rounds,
                                     round_cap=REVIEW_ROUND_CAP)
-                    verdict = review_fn(status_path, review_rounds) or {}
+                    # The whole reviewer pass runs muted (probe + review turn +
+                    # the reviewer's own peer-eval all stream to a quiet sink),
+                    # so the user would otherwise sit on a static screen. Raise a
+                    # 'reviewing…' indicator on the real io_out for its duration;
+                    # the helper stops the spinner before the banner write below.
+                    verdict = _with_status_spinner(
+                        io_out, "reviewing",
+                        lambda: review_fn(status_path, review_rounds)) or {}
                     if trace:
                         trace.event(
                             "review.verdict", role=reviewer_role,
@@ -2041,7 +2076,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if evaluate_fn is not None:
                         try:
                             with ui.Spinner(io_out,
-                                            label="Handoff in progress"):
+                                            label="scoring this round"):
                                 evaluate_fn(session, verdict, review_rounds)
                         except Exception:  # noqa: BLE001 - observational only
                             if trace:
@@ -2174,7 +2209,7 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    reviewer_role=SCOUT_REVIEWER, phase=None,
                    eval_scratch_path=None, scores_path=None,
                    session_uuid=None, intel_path=None, planning_epoch=None,
-                   consumed_upstream=None):
+                   consumed_upstream=None, extra_writable_dir=None):
     """Build the `review_fn` passed to `_role_loop` when the paired reviewer
     (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
     not. The closure runs one reviewer pass and returns its verdict dict.
@@ -2196,8 +2231,9 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     approved intel JSON embedded, read at eval time) in the planning phase.
     After the runner returns, the reviewer's scratch is read back, stamped,
     and appended to the aggregate — the evaluator is never given the
-    aggregate path (the scratch itself stays in .cowork, overwritten per
-    round; it is cleared before each eval send, not after)."""
+    aggregate path (the scratch itself stays under the session-assets home,
+    ~/.cowork/sessions/<uuid>/, overwritten per round; it is cleared before
+    each eval send, not after)."""
     if reviewer_role not in selected or not review_path:
         return None
     runner = reviewer_runner or run_reviewer_once
@@ -2224,6 +2260,12 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
         }
         if trace is not None and reviewer_runner is None:
             kwargs["trace"] = trace
+        # The default scout-reviewer path calls run_reviewer_once directly, so
+        # the writable-root grant is threaded through kwargs here. The planner/
+        # builder real runners are closures (reviewer_runner is set) that bake
+        # the grant in themselves; test runners get nothing (byte-identical).
+        if reviewer_runner is None and extra_writable_dir is not None:
+            kwargs["extra_writable_dir"] = extra_writable_dir
         specs = None
         if eval_enabled and evaluatee:
             specs = [{
@@ -2291,7 +2333,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
     called so the session id can be persisted for a future resume.
-    `intel_path` is the scout's only write target (`.cowork/scout.intel.*.json`).
+    `intel_path` is the scout's only write target
+    (`~/.cowork/sessions/<uuid>/scout.intel.*.json`).
     `session_factory(controller, **kw)` overrides session creation (for tests).
     `review_path` + the scout-reviewer being on the team enable the reviewer gate;
     `reviewer_runner` overrides the reviewer pass (for tests).
@@ -2309,6 +2352,10 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     io_out = io_out or sys.stdout
     cfg = config["scout"]
     brief = assemble_scout_brief(selected, intel_path or "")
+    # Writable root granted to the agent CLIs so a no-yolo role can write its
+    # relocated session artifacts (which live outside cwd).
+    sessions_dir = (state_store.session_assets_dir(session_uuid)
+                    if session_uuid else None)
     review_fn = make_review_fn(
         config,
         reviewer_context if reviewer_context is not None else context,
@@ -2316,10 +2363,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         reviewer_resume_id=reviewer_resume_id,
         on_reviewer_session=on_reviewer_session,
         context_update=reviewer_context_update,
-        on_context_ack=on_reviewer_context_ack,
         trace=trace, phase="scouting",
+        on_context_ack=on_reviewer_context_ack,
         eval_scratch_path=reviewer_eval_scratch_path,
-        scores_path=scores_path, session_uuid=session_uuid)
+        scores_path=scores_path, session_uuid=session_uuid,
+        extra_writable_dir=sessions_dir)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -2337,10 +2385,12 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = bridge.probe_claude_stream_json(
-            spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-            role_prompt_file=SCOUT_PROMPT_PATH, trace=trace, role="scout",
-        )
+        ok, alert = _with_status_spinner(
+            io_out, "starting scout",
+            lambda: bridge.probe_claude_stream_json(
+                spawn, mode=cfg["mode"], yolo=cfg["yolo"],
+                role_prompt_file=SCOUT_PROMPT_PATH, trace=trace, role="scout",
+                extra_writable_dir=sessions_dir))
         if not ok:
             if trace:
                 trace.event("role.end", role="scout", result="probe_failed")
@@ -2364,7 +2414,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             session = bridge.ClaudeSession(
                 SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                 speaker="scout", session_id=session_id, resume_id=rid,
-                on_session_id=cb, trace=trace)
+                on_session_id=cb, trace=trace, extra_writable_dir=sessions_dir)
         first = (brief + "\n\n" + context).strip()
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
@@ -2381,7 +2431,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     else:
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="scout",
-            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
+            extra_writable_dir=sessions_dir)
     return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
                        review_fn=review_fn, trace=trace, on_outcome=on_outcome,
                        evaluate_fn=evaluate_fn)
@@ -2417,8 +2468,12 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     io_out = io_out or sys.stdout
     cfg = config["planner"]
     brief = assemble_planner_brief(plan_json_path or "", plan_md_path or "")
+    # Writable root granted to the agent CLIs so a no-yolo role can write its
+    # relocated session artifacts (which live outside cwd).
+    sessions_dir = (state_store.session_assets_dir(session_uuid)
+                    if session_uuid else None)
     runner = reviewer_runner or make_planning_advisor_runner(
-        plan_md_path, trace=trace)
+        plan_md_path, trace=trace, extra_writable_dir=sessions_dir)
     review_fn = make_review_fn(
         config,
         reviewer_context if reviewer_context is not None else context,
@@ -2430,7 +2485,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         reviewer_role=PLANNING_ADVISOR, phase="planning",
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
-        intel_path=intel_path, planning_epoch=planning_epoch)
+        intel_path=intel_path, planning_epoch=planning_epoch,
+        extra_writable_dir=sessions_dir)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -2463,10 +2519,12 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = bridge.probe_claude_stream_json(
-            spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-            role_prompt_file=PLANNER_PROMPT_PATH, trace=trace, role="planner",
-        )
+        ok, alert = _with_status_spinner(
+            io_out, "starting planner",
+            lambda: bridge.probe_claude_stream_json(
+                spawn, mode=cfg["mode"], yolo=cfg["yolo"],
+                role_prompt_file=PLANNER_PROMPT_PATH, trace=trace,
+                role="planner", extra_writable_dir=sessions_dir))
         if not ok:
             if trace:
                 trace.event("role.end", role="planner", result="probe_failed")
@@ -2491,7 +2549,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             session = bridge.ClaudeSession(
                 PLANNER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                 speaker="planner", session_id=session_id, resume_id=rid,
-                on_session_id=cb, trace=trace)
+                on_session_id=cb, trace=trace, extra_writable_dir=sessions_dir)
         first = (brief + "\n\n" + context).strip()
         rc, outcome, payload = _role_loop(
             session, first, plan_json_path, context, io_in, io_out,
@@ -2511,7 +2569,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     else:
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="planner",
-            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
+            extra_writable_dir=sessions_dir)
     rc, outcome, payload = _role_loop(
         session, prompt, plan_json_path, context, io_in, io_out, **loop_kwargs)
     report(outcome, payload)
@@ -2550,9 +2609,14 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     io_out = io_out or sys.stdout
     cfg = config["builder"]
     brief = assemble_builder_brief(build_status_path or "")
+    # Writable root granted to the agent CLIs so a no-yolo role can write its
+    # relocated session artifacts (which live outside cwd).
+    sessions_dir = (state_store.session_assets_dir(session_uuid)
+                    if session_uuid else None)
     runner = reviewer_runner or make_build_reviewer_runner(
         plan_json_path, plan_md_path, baseline_note=baseline_note,
-        baseline_repos=baseline_repos, trace=trace)
+        baseline_repos=baseline_repos, trace=trace,
+        extra_writable_dir=sessions_dir)
     consumed = plan_consumed_upstream(plan_json_path, plan_md_path,
                                       building_epoch)
     review_fn = make_review_fn(
@@ -2566,7 +2630,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         reviewer_role=BUILD_REVIEWER, phase="building",
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
-        consumed_upstream=consumed)
+        consumed_upstream=consumed, extra_writable_dir=sessions_dir)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -2601,10 +2665,12 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = bridge.probe_claude_stream_json(
-            spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-            role_prompt_file=BUILDER_PROMPT_PATH, trace=trace, role="builder",
-        )
+        ok, alert = _with_status_spinner(
+            io_out, "starting builder",
+            lambda: bridge.probe_claude_stream_json(
+                spawn, mode=cfg["mode"], yolo=cfg["yolo"],
+                role_prompt_file=BUILDER_PROMPT_PATH, trace=trace,
+                role="builder", extra_writable_dir=sessions_dir))
         if not ok:
             if trace:
                 trace.event("role.end", role="builder", result="probe_failed")
@@ -2627,7 +2693,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             session = bridge.ClaudeSession(
                 BUILDER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                 speaker="builder", session_id=session_id, resume_id=rid,
-                on_session_id=cb, trace=trace)
+                on_session_id=cb, trace=trace, extra_writable_dir=sessions_dir)
         first = (brief + "\n\n" + context).strip()
         rc, outcome, payload = _role_loop(
             session, first, build_status_path, context, io_in, io_out,
@@ -2647,7 +2713,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     else:
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="builder",
-            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
+            extra_writable_dir=sessions_dir)
     rc, outcome, payload = _role_loop(
         session, prompt, build_status_path, context, io_in, io_out,
         **loop_kwargs)
@@ -2897,7 +2964,13 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         trace.event("phase.change", **{"from": phase, "to": new_phase})
         return new_phase
 
-    intel_dir = os.path.dirname(spath) if session_enabled else state_store.session_dir()
+    # All per-session produced artifacts live under the session-assets home
+    # (~/.cowork/sessions/<uuid>/, COWORK_SESSIONS_ROOT-overridable), joining
+    # the trace and scores already kept there; only .cowork/session.json stays
+    # project-local as the per-directory anchor. Create the home up front so the
+    # agent CLIs (which write their own artifacts) always have a target dir.
+    intel_dir = state_store.session_assets_dir(session_uuid)
+    os.makedirs(intel_dir, exist_ok=True)
     intel_path = scout_intel_path(intel_dir, session_uuid)
     review_path = state_store.review_path_for(intel_dir, session_uuid)
     plan_json_path = state_store.planner_plan_json_path_for(intel_dir, session_uuid)
@@ -2964,19 +3037,33 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             repo_paths = _plan_repo_set(plan_json_path, run_cwd)
             entries = []
             repos = []
-            for path in repo_paths:
-                head, dirty = _git_build_baseline(path)
-                entries.append({"path": path, "head": head, "dirty": dirty})
-                repos.append({"path": path, "has_head": head is not None})
-                trace.event("build.baseline", repo=path, head=head,
-                            dirty=bool(dirty))
-                if head and dirty:
-                    io_out.write(
-                        "cowork: building from a dirty worktree in %s — "
-                        "pre-existing changes will be mixed into the build "
-                        "review. Commit or stash unrelated work for a clean "
-                        "review.\n" % path)
-                    io_out.flush()
+            dirty_repos = []
+
+            def gather():
+                # Per-repo git reads (rev-parse + status --porcelain, 10s
+                # timeouts each) run synchronously over the repo set — the slow
+                # window. trace.event does not touch io_out, so it is safe under
+                # the spinner; the dirty warning (which DOES write io_out) is
+                # deferred until after the spinner stops.
+                for path in repo_paths:
+                    head, dirty = _git_build_baseline(path)
+                    entries.append({"path": path, "head": head, "dirty": dirty})
+                    repos.append({"path": path, "has_head": head is not None})
+                    trace.event("build.baseline", repo=path, head=head,
+                                dirty=bool(dirty))
+                    if head and dirty:
+                        dirty_repos.append(path)
+
+            _with_status_spinner(io_out, "reading repo state", gather)
+            # Spinner is down — now safe to write the dirty-worktree warning to
+            # io_out without a CR-frame interleave.
+            for path in dirty_repos:
+                io_out.write(
+                    "cowork: building from a dirty worktree in %s — "
+                    "pre-existing changes will be mixed into the build "
+                    "review. Commit or stash unrelated work for a clean "
+                    "review.\n" % path)
+                io_out.flush()
             baseline_box["note"] = build_baselines_note(entries)
             baseline_box["repos"] = repos
             baseline_box["computed"] = True

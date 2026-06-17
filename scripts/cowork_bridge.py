@@ -90,11 +90,15 @@ def codex_mode_flags(mode, yolo):
 
 
 def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
-                         resume_id=None):
+                         resume_id=None, extra_writable_dir=None):
     """Full argv for a persistent duplex claude scout process.
 
     Pass `session_id` to pin a known UUID on a fresh session (so it can be saved
-    and resumed later), or `resume_id` to continue a saved session."""
+    and resumed later), or `resume_id` to continue a saved session.
+    `extra_writable_dir`, when set, is granted as an additional writable root
+    via `--add-dir` so a no-yolo (acceptEdits) role can write its session
+    artifacts even though they live outside cwd. Re-applied on every spawn
+    (fresh AND resume), so resumed Claude roles keep the grant."""
     cmd = [
         "claude",
         "-p",
@@ -113,6 +117,8 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         "--append-system-prompt-file",
         role_prompt_file,
     ] + claude_mode_flags(mode, yolo)
+    if extra_writable_dir:
+        cmd += ["--add-dir", extra_writable_dir]
     if resume_id:
         cmd += ["--resume", resume_id]
     elif session_id:
@@ -120,15 +126,20 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     return cmd
 
 
-def build_codex_command(prompt_text, mode, yolo):
+def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None):
     """argv for the first one-shot codex exec turn. The role spec is prepended
     into prompt_text by the caller (no AGENTS.md is written into the repo).
 
     `--skip-git-repo-check` lets cowork run outside a trusted/git directory
-    (codex exec otherwise refuses with "Not inside a trusted directory")."""
+    (codex exec otherwise refuses with "Not inside a trusted directory").
+    `extra_writable_dir`, when set, is granted as an additional writable root
+    via `--add-dir` so a no-yolo (workspace-write) role can write its session
+    artifacts outside cwd. Granted on the fresh turn only — a codex resume
+    inherits this session's sandbox and cannot re-grant a root."""
     return (
         ["codex", "exec", "--json", "--skip-git-repo-check"]
         + codex_mode_flags(mode, yolo)
+        + (["--add-dir", extra_writable_dir] if extra_writable_dir else [])
         + [prompt_text]
     )
 
@@ -299,15 +310,18 @@ def denial_message():
 
 def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                              role_prompt_file=DEFAULT_ROLE_PROMPT, trace=None,
-                             role="scout"):
+                             role="scout", extra_writable_dir=None):
     """Send one minimal user message to claude and confirm an assistant/result
     event comes back.
 
     spawn(command, stdin_text) -> iterable of raw event dicts (json objects).
     Returns (ok, alert_or_None). On an unsupported shape, ok is False and alert
     explains the failure rather than proceeding on a guessed schema.
+    `extra_writable_dir` mirrors the live session's writable-root grant so the
+    pre-first-token probe runs with the same sandbox.
     """
-    command = build_claude_command(role_prompt_file, mode, yolo)
+    command = build_claude_command(role_prompt_file, mode, yolo,
+                                   extra_writable_dir=extra_writable_dir)
     stdin_text = encode_user_message("ping")
     if trace:
         data = trace_store.command_meta(command)
@@ -390,7 +404,7 @@ class ClaudeSession:
 
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
                  session_id=None, resume_id=None, on_session_id=None,
-                 region_factory=None, trace=None):
+                 region_factory=None, trace=None, extra_writable_dir=None):
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
@@ -405,8 +419,10 @@ class ClaudeSession:
         # Non-TTY: raw passthrough, byte-identical to the historical stream.
         self._region_factory = region_factory or ui.StreamingMarkdown
         self._seen_session = False
+        self.extra_writable_dir = extra_writable_dir
         command = build_claude_command(role_prompt_file, mode, yolo,
-                                       session_id=session_id, resume_id=resume_id)
+                                       session_id=session_id, resume_id=resume_id,
+                                       extra_writable_dir=extra_writable_dir)
         if self.trace:
             self.trace.event(
                 "controller.spawn.start", controller="claude", role=speaker,
@@ -588,7 +604,8 @@ class CodexSession:
     `codex exec resume <thread_id>` per send(). A spinner runs during each turn."""
 
     def __init__(self, mode, yolo, io_out=None, speaker="scout",
-                 resume_thread_id=None, on_thread_id=None, trace=None):
+                 resume_thread_id=None, on_thread_id=None, trace=None,
+                 extra_writable_dir=None):
         self.mode = mode
         self.yolo = yolo
         self.io_out = io_out or sys.stdout
@@ -597,6 +614,9 @@ class CodexSession:
         self.thread_id = resume_thread_id
         self.on_thread_id = on_thread_id
         self.trace = trace
+        # Granted as a writable root on the FRESH exec turn only; a codex resume
+        # inherits this session's sandbox and cannot re-grant a root.
+        self.extra_writable_dir = extra_writable_dir
         self._notified = False
         self._resuming_first = resume_thread_id is not None
         self._started = False
@@ -654,7 +674,9 @@ class CodexSession:
 
     def send(self, text):
         if not self._started and not self._resuming_first:
-            command = build_codex_command(text, self.mode, self.yolo)
+            command = build_codex_command(
+                text, self.mode, self.yolo,
+                extra_writable_dir=self.extra_writable_dir)
             fresh = True
         else:
             if not self.thread_id:
