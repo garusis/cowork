@@ -10,8 +10,12 @@ Thin shim that dispatches to scripts/cowork.py. Run from a terminal:
 import os
 import sys
 
-_SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
-sys.path.insert(0, _SCRIPTS)
+_HERE = os.path.dirname(os.path.realpath(__file__))
+_VENV_PY = os.path.join(_HERE, ".venv", "bin", "python")
+if os.path.exists(_VENV_PY) and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PY):
+    os.execv(_VENV_PY, [_VENV_PY, os.path.realpath(__file__), *sys.argv[1:]])
+
+sys.path.insert(0, os.path.join(_HERE, "scripts"))
 
 import cowork  # noqa: E402
 

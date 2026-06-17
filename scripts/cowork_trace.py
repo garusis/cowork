@@ -3,7 +3,8 @@
 
 The trace complements Claude/Codex controller logs. It records cowork's own
 decisions and controller invocation metadata, but never raw prompts, replies, or
-terminal transcript text.
+terminal transcript text. UI render diagnostics are limited to metadata such as
+renderer mode, terminal dimensions, byte/line counts, and status counters.
 """
 
 import datetime
@@ -13,8 +14,13 @@ import os
 import uuid
 
 
-def trace_path_for(cowork_dir, session_uuid):
-    return os.path.join(cowork_dir, "trace.%s.jsonl" % session_uuid)
+def trace_path_for(session_uuid):
+    """Path of the per-session trace file. Root is overridable via
+    COWORK_SESSIONS_ROOT so tests never write to the real home dir
+    (mirrors cowork_state.scores_path_for)."""
+    root = (os.environ.get("COWORK_SESSIONS_ROOT")
+            or os.path.expanduser(os.path.join("~", ".cowork", "sessions")))
+    return os.path.join(root, session_uuid, "trace.jsonl")
 
 
 def new_run_id():

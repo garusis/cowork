@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""cowork: multi-role CLI orchestration entry flow + the scouting and planning
-phases.
+"""cowork: multi-role CLI orchestration entry flow + the scouting, planning,
+and building phases.
 
 The 3-step entry flow (team checklist, per-role tool config, initial context),
 the preflight dependency check, and a phase loop that drives the user-facing
 roles by spawning the selected CLI and bridging it to the user: the `scout`
 (paired with the `scout-reviewer`) gathers context; on intel approval the
-`planner` (paired with the `planning-advisor`) turns it into a plan, with a
-user-confirmed hand-back from planner to scout. Remaining roles
-(revisor/builder) are out of scope here.
+`planner` (paired with the `planning-advisor`) turns it into a plan; on plan
+approval the `builder` (paired with the `build-reviewer`) executes it. Each
+edge has a user-confirmed hand-back to its pre-processor (planner -> scout,
+builder -> planner). Build approval ends the run with no git side effects.
 
 Selection uses questionary for real interactive checkbox/choice menus. A
 non-interactive args path (--team/--config/--context) skips the menus entirely
@@ -41,6 +42,9 @@ SCOUT_REVIEWER_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout-reviewer.m
 PLANNER_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "planner.md")
 PLANNING_ADVISOR_PROMPT_PATH = os.path.join(
     SKILL_ROOT, "roles", "planning-advisor.md")
+BUILDER_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "builder.md")
+BUILD_REVIEWER_PROMPT_PATH = os.path.join(
+    SKILL_ROOT, "roles", "build-reviewer.md")
 
 # Max reviewer<->role review rounds per `ready_for_review` (D5). After this many
 # reviewer passes without approval, cowork falls through to the user review gate
@@ -48,25 +52,28 @@ PLANNING_ADVISOR_PROMPT_PATH = os.path.join(
 # scout-reviewer and the planning-advisor.
 REVIEW_ROUND_CAP = 5
 
-# Role order matches the user's vision: context-gather, scout-reviewer,
-# plan-revisor, planner, planning-advisor, implementer. `scout`/`scout-reviewer`
-# (the scouting phase) and `planner`/`planning-advisor` (the planning phase) are
-# implemented now.
+# Role order matches the user's vision and the phase order: context-gather
+# (scouting), planning, building. Each user-facing role is followed by its
+# paired critical reviewer. All three phases — `scout`/`scout-reviewer`,
+# `planner`/`planning-advisor`, `builder`/`build-reviewer` — are implemented.
 #
-# `scout-reviewer` and `planning-advisor` are critical reviewers paired with
-# their user-facing role DURING that role's session (deterministically invoked
-# when the role sets `ready_for_review`); they are distinct from `revisor`, the
-# planned SEQUENTIAL plan-revisor that would run after the scout.
+# `scout-reviewer`, `planning-advisor`, and `build-reviewer` are critical
+# reviewers paired with their user-facing role DURING that role's session
+# (deterministically invoked when the role sets `ready_for_review`). The
+# build-reviewer occupies the paired-reviewer slot the `revisor` name once
+# reserved; `revisor` is dropped (a future sequential plan-revisor would get a
+# new name).
 SCOUT_REVIEWER = "scout-reviewer"
 PLANNING_ADVISOR = "planning-advisor"
-ROLES = ["scout", SCOUT_REVIEWER, "revisor", "planner", PLANNING_ADVISOR,
-         "builder"]
+BUILD_REVIEWER = "build-reviewer"
+ROLES = ["scout", SCOUT_REVIEWER, "planner", PLANNING_ADVISOR, "builder",
+         BUILD_REVIEWER]
 
 # Hand-back contract: a user-facing role may set `status: "handoff_back"` (plus
 # a `handoff` payload) in its status file to hand the work back to its
-# pre-processor through a user-confirmed gate. The contract is role-generic;
-# only planner -> scout is wired this iteration.
-HANDBACK_PREPROCESSOR = {"planner": "scout"}
+# pre-processor through a user-confirmed gate. The contract is role-generic:
+# planner -> scout and builder -> planner are wired.
+HANDBACK_PREPROCESSOR = {"planner": "scout", "builder": "planner"}
 
 # Per-role defaults (controller, yolo, mode), all roles checked by default.
 # Roles default to implement mode (write-enabled) and are kept in their lane by
@@ -74,10 +81,10 @@ HANDBACK_PREPROCESSOR = {"planner": "scout"}
 DEFAULTS = {
     "scout": {"controller": "claude", "yolo": True, "mode": "implement"},
     SCOUT_REVIEWER: {"controller": "codex", "yolo": True, "mode": "implement"},
-    "revisor": {"controller": "codex", "yolo": True, "mode": "implement"},
     "planner": {"controller": "claude", "yolo": True, "mode": "implement"},
     PLANNING_ADVISOR: {"controller": "codex", "yolo": True, "mode": "implement"},
     "builder": {"controller": "claude", "yolo": True, "mode": "implement"},
+    BUILD_REVIEWER: {"controller": "codex", "yolo": True, "mode": "implement"},
 }
 
 
@@ -497,10 +504,29 @@ EVAL_CRITERIA = {
         "intel quality from planning lens",
         "goal alignment of intel",
     ],
+    ("builder", BUILD_REVIEWER): [
+        "accuracy of findings",
+        "helpfulness toward a better build",
+        "signal-to-noise",
+    ],
+    (BUILD_REVIEWER, "builder"): [
+        "build quality vs the approved plan",
+        "responsiveness to feedback",
+        "goal alignment",
+    ],
+    ("builder", "planner"): [
+        "usefulness/sufficiency of plan for building",
+        "accuracy of cited code/constraints",
+    ],
+    (BUILD_REVIEWER, "planner"): [
+        "plan-quality from build-execution lens",
+        "goal alignment of plan",
+    ],
 }
 
 # Which user-facing role a paired reviewer evaluates on its eval turn.
-_REVIEWER_EVALUATEE = {SCOUT_REVIEWER: "scout", PLANNING_ADVISOR: "planner"}
+_REVIEWER_EVALUATEE = {SCOUT_REVIEWER: "scout", PLANNING_ADVISOR: "planner",
+                       BUILD_REVIEWER: "builder"}
 
 
 def assemble_eval_prompt(evaluator, scratch_path, specs):
@@ -567,18 +593,120 @@ def _intel_sha256(intel_text):
     return hashlib.sha256((intel_text or "").encode("utf-8")).hexdigest()
 
 
+# Backwards-compatible alias: the consumed-upstream provenance hash used to be
+# named `intel_sha256` (scout intel only). It is now a generic
+# `artifact_sha256` (the planning phase scores the intel, the building phase
+# scores the plan). Aggregate entries written before this change still carry
+# `intel_sha256`; nothing reads the hash for matching, so the rename is purely
+# a field name on newly written entries.
+_artifact_sha256 = _intel_sha256
+
+
 def _eval_spec_stamp(spec):
     """The orchestrator-stamped fields one eval spec contributes to its
-    aggregate entry: the context, plus — on consumed-intel specs — the
-    planning epoch (it scopes the once-per-phase dedupe: a hand-back round
-    trip bumps it even when the re-approved intel is byte-identical) and the
-    approved-intel hash (provenance: which intel revision was scored)."""
+    aggregate entry: the context, plus — on consumed-upstream specs — the
+    phase epoch (it scopes the once-per-phase dedupe: a hand-back round trip
+    bumps it even when the re-approved upstream artifact is byte-identical)
+    and the consumed-artifact hash (provenance: which artifact revision was
+    scored). The epoch is stamped under whichever field the spec names
+    (`planning_epoch` for the planning phase, `building_epoch` for the
+    building phase)."""
     stamp = {"context": spec.get("context") or "review-round"}
-    if spec.get("planning_epoch") is not None:
-        stamp["planning_epoch"] = spec["planning_epoch"]
-    if spec.get("intel_sha256"):
-        stamp["intel_sha256"] = spec["intel_sha256"]
+    epoch_field = spec.get("epoch_field")
+    if epoch_field and spec.get("epoch_value") is not None:
+        stamp[epoch_field] = spec["epoch_value"]
+    # Legacy specs constructed with the epoch under its own key.
+    for legacy in ("planning_epoch", "building_epoch"):
+        if legacy not in stamp and spec.get(legacy) is not None:
+            stamp[legacy] = spec[legacy]
+    sha = spec.get("artifact_sha256") or spec.get("intel_sha256")
+    if sha:
+        stamp["artifact_sha256"] = sha
     return stamp
+
+
+def _consumed_upstream_spec(consumed, scores_path, evaluator, round_index):
+    """The once-per-phase consumed-upstream eval spec `evaluator` should emit
+    for the role whose artifact this phase consumed (the planner scoring the
+    scout's intel in the planning phase; the builder/build-reviewer scoring
+    the planner's approved plan in the building phase), or None to skip, or
+    the string "deduped" when the aggregate already holds this phase's entry.
+
+    Skips (None) when: there is no consumed-upstream wiring, it is not the
+    first eval turn of the phase (the bundle rides round 1 only), the
+    (evaluator, evaluatee) pair is not in EVAL_CRITERIA, or any consumed
+    artifact file is missing. The embedded evidence is the concatenation of
+    the consumed artifact files, read at eval time, so the prompt is
+    self-contained."""
+    if not consumed or round_index != 1:
+        return None
+    evaluatee = consumed["role"]
+    if (evaluator, evaluatee) not in EVAL_CRITERIA:
+        return None
+    paths = [p for p in (consumed.get("artifact_paths") or []) if p]
+    if not paths or not all(os.path.exists(p) for p in paths):
+        return None
+    epoch_field = consumed.get("epoch_field")
+    epoch_value = consumed.get("epoch_value")
+    if state_store.has_eval_entry(
+            scores_path, evaluator, evaluatee, consumed["context"],
+            planning_epoch=epoch_value if epoch_field == "planning_epoch"
+            else None,
+            building_epoch=epoch_value if epoch_field == "building_epoch"
+            else None):
+        return "deduped"
+    text = "\n\n".join(_read_text(p).strip() for p in paths)
+    spec = {
+        "evaluatee": evaluatee,
+        "criteria": EVAL_CRITERIA[(evaluator, evaluatee)],
+        "artifact_block": consumed["embed"] % text,
+        "context": consumed["context"],
+        "epoch_field": epoch_field,
+        "epoch_value": epoch_value,
+        "artifact_sha256": _artifact_sha256(text),
+    }
+    if epoch_field:
+        # Legacy-named convenience key (planning_epoch / building_epoch) so
+        # eval-spec consumers reading the epoch by its own name still work.
+        spec[epoch_field] = epoch_value
+    return spec
+
+
+def _scout_consumed_upstream(intel_path, planning_epoch):
+    """The consumed-upstream descriptor for the planning phase: the planner
+    and planning-advisor scoring the approved scout intel once per phase. A
+    literal re-statement of the behavior that used to be hard-coded, so the
+    planning-phase eval flow is unchanged."""
+    if intel_path is None:
+        return None
+    return {
+        "role": "scout",
+        "label": "scout intel",
+        "artifact_paths": [intel_path],
+        "epoch_field": "planning_epoch",
+        "epoch_value": planning_epoch,
+        "context": "consumed-intel",
+        "embed": "The approved scout intel JSON this phase consumed:\n%s",
+    }
+
+
+def plan_consumed_upstream(plan_json_path, plan_md_path, building_epoch):
+    """The consumed-upstream descriptor for the building phase: the builder
+    and build-reviewer scoring the approved plan (JSON + markdown) once per
+    building phase."""
+    paths = [p for p in (plan_json_path, plan_md_path) if p]
+    if not paths:
+        return None
+    return {
+        "role": "planner",
+        "label": "approved plan",
+        "artifact_paths": paths,
+        "epoch_field": "building_epoch",
+        "epoch_value": building_epoch,
+        "context": "consumed-plan",
+        "embed": "The approved plan this building phase consumed "
+                 "(plan JSON, then plan markdown):\n%s",
+    }
 
 
 def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
@@ -624,7 +752,7 @@ def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
 
 def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
                       session_uuid, intel_path=None, planning_epoch=None,
-                      trace=None):
+                      consumed_upstream=None, trace=None):
     """Build the role-side `evaluate_fn(session, verdict, round_index)` for
     `_role_loop`, or None when eval is not wired (missing paths).
 
@@ -632,12 +760,19 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
     with its output muted (the eval is private), reads the role's scratch
     back, and aggregates. The verdict JSON is always embedded — on approve the
     findings never reach the role via the reviewer handoff, so embedding keeps
-    the prompt self-contained for every verdict kind. In the planning phase
-    the FIRST eval turn additionally bundles the ->scout eval with the
-    approved intel JSON embedded (the once-per-phase consumed-intel eval)."""
+    the prompt self-contained for every verdict kind.
+
+    When a phase consumes an upstream artifact (the planning phase consumes the
+    scout intel; the building phase consumes the approved plan), the FIRST eval
+    turn additionally bundles a once-per-phase consumed-upstream eval with that
+    artifact embedded. `consumed_upstream` names it; for back-compat callers may
+    instead pass `intel_path`/`planning_epoch` and the scout descriptor is built
+    for them."""
     if not (scratch_path and scores_path and session_uuid):
         return None
-    scout_evaled = {"done": phase != "planning"}
+    if consumed_upstream is None:
+        consumed_upstream = _scout_consumed_upstream(intel_path, planning_epoch)
+    consumed_done = {"done": consumed_upstream is None}
 
     def evaluate_fn(session, verdict, round_index):
         # The scratch is per-turn output, not durable state: clear any prior
@@ -658,34 +793,20 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
                 % json.dumps(verdict or {}, indent=2, sort_keys=True),
             "context": "review-round",
         }]
-        # The ->scout bundle rides only the FIRST eval turn of the phase
-        # (round_index == 1, per the plan): intel that appears mid-cycle
-        # waits for the next round-1 turn.
-        if (not scout_evaled["done"] and round_index == 1 and intel_path
-                and os.path.exists(intel_path)
-                and (role, "scout") in EVAL_CRITERIA):
-            # Once per phase survives a resume/restart: the in-memory flag
-            # only covers this closure, so the aggregate itself is the
-            # durable record — scoped by the planning epoch, which bumps on
-            # every scouting -> planning transition, so a hand-back round
-            # trip (a new planning phase) is evaluated again even when the
-            # re-approved intel is byte-identical.
-            intel_text = _read_text(intel_path)
-            if state_store.has_eval_entry(scores_path, role, "scout",
-                                          "consumed-intel",
-                                          planning_epoch=planning_epoch):
-                scout_evaled["done"] = True
-            else:
-                specs.append({
-                    "evaluatee": "scout",
-                    "criteria": EVAL_CRITERIA[(role, "scout")],
-                    "artifact_block":
-                        "The approved scout intel JSON this phase consumed:"
-                        "\n%s" % intel_text.strip(),
-                    "context": "consumed-intel",
-                    "planning_epoch": planning_epoch,
-                    "intel_sha256": _intel_sha256(intel_text),
-                })
+        # The consumed-upstream bundle rides only the FIRST eval turn of the
+        # phase (round_index == 1): an artifact that appears mid-cycle waits
+        # for the next round-1 turn. Once per phase survives a resume/restart:
+        # the in-memory flag only covers this closure, so the aggregate itself
+        # is the durable record — scoped by the phase epoch, which bumps on
+        # every phase transition, so a hand-back round trip (a new phase) is
+        # evaluated again even when the re-approved artifact is byte-identical.
+        if not consumed_done["done"]:
+            spec = _consumed_upstream_spec(
+                consumed_upstream, scores_path, role, round_index)
+            if spec == "deduped":
+                consumed_done["done"] = True
+            elif spec:
+                specs.append(spec)
         if trace:
             trace.event("eval.request", evaluator=role,
                         evaluatees=[s["evaluatee"] for s in specs],
@@ -694,7 +815,7 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
         with _muted_session(session):
             session.send(prompt)
         if len(specs) > 1:
-            scout_evaled["done"] = True
+            consumed_done["done"] = True
         _aggregate_eval(
             scratch_path, scores_path, session_uuid, role, phase, round_index,
             {s["evaluatee"]: _eval_spec_stamp(s) for s in specs}, trace=trace)
@@ -794,6 +915,82 @@ def handoff_declined_text():
     )
 
 
+# --------------------------------------------------------------------------- #
+# builder: the single user-facing voice of the building phase, paired with the  #
+# build-reviewer exactly as the scout pairs with the scout-reviewer and the     #
+# planner with the planning-advisor. The builder edits the repository to        #
+# execute the approved plan; its status JSON is a status channel + verification  #
+# log, NOT a deliverable in itself.                                             #
+# --------------------------------------------------------------------------- #
+
+
+def assemble_builder_brief(build_status_path):
+    """The builder's status-file instruction. Unlike the scout/planner, the
+    builder's write target is the WHOLE REPO (it edits source to execute the
+    plan); the status file named here is only its status/verification channel,
+    not a write restriction."""
+    return (
+        "Write and keep current your status as a single JSON object to exactly "
+        "this file:\n  %s\n"
+        "That status file is your status + verification channel (status, "
+        "handoff, and the result.verification log) — NOT a restriction on what "
+        "you may edit. You execute the approved plan by editing the repository "
+        "itself. Do NOT run any git commit or PR/branch tooling: approval ends "
+        "the run and leaves the changes in the working tree for the user."
+        % build_status_path
+    )
+
+
+def assemble_builder_seed(plan_json_path, plan_md_path, context):
+    """The fresh builder's situational context: the approved plan (verbatim
+    JSON + markdown) plus the current shared session context."""
+    return (
+        "The planning phase is complete and the user APPROVED the plan below. "
+        "Execute it: make the code changes, verify them, and drive the build "
+        "conversation.\n\n"
+        "Approved plan JSON (the machine source of truth):\n%s\n\n"
+        "Approved plan markdown (the human-readable summary):\n%s\n\n"
+        "Current shared context:\n%s"
+        % (_read_text(plan_json_path).strip(), _read_text(plan_md_path).strip(),
+           (context or "").strip())
+    )
+
+
+def plan_updated_block(plan_json_path, plan_md_path):
+    """Wake block for a resumed builder after a hand-back round trip: the
+    builder handed back to the planner, the planner re-planned, and the user
+    approved the UPDATED plan."""
+    return (
+        "The plan changed since you started building: your hand-back was "
+        "executed, the planner re-planned, and the user approved the UPDATED "
+        "plan below. Digest the changes and continue building. Keep prior work "
+        "only where it remains compatible.\n\n"
+        "Updated approved plan JSON:\n%s\n\n"
+        "Updated approved plan markdown:\n%s"
+        % (_read_text(plan_json_path).strip(), _read_text(plan_md_path).strip())
+    )
+
+
+def plan_handback_wake_block(payload):
+    """Wake block for the planner session resumed by a builder hand-back."""
+    return (
+        "The builder handed the work back to you mid-build (the user confirmed "
+        "the hand-back). Re-plan as needed: digest the builder's note, update "
+        "your plan files, clarify with the user, and set status "
+        "ready_for_review when done.\n\n"
+        "<handoff>\n%s\n</handoff>" % (payload or "").strip()
+    )
+
+
+def handoff_declined_to_planner_text():
+    """Turn injected into the builder when the user declines the hand-back."""
+    return (
+        "The user DECLINED the hand-back to the planner. Continue building with "
+        "the current plan; raise anything unresolved with the user directly "
+        "and update your build status as appropriate."
+    )
+
+
 def assemble_advisor_context(context, selected, plan_json_path, plan_md_path):
     """The planning-advisor's situational context: the shared session context,
     the team framing, and BOTH planner artifacts to review."""
@@ -849,6 +1046,328 @@ def make_planning_advisor_runner(plan_md_path, trace=None):
             resume_context_fn=lambda p, context_update=None:
                 assemble_advisor_resume_context(
                     p, plan_md_path, context_update=context_update))
+    return runner
+
+
+# --------------------------------------------------------------------------- #
+# build-reviewer: a critical reviewer paired with the builder. Invoked          #
+# deterministically when the builder sets `ready_for_review`. Unlike the other  #
+# paired reviewers, its unit of review is the builder's WORKING-TREE DIFF: the  #
+# reviewer runs `git diff` itself (so the snapshot is never stale) and checks   #
+# it against the approved plan + the builder's status/verification log.         #
+# --------------------------------------------------------------------------- #
+
+
+def discover_git_roots(base):
+    """Discover the NEAREST git roots around `base`, in a DETERMINISTIC order.
+
+    Returns an ordered list of ``{"path": <abs>, "relation": <rel>}`` where
+    `relation` is one of ``self|descendant|ancestor|fallback``. Order:
+
+      - `base` is itself a git root -> ``[{base, 'self'}]``;
+      - else the nearest git roots BENEATH `base` (descendant scan, pruning at
+        the first `.git` on each branch so nested submodules / vendored libs are
+        excluded), sorted by path, relation ``descendant``;
+      - else the nearest git root ABOVE `base` (walk parents to the first root),
+        relation ``ancestor``;
+      - else `base` itself as the root, relation ``fallback``.
+
+    Determinism: `base` is abspath-normalized, `os.walk` dirnames are sorted
+    in place before descent (so traversal order is filesystem-independent), and
+    descendant roots are returned sorted by path. All returned paths are
+    absolute. Tolerant by design — any error degrades to the fallback."""
+    def is_root(d):
+        return os.path.exists(os.path.join(d, ".git"))
+
+    try:
+        base = os.path.abspath(base)
+        if is_root(base):
+            return [{"path": base, "relation": "self"}]
+
+        # Nearest descendant roots: prune at the first .git on each branch so a
+        # root nested inside another root (submodule / vendored lib) is excluded.
+        descendants = []
+        for dirpath, dirnames, _filenames in os.walk(base):
+            dirnames.sort()  # deterministic, filesystem-independent descent
+            if dirpath == base:
+                continue
+            if is_root(dirpath):
+                descendants.append(dirpath)
+                dirnames[:] = []  # do not descend INTO a found root
+        if descendants:
+            return [{"path": p, "relation": "descendant"}
+                    for p in sorted(descendants)]
+
+        # Nearest ancestor root: walk parents to the first root.
+        cur = base
+        while True:
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            if is_root(parent):
+                return [{"path": parent, "relation": "ancestor"}]
+            cur = parent
+
+        return [{"path": base, "relation": "fallback"}]
+    except Exception:  # noqa: BLE001 - discovery degrades to fallback, never blocks
+        return [{"path": os.path.abspath(base), "relation": "fallback"}]
+
+
+def _plan_repo_set(plan_json_path, run_cwd):
+    """The selected repo-root paths for the build phase. Read from the plan
+    JSON's ``result.repos`` (entries with a truthy ``selected``), falling back
+    to ``discover_git_roots(run_cwd)`` when the field is missing, unparseable,
+    or empty. Tolerant by design — the plan JSON is the builder's contract, the
+    discovery fallback keeps no-planner / older-plan runs working."""
+    try:
+        with open(plan_json_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        repos = (data.get("result") or {}).get("repos") or []
+        selected = [r["path"] for r in repos
+                    if isinstance(r, dict) and r.get("selected") and r.get("path")]
+        if selected:
+            return selected
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return [r["path"] for r in discover_git_roots(run_cwd)]
+
+
+def assemble_repo_discovery_note(candidates, base=None):
+    """The repo-discovery note prepended to EVERY scout seed (initial, hand-back
+    re-run, and resumed) so the scout's discovery responsibility survives every
+    cycle. Names the launch folder and the discovered candidate git roots with
+    their relation; identical text across all paths so it never drifts."""
+    lines = "\n".join(
+        "  - %s (%s)" % (c["path"], c["relation"]) for c in candidates)
+    base_line = ("Launch folder: %s\n" % base) if base else ""
+    return (
+        "Repository discovery (computed for you from the launch folder):\n"
+        "%s%s\n\n"
+        "Your discovery responsibility: confirm with the user WHICH of these "
+        "git roots the ticket actually touches, and record the chosen subset in "
+        "your intel (result.repos, with a `selected` flag per root, plus "
+        "result.repo_discovery). When exactly ONE root was discovered (including "
+        "an ancestor or fallback single-root outcome), take it as the set and "
+        "skip the confirmation question; ask only when 2+ candidate roots exist."
+        % (base_line, lines))
+
+
+def _git_build_baseline(cwd=None):
+    """Read-only git snapshot at building-phase entry: `(head_sha, dirty)`, or
+    `(None, None)` when this is not a git repo or git is unavailable.
+
+    `head_sha` is the commit the build delta is measured from; `dirty` flags a
+    non-empty worktree at build start (pre-existing changes that would
+    otherwise be conflated into the delta). Tolerant by design — any failure
+    degrades to no baseline rather than blocking the build."""
+    import subprocess
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True,
+            text=True, timeout=10)
+        if head.returncode != 0:
+            return None, None
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=cwd, capture_output=True,
+            text=True, timeout=10)
+        dirty = bool(status.stdout.strip()) if status.returncode == 0 else False
+        return head.stdout.strip(), dirty
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, None
+
+
+def build_baseline_note(head_sha, dirty):
+    """The reviewer-facing note describing the build baseline, or "" when there
+    is no git baseline. Names the start commit and, on a dirty start, warns the
+    reviewer not to assume every change in the delta is the builder's."""
+    if not head_sha:
+        return ""
+    note = "The build started from commit %s." % head_sha[:12]
+    if dirty:
+        note += (" NOTE: the worktree was ALREADY dirty at build start, so "
+                 "some changes in the delta below may predate this build — "
+                 "judge each change against the plan, do not assume every "
+                 "change is the builder's.")
+    return note
+
+
+def build_baselines_note(entries):
+    """Per-repo baseline METADATA block over the selected repo set. Each repo
+    WITH a HEAD contributes a ``<path> started from commit <sha12>`` line (plus
+    the dirty warning); a repo with NO HEAD (no commits yet / non-git fallback)
+    still appears as ``<path> (no commit baseline)`` so the set is never
+    silently narrowed. Returns ``""`` only when `entries` is empty.
+
+    This is metadata ABOUT the roots, NOT the authoritative root list — that
+    list is threaded separately to ``_build_diff_recipe``. `entries` are
+    ``{path, head, dirty}`` dicts (head may be None)."""
+    lines = []
+    for e in entries:
+        path = e.get("path")
+        head = e.get("head")
+        if head:
+            line = "%s started from commit %s." % (path, head[:12])
+            if e.get("dirty"):
+                line += (" NOTE: this worktree was ALREADY dirty at build "
+                         "start, so some changes in its delta may predate this "
+                         "build — judge each change against the plan, do not "
+                         "assume every change is the builder's.")
+            lines.append(line)
+        else:
+            lines.append("%s (no commit baseline)." % path)
+    return "\n".join(lines)
+
+
+def _build_diff_recipe(repos=None, baseline_note=""):
+    """The full-delta capture recipe handed to the build-reviewer. Plain
+    `git diff` is NOT enough — it misses staged changes and untracked new files
+    (and the builder creates files), so the recipe names every channel.
+
+    `repos` is the EXPLICIT selected repo-root list, each entry
+    ``{"path", "has_head"}``. When given, the recipe enumerates EVERY root and
+    branches the capture per root: a root WITH a baseline HEAD uses
+    ``git -C <root> diff HEAD``; a root with NO HEAD (unborn repo / non-git
+    fallback) must NOT run ``git diff HEAD`` (it fails 'bad revision HEAD') and
+    uses ``status --porcelain`` + ``diff --cached`` + ``diff`` + untracked reads.
+    The union of per-root deltas is the review unit. When `repos` is empty the
+    recipe falls back to the single process-cwd form (back-compat)."""
+    note = ("\n" + baseline_note) if baseline_note else ""
+    if not repos:
+        return (
+            "The unit of review is the builder's FULL working-tree delta against "
+            "this plan. The delta is NOT embedded here — capture the COMPLETE "
+            "delta yourself. Plain `git diff` is insufficient: it omits STAGED "
+            "changes and UNTRACKED new files (and the builder creates files). Run:"
+            "\n  - `git status --porcelain` — every staged, unstaged, and "
+            "untracked path at a glance;"
+            "\n  - `git diff HEAD` (or `git diff --stat HEAD` first, then targeted "
+            "`git diff HEAD -- <path>`) — all tracked staged+unstaged changes since "
+            "the last commit;"
+            "\n  - read each untracked/new file directly — it will NOT appear in "
+            "`git diff`."
+            "%s"
+            "\nReview the full delta critically against the plan and context "
+            "above." % note)
+
+    blocks = []
+    for r in repos:
+        path = r.get("path", ".")
+        if r.get("has_head"):
+            blocks.append(
+                "  Repo %s (has a baseline commit):"
+                "\n    - `git -C %s status --porcelain` — staged, unstaged, and "
+                "untracked paths;"
+                "\n    - `git -C %s diff HEAD` (or `git -C %s diff --stat HEAD` "
+                "first, then targeted `git -C %s diff HEAD -- <path>`) — all "
+                "tracked staged+unstaged changes since the last commit;"
+                "\n    - read each untracked/new file under %s directly — it "
+                "will NOT appear in `git diff`."
+                % (path, path, path, path, path, path))
+        else:
+            blocks.append(
+                "  Repo %s (NO baseline commit — unborn repo or non-git "
+                "fallback; do NOT run `git diff HEAD`, it fails):"
+                "\n    - `git -C %s status --porcelain` — every path at a glance;"
+                "\n    - `git -C %s diff --cached` and `git -C %s diff` — staged "
+                "and unstaged changes;"
+                "\n    - read untracked/new files under %s directly."
+                % (path, path, path, path, path))
+    return (
+        "The unit of review is the builder's FULL working-tree delta against "
+        "this plan, taken as the UNION of the deltas of EACH of these selected "
+        "repo roots. The delta is NOT embedded here — capture the COMPLETE delta "
+        "yourself, per root. Plain `git diff` is insufficient: it omits STAGED "
+        "changes and UNTRACKED new files (and the builder creates files). "
+        "Capture the delta of EACH of these repos:"
+        "\n%s"
+        "%s"
+        "\nReview the union of per-root deltas critically against the plan and "
+        "context above. An empty delta in a repo the plan touches is a finding; "
+        "ignore repos the plan does not list."
+        % ("\n".join(blocks), note))
+
+
+def assemble_build_reviewer_context(context, selected, plan_json_path,
+                                    plan_md_path, build_status_path,
+                                    baseline_note="", baseline_repos=None):
+    """The build-reviewer's situational context: the shared session context,
+    the team framing, BOTH plan artifacts, the builder's status JSON, and the
+    full-delta capture recipe (the delta is NOT embedded — a stale snapshot
+    would mis-review). `baseline_repos` is the explicit selected repo-root list
+    (each ``{path, has_head}``) that drives the per-root capture recipe."""
+    team = ", ".join(selected) if selected else "(unspecified)"
+    return (
+        "Shared session context — this is the SAME context the builder was "
+        "given:\n%s\n\n"
+        "Team on this session: %s\n\n"
+        "The approved plan JSON the builder is executing (the machine source "
+        "of truth — review the build against it):\n%s\n\n"
+        "The approved plan markdown (the human-readable summary):\n%s\n\n"
+        "The builder's current status JSON (its status + verification log):"
+        "\n%s\n\n"
+        "%s"
+        % (context.strip(), team, _read_text(plan_json_path).strip(),
+           _read_text(plan_md_path).strip(),
+           _read_text(build_status_path).strip(),
+           _build_diff_recipe(baseline_repos, baseline_note)))
+
+
+def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
+                                           build_status_path,
+                                           context_update=None,
+                                           baseline_note="",
+                                           baseline_repos=None):
+    """Lighter context for a RESUMED build-reviewer session: its thread already
+    holds the role + the prior context, so only the updated artifacts are sent
+    — plus a context-update wake block when the session context changed since
+    the reviewer last acknowledged it. The full delta is still read live."""
+    body = (
+        "The builder has updated its work since your last review. Re-review "
+        "the current full working-tree delta against the plan and the "
+        "builder's current status below, and write your verdict to the review "
+        "file again.\n\n"
+        "Current plan JSON:\n%s\n\n"
+        "Current plan markdown:\n%s\n\n"
+        "Current builder status JSON:\n%s\n\n"
+        "%s"
+        % (_read_text(plan_json_path).strip(),
+           _read_text(plan_md_path).strip(),
+           _read_text(build_status_path).strip(),
+           _build_diff_recipe(baseline_repos, baseline_note)))
+    if context_update:
+        return context_update_block(context_update) + "\n\n" + body
+    return body
+
+
+def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
+                               baseline_repos=None, trace=None):
+    """Build the real (non-test) reviewer runner for the building phase: a
+    `run_reviewer_once` closure carrying the build-reviewer role, prompt, and
+    the full-delta context assemblers. The reviewed artifact passed to the
+    runner is the builder's status file path; the delta itself is read live by
+    the reviewer (`baseline_note` tells it which commit each repo's delta is
+    measured from and whether a worktree started dirty; `baseline_repos` is the
+    explicit selected repo-root list, each ``{path, has_head}``, that drives the
+    per-root capture recipe)."""
+    def runner(config, context, selected, build_status_path, review_path,
+               resume_id=None, on_session=None, context_update=None,
+               eval_scratch_path=None, eval_specs=None):
+        return run_reviewer_once(
+            config, context, selected, build_status_path, review_path,
+            resume_id=resume_id, on_session=on_session,
+            context_update=context_update, trace=trace,
+            eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
+            reviewer_role=BUILD_REVIEWER,
+            prompt_path=BUILD_REVIEWER_PROMPT_PATH,
+            protected="the builder's working-tree delta and status file",
+            context_fn=lambda ctx, sel, p: assemble_build_reviewer_context(
+                ctx, sel, plan_json_path, plan_md_path, p,
+                baseline_note=baseline_note, baseline_repos=baseline_repos),
+            resume_context_fn=lambda p, context_update=None:
+                assemble_build_reviewer_resume_context(
+                    plan_json_path, plan_md_path, p,
+                    context_update=context_update, baseline_note=baseline_note,
+                    baseline_repos=baseline_repos))
     return runner
 
 
@@ -1078,6 +1597,39 @@ def handoff_gate_text(payload):
             "handoff note:\n%s" % (payload or "").strip())
 
 
+def builder_start_text(build_status_path, resuming=False):
+    if resuming:
+        head = (
+            "builder — resuming our previous build session\n"
+            "Picking up where we left off. Ctrl-C aborts."
+        )
+    else:
+        head = (
+            "builder — building from the approved plan\n"
+            "I'll make the changes, verify them, and mark the build ready when "
+            "it's done. You drive — answer my questions. Ctrl-C aborts."
+        )
+    return head + "\nstatus → %s" % build_status_path
+
+
+def builder_needs_input_text():
+    return "builder needs your input"
+
+
+def builder_review_text(build_status_path):
+    return "build ready for review — %s" % ui.shorten_path(build_status_path)
+
+
+def builder_done_text(build_status_path):
+    return ("builder finished — review your working tree → %s"
+            % ui.shorten_path(build_status_path))
+
+
+def builder_handoff_gate_text(payload):
+    return ("builder wants to hand the work back to the planner\n"
+            "handoff note:\n%s" % (payload or "").strip())
+
+
 # Returned by the turn readers to mean "end the conversation" (EOF / Ctrl-D /
 # explicit /quit), distinct from a blank line (which re-prompts).
 _END = object()
@@ -1173,12 +1725,87 @@ def _dissent_suffix(verdict):
         "  - " + str(f) for f in findings)
 
 
-def _read_handoff_confirm(io_in, io_out):
-    """The hand-back confirmation gate. On a TTY an explicit questionary
-    confirm; off a TTY a readline where blank/y/yes confirms (mirrors the
-    blank=approve contract of `_read_review` for the scripted/test path)."""
+# Returned by the stuck-gate reader (the visible escalation shown when an
+# automatic repair turn also fails to change the status artifact).
+_STUCK_RETRY = object()
+_STUCK_INSPECT = object()
+_STUCK_END = object()
+
+
+def _repair_prompt(artifact_noun):
+    """The firm, role-parameterized instruction sent on the single automatic
+    repair turn (and on a user-driven stuck-gate retry). It tells the role that
+    its status artifact did not change on disk and that the harness gates on the
+    literal on-disk `status` field, not on what the role claims in chat."""
+    return (
+        "Your last turn reopened work, but the %s status file was NOT changed "
+        "on disk — its raw bytes are byte-identical to before your turn. The "
+        "cowork harness gates strictly on that file's literal top-level "
+        "`status` field, never on what you write in chat. Rewrite the %s "
+        "status artifact NOW: address the reopened work and set the correct "
+        "`status` (`needs_input` if you still need an answer, "
+        "`ready_for_review` once the work is complete). Writing the file is "
+        "mandatory — a chat-only reply will be treated as no progress."
+        % (artifact_noun, artifact_noun))
+
+
+def _stuck_gate_text(status_path, role):
+    """The banner shown at the visible stuck gate."""
+    return (
+        "the %s appears stuck — it reopened work but its status file did not "
+        "change across an automatic repair attempt.\n  status file: %s\n"
+        "choose: retry (run it once more), inspect (show the status file), or "
+        "end (end this phase cleanly)." % (role, status_path))
+
+
+def _emit_stuck_inspect(io_out, status_path):
+    """Print the diagnostic for the stuck-gate `inspect` action: the artifact
+    path, its current on-disk status field, and the raw file content. Read-only
+    — never runs the role."""
+    io_out.write("status file: %s\n" % status_path)
+    io_out.write("on-disk status: %s\n" % state_store.read_status(status_path))
+    try:
+        with open(status_path, "r") as fh:
+            content = fh.read()
+    except OSError:
+        content = "<missing or unreadable>"
+    io_out.write(content)
+    if not content.endswith("\n"):
+        io_out.write("\n")
+    io_out.flush()
+
+
+def _read_stuck_gate(io_in, io_out):
+    """Read the stuck-gate choice. On a TTY a 3-way questionary select; off a
+    TTY a readline where `retry`/`inspect` map to those actions and anything
+    else (including blank/EOF) ends the phase — the safe terminating default so
+    a scripted/test path is never trapped at the gate.
+
+    Returns one of `_STUCK_RETRY`, `_STUCK_INSPECT`, `_STUCK_END`."""
     if ui.is_tty(io_in) and ui.is_tty(io_out):
-        return ui.confirm("Hand the work back to the scout?")
+        choice = ui.select(
+            "The role reopened work but didn't update its status — what now?",
+            [("retry", "Run it once more"),
+             ("inspect", "Show the status file"),
+             ("end", "End this phase")])
+        return {"retry": _STUCK_RETRY, "inspect": _STUCK_INSPECT,
+                "end": _STUCK_END}.get(choice, _STUCK_END)
+    line = io_in.readline()
+    token = line.strip().lower()
+    if token == "retry":
+        return _STUCK_RETRY
+    if token == "inspect":
+        return _STUCK_INSPECT
+    return _STUCK_END
+
+
+def _read_handoff_confirm(io_in, io_out, prompt="Hand the work back to the scout?"):
+    """The hand-back confirmation gate. On a TTY an explicit questionary
+    confirm (with the role-appropriate `prompt`); off a TTY a readline where
+    blank/y/yes confirms (mirrors the blank=approve contract of `_read_review`
+    for the scripted/test path)."""
+    if ui.is_tty(io_in) and ui.is_tty(io_out):
+        return ui.confirm(prompt)
     line = io_in.readline()
     return line.strip().lower() in ("", "y", "yes")
 
@@ -1191,6 +1818,9 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                done_text=scout_done_text,
                artifact_noun="intel",
                handoff_enabled=False, handoff_confirm=None,
+               handoff_gate_text_fn=handoff_gate_text,
+               handoff_confirm_prompt="Hand the work back to the scout?",
+               handoff_declined_text_fn=handoff_declined_text,
                evaluate_fn=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
@@ -1227,6 +1857,18 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     (never an implicit hand-back)."""
     pending = first
     pending_reopens_work = False
+    # A source-tagged reason set at every work-reopening site (one of
+    # 'user_revise'/'user_iterate'/'user_answer'/'reviewer_needs_user'/
+    # 'reviewer_revise'/'handoff_declined'). Detection keys off this being set —
+    # NOT off `pending_reopens_work` — because the handoff-declined branch
+    # invalidates inline and never sets the boolean, yet is still a reopen the
+    # stale-no-op detector must cover (the general invariant, D1/D9).
+    pending_reopen_reason = None
+    # Stale-no-op repair state: True between the firing of the single automatic
+    # repair turn and its result (or a user-driven stuck-gate retry). When True,
+    # the next send is re-checked for a no-op even without a fresh reopen.
+    in_repair = False
+    repair_reason = None  # reopen reason carried into the repair/escalation
     review_rounds = 0
     outcome_kind = "ended"
     payload = None
@@ -1235,21 +1877,99 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             io_out.write(ui.label("you", ui.is_tty(io_out)) + context.strip() + "\n")
             io_out.flush()
         while True:
+            # Capture the reopen signal BEFORE the invalidate/reset block runs.
+            reopened_this_turn = pending_reopen_reason is not None
+            reopen_reason_this_turn = pending_reopen_reason
             if pending_reopens_work:
+                before_status = state_store.read_status(status_path)
                 changed = state_store.invalidate_ready_status(status_path)
+                after_status = state_store.read_status(status_path)
                 if trace:
                     trace.event("status.invalidated", role=role,
                                 path=status_path, changed=changed,
                                 from_status="ready_for_review",
                                 to_status="needs_input",
-                                reason="work_reopened")
+                                reason="work_reopened",
+                                before_status=before_status,
+                                after_status=after_status)
                 pending_reopens_work = False
+            pending_reopen_reason = None
+            fp_before = state_store.fingerprint_status(status_path)
             if trace:
+                trace.event("role.fingerprint.before", role=role,
+                            status=fp_before["status"],
+                            sha256=fp_before["sha256"],
+                            size=fp_before["size"], exists=fp_before["exists"])
                 trace.event("role.send.start", role=role,
                             **trace_store.prompt_meta(pending))
             session.send(pending)
             if trace:
                 trace.event("role.send.end", role=role)
+            fp_after = state_store.fingerprint_status(status_path)
+            if trace:
+                trace.event("role.fingerprint.after", role=role,
+                            status=fp_after["status"], sha256=fp_after["sha256"],
+                            size=fp_after["size"], exists=fp_after["exists"])
+            # Stale-no-op detection: a reopened (or in-repair) turn that left the
+            # status file byte-identical made no progress. Both-missing
+            # (None == None) also counts as a no-op — the role never wrote.
+            if (reopened_this_turn or in_repair) and (
+                    fp_after["sha256"] == fp_before["sha256"]):
+                if not in_repair:
+                    # First no-op of the episode: one automatic, invisible
+                    # repair turn (bounded — never a repair loop).
+                    in_repair = True
+                    repair_reason = reopen_reason_this_turn
+                    if trace:
+                        trace.event(
+                            "stale_noop", role=role,
+                            reopen_reason=reopen_reason_this_turn,
+                            before_status=fp_before["status"],
+                            after_status=fp_after["status"],
+                            before_sha256=fp_before["sha256"],
+                            after_sha256=fp_after["sha256"],
+                            repair_attempted=True)
+                    pending = _repair_prompt(artifact_noun)
+                    continue
+                # Second consecutive no-op: the automatic repair failed. Show the
+                # visible stuck gate instead of looping forever.
+                if trace:
+                    trace.event(
+                        "stale_noop.unresolved", role=role,
+                        reopen_reason=repair_reason,
+                        before_status=fp_before["status"],
+                        after_status=fp_after["status"],
+                        before_sha256=fp_before["sha256"],
+                        after_sha256=fp_after["sha256"],
+                        repair_attempted=True)
+                in_repair = False
+                gate_decision = None
+                while gate_decision is None:
+                    ui.banner(io_out, _stuck_gate_text(status_path, role),
+                              "dissent")
+                    action = _read_stuck_gate(io_in, io_out)
+                    if action is _STUCK_INSPECT:
+                        if trace:
+                            trace.event("user.action", role=role,
+                                        action="stuck_inspect")
+                        _emit_stuck_inspect(io_out, status_path)
+                        continue
+                    gate_decision = action
+                if gate_decision is _STUCK_RETRY:
+                    if trace:
+                        trace.event("user.action", role=role,
+                                    action="stuck_retry")
+                    pending = _repair_prompt(artifact_noun)
+                    in_repair = True  # re-checked; re-shows gate if still stuck
+                    continue
+                # _STUCK_END: end this phase cleanly, like EOF.
+                if trace:
+                    trace.event("user.action", role=role, action="stuck_end")
+                outcome_kind = "ended"
+                break
+            # Progress (the file changed) — clear any repair state and proceed.
+            in_repair = False
+            repair_reason = None
             status = state_store.read_status(status_path)
             if trace:
                 trace.event("status.read", role=role, path=status_path,
@@ -1260,9 +1980,12 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     trace.event("handoff.signal", role=role, path=status_path,
                                 has_payload=bool(note))
                 if note:
-                    ui.banner(io_out, handoff_gate_text(note), "review")
-                    confirmed = (handoff_confirm or _read_handoff_confirm)(
-                        io_in, io_out)
+                    ui.banner(io_out, handoff_gate_text_fn(note), "review")
+                    if handoff_confirm:
+                        confirmed = handoff_confirm(io_in, io_out)
+                    else:
+                        confirmed = _read_handoff_confirm(
+                            io_in, io_out, handoff_confirm_prompt)
                     if trace:
                         trace.event("handoff.gate", role=role,
                                     confirmed=bool(confirmed))
@@ -1272,15 +1995,24 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     # Declined: downgrade the stale handoff_back so the status
                     # file cannot re-trigger the gate, then let the role
                     # continue planning.
+                    decl_before = state_store.read_status(status_path)
                     changed = state_store.invalidate_ready_status(
                         status_path, from_status="handoff_back")
+                    decl_after = state_store.read_status(status_path)
                     if trace:
                         trace.event("status.invalidated", role=role,
                                     path=status_path, changed=changed,
                                     from_status="handoff_back",
                                     to_status="needs_input",
-                                    reason="handoff_declined")
-                    pending = handoff_declined_text()
+                                    reason="handoff_declined",
+                                    before_status=decl_before,
+                                    after_status=decl_after)
+                    pending = handoff_declined_text_fn()
+                    # Detection keys off the reason, not the boolean: this branch
+                    # invalidates inline and intentionally does not set
+                    # pending_reopens_work, so the top-of-loop invalidate is not
+                    # re-run, but the next send is still checked for a no-op.
+                    pending_reopen_reason = "handoff_declined"
                     continue
                 # Payload-less handoff_back: degrade to the needs-input gate
                 # (D10) — never an implicit hand-back.
@@ -1325,6 +2057,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         pending = assemble_reviewer_handoff(
                             "needs_user", verdict, artifact=artifact_noun)
                         pending_reopens_work = True
+                        pending_reopen_reason = "reviewer_needs_user"
                         if trace:
                             trace.event("review.handoff", from_role=reviewer_role,
                                         to_role=role, kind="needs_user")
@@ -1337,6 +2070,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             pending = assemble_reviewer_handoff(
                                 "revise", verdict, artifact=artifact_noun)
                             pending_reopens_work = True
+                            pending_reopen_reason = "reviewer_revise"
                             if trace:
                                 trace.event("review.handoff",
                                             from_role=reviewer_role,
@@ -1370,6 +2104,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     action="iterate_review",
                                     gate="ready_for_review")
                     pending_reopens_work = True
+                    pending_reopen_reason = "user_iterate"
                     review_rounds = 0  # user re-engaged: fresh review budget
                     continue
                 if outcome is _END:
@@ -1387,6 +2122,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 gate="ready_for_review",
                                 **trace_store.prompt_meta(outcome, prefix="input"))
                 pending_reopens_work = True
+                pending_reopen_reason = "user_revise"
                 review_rounds = 0  # user re-engaged: fresh review budget
             else:
                 if status == "needs_input":
@@ -1405,6 +2141,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     trace.event("user.action", role=role, action="answer",
                                 **trace_store.prompt_meta(outcome, prefix="input"))
                 pending_reopens_work = True
+                pending_reopen_reason = "user_answer"
     except KeyboardInterrupt:
         if trace:
             trace.event("role.interrupted", role=role)
@@ -1436,7 +2173,8 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    context_update=None, on_context_ack=None, trace=None,
                    reviewer_role=SCOUT_REVIEWER, phase=None,
                    eval_scratch_path=None, scores_path=None,
-                   session_uuid=None, intel_path=None, planning_epoch=None):
+                   session_uuid=None, intel_path=None, planning_epoch=None,
+                   consumed_upstream=None):
     """Build the `review_fn` passed to `_role_loop` when the paired reviewer
     (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
     not. The closure runs one reviewer pass and returns its verdict dict.
@@ -1465,10 +2203,12 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     runner = reviewer_runner or run_reviewer_once
     eval_enabled = bool(eval_scratch_path and scores_path and session_uuid)
     evaluatee = _REVIEWER_EVALUATEE.get(reviewer_role)
+    if consumed_upstream is None:
+        consumed_upstream = _scout_consumed_upstream(intel_path, planning_epoch)
     holder = {"resume_id": reviewer_resume_id,
               "context_update": context_update,
               "ack": on_context_ack,
-              "scout_evaled": phase != "planning"}
+              "consumed_done": consumed_upstream is None}
 
     def review_fn(artifact_path, round_index):
         def capture(controller, sid):
@@ -1496,44 +2236,31 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                 "context": "review-round",
                 "phase": phase, "round": round_index,
             }]
-            # The ->scout bundle rides only the FIRST eval turn of the phase
-            # (round_index == 1, per the plan).
-            if (not holder["scout_evaled"] and round_index == 1 and intel_path
-                    and os.path.exists(intel_path)
-                    and (reviewer_role, "scout") in EVAL_CRITERIA):
-                # Once per phase survives a resume/restart: the aggregate
-                # itself is the durable record (the holder flag only covers
-                # this closure) — scoped by the planning epoch, which bumps
-                # on every scouting -> planning transition, so a hand-back
-                # round trip (a new planning phase) is evaluated again even
-                # when the re-approved intel is byte-identical.
-                intel_text = _read_text(intel_path)
-                if state_store.has_eval_entry(scores_path, reviewer_role,
-                                              "scout", "consumed-intel",
-                                              planning_epoch=planning_epoch):
-                    holder["scout_evaled"] = True
-                else:
-                    # The advisor never consumed the intel through its review
-                    # context, so the orchestrator reads the intel file at
-                    # eval time and embeds it — self-contained evidence.
-                    specs.append({
-                        "evaluatee": "scout",
-                        "criteria": EVAL_CRITERIA[(reviewer_role, "scout")],
-                        "artifact_block":
-                            "The approved scout intel JSON this phase "
-                            "consumed:\n%s" % intel_text.strip(),
-                        "context": "consumed-intel",
-                        "planning_epoch": planning_epoch,
-                        "intel_sha256": _intel_sha256(intel_text),
-                        "phase": phase, "round": round_index,
-                    })
+            # The consumed-upstream bundle rides only the FIRST eval turn of
+            # the phase (round_index == 1). Once per phase survives a
+            # resume/restart: the aggregate itself is the durable record (the
+            # holder flag only covers this closure) — scoped by the phase
+            # epoch, which bumps on every phase transition, so a hand-back
+            # round trip (a new phase) is evaluated again even when the
+            # re-approved artifact is byte-identical. The reviewer never
+            # consumed the upstream artifact through its review context, so the
+            # orchestrator reads it at eval time and embeds it — self-contained
+            # evidence.
+            if not holder["consumed_done"]:
+                spec = _consumed_upstream_spec(
+                    consumed_upstream, scores_path, reviewer_role, round_index)
+                if spec == "deduped":
+                    holder["consumed_done"] = True
+                elif spec:
+                    spec = dict(spec, phase=phase, round=round_index)
+                    specs.append(spec)
             kwargs["eval_scratch_path"] = eval_scratch_path
             kwargs["eval_specs"] = specs
         verdict = runner(config, context, selected, artifact_path, review_path,
                          **kwargs)
         if specs:
             if len(specs) > 1:
-                holder["scout_evaled"] = True
+                holder["consumed_done"] = True
             _aggregate_eval(
                 eval_scratch_path, scores_path, session_uuid, reviewer_role,
                 phase, round_index,
@@ -1791,18 +2518,161 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     return rc
 
 
+def run_builder(config, context, selected, io_in=None, io_out=None,
+                claude_spawn=None, resume_id=None, on_session=None,
+                build_status_path=None, build_review_path=None,
+                session_factory=None,
+                reviewer_runner=None, reviewer_resume_id=None,
+                on_reviewer_session=None, reviewer_context=None,
+                reviewer_context_update=None, on_reviewer_context_ack=None,
+                trace=None, handoff_confirm=None, on_outcome=None,
+                eval_scratch_path=None, reviewer_eval_scratch_path=None,
+                scores_path=None, session_uuid=None, plan_json_path=None,
+                plan_md_path=None, building_epoch=None, baseline_note="",
+                baseline_repos=None):
+    """Spin up the builder's CLI and drive the building loop (the builder
+    instantiation of `_role_loop`).
+
+    `context` is the seed message for this cycle: the approved-plan seed on a
+    fresh chain, a plan-updated wake block after a hand-back round trip, or ""
+    on a plain resume (auto-continue). `build_status_path` is the builder's
+    status + verification channel (NOT a write restriction — the builder edits
+    the repo). `build_review_path` + the build-reviewer being on the team
+    enable the reviewer gate; `reviewer_runner` overrides the reviewer pass
+    (for tests). `eval_scratch_path`/`reviewer_eval_scratch_path` + `scores_path`
+    + `session_uuid` wire the per-round peer evaluations (builder <->
+    build-reviewer, each bundling a one-time ->planner eval of the approved
+    plan at `plan_json_path`/`plan_md_path`); absent, no evaluations happen.
+    `on_outcome(outcome, payload)` reports how the loop ended so `run_flow` can
+    execute a confirmed hand-back ("handoff" outcome, builder -> planner) or
+    finish the session."""
+    io_in = io_in or sys.stdin
+    io_out = io_out or sys.stdout
+    cfg = config["builder"]
+    brief = assemble_builder_brief(build_status_path or "")
+    runner = reviewer_runner or make_build_reviewer_runner(
+        plan_json_path, plan_md_path, baseline_note=baseline_note,
+        baseline_repos=baseline_repos, trace=trace)
+    consumed = plan_consumed_upstream(plan_json_path, plan_md_path,
+                                      building_epoch)
+    review_fn = make_review_fn(
+        config,
+        reviewer_context if reviewer_context is not None else context,
+        selected, build_review_path, reviewer_runner=runner,
+        reviewer_resume_id=reviewer_resume_id,
+        on_reviewer_session=on_reviewer_session,
+        context_update=reviewer_context_update,
+        on_context_ack=on_reviewer_context_ack,
+        reviewer_role=BUILD_REVIEWER, phase="building",
+        eval_scratch_path=reviewer_eval_scratch_path,
+        scores_path=scores_path, session_uuid=session_uuid,
+        consumed_upstream=consumed)
+    evaluate_fn = None
+    if review_fn is not None:
+        evaluate_fn = _make_evaluate_fn(
+            "builder", BUILD_REVIEWER, "building", eval_scratch_path,
+            scores_path, session_uuid, consumed_upstream=consumed, trace=trace)
+    if resume_id and not context.strip():
+        context = "Continue the session."
+    if trace:
+        trace.event("role.start", role="builder", controller=cfg["controller"],
+                    resume=bool(resume_id), build_status_path=build_status_path,
+                    review_path=build_review_path)
+    ui.banner(io_out, builder_start_text(build_status_path or "",
+                                         resuming=bool(resume_id)), "start")
+    io_out.flush()
+
+    def report(outcome, payload):
+        if on_outcome:
+            on_outcome(outcome, payload)
+
+    loop_kwargs = dict(
+        role="builder", review_fn=review_fn, trace=trace,
+        reviewer_role=BUILD_REVIEWER,
+        needs_input_text=builder_needs_input_text,
+        review_text=lambda _p: builder_review_text(build_status_path or ""),
+        done_text=lambda _p: builder_done_text(build_status_path or ""),
+        artifact_noun="build",
+        handoff_enabled=True, handoff_confirm=handoff_confirm,
+        handoff_gate_text_fn=builder_handoff_gate_text,
+        handoff_confirm_prompt="Hand the work back to the planner?",
+        handoff_declined_text_fn=handoff_declined_to_planner_text,
+        evaluate_fn=evaluate_fn)
+
+    if cfg["controller"] == "claude":
+        spawn = claude_spawn or bridge._real_claude_spawn
+        ok, alert = bridge.probe_claude_stream_json(
+            spawn, mode=cfg["mode"], yolo=cfg["yolo"],
+            role_prompt_file=BUILDER_PROMPT_PATH, trace=trace, role="builder",
+        )
+        if not ok:
+            if trace:
+                trace.event("role.end", role="builder", result="probe_failed")
+            io_out.write("cowork: " + alert + "\n")
+            io_out.flush()
+            report("ended", None)
+            return 1
+        if resume_id:
+            session_id, rid = None, resume_id
+            io_out.write("cowork: resuming claude session %s\n" % resume_id)
+        else:
+            session_id, rid = str(uuid.uuid4()), None
+            if on_session:
+                on_session("claude", session_id)
+        cb = (lambda i: on_session("claude", i)) if on_session else None
+        if session_factory:
+            session = session_factory("claude", session_id=session_id,
+                                      resume_id=rid, on_session_id=cb)
+        else:
+            session = bridge.ClaudeSession(
+                BUILDER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
+                speaker="builder", session_id=session_id, resume_id=rid,
+                on_session_id=cb, trace=trace)
+        first = (brief + "\n\n" + context).strip()
+        rc, outcome, payload = _role_loop(
+            session, first, build_status_path, context, io_in, io_out,
+            **loop_kwargs)
+        report(outcome, payload)
+        return rc
+
+    role_text = _read_text(BUILDER_PROMPT_PATH)
+    prompt = assemble_codex_prompt(role_text, brief, context)
+    if resume_id:
+        io_out.write("cowork: resuming codex session %s\n" % resume_id)
+        prompt = (brief + "\n\n" + context).strip()  # thread already has role
+    cb = (lambda i: on_session("codex", i)) if on_session else None
+    if session_factory:
+        session = session_factory("codex", resume_thread_id=resume_id,
+                                  on_thread_id=cb)
+    else:
+        session = bridge.CodexSession(
+            cfg["mode"], cfg["yolo"], io_out=io_out, speaker="builder",
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
+    rc, outcome, payload = _role_loop(
+        session, prompt, build_status_path, context, io_in, io_out,
+        **loop_kwargs)
+    report(outcome, payload)
+    return rc
+
+
 # --------------------------------------------------------------------------- #
 # Entry point.                                                                #
 # --------------------------------------------------------------------------- #
 
 
 def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
-             run_planner_fn=None):
+             run_planner_fn=None, run_builder_fn=None):
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     run_scout_fn = run_scout_fn or run_scout
     run_planner_fn = run_planner_fn or run_planner
+    run_builder_fn = run_builder_fn or run_builder
     interactive = not _is_non_interactive(args)
+    # The builder and reviewer CLI sessions spawn in the process cwd, so their
+    # `git diff` is relative to cwd — NOT to the session-file parent (which may
+    # live outside the repo when --session-file points elsewhere). The build
+    # baseline must be read from the same cwd to match what they see.
+    run_cwd = os.getcwd()
 
     # Session store: project-local .cowork/session.json unless disabled.
     session_enabled = not args.no_session
@@ -1816,8 +2686,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     else:
         session_uuid = str(uuid.uuid4())
     trace = trace_store.Trace(
-        trace_store.trace_path_for(os.path.dirname(spath), session_uuid)
-        if session_enabled else None,
+        trace_store.trace_path_for(session_uuid) if session_enabled else None,
         session_uuid=session_uuid,
         enabled=session_enabled,
     )
@@ -1879,10 +2748,15 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         io_out.flush()
         return 1
 
-    # Phase: resume into the persisted phase (default scouting). A persisted
-    # `planning` phase without a planner on the team falls back to scouting.
+    # Phase: resume into the persisted phase (default scouting). The cascade
+    # falls back when the resumed phase's lead role is not on the team: a
+    # `building` phase without a builder falls back to planning; a `planning`
+    # phase without a planner falls back to scouting.
     phase = state_store.get_phase(saved) if session_enabled else "scouting"
     planner_on_team = "planner" in selected
+    builder_on_team = "builder" in selected
+    if phase == "building" and not builder_on_team:
+        phase = "planning"
     if phase == "planning" and not planner_on_team:
         phase = "scouting"
     if phase == "scouting" and "scout" not in selected:
@@ -1894,9 +2768,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 "the planning phase resumes without re-running the scout).\n")
         else:
             io_out.write(
-                "cowork: scout not selected. Only the scouting and planning "
-                "phases are implemented in this version; later roles are not "
-                "yet available.\n")
+                "cowork: scout not selected. Every cowork run begins with the "
+                "scouting phase; add the scout role to the team (a session "
+                "already past scouting resumes into its saved phase).\n")
         return 0
 
     # Saved CLI session ids per role. With the session store enabled they are
@@ -1930,7 +2804,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
     # Resolved BEFORE the context step so we can skip the goal prompt on a
     # resume of the current phase's user-facing role.
-    lead_role = "planner" if phase == "planning" else "scout"
+    lead_role = {"scouting": "scout", "planning": "planner",
+                 "building": "builder"}[phase]
     lead_resume_id = role_resume_id(lead_role)
     if lead_resume_id:
         trace.event("run.resume", role=lead_role,
@@ -2029,11 +2904,16 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     plan_md_path = state_store.planner_plan_md_path_for(intel_dir, session_uuid)
     planner_review_path = state_store.planner_review_path_for(
         intel_dir, session_uuid)
+    build_status_path = state_store.build_status_path_for(
+        intel_dir, session_uuid)
+    build_review_path = state_store.build_review_path_for(
+        intel_dir, session_uuid)
     # Peer-evaluation assets: a per-role scratch file (each evaluator's only
     # eval write target) and the orchestrator-only aggregate scores file.
     eval_scratch = {
         role: state_store.eval_scratch_path_for(intel_dir, role, session_uuid)
-        for role in ("scout", SCOUT_REVIEWER, "planner", PLANNING_ADVISOR)
+        for role in ("scout", SCOUT_REVIEWER, "planner", PLANNING_ADVISOR,
+                     "builder", BUILD_REVIEWER)
     }
     scores_path = state_store.scores_path_for(session_uuid)
     # Planning-phase epoch: bumped on every scouting -> planning transition so
@@ -2042,6 +2922,12 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # planning phase keeps the persisted epoch.
     epoch_box = {"epoch": state_store.get_planning_epoch(holder["state"])
                  if session_enabled else 0}
+    # Building-phase epoch: the analogue for the building phase (every
+    # plan-approved -> building transition bumps it, so the once-per-phase
+    # ->planner consumed-plan evals re-run after a builder -> planner hand-back
+    # round trip even when the re-approved plan is byte-identical).
+    building_epoch_box = {"epoch": state_store.get_building_epoch(
+        holder["state"]) if session_enabled else 0}
 
     def bump_planning_epoch():
         if session_enabled:
@@ -2052,12 +2938,74 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         else:
             epoch_box["epoch"] += 1
 
+    def bump_building_epoch():
+        if session_enabled:
+            holder["state"] = state_store.bump_building_epoch(
+                spath, prior=holder["state"])
+            building_epoch_box["epoch"] = state_store.get_building_epoch(
+                holder["state"])
+        else:
+            building_epoch_box["epoch"] += 1
+
+    # Build baseline: the build-reviewer reviews the builder's full working-tree
+    # delta, which it captures itself (status --porcelain + git diff HEAD +
+    # untracked). Recorded once, the first time building is entered this run, so
+    # the reviewer knows which commit the delta is measured from; a dirty start
+    # is surfaced to the user (pre-existing changes get conflated otherwise).
+    baseline_box = {"computed": False, "note": None, "repos": None}
+
+    def build_baseline():
+        # Per-repo baseline over the user-confirmed repo set (plan JSON
+        # result.repos, falling back to discovery from run_cwd — never the
+        # session-file/intel dir). Each selected root gets its own (HEAD, dirty)
+        # snapshot; the explicit root list (with a has_head flag) is threaded to
+        # the reviewer so a no-commit/fallback root is still named and captured.
+        if not baseline_box["computed"]:
+            repo_paths = _plan_repo_set(plan_json_path, run_cwd)
+            entries = []
+            repos = []
+            for path in repo_paths:
+                head, dirty = _git_build_baseline(path)
+                entries.append({"path": path, "head": head, "dirty": dirty})
+                repos.append({"path": path, "has_head": head is not None})
+                trace.event("build.baseline", repo=path, head=head,
+                            dirty=bool(dirty))
+                if head and dirty:
+                    io_out.write(
+                        "cowork: building from a dirty worktree in %s — "
+                        "pre-existing changes will be mixed into the build "
+                        "review. Commit or stash unrelated work for a clean "
+                        "review.\n" % path)
+                    io_out.flush()
+            baseline_box["note"] = build_baselines_note(entries)
+            baseline_box["repos"] = repos
+            baseline_box["computed"] = True
+        return baseline_box
+
     # Phase loop: scouting -> (on intel approval, planner on team) planning ->
     # (on a user-confirmed hand-back) scouting -> ... Plan approval, EOF, or an
     # interrupt ends the run; the persisted phase makes a rerun resume here.
     rc = 0
-    scout_seed = context
+    # Discover the candidate git roots from the LAUNCH folder (run_cwd, never the
+    # session-file/intel dir) once, and prepend the same note to EVERY scout seed
+    # — the initial seed AND the planner hand-back re-run — so the scout's
+    # discover-and-confirm responsibility survives every cycle.
+    repo_candidates = discover_git_roots(run_cwd)
+    repo_discovery_note = assemble_repo_discovery_note(repo_candidates, run_cwd)
+
+    def with_discovery(seed):
+        # Prepend the discovery note to EVERY scout seed — fresh, plain resume,
+        # and hand-back re-run alike — so the discover-and-confirm responsibility
+        # is present on every cycle. The note is a standing reminder, not a new
+        # task, so a plain auto-continue resume still carries no new goal (the
+        # note alone, never a re-injected user goal). An empty seed collapses to
+        # the note alone — no trailing blank lines.
+        seed = (seed or "").strip()
+        return (repo_discovery_note + "\n\n" + seed) if seed else repo_discovery_note
+
+    scout_seed = with_discovery(context)
     planner_seed = None
+    builder_seed = None
     if phase == "planning":
         # Resuming into the planning phase. A saved planner session continues
         # with the (possibly new) context; a planning phase persisted WITHOUT a
@@ -2068,6 +3016,16 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             planner_seed = context
         else:
             planner_seed = assemble_planner_seed(intel_path, shared_context)
+    elif phase == "building":
+        # Resuming into the building phase. A saved builder session continues
+        # with the (possibly new) context; a building phase persisted WITHOUT a
+        # builder session id (killed between save_phase and the id save) must
+        # start a fresh builder from the approved plan, not from a bare context.
+        if role_resume_id("builder"):
+            builder_seed = context
+        else:
+            builder_seed = assemble_builder_seed(
+                plan_json_path, plan_md_path, shared_context)
     while True:
         if phase == "scouting":
             if "scout" not in selected:
@@ -2114,46 +3072,119 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 continue
             break
 
-        # planning phase
-        planner_box = {"outcome": None, "payload": None}
-        rc = run_planner_fn(
+        if phase == "planning":
+            planner_box = {"outcome": None, "payload": None}
+            rc = run_planner_fn(
+                config,
+                deliver_context(
+                    "planner",
+                    planner_seed if planner_seed is not None else ""),
+                selected, io_in=io_in, io_out=io_out,
+                resume_id=role_resume_id("planner"),
+                on_session=role_saver("planner"),
+                plan_json_path=plan_json_path, plan_md_path=plan_md_path,
+                review_path=planner_review_path,
+                reviewer_resume_id=role_resume_id(PLANNING_ADVISOR),
+                on_reviewer_session=role_saver(PLANNING_ADVISOR),
+                reviewer_context=shared_context,
+                reviewer_context_update=reviewer_gap(PLANNING_ADVISOR)
+                if PLANNING_ADVISOR in selected else None,
+                on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
+                trace=trace,
+                eval_scratch_path=eval_scratch["planner"],
+                reviewer_eval_scratch_path=eval_scratch[PLANNING_ADVISOR],
+                scores_path=scores_path, session_uuid=session_uuid,
+                intel_path=intel_path, planning_epoch=epoch_box["epoch"],
+                on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+            if rc == 0:
+                ack_lead("planner")
+            if rc == 0 and planner_box["outcome"] == "handoff":
+                # User-confirmed hand-back (planner -> its pre-processor):
+                # resume the scout session with the handoff payload and run the
+                # full scout cycle again.
+                phase = set_phase("scouting")
+                trace.event("handoff.execute", from_role="planner",
+                            to_role=HANDBACK_PREPROCESSOR["planner"],
+                            **trace_store.prompt_meta(
+                                planner_box["payload"] or "", prefix="payload"))
+                scout_seed = with_discovery(
+                    handoff_wake_block(planner_box["payload"]))
+                planner_seed = None
+                continue
+            if (rc == 0 and planner_box["outcome"] == "approved"
+                    and builder_on_team):
+                # Plan approved with a builder on the team: chain into the
+                # building phase. Each plan-approved -> building transition is a
+                # new building phase (the epoch bumps so the consumed-plan evals
+                # re-fire after a hand-back round trip even on byte-identical
+                # re-approved plans). A builder session that already exists
+                # (hand-back round trip, or a crash after building started)
+                # digests the updated plan; a fresh one is seeded from scratch.
+                phase = set_phase("building")
+                bump_building_epoch()
+                if role_resume_id("builder"):
+                    builder_seed = plan_updated_block(
+                        plan_json_path, plan_md_path)
+                else:
+                    builder_seed = assemble_builder_seed(
+                        plan_json_path, plan_md_path, shared_context)
+                continue
+            if (rc == 0 and planner_box["outcome"] == "approved"
+                    and not builder_on_team):
+                # No builder on the team: the plan is the deliverable. Informa-
+                # tional only; the phase stays `planning` so a rerun resumes the
+                # planner conversation.
+                io_out.write(
+                    "cowork: building not selected — run ends with the plan as "
+                    "the deliverable.\n")
+            # Plan approval (no builder), EOF, or interrupt ends the run the
+            # same way the scout loop always has.
+            break
+
+        # building phase
+        builder_box = {"outcome": None, "payload": None}
+        rc = run_builder_fn(
             config,
-            deliver_context("planner",
-                            planner_seed if planner_seed is not None else ""),
+            deliver_context("builder",
+                            builder_seed if builder_seed is not None else ""),
             selected, io_in=io_in, io_out=io_out,
-            resume_id=role_resume_id("planner"),
-            on_session=role_saver("planner"),
-            plan_json_path=plan_json_path, plan_md_path=plan_md_path,
-            review_path=planner_review_path,
-            reviewer_resume_id=role_resume_id(PLANNING_ADVISOR),
-            on_reviewer_session=role_saver(PLANNING_ADVISOR),
+            resume_id=role_resume_id("builder"),
+            on_session=role_saver("builder"),
+            build_status_path=build_status_path,
+            build_review_path=build_review_path,
+            reviewer_resume_id=role_resume_id(BUILD_REVIEWER),
+            on_reviewer_session=role_saver(BUILD_REVIEWER),
             reviewer_context=shared_context,
-            reviewer_context_update=reviewer_gap(PLANNING_ADVISOR)
-            if PLANNING_ADVISOR in selected else None,
-            on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
+            reviewer_context_update=reviewer_gap(BUILD_REVIEWER)
+            if BUILD_REVIEWER in selected else None,
+            on_reviewer_context_ack=context_acker(BUILD_REVIEWER),
             trace=trace,
-            eval_scratch_path=eval_scratch["planner"],
-            reviewer_eval_scratch_path=eval_scratch[PLANNING_ADVISOR],
+            eval_scratch_path=eval_scratch["builder"],
+            reviewer_eval_scratch_path=eval_scratch[BUILD_REVIEWER],
             scores_path=scores_path, session_uuid=session_uuid,
-            intel_path=intel_path, planning_epoch=epoch_box["epoch"],
-            on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+            plan_json_path=plan_json_path, plan_md_path=plan_md_path,
+            building_epoch=building_epoch_box["epoch"],
+            baseline_note=build_baseline()["note"],
+            baseline_repos=build_baseline()["repos"],
+            on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
         if rc == 0:
-            ack_lead("planner")
-        if rc == 0 and planner_box["outcome"] == "handoff":
-            # User-confirmed hand-back (planner -> its pre-processor): resume
-            # the scout session with the handoff payload and run the full scout
-            # cycle again.
-            phase = set_phase("scouting")
-            trace.event("handoff.execute", from_role="planner",
-                        to_role=HANDBACK_PREPROCESSOR["planner"],
+            ack_lead("builder")
+        if rc == 0 and builder_box["outcome"] == "handoff":
+            # User-confirmed hand-back (builder -> planner): resume the planner
+            # session with the handoff payload, re-plan, and chain forward into
+            # the building phase again on the next plan approval.
+            phase = set_phase("planning")
+            bump_planning_epoch()
+            trace.event("handoff.execute", from_role="builder",
+                        to_role=HANDBACK_PREPROCESSOR["builder"],
                         **trace_store.prompt_meta(
-                            planner_box["payload"] or "", prefix="payload"))
-            scout_seed = handoff_wake_block(planner_box["payload"])
-            planner_seed = None
+                            builder_box["payload"] or "", prefix="payload"))
+            planner_seed = plan_handback_wake_block(builder_box["payload"])
+            builder_seed = None
             continue
-        # Plan approval is terminal for this run (the phase stays `planning`,
-        # so a rerun resumes the planner conversation), and EOF/interrupt ends
-        # the run the same way the scout loop always has.
+        # Build approval is terminal for this run (the phase stays `building`,
+        # so a rerun resumes the builder conversation), and EOF/interrupt ends
+        # the run the same way.
         break
 
     trace.event("run.end", rc=rc)

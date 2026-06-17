@@ -97,6 +97,38 @@ def read_status(intel_path):
     return None
 
 
+def fingerprint_status(intel_path):
+    """Return a fingerprint of the status file: `{exists, status, sha256, size,
+    mtime_ns}`.
+
+    `sha256`/`size` are computed over the RAW file bytes (NOT the parsed JSON),
+    so any byte-level change — even a malformed-but-different write — registers
+    as progress; only a genuinely missing or byte-identical file reads as a
+    no-op. `status` reuses `read_status` (None on missing/unparseable).
+
+    Tolerant by design (mirrors `read_status`): a missing or unreadable file
+    yields `{exists: False, status: None, sha256: None, size: None,
+    mtime_ns: None}` and never raises. stdlib only."""
+    result = {"exists": False, "status": None, "sha256": None,
+              "size": None, "mtime_ns": None}
+    if not intel_path:
+        return result
+    try:
+        with open(intel_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return result
+    result["exists"] = True
+    result["sha256"] = hashlib.sha256(raw).hexdigest()
+    result["size"] = len(raw)
+    try:
+        result["mtime_ns"] = os.stat(intel_path).st_mtime_ns
+    except OSError:
+        result["mtime_ns"] = None
+    result["status"] = read_status(intel_path)
+    return result
+
+
 def invalidate_ready_status(intel_path, from_status="ready_for_review"):
     """Downgrade a stale `from_status` status (default `ready_for_review`) to
     `needs_input`.
@@ -215,6 +247,18 @@ def planner_review_path_for(intel_dir, session_uuid):
     return os.path.join(intel_dir, "planner-review.%s.json" % session_uuid)
 
 
+def build_status_path_for(intel_dir, session_uuid):
+    """Path of the builder's status JSON for a session (the builder's status
+    channel and verification log; sibling of the plan files)."""
+    return os.path.join(intel_dir, "builder.status.%s.json" % session_uuid)
+
+
+def build_review_path_for(intel_dir, session_uuid):
+    """Path of the build-reviewer's verdict file for a session (sibling of the
+    builder status file)."""
+    return os.path.join(intel_dir, "builder-review.%s.json" % session_uuid)
+
+
 # --------------------------------------------------------------------------- #
 # Peer evaluations.                                                            #
 #                                                                              #
@@ -317,19 +361,45 @@ def bump_planning_epoch(path, prior=None):
     return state
 
 
+def get_building_epoch(state):
+    """Return the persisted building-phase epoch (0 when building was never
+    entered, and for legacy sessions saved before epochs existed)."""
+    try:
+        return int((state or {}).get("building_epoch") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_building_epoch(path, prior=None):
+    """Increment and persist the building-phase epoch. Called on every
+    plan-approved -> building transition, so a builder -> planner hand-back
+    round trip yields a NEW epoch even when the re-approved plan is
+    byte-identical."""
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    state.setdefault("sessions", state.get("sessions") or {})
+    state["building_epoch"] = get_building_epoch(state) + 1
+    save(path, state)
+    return state
+
+
 def has_eval_entry(scores_path, evaluator, evaluatee, context,
-                   planning_epoch=None):
+                   planning_epoch=None, building_epoch=None):
     """True when the aggregate already holds a matching evaluation.
 
     The resume-safe "did this already happen" check: the once-per-phase
-    ->scout consumed-intel eval must not be re-emitted when a run is resumed
-    or restarted within the planning phase, and the in-memory closure flag
-    does not survive that. `planning_epoch` scopes the match to one planning
-    phase: a hand-back round trip bumps the epoch (even when the re-approved
-    intel is byte-identical), so the scout is evaluated again for the new
-    phase. With `planning_epoch=None` the match is epoch-agnostic (the safe,
-    more-deduping fallback when no epoch is wired). Tolerant by design: a
-    missing or malformed aggregate reads as "not yet"."""
+    consumed-upstream eval (->scout in the planning phase, ->planner in the
+    building phase) must not be re-emitted when a run is resumed or restarted
+    within the same phase, and the in-memory closure flag does not survive
+    that. `planning_epoch`/`building_epoch` scope the match to one phase: a
+    hand-back round trip bumps the relevant epoch (even when the re-approved
+    upstream artifact is byte-identical), so the upstream role is evaluated
+    again for the new phase. With both epochs None the match is epoch-agnostic
+    (the safe, more-deduping fallback when no epoch is wired). The two epoch
+    params are mutually exclusive in practice (the planning phase passes one,
+    the building phase the other). Tolerant by design: a missing or malformed
+    aggregate reads as "not yet"."""
     if not scores_path:
         return False
     try:
@@ -348,7 +418,9 @@ def has_eval_entry(scores_path, evaluator, evaluatee, context,
                 and entry.get("evaluatee") == evaluatee
                 and entry.get("context") == context
                 and (planning_epoch is None
-                     or entry.get("planning_epoch") == planning_epoch)):
+                     or entry.get("planning_epoch") == planning_epoch)
+                and (building_epoch is None
+                     or entry.get("building_epoch") == building_epoch)):
             return True
     return False
 
@@ -451,7 +523,7 @@ def save_role_session(path, role, controller, session_id, prior=None):
 # conversation the same way a rerun resumes the scout today.                   #
 # --------------------------------------------------------------------------- #
 
-PHASES = ("scouting", "planning")
+PHASES = ("scouting", "planning", "building")
 
 
 def get_phase(state):

@@ -477,8 +477,16 @@ class ClaudeSession:
             if region is None:
                 if spinner:
                     spinner.stop()
-                region = self._region_factory(
-                    self.io_out, ui.label(self.speaker, tty))
+                label = ui.label(self.speaker, tty)
+                if self._region_factory is ui.StreamingMarkdown:
+                    region = self._region_factory(
+                        self.io_out, label, trace=self.trace,
+                        trace_fields={
+                            "controller": "claude",
+                            "role": self.speaker,
+                        })
+                else:
+                    region = self._region_factory(self.io_out, label)
                 region.__enter__()
             else:
                 _clear_status()  # text resumed: drop the tool-activity row

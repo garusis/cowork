@@ -16,6 +16,7 @@ installed. `cowork --check` verifies them for interactive use.
 Python 3.9+. Does not import co_plan_file.py.
 """
 
+import os
 import sys
 import threading
 
@@ -24,11 +25,12 @@ RESET = "\033[0m"
 CYAN = "\033[36m"     # the user
 GREEN = "\033[32m"    # the speaking role (scout, …)
 MAGENTA = "\033[35m"  # the planner (distinct from the scout's green)
+YELLOW = "\033[33m"   # the builder (distinct from the planner's magenta)
 RED = "\033[31m"      # errors
 DIM = "\033[2m"       # turn separators / hints
 
 # Per-role label colors; any role not listed falls back to green.
-ROLE_COLORS = {"you": CYAN, "planner": MAGENTA}
+ROLE_COLORS = {"you": CYAN, "planner": MAGENTA, "builder": YELLOW}
 
 # Labels. The plain forms MUST stay byte-identical to the historical constants;
 # cowork_bridge re-exports these so `bridge.USER_LABEL` / `bridge.speaker_label`
@@ -143,11 +145,21 @@ class Spinner:
 # --------------------------------------------------------------------------- #
 
 
-def _rich_console(io_out):
+def _terminal_size():
+    import shutil
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    return size.columns, size.lines
+
+
+def _rich_console(io_out, size=None):
     from rich.console import Console
     # force_terminal so Rich emits styling even when io_out is a FakeTTY/pipe we
-    # have already decided is interactive.
-    return Console(file=io_out, force_terminal=True)
+    # have already decided is interactive. Pin the real terminal size: io_out is a
+    # wrapped stream Rich can't always size from, so it would fall back to 80x25 —
+    # which makes Live think short replies overflow the viewport and replay lines.
+    cols, rows = size or _terminal_size()
+    return Console(file=io_out, force_terminal=True,
+                   width=cols, height=rows)
 
 
 def render_markdown(io_out, text, enabled=None):
@@ -162,41 +174,126 @@ def render_markdown(io_out, text, enabled=None):
     _rich_console(io_out).print(Markdown(text))
 
 
+def _safe_commit_point(text, start):
+    """Largest index > start such that text[start:index] is a self-contained
+    markdown prefix safe to render permanently and drop from the live region.
+
+    "Safe" = ends on a paragraph boundary (a blank line) that is NOT inside an
+    open ``` code fence (a fence can contain blank lines, so a naive split would
+    cut it mid-block and render garbage). Returns the index just past the blank
+    line, or None if nothing can be committed yet."""
+    best = None
+    fences = 0
+    i = start
+    n = len(text)
+    while True:
+        nl = text.find("\n\n", i)
+        if nl == -1:
+            break
+        # count fence lines in the candidate prefix (cheap; prefixes are short).
+        seg = text[i:nl]
+        fences += sum(1 for ln in seg.split("\n") if ln.lstrip().startswith("```"))
+        if fences % 2 == 0:
+            best = nl + 2  # commit through the blank line; remainder starts clean
+        i = nl + 2
+        if i >= n:
+            break
+    return best
+
+
 class StreamingMarkdown:
     """A live-rendered markdown region on a TTY; a raw passthrough otherwise.
 
-    TTY: open a Rich Live region; feed(chunk) grows a buffer and re-renders the
-    markdown each tick (length-independent — Rich owns the region). Non-TTY: write
-    the label once, then stream raw chunks live — byte-identical to the historical
-    raw stream, so the StringIO/mocked-subprocess tests are unchanged."""
+    TTY: open a Rich Live region. feed(chunk) grows a buffer, permanently prints
+    any complete leading paragraphs above the region, and keeps only the still-
+    growing tail inside Live. Holding just the tail bounds the Live region height,
+    so it never overflows the viewport and replays lines as the reply gets long.
+    Non-TTY: write the label once, then stream raw chunks live — byte-identical to
+    the historical raw stream, so the StringIO/mocked-subprocess tests are
+    unchanged."""
 
-    def __init__(self, io_out, label_text):
+    def __init__(self, io_out, label_text, trace=None, trace_fields=None):
         self.io_out = io_out
         self.label_text = label_text
+        self.trace = trace
+        self.trace_fields = trace_fields or {}
         self.tty = is_tty(io_out)
         self.buf = []
+        self._committed = 0  # chars of the buffer already printed permanently
+        self._console = None
         self._live = None
         self._status = None  # transient activity line ('scout using Bash…')
         self._started = False  # non-TTY: have we written the label yet
+        self._chunks = 0
+        self._chars = 0
+        self._status_sets = 0
+        self._status_clears = 0
+
+    def _trace(self, name, **fields):
+        if not self.trace:
+            return
+        data = dict(self.trace_fields)
+        data.update(fields)
+        self.trace.event(name, **data)
 
     def __enter__(self):
+        renderer = "rich_live" if self.tty else "raw"
+        size = _terminal_size() if self.tty else (None, None)
+        term = os.environ.get("TERM") if self.tty else None
+        self._trace(
+            "ui.markdown.start",
+            renderer=renderer,
+            tty=self.tty,
+            terminal_width=size[0],
+            terminal_height=size[1],
+            label_bytes=len(self.label_text.encode("utf-8")),
+            vertical_overflow="visible" if self.tty else None,
+            term_present=bool(term) if self.tty else None,
+            term_dumb=(term == "dumb") if self.tty else None,
+        )
         if self.tty:
             from rich.live import Live
             from rich.markdown import Markdown
             self.io_out.write("\n" + self.label_text + "\n")
             self.io_out.flush()
-            self._live = Live(Markdown(""), console=_rich_console(self.io_out),
+            self._console = _rich_console(self.io_out, size=size)
+            self._live = Live(Markdown(""), console=self._console,
                               refresh_per_second=10, vertical_overflow="visible")
             self._live.__enter__()
         return self
 
+    def _tail(self):
+        return "".join(self.buf)[self._committed:]
+
+    def _commit_complete_paragraphs(self):
+        """Print finalized leading paragraphs above the Live region and advance the
+        commit cursor, so Live only ever holds the unfinished tail. Rich routes
+        console.print on the Live console above the live region automatically."""
+        full = "".join(self.buf)
+        point = _safe_commit_point(full, self._committed)
+        if point is None:
+            return
+        from rich.markdown import Markdown
+        chunk = full[self._committed:point].strip("\n")
+        if chunk:
+            self._console.print(Markdown(chunk))
+            self._trace(
+                "ui.markdown.commit",
+                renderer="rich_live",
+                chunk_chars=len(chunk),
+                chunk_lines=chunk.count("\n") + 1,
+                committed_chars=point,
+                tail_chars=len(full) - point,
+            )
+        self._committed = point
+
     def _render(self):
-        """The Live renderable: the markdown so far, plus an animated dim status
+        """The Live renderable: the still-growing tail, plus an animated dim status
         row while the agent is busy between text blocks (tool calls). The spinner
         is built fresh per render — Live's auto-refresh animates it against
         console time, and not storing it keeps the state surface minimal."""
         from rich.markdown import Markdown
-        md = Markdown("".join(self.buf))
+        md = Markdown(self._tail())
         if self._status is None:
             return md
         from rich.console import Group
@@ -209,6 +306,7 @@ class StreamingMarkdown:
         the non-TTY byte contract is untouched)."""
         if not self.tty or self._live is None:
             return
+        self._status_sets += 1
         self._status = text
         self._live.update(self._render())
 
@@ -216,12 +314,16 @@ class StreamingMarkdown:
         if self._status is None:
             return
         self._status = None
+        self._status_clears += 1
         if self.tty and self._live is not None:
             self._live.update(self._render())
 
     def feed(self, chunk):
         self.buf.append(chunk)
+        self._chunks += 1
+        self._chars += len(chunk)
         if self.tty:
+            self._commit_complete_paragraphs()
             self._live.update(self._render())
         else:
             if not self._started:
@@ -233,10 +335,31 @@ class StreamingMarkdown:
     def __exit__(self, *exc):
         if self.tty and self._live is not None:
             self._status = None  # never leave a tool label in the final render
+            # Empty the Live region, tear it down, then print the remaining tail
+            # permanently — once. Rendering the tail in the final Live frame AND
+            # printing it would duplicate it; clearing first avoids that.
+            tail = self._tail().strip("\n")
+            self._committed = len("".join(self.buf))  # _tail() now empty
             self._live.update(self._render())
             self._live.__exit__(*exc)
+            if tail:
+                from rich.markdown import Markdown
+                self._console.print(Markdown(tail))
         else:
             self.io_out.write("\n")
+        full = "".join(self.buf)
+        self._trace(
+            "ui.markdown.end",
+            renderer="rich_live" if self.tty else "raw",
+            tty=self.tty,
+            chunks=self._chunks,
+            chars=self._chars,
+            lines=full.count("\n") + (1 if full else 0),
+            committed_chars=self._committed,
+            final_tail_chars=len(self._tail()),
+            status_sets=self._status_sets,
+            status_clears=self._status_clears,
+        )
         self.io_out.flush()
 
 
