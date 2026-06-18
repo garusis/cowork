@@ -7,6 +7,7 @@ fakes; no real claude/codex CLI is spawned. Run:
     python3 -m unittest scripts/test_cowork.py
 """
 
+import contextlib
 import io
 import json
 import os
@@ -590,6 +591,482 @@ class StateStoreTest(unittest.TestCase):
         self.assertEqual(fp["status"], "ready_for_review")
         self.assertIsNotNone(fp["sha256"])
         self.assertGreater(fp["size"], 0)
+
+
+class MultiSessionStoreTest(unittest.TestCase):
+    def _dir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def _write_session(self, cwd, suid=None, legacy=False, context=None,
+                       phase=None, created=None, mtime=None):
+        if legacy:
+            path = state_store.session_path(cwd)
+        else:
+            path = state_store.new_session_path(cwd, suid)
+        state = {"team": [], "config": {}, "sessions": {}}
+        if suid:
+            state["session_uuid"] = suid
+        if context is not None:
+            state["context"] = {"text": context, "revision": 1}
+        if phase:
+            state["phase"] = phase
+        if created is not None:
+            state["created"] = created
+        state_store.save(path, state)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_new_session_path_shape(self):
+        cwd = self._dir()
+        p = state_store.new_session_path(cwd, "abc-123")
+        self.assertEqual(os.path.basename(p), "session.abc-123.json")
+        self.assertEqual(os.path.dirname(p), state_store.session_dir(cwd))
+
+    def test_derive_summary_first_line_trim_and_none(self):
+        self.assertEqual(
+            state_store.derive_summary({"context": {"text": "\n\n  build a    thing  \nmore"}}),
+            "build a thing")
+        self.assertIsNone(state_store.derive_summary({"context": {"text": "   \n  "}}))
+        self.assertIsNone(state_store.derive_summary({}))
+        long = "x" * 200
+        out = state_store.derive_summary({"context": {"text": long}}, max_len=10)
+        self.assertEqual(len(out), 10)
+        self.assertTrue(out.endswith("…"))
+        # legacy plain-string context form is tolerated
+        self.assertEqual(
+            state_store.derive_summary({"context": "legacy goal text"}),
+            "legacy goal text")
+
+    def test_fallback_label_short_id_and_time(self):
+        self.assertTrue(
+            state_store.fallback_label("abcdef123456").startswith("session abcdef12"))
+        labeled = state_store.fallback_label("abcdef123456", 0)  # falsy -> no time
+        self.assertEqual(labeled, "session abcdef12")
+        labeled2 = state_store.fallback_label("abcdef123456", 1_700_000_000)
+        self.assertIn("session abcdef12", labeled2)
+        self.assertIn("·", labeled2)
+
+    def test_ensure_session_sets_created(self):
+        cwd = self._dir()
+        path = state_store.new_session_path(cwd, "u1")
+        state = state_store.ensure_session(path, None, "u1")
+        self.assertIn("created", state)
+        self.assertGreater(state["created"], 0)
+        # existing file (no created) is left alone
+        path2 = self._write_session(cwd, suid="u2")  # no created field
+        state2 = state_store.ensure_session(
+            path2, state_store.load(path2), "ignored")
+        self.assertNotIn("created", state2)
+        self.assertEqual(state_store.get_session_uuid(state2), "u2")
+
+    def test_new_session_uuid_identity(self):
+        # A New session's filename uuid == persisted internal session_uuid
+        # (== the ~/.cowork/sessions/<uuid>/ assets-dir key).
+        cwd = self._dir()
+        u = "11111111-2222-3333-4444-555555555555"
+        path = state_store.new_session_path(cwd, u)
+        state_store.ensure_session(path, None, u)
+        loaded = state_store.load(path)
+        self.assertEqual(
+            os.path.basename(path),
+            "session.%s.json" % state_store.get_session_uuid(loaded))
+
+    def test_list_sessions_discovery_and_ordering(self):
+        cwd = self._dir()
+        # Three sessions: two new + one legacy, with distinct mtimes.
+        self._write_session(cwd, suid="old", context="old goal",
+                            phase="planning", created=100, mtime=100)
+        self._write_session(cwd, suid="mid", context="mid goal",
+                            phase="building", created=200, mtime=200)
+        self._write_session(cwd, legacy=True, suid="leg", context="legacy goal",
+                            mtime=300)  # no created -> sorts by mtime
+        rows = state_store.list_sessions(cwd)
+        self.assertEqual([r["id"] for r in rows], ["leg", "mid", "old"])
+        self.assertEqual(rows[1]["summary"], "mid goal")
+        self.assertEqual(rows[1]["phase"], "building")
+        # legacy file appears with a derived summary and default phase
+        leg = rows[0]
+        self.assertEqual(leg["summary"], "legacy goal")
+        self.assertEqual(leg["phase"], "scouting")
+        self.assertIsNone(leg["created"])
+
+    def test_list_sessions_skips_unreadable_and_idless(self):
+        cwd = self._dir()
+        good = self._write_session(cwd, suid="good", context="g")
+        # a corrupt session.<uuid>.json -> load() returns None -> skipped
+        bad = state_store.new_session_path(cwd, "bad")
+        os.makedirs(os.path.dirname(bad), exist_ok=True)
+        with open(bad, "w") as fh:
+            fh.write("not json {")
+        # a legacy file with neither session_uuid nor a filename uuid -> skipped
+        legacy = state_store.session_path(cwd)
+        state_store.save(legacy, {"team": [], "config": {}, "sessions": {}})
+        rows = state_store.list_sessions(cwd)
+        self.assertEqual([r["id"] for r in rows], ["good"])
+
+    def test_format_relative_time_is_relative_for_all_ages(self):
+        now = 1_000_000_000
+        self.assertEqual(ui.format_relative_time(0, now), "unknown")
+        self.assertEqual(ui.format_relative_time(now, now), "just now")
+        self.assertEqual(ui.format_relative_time(now - 5 * 60, now), "5m ago")
+        self.assertEqual(ui.format_relative_time(now - 3 * 3600, now), "3h ago")
+        self.assertEqual(ui.format_relative_time(now - 2 * 86400, now), "2d ago")
+        # Older than a week must STAY relative — never an absolute date.
+        for days, suffix in [(10, "w ago"), (40, "mo ago"), (800, "y ago")]:
+            label = ui.format_relative_time(now - days * 86400, now)
+            self.assertTrue(label.endswith(suffix), label)
+            self.assertTrue(label.endswith("ago"), label)
+            self.assertNotIn("-", label)  # no YYYY-MM-DD leak
+        # Explicit large-age examples.
+        self.assertEqual(ui.format_relative_time(now - 8 * 86400, now), "1w ago")
+        self.assertEqual(ui.format_relative_time(now - 60 * 86400, now), "2mo ago")
+        self.assertEqual(ui.format_relative_time(now - 400 * 86400, now), "1y ago")
+
+    def test_list_sessions_id_falls_back_to_filename(self):
+        cwd = self._dir()
+        # A new-style file whose state lacks session_uuid still lists via the
+        # uuid parsed from its filename.
+        path = state_store.new_session_path(cwd, "fromname")
+        state_store.save(path, {"team": [], "config": {}, "sessions": {}})
+        rows = state_store.list_sessions(cwd)
+        self.assertEqual([r["id"] for r in rows], ["fromname"])
+
+
+class SelectSessionTest(unittest.TestCase):
+    """select_session decision tree. TTY runs use FakeTTY streams + an injected
+    select_fn; non-TTY runs use plain StringIO."""
+
+    def _dir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    @contextlib.contextmanager
+    def _chdir(self, d):
+        prev = os.getcwd()
+        os.chdir(d)
+        try:
+            yield
+        finally:
+            os.chdir(prev)
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _seed(self, cwd, suid, context="goal", mtime=None):
+        path = state_store.new_session_path(cwd, suid)
+        state = {"session_uuid": suid, "team": [], "config": {}, "sessions": {},
+                 "context": {"text": context, "revision": 1}, "created": 1.0}
+        state_store.save(path, state)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _select(self, argv, cwd, select_fn=None, tty=True):
+        io_cls = FakeTTY if tty else io.StringIO
+        with self._chdir(cwd):
+            return cowork.select_session(
+                self._args(argv), io_cls(), io_cls(), select_fn=select_fn)
+
+    # -- conflict checks fire first, even with --session-file present -------- #
+    def test_new_and_resume_conflict(self):
+        c = self._select(["--new", "--resume"], self._dir())
+        self.assertIsNotNone(c.error)
+
+    def test_no_session_and_resume_conflict(self):
+        c = self._select(["--no-session", "--resume"], self._dir())
+        self.assertIsNotNone(c.error)
+
+    def test_conflict_beats_session_file(self):
+        # --session-file must NOT bypass the conflict checks.
+        c = self._select(
+            ["--session-file", "/tmp/x.json", "--new", "--resume"], self._dir())
+        self.assertIsNotNone(c.error)
+
+    # -- --no-session runs the flow (not cancelled, not error) -------------- #
+    def test_no_session_runs_flow(self):
+        c = self._select(["--no-session"], self._dir())
+        self.assertFalse(c.cancelled)
+        self.assertIsNone(c.error)
+        self.assertIsNotNone(c.path)
+
+    # -- --session-file is single-session, no picker ------------------------ #
+    def test_session_file_single_session(self):
+        called = []
+        c = self._select(["--session-file", "/tmp/x.json"], self._dir(),
+                         select_fn=lambda *a: called.append(a))
+        self.assertEqual(c.path, "/tmp/x.json")
+        self.assertEqual(called, [])  # picker never shown
+
+    # -- zero sessions -> silent fresh, no prompt --------------------------- #
+    def test_zero_sessions_mints_fresh(self):
+        cwd = self._dir()
+        called = []
+        c = self._select([], cwd, select_fn=lambda *a: called.append(a) or "new")
+        self.assertIsNotNone(c.new_uuid)
+        self.assertIn(c.new_uuid, c.path)
+        self.assertEqual(called, [])  # no menu when nothing to resume
+
+    # -- >=1 session + TTY -> resume-or-new menu ---------------------------- #
+    def test_menu_resume_opens_picker(self):
+        cwd = self._dir()
+        p1 = self._seed(cwd, "s1", "first", mtime=100)
+        p2 = self._seed(cwd, "s2", "second", mtime=200)
+        answers = iter(["resume", p2])  # menu says resume, picker picks s2
+
+        def fake_select(prompt, choices):
+            return next(answers)
+        c = self._select([], cwd, select_fn=fake_select)
+        self.assertEqual(c.path, p2)
+        self.assertFalse(c.cancelled)
+
+    def test_menu_new_mints_fresh(self):
+        cwd = self._dir()
+        self._seed(cwd, "s1", "first")
+        c = self._select([], cwd, select_fn=lambda *a: "new")
+        self.assertIsNotNone(c.new_uuid)
+
+    def test_menu_dismiss_is_cancelled(self):
+        cwd = self._dir()
+        self._seed(cwd, "s1", "first")
+        c = self._select([], cwd, select_fn=lambda *a: None)
+        self.assertTrue(c.cancelled)
+
+    def test_picker_cancel_is_cancelled(self):
+        cwd = self._dir()
+        self._seed(cwd, "s1", "first")
+        answers = iter(["resume", None])  # resume, then dismiss the picker
+        c = self._select([], cwd, select_fn=lambda *a: next(answers))
+        self.assertTrue(c.cancelled)
+
+    # -- --new skips the prompt --------------------------------------------- #
+    def test_new_flag_skips_prompt(self):
+        cwd = self._dir()
+        self._seed(cwd, "s1", "first")
+        called = []
+        c = self._select(["--new"], cwd,
+                        select_fn=lambda *a: called.append(a) or "x")
+        self.assertIsNotNone(c.new_uuid)
+        self.assertEqual(called, [])
+
+    # -- --resume opens the picker on a TTY --------------------------------- #
+    def test_resume_flag_opens_picker(self):
+        cwd = self._dir()
+        p1 = self._seed(cwd, "s1", "first", mtime=100)
+        p2 = self._seed(cwd, "s2", "second", mtime=200)
+        c = self._select(["--resume"], cwd, select_fn=lambda prompt, ch: p1)
+        self.assertEqual(c.path, p1)
+
+    def test_resume_newest_first_order(self):
+        cwd = self._dir()
+        self._seed(cwd, "s1", "first", mtime=100)
+        self._seed(cwd, "s2", "second", mtime=200)
+        seen = {}
+
+        def fake_select(prompt, choices):
+            seen["choices"] = choices
+            return choices[0][0]
+        self._select(["--resume"], cwd, select_fn=fake_select)
+        # newest (s2) is first in the picker
+        self.assertIn("s2", seen["choices"][0][0])
+
+    def test_resume_zero_sessions_errors(self):
+        c = self._select(["--resume"], self._dir(),
+                        select_fn=lambda *a: None)
+        self.assertIsNotNone(c.error)
+
+    def test_resume_non_tty_errors(self):
+        cwd = self._dir()
+        self._seed(cwd, "s1", "first")
+        c = self._select(["--resume"], cwd, tty=False)
+        self.assertIsNotNone(c.error)
+
+    # -- non-TTY plain run -> most-recent, no crash ------------------------- #
+    def test_non_tty_plain_continues_most_recent(self):
+        cwd = self._dir()
+        self._seed(cwd, "s1", "first", mtime=100)
+        p2 = self._seed(cwd, "s2", "second", mtime=200)
+        c = self._select([], cwd, tty=False)
+        self.assertEqual(os.path.basename(c.path),
+                         os.path.basename(p2))  # newest
+        self.assertFalse(c.cancelled)
+        self.assertIsNone(c.error)
+
+
+class MultiSessionFlowTest(unittest.TestCase):
+    """End-to-end run_flow over multiple resumable sessions in one directory."""
+
+    def setUp(self):
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+        self.root = root
+        self.cwd = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.cwd, ignore_errors=True))
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _all_trace_events(self):
+        events = []
+        for dirpath, _dirs, files in os.walk(self.root):
+            for name in files:
+                if name == "trace.jsonl":
+                    with open(os.path.join(dirpath, name), "r") as fh:
+                        events.extend(json.loads(l) for l in fh if l.strip())
+        return events
+
+    @contextlib.contextmanager
+    def _chdir(self):
+        prev = os.getcwd()
+        os.chdir(self.cwd)
+        try:
+            yield
+        finally:
+            os.chdir(prev)
+
+    def _scout(self):
+        def fake_scout(config, context, selected, io_in=None, io_out=None,
+                      resume_id=None, on_session=None, intel_path=None,
+                      review_path=None, **kwargs):
+            fake_scout.last_resume = resume_id
+            fake_scout.last_intel = intel_path
+            if on_session and resume_id is None:
+                on_session("claude", "sess-" + os.path.basename(
+                    intel_path or "x"))
+            return 0
+        fake_scout.last_resume = "unset"
+        fake_scout.last_intel = None
+        return fake_scout
+
+    def test_two_new_runs_create_two_sessions_then_resume(self):
+        scout = self._scout()
+        with self._chdir():
+            # Two --new runs -> two distinct resumable session files.
+            cowork.run_flow(
+                self._args(["--new", "--team", "scout",
+                            "--config", "scout=claude,yolo,plan",
+                            "--context", "alpha goal"]),
+                io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+                run_scout_fn=scout)
+            cowork.run_flow(
+                self._args(["--new", "--team", "scout",
+                            "--config", "scout=claude,yolo,plan",
+                            "--context", "beta goal"]),
+                io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+                run_scout_fn=scout)
+            rows = state_store.list_sessions(self.cwd)
+            self.assertEqual(len(rows), 2)
+            summaries = sorted(r["summary"] for r in rows)
+            self.assertEqual(summaries, ["alpha goal", "beta goal"])
+            # Resume the alpha session via the picker; its scout session resumes.
+            alpha = [r for r in rows if r["summary"] == "alpha goal"][0]
+            import unittest.mock as mock
+            with mock.patch.object(cowork.ui, "select",
+                                   return_value=alpha["path"]), \
+                    mock.patch.object(cowork.preflight, "preflight",
+                                      return_value=(True, [])):
+                rc = cowork.run_flow(
+                    self._args(["--resume"]),
+                    io_in=FakeTTY(), io_out=FakeTTY(),
+                    which=lambda c: "/bin/" + c, run_scout_fn=scout)
+            self.assertEqual(rc, 0)
+        # The resumed run reused alpha's saved scout session id (recorded on the
+        # first run, keyed by alpha's uuid).
+        self.assertTrue(scout.last_resume.startswith("sess-"))
+        self.assertIn(alpha["id"], scout.last_resume)
+
+    def test_legacy_session_lists_and_resumes(self):
+        scout = self._scout()
+        with self._chdir():
+            # Seed a legacy single-session file (no `created`), as written by an
+            # older cowork.
+            legacy = state_store.session_path(self.cwd)
+            state_store.save(legacy, {
+                "session_uuid": "legacy-uuid", "team": ["scout"],
+                "config": {"scout": {"controller": "claude", "yolo": True,
+                                     "mode": "plan"}},
+                "sessions": {"scout": {"controller": "claude",
+                                       "id": "legacy-sess"}},
+                "context": {"text": "legacy goal", "revision": 1}})
+            rows = state_store.list_sessions(self.cwd)
+            self.assertEqual([r["id"] for r in rows], ["legacy-uuid"])
+            self.assertEqual(rows[0]["summary"], "legacy goal")
+            self.assertIsNone(rows[0]["created"])
+            # Resume it via the picker -> the legacy scout session resumes.
+            import unittest.mock as mock
+            with mock.patch.object(cowork.ui, "select", return_value=legacy), \
+                    mock.patch.object(cowork.preflight, "preflight",
+                                      return_value=(True, [])):
+                rc = cowork.run_flow(
+                    self._args(["--resume"]),
+                    io_in=FakeTTY(), io_out=FakeTTY(),
+                    which=lambda c: "/bin/" + c, run_scout_fn=scout)
+            self.assertEqual(rc, 0)
+        self.assertEqual(scout.last_resume, "legacy-sess")
+
+    def test_no_session_runs_full_flow(self):
+        scout = self._scout()
+        with self._chdir():
+            rc = cowork.run_flow(
+                self._args(["--no-session", "--team", "scout",
+                            "--config", "scout=claude,yolo,plan",
+                            "--context", "ephemeral goal"]),
+                io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+                run_scout_fn=scout)
+            self.assertEqual(rc, 0)
+            # nothing persisted
+            self.assertEqual(state_store.list_sessions(self.cwd), [])
+        self.assertEqual(scout.last_resume, None)  # reached the scout fresh
+
+    def test_session_select_error_traces_run_end(self):
+        # A conflicting flag combo exits rc 2 AND records a run.end trace event.
+        out = io.StringIO()
+        with self._chdir():
+            rc = cowork.run_flow(
+                self._args(["--new", "--resume"]),
+                io_out=out, which=lambda c: "/bin/" + c,
+                run_scout_fn=self._scout())
+        self.assertEqual(rc, 2)
+        self.assertIn("--new and --resume", out.getvalue())
+        ends = [e for e in self._all_trace_events()
+                if e["event"] == "run.end" and e.get("rc") == 2
+                and e.get("reason") == "session_select_error"]
+        self.assertEqual(len(ends), 1)
+
+    def test_session_select_cancel_traces_run_end(self):
+        # A dismissed resume/new menu exits rc 0 (benign) AND traces run.end.
+        scout = self._scout()
+        out = FakeTTY()  # both streams must be TTY for the menu to show
+        with self._chdir():
+            # Seed a session so the resume-or-new menu is shown.
+            state_store.ensure_session(
+                state_store.new_session_path(self.cwd, "seed"), None, "seed")
+            import unittest.mock as mock
+            with mock.patch.object(cowork.ui, "select", return_value=None):
+                rc = cowork.run_flow(
+                    self._args([]), io_in=FakeTTY(), io_out=out,
+                    which=lambda c: "/bin/" + c, run_scout_fn=scout)
+        self.assertEqual(rc, 0)
+        self.assertIn("cancelled; nothing to do", out.getvalue())
+        ends = [e for e in self._all_trace_events()
+                if e["event"] == "run.end" and e.get("rc") == 0
+                and e.get("reason") == "session_select_cancelled"]
+        self.assertEqual(len(ends), 1)
 
 
 class TraceTest(unittest.TestCase):
