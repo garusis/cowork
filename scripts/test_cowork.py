@@ -76,15 +76,18 @@ class FlagAssemblyTest(unittest.TestCase):
         self.assertEqual(cmd[-1], "PROMPT")
 
     def test_codex_resume_uses_explicit_id_never_last(self):
-        cmd = bridge.build_codex_resume_command("thread-abc", "next")
-        self.assertEqual(
-            cmd,
-            ["codex", "exec", "resume", "--json", "--skip-git-repo-check",
-             "thread-abc", "next"],
-        )
+        cmd = bridge.build_codex_resume_command(
+            "thread-abc", "next", "plan", True)
+        self.assertEqual(cmd[:5],
+                         ["codex", "exec", "resume", "--json",
+                          "--skip-git-repo-check"])
+        # explicit id present, prompt strictly last, never --last.
+        self.assertIn("thread-abc", cmd)
+        self.assertEqual(cmd[-1], "next")
         self.assertNotIn("--last", cmd)
-        # resume rejects --sandbox (policy inherited from the original session).
+        # resume rejects --sandbox/--add-dir; permissions re-applied via -c.
         self.assertNotIn("--sandbox", cmd)
+        self.assertNotIn("--add-dir", cmd)
 
     def _add_dir_pair(self, cmd):
         # Return the (flag, value) pair following --add-dir, or None.
@@ -133,11 +136,65 @@ class FlagAssemblyTest(unittest.TestCase):
             "--add-dir",
             bridge.build_codex_command("PROMPT", "implement", False))
 
-    def test_codex_resume_command_never_grants_add_dir(self):
-        # Resume inherits the fresh session's sandbox and cannot re-grant a root;
-        # it takes no extra_writable_dir param and never carries --add-dir.
-        cmd = bridge.build_codex_resume_command("thread-abc", "next")
+    def _c_values(self, cmd):
+        # Return the list of values following each `-c` flag.
+        return [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "-c"]
+
+    def test_codex_resume_mode_args_branches(self):
+        # plan -> read-only via -c.
+        self.assertEqual(
+            bridge.codex_resume_mode_args("plan", True),
+            ["-c", 'sandbox_mode="read-only"'])
+        self.assertEqual(
+            bridge.codex_resume_mode_args("plan", False),
+            ["-c", 'sandbox_mode="read-only"'])
+        # implement + yolo -> bypass flag, no sandbox/add-dir.
+        self.assertEqual(
+            bridge.codex_resume_mode_args("implement", True),
+            ["--dangerously-bypass-approvals-and-sandbox"])
+        # implement + no-yolo, no dir -> workspace-write only.
+        self.assertEqual(
+            bridge.codex_resume_mode_args("implement", False),
+            ["-c", 'sandbox_mode="workspace-write"'])
+        # implement + no-yolo + dir -> workspace-write + json-encoded root.
+        self.assertEqual(
+            bridge.codex_resume_mode_args(
+                "implement", False,
+                extra_writable_dir="/home/u/.cowork/sessions/S"),
+            ["-c", 'sandbox_mode="workspace-write"',
+             "-c",
+             'sandbox_workspace_write.writable_roots='
+             '["/home/u/.cowork/sessions/S"]'])
+
+    def test_codex_resume_implement_yolo(self):
+        cmd = bridge.build_codex_resume_command(
+            "thread-abc", "next", "implement", True)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+        self.assertNotIn("--sandbox", cmd)
         self.assertNotIn("--add-dir", cmd)
+        self.assertIn("thread-abc", cmd)
+        self.assertEqual(cmd[-1], "next")
+        self.assertNotIn("--last", cmd)
+
+    def test_codex_resume_implement_no_yolo_regrants_root(self):
+        cmd = bridge.build_codex_resume_command(
+            "thread-abc", "next", "implement", False,
+            extra_writable_dir="/home/u/.cowork/sessions/S")
+        cvals = self._c_values(cmd)
+        self.assertIn('sandbox_mode="workspace-write"', cvals)
+        self.assertIn(
+            'sandbox_workspace_write.writable_roots='
+            '["/home/u/.cowork/sessions/S"]', cvals)
+        self.assertNotIn("--sandbox", cmd)
+        self.assertNotIn("--add-dir", cmd)
+        self.assertEqual(cmd[-1], "next")  # prompt stays last
+        self.assertNotIn("--last", cmd)
+
+    def test_codex_resume_plan_read_only(self):
+        cmd = bridge.build_codex_resume_command(
+            "thread-abc", "next", "plan", False)
+        self.assertIn('sandbox_mode="read-only"', self._c_values(cmd))
+        self.assertEqual(cmd[-1], "next")
 
 
 class StatusSpinnerTest(unittest.TestCase):
@@ -1235,10 +1292,12 @@ class SessionClassTest(unittest.TestCase):
         self.assertEqual(recorded["cmds"][0][:4],
                          ["codex", "exec", "--json", "--skip-git-repo-check"])
         self.assertEqual(recorded["cmds"][0][-1], "first")
+        # implement + yolo: resume re-applies the bypass flag (see
+        # codex_resume_mode_args) and addresses the thread by explicit id.
         self.assertEqual(
             recorded["cmds"][1],
             ["codex", "exec", "resume", "--json", "--skip-git-repo-check",
-             "T1", "second"])
+             "--dangerously-bypass-approvals-and-sandbox", "T1", "second"])
         self.assertEqual(recorded["tid"], "T1")
 
     def test_codex_tool_activity_retitles_spinner(self):
@@ -3184,7 +3243,8 @@ class LiveCodexTest(unittest.TestCase):
         tid = bridge.capture_thread_id(objs)
         self.assertIsNotNone(tid)
         rc2, objs2, err2 = _run_cli(bridge.build_codex_resume_command(
-            tid, "What number did I ask you to remember? Reply with just the number."))
+            tid, "What number did I ask you to remember? Reply with just the number.",
+            "plan", True))
         self.assertEqual(rc2, 0, err2[:300])
         texts = " ".join(
             bridge.parse_codex_event(o).get("text", "")
@@ -5886,6 +5946,440 @@ class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
                            if e["evaluatee"] == "planner"]
         self.assertEqual(sorted(e["building_epoch"] for e in planner_entries),
                          [1, 2])
+
+
+# --------------------------------------------------------------------------- #
+# Channel delineation: user-facing vs. internal (self-narration / reviewer).    #
+# --------------------------------------------------------------------------- #
+
+
+class ChannelParserTest(unittest.TestCase):
+    def test_happy_path_splits_and_strips_markers(self):
+        text = "before\n[[internal]]\nnote\n[[/internal]]\nafter\n"
+        segs, end = ui.split_channel_segments(text)
+        self.assertEqual([c for c, _ in segs], ["user", "internal", "user"])
+        joined = "".join(s for _c, s in segs)
+        self.assertNotIn("[[internal]]", joined)
+        self.assertNotIn("[[/internal]]", joined)
+        self.assertIn("note", segs[1][1])     # the internal segment holds 'note'
+        self.assertIn("before", segs[0][1])
+        self.assertIn("after", segs[2][1])
+        self.assertFalse(end)  # closed block -> ends on the user channel
+
+    def test_marker_free_is_byte_identical(self):
+        for text in ("", "plain text", "a\n\nb\n", "line1\nline2"):
+            segs, end = ui.split_channel_segments(text)
+            self.assertEqual("".join(s for _c, s in segs), text)
+            self.assertFalse(end)
+
+    def test_unclosed_block_reports_internal_end(self):
+        segs, end = ui.split_channel_segments("u\n[[internal]]\nstill open\n")
+        self.assertTrue(end)  # force-close is the caller's job (end of turn)
+        self.assertEqual(segs[-1][0], "internal")
+
+    def test_stray_close_and_double_open_are_noops(self):
+        # stray close with no open: dropped, stays user.
+        segs, end = ui.split_channel_segments("[[/internal]]\nplain\n")
+        self.assertEqual([c for c, _ in segs], ["user"])
+        self.assertNotIn("[[/internal]]", "".join(s for _c, s in segs))
+        self.assertFalse(end)
+        # second open while already open: no-op (depth-1 boolean).
+        segs2, _ = ui.split_channel_segments(
+            "[[internal]]\na\n[[internal]]\nb\n[[/internal]]\n")
+        self.assertEqual([c for c, _ in segs2], ["internal"])
+        self.assertIn("a", "".join(s for _c, s in segs2))
+        self.assertIn("b", "".join(s for _c, s in segs2))
+
+    def test_literal_marker_mid_line_is_verbatim(self):
+        # Only a full line equal to the marker is control; mid-line is content.
+        text = "talk about [[internal]] inline\n"
+        segs, _ = ui.split_channel_segments(text)
+        self.assertEqual(segs, [("user", text)])
+
+    def test_internal_start_seeds_state(self):
+        segs, end = ui.split_channel_segments("carried\n", internal_start=True)
+        self.assertEqual(segs[0][0], "internal")
+        self.assertTrue(end)
+
+
+class StreamingChannelTest(unittest.TestCase):
+    def test_nontty_strips_marker_lines_plain(self):
+        out = io.StringIO()
+        with ui.StreamingMarkdown(out, "scout › ") as r:
+            r.feed("hi\n[[internal]]\nsecret\n[[/internal]]\nbye\n")
+        self.assertEqual(out.getvalue(), "\nscout › hi\nsecret\nbye\n\n")
+
+    def test_nontty_marker_split_across_chunks(self):
+        out = io.StringIO()
+        with ui.StreamingMarkdown(out, "scout › ") as r:
+            r.feed("before\n[[intern")          # marker split mid-line
+            r.feed("al]]\nINSIDE\n[[/internal]]\nafter\n")
+        text = out.getvalue()
+        self.assertNotIn("[[internal]]", text)
+        self.assertNotIn("[[/internal]]", text)
+        self.assertIn("INSIDE", text)
+        self.assertIn("before", text)
+        self.assertIn("after", text)
+
+    def test_nontty_marker_free_byte_identical(self):
+        out = io.StringIO()
+        with ui.StreamingMarkdown(out, "scout › ") as r:
+            r.feed("a\n\n")
+            r.feed("b")
+        self.assertEqual(out.getvalue(), "\nscout › a\n\nb\n")
+
+    def test_fresh_region_starts_on_user_channel(self):
+        # Channel state never carries across turns: a new region is fresh.
+        r = ui.StreamingMarkdown(io.StringIO(), "scout › ")
+        self.assertFalse(r._channel_internal)
+        self.assertFalse(r._nontty_internal)
+
+    def test_internal_region_seeds_internal_state(self):
+        r = ui.StreamingMarkdown(io.StringIO(), "rev › ", internal=True)
+        self.assertTrue(r._channel_internal)
+
+    def test_internal_region_nontty_still_plain(self):
+        # Off a TTY there is no styling; an internal region writes plain text.
+        out = io.StringIO()
+        with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
+            r.feed("verdict notes")
+        self.assertEqual(out.getvalue(), "\nrev › verdict notes\n")
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_internal_block_dimmed_markers_stripped(self):
+        import unittest.mock as mock
+        out = FakeTTY()
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            with ui.StreamingMarkdown(out, "scout › ") as r:
+                r.feed("user line\n\n[[internal]]\ninternal note\n"
+                       "[[/internal]]\n\ntail line\n")
+        text = out.getvalue()
+        self.assertNotIn("[[internal]]", text)
+        self.assertNotIn("[[/internal]]", text)
+        self.assertIn("internal note", text)
+        self.assertIn("user line", text)
+        self.assertIn("\x1b[2m", text)  # dim styling emitted for the block
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_internal_region_dims_whole_content(self):
+        import unittest.mock as mock
+        out = FakeTTY()
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
+                r.feed("wholly internal narration\n")
+        text = out.getvalue()
+        self.assertIn("wholly internal narration", text)
+        self.assertIn("\x1b[2m", text)
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_internal_region_strips_emitted_markers(self):
+        # Even a wholly-internal region must never render literal sentinels if
+        # the reviewer/advisor happens to emit them (contract: always stripped).
+        import unittest.mock as mock
+        out = FakeTTY()
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
+                r.feed("[[internal]]\nverdict body\n[[/internal]]\n")
+        text = out.getvalue()
+        self.assertNotIn("[[internal]]", text)
+        self.assertNotIn("[[/internal]]", text)
+        self.assertIn("verdict body", text)
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_marker_split_across_chunks_no_flash(self):
+        # A marker split mid-line must not flash half-matched in the live tail,
+        # and must be fully stripped from the final output.
+        import unittest.mock as mock
+        out = FakeTTY()
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            region = ui.StreamingMarkdown(out, "scout › ")
+            region.__enter__()
+            try:
+                region.feed("before\n[[intern")   # partial marker, no newline
+                region._live.refresh()             # force a live frame
+                # The partial sentinel is held, never shown half-matched.
+                self.assertNotIn("[[intern", out.getvalue())
+                region.feed("al]]\nINSIDE\n[[/internal]]\nafter\n")
+            finally:
+                region.__exit__(None, None, None)
+        text = out.getvalue()
+        self.assertNotIn("[[internal]]", text)
+        self.assertNotIn("[[/internal]]", text)
+        self.assertIn("INSIDE", text)
+        self.assertIn("after", text)
+
+
+class RenderMarkdownChannelTest(unittest.TestCase):
+    def test_nontty_strips_markers(self):
+        out = io.StringIO()
+        ui.render_markdown(out, "a\n[[internal]]\nb\n[[/internal]]\nc",
+                           enabled=False)
+        self.assertEqual(out.getvalue(), "a\nb\nc\n")
+
+    def test_nontty_marker_free_byte_identical(self):
+        out = io.StringIO()
+        ui.render_markdown(out, "# hi\nbody", enabled=False)
+        self.assertEqual(out.getvalue(), "# hi\nbody\n")
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_inline_internal_block(self):
+        out = FakeTTY()
+        ui.render_markdown(out, "user\n\n[[internal]]\nnote\n[[/internal]]\n\nmore",
+                           enabled=True)
+        text = out.getvalue()
+        self.assertNotIn("[[internal]]", text)
+        self.assertIn("note", text)
+        self.assertIn("user", text)
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_internal_true_dims_whole(self):
+        out = FakeTTY()
+        ui.render_markdown(out, "wholly internal", enabled=True, internal=True)
+        text = out.getvalue()
+        self.assertIn("internal", text)
+        self.assertIn("\x1b[2m", text)
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_tty_internal_true_strips_emitted_markers(self):
+        out = FakeTTY()
+        ui.render_markdown(out, "[[internal]]\nbody text\n[[/internal]]",
+                           enabled=True, internal=True)
+        text = out.getvalue()
+        self.assertNotIn("[[internal]]", text)
+        self.assertNotIn("[[/internal]]", text)
+        self.assertIn("body text", text)
+
+    def test_nontty_internal_true_strips_markers(self):
+        out = io.StringIO()
+        ui.render_markdown(out, "a\n[[internal]]\nb\n[[/internal]]\nc",
+                           enabled=False, internal=True)
+        self.assertEqual(out.getvalue(), "a\nb\nc\n")
+
+
+class CodexChannelPropagationTest(unittest.TestCase):
+    def test_internal_flag_reaches_render_markdown(self):
+        import unittest.mock as mock
+
+        class FakeProc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": "T1"}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "agent_message", "text": "verdict"}}),
+        ]
+        captured = {}
+
+        def fake_render(io_out, text, enabled=None, internal=False):
+            captured["internal"] = internal
+            captured["text"] = text
+
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=FakeProc(lines)), \
+                mock.patch.object(bridge.ui, "render_markdown", fake_render):
+            s = bridge.CodexSession("implement", True, io_out=io.StringIO(),
+                                    speaker="scout-reviewer", internal=True)
+            s.send("review")
+        self.assertTrue(captured.get("internal"))  # propagated to render
+        self.assertEqual(captured["text"], "verdict")
+
+
+# --------------------------------------------------------------------------- #
+# Caveman compression directive injection (gated on caveman availability).      #
+# --------------------------------------------------------------------------- #
+
+
+class CavemanDirectiveTest(unittest.TestCase):
+    def test_directive_text_gates_on_availability(self):
+        self.assertIn("IS installed", cowork.caveman_directive(True))
+        self.assertIn("NOT installed", cowork.caveman_directive(False))
+
+    def test_briefs_inject_directive(self):
+        on_scout = cowork.assemble_scout_brief(["scout"], "/x.json",
+                                               caveman_available=True)
+        off_scout = cowork.assemble_scout_brief(["scout"], "/x.json",
+                                                caveman_available=False)
+        self.assertIn("IS installed", on_scout)
+        self.assertIn("NOT installed", off_scout)
+        # the scout brief still carries its own write-target guardrail.
+        self.assertIn("ONLY write target", on_scout)
+
+        self.assertIn("IS installed", cowork.assemble_planner_brief(
+            "a.json", "a.md", caveman_available=True))
+        self.assertIn("NOT installed", cowork.assemble_planner_brief(
+            "a.json", "a.md", caveman_available=False))
+        self.assertIn("IS installed", cowork.assemble_builder_brief(
+            "s.json", caveman_available=True))
+        self.assertIn("NOT installed", cowork.assemble_builder_brief(
+            "s.json", caveman_available=False))
+        self.assertIn("IS installed", cowork.assemble_reviewer_brief(
+            "r.json", caveman_available=True))
+        self.assertIn("NOT installed", cowork.assemble_reviewer_brief(
+            "r.json", caveman_available=False))
+
+    def test_available_detects_via_env_path(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        marker = os.path.join(d, "caveman", "SKILL.md")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        open(marker, "w").close()
+        import unittest.mock as mock
+        with mock.patch.dict(os.environ, {"COPLAN_CAVEMAN_PATHS": marker}):
+            self.assertTrue(cowork._caveman_available())
+
+
+# --------------------------------------------------------------------------- #
+# Surfacing the reviewer/advisor REVIEW turn on the internal channel.           #
+# --------------------------------------------------------------------------- #
+
+
+class ReviewerSurfacingTest(unittest.TestCase):
+    def _paths(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
+        review = os.path.join(d, ".cowork", "scout-review.X.json")
+        scratch = os.path.join(d, ".cowork", "eval.X.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review", "result": {}}, fh)
+        return intel, review, scratch
+
+    def test_review_turn_streams_to_surface_io_out(self):
+        intel, review, _scratch = self._paths()
+        surface = io.StringIO()
+        seen = {}
+
+        def factory(controller, io_out):
+            seen["io_out"] = io_out
+
+            class FakeRevSession:
+                def __init__(self):
+                    self.io_out = io_out
+
+                def send(self, text):
+                    self.io_out.write("reviewer reasoning ")
+                    with open(review, "w") as fh:
+                        json.dump({"verdict": "approve"}, fh)
+
+                def close(self):
+                    pass
+            return FakeRevSession()
+
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        verdict = cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory, surface_io_out=surface)
+        self.assertEqual(verdict["verdict"], "approve")
+        self.assertIs(seen["io_out"], surface)  # surfaced: real io_out, not quiet
+        self.assertIn("reviewer reasoning", surface.getvalue())
+
+    def test_not_surfaced_is_quiet(self):
+        # surface_io_out=None -> the reviewer streams to a quiet sink; a user
+        # io_out would see nothing (byte-identical to the hidden behavior).
+        intel, review, _scratch = self._paths()
+        seen = {}
+
+        def factory(controller, io_out):
+            seen["io_out"] = io_out
+
+            class FakeRevSession:
+                def send(self, text):
+                    with open(review, "w") as fh:
+                        json.dump({"verdict": "approve"}, fh)
+
+                def close(self):
+                    pass
+            return FakeRevSession()
+
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory)
+        self.assertIsInstance(seen["io_out"], cowork._QuietSink)
+
+    def test_eval_stays_muted_when_surfaced(self):
+        intel, review, scratch = self._paths()
+        surface = io.StringIO()
+
+        def factory(controller, io_out):
+            class FakeRevSession:
+                def __init__(self):
+                    self.io_out = io_out
+
+                def send(self, text):
+                    # Visible marker written on EVERY send; the eval send is
+                    # wrapped in _muted_session, so it lands on a quiet sink.
+                    self.io_out.write("MARK ")
+                    if "[private evaluation turn]" in text:
+                        with open(scratch, "w") as fh:
+                            json.dump({"evaluations": []}, fh)
+                    else:
+                        with open(review, "w") as fh:
+                            json.dump({"verdict": "approve"}, fh)
+
+                def close(self):
+                    pass
+            return FakeRevSession()
+
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory, surface_io_out=surface,
+            eval_scratch_path=scratch,
+            eval_specs=[{"evaluatee": "scout", "criteria": ["intel quality"]}])
+        # The review turn was visible exactly once; the eval send was muted.
+        self.assertEqual(surface.getvalue().count("MARK"), 1)
+        self.assertTrue(os.path.exists(scratch))  # eval still produced its file
+
+
+class MakeReviewFnSurfaceTest(unittest.TestCase):
+    def test_test_runner_receives_no_surface_kwarg(self):
+        # A test-injected reviewer_runner (no surface-capable marker) must NOT
+        # receive surface_io_out — its signature stays byte-identical.
+        seen = {}
+
+        def fake_runner(config, context, selected, artifact, review_path,
+                        **kwargs):
+            seen["kwargs"] = kwargs
+            return {"verdict": "approve"}
+
+        fn = cowork.make_review_fn(
+            {}, "ctx", ["scout", "scout-reviewer"], "/r.json",
+            reviewer_runner=fake_runner, surface_io_out=io.StringIO())
+        fn("/artifact", 1)
+        self.assertNotIn("surface_io_out", seen["kwargs"])
+
+    def test_surface_capable_runner_receives_kwarg(self):
+        seen = {}
+
+        def fake_runner(config, context, selected, artifact, review_path,
+                        **kwargs):
+            seen["kwargs"] = kwargs
+            return {"verdict": "approve"}
+        fake_runner._coplan_surface_capable = True
+
+        surface = io.StringIO()
+        fn = cowork.make_review_fn(
+            {}, "ctx", ["scout", "scout-reviewer"], "/r.json",
+            reviewer_runner=fake_runner, surface_io_out=surface)
+        fn("/artifact", 1)
+        self.assertIs(seen["kwargs"].get("surface_io_out"), surface)
 
 
 if __name__ == "__main__":
