@@ -327,38 +327,49 @@ def read_handoff(path):
 
 def review_path_for(intel_dir, session_uuid):
     """Path of the scout-reviewer's verdict file for a session (sibling of the
-    scout intel file)."""
-    return os.path.join(intel_dir, "scout-review.%s.json" % session_uuid)
+    scout intel file). The per-session folder carries the uuid, so the filename
+    does not; `session_uuid` is accepted for call-site stability but unused."""
+    return os.path.join(intel_dir, "scout-review.json")
 
 
 def planner_plan_json_path_for(intel_dir, session_uuid):
     """Path of the planner's JSON plan deliverable (machine source of truth and
-    the planner's status channel)."""
-    return os.path.join(intel_dir, "planner.plan.%s.json" % session_uuid)
+    the planner's status channel). The per-session folder carries the uuid, so
+    the filename does not; `session_uuid` is accepted for call-site stability
+    but unused."""
+    return os.path.join(intel_dir, "planner.plan.json")
 
 
 def planner_plan_md_path_for(intel_dir, session_uuid):
     """Path of the planner's human-first markdown plan (the user's review
-    surface at the plan gate)."""
-    return os.path.join(intel_dir, "planner.plan.%s.md" % session_uuid)
+    surface at the plan gate). The per-session folder carries the uuid, so the
+    filename does not; `session_uuid` is accepted for call-site stability but
+    unused."""
+    return os.path.join(intel_dir, "planner.plan.md")
 
 
 def planner_review_path_for(intel_dir, session_uuid):
     """Path of the planning-advisor's verdict file for a session (sibling of
-    the planner plan files)."""
-    return os.path.join(intel_dir, "planner-review.%s.json" % session_uuid)
+    the planner plan files). The per-session folder carries the uuid, so the
+    filename does not; `session_uuid` is accepted for call-site stability but
+    unused."""
+    return os.path.join(intel_dir, "planner-review.json")
 
 
 def build_status_path_for(intel_dir, session_uuid):
     """Path of the builder's status JSON for a session (the builder's status
-    channel and verification log; sibling of the plan files)."""
-    return os.path.join(intel_dir, "builder.status.%s.json" % session_uuid)
+    channel and verification log; sibling of the plan files). The per-session
+    folder carries the uuid, so the filename does not; `session_uuid` is
+    accepted for call-site stability but unused."""
+    return os.path.join(intel_dir, "builder.status.json")
 
 
 def build_review_path_for(intel_dir, session_uuid):
     """Path of the build-reviewer's verdict file for a session (sibling of the
-    builder status file)."""
-    return os.path.join(intel_dir, "builder-review.%s.json" % session_uuid)
+    builder status file). The per-session folder carries the uuid, so the
+    filename does not; `session_uuid` is accepted for call-site stability but
+    unused."""
+    return os.path.join(intel_dir, "builder-review.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -376,8 +387,11 @@ def build_review_path_for(intel_dir, session_uuid):
 
 def eval_scratch_path_for(intel_dir, role, session_uuid):
     """Path of `role`'s private evaluation scratch file for a session
-    (overwritten each eval turn; sibling of the other session assets)."""
-    return os.path.join(intel_dir, "eval.%s.%s.json" % (role, session_uuid))
+    (overwritten each eval turn; sibling of the other session assets). The
+    per-session folder carries the uuid, so the filename does not; `role` stays
+    in the name to keep the two evaluators' scratch files distinct, while
+    `session_uuid` is accepted for call-site stability but unused."""
+    return os.path.join(intel_dir, "eval.%s.json" % role)
 
 
 def session_assets_dir(session_uuid):

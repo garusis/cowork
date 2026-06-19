@@ -56,6 +56,14 @@ BUILD_REVIEWER_PROMPT_PATH = os.path.join(
 # scout-reviewer and the planning-advisor.
 REVIEW_ROUND_CAP = 5
 
+# Max CONSECUTIVE reviewer turns with no usable verdict (account limit, crash,
+# empty/garbled write) before cowork surfaces the visible reviewer-failure gate
+# (retry / skip-review / end). Mirrors the user-facing stuck gate's "2 failing
+# tries" — one silent auto-retry of the reviewer, then the gate. Distinct from
+# REVIEW_ROUND_CAP, which bounds a reviewer that legitimately keeps requesting
+# changes. Shared by all three paired reviewers.
+REVIEW_FAIL_CAP = 2
+
 # Role order matches the user's vision and the phase order: context-gather
 # (scouting), planning, building. Each user-facing role is followed by its
 # paired critical reviewer. All three phases — `scout`/`scout-reviewer`,
@@ -316,7 +324,9 @@ def apply_config_args(config, config_args):
 
 
 def scout_intel_path(intel_dir, session_uuid):
-    return os.path.join(intel_dir, "scout.intel.%s.json" % session_uuid)
+    # The per-session folder carries the uuid, so the filename does not;
+    # `session_uuid` is accepted for call-site stability but unused.
+    return os.path.join(intel_dir, "scout.intel.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -1677,7 +1687,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
 # non-TTY/test path can assert them.
 
 
-def scout_start_text(intel_path, resuming=False):
+def scout_start_text(intel_path, resuming=False, enabled=False):
     if resuming:
         head = (
             "scout — resuming our previous session\n"
@@ -1691,22 +1701,23 @@ def scout_start_text(intel_path, resuming=False):
             "I'll investigate, ask what I need, and propose options. I finish on my\n"
             "own once we agree. You drive — answer my questions. Ctrl-C aborts."
         )
-    return head + "\nintel → %s" % intel_path
+    return head + "\nintel → %s" % ui.render_path(intel_path, enabled)
 
 
 def scout_needs_input_text():
     return "scout needs your input"
 
 
-def scout_review_text(intel_path):
-    return "scout intel ready for review — %s" % ui.shorten_path(intel_path)
+def scout_review_text(intel_path, enabled=False):
+    return "scout intel ready for review — %s" % ui.render_path(
+        intel_path, enabled)
 
 
-def scout_done_text(intel_path):
-    return "scout finished — intel → %s" % ui.shorten_path(intel_path)
+def scout_done_text(intel_path, enabled=False):
+    return "scout finished — intel → %s" % ui.render_path(intel_path, enabled)
 
 
-def planner_start_text(plan_md_path, resuming=False):
+def planner_start_text(plan_md_path, resuming=False, enabled=False):
     if resuming:
         head = (
             "planner — resuming our previous planning session\n"
@@ -1718,19 +1729,20 @@ def planner_start_text(plan_md_path, resuming=False):
             "I'll draft the plan, ask what I need, and mark it ready when we "
             "agree. You drive — answer my questions. Ctrl-C aborts."
         )
-    return head + "\nplan → %s" % plan_md_path
+    return head + "\nplan → %s" % ui.render_path(plan_md_path, enabled)
 
 
 def planner_needs_input_text():
     return "planner needs your input"
 
 
-def planner_review_text(plan_md_path):
-    return "plan ready for review — %s" % ui.shorten_path(plan_md_path)
+def planner_review_text(plan_md_path, enabled=False):
+    return "plan ready for review — %s" % ui.render_path(plan_md_path, enabled)
 
 
-def planner_done_text(plan_md_path):
-    return "planner finished — plan approved → %s" % ui.shorten_path(plan_md_path)
+def planner_done_text(plan_md_path, enabled=False):
+    return "planner finished — plan approved → %s" % ui.render_path(
+        plan_md_path, enabled)
 
 
 def handoff_gate_text(payload):
@@ -1738,7 +1750,7 @@ def handoff_gate_text(payload):
             "handoff note:\n%s" % (payload or "").strip())
 
 
-def builder_start_text(build_status_path, resuming=False):
+def builder_start_text(build_status_path, resuming=False, enabled=False):
     if resuming:
         head = (
             "builder — resuming our previous build session\n"
@@ -1750,20 +1762,21 @@ def builder_start_text(build_status_path, resuming=False):
             "I'll make the changes, verify them, and mark the build ready when "
             "it's done. You drive — answer my questions. Ctrl-C aborts."
         )
-    return head + "\nstatus → %s" % build_status_path
+    return head + "\nstatus → %s" % ui.render_path(build_status_path, enabled)
 
 
 def builder_needs_input_text():
     return "builder needs your input"
 
 
-def builder_review_text(build_status_path):
-    return "build ready for review — %s" % ui.shorten_path(build_status_path)
+def builder_review_text(build_status_path, enabled=False):
+    return "build ready for review — %s" % ui.render_path(
+        build_status_path, enabled)
 
 
-def builder_done_text(build_status_path):
+def builder_done_text(build_status_path, enabled=False):
     return ("builder finished — review your working tree → %s"
-            % ui.shorten_path(build_status_path))
+            % ui.render_path(build_status_path, enabled))
 
 
 def builder_handoff_gate_text(payload):
@@ -1890,20 +1903,22 @@ def _repair_prompt(artifact_noun):
         % (artifact_noun, artifact_noun))
 
 
-def _stuck_gate_text(status_path, role):
+def _stuck_gate_text(status_path, role, enabled=False):
     """The banner shown at the visible stuck gate."""
     return (
         "the %s appears stuck — it reopened work but its status file did not "
         "change across an automatic repair attempt.\n  status file: %s\n"
         "choose: retry (run it once more), inspect (show the status file), or "
-        "end (end this phase cleanly)." % (role, status_path))
+        "end (end this phase cleanly)." % (role, ui.render_path(
+            status_path, enabled)))
 
 
 def _emit_stuck_inspect(io_out, status_path):
     """Print the diagnostic for the stuck-gate `inspect` action: the artifact
     path, its current on-disk status field, and the raw file content. Read-only
     — never runs the role."""
-    io_out.write("status file: %s\n" % status_path)
+    io_out.write("status file: %s\n" % ui.render_path(
+        status_path, ui.is_tty(io_out)))
     io_out.write("on-disk status: %s\n" % state_store.read_status(status_path))
     try:
         with open(status_path, "r") as fh:
@@ -1938,6 +1953,79 @@ def _read_stuck_gate(io_in, io_out):
     if token == "inspect":
         return _STUCK_INSPECT
     return _STUCK_END
+
+
+# Returned by the reviewer-failure gate reader (the visible escalation shown when
+# the paired reviewer/advisor fails to return a usable verdict REVIEW_FAIL_CAP
+# times running — an account limit, a crash, or an empty/garbled write — distinct
+# from a reviewer that legitimately keeps asking for changes, which the
+# REVIEW_ROUND_CAP dissent path already handles).
+_REVFAIL_RETRY = object()
+_REVFAIL_SKIP = object()
+_REVFAIL_END = object()
+
+
+def _is_review_failure(verdict):
+    """Whether a reviewer turn produced NO USABLE verdict — the failure mode the
+    reviewer-failure gate counts, as opposed to a reviewer that legitimately asks
+    for changes.
+
+    True when ANY of: the verdict is missing/empty or carries no 'verdict' key;
+    its value is not one of `state_store.VALID_VERDICTS`; it is 'needs_user' with
+    a blank/absent 'user_question' (cannot be relayed faithfully); or it is
+    flagged `malformed` (read_review's safe-revise coercion of an
+    unparseable/missing review). A genuine 'approve'/'revise'/valid 'needs_user'
+    (non-blank question) is NOT a failure. Validated directly against the verdict
+    contract (not the looser '(not verdict.get("verdict")) or malformed') so an
+    unknown verdict value or a question-less needs_user is caught even on an
+    injected/direct verdict dict that bypassed read_review."""
+    if not isinstance(verdict, dict) or not verdict:
+        return True
+    v = verdict.get("verdict")
+    if v not in state_store.VALID_VERDICTS:
+        return True
+    if v == "needs_user" and not str(verdict.get("user_question") or "").strip():
+        return True
+    if verdict.get("malformed"):
+        return True
+    return False
+
+
+def _reviewer_fail_gate_text(reviewer_role, role):
+    """The banner shown at the visible reviewer-failure gate."""
+    return (
+        "the %s could not return a usable verdict (account limit, crash, or an "
+        "empty/garbled write) across %d tries — it is not reviewing the %s's "
+        "work.\nchoose: retry (run the reviewer once more), skip-review (stop "
+        "reviewing for the rest of this phase and go straight to the approve/"
+        "revise gate), or end (end this phase cleanly)."
+        % (reviewer_role, REVIEW_FAIL_CAP, role))
+
+
+def _read_reviewer_fail_gate(io_in, io_out):
+    """Read the reviewer-failure-gate choice. On a TTY a 3-way questionary
+    select; off a TTY a readline where `retry`/`end` map to those actions and
+    anything else (including blank/EOF) skips the review — the safe default so a
+    scripted/test path is never trapped AND a broken reviewer never blocks a
+    headless run (skip-review then reaches the user gate, which off a TTY reads
+    blank=approve, preserving the historical 'scripted runs complete' contract).
+
+    Returns one of `_REVFAIL_RETRY`, `_REVFAIL_SKIP`, `_REVFAIL_END`."""
+    if ui.is_tty(io_in) and ui.is_tty(io_out):
+        choice = ui.select(
+            "The reviewer isn't returning a usable verdict — what now?",
+            [("retry", "Run the reviewer once more"),
+             ("skip-review", "Skip review for this phase — go to approve/revise"),
+             ("end", "End this phase")])
+        return {"retry": _REVFAIL_RETRY, "skip-review": _REVFAIL_SKIP,
+                "end": _REVFAIL_END}.get(choice, _REVFAIL_SKIP)
+    line = io_in.readline()
+    token = line.strip().lower()
+    if token == "retry":
+        return _REVFAIL_RETRY
+    if token == "end":
+        return _REVFAIL_END
+    return _REVFAIL_SKIP
 
 
 def _read_handoff_confirm(io_in, io_out, prompt="Hand the work back to the scout?"):
@@ -2011,6 +2099,12 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     in_repair = False
     repair_reason = None  # reopen reason carried into the repair/escalation
     review_rounds = 0
+    # Consecutive reviewer turns with no usable verdict (reset by a usable
+    # verdict or by user re-engagement); once `skip_review` is set at the
+    # reviewer-failure gate it stays set for the rest of this phase, bypassing
+    # the reviewer straight to the user gate.
+    review_failures = 0
+    skip_review = False
     outcome_kind = "ended"
     payload = None
     try:
@@ -2086,8 +2180,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 in_repair = False
                 gate_decision = None
                 while gate_decision is None:
-                    ui.banner(io_out, _stuck_gate_text(status_path, role),
-                              "dissent")
+                    ui.banner(io_out, _stuck_gate_text(
+                        status_path, role, ui.is_tty(io_out)), "dissent")
                     action = _read_stuck_gate(io_in, io_out)
                     if action is _STUCK_INSPECT:
                         if trace:
@@ -2162,57 +2256,109 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 dissent = ""
                 dissent_verdict = None
                 # Reviewer gate (topology D): runs transparently before the user.
-                if review_fn is not None and review_rounds < REVIEW_ROUND_CAP:
+                # `skip_review` (latched at the reviewer-failure gate) bypasses it
+                # for the rest of the phase, straight to the user gate.
+                if review_fn is not None and not skip_review and \
+                        review_rounds < REVIEW_ROUND_CAP:
                     review_rounds += 1
                     if trace:
                         trace.event("review.round.start", role=reviewer_role,
                                     round=review_rounds,
                                     round_cap=REVIEW_ROUND_CAP)
-                    # The review turn now streams on the internal channel (the
-                    # bridge raises its own pre-first-token spinner on io_out);
-                    # no outer \r-frame spinner here — it would collide with the
-                    # Live region the bridge opens on the same io_out. The muted
-                    # probe/eval inside the pass need no visible spinner.
-                    verdict = review_fn(status_path, review_rounds) or {}
-                    if trace:
-                        trace.event(
-                            "review.verdict", role=reviewer_role,
-                            round=review_rounds, verdict=verdict.get("verdict"),
-                            has_question=bool(str(
-                                verdict.get("user_question") or "").strip()),
-                            findings_count=len(verdict.get("findings") or []),
-                            malformed=bool(verdict.get("malformed")))
-                    ui.banner(io_out, scout_reviewed_text(
-                        verdict, review_rounds, REVIEW_ROUND_CAP), "info")
-                    if evaluate_fn is not None:
-                        try:
-                            with ui.Spinner(io_out,
-                                            label="scoring this round"):
-                                evaluate_fn(session, verdict, review_rounds)
-                        except Exception:  # noqa: BLE001 - observational only
-                            if trace:
-                                trace.event("eval.error", evaluator=role,
-                                            round=review_rounds)
-                    v = verdict.get("verdict")
-                    has_question = bool(str(verdict.get("user_question") or "").strip())
-                    if v == "approve":
-                        # Only an explicit approve reaches the user gate.
-                        review_rounds = 0
-                    elif v == "needs_user" and has_question:
-                        review_rounds = 0
-                        pending = assemble_reviewer_handoff(
-                            "needs_user", verdict, artifact=artifact_noun)
-                        pending_reopens_work = True
-                        pending_reopen_reason = "reviewer_needs_user"
+                    # None: fall through to the user gate this round.
+                    # "continue"/"end": act on the OUTER loop after the inner one.
+                    review_action = None
+                    # Inner loop so a reviewer-failure RETRY (and the one silent
+                    # auto-retry) re-runs the reviewer in place — same round, no
+                    # bounce through the role.
+                    while True:
+                        # The review turn streams on the internal channel (the
+                        # bridge raises its own pre-first-token spinner on io_out);
+                        # no outer \r-frame spinner here — it would collide with the
+                        # Live region the bridge opens on the same io_out. The muted
+                        # probe/eval inside the pass need no visible spinner.
+                        verdict = review_fn(status_path, review_rounds) or {}
                         if trace:
-                            trace.event("review.handoff", from_role=reviewer_role,
-                                        to_role=role, kind="needs_user")
-                        continue
-                    else:
-                        # revise, an unknown/empty verdict (missing or unreadable
-                        # review file), or needs_user without a question: the safe
-                        # non-approving default — never silently approve.
-                        if review_rounds < REVIEW_ROUND_CAP:
+                            trace.event(
+                                "review.verdict", role=reviewer_role,
+                                round=review_rounds,
+                                verdict=verdict.get("verdict"),
+                                has_question=bool(str(
+                                    verdict.get("user_question") or "").strip()),
+                                findings_count=len(verdict.get("findings") or []),
+                                malformed=bool(verdict.get("malformed")))
+                        # No usable verdict (account limit, crash, empty/garbled
+                        # write): count it. One silent auto-retry, then the gate.
+                        if _is_review_failure(verdict):
+                            review_failures += 1
+                            if trace:
+                                trace.event(
+                                    "review.failure", role=reviewer_role,
+                                    round=review_rounds,
+                                    consecutive=review_failures,
+                                    fail_cap=REVIEW_FAIL_CAP)
+                            if review_failures < REVIEW_FAIL_CAP:
+                                # Silent auto-retry of the reviewer (mirrors the
+                                # stuck gate's one automatic repair attempt).
+                                continue
+                            ui.banner(io_out, _reviewer_fail_gate_text(
+                                reviewer_role, role), "dissent")
+                            decision = _read_reviewer_fail_gate(io_in, io_out)
+                            if decision is _REVFAIL_RETRY:
+                                # Re-run the reviewer, SAME round, counter kept —
+                                # re-shows the gate if it fails again.
+                                if trace:
+                                    trace.event("user.action", role=role,
+                                                action="review_fail_retry")
+                                continue
+                            if decision is _REVFAIL_SKIP:
+                                # Stop reviewing for the rest of this phase; fall
+                                # through to the normal approve/revise gate.
+                                if trace:
+                                    trace.event("user.action", role=role,
+                                                action="review_fail_skip")
+                                skip_review = True
+                                review_failures = 0
+                                break
+                            # _REVFAIL_END: end this phase cleanly, like EOF.
+                            if trace:
+                                trace.event("user.action", role=role,
+                                            action="review_fail_end")
+                            review_action = "end"
+                            break
+                        # Usable verdict: clear the failure counter and branch.
+                        review_failures = 0
+                        ui.banner(io_out, scout_reviewed_text(
+                            verdict, review_rounds, REVIEW_ROUND_CAP), "info")
+                        if evaluate_fn is not None:
+                            try:
+                                with ui.Spinner(io_out,
+                                                label="scoring this round"):
+                                    evaluate_fn(session, verdict, review_rounds)
+                            except Exception:  # noqa: BLE001 - observational only
+                                if trace:
+                                    trace.event("eval.error", evaluator=role,
+                                                round=review_rounds)
+                        v = verdict.get("verdict")
+                        has_question = bool(str(
+                            verdict.get("user_question") or "").strip())
+                        if v == "approve":
+                            # Only an explicit approve reaches the user gate.
+                            review_rounds = 0
+                        elif v == "needs_user" and has_question:
+                            review_rounds = 0
+                            pending = assemble_reviewer_handoff(
+                                "needs_user", verdict, artifact=artifact_noun)
+                            pending_reopens_work = True
+                            pending_reopen_reason = "reviewer_needs_user"
+                            if trace:
+                                trace.event("review.handoff",
+                                            from_role=reviewer_role,
+                                            to_role=role, kind="needs_user")
+                            review_action = "continue"
+                        elif review_rounds < REVIEW_ROUND_CAP:
+                            # A legitimate revise (reviewer wants changes): hand
+                            # back to the role for another pass.
                             pending = assemble_reviewer_handoff(
                                 "revise", verdict, artifact=artifact_noun)
                             pending_reopens_work = True
@@ -2221,20 +2367,29 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 trace.event("review.handoff",
                                             from_role=reviewer_role,
                                             to_role=role, kind="revise")
-                            continue
-                        # Cap reached without approval: fall through to the user
-                        # with the reviewer's unresolved dissent attached (D5).
-                        dissent = _dissent_suffix(verdict)
-                        dissent_verdict = verdict
-                        review_rounds = 0
-                        if trace:
-                            trace.event("review.round_cap", role=reviewer_role,
-                                        round_cap=REVIEW_ROUND_CAP)
+                            review_action = "continue"
+                        else:
+                            # Round cap reached on a legitimate revise: fall
+                            # through to the user with the dissent attached (D5).
+                            dissent = _dissent_suffix(verdict)
+                            dissent_verdict = verdict
+                            review_rounds = 0
+                            if trace:
+                                trace.event("review.round_cap",
+                                            role=reviewer_role,
+                                            round_cap=REVIEW_ROUND_CAP)
+                        break
+                    if review_action == "continue":
+                        continue
+                    if review_action == "end":
+                        outcome_kind = "ended"
+                        break
                 if trace:
                     trace.event("gate.show", role=role,
                                 gate="ready_for_review", path=status_path,
                                 has_dissent=bool(dissent))
-                ui.banner(io_out, review_text(status_path) + dissent,
+                ui.banner(io_out,
+                          review_text(status_path, ui.is_tty(io_out)) + dissent,
                           "dissent" if dissent else "review")
                 if dissent:
                     outcome = _read_review_dissent(io_in, io_out)
@@ -2252,6 +2407,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     pending_reopens_work = True
                     pending_reopen_reason = "user_iterate"
                     review_rounds = 0  # user re-engaged: fresh review budget
+                    review_failures = 0  # and a fresh reviewer-failure budget
                     continue
                 if outcome is _END:
                     if trace:
@@ -2259,7 +2415,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     action="approve", gate="ready_for_review")
                         trace.event("gate.show", role=role, gate="done",
                                     path=status_path)
-                    ui.banner(io_out, done_text(status_path), "done")
+                    ui.banner(io_out, done_text(
+                        status_path, ui.is_tty(io_out)), "done")
                     outcome_kind = "approved"
                     break
                 pending = outcome  # revision feedback → another turn
@@ -2270,6 +2427,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 pending_reopens_work = True
                 pending_reopen_reason = "user_revise"
                 review_rounds = 0  # user re-engaged: fresh review budget
+                review_failures = 0  # and a fresh reviewer-failure budget
             else:
                 if status == "needs_input":
                     review_rounds = 0  # role re-opened work: fresh review budget
@@ -2500,8 +2658,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         trace.event("role.start", role="scout", controller=cfg["controller"],
                     resume=bool(resume_id), intel_path=intel_path,
                     review_path=review_path)
-    ui.banner(io_out, scout_start_text(intel_path or "", resuming=bool(resume_id)),
-              "start")
+    ui.banner(io_out, scout_start_text(intel_path or "", resuming=bool(resume_id),
+                                       enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
 
     if cfg["controller"] == "claude":
@@ -2621,7 +2779,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                     resume=bool(resume_id), plan_json_path=plan_json_path,
                     plan_md_path=plan_md_path, review_path=review_path)
     ui.banner(io_out, planner_start_text(plan_md_path or "",
-                                         resuming=bool(resume_id)), "start")
+                                         resuming=bool(resume_id),
+                                         enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
 
     def report(outcome, payload):
@@ -2632,8 +2791,9 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         role="planner", review_fn=review_fn, trace=trace,
         reviewer_role=PLANNING_ADVISOR,
         needs_input_text=planner_needs_input_text,
-        review_text=lambda _p: planner_review_text(plan_md_path or ""),
-        done_text=lambda _p: planner_done_text(plan_md_path or ""),
+        review_text=lambda _p, en=False: planner_review_text(
+            plan_md_path or "", en),
+        done_text=lambda _p, en=False: planner_done_text(plan_md_path or "", en),
         artifact_noun="plan",
         handoff_enabled=True, handoff_confirm=handoff_confirm,
         evaluate_fn=evaluate_fn)
@@ -2765,7 +2925,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                     resume=bool(resume_id), build_status_path=build_status_path,
                     review_path=build_review_path)
     ui.banner(io_out, builder_start_text(build_status_path or "",
-                                         resuming=bool(resume_id)), "start")
+                                         resuming=bool(resume_id),
+                                         enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
 
     def report(outcome, payload):
@@ -2776,8 +2937,10 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         role="builder", review_fn=review_fn, trace=trace,
         reviewer_role=BUILD_REVIEWER,
         needs_input_text=builder_needs_input_text,
-        review_text=lambda _p: builder_review_text(build_status_path or ""),
-        done_text=lambda _p: builder_done_text(build_status_path or ""),
+        review_text=lambda _p, en=False: builder_review_text(
+            build_status_path or "", en),
+        done_text=lambda _p, en=False: builder_done_text(
+            build_status_path or "", en),
         artifact_noun="build",
         handoff_enabled=True, handoff_confirm=handoff_confirm,
         handoff_gate_text_fn=builder_handoff_gate_text,

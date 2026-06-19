@@ -63,24 +63,86 @@ def label(name, enabled):
     return colorize(plain, ROLE_COLORS.get(name, GREEN), enabled)
 
 
-def shorten_path(path, cwd=None):
-    """A short, scannable form of an intel path: relative to cwd when it sits
-    under it, else '…/<basename>'. Used everywhere except the one full mention."""
+def display_path(path):
+    """Collapse a leading $HOME prefix to '~' so a home-rooted path renders short
+    and scannable (e.g. '~/.cowork/sessions/<id>/planner.plan.md'). A path that
+    is exactly home becomes '~'; a path not under home is returned unchanged."""
     if not path:
         return path
-    import os
+    home = os.path.expanduser("~")
+    if not home or home == "~":
+        return path
+    if path == home:
+        return "~"
+    prefix = home + os.sep
+    if path.startswith(prefix):
+        return "~" + os.sep + path[len(prefix):]
+    return path
+
+
+def hyperlink(text, target_abspath, enabled):
+    """Layer an OSC 8 hyperlink to file://<abs> over `text` when enabled (a TTY).
+    The visible characters are unchanged in both cases — capable terminals make
+    `text` clickable; everywhere else (and off a TTY) `text` is returned plain so
+    the short path stays copy-pasteable. Width-correct: terminals and Rich size
+    on the visible text, not the escape."""
+    if not enabled or not target_abspath:
+        return text
+    target = os.path.abspath(target_abspath)
+    return "\033]8;;file://%s\033\\%s\033]8;;\033\\" % (target, text)
+
+
+def _path_display(path, cwd=None):
+    """The short display string for a path: cwd-relative when it sits under cwd,
+    else '~/…' when under home, else '…/<basename>'. (No linking — see
+    `render_path`.)"""
+    if not path:
+        return path
     cwd = cwd or os.getcwd()
     try:
         rel = os.path.relpath(path, cwd)
     except ValueError:  # different drive on Windows, etc.
-        return path
-    if not rel.startswith(".."):
+        rel = None
+    if rel is not None and not rel.startswith(".."):
         return rel
+    home = display_path(path)
+    if home != path:
+        return home
     return "…/" + os.path.basename(path)
+
+
+def render_path(path, enabled=False, cwd=None):
+    """The user-facing rendering of a filesystem path: the short display form
+    (`_path_display`) wrapped in an OSC 8 hyperlink to the absolute file on a TTY.
+    The single helper every banner/notice path should use so the '~' form and the
+    clickable link are consistent everywhere."""
+    if not path:
+        return path
+    return hyperlink(_path_display(path, cwd), path, enabled)
+
+
+def shorten_path(path, cwd=None):
+    """A short, scannable form of a path: relative to cwd when it sits under it,
+    else '~/…' for a home-rooted path, else '…/<basename>'. Linking-free; callers
+    that also want a clickable target use `render_path`."""
+    return _path_display(path, cwd)
 
 
 def turn_separator(io_out, enabled=None):
     """A faint rule between turns. No-op when not a TTY (keeps test output clean)."""
+    enabled = is_tty(io_out) if enabled is None else enabled
+    if not enabled:
+        return
+    io_out.write("\n" + colorize("─" * 48, DIM, True) + "\n")
+    io_out.flush()
+
+
+def internal_lead_in(io_out, enabled=None):
+    """A faint lead-in (blank line + dim rule) printed just above a surfaced
+    internal block — the reviewer/advisor's dim channel — so it gets breathing
+    room from the agent text above instead of crowding it. No-op when not a TTY
+    (byte-identical output, exactly like turn_separator), so the scripted/test
+    paths are unchanged."""
     enabled = is_tty(io_out) if enabled is None else enabled
     if not enabled:
         return
@@ -395,6 +457,12 @@ class StreamingMarkdown:
         if self.tty:
             from rich.live import Live
             from rich.markdown import Markdown
+            # A surfaced internal region (reviewer/advisor) gets a faint lead-in
+            # gap above its label so the dim channel doesn't crowd the agent text
+            # before it. Rendered once, here, above the label (no-op off a TTY,
+            # which never reaches this branch).
+            if self.internal:
+                internal_lead_in(self.io_out, True)
             self.io_out.write("\n" + self.label_text + "\n")
             self.io_out.flush()
             self._console = _rich_console(self.io_out, size=size)

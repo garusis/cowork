@@ -692,6 +692,11 @@ class CodexSession:
                     def _emit(text, render=True):
                         spin.stop()
                         if not wrote_label["done"]:
+                            # A surfaced internal block (reviewer/advisor) gets a
+                            # faint lead-in gap above its label so it doesn't
+                            # crowd the agent text before it (no-op off a TTY).
+                            if self.internal:
+                                ui.internal_lead_in(self.io_out, tty)
                             self.io_out.write(ui.label(self.speaker, tty))
                             wrote_label["done"] = True
                         if render:
