@@ -73,6 +73,19 @@ Keep it current — overwrite it as the build progresses. `result.verification`
 is the record of the plan's verification commands you ran (see below);
 `classification` is present only on a command that failed.
 
+### Also: the build summary (`builder.summary.md`)
+
+When a summary-file path is named in your first message, you **also** emit a
+human-first Markdown summary of the build at your self-audit — the turn you mark
+`ready_for_review`. It is the user's review surface for the build (mirrors the
+planner's `plan.md`); the build-reviewer reads it and **consistency-checks it
+against the actual working-tree delta and your status JSON** before it reaches
+the user, so it must not under- or mis-report what you built. Use small,
+scannable sections: a TL;DR; the changes by file; the verification results; any
+issues & deviations from the plan; and anything left for the user. The status
+JSON stays the machine source of truth; the summary is the readable companion.
+It is a deliverable, not a write restriction — you still edit the whole repo.
+
 > **Backup check (secondary — not your primary safety net):** before you tell
 > the user in chat that the build is ready, re-read the **literal** `status`
 > field on disk in the status file and confirm it actually says

@@ -413,9 +413,15 @@ def caveman_directive(available=None):
     )
 
 
-def assemble_scout_brief(selected, intel_path, caveman_available=None):
+def assemble_scout_brief(selected, intel_path, intel_md_path=None,
+                         caveman_available=None):
     """Dynamic first-message brief for the scout: where to write, the JSON +
-    domain guardrail, and the plan-only fallthrough for this team."""
+    domain guardrail, and the plan-only fallthrough for this team.
+
+    When `intel_md_path` is given, the scout writes TWO files: the JSON (machine
+    source of truth + status channel) and a human-first markdown rendering (the
+    user's review surface, also reviewed by the scout-reviewer). Both are the
+    scout's write targets and nothing else."""
     if "planner" in selected:
         plan_note = (
             "A dedicated `planner` role is on the team: stop at the intel file "
@@ -426,13 +432,28 @@ def assemble_scout_brief(selected, intel_path, caveman_available=None):
             "NO `planner` role is on the team: in the same intel JSON, also "
             "include a lightweight plan/handoff."
         )
-    return (
-        "Write your findings as a single JSON object to exactly this file:\n"
-        "  %s\n"
-        "That intel file is your ONLY write target. Do not create, edit, or "
-        "delete any other file (reading/searching the repo is fine).\n"
-        "%s\n\n%s" % (intel_path, plan_note, caveman_directive(caveman_available))
-    )
+    if intel_md_path:
+        target = (
+            "Write your findings as TWO files, to exactly these paths:\n"
+            "  JSON (machine source of truth + your status channel): %s\n"
+            "  Markdown (the user's review surface, small scannable sections): "
+            "%s\n"
+            "Those two intel files are your ONLY write targets. Do not create, "
+            "edit, or delete any other file (reading/searching the repo is "
+            "fine). Keep the markdown CONSISTENT with the JSON — it must not "
+            "under- or mis-report what the JSON says."
+            % (intel_path, intel_md_path)
+        )
+    else:
+        target = (
+            "Write your findings as a single JSON object to exactly this file:\n"
+            "  %s\n"
+            "That intel file is your ONLY write target. Do not create, edit, or "
+            "delete any other file (reading/searching the repo is fine)."
+            % intel_path
+        )
+    return "%s\n%s\n\n%s" % (
+        target, plan_note, caveman_directive(caveman_available))
 
 
 def read_scout_prompt(path=SCOUT_PROMPT_PATH):
@@ -465,7 +486,8 @@ def read_scout_reviewer_prompt(path=SCOUT_REVIEWER_PROMPT_PATH):
         return fh.read()
 
 
-def assemble_reviewer_brief(review_path, protected="the scout intel file",
+def assemble_reviewer_brief(review_path,
+                            protected="the scout intel files (JSON and markdown)",
                             caveman_available=None):
     """The reviewer's write-target instruction — its analogue of the scout brief.
     It points at the review file only (never the reviewed artifact, named by
@@ -481,14 +503,31 @@ def assemble_reviewer_brief(review_path, protected="the scout intel file",
     )
 
 
-def assemble_reviewer_context(context, selected, intel_path):
+def assemble_reviewer_context(context, selected, intel_path, intel_md_path=None):
     """The reviewer's situational context: the SAME initial `context` the scout
-    received, the team framing, and the scout's current intel JSON to review.
+    received, the team framing, and the scout's current intel to review.
+
+    When `intel_md_path` is given, BOTH the intel JSON (machine source of truth)
+    and the intel markdown (the user's review surface) are embedded, so the
+    scout-reviewer reviews both and can check the markdown stays CONSISTENT with
+    the JSON (it must not under- or mis-report it).
 
     Deliberately excludes the scout's write-target `brief` / `first` payload —
     that carries the scout's own guardrail and would mis-instruct the reviewer."""
     intel_text = _read_text(intel_path)
     team = ", ".join(selected) if selected else "(unspecified)"
+    if intel_md_path:
+        return (
+            "Shared initial context — this is the SAME context the scout was "
+            "given:\n%s\n\n"
+            "Team on this session: %s\n\n"
+            "The scout's current intel JSON (the machine source of truth — "
+            "review it critically against the context above):\n%s\n\n"
+            "The scout's current intel markdown (the user's review surface — "
+            "check it stays small, scannable, and CONSISTENT with the JSON):\n%s"
+            % (context.strip(), team, intel_text.strip(),
+               _read_text(intel_md_path).strip())
+        )
     return (
         "Shared initial context — this is the SAME context the scout was given:\n"
         "%s\n\n"
@@ -549,6 +588,16 @@ def scout_reviewed_text(verdict=None, round_index=None, round_cap=None):
     if v == "needs_user":
         return "reviewed: needs user input" + counter
     return "reviewed" + counter
+
+
+def review_skipped_text():
+    """Marker shown to the user when the paired reviewer turn is SKIPPED by the
+    hash-gate: the lead's reviewed artifact set is byte-identical to what that
+    reviewer last approved this phase, so the prior approval is reused (D6).
+
+    Content-free and single-voice (modeled on scout_reviewed_text); never a
+    silent bypass. The substring 'review skipped' is asserted by tests."""
+    return "review skipped — unchanged since last approved"
 
 
 class _QuietSink:
@@ -796,21 +845,26 @@ def _consumed_upstream_spec(consumed, scores_path, evaluator, round_index):
     return spec
 
 
-def _scout_consumed_upstream(intel_path, planning_epoch):
+def _scout_consumed_upstream(intel_path, planning_epoch, intel_md_path=None):
     """The consumed-upstream descriptor for the planning phase: the planner
-    and planning-advisor scoring the approved scout intel once per phase. A
-    literal re-statement of the behavior that used to be hard-coded, so the
-    planning-phase eval flow is unchanged."""
+    and planning-advisor scoring the approved scout intel once per phase. When
+    `intel_md_path` is given, BOTH intel files (JSON, then markdown) are the
+    consumed artifact, so the downstream eval evidence covers both."""
     if intel_path is None:
         return None
+    paths = [p for p in (intel_path, intel_md_path) if p]
+    embed = (
+        "The approved scout intel this phase consumed (intel JSON, then intel "
+        "markdown):\n%s" if intel_md_path
+        else "The approved scout intel JSON this phase consumed:\n%s")
     return {
         "role": "scout",
         "label": "scout intel",
-        "artifact_paths": [intel_path],
+        "artifact_paths": paths,
         "epoch_field": "planning_epoch",
         "epoch_value": planning_epoch,
         "context": "consumed-intel",
-        "embed": "The approved scout intel JSON this phase consumed:\n%s",
+        "embed": embed,
     }
 
 
@@ -876,7 +930,7 @@ def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
 
 def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
                       session_uuid, intel_path=None, planning_epoch=None,
-                      consumed_upstream=None, trace=None):
+                      consumed_upstream=None, trace=None, intel_md_path=None):
     """Build the role-side `evaluate_fn(session, verdict, round_index)` for
     `_role_loop`, or None when eval is not wired (missing paths).
 
@@ -895,7 +949,8 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
     if not (scratch_path and scores_path and session_uuid):
         return None
     if consumed_upstream is None:
-        consumed_upstream = _scout_consumed_upstream(intel_path, planning_epoch)
+        consumed_upstream = _scout_consumed_upstream(
+            intel_path, planning_epoch, intel_md_path)
     consumed_done = {"done": consumed_upstream is None}
 
     def evaluate_fn(session, verdict, round_index):
@@ -959,19 +1014,66 @@ def context_update_block(text):
     )
 
 
-def assemble_reviewer_resume_context(intel_path, context_update=None):
+def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
+                                     context_update=None):
     """Lighter context for a RESUMED reviewer session: its thread already holds
     the role + the prior context, so only the updated intel is sent — plus a
     context-update wake block when the session context changed since the
-    reviewer last acknowledged it."""
-    body = (
-        "The scout has updated its intel since your last review. Re-review the "
-        "current intel below against the current task context, and write your "
-        "verdict to the review file again:\n%s" % _read_text(intel_path).strip()
-    )
+    reviewer last acknowledged it. When `intel_md_path` is given, BOTH the
+    updated intel JSON and markdown are sent (the reviewer reviews both)."""
+    if intel_md_path:
+        body = (
+            "The scout has updated its intel since your last review. Re-review "
+            "both current artifacts below against the current task context, and "
+            "write your verdict to the review file again.\n\n"
+            "Current intel JSON:\n%s\n\n"
+            "Current intel markdown (check it stays consistent with the JSON):"
+            "\n%s"
+            % (_read_text(intel_path).strip(),
+               _read_text(intel_md_path).strip())
+        )
+    else:
+        body = (
+            "The scout has updated its intel since your last review. Re-review "
+            "the current intel below against the current task context, and "
+            "write your verdict to the review file again:\n%s"
+            % _read_text(intel_path).strip()
+        )
     if context_update:
         return context_update_block(context_update) + "\n\n" + body
     return body
+
+
+def make_scout_reviewer_runner(intel_md_path, trace=None,
+                               extra_writable_dir=None):
+    """Build the real (non-test) reviewer runner for the scouting phase: a
+    `run_reviewer_once` closure carrying the scout-reviewer role, prompt, and
+    the dual-artifact (intel JSON + markdown) context assemblers, so the
+    scout-reviewer actually RECEIVES both files (the load-bearing invariant
+    behind the hash-gate composite, D8). Mirrors `make_planning_advisor_runner`.
+    `extra_writable_dir` is the relocated session-assets root, granted to the
+    reviewer CLI so its review/eval writes (outside cwd) succeed on the no-yolo
+    path."""
+    def runner(config, context, selected, intel_path, review_path,
+               resume_id=None, on_session=None, context_update=None,
+               eval_scratch_path=None, eval_specs=None, surface_io_out=None):
+        return run_reviewer_once(
+            config, context, selected, intel_path, review_path,
+            resume_id=resume_id, on_session=on_session,
+            context_update=context_update, trace=trace,
+            eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
+            extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
+            reviewer_role=SCOUT_REVIEWER,
+            prompt_path=SCOUT_REVIEWER_PROMPT_PATH,
+            protected="the scout intel files (JSON and markdown)",
+            context_fn=lambda ctx, sel, p: assemble_reviewer_context(
+                ctx, sel, p, intel_md_path),
+            resume_context_fn=lambda p, context_update=None:
+                assemble_reviewer_resume_context(
+                    p, intel_md_path, context_update=context_update))
+    # See make_planning_advisor_runner: marks a real surface-capable closure.
+    runner._coplan_surface_capable = True
+    return runner
 
 
 # --------------------------------------------------------------------------- #
@@ -1048,11 +1150,29 @@ def handoff_declined_text():
 # --------------------------------------------------------------------------- #
 
 
-def assemble_builder_brief(build_status_path, caveman_available=None):
+def assemble_builder_brief(build_status_path, build_summary_path=None,
+                           caveman_available=None):
     """The builder's status-file instruction. Unlike the scout/planner, the
     builder's write target is the WHOLE REPO (it edits source to execute the
     plan); the status file named here is only its status/verification channel,
-    not a write restriction."""
+    not a write restriction.
+
+    When `build_summary_path` is given, the builder ALSO emits a human-first
+    markdown summary at its self-audit (when it marks ready_for_review): the
+    user's review surface for the build, consistency-checked by the
+    build-reviewer against the working-tree delta. It is a deliverable, not a
+    write restriction (the builder still edits the whole repo)."""
+    summary_note = ""
+    if build_summary_path:
+        summary_note = (
+            "At your self-audit, when you mark the build ready_for_review, also "
+            "write a human-first markdown summary of the build to exactly this "
+            "file:\n  %s\n"
+            "Cover, in small scannable sections: a TL;DR; the changes by file; "
+            "the verification results; any issues & deviations from the plan; "
+            "and anything left for the user. Keep it CONSISTENT with the actual "
+            "working-tree changes and your status JSON.\n" % build_summary_path
+        )
     return (
         "Write and keep current your status as a single JSON object to exactly "
         "this file:\n  %s\n"
@@ -1060,8 +1180,9 @@ def assemble_builder_brief(build_status_path, caveman_available=None):
         "handoff, and the result.verification log) — NOT a restriction on what "
         "you may edit. You execute the approved plan by editing the repository "
         "itself. Do NOT run any git commit or PR/branch tooling: approval ends "
-        "the run and leaves the changes in the working tree for the user.\n\n%s"
-        % (build_status_path, caveman_directive(caveman_available))
+        "the run and leaves the changes in the working tree for the user.\n%s\n%s"
+        % (build_status_path, summary_note,
+           caveman_directive(caveman_available))
     )
 
 
@@ -1419,14 +1540,31 @@ def _build_diff_recipe(repos=None, baseline_note=""):
         % ("\n".join(blocks), note))
 
 
+def _build_summary_block(build_summary_path):
+    """The build-reviewer-facing block embedding the builder's markdown summary,
+    or "" when no summary path is wired (back-compat). The reviewer must
+    consistency-check it against the actual working-tree delta + status JSON
+    (D9) — the summary is the user's build-gate surface, so an unreviewed or
+    mis-reporting summary must never reach the user."""
+    if not build_summary_path:
+        return ""
+    return (
+        "The builder's current markdown summary (the user's review surface — "
+        "consistency-check it against the working-tree delta and the status "
+        "JSON; it must not under- or mis-report what was actually built):\n%s"
+        "\n\n" % _read_text(build_summary_path).strip())
+
+
 def assemble_build_reviewer_context(context, selected, plan_json_path,
                                     plan_md_path, build_status_path,
-                                    baseline_note="", baseline_repos=None):
+                                    baseline_note="", baseline_repos=None,
+                                    build_summary_path=None):
     """The build-reviewer's situational context: the shared session context,
-    the team framing, BOTH plan artifacts, the builder's status JSON, and the
-    full-delta capture recipe (the delta is NOT embedded — a stale snapshot
-    would mis-review). `baseline_repos` is the explicit selected repo-root list
-    (each ``{path, has_head}``) that drives the per-root capture recipe."""
+    the team framing, BOTH plan artifacts, the builder's status JSON, the
+    builder's markdown summary (when wired), and the full-delta capture recipe
+    (the delta is NOT embedded — a stale snapshot would mis-review).
+    `baseline_repos` is the explicit selected repo-root list (each
+    ``{path, has_head}``) that drives the per-root capture recipe."""
     team = ", ".join(selected) if selected else "(unspecified)"
     return (
         "Shared session context — this is the SAME context the builder was "
@@ -1438,9 +1576,11 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
         "The builder's current status JSON (its status + verification log):"
         "\n%s\n\n"
         "%s"
+        "%s"
         % (context.strip(), team, _read_text(plan_json_path).strip(),
            _read_text(plan_md_path).strip(),
            _read_text(build_status_path).strip(),
+           _build_summary_block(build_summary_path),
            _build_diff_recipe(baseline_repos, baseline_note)))
 
 
@@ -1448,11 +1588,14 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
                                            build_status_path,
                                            context_update=None,
                                            baseline_note="",
-                                           baseline_repos=None):
+                                           baseline_repos=None,
+                                           build_summary_path=None):
     """Lighter context for a RESUMED build-reviewer session: its thread already
     holds the role + the prior context, so only the updated artifacts are sent
     — plus a context-update wake block when the session context changed since
-    the reviewer last acknowledged it. The full delta is still read live."""
+    the reviewer last acknowledged it. The full delta is still read live; the
+    builder's markdown summary (when wired) is re-sent for the consistency
+    check."""
     body = (
         "The builder has updated its work since your last review. Re-review "
         "the current full working-tree delta against the plan and the "
@@ -1462,9 +1605,11 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
         "Current plan markdown:\n%s\n\n"
         "Current builder status JSON:\n%s\n\n"
         "%s"
+        "%s"
         % (_read_text(plan_json_path).strip(),
            _read_text(plan_md_path).strip(),
            _read_text(build_status_path).strip(),
+           _build_summary_block(build_summary_path),
            _build_diff_recipe(baseline_repos, baseline_note)))
     if context_update:
         return context_update_block(context_update) + "\n\n" + body
@@ -1473,7 +1618,7 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
 
 def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                                baseline_repos=None, trace=None,
-                               extra_writable_dir=None):
+                               extra_writable_dir=None, build_summary_path=None):
     """Build the real (non-test) reviewer runner for the building phase: a
     `run_reviewer_once` closure carrying the build-reviewer role, prompt, and
     the full-delta context assemblers. The reviewed artifact passed to the
@@ -1496,12 +1641,14 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
             protected="the builder's working-tree delta and status file",
             context_fn=lambda ctx, sel, p: assemble_build_reviewer_context(
                 ctx, sel, plan_json_path, plan_md_path, p,
-                baseline_note=baseline_note, baseline_repos=baseline_repos),
+                baseline_note=baseline_note, baseline_repos=baseline_repos,
+                build_summary_path=build_summary_path),
             resume_context_fn=lambda p, context_update=None:
                 assemble_build_reviewer_resume_context(
                     plan_json_path, plan_md_path, p,
                     context_update=context_update, baseline_note=baseline_note,
-                    baseline_repos=baseline_repos))
+                    baseline_repos=baseline_repos,
+                    build_summary_path=build_summary_path))
     # See make_planning_advisor_runner: marks a real surface-capable closure.
     runner._coplan_surface_capable = True
     return runner
@@ -1750,7 +1897,7 @@ def handoff_gate_text(payload):
             "handoff note:\n%s" % (payload or "").strip())
 
 
-def builder_start_text(build_status_path, resuming=False, enabled=False):
+def builder_start_text(build_surface_path, resuming=False, enabled=False):
     if resuming:
         head = (
             "builder — resuming our previous build session\n"
@@ -1762,7 +1909,10 @@ def builder_start_text(build_status_path, resuming=False, enabled=False):
             "I'll make the changes, verify them, and mark the build ready when "
             "it's done. You drive — answer my questions. Ctrl-C aborts."
         )
-    return head + "\nstatus → %s" % ui.render_path(build_status_path, enabled)
+    # The review surface is the build summary when one is wired (mirrors the
+    # scout's intel.md / planner's plan.md start banner); falls back to the
+    # status file when no summary path is given.
+    return head + "\nsummary → %s" % ui.render_path(build_surface_path, enabled)
 
 
 def builder_needs_input_text():
@@ -1782,6 +1932,20 @@ def builder_done_text(build_status_path, enabled=False):
 def builder_handoff_gate_text(payload):
     return ("builder wants to hand the work back to the planner\n"
             "handoff note:\n%s" % (payload or "").strip())
+
+
+# The reviewer hash-gate bundle threaded into `_role_loop` for the scout and
+# planner (never the builder). Its three callables close over run_flow's active
+# session-state holder + the phase epoch + the paired reviewer role + the
+# current context revision:
+#   - compute_composite() -> the sha256 over the reviewer's covered file set;
+#   - eligible(composite)  -> True when that composite was the LAST APPROVED one
+#                             in this epoch + acked context revision (skip OK);
+#   - record(composite)    -> persist it as the new last-approved baseline
+#                             (called only on an explicit reviewer approve).
+# Default None in `_role_loop` preserves today's always-review behavior.
+SkipBaseline = collections.namedtuple(
+    "SkipBaseline", ["compute_composite", "eligible", "record"])
 
 
 # Returned by the turn readers to mean "end the conversation" (EOF / Ctrl-D /
@@ -2050,7 +2214,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                handoff_gate_text_fn=handoff_gate_text,
                handoff_confirm_prompt="Hand the work back to the scout?",
                handoff_declined_text_fn=handoff_declined_text,
-               evaluate_fn=None):
+               evaluate_fn=None, skip_baseline=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -2255,10 +2419,31 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             if status == "ready_for_review":
                 dissent = ""
                 dissent_verdict = None
+                # Hash-gate (scout + planner): when the lead's reviewed artifact
+                # set is byte-identical to what the paired reviewer LAST APPROVED
+                # in this phase epoch + acked context revision, skip the reviewer
+                # turn entirely — reuse that approval and fall through to the
+                # user gate with a visible marker (never a silent bypass, D6).
+                # Only on the FIRST round of a fresh ready_for_review
+                # (review_rounds == 0); a revise loop already in progress always
+                # re-reviews. Latched skip_review (reviewer-failure) takes
+                # precedence. The builder passes no bundle, so it never skips.
+                review_skipped = False
+                if (skip_baseline is not None and review_fn is not None
+                        and not skip_review and review_rounds == 0):
+                    composite = skip_baseline.compute_composite()
+                    if skip_baseline.eligible(composite):
+                        review_skipped = True
+                        if trace:
+                            trace.event("review.skipped", role=reviewer_role,
+                                        reason="unchanged_since_approved",
+                                        composite=composite)
+                        ui.banner(io_out, review_skipped_text(), "info")
                 # Reviewer gate (topology D): runs transparently before the user.
                 # `skip_review` (latched at the reviewer-failure gate) bypasses it
                 # for the rest of the phase, straight to the user gate.
-                if review_fn is not None and not skip_review and \
+                if review_fn is not None and not skip_review \
+                        and not review_skipped and \
                         review_rounds < REVIEW_ROUND_CAP:
                     review_rounds += 1
                     if trace:
@@ -2345,6 +2530,16 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         if v == "approve":
                             # Only an explicit approve reaches the user gate.
                             review_rounds = 0
+                            # Seed the hash-gate baseline so the NEXT unchanged
+                            # ready_for_review skips the reviewer (D4: only a
+                            # real approve seeds it). The composite is recomputed
+                            # over the artifact the reviewer just approved; the
+                            # record() closure updates the in-memory session
+                            # state in place so a later lead-ack / phase-save
+                            # cannot clobber it.
+                            if skip_baseline is not None:
+                                skip_baseline.record(
+                                    skip_baseline.compute_composite())
                         elif v == "needs_user" and has_question:
                             review_rounds = 0
                             pending = assemble_reviewer_handoff(
@@ -2459,14 +2654,26 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
 
 def _scout_loop(session, first, intel_path, context, io_in, io_out,
                 review_fn=None, trace=None, on_outcome=None,
-                evaluate_fn=None):
+                evaluate_fn=None, intel_md_path=None, skip_baseline=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
-    `run_flow` can chain into the planning phase on approval."""
-    rc, outcome, _payload = _role_loop(
-        session, first, intel_path, context, io_in, io_out,
+    `run_flow` can chain into the planning phase on approval.
+
+    `intel_md_path`, when given, repoints the review/done gate surfaces at the
+    human-first intel markdown (mirroring the planner gate pointing at plan.md);
+    the status file driving the loop stays the intel JSON. `skip_baseline` wires
+    the reviewer hash-gate (see `_role_loop`)."""
+    loop_kwargs = dict(
         role="scout", review_fn=review_fn, trace=trace,
-        reviewer_role=SCOUT_REVIEWER, evaluate_fn=evaluate_fn)
+        reviewer_role=SCOUT_REVIEWER, evaluate_fn=evaluate_fn,
+        skip_baseline=skip_baseline)
+    if intel_md_path:
+        loop_kwargs["review_text"] = (
+            lambda _p, en=False: scout_review_text(intel_md_path, en))
+        loop_kwargs["done_text"] = (
+            lambda _p, en=False: scout_done_text(intel_md_path, en))
+    rc, outcome, _payload = _role_loop(
+        session, first, intel_path, context, io_in, io_out, **loop_kwargs)
     if on_outcome:
         on_outcome(outcome)
     return rc
@@ -2479,7 +2686,7 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    eval_scratch_path=None, scores_path=None,
                    session_uuid=None, intel_path=None, planning_epoch=None,
                    consumed_upstream=None, extra_writable_dir=None,
-                   surface_io_out=None):
+                   surface_io_out=None, intel_md_path=None):
     """Build the `review_fn` passed to `_role_loop` when the paired reviewer
     (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
     not. The closure runs one reviewer pass and returns its verdict dict.
@@ -2510,7 +2717,8 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     eval_enabled = bool(eval_scratch_path and scores_path and session_uuid)
     evaluatee = _REVIEWER_EVALUATEE.get(reviewer_role)
     if consumed_upstream is None:
-        consumed_upstream = _scout_consumed_upstream(intel_path, planning_epoch)
+        consumed_upstream = _scout_consumed_upstream(
+            intel_path, planning_epoch, intel_md_path)
     holder = {"resume_id": reviewer_resume_id,
               "context_update": context_update,
               "ack": on_context_ack,
@@ -2607,7 +2815,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               reviewer_context_update=None, on_reviewer_context_ack=None,
               trace=None, on_outcome=None,
               eval_scratch_path=None, reviewer_eval_scratch_path=None,
-              scores_path=None, session_uuid=None):
+              scores_path=None, session_uuid=None, intel_md_path=None,
+              skip_baseline=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -2630,15 +2839,22 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     cfg = config["scout"]
-    brief = assemble_scout_brief(selected, intel_path or "")
+    brief = assemble_scout_brief(selected, intel_path or "", intel_md_path)
     # Writable root granted to the agent CLIs so a no-yolo role can write its
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    # The real scout-reviewer runner embeds BOTH intel files (JSON + markdown) so
+    # the reviewer actually receives the markdown (D8); a test-injected
+    # reviewer_runner overrides it byte-identically to the other phases.
+    runner = reviewer_runner
+    if runner is None and intel_md_path:
+        runner = make_scout_reviewer_runner(
+            intel_md_path, trace=trace, extra_writable_dir=sessions_dir)
     review_fn = make_review_fn(
         config,
         reviewer_context if reviewer_context is not None else context,
-        selected, review_path, reviewer_runner=reviewer_runner,
+        selected, review_path, reviewer_runner=runner,
         reviewer_resume_id=reviewer_resume_id,
         on_reviewer_session=on_reviewer_session,
         context_update=reviewer_context_update,
@@ -2658,8 +2874,9 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         trace.event("role.start", role="scout", controller=cfg["controller"],
                     resume=bool(resume_id), intel_path=intel_path,
                     review_path=review_path)
-    ui.banner(io_out, scout_start_text(intel_path or "", resuming=bool(resume_id),
-                                       enabled=ui.is_tty(io_out)), "start")
+    ui.banner(io_out, scout_start_text(
+        intel_md_path or intel_path or "", resuming=bool(resume_id),
+        enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
 
     if cfg["controller"] == "claude":
@@ -2697,7 +2914,9 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         first = (brief + "\n\n" + context).strip()
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
-                           on_outcome=on_outcome, evaluate_fn=evaluate_fn)
+                           on_outcome=on_outcome, evaluate_fn=evaluate_fn,
+                           intel_md_path=intel_md_path,
+                           skip_baseline=skip_baseline)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -2714,7 +2933,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             extra_writable_dir=sessions_dir)
     return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
                        review_fn=review_fn, trace=trace, on_outcome=on_outcome,
-                       evaluate_fn=evaluate_fn)
+                       evaluate_fn=evaluate_fn, intel_md_path=intel_md_path,
+                       skip_baseline=skip_baseline)
 
 
 def run_planner(config, context, selected, io_in=None, io_out=None,
@@ -2727,7 +2947,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 trace=None, handoff_confirm=None, on_outcome=None,
                 eval_scratch_path=None, reviewer_eval_scratch_path=None,
                 scores_path=None, session_uuid=None, intel_path=None,
-                planning_epoch=None):
+                planning_epoch=None, skip_baseline=None, intel_md_path=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -2765,13 +2985,15 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
         intel_path=intel_path, planning_epoch=planning_epoch,
+        intel_md_path=intel_md_path,
         extra_writable_dir=sessions_dir, surface_io_out=io_out)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
             "planner", PLANNING_ADVISOR, "planning", eval_scratch_path,
             scores_path, session_uuid, intel_path=intel_path,
-            planning_epoch=planning_epoch, trace=trace)
+            planning_epoch=planning_epoch, intel_md_path=intel_md_path,
+            trace=trace)
     if resume_id and not context.strip():
         context = "Continue the session."
     if trace:
@@ -2796,7 +3018,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         done_text=lambda _p, en=False: planner_done_text(plan_md_path or "", en),
         artifact_noun="plan",
         handoff_enabled=True, handoff_confirm=handoff_confirm,
-        evaluate_fn=evaluate_fn)
+        evaluate_fn=evaluate_fn, skip_baseline=skip_baseline)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -2869,7 +3091,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 eval_scratch_path=None, reviewer_eval_scratch_path=None,
                 scores_path=None, session_uuid=None, plan_json_path=None,
                 plan_md_path=None, building_epoch=None, baseline_note="",
-                baseline_repos=None):
+                baseline_repos=None, build_summary_path=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -2889,7 +3111,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     cfg = config["builder"]
-    brief = assemble_builder_brief(build_status_path or "")
+    brief = assemble_builder_brief(build_status_path or "", build_summary_path)
     # Writable root granted to the agent CLIs so a no-yolo role can write its
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
@@ -2897,7 +3119,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     runner = reviewer_runner or make_build_reviewer_runner(
         plan_json_path, plan_md_path, baseline_note=baseline_note,
         baseline_repos=baseline_repos, trace=trace,
-        extra_writable_dir=sessions_dir)
+        extra_writable_dir=sessions_dir, build_summary_path=build_summary_path)
     consumed = plan_consumed_upstream(plan_json_path, plan_md_path,
                                       building_epoch)
     review_fn = make_review_fn(
@@ -2924,7 +3146,12 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         trace.event("role.start", role="builder", controller=cfg["controller"],
                     resume=bool(resume_id), build_status_path=build_status_path,
                     review_path=build_review_path)
-    ui.banner(io_out, builder_start_text(build_status_path or "",
+    # The user-facing gate surfaces (start / review / done) point at the build
+    # summary markdown when one is wired — the readable review surface — mirroring
+    # the scout's intel.md and the planner's plan.md; the status file driving the
+    # loop stays build_status_path. Falls back to the status file otherwise.
+    build_surface_path = build_summary_path or build_status_path
+    ui.banner(io_out, builder_start_text(build_surface_path or "",
                                          resuming=bool(resume_id),
                                          enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
@@ -2938,9 +3165,9 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         reviewer_role=BUILD_REVIEWER,
         needs_input_text=builder_needs_input_text,
         review_text=lambda _p, en=False: builder_review_text(
-            build_status_path or "", en),
+            build_surface_path or "", en),
         done_text=lambda _p, en=False: builder_done_text(
-            build_status_path or "", en),
+            build_surface_path or "", en),
         artifact_noun="build",
         handoff_enabled=True, handoff_confirm=handoff_confirm,
         handoff_gate_text_fn=builder_handoff_gate_text,
@@ -3400,12 +3627,15 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     intel_dir = state_store.session_assets_dir(session_uuid)
     os.makedirs(intel_dir, exist_ok=True)
     intel_path = scout_intel_path(intel_dir, session_uuid)
+    intel_md_path = state_store.scout_intel_md_path_for(intel_dir, session_uuid)
     review_path = state_store.review_path_for(intel_dir, session_uuid)
     plan_json_path = state_store.planner_plan_json_path_for(intel_dir, session_uuid)
     plan_md_path = state_store.planner_plan_md_path_for(intel_dir, session_uuid)
     planner_review_path = state_store.planner_review_path_for(
         intel_dir, session_uuid)
     build_status_path = state_store.build_status_path_for(
+        intel_dir, session_uuid)
+    build_summary_path = state_store.build_summary_path_for(
         intel_dir, session_uuid)
     build_review_path = state_store.build_review_path_for(
         intel_dir, session_uuid)
@@ -3447,6 +3677,56 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 holder["state"])
         else:
             building_epoch_box["epoch"] += 1
+
+    # Scouting-phase epoch: the scout-side analogue of planning_epoch. Bumped on
+    # every planning -> scouting transition (a user-confirmed planner -> scout
+    # hand-back), so the scout reviewer hash-gate baseline from the prior
+    # scouting pass is invalidated by a re-entry (D12). The initial scouting
+    # pass runs at the persisted epoch (0 for a fresh session).
+    scouting_epoch_box = {"epoch": state_store.get_scouting_epoch(
+        holder["state"]) if session_enabled else 0}
+
+    def bump_scouting_epoch():
+        if session_enabled:
+            holder["state"] = state_store.bump_scouting_epoch(
+                spath, prior=holder["state"])
+            scouting_epoch_box["epoch"] = state_store.get_scouting_epoch(
+                holder["state"])
+        else:
+            scouting_epoch_box["epoch"] += 1
+
+    # Reviewer hash-gate (scout + planner only). Each bundle's three callables
+    # close over the active session-state holder + the phase epoch box + the
+    # paired reviewer role + the current context revision, so a skip reuses the
+    # LAST APPROVED artifact set only within the same epoch and acked context.
+    # record() updates holder['state'] IN PLACE (mirroring context_acker) so the
+    # baseline survives the next lead-ack / phase-save that threads holder.
+    # Disabled (None) when persistence is off — a baseline has nowhere to live.
+    def make_skip_baseline(reviewer_role, covered_paths, epoch_box_ref):
+        if not (session_enabled and reviewer_role in selected):
+            return None
+
+        def compute_composite():
+            return state_store.composite_artifact_hash(covered_paths)
+
+        def eligible(composite):
+            return state_store.review_skip_eligible(
+                holder["state"], reviewer_role, epoch_box_ref["epoch"],
+                current_rev, composite)
+
+        def record(composite):
+            holder["state"] = state_store.record_review_baseline(
+                spath, reviewer_role, epoch_box_ref["epoch"], current_rev,
+                composite, prior=holder["state"])
+            trace.event("review.baseline.recorded", role=reviewer_role,
+                        epoch=epoch_box_ref["epoch"], context_revision=current_rev)
+
+        return SkipBaseline(compute_composite, eligible, record)
+
+    scout_skip_baseline = make_skip_baseline(
+        SCOUT_REVIEWER, [intel_path, intel_md_path], scouting_epoch_box)
+    planner_skip_baseline = make_skip_baseline(
+        PLANNING_ADVISOR, [plan_json_path, plan_md_path], epoch_box)
 
     # Build baseline: the build-reviewer reviews the builder's full working-tree
     # delta, which it captures itself (status --porcelain + git diff HEAD +
@@ -3569,6 +3849,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 eval_scratch_path=eval_scratch["scout"],
                 reviewer_eval_scratch_path=eval_scratch[SCOUT_REVIEWER],
                 scores_path=scores_path, session_uuid=session_uuid,
+                intel_md_path=intel_md_path,
+                skip_baseline=scout_skip_baseline,
                 on_outcome=lambda o: outcome_box.update(outcome=o))
             if rc == 0:
                 ack_lead("scout")
@@ -3610,6 +3892,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 reviewer_eval_scratch_path=eval_scratch[PLANNING_ADVISOR],
                 scores_path=scores_path, session_uuid=session_uuid,
                 intel_path=intel_path, planning_epoch=epoch_box["epoch"],
+                intel_md_path=intel_md_path,
+                skip_baseline=planner_skip_baseline,
                 on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
             if rc == 0:
                 ack_lead("planner")
@@ -3618,6 +3902,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 # resume the scout session with the handoff payload and run the
                 # full scout cycle again.
                 phase = set_phase("scouting")
+                # Each planner -> scout hand-back is a new scouting phase: bump
+                # the scouting epoch so a stale scout hash-gate baseline from the
+                # prior pass cannot authorize a skip on the re-investigated intel.
+                bump_scouting_epoch()
                 trace.event("handoff.execute", from_role="planner",
                             to_role=HANDBACK_PREPROCESSOR["planner"],
                             **trace_store.prompt_meta(
@@ -3681,6 +3969,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             building_epoch=building_epoch_box["epoch"],
             baseline_note=build_baseline()["note"],
             baseline_repos=build_baseline()["repos"],
+            build_summary_path=build_summary_path,
             on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
         if rc == 0:
             ack_lead("builder")

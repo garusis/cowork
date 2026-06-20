@@ -201,10 +201,11 @@ Defaults per role:
 
 Roles default to **implement** mode (write-enabled). The user-facing roles are
 kept in their lane by **role-spec guardrails**, not by plan mode — the scout may
-write only its intel file, the planner only its two plan files; the builder
-edits the repository freely to execute the plan but makes no git commit. The
-reviewers each write only their own review file (see below). This is
-instruction-level confinement, not an OS sandbox.
+write only its two intel files (JSON + markdown), the planner only its two plan
+files; the builder edits the repository freely to execute the plan but makes no
+git commit (and also emits a markdown build summary). The reviewers each write
+only their own review file (see below). This is instruction-level confinement,
+not an OS sandbox.
 
 All three phases — scouting, planning, building — run in this release. A
 **fresh** team without `scout` exits with a note: every run begins with
@@ -218,12 +219,13 @@ the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
 
 - a **cowork session UUID** (`session_uuid`) — minted once per session, distinct
   from any claude/codex session id. It names this session's assets, all of which
-  live under `~/.cowork/sessions/<session_uuid>/`: the scout intel file
-  `scout.intel.json`, the review file
+  live under `~/.cowork/sessions/<session_uuid>/`: the scout intel files
+  `scout.intel.json` / `.md`, the review file
   `scout-review.json`, the planner's plan files
   `planner.plan.json` / `.md`, the planning-advisor's review file
   `planner-review.json`, the builder's status file
-  `builder.status.json`, the build-reviewer's review file
+  `builder.status.json` and build summary `builder.summary.md`, the
+  build-reviewer's review file
   `builder-review.json`, the aggregate peer-eval `scores.json`,
   and the private orchestration trace `trace.jsonl`;
 - the **team** and **per-role config** — so the next run in the same directory
@@ -234,8 +236,12 @@ the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
 - each role's **CLI session id** (claude `session_id` / codex `thread_id`) —
   scout, scout-reviewer, planner, planning-advisor, builder, and build-reviewer
   — so a run that is killed can be **resumed where it left off**, with the
-  reviewers keeping their accumulated review context too; and
-- the **current session context**, versioned (see below).
+  reviewers keeping their accumulated review context too;
+- the **current session context**, versioned (see below); and
+- each paired reviewer's **last-approved hash-gate baseline** (the artifact
+  composite it last approved, scoped by phase epoch + acknowledged context
+  revision) — so the [reviewer skip on unchanged artifacts](#reviewer-skip-on-unchanged-artifacts-hash-gate)
+  survives a resume.
 
 On the next run, if a saved session exists, `cowork` reuses the config and
 **auto-resumes** the saved CLI sessions (`claude --resume <id>` /
@@ -300,14 +306,16 @@ find the right thing to build, the way a good product conversation goes:
 4. **Iterate** — refines with you until you reach product consensus.
 5. **Hand off** — writes its intel and marks it ready for review.
 
-Its **only write target** is its intel file
-`~/.cowork/sessions/<session_uuid>/scout.intel.json`; it must not touch any other file
+Its **only write targets** are its two intel files,
+`~/.cowork/sessions/<session_uuid>/scout.intel.json` (machine source of truth +
+status channel) and `scout.intel.md` (the human-first rendering you review at the
+gate, like the planner's `plan.md`); it must not touch any other file
 (reading/searching the whole repo is encouraged). Full spec:
 [roles/scout.md](roles/scout.md).
 
-### Intel file
+### Intel files
 
-A JSON object with a fixed top level; `result` is the scout's free-form
+The JSON object has a fixed top level; `result` is the scout's free-form
 deliverable:
 
 ```json
@@ -320,7 +328,10 @@ deliverable:
 
 cowork reads only `status`. The asked questions and your answers are recorded in
 `result.clarifications`. If no `planner` role is on the team, the scout also
-includes a lightweight plan in `result`.
+includes a lightweight plan in `result`. Alongside the JSON, `scout.intel.md` is
+a readable rendering of the same intel — the scout-reviewer reviews both and
+checks the markdown stays consistent with the JSON, and the scout's approve gate
+points you at the `.md`.
 
 ## The scout-reviewer role
 
@@ -360,6 +371,23 @@ The reviewer is a **persistent session** like the scout: its CLI session id is
 saved and resumed on every pass and across cowork resumes, and it participates in
 [context revisions](#context-revisions) — a resumed reviewer that hasn't seen the
 latest `--context` gets it as an explicit update block on its next pass.
+
+### Reviewer skip on unchanged artifacts (hash-gate)
+
+So you can keep chatting with the scout (or planner) without forcing a pointless
+review pass, cowork **skips** the paired reviewer when the artifact set it would
+review is **byte-for-byte identical to what that reviewer last approved** in the
+current phase. It is never a silent bypass: you see a `review skipped — unchanged
+since last approved` marker, the prior approval is reused, and you land at your
+normal approve gate. The "unchanged" check is a composite over **every** file the
+reviewer sees (scout = `scout.intel.json` + `scout.intel.md`; planner =
+`planner.plan.json` + `planner.plan.md`), so any edit — including a markdown-only
+one — forces a full review again. Only a real prior **approve** ever seeds a skip
+(a `revise`, a round-cap dissent, a `needs_user`, or a reviewer-failure skip never
+does), and the baseline is tied to the phase and to the context revision the
+reviewer actually acknowledged — a phase re-entry (e.g. a planner→scout hand-back)
+or any newer context clears it. The hash-gate covers the **scout and planner
+only**; the builder is out (its summary is a deliverable, not a skip baseline).
 
 ## The planner role
 
@@ -423,12 +451,19 @@ failures it can fix itself never reach you — it only asks when truly blocked,
 when a big deviation from the plan surfaces, or when the reviewer needs a product
 decision. Before marking the build ready it runs a self-audit: re-read the plan,
 walk every per-file change, run each plan-listed verification command, and record
-the results. Verification is **strict** — it does not declare the build ready
-while a verification command is failing for a reason it introduced. A failure it
-cannot fix in the working tree (a missing dependency, broken local tooling) is
-routed to **you**, not silently past the reviewer. The builder runs **no git
-commit and opens no PR**: approval ends the run with the changes in your working
-tree. Full spec: [roles/builder.md](roles/builder.md).
+the results. At that self-audit it also emits a human-first build summary,
+`~/.cowork/sessions/<session_uuid>/builder.summary.md` — what changed per file,
+the verification results, and any issues/deviations — the readable surface you
+review at the build gate (the status JSON stays the machine source of truth). The
+build-reviewer reads the summary and **consistency-checks it against the real
+working-tree delta** before it reaches you, so it can't mask the build. The
+builder itself stays **out** of the reviewer hash-gate: the summary is a
+deliverable, not a skip baseline. Verification is **strict** — it does not declare
+the build ready while a verification command is failing for a reason it
+introduced. A failure it cannot fix in the working tree (a missing dependency,
+broken local tooling) is routed to **you**, not silently past the reviewer. The
+builder runs **no git commit and opens no PR**: approval ends the run with the
+changes in your working tree. Full spec: [roles/builder.md](roles/builder.md).
 
 ## The build-reviewer role
 

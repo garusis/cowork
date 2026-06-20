@@ -325,6 +325,16 @@ def read_handoff(path):
     return payload or None
 
 
+def scout_intel_md_path_for(intel_dir, session_uuid):
+    """Path of the scout's human-first markdown intel (the user's review surface
+    at the scout gate, sibling of the scout intel JSON). The JSON stays the
+    machine source of truth + status channel; this MD is the readable rendering
+    and is folded into the reviewer hash-gate composite. The per-session folder
+    carries the uuid, so the filename does not; `session_uuid` is accepted for
+    call-site stability but unused."""
+    return os.path.join(intel_dir, "scout.intel.md")
+
+
 def review_path_for(intel_dir, session_uuid):
     """Path of the scout-reviewer's verdict file for a session (sibling of the
     scout intel file). The per-session folder carries the uuid, so the filename
@@ -370,6 +380,17 @@ def build_review_path_for(intel_dir, session_uuid):
     filename does not; `session_uuid` is accepted for call-site stability but
     unused."""
     return os.path.join(intel_dir, "builder-review.json")
+
+
+def build_summary_path_for(intel_dir, session_uuid):
+    """Path of the builder's human-first markdown summary (the user's review
+    surface at the build gate, sibling of the builder status file). It is the
+    builder's post-build report — emitted at the self-audit when the builder
+    marks ready_for_review — NOT a hash-gate baseline (the builder stays out of
+    the reviewer hash-gate). The per-session folder carries the uuid, so the
+    filename does not; `session_uuid` is accepted for call-site stability but
+    unused."""
+    return os.path.join(intel_dir, "builder.summary.md")
 
 
 # --------------------------------------------------------------------------- #
@@ -462,6 +483,33 @@ def read_eval(path):
                 entry.get("enhancement_suggestions") or ""),
         })
     return out
+
+
+def get_scouting_epoch(state):
+    """Return the persisted scouting-phase epoch (0 when scouting was never
+    re-entered, and for legacy sessions saved before this epoch existed). The
+    initial scouting pass runs at epoch 0; a planner -> scout hand-back bumps
+    it, so the scout reviewer hash-gate baseline is invalidated by a re-entry."""
+    try:
+        return int((state or {}).get("scouting_epoch") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_scouting_epoch(path, prior=None):
+    """Increment and persist the scouting-phase epoch. Called on every
+    planning -> scouting transition (a user-confirmed planner -> scout
+    hand-back), so a hand-back round trip yields a NEW epoch even when the
+    re-investigated intel is byte-identical — invalidating any stale scout
+    hash-gate baseline from the prior scouting pass (mirrors
+    `bump_planning_epoch`)."""
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    state.setdefault("sessions", state.get("sessions") or {})
+    state["scouting_epoch"] = get_scouting_epoch(state) + 1
+    save(path, state)
+    return state
 
 
 def get_planning_epoch(state):
@@ -750,3 +798,113 @@ def role_context_gap(state, role):
     if get_context_revision(state) > get_seen_revision(state, role):
         return get_context(state)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer hash-gate baseline.                                                 #
+#                                                                              #
+# When a user-facing lead (scout / planner) re-marks `ready_for_review` but    #
+# the artifact set the paired reviewer sees is byte-identical to what that     #
+# reviewer LAST APPROVED — in the same phase epoch and the same acknowledged   #
+# context revision — the reviewer turn is skipped and the prior approval is    #
+# reused (never a silent bypass: a visible marker is emitted). The baseline    #
+# that authorizes a skip is persisted in the active session state file, keyed  #
+# under sessions[reviewer_role]['last_approved_baseline'], so a skip survives  #
+# a cowork resume. Only an explicit reviewer `approve` seeds it.               #
+# --------------------------------------------------------------------------- #
+
+# Stable sentinel mixed into the composite for a MISSING member file, so a set
+# with one file absent never collides with a set where both are present-but-empty.
+_MISSING_MEMBER = b"\x00cowork-missing-artifact\x00"
+
+
+def composite_artifact_hash(paths):
+    """Return a sha256 hex digest over the member files' RAW bytes, concatenated
+    in the given fixed order (e.g. [intel.json, intel.md] or [plan.json,
+    plan.md]).
+
+    Reuses the `fingerprint_status` raw-byte approach (NOT parsed JSON), so any
+    byte change to any member — even a malformed-but-different write — changes
+    the composite. A missing member contributes a stable sentinel (so "one file
+    missing" never hashes the same as "both present"); a per-member length
+    prefix keeps the concatenation unambiguous. stdlib only."""
+    h = hashlib.sha256()
+    for path in paths or []:
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            raw = _MISSING_MEMBER
+        h.update(b"%d:" % len(raw))
+        h.update(raw)
+    return h.hexdigest()
+
+
+def record_review_baseline(path, reviewer_role, epoch, context_revision,
+                           composite_hash, prior=None):
+    """Persist the last-approved hash-gate baseline for `reviewer_role` under
+    sessions[reviewer_role]['last_approved_baseline'] = {epoch, context_revision,
+    hash}, and return the updated state.
+
+    Takes `prior` WITHOUT reloading from disk — exactly like `mark_context_seen`
+    — so the caller MUST thread its in-memory state (e.g. run_flow's
+    holder['state']) as `prior` and assign the returned state back; a baseline
+    written only to disk would be clobbered by the next lead-ack / phase-save
+    that threads the older in-memory state."""
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    sessions = dict(state.get("sessions") or {})
+    entry = dict(sessions.get(reviewer_role) or {})
+    entry["last_approved_baseline"] = {
+        "epoch": epoch,
+        "context_revision": context_revision,
+        "hash": composite_hash,
+    }
+    sessions[reviewer_role] = entry
+    state["sessions"] = sessions
+    save(path, state)
+    return state
+
+
+def get_review_baseline(state, reviewer_role):
+    """Return `reviewer_role`'s persisted last-approved baseline dict
+    {epoch, context_revision, hash}, or None when none is stored. Tolerant by
+    design: a missing/legacy/malformed entry reads as None (no skip)."""
+    sess = ((state or {}).get("sessions") or {}).get(reviewer_role) or {}
+    baseline = sess.get("last_approved_baseline")
+    if not isinstance(baseline, dict):
+        return None
+    if "hash" not in baseline:
+        return None
+    return baseline
+
+
+def review_skip_eligible(state, reviewer_role, current_epoch,
+                         current_context_revision, current_composite_hash):
+    """Whether the paired reviewer turn may be SKIPPED, reusing its last
+    approval.
+
+    True only when ALL hold:
+      - a baseline exists for `reviewer_role`;
+      - baseline.hash == current_composite_hash (the artifact set is
+        byte-identical to what the reviewer last approved);
+      - baseline.epoch == current_epoch (no phase re-entry since — a hand-back
+        bumps the epoch and clears the skip);
+      - baseline.context_revision == the reviewer's acknowledged revision
+        (`get_seen_revision`) — the approval authority is what the reviewer
+        actually acked, not merely what is current;
+      - that acknowledged revision == current_context_revision (no newer,
+        unacknowledged context — a skip must never implicitly absorb new
+        context).
+
+    Any mismatch (or any missing baseline) returns False -> a full review runs.
+    Tolerant by design."""
+    baseline = get_review_baseline(state, reviewer_role)
+    if not baseline:
+        return False
+    acked = get_seen_revision(state, reviewer_role)
+    return (baseline.get("hash") == current_composite_hash
+            and baseline.get("epoch") == current_epoch
+            and baseline.get("context_revision") == acked
+            and acked == current_context_revision)

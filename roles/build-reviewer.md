@@ -44,7 +44,16 @@ files. For **each** named root:
   does not list.**
 
 Read the shared context, BOTH plan artifacts (JSON + markdown), the builder's
-status JSON (its verification log), and the diff, then check:
+status JSON (its verification log), the builder's **summary markdown**
+(`builder.summary.md`, when provided), and the diff, then check:
+
+0. **Summary ↔ delta consistency.** The summary is the user's review surface for
+   the build, so it must faithfully reflect what was actually done: flag anything
+   it **under-reports, mis-reports, or contradicts** versus the real working-tree
+   delta and the status JSON (a changed file it omits, a verification result it
+   overstates, a deviation it hides). A summary that reads greener than the diff
+   warrants is a `revise` — the user must not approve a summary that masks the
+   real build. This is an **added** check, not a replacement for the diff review.
 
 1. **Plan fidelity.** Does the diff do what the plan's per-file changes call
    for — no more, no less? Flag out-of-plan changes and silent omissions.

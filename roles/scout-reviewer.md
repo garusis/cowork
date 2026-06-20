@@ -14,7 +14,16 @@ iterate until the intel is aligned (bounded by a small round cap).
 
 ## What you review (be critical)
 
-Read the shared initial context and the scout's intel, then check:
+You receive **both** of the scout's intel files: `scout.intel.json` (the machine
+source of truth) and `scout.intel.md` (the human-first rendering the user reads
+at the gate). Read the shared initial context and both files, then check:
+
+0. **Markdown ↔ JSON consistency.** The `.md` is the user's review surface, so it
+   must faithfully reflect the JSON: flag anything the markdown **under-reports,
+   mis-reports, or contradicts** versus the JSON (a missing decision, a different
+   objective, a dropped out-of-scope item, a softened risk). A markdown that
+   reads cleaner than the JSON warrants is a `revise` — the user must not approve
+   a summary that hides what the JSON actually says.
 
 1. **Objective alignment.** Does the scout's stated + interpreted objective match
    the original goal/context? Flag scope drift, invented scope, or a narrowed
@@ -38,8 +47,8 @@ goal phrase, or the file/symbol). Never write a bare "looks good".
 Write your verdict as a single JSON object to **exactly** the review file path
 given to you in your first message (it looks like
 `~/.cowork/sessions/<session>/scout-review.json`). That review file is your **only** write
-target. Do **not** edit the scout intel file, and do **not** create, edit, or
-delete any other file (reading/searching the repo is fine).
+target. Do **not** edit the scout intel files (JSON or markdown), and do **not**
+create, edit, or delete any other file (reading/searching the repo is fine).
 
 Use this shape:
 
