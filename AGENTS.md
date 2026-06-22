@@ -68,3 +68,23 @@ Notes:
 - `.cowork/` session state is per-working-tree — not shared across worktrees.
 - Sibling-outside (`../cowork-worktrees/`) is the cleaner general default;
   inside `.worktrees/` is the chosen approach here.
+
+### `--worktree` / `--headless` (automatic operation)
+
+- `cowork --worktree [name]` runs a small **worktree role** before scouting. It
+  reads THIS file to follow the repo's worktree convention — for this repo:
+  `.worktrees/<name>` created with `git worktree add .worktrees/<name> -b
+  <name>`, **plus** the documented per-worktree setup above (its own venv +
+  `pip install -r requirements.txt`). The role applies that setup as part of
+  following the convention; a repo that documents no setup gets a bare worktree.
+  cowork then redirects (`os.chdir`) into the worktree for the rest of the run.
+- Resume-from-launch-dir constraint: with `--worktree`, the cowork session store
+  (`.cowork/session.<uuid>.json`) stays in the **launch** directory, not the
+  worktree. Resume the session from the launch directory (or via
+  `--session-file`), not from inside the worktree. Per-session assets under
+  `~/.cowork/sessions/<uuid>/` are always found.
+- `cowork --headless` (alias `--auto`) drives the whole flow with no human
+  gates: roles never block (they record assumptions and proceed), reviewers
+  work with what they have, rounds end on reviewer consensus or the review-round
+  cap. It requires `--context`/`--context-file`. The builder contract is
+  unchanged under headless — working-tree edits only, no commit/PR.

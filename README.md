@@ -205,6 +205,42 @@ echo "the brief" | ./cowork --team scout --context-file -
   interactively. `--switch-controller` requires saved team/config state and
   cannot be combined with `--team`, `--config`, `--new`, `--no-session`,
   `--check`, or `--report`.
+- `--worktree [NAME]` / `--wt [NAME]` — before scouting, spin up a small agent
+  that creates a git **worktree** for the launch repo and runs the rest of the
+  session inside it. The agent follows the repo's documented worktree
+  convention (and any documented setup it states — e.g. a per-worktree venv and
+  dependency install); a repo with no convention gets a sibling
+  `../<repo>-worktrees/<name>` folder. `NAME` is optional (default
+  `cowork-<short session id>`); the branch is the same name off HEAD. Requires
+  launching **inside a git work tree** — otherwise it fails fast (rc 2). One
+  explicit base repo only (no multi-root). cowork validates the created worktree
+  (it must exist and be git-registered) before switching into it. On a name
+  clash, an explicit `NAME` stops (or reuses an exact match) rather than
+  silently renaming; an auto name picks a free numbered variant.
+- `--wt-controller claude|codex` — controller for the worktree agent (default
+  `claude`).
+- `--headless` / `--auto` — drive the whole scout → plan → build flow with **no
+  human gates**: leads never block (they record an assumption and proceed
+  instead of asking), reviewers review with what they have (a would-be user
+  question becomes a `revise`), and each phase ends on reviewer consensus or the
+  review-round cap (accept-with-dissent at the cap, never a hard fail).
+  Auto-progression happens **only** with this flag — without it every gate
+  blocks exactly as today. Headless **requires** initial context up front
+  (`--context`/`--context-file`, else a hard error).
+
+  ```bash
+  # provision a worktree, then run the whole flow headless inside it
+  ./cowork --worktree --headless --context "Add a --dry-run flag to the CLI"
+
+  # explicit worktree name + a specific worktree-agent controller
+  ./cowork --worktree my-feature --wt-controller codex --context "…"
+  ```
+
+  Resume note: with `--worktree`, cowork's own session record stays in the
+  folder you **launched from** (the per-session assets are home-dir keyed and
+  always found). To resume that session later, relaunch from the **same launch
+  folder** (or point at it with `--session-file`) — resuming from *inside* the
+  worktree will not find it.
 
 Defaults per role:
 
