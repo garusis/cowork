@@ -504,6 +504,41 @@ class StateStoreTest(unittest.TestCase):
         self.assertIsNone(
             state_store.get_role_session(loaded, "scout", "codex"))
 
+    def test_switch_role_controller_clears_active_id_and_preserves_bookkeeping(self):
+        path = self._tmp()
+        state = state_store.save_config(
+            path, ["planner"], cowork.default_config(["planner"]))
+        state = state_store.save_role_session(
+            path, "planner", "claude", "old-claude", prior=state)
+        state["sessions"]["planner"]["last_context_revision_seen"] = 7
+        state["sessions"]["planner"]["last_approved_baseline"] = {"sha": "abc"}
+        state_store.save(path, state)
+
+        switched = state_store.switch_role_controller(
+            path, "planner", "codex", prior=state, reason="limit",
+            source="gate", created=123.0)
+
+        self.assertEqual(switched["config"]["planner"]["controller"], "codex")
+        sess = switched["sessions"]["planner"]
+        self.assertEqual(sess["controller"], "codex")
+        self.assertNotIn("id", sess)
+        self.assertEqual(sess["last_context_revision_seen"], 7)
+        self.assertEqual(sess["last_approved_baseline"], {"sha": "abc"})
+        self.assertIsNone(
+            state_store.get_role_session(switched, "planner", "codex"))
+        pending = state_store.read_pending_switch(switched, "planner")
+        self.assertEqual(pending["from_controller"], "claude")
+        self.assertEqual(pending["to_controller"], "codex")
+        self.assertEqual(pending["source"], "gate")
+
+        saved = state_store.save_role_session(
+            path, "planner", "codex", "new-thread", prior=switched)
+        self.assertEqual(
+            state_store.get_role_session(saved, "planner", "codex"),
+            "new-thread")
+        cleared = state_store.clear_pending_switch(path, "planner", prior=saved)
+        self.assertIsNone(state_store.read_pending_switch(cleared, "planner"))
+
     def test_ensure_session_mints_and_persists_uuid_once(self):
         path = self._tmp()
         s1 = state_store.ensure_session(path, None, "fixed-uuid")
@@ -1654,10 +1689,56 @@ class SessionClassTest(unittest.TestCase):
                 "roles/scout.md", "implement", True, io_out=out,
                 on_session_id=lambda i: got.setdefault("id", i))
             s.send("hello")
+        self.assertEqual(s.controller, "claude")
         self.assertIn("scout › hi", out.getvalue())
         self.assertEqual(got.get("id"), "S1")
         self.assertEqual(s.proc.stdin.data[0],
                          bridge.encode_user_message("hello"))
+
+    def test_claude_session_result_error_is_structured_failure(self):
+        import unittest.mock as mock
+
+        class FakeStdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = FakeStdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        lines = [
+            json.dumps({"type": "result", "subtype": "error_during_execution",
+                        "result": "limit reached", "session_id": "SERR"}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=FakeProc(lines)):
+            out = io.StringIO()
+            s = bridge.ClaudeSession("roles/scout.md", "implement", True,
+                                     io_out=out)
+            result = s.send("go")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["result"], "error")
+        self.assertEqual(result["subtype"], "error_during_execution")
+        self.assertIn("limit reached", out.getvalue())
 
     def test_claude_session_separates_text_blocks(self):
         import unittest.mock as mock
@@ -1771,6 +1852,7 @@ class SessionClassTest(unittest.TestCase):
 
         s = FakeCodex("implement", True, io_out=io.StringIO(),
                       on_thread_id=lambda i: recorded.__setitem__("tid", i))
+        self.assertEqual(s.controller, "codex")
         s.send("first")
         s.send("second")
         self.assertEqual(recorded["cmds"][0][:4],
@@ -1783,6 +1865,37 @@ class SessionClassTest(unittest.TestCase):
             ["codex", "exec", "resume", "--json", "--skip-git-repo-check",
              "--dangerously-bypass-approvals-and-sandbox", "T1", "second"])
         self.assertEqual(recorded["tid"], "T1")
+
+    def test_codex_session_error_denied_and_missing_thread_are_failures(self):
+        class ErrorCodex(bridge.CodexSession):
+            def _run(self, command):
+                return [{"type": "thread.started", "thread_id": "T1"},
+                        {"type": "error", "message": "boom"}]
+
+        err = ErrorCodex("implement", True, io_out=io.StringIO()).send("x")
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["result"], "error")
+
+        class DeniedCodex(bridge.CodexSession):
+            def _run(self, command):
+                return [{"type": "thread.started", "thread_id": "T1"},
+                        {"type": "item.completed",
+                         "item": {"type": "file_change",
+                                  "status": "denied", "text": "no"}}]
+
+        denied = DeniedCodex("implement", True, io_out=io.StringIO()).send("x")
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["result"], "denied")
+        self.assertTrue(denied["denied"])
+
+        missing = bridge.CodexSession(
+            "implement", True, io_out=io.StringIO(),
+            resume_thread_id="old")
+        missing.thread_id = None
+        missing._started = True
+        result = missing.send("next")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "missing_thread_id")
 
     def test_codex_tool_activity_retitles_spinner(self):
         import unittest.mock as mock
@@ -2596,6 +2709,254 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertFalse(any(e["event"] == "stale_noop" for e in events2))
 
 
+class ControllerSwitchLoopTest(unittest.TestCase):
+    def _path(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "status.json")
+
+    def test_send_failure_without_artifact_progress_returns_switch_outcome(self):
+        path = self._path()
+
+        class FailingSession:
+            controller = "claude"
+
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                return {"ok": False, "result": "error",
+                        "error_type": "rate_limit"}
+
+            def close(self):
+                self.closed = True
+
+        sess = FailingSession()
+        out = io.StringIO()
+        rc, outcome, payload = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO("switch\n"),
+            io_out=out, role="planner")
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "switch_controller")
+        self.assertEqual(payload["role"], "planner")
+        self.assertEqual(payload["reason"], "send_failed")
+        self.assertEqual(payload["pending"], "seed")
+        self.assertTrue(sess.closed)
+        self.assertIn("switch-controller", out.getvalue())
+        self.assertIn("the claude controller for planner", out.getvalue())
+
+    def test_later_turn_failures_preserve_failed_pending_turn(self):
+        cases = []
+
+        def user_answer(path):
+            return {
+                "writes": [{"status": "needs_input", "result": {"q": "q?"}},
+                           {"fail": "rate_limit"}],
+                "io": "answer text\nswitch\n",
+                "review_fn": None,
+                "expect": "answer text",
+            }
+
+        def reviewer_handoff(path):
+            def review_fn(_status_path, _round_index):
+                return {"verdict": "revise", "findings": ["fix risk"]}
+            return {
+                "writes": [{"status": "ready_for_review", "result": {}},
+                           {"fail": "rate_limit"}],
+                "io": "switch\n",
+                "review_fn": review_fn,
+                "expect": "fix risk",
+            }
+
+        def repair(path):
+            return {
+                "writes": [{"status": "ready_for_review", "result": {}},
+                           None,
+                           {"fail": "rate_limit"}],
+                "io": "revise it\nswitch\n",
+                "review_fn": None,
+                "expect": "byte-identical",
+            }
+
+        cases.extend([
+            ("user_answer", user_answer),
+            ("reviewer_handoff", reviewer_handoff),
+            ("repair", repair),
+        ])
+        for name, factory in cases:
+            with self.subTest(name=name):
+                path = self._path()
+                cfg = factory(path)
+
+                class Session:
+                    controller = "claude"
+
+                    def __init__(self):
+                        self.sent = []
+
+                    def send(self, text):
+                        self.sent.append(text)
+                        item = cfg["writes"].pop(0)
+                        if isinstance(item, dict) and item.get("fail"):
+                            return {"ok": False, "result": "error",
+                                    "error_type": item["fail"]}
+                        if item is not None:
+                            os.makedirs(os.path.dirname(path), exist_ok=True)
+                            with open(path, "w") as fh:
+                                json.dump(item, fh)
+
+                    def close(self):
+                        pass
+
+                rc, outcome, payload = cowork._role_loop(
+                    Session(), "seed", path, context="",
+                    io_in=io.StringIO(cfg["io"]), io_out=io.StringIO(),
+                    role="planner", review_fn=cfg["review_fn"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(outcome, "switch_controller")
+                self.assertIn(cfg["expect"], payload["pending"])
+
+    def test_stuck_gate_switch_returns_switch_outcome(self):
+        path = self._path()
+
+        class Session:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                if len(self.sent) == 1:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as fh:
+                        json.dump({"status": "ready_for_review",
+                                   "result": {}}, fh)
+                # Later sends intentionally write nothing: stale/no-op.
+
+            def close(self):
+                pass
+
+        rc, outcome, payload = cowork._role_loop(
+            Session(), "seed", path, context="",
+            io_in=io.StringIO("fix it\nswitch\n"), io_out=io.StringIO(),
+            role="planner")
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "switch_controller")
+        self.assertEqual(payload["reason"], "stuck")
+        self.assertIn("byte-identical", payload["pending"])
+
+    def test_reviewer_failure_switch_retries_same_round_without_lead_bounce(self):
+        path = self._path()
+
+        class LeadSession:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as fh:
+                    json.dump({"status": "ready_for_review", "result": {}}, fh)
+
+            def close(self):
+                pass
+
+        class ReviewFn:
+            def __init__(self):
+                self.calls = 0
+                self.switched = False
+
+            def __call__(self, status_path, round_index,
+                         force_full_reread=False):
+                self.calls += 1
+                if not self.switched:
+                    return {}
+                self.force_full_reread = force_full_reread
+                return {"verdict": "approve"}
+
+            def switch_controller(self, reason="reviewer_failure"):
+                self.switched = True
+                self.reason = reason
+                return True
+
+        lead = LeadSession()
+        review_fn = ReviewFn()
+        rc, outcome, _ = cowork._role_loop(
+            lead, "seed", path, context="",
+            io_in=io.StringIO("switch\n\n"), io_out=io.StringIO(),
+            role="planner", reviewer_role=cowork.PLANNING_ADVISOR,
+            review_fn=review_fn)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "approved")
+        self.assertEqual(lead.sent, ["seed"])
+        self.assertEqual(review_fn.calls, 3)  # fail, silent retry, switched pass
+        self.assertTrue(review_fn.switched)
+        self.assertEqual(review_fn.reason, "reviewer_failure")
+        self.assertTrue(review_fn.force_full_reread)
+
+    def test_reviewer_preflight_failure_routes_to_switch_gate(self):
+        status_path = self._path()
+        review_path = status_path + ".review"
+        config = cowork.default_config(["planner", cowork.PLANNING_ADVISOR])
+        calls = {"runner": [], "checks": 0, "switches": []}
+
+        class LeadSession:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                os.makedirs(os.path.dirname(status_path), exist_ok=True)
+                with open(status_path, "w") as fh:
+                    json.dump({"status": "ready_for_review", "result": {}}, fh)
+
+            def close(self):
+                pass
+
+        def check(role):
+            calls["checks"] += 1
+            if config[role]["controller"] == "codex":
+                return [
+                    "Required tool 'codex' not found on PATH.\n"
+                    "    Install it with: npm install -g @openai/codex"
+                ]
+            return None
+
+        def switch(role, reason=None, source=None):
+            calls["switches"].append((role, reason, source))
+            config[role]["controller"] = "claude"
+            return True
+
+        def runner(config, context, selected, artifact_path, review_path, **kw):
+            calls["runner"].append((context, kw.get("force_full_reread")))
+            return {"verdict": "approve"}
+
+        review_fn = cowork.make_review_fn(
+            config, "shared context", ["planner", cowork.PLANNING_ADVISOR],
+            review_path, reviewer_runner=runner,
+            reviewer_role=cowork.PLANNING_ADVISOR,
+            switch_controller_fn=switch,
+            switch_note_fn=lambda role: "fresh reviewer switch note",
+            reviewer_controller_check_fn=check)
+        out = io.StringIO()
+        rc, outcome, _ = cowork._role_loop(
+            LeadSession(), "seed", status_path, context="",
+            io_in=io.StringIO("switch\n\n"), io_out=out,
+            role="planner", reviewer_role=cowork.PLANNING_ADVISOR,
+            review_fn=review_fn)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "approved")
+        self.assertEqual(
+            calls["switches"],
+            [(cowork.PLANNING_ADVISOR, "reviewer_failure", "gate")])
+        self.assertEqual(len(calls["runner"]), 1)
+        self.assertIn("fresh reviewer switch note", calls["runner"][0][0])
+        self.assertIn("Required tool 'codex' not found", out.getvalue())
+
+
 class MakeReviewFnTest(unittest.TestCase):
     def test_none_when_reviewer_not_selected(self):
         self.assertIsNone(cowork.make_review_fn(
@@ -2968,6 +3329,36 @@ class RunReviewerOnceTest(unittest.TestCase):
             session_factory=factory)
         self.assertIsNone(verdict)                  # caller treats as safe revise
         self.assertFalse(os.path.exists(review))    # stale file was cleared
+
+    def test_structured_send_failure_returns_controller_failure_verdict(self):
+        intel, review = self._paths()
+        trace_path = os.path.join(os.path.dirname(intel), "trace.jsonl")
+        trace = trace_store.Trace(trace_path, session_uuid="X", run_id="R")
+
+        def factory(controller, io_out):
+            class FailingRevSession:
+                def send(self, text):
+                    return {"ok": False, "result": "error",
+                            "error_type": "rate_limit"}
+
+                def close(self):
+                    pass
+            return FailingRevSession()
+
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        verdict = cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=factory, trace=trace)
+        self.assertTrue(verdict["controller_failure"])
+        self.assertTrue(verdict["malformed"])
+        self.assertEqual(
+            verdict["controller_failure_result"]["error_type"], "rate_limit")
+        with open(trace_path, "r") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        self.assertTrue(any(e["event"] == "review.run.end"
+                            and e["result"] == "controller_failed"
+                            and e["error_type"] == "rate_limit"
+                            for e in events))
 
 
 # --------------------------------------------------------------------------- #
@@ -4008,6 +4399,389 @@ class PlannerSeedTest(unittest.TestCase):
             intel, md, context_update="new goal")
         self.assertIn("<context>\nnew goal\n</context>", resumed)
         self.assertIn("# MD PLAN", resumed)
+
+
+class SwitchControllerFlowTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def _tmp_session(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "session.json")
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _saved_planning_session(self):
+        spath = self._tmp_session()
+        state = state_store.ensure_session(spath, None, "SWITCH-S")
+        cfg = cowork.default_config(
+            ["scout", "planner", cowork.PLANNING_ADVISOR])
+        state = state_store.save_config(
+            spath, ["scout", "planner", cowork.PLANNING_ADVISOR],
+            cfg, prior=state)
+        state = state_store.save_phase(spath, "planning", prior=state)
+        state = state_store.save_role_session(
+            spath, "planner", "claude", "old-claude", prior=state)
+        intel = os.path.join(state_store.session_assets_dir("SWITCH-S"),
+                             "scout.intel.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"finding": "keep"}}, fh)
+        return spath
+
+    def test_switch_controller_parser_rejects_invalid_role_and_controller(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self._args(["--switch-controller", "unknown=codex"])
+            with self.assertRaises(SystemExit):
+                self._args(["--switch-controller", "planner=vim"])
+            with self.assertRaises(SystemExit):
+                self._args(["--switch-controller", "planner"])
+
+    def test_cli_switch_planner_to_codex_continues_planning_with_handoff(self):
+        spath = self._saved_planning_session()
+        calls = []
+
+        def fake_planner(config, context, selected, on_session=None,
+                         on_outcome=None, resume_id=None, **kw):
+            calls.append({"config": config, "context": context,
+                          "resume_id": resume_id})
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_session:
+                on_session("codex", "new-codex-thread")
+            if on_outcome:
+                on_outcome("approved", None)
+            return 0
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "planner=codex"]),
+            io_in=io.StringIO(), io_out=out,
+            which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["resume_id"])
+        self.assertEqual(calls[0]["config"]["planner"]["controller"], "codex")
+        self.assertIn("[controller switch handoff]", calls[0]["context"])
+        self.assertIn("fresh codex provider conversation", calls[0]["context"])
+        self.assertIn('"finding": "keep"', calls[0]["context"])
+        saved = state_store.load(spath)
+        self.assertEqual(saved["config"]["planner"]["controller"], "codex")
+        self.assertEqual(
+            state_store.get_role_session(saved, "planner", "codex"),
+            "new-codex-thread")
+        self.assertIsNone(state_store.read_pending_switch(saved, "planner"))
+        self.assertIn("switched planner controller claude -> codex",
+                      out.getvalue())
+        saved = state_store.load(spath)
+        trace_path = trace_store.trace_path_for(
+            state_store.get_session_uuid(saved))
+        with open(trace_path, "r") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        self.assertTrue(any(e["event"] == "controller.switch.request"
+                            and e["role"] == "planner"
+                            and e["from_controller"] == "claude"
+                            and e["to_controller"] == "codex"
+                            for e in events))
+        self.assertTrue(any(e["event"] == "controller.switch.commit"
+                            and e["role"] == "planner"
+                            and e["source"] == "cli"
+                            for e in events))
+        self.assertTrue(any(e["event"] == "role.session_saved"
+                            and e["role"] == "planner"
+                            and e["controller"] == "codex"
+                            and e["session_id"] == "new-codex-thread"
+                            for e in events))
+
+    def test_cli_switch_rejects_off_phase_role_without_mutating_state(self):
+        spath = self._saved_planning_session()
+        before = state_store.load(spath)
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "scout=codex"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 2)
+        self.assertIn("not switchable in the current planning phase",
+                      out.getvalue())
+        self.assertEqual(state_store.load(spath)["config"], before["config"])
+        self.assertEqual(state_store.load(spath)["sessions"], before["sessions"])
+
+    def test_missing_active_controller_reaches_switch_gate_before_launch(self):
+        spath = self._tmp_session()
+        state = state_store.ensure_session(spath, None, "SWITCH-MISSING")
+        cfg = cowork.default_config(["scout"])
+        state = state_store.save_config(spath, ["scout"], cfg, prior=state)
+        state_store.save_phase(spath, "scouting", prior=state)
+        calls = []
+
+        def fake_scout(config, context, selected, on_session=None,
+                       on_outcome=None, **kw):
+            calls.append({"config": config, "context": context})
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_session:
+                on_session("codex", "scout-codex-thread")
+            if on_outcome:
+                on_outcome("ended")
+            return 0
+
+        def which(cmd):
+            return None if cmd == "claude" else "/bin/" + cmd
+
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath]),
+            io_in=io.StringIO("switch\n"), io_out=io.StringIO(),
+            which=which, run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["config"]["scout"]["controller"], "codex")
+        self.assertIn("[controller switch handoff]", calls[0]["context"])
+        saved = state_store.load(spath)
+        self.assertEqual(saved["config"]["scout"]["controller"], "codex")
+        self.assertEqual(
+            state_store.get_role_session(saved, "scout", "codex"),
+            "scout-codex-thread")
+
+    def test_cli_switch_rejects_incompatible_flags_without_mutation(self):
+        spath = self._saved_planning_session()
+        before = state_store.load(spath)
+        cases = [
+            ["--session-file", spath, "--switch-controller", "planner=codex",
+             "--no-session"],
+            ["--session-file", spath, "--switch-controller", "planner=codex",
+             "--new"],
+            ["--session-file", spath, "--switch-controller", "planner=codex",
+             "--team", "planner"],
+            ["--session-file", spath, "--switch-controller", "planner=codex",
+             "--config", "planner=codex"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                out = io.StringIO()
+                rc = cowork.run_flow(
+                    self._args(argv), io_in=io.StringIO(), io_out=out,
+                    which=lambda c: "/bin/" + c,
+                    run_planner_fn=lambda *a, **k: 0)
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot be combined", out.getvalue())
+                self.assertEqual(state_store.load(spath)["config"],
+                                 before["config"])
+                self.assertEqual(state_store.load(spath)["sessions"],
+                                 before["sessions"])
+
+    def test_cli_switch_rejects_check_and_report(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cowork.main(["--switch-controller", "planner=codex", "--check"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot be combined with --check", err.getvalue())
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cowork.main(["--switch-controller", "planner=codex", "--report"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot be combined with --report", err.getvalue())
+
+    def test_cli_switch_rejects_missing_config_and_role_not_on_team(self):
+        spath = self._tmp_session()
+        state_store.ensure_session(spath, None, "NO-CONFIG")
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "planner=codex"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertEqual(rc, 2)
+        self.assertIn("requires a saved session", out.getvalue())
+
+        spath = self._tmp_session()
+        state = state_store.ensure_session(spath, None, "NO-ROLE")
+        cfg = cowork.default_config(["scout", "planner"])
+        state = state_store.save_config(
+            spath, ["scout", "planner"], cfg, prior=state)
+        state_store.save_phase(spath, "planning", prior=state)
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "planning-advisor=codex"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 2)
+        self.assertIn("not on the saved team", out.getvalue())
+
+    def test_cli_switch_rejects_unloadable_session_file_without_mutation(self):
+        spath = self._tmp_session()
+        os.makedirs(os.path.dirname(spath), exist_ok=True)
+        raw = "{not valid json"
+        with open(spath, "w") as fh:
+            fh.write(raw)
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "planner=codex"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertEqual(rc, 2)
+        self.assertIn("not a loadable cowork session", out.getvalue())
+        with open(spath, "r") as fh:
+            self.assertEqual(fh.read(), raw)
+
+    def test_cli_switch_session_discovery_errors(self):
+        import tempfile
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(cwd, ignore_errors=True))
+        prev = os.getcwd()
+        os.chdir(cwd)
+        try:
+            out = io.StringIO()
+            rc = cowork.run_flow(
+                self._args(["--switch-controller", "planner=codex"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+            self.assertEqual(rc, 2)
+            self.assertIn("no saved sessions", out.getvalue())
+
+            for sid in ("S1", "S2"):
+                state_store.ensure_session(
+                    state_store.new_session_path(cwd, sid), None, sid)
+            out = io.StringIO()
+            rc = cowork.run_flow(
+                self._args(["--switch-controller", "planner=codex"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+            self.assertEqual(rc, 2)
+            self.assertIn("multiple saved sessions", out.getvalue())
+        finally:
+            os.chdir(prev)
+
+    def test_cli_switch_target_preflight_failure_leaves_state_unchanged(self):
+        spath = self._saved_planning_session()
+        before = state_store.load(spath)
+
+        def which(cmd):
+            return None if cmd == "codex" else "/bin/" + cmd
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "planner=codex"]),
+            io_in=io.StringIO(), io_out=out, which=which,
+            run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot switch planner to codex", out.getvalue())
+        saved = state_store.load(spath)
+        self.assertEqual(saved["config"], before["config"])
+        self.assertEqual(saved["sessions"], before["sessions"])
+        self.assertIsNone(state_store.read_pending_switch(saved, "planner"))
+
+    def test_lead_startup_failure_can_switch_and_relaunch_same_phase(self):
+        spath = self._saved_planning_session()
+        calls = []
+
+        def fake_planner(config, context, selected, on_session=None,
+                         on_outcome=None, **kw):
+            calls.append({"controller": config["planner"]["controller"],
+                          "context": context})
+            if len(calls) == 1:
+                return 1  # models startup/probe failure in the active controller
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_session:
+                on_session("codex", "after-startup-switch")
+            if on_outcome:
+                on_outcome("approved", None)
+            return 0
+
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath]),
+            io_in=io.StringIO("switch\n"), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c["controller"] for c in calls], ["claude", "codex"])
+        self.assertIn("[controller switch handoff]", calls[1]["context"])
+        self.assertEqual(
+            state_store.get_role_session(
+                state_store.load(spath), "planner", "codex"),
+            "after-startup-switch")
+
+    def test_cli_switch_resume_picker_targets_selected_session(self):
+        import tempfile
+        import unittest.mock as mock
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(cwd, ignore_errors=True))
+        prev = os.getcwd()
+        os.chdir(cwd)
+        try:
+            paths = []
+            for sid in ("PICK-1", "PICK-2"):
+                spath = state_store.new_session_path(cwd, sid)
+                paths.append(spath)
+                state = state_store.ensure_session(spath, None, sid)
+                cfg = cowork.default_config(
+                    ["scout", "planner", cowork.PLANNING_ADVISOR])
+                state = state_store.save_config(
+                    spath, ["scout", "planner", cowork.PLANNING_ADVISOR],
+                    cfg, prior=state)
+                state = state_store.save_phase(spath, "planning", prior=state)
+                state_store.save_role_session(
+                    spath, "planner", "claude", "old-" + sid, prior=state)
+                intel = os.path.join(state_store.session_assets_dir(sid),
+                                     "scout.intel.json")
+                os.makedirs(os.path.dirname(intel), exist_ok=True)
+                with open(intel, "w") as fh:
+                    json.dump({"status": "ready_for_review",
+                               "result": {"session": sid}}, fh)
+
+            calls = []
+
+            def fake_planner(config, context, selected, on_session=None,
+                             on_outcome=None, **kw):
+                calls.append(context)
+                if kw.get("on_first_send_accepted"):
+                    kw["on_first_send_accepted"]()
+                if on_session:
+                    on_session("codex", "picked-thread")
+                if on_outcome:
+                    on_outcome("approved", None)
+                return 0
+
+            with mock.patch.object(cowork.ui, "select", return_value=paths[1]):
+                rc = cowork.run_flow(
+                    self._args(["--resume", "--switch-controller",
+                                "planner=codex"]),
+                    io_in=FakeTTY(), io_out=FakeTTY(),
+                    which=lambda c: "/bin/" + c,
+                    run_planner_fn=fake_planner)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(calls), 1)
+            self.assertIn('"session": "PICK-2"', calls[0])
+            self.assertEqual(
+                state_store.get_role_session(
+                    state_store.load(paths[1]), "planner", "codex"),
+                "picked-thread")
+            self.assertEqual(
+                state_store.get_role_session(
+                    state_store.load(paths[0]), "planner", "claude"),
+                "old-PICK-1")
+        finally:
+            os.chdir(prev)
 
 
 class PhaseChainFlowTest(unittest.TestCase):
