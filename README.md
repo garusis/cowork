@@ -124,16 +124,16 @@ anything (the pip packages are checked only for the interactive flow).
 
 ## Install
 
-Clone into your local skills directory and run the installer:
+Clone this repository into a local tool directory and run the installer:
 
 ```bash
-git clone https://github.com/garusis/co-plan.git ~/.claude/skills/co-plan
-cd ~/.claude/skills/co-plan
+git clone <repo-url> ~/.local/share/cowork
+cd ~/.local/share/cowork
 ./install.sh
 ```
 
 `install.sh` creates a dedicated `.venv` for the pip packages (immune to
-PEP 668 / Homebrew "externally-managed-environment"), adds the skill dir to your
+PEP 668 / Homebrew "externally-managed-environment"), adds the checkout dir to your
 `PATH` via `~/.zshrc`, makes `cowork` executable, links bundled skills from
 `./skills/` into both `~/.claude/skills` and `~/.codex/skills`, and runs the
 preflight to report any missing controller CLIs. It is idempotent — safe to

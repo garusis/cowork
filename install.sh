@@ -6,10 +6,10 @@
 # controller CLIs. Idempotent — safe to re-run.
 set -euo pipefail
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SKILL_DIR/.venv"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$APP_DIR/.venv"
 VENV_PY="$VENV_DIR/bin/python"
-LOCAL_SKILLS_DIR="$SKILL_DIR/skills"
+LOCAL_SKILLS_DIR="$APP_DIR/skills"
 COWORK_HOME="$HOME/.cowork"
 COWORK_SESSIONS_DIR="$COWORK_HOME/sessions"
 ZSHRC="$HOME/.zshrc"
@@ -51,11 +51,11 @@ fi
 # 3. Install the interactive UX deps into the venv.
 info "Installing deps (rich, prompt_toolkit, questionary)"
 "$VENV_PY" -m pip install --upgrade --quiet pip
-"$VENV_PY" -m pip install --quiet -r "$SKILL_DIR/requirements.txt"
+"$VENV_PY" -m pip install --quiet -r "$APP_DIR/requirements.txt"
 ok "Deps installed"
 
 # 4. Make the launcher executable.
-chmod +x "$SKILL_DIR/cowork"
+chmod +x "$APP_DIR/cowork"
 
 # 5. Create the cowork home + sessions dir (idempotent).
 mkdir -p "$COWORK_SESSIONS_DIR"
@@ -98,10 +98,10 @@ fi
 
 # 7. PATH wiring — make ~/.zshrc the source of truth, independent of the live
 #    PATH (which may carry only a temporary entry that won't persist to new
-#    shells). Always ensure a correct marked block pointing at THIS SKILL_DIR.
+#    shells). Always ensure a correct marked block pointing at THIS APP_DIR.
 desired_block="$(
     printf '%s\n' "$PATH_MARKER_OPEN"
-    printf 'export PATH="%s:$PATH"\n' "$SKILL_DIR"
+    printf 'export PATH="%s:$PATH"\n' "$APP_DIR"
     printf '%s\n' "$PATH_MARKER_CLOSE"
 )"
 
@@ -119,7 +119,7 @@ fi
 desired_rc="$cleaned"$'\n\n'"$desired_block"
 
 if [ -f "$ZSHRC" ] && [ "$(cat "$ZSHRC")" = "$desired_rc" ]; then
-    ok "~/.zshrc already exports this skill dir"
+    ok "~/.zshrc already exports this cowork dir"
 else
     if [ -f "$ZSHRC" ] && grep -qF "$PATH_MARKER_OPEN" "$ZSHRC"; then
         info "Replaced stale cowork PATH block(s) in ~/.zshrc"
@@ -131,7 +131,7 @@ fi
 # Does the *current* shell already resolve it? Only then is no reload needed.
 path_action="reload"
 case ":$PATH:" in
-    *":$SKILL_DIR:"*) path_action="" ;;
+    *":$APP_DIR:"*) path_action="" ;;
 esac
 
 # 8. Verify deps + controller CLIs (verify-only, no auto-install).
@@ -139,7 +139,7 @@ echo
 info "Running preflight…"
 echo
 check_status=0
-"$VENV_PY" "$SKILL_DIR/cowork" --check || check_status=$?
+"$VENV_PY" "$APP_DIR/cowork" --check || check_status=$?
 
 # 9. Summary.
 echo
