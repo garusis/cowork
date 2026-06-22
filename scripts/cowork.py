@@ -28,6 +28,7 @@ import inspect
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -51,6 +52,12 @@ PLANNING_ADVISOR_PROMPT_PATH = os.path.join(
 BUILDER_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "builder.md")
 BUILD_REVIEWER_PROMPT_PATH = os.path.join(
     SKILL_ROOT, "roles", "build-reviewer.md")
+# The worktree role is a lightweight PRE-PHASE step (runs before scouting when
+# --worktree is set), NOT a member of the scout->build ROLES tuple: it has no
+# paired reviewer and no approval gate (D4). It creates a git worktree following
+# the repo's own convention and the session is redirected into it.
+WORKTREE_ROLE = "worktree"
+WORKTREE_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "worktree.md")
 
 # Max reviewer<->role review rounds per `ready_for_review` (D5). After this many
 # reviewer passes without approval, cowork falls through to the user review gate
@@ -65,6 +72,33 @@ REVIEW_ROUND_CAP = 5
 # REVIEW_ROUND_CAP, which bounds a reviewer that legitimately keeps requesting
 # changes. Shared by all three paired reviewers.
 REVIEW_FAIL_CAP = 2
+
+# Runtime headless notes prepended to a role's/reviewer's seed when --headless is
+# set, so the role itself KNOWS this session is headless on its very first turn
+# (the static role-prompt directives are only "meaningful under --headless" — this
+# is the runtime activation, the primary prompt layer behind the orchestrator
+# safety-net). Leads must not block; reviewers must not pose user questions.
+HEADLESS_LEAD_NOTE = (
+    "[headless mode] This session is running headless — there is NO human "
+    "available to answer questions. Do not set your status to needs_input and "
+    "do not wait for input: choose the most reasonable interpretation of any "
+    "open question, record it in result.assumptions, and drive to "
+    "ready_for_review.")
+HEADLESS_REVIEWER_NOTE = (
+    "[headless mode] This session is running headless — there is NO human "
+    "available. Do not emit a needs_user verdict and do not pose a product or "
+    "review question to the user: review with the context you have, and express "
+    "any concern you would otherwise raise as a user question as a revise "
+    "finding (or approve).")
+
+# Max headless needs_input nudges per lead role before the phase ends cleanly.
+# The primary bound on a headless needs_input loop is the existing stale-no-op /
+# stuck handling (a byte-identical re-write ends the phase). This cap is the
+# backstop for the pathological case of a role that keeps writing a DIFFERENT
+# needs_input each turn (which the byte-level detector would not catch): after
+# this many nudges with no ready_for_review, the phase ends cleanly so a
+# headless run can never hang. Mirrors REVIEW_ROUND_CAP's "never block" intent.
+HEADLESS_NUDGE_CAP = 5
 
 # Role order matches the user's vision and the phase order: context-gather
 # (scouting), planning, building. Each user-facing role is followed by its
@@ -329,12 +363,28 @@ def build_parser():
                    metavar="ROLE=CONTROLLER",
                    help="switch one current-phase role in an existing saved "
                         "session to claude or codex, then continue")
+    p.add_argument("--worktree", "--wt", dest="worktree", nargs="?",
+                   const=True, metavar="NAME",
+                   help="before scouting, spin up a small agent that creates a "
+                        "git worktree (following the repo's convention) and run "
+                        "the rest of the session inside it. Optional NAME names "
+                        "the worktree/branch (default: cowork-<short session "
+                        "id>). Requires launching inside a git work tree.")
+    p.add_argument("--wt-controller", dest="wt_controller",
+                   choices=list(CONTROLLERS), default="claude",
+                   help="controller for the worktree role (default: claude)")
+    p.add_argument("--headless", "--auto", dest="headless",
+                   action="store_true",
+                   help="drive the whole scout->plan->build flow with no human "
+                        "gates: roles never block, reviewers work with what they "
+                        "have, rounds end on reviewer consensus or the review "
+                        "round cap. Requires --context/--context-file.")
     return p
 
 
 def _is_non_interactive(args):
     return bool(args.team or args.config or args.context is not None
-                or args.context_file)
+                or args.context_file or getattr(args, "headless", False))
 
 
 def run_report(args, io_out=None):
@@ -1634,6 +1684,265 @@ def _plan_repo_set(plan_json_path, run_cwd):
     return [r["path"] for r in discover_git_roots(run_cwd)]
 
 
+# --------------------------------------------------------------------------- #
+# Worktree provisioning (--worktree).                                          #
+#                                                                              #
+# A deterministic git gate (cowork's own check, never the agent's word) plus a #
+# lightweight pre-scouting role that creates the worktree following the repo's #
+# convention, then a deterministic validation of the result (D13) before the   #
+# session is redirected into the worktree (os.chdir).                          #
+# --------------------------------------------------------------------------- #
+
+
+def git_worktree_toplevel(cwd):
+    """Return the absolute git work-tree toplevel for `cwd`, or None if `cwd` is
+    not inside a git work tree (the deterministic --worktree gate, D1).
+
+    Uses `git rev-parse --is-inside-work-tree` + `--show-toplevel`; never calls
+    discover_git_roots() — the base is the single launch toplevel. Tolerant by
+    design: a missing git, a bare repo, or any error reads as 'not a work tree'
+    (None) so the caller fails fast with rc 2 rather than half-initializing."""
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd,
+            capture_output=True, text=True, timeout=10)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+            capture_output=True, text=True, timeout=10)
+        if top.returncode != 0:
+            return None
+        path = top.stdout.strip()
+        return os.path.abspath(path) if path else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _worktree_registered(base_toplevel, path):
+    """Look up `path` in `git -C <base_toplevel> worktree list --porcelain`.
+
+    Returns `{worktree, branch}` (branch as a short name, "" when detached) for
+    the registered entry whose worktree path resolves to the same real path as
+    `path`, or None when git fails or no entry matches. The deterministic half
+    of the creation contract (D13c/d): cowork confirms the agent's reported path
+    is actually a registered worktree of the launch repo, not the agent's word."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", base_toplevel, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=10)
+        if res.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    target = os.path.realpath(path)
+    entries = []
+    cur = {}
+    for line in res.stdout.splitlines():
+        if line.startswith("worktree "):
+            if cur:
+                entries.append(cur)
+            cur = {"worktree": line[len("worktree "):].strip(), "branch": ""}
+        elif line.startswith("branch "):
+            ref = line[len("branch "):].strip()
+            cur["branch"] = ref[len("refs/heads/"):] \
+                if ref.startswith("refs/heads/") else ref
+    if cur:
+        entries.append(cur)
+    for entry in entries:
+        if os.path.realpath(entry.get("worktree", "")) == target:
+            return {"worktree": entry["worktree"], "branch": entry["branch"]}
+    return None
+
+
+def validate_worktree(base_toplevel, artifact):
+    """Deterministically validate the worktree role's result BEFORE any chdir
+    (D13). Returns `(ok, worktree_path, branch, error)`.
+
+    Requires: a status artifact dict with status='ready'; an absolute,
+    existing-directory worktree path; that path registered in
+    `git worktree list` for `base_toplevel`; and a reported branch that matches
+    the branch checked out there. A missing/malformed artifact, status='failed',
+    status='handoff_back' (the worktree role has no hand-back partner), a
+    non-absolute/nonexistent/unregistered path, or a branch mismatch all fail —
+    so a malformed/partial creation can never silently chdir the session into a
+    bad tree."""
+    if not isinstance(artifact, dict) or not artifact:
+        return False, None, None, "worktree role wrote no status artifact"
+    status = artifact.get("status")
+    if status != "ready":
+        result = artifact.get("result") or {}
+        reason = (result.get("error") if isinstance(result, dict) else None) \
+            or artifact.get("handoff") or "no reason given"
+        return (False, None, None,
+                "worktree role did not succeed (status=%r): %s"
+                % (status, reason))
+    result = artifact.get("result") or {}
+    if not isinstance(result, dict):
+        return False, None, None, "worktree artifact result is malformed"
+    path = result.get("worktree_path") or result.get("path")
+    branch = result.get("branch")
+    if not path or not os.path.isabs(str(path)):
+        return (False, None, None,
+                "worktree path missing or not absolute: %r" % (path,))
+    if not os.path.isdir(path):
+        return False, None, None, "worktree path does not exist: %s" % path
+    if not branch:
+        return False, None, None, "worktree branch missing from artifact"
+    registered = _worktree_registered(base_toplevel, path)
+    if not registered:
+        return (False, None, None,
+                "worktree path is not registered in `git worktree list` for %s: "
+                "%s" % (base_toplevel, path))
+    reg_branch = registered.get("branch") or ""
+    if reg_branch != branch:
+        return (False, None, None,
+                "worktree branch mismatch: artifact reported %r but the "
+                "registered worktree is on %r" % (branch, reg_branch or
+                                                  "(detached)"))
+    return True, os.path.realpath(path), branch, None
+
+
+def default_worktree_name(session_uuid):
+    """The auto worktree/branch name when --worktree is given without a NAME:
+    `cowork-<first 8 of session uuid>` (D7) — deterministic and tied to the
+    session. The agent appends a numeric suffix on an auto-name collision."""
+    return "cowork-" + (session_uuid or "00000000")[:8]
+
+
+def assemble_worktree_brief(status_path, base_toplevel, name, explicit):
+    """The worktree role's deterministic brief: the base repo path, the desired
+    name + branch, the explicit-vs-auto collision policy (D13), and the exact
+    status artifact it must write. Pure string templating — no model call."""
+    collision = (
+        "The name was requested EXPLICITLY (via --worktree NAME). On a "
+        "collision (a worktree or branch of this name already exists), do NOT "
+        "rename it: reuse it ONLY if an existing worktree at the matching path "
+        "is already on this exact branch (idempotent reuse); otherwise report "
+        "failure (status=failed) with a clear reason."
+        if explicit else
+        "The name was AUTO-generated. On a collision (a worktree or branch of "
+        "this name already exists and is not an exact reusable match), append a "
+        "numeric suffix (%s-2, %s-3, ...) to find a free name." % (name, name))
+    return (
+        "You are the cowork worktree role. Create a git worktree for the "
+        "repository below, FOLLOWING that repository's own worktree "
+        "convention, WITHOUT asking the user anything.\n\n"
+        "Base repository (git work-tree toplevel): %s\n"
+        "Desired worktree/branch name: %s\n\n"
+        "Steps:\n"
+        "1. Inspect the base repo for its worktree convention, in order: its "
+        "docs/notes (AGENTS.md, README, CONTRIBUTING, etc.), `git worktree "
+        "list`, an existing `.worktrees/` directory, and existing sibling "
+        "worktree directories. Follow whatever convention you find. If the repo "
+        "documents NO convention, create the worktree as a sibling directory "
+        "`../<repo>-worktrees/<name>` next to the base repo.\n"
+        "2. Create the worktree AND a same-named branch off the current HEAD "
+        "(e.g. `git -C <base> worktree add <path> -b <name>`). %s\n"
+        "3. ALSO perform any post-create setup the repo documents as part of "
+        "its convention (e.g. creating a per-worktree virtualenv and installing "
+        "dependencies). If the repo documents no setup, create the bare "
+        "worktree + branch only — do not invent setup steps.\n"
+        "4. Write your status artifact to EXACTLY this file (absolute path):\n"
+        "   %s\n"
+        "   On success, write JSON:\n"
+        "     {\"role\": \"worktree\", \"status\": \"ready\", \"result\": "
+        "{\"worktree_path\": \"<ABSOLUTE path to the created worktree>\", "
+        "\"branch\": \"<branch name>\"}}\n"
+        "   The worktree_path MUST be absolute and MUST be the path you passed "
+        "to `git worktree add`. On failure (you could not create or reuse a "
+        "worktree), write status=failed with result.error explaining why. "
+        "There is no reviewer and no approval gate — the status artifact is the "
+        "only channel cowork reads, and cowork independently verifies the "
+        "worktree exists and is git-registered."
+        % (base_toplevel, name, collision, status_path))
+
+
+def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
+                 io_in=None, io_out=None, session_factory=None,
+                 claude_spawn=None, session_uuid=None, trace=None,
+                 extra_writable_dir=None):
+    """Spawn ONE agent (controller from --wt-controller) to create the worktree,
+    then read back its status artifact. No reviewer, no gate (D4). Returns the
+    parsed artifact dict (or None when the agent wrote nothing); the CALLER
+    validates it deterministically via validate_worktree (D13).
+
+    `wt_config` is the single-role config dict {controller, yolo, mode}. The
+    role runs with execution enabled (yolo) so it can run `git worktree add`
+    (D5). `session_factory` is injectable for tests."""
+    io_in = io_in or sys.stdin
+    io_out = io_out or sys.stdout
+    controller = wt_config["controller"]
+    brief = assemble_worktree_brief(status_path, base_toplevel, name, explicit)
+    # Clear any stale artifact so a failed/no-write run reads as None, never a
+    # leftover 'ready' from an earlier attempt.
+    try:
+        os.remove(status_path)
+    except OSError:
+        pass
+    if trace:
+        trace.event("worktree.run.start", controller=controller,
+                    base_toplevel=base_toplevel, name=name, explicit=explicit,
+                    status_path=status_path)
+    ui.banner(io_out, "worktree — creating a git worktree for this session\n"
+              "name → %s\nbase → %s" % (name, base_toplevel), "start")
+    io_out.flush()
+
+    if controller == "claude":
+        spawn = claude_spawn or bridge._real_claude_spawn
+        if session_factory:
+            session = session_factory("claude")
+        else:
+            ok, alert = _with_status_spinner(
+                io_out, "starting worktree role",
+                lambda: bridge.probe_claude_stream_json(
+                    spawn, mode=wt_config["mode"], yolo=wt_config["yolo"],
+                    role_prompt_file=WORKTREE_PROMPT_PATH, trace=trace,
+                    role=WORKTREE_ROLE, extra_writable_dir=extra_writable_dir,
+                    cache_enabled=True))
+            if not ok:
+                if trace:
+                    trace.event("worktree.run.end", result="probe_failed")
+                io_out.write("cowork: " + alert + "\n")
+                io_out.flush()
+                return None
+            session = bridge.ClaudeSession(
+                WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
+                io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
+                extra_writable_dir=extra_writable_dir)
+        first = brief
+    else:
+        if session_factory:
+            session = session_factory("codex")
+        else:
+            session = bridge.CodexSession(
+                wt_config["mode"], wt_config["yolo"], io_out=io_out,
+                speaker=WORKTREE_ROLE, trace=trace,
+                extra_writable_dir=extra_writable_dir)
+        first = assemble_codex_prompt(
+            _read_text(WORKTREE_PROMPT_PATH), "", brief)
+    try:
+        _send(session, first, meta={"prompt_kind": "worktree_seed",
+                                    "phase": "worktree"})
+    finally:
+        session.close()
+    artifact = _read_worktree_artifact(status_path)
+    if trace:
+        trace.event("worktree.run.end", result="closed",
+                    status=(artifact or {}).get("status"))
+    return artifact
+
+
+def _read_worktree_artifact(status_path):
+    """Read the worktree role's status artifact, or None if missing/malformed."""
+    try:
+        with open(status_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def assemble_repo_discovery_note(candidates, base=None):
     """The repo-discovery note prepended to EVERY scout seed (initial, hand-back
     re-run, and resumed) so the scout's discovery responsibility survives every
@@ -2475,6 +2784,22 @@ def _repair_prompt(artifact_noun):
         % (artifact_noun, artifact_noun))
 
 
+def _headless_nudge_text(artifact_noun):
+    """The canned directive re-sent to a LEAD that set needs_input under
+    --headless (F2): no human is available, so proceed on the best assumption
+    and drive to ready_for_review. Bounded by the existing stale-no-op/stuck
+    handling and a headless nudge cap so it can never hang."""
+    return (
+        "This session is running in headless mode — there is NO human available "
+        "to answer questions. Do not wait for input. Choose the most reasonable "
+        "interpretation of the open question, record it explicitly in your "
+        "status artifact's result.assumptions, complete the work, and set the "
+        "%s status to ready_for_review. If the work genuinely cannot proceed, "
+        "make your best effort and still move to ready_for_review with the "
+        "assumption recorded — never leave the status at needs_input."
+        % artifact_noun)
+
+
 def _stuck_gate_text(status_path, role, enabled=False):
     """The banner shown at the visible stuck gate."""
     return (
@@ -2681,7 +3006,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                handoff_declined_text_fn=handoff_declined_text,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
                phase=None, is_resume=False, seed_artifact_paths=None,
-               on_first_send_accepted=None):
+               on_first_send_accepted=None, headless=False):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -2738,6 +3063,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     # the reviewer straight to the user gate.
     review_failures = 0
     skip_review = False
+    # Headless needs_input nudges fired this phase (HEADLESS_NUDGE_CAP backstop).
+    headless_nudges = 0
     outcome_kind = "ended"
     payload = None
     try:
@@ -2828,6 +3155,15 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 error_type=send_result.get("error_type"),
                                 subtype=send_result.get("subtype"),
                                 artifact_progress=False)
+                if headless:
+                    # No human to choose retry/switch/end: a controller failure
+                    # is an environment problem, so end the phase cleanly rather
+                    # than show an interactive gate (F2: never block headless).
+                    if trace:
+                        trace.event("headless.auto", role=role,
+                                    gate="controller_failure", action="end")
+                    outcome_kind = "ended"
+                    break
                 while True:
                     ui.banner(io_out, _controller_failure_text(
                         role, getattr(session, "controller", "configured"),
@@ -2899,6 +3235,15 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         after_sha256=fp_after["sha256"],
                         repair_attempted=True)
                 in_repair = False
+                if headless:
+                    # No human to choose retry/switch/inspect: the bounded
+                    # nudge (the automatic repair turn) already failed, so end
+                    # the phase cleanly rather than hang (F2_auto_resolve_gates).
+                    if trace:
+                        trace.event("headless.auto", role=role, gate="stuck",
+                                    action="end")
+                    outcome_kind = "ended"
+                    break
                 gate_decision = None
                 while gate_decision is None:
                     ui.banner(io_out, _stuck_gate_text(
@@ -2949,7 +3294,15 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 has_payload=bool(note))
                 if note:
                     ui.banner(io_out, handoff_gate_text_fn(note), "review")
-                    if handoff_confirm:
+                    if headless:
+                        # Headless auto-DECLINES a hand-back (D10): no human to
+                        # arbitrate, and auto-executing cross-phase hand-backs
+                        # could loop unbounded. Downgrade + nudge to proceed.
+                        confirmed = False
+                        if trace:
+                            trace.event("headless.auto", role=role,
+                                        gate="handoff_back", action="decline")
+                    elif handoff_confirm:
                         confirmed = handoff_confirm(io_in, io_out)
                     else:
                         confirmed = _read_handoff_confirm(
@@ -3063,6 +3416,19 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 # stuck gate's one automatic repair attempt).
                                 force_full_reread = True  # D8: retry full-reread
                                 continue
+                            if headless:
+                                # No human to choose retry/skip/switch: skip
+                                # review for the rest of this phase and fall
+                                # through to the (auto-approving) user gate
+                                # (F2_auto_resolve_gates).
+                                if trace:
+                                    trace.event(
+                                        "headless.auto", role=role,
+                                        reviewer_role=reviewer_role,
+                                        gate="reviewer_failure", action="skip")
+                                skip_review = True
+                                review_failures = 0
+                                break
                             ui.banner(io_out, _reviewer_fail_gate_text(
                                 reviewer_role, role,
                                 verdict.get("controller_failure_alert")),
@@ -3129,6 +3495,27 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         v = verdict.get("verdict")
                         has_question = bool(str(
                             verdict.get("user_question") or "").strip())
+                        if headless and v == "needs_user" and has_question:
+                            # Headless orchestrator safety-net
+                            # (F2_reviewer_needs_user): no human to answer, so a
+                            # reviewer's user question is downgraded to a 'revise'
+                            # finding handed back to the lead — never surfaced as
+                            # a user question.
+                            q = str(verdict.get("user_question") or "").strip()
+                            verdict = dict(
+                                verdict, verdict="revise",
+                                findings=list(verdict.get("findings") or [])
+                                + ["(headless) reviewer raised a question with "
+                                   "no human to answer — resolve it with your "
+                                   "best judgment: " + q])
+                            v = "revise"
+                            has_question = False
+                            if trace:
+                                trace.event(
+                                    "headless.auto", role=role,
+                                    reviewer_role=reviewer_role,
+                                    gate="reviewer_needs_user",
+                                    action="downgrade_revise")
                         if v == "approve":
                             # Only an explicit approve reaches the user gate.
                             review_rounds = 0
@@ -3188,7 +3575,18 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 ui.banner(io_out,
                           review_text(status_path, ui.is_tty(io_out)) + dissent,
                           "dissent" if dissent else "review")
-                if dissent:
+                if headless:
+                    # Headless auto-approves the ready_for_review user gate
+                    # (F2_auto_resolve_gates). At the review round cap the dissent
+                    # was already attached to the banner above and traced, so the
+                    # unresolved dissent is recorded as the work is accepted and
+                    # the phase advances (F2_consensus_and_cap).
+                    if trace:
+                        trace.event("headless.auto", role=role,
+                                    gate="ready_for_review", action="approve",
+                                    has_dissent=bool(dissent))
+                    outcome = _END
+                elif dissent:
                     outcome = _read_review_dissent(io_in, io_out)
                 else:
                     outcome = _read_review(io_in, io_out)
@@ -3232,6 +3630,28 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         trace.event("gate.show", role=role,
                                     gate="needs_input", path=status_path)
                     ui.banner(io_out, needs_input_text(), "needs_input")
+                if headless:
+                    # No human to answer: re-send the canned nudge so the role
+                    # records an assumption and proceeds (F2_roles_never_block).
+                    # The stale-no-op/stuck handling bounds a role that keeps
+                    # re-writing the SAME status; HEADLESS_NUDGE_CAP backstops a
+                    # role that keeps writing DIFFERENT needs_input each turn.
+                    headless_nudges += 1
+                    if headless_nudges > HEADLESS_NUDGE_CAP:
+                        if trace:
+                            trace.event("headless.auto", role=role,
+                                        gate="needs_input", action="end",
+                                        nudges=headless_nudges)
+                        outcome_kind = "ended"
+                        break
+                    if trace:
+                        trace.event("headless.auto", role=role,
+                                    gate="needs_input", action="nudge",
+                                    nudges=headless_nudges)
+                    pending = _headless_nudge_text(artifact_noun)
+                    pending_reopens_work = True
+                    pending_reopen_reason = "user_answer"
+                    continue
                 outcome = _read_turn(io_in, io_out)
                 if outcome is _END:
                     if trace:
@@ -3258,7 +3678,7 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
                 review_fn=None, trace=None, on_outcome=None,
                 evaluate_fn=None, intel_md_path=None, skip_baseline=None,
                 context_revision=None, is_resume=False,
-                on_first_send_accepted=None):
+                on_first_send_accepted=None, headless=False):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
     `run_flow` can chain into the planning phase on approval.
@@ -3271,7 +3691,7 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
         role="scout", review_fn=review_fn, trace=trace,
         reviewer_role=SCOUT_REVIEWER, evaluate_fn=evaluate_fn,
         skip_baseline=skip_baseline, context_revision=context_revision,
-        phase="scouting", is_resume=is_resume)
+        phase="scouting", is_resume=is_resume, headless=headless)
     if intel_md_path:
         loop_kwargs["review_text"] = (
             lambda _p, en=False: scout_review_text(intel_md_path, en))
@@ -3495,7 +3915,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               switch_controller_fn=None, reviewer_switch_note_fn=None,
               on_reviewer_switch_consumed=None,
               on_first_send_accepted=None,
-              reviewer_controller_check_fn=None):
+              reviewer_controller_check_fn=None, headless=False):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -3617,7 +4037,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                            context_revision=(review_packet_ctx or {}).get(
                                "context_revision"),
                            is_resume=bool(resume_id),
-                           on_first_send_accepted=on_first_send_accepted)
+                           on_first_send_accepted=on_first_send_accepted,
+                           headless=headless)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -3639,7 +4060,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                        context_revision=(review_packet_ctx or {}).get(
                            "context_revision"),
                        is_resume=bool(resume_id),
-                       on_first_send_accepted=on_first_send_accepted)
+                       on_first_send_accepted=on_first_send_accepted,
+                       headless=headless)
 
 
 def run_planner(config, context, selected, io_in=None, io_out=None,
@@ -3657,7 +4079,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None,
-                reviewer_controller_check_fn=None):
+                reviewer_controller_check_fn=None, headless=False):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -3737,7 +4159,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         evaluate_fn=evaluate_fn, skip_baseline=skip_baseline,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="planning", is_resume=bool(resume_id),
-        seed_artifact_paths=[intel_path])
+        seed_artifact_paths=[intel_path], headless=headless)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -3830,7 +4252,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None,
-                reviewer_controller_check_fn=None):
+                reviewer_controller_check_fn=None, headless=False):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -3920,7 +4342,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         evaluate_fn=evaluate_fn,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="building", is_resume=bool(resume_id),
-        seed_artifact_paths=[plan_json_path, plan_md_path])
+        seed_artifact_paths=[plan_json_path, plan_md_path], headless=headless)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -4245,18 +4667,41 @@ def switch_handoff_packet(role, phase, pending_switch, artifact_paths=None,
 
 
 def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
-             run_planner_fn=None, run_builder_fn=None):
+             run_planner_fn=None, run_builder_fn=None, run_worktree_fn=None):
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     run_scout_fn = run_scout_fn or run_scout
     run_planner_fn = run_planner_fn or run_planner
     run_builder_fn = run_builder_fn or run_builder
+    run_worktree_fn = run_worktree_fn or run_worktree
     interactive = not _is_non_interactive(args)
+    headless = bool(getattr(args, "headless", False))
+    worktree_requested = bool(getattr(args, "worktree", None))
     # The builder and reviewer CLI sessions spawn in the process cwd, so their
     # `git diff` is relative to cwd — NOT to the session-file parent (which may
     # live outside the repo when --session-file points elsewhere). The build
     # baseline must be read from the same cwd to match what they see.
     run_cwd = os.getcwd()
+
+    # Headless requires its initial context up front (F2_context_required): no
+    # human will be prompted, so a missing --context/--context-file is a hard
+    # error before any phase runs.
+    if headless and args.context is None and not args.context_file:
+        io_out.write("cowork: --headless requires initial context; pass "
+                     "--context or --context-file.\n")
+        return 2
+
+    # Deterministic --worktree git gate (D1): runs early, before session
+    # selection, so a non-git launch fails fast with rc 2 and no half-init. The
+    # base is the single launch toplevel — NOT discover_git_roots (single repo
+    # only). Carried to the worktree creation block below.
+    worktree_base = None
+    if worktree_requested:
+        worktree_base = git_worktree_toplevel(run_cwd)
+        if worktree_base is None:
+            io_out.write("cowork: --worktree requires launching inside a git "
+                         "work tree; %s is not one.\n" % run_cwd)
+            return 2
 
     # Session store: select which of the directory's sessions this run uses
     # (resume-or-new prompt, --new/--resume, picker) BEFORE any team/config/phase
@@ -4528,6 +4973,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             trace.event("controller.failure", role=role, phase=phase,
                         controller=controller, reason="missing_executable",
                         artifact_progress=False)
+            if headless:
+                # No human to choose retry/switch/end: a missing controller is
+                # an environment problem cowork cannot fix, so fail cleanly
+                # instead of showing an interactive gate.
+                trace.event("headless.auto", role=role,
+                            gate="controller_failure", action="end",
+                            reason=reason)
+                return False
             ui.banner(io_out, _controller_failure_text(
                 role, controller, "missing executable", alert), "dissent")
             action = _read_controller_failure_gate(io_in, io_out)
@@ -4554,6 +5007,13 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             trace.event("controller.failure", role=role, phase=phase,
                         controller=controller, reason=reason,
                         artifact_progress=False)
+            if headless:
+                # No human to choose retry/switch/end: end cleanly instead of
+                # showing an interactive recovery gate.
+                trace.event("headless.auto", role=role,
+                            gate="controller_failure", action="end",
+                            reason=reason)
+                return "end"
             ui.banner(io_out, _controller_failure_text(
                 role, controller, reason, alert), "dissent")
             action = _read_controller_failure_gate(io_in, io_out)
@@ -4628,6 +5088,22 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
     shared_context = (current_text or context) if session_enabled else context
 
+    def with_headless_lead(seed):
+        """Prepend the runtime headless note to a LEAD seed when --headless is
+        set, so the lead knows on its first turn that no human is available
+        (F2_roles_never_block, runtime activation of the prompt layer)."""
+        if not headless:
+            return seed
+        body = (seed or "").strip()
+        return (HEADLESS_LEAD_NOTE + "\n\n" + body) if body \
+            else HEADLESS_LEAD_NOTE
+
+    # The reviewer context passed to every paired reviewer this run: under
+    # --headless it carries the runtime headless reviewer note so the reviewer
+    # itself works with what it has (F2_reviewer_needs_user, prompt layer).
+    reviewer_ctx = ((HEADLESS_REVIEWER_NOTE + "\n\n" + (shared_context or ""))
+                    .strip() if headless else shared_context)
+
     def deliver_context(role, seed):
         """Prepend the current-context wake block to `seed` when `role` is a
         RESUMED session that has not acknowledged the current revision.
@@ -4654,13 +5130,24 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
     def reviewer_gap(reviewer_role):
         """The context-update wake block for a RESUMED paired reviewer that has
-        not acknowledged the current revision, else None."""
-        if not session_enabled or not role_resume_id(reviewer_role):
-            return None
-        gap = state_store.role_context_gap(holder["state"], reviewer_role)
-        trace.event("context.gap", role=reviewer_role, revision=current_rev,
-                    context_revision=current_rev,
-                    delivered=bool(gap), reason="reviewer_resume")
+        not acknowledged the current revision, else None.
+
+        Under --headless the runtime headless reviewer note is prepended (or sent
+        alone when there is no other gap) so a RESUMED reviewer — whose first
+        pass uses context_update, not reviewer_context — still gets the 'no human
+        available' instruction on its first headless turn. A FRESH reviewer
+        ignores context_update and gets the note via reviewer_context instead, so
+        the note is never doubled."""
+        gap = None
+        if session_enabled and role_resume_id(reviewer_role):
+            gap = state_store.role_context_gap(holder["state"], reviewer_role)
+            trace.event("context.gap", role=reviewer_role, revision=current_rev,
+                        context_revision=current_rev,
+                        delivered=bool(gap), reason="reviewer_resume")
+        if headless and role_resume_id(reviewer_role):
+            if gap:
+                return (HEADLESS_REVIEWER_NOTE + "\n\n" + gap).strip()
+            return HEADLESS_REVIEWER_NOTE
         return gap
 
     def context_acker(role):
@@ -4713,6 +5200,73 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         intel_dir, session_uuid)
     build_review_path = state_store.build_review_path_for(
         intel_dir, session_uuid)
+
+    # --worktree pre-phase (D2/D3/D4/D6/D13): create (or reuse) a git worktree
+    # and redirect the session into it BEFORE scouting. The cowork session store
+    # (.cowork/session.<uuid>.json) and per-session assets stay at the LAUNCH
+    # location: spath is absolutized here so later save_* calls keep writing
+    # there after the os.chdir, and the assets dir is home-dir keyed by uuid
+    # (unaffected by cwd). The worktree role has NO reviewer and NO gate.
+    if worktree_requested:
+        spath = os.path.abspath(spath)
+        worktree_status_path = state_store.worktree_status_path_for(
+            intel_dir, session_uuid)
+        explicit_name = (args.worktree if isinstance(args.worktree, str)
+                         else None)
+        # D6: reuse a recorded worktree — but ONLY when it still passes the same
+        # deterministic D13 validation (git-registered path on the recorded
+        # branch), so a stale/unregistered/wrong-branch recorded path can never
+        # redirect the session into a bad tree. A recorded path that no longer
+        # validates falls through to re-creation (idempotent resume), never a
+        # blind chdir.
+        recorded = (state_store.get_worktree(holder["state"])
+                    if session_enabled else None)
+        wt_path = wt_branch = None
+        if recorded:
+            rok, rpath, rbranch, rerr = validate_worktree(
+                worktree_base,
+                {"status": "ready",
+                 "result": {"worktree_path": recorded.get("path"),
+                            "branch": recorded.get("branch")}})
+            if rok:
+                wt_path, wt_branch = rpath, rbranch
+                trace.event("worktree.reuse", path=wt_path, branch=wt_branch)
+            else:
+                trace.event("worktree.reuse_rejected",
+                            path=recorded.get("path"),
+                            branch=recorded.get("branch"), detail=rerr)
+        if wt_path is None:
+            wt_name = explicit_name or default_worktree_name(session_uuid)
+            wt_cfg = {"controller": getattr(args, "wt_controller", "claude"),
+                      "yolo": True, "mode": "implement"}
+            artifact = run_worktree_fn(
+                wt_cfg, worktree_status_path, worktree_base, wt_name,
+                bool(explicit_name), io_in=io_in, io_out=io_out,
+                session_uuid=session_uuid, trace=trace,
+                extra_writable_dir=intel_dir)
+            ok, wt_path, wt_branch, err = validate_worktree(
+                worktree_base, artifact)
+            if not ok:
+                # Fail-fast (D13): no chdir, no scouting — the session never
+                # half-redirects into a bad/nonexistent tree.
+                trace.event("run.end", rc=2, reason="worktree_failed",
+                            detail=err)
+                io_out.write("cowork: worktree creation failed: %s\n" % err)
+                io_out.flush()
+                return 2
+            if session_enabled:
+                holder["state"] = state_store.set_worktree(
+                    spath, wt_path, wt_branch, prior=holder["state"])
+            trace.event("worktree.created", path=wt_path, branch=wt_branch)
+        # Redirect the rest of the session into the worktree: every spawned CLI
+        # uses cwd=os.getcwd() (cowork_bridge), and run_cwd drives discovery and
+        # the build baseline.
+        os.chdir(wt_path)
+        run_cwd = wt_path
+        trace.event("worktree.redirect", cwd=wt_path)
+        io_out.write("cowork: running inside worktree %s (branch %s)\n"
+                     % (wt_path, wt_branch))
+        io_out.flush()
 
     def pending_switch_for(role):
         if session_enabled:
@@ -4970,8 +5524,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             outcome_box = {"outcome": None, "payload": None}
             rc = run_scout_fn(
                 config,
-                seed_with_switch_note(
-                    "scout", deliver_context("scout", scout_seed)),
+                with_headless_lead(seed_with_switch_note(
+                    "scout", deliver_context("scout", scout_seed))),
                 selected,
                 io_in=io_in, io_out=io_out,
                 resume_id=role_resume_id("scout"),
@@ -4979,7 +5533,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 intel_path=intel_path, review_path=review_path,
                 reviewer_resume_id=role_resume_id(SCOUT_REVIEWER),
                 on_reviewer_session=role_saver(SCOUT_REVIEWER),
-                reviewer_context=shared_context,
+                reviewer_context=reviewer_ctx,
                 reviewer_context_update=reviewer_gap(SCOUT_REVIEWER)
                 if SCOUT_REVIEWER in selected else None,
                 on_reviewer_context_ack=context_acker(SCOUT_REVIEWER),
@@ -4998,6 +5552,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     (lambda: clear_pending_switch_for("scout"))
                     if pending_switch_for("scout") else None),
                 reviewer_controller_check_fn=reviewer_controller_check,
+                headless=headless,
                 on_outcome=lambda o, p=None: outcome_box.update(
                     outcome=o, payload=p))
             if rc != 0:
@@ -5042,11 +5597,11 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             planner_box = {"outcome": None, "payload": None}
             rc = run_planner_fn(
                 config,
-                seed_with_switch_note(
+                with_headless_lead(seed_with_switch_note(
                     "planner",
                     deliver_context(
                         "planner",
-                        planner_seed if planner_seed is not None else "")),
+                        planner_seed if planner_seed is not None else ""))),
                 selected, io_in=io_in, io_out=io_out,
                 resume_id=role_resume_id("planner"),
                 on_session=role_saver("planner"),
@@ -5054,7 +5609,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 review_path=planner_review_path,
                 reviewer_resume_id=role_resume_id(PLANNING_ADVISOR),
                 on_reviewer_session=role_saver(PLANNING_ADVISOR),
-                reviewer_context=shared_context,
+                reviewer_context=reviewer_ctx,
                 reviewer_context_update=reviewer_gap(PLANNING_ADVISOR)
                 if PLANNING_ADVISOR in selected else None,
                 on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
@@ -5074,6 +5629,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     (lambda: clear_pending_switch_for("planner"))
                     if pending_switch_for("planner") else None),
                 reviewer_controller_check_fn=reviewer_controller_check,
+                headless=headless,
                 on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
             if rc != 0:
                 action = recover_controller_failure("planner", "startup_or_probe")
@@ -5149,10 +5705,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         builder_box = {"outcome": None, "payload": None}
         rc = run_builder_fn(
             config,
-            seed_with_switch_note(
+            with_headless_lead(seed_with_switch_note(
                 "builder",
                 deliver_context("builder",
-                                builder_seed if builder_seed is not None else "")),
+                                builder_seed if builder_seed is not None else ""))),
             selected, io_in=io_in, io_out=io_out,
             resume_id=role_resume_id("builder"),
             on_session=role_saver("builder"),
@@ -5160,7 +5716,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             build_review_path=build_review_path,
             reviewer_resume_id=role_resume_id(BUILD_REVIEWER),
             on_reviewer_session=role_saver(BUILD_REVIEWER),
-            reviewer_context=shared_context,
+            reviewer_context=reviewer_ctx,
             reviewer_context_update=reviewer_gap(BUILD_REVIEWER)
             if BUILD_REVIEWER in selected else None,
             on_reviewer_context_ack=context_acker(BUILD_REVIEWER),
@@ -5182,6 +5738,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 (lambda: clear_pending_switch_for("builder"))
                 if pending_switch_for("builder") else None),
             reviewer_controller_check_fn=reviewer_controller_check,
+            headless=headless,
             on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
         if rc != 0:
             action = recover_controller_failure("builder", "startup_or_probe")

@@ -393,6 +393,45 @@ def build_summary_path_for(intel_dir, session_uuid):
     return os.path.join(intel_dir, "builder.summary.md")
 
 
+def worktree_status_path_for(intel_dir, session_uuid):
+    """Path of the worktree role's status artifact for a session (sibling of the
+    other session assets). The pre-scouting worktree role writes its result here
+    and cowork validates it deterministically before redirecting (D13). The
+    per-session folder carries the uuid, so the filename does not; `session_uuid`
+    is accepted for call-site stability but unused."""
+    return os.path.join(intel_dir, "worktree.status.json")
+
+
+# --------------------------------------------------------------------------- #
+# Created worktree (per `--worktree`).                                          #
+#                                                                              #
+# When a session is launched with `--worktree`, the worktree role creates a    #
+# git worktree + branch and the path is recorded here so a resume reuses the   #
+# existing worktree (D6) instead of re-creating it.                            #
+# --------------------------------------------------------------------------- #
+
+
+def set_worktree(path, worktree_path, branch, prior=None):
+    """Persist the created worktree path + branch on the session record,
+    preserving the rest of the state. Returns the updated state."""
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    state.setdefault("sessions", state.get("sessions") or {})
+    state["worktree"] = {"path": worktree_path, "branch": branch}
+    save(path, state)
+    return state
+
+
+def get_worktree(state):
+    """Return the recorded worktree `{path, branch}` dict, or None. Tolerant of
+    legacy session files written before worktrees existed."""
+    wt = (state or {}).get("worktree")
+    if isinstance(wt, dict) and wt.get("path"):
+        return {"path": wt.get("path"), "branch": wt.get("branch")}
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Peer evaluations.                                                            #
 #                                                                              #
