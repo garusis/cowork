@@ -17,7 +17,7 @@ The `--input-format stream-json` stdin schema is officially undocumented
 installed claude accepts our shape before any real turn, so no unverified shape
 is baked in silently.
 
-Python 3.9+, stdlib only. Does not import co_plan_file.py.
+Python 3.9+, stdlib only.
 """
 
 import json
@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cowork_ui as ui  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
+import cowork_probe_cache as probe_cache  # noqa: E402
 # Re-exported so existing callers/tests keep using bridge.USER_LABEL /
 # bridge.speaker_label; the canonical definitions live in cowork_ui.
 from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
@@ -233,6 +234,26 @@ def _looks_like_permission_denial(text):
     )
 
 
+def _usage_from_result(obj):
+    """Best-effort extraction of token usage from a claude stream-json `result`
+    event (#1/D2). Returns a small content-free dict of int counts when the CLI
+    exposes them, else None. Tolerant: any unexpected shape yields None and never
+    raises. Byte+hash accounting is the load-bearing data; usage is optional."""
+    usage = obj.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    keys = ("input_tokens", "output_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens")
+    out = {}
+    for key in keys:
+        val = usage.get(key)
+        if isinstance(val, bool):  # bool is an int subclass; never a token count
+            continue
+        if isinstance(val, int):
+            out[key] = val
+    return out or None
+
+
 def parse_claude_event(obj):
     """Classify one claude stream-json output event.
 
@@ -260,6 +281,9 @@ def parse_claude_event(obj):
             "is_error": is_error,
             "text": obj.get("result", ""),
             "session_id": obj.get("session_id"),
+            # Best-effort controller-reported usage (#1/D2): present only when the
+            # CLI's result event exposes token counts. Never load-bearing.
+            "usage": _usage_from_result(obj),
         }
     if etype == "system":
         return {"kind": "system", "subtype": obj.get("subtype", "")}
@@ -349,7 +373,9 @@ def denial_message():
 
 def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                              role_prompt_file=DEFAULT_ROLE_PROMPT, trace=None,
-                             role="scout", extra_writable_dir=None):
+                             role="scout", extra_writable_dir=None,
+                             cache_enabled=False, version_fn=None,
+                             cache_path=None):
     """Send one minimal user message to claude and confirm an assistant/result
     event comes back.
 
@@ -358,29 +384,74 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     explains the failure rather than proceeding on a guessed schema.
     `extra_writable_dir` mirrors the live session's writable-root grant so the
     pre-first-token probe runs with the same sandbox.
+
+    #3 probe cache: when `cache_enabled` (the live launch call sites pass True;
+    tests and existing callers default to False, keeping the always-live-probe
+    behavior), a conservative cache key is computed over the resolved CLI path,
+    `claude --version`, the role-prompt hash, mode, yolo, and writable-dir
+    presence. On a HIT the live probe is skipped entirely (no spawn) and
+    (True, None) is returned. On a MISS the live probe runs and, on success, the
+    key is stored. A version-resolution failure forces always-live (never
+    cached). `version_fn`/`cache_path` are injectable for tests.
     """
     command = build_claude_command(role_prompt_file, mode, yolo,
                                    extra_writable_dir=extra_writable_dir)
+    cache_key = None
+    if cache_enabled:
+        claude_path = probe_cache.resolve_claude_path(command)
+        resolver = version_fn or probe_cache.claude_version
+        version = resolver(claude_path)
+        cache_key = probe_cache.probe_cache_key(
+            claude_path, version, role_prompt_file, mode, yolo,
+            bool(extra_writable_dir))
+        if cache_key and probe_cache.cache_hit(cache_key, path=cache_path):
+            if trace:
+                trace.event("controller.probe.cache_hit", controller="claude",
+                            role=role, prompt_kind="probe", mode=mode, yolo=yolo,
+                            role_prompt_file=role_prompt_file)
+            return True, None
     stdin_text = encode_user_message("ping")
     if trace:
         data = trace_store.command_meta(command)
         data.update(trace_store.prompt_meta(stdin_text, prefix="stdin"))
         trace.event("controller.probe.start", controller="claude", role=role,
-                    mode=mode, yolo=yolo, cwd=os.getcwd(),
+                    prompt_kind="probe", mode=mode, yolo=yolo, cwd=os.getcwd(),
                     role_prompt_file=role_prompt_file, **data)
     try:
         events = spawn(command, stdin_text)
+        seen_ok = False
+        probe_usage = None
         for obj in events:
-            kind = parse_claude_event(obj).get("kind")
-            if kind in ("assistant", "result"):
+            parsed = parse_claude_event(obj)
+            kind = parsed.get("kind")
+            if kind == "result":
+                # The result is terminal AND the only event carrying usage —
+                # capture it even when an assistant event preceded it (#1/D2),
+                # then stop.
+                probe_usage = parsed.get("usage")
+                seen_ok = True
+                break
+            if kind == "assistant":
+                # A valid shape, but keep scanning so a following result's usage
+                # is not dropped.
+                seen_ok = True
+        if seen_ok:
+            if cache_enabled and cache_key:
+                probe_cache.cache_store(cache_key, path=cache_path)
                 if trace:
-                    trace.event("controller.probe.end", controller="claude",
-                                role=role, result="ok")
-                return True, None
+                    trace.event("controller.probe.cache_store",
+                                controller="claude", role=role,
+                                prompt_kind="probe")
+            if trace:
+                trace.event("controller.probe.end", controller="claude",
+                            role=role, prompt_kind="probe", result="ok",
+                            usage=probe_usage)
+            return True, None
     except Exception as exc:  # noqa: BLE001 - surface any spawn failure as an alert
         if trace:
             trace.event("controller.probe.end", controller="claude", role=role,
-                        result="error", error_type=type(exc).__name__)
+                        prompt_kind="probe", result="error",
+                        error_type=type(exc).__name__)
         return False, (
             "Could not probe `claude` stream-json input (%s).\n"
             "    Confirm `claude` is installed and supports "
@@ -388,7 +459,7 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         )
     if trace:
         trace.event("controller.probe.end", controller="claude", role=role,
-                    result="unsupported")
+                    prompt_kind="probe", result="unsupported")
     return False, (
         "`claude` did not accept the cowork stream-json stdin message shape.\n"
         "    The stdin schema is undocumented (anthropics/claude-code #24594); "
@@ -488,17 +559,24 @@ class ClaudeSession:
             self.trace.event("controller.spawn.end", controller="claude",
                              role=speaker, result="ok")
 
-    def send(self, text):
+    def send(self, text, meta=None):
         """Send one user message and surface the labeled reply for one turn.
 
         On a TTY a `scout working…` spinner fills the gap before the first token
         (#13), then the reply renders **live** as markdown in a Rich region (#5) —
         length-independent. Off a TTY the region is a raw passthrough, byte-for-byte
-        the historical token stream (so the streaming/test contract is unchanged)."""
+        the historical token stream (so the streaming/test contract is unchanged).
+
+        `meta` is an optional per-turn accounting dict (#1/D11) merged into the
+        controller.turn.start event (prompt_kind, role, controller, phase,
+        fresh/resume, round, artifact descriptors, context_revision). It is
+        content-free metadata only — Trace.event drops any None field."""
         if self.trace:
-            data = trace_store.prompt_meta(text)
-            self.trace.event("controller.turn.start", controller="claude",
-                             role=self.speaker, **data)
+            fields = {"controller": "claude", "role": self.speaker}
+            fields.update(trace_store.prompt_meta(text))
+            if meta:
+                fields.update({k: v for k, v in meta.items() if v is not None})
+            self.trace.event("controller.turn.start", **fields)
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
         tty = ui.is_tty(self.io_out)
@@ -629,7 +707,8 @@ class ClaudeSession:
                 elif self.trace:
                     self.trace.event("controller.turn.end", controller="claude",
                                      role=self.speaker, result="ok",
-                                     subtype=parsed.get("subtype"))
+                                     subtype=parsed.get("subtype"),
+                                     usage=parsed.get("usage"))
                 self.io_out.flush()
                 return
             self.io_out.flush()
@@ -725,7 +804,7 @@ class CodexSession:
             raise
         return events
 
-    def send(self, text):
+    def send(self, text, meta=None):
         if not self._started and not self._resuming_first:
             command = build_codex_command(
                 text, self.mode, self.yolo,
@@ -746,11 +825,19 @@ class CodexSession:
             fresh = False
         self._started = True
         if self.trace:
-            data = trace_store.command_meta(command, prompt_text=text)
-            self.trace.event(
-                "controller.turn.start", controller="codex", role=self.speaker,
-                fresh=fresh, resume=not fresh, mode=self.mode, yolo=self.yolo,
-                cwd=os.getcwd(), thread_id=self.thread_id, **data)
+            fields = {
+                "controller": "codex", "role": self.speaker,
+                "fresh": fresh, "resume": not fresh, "mode": self.mode,
+                "yolo": self.yolo, "cwd": os.getcwd(),
+                "thread_id": self.thread_id,
+            }
+            fields.update(trace_store.command_meta(command, prompt_text=text))
+            # Per-turn accounting (#1/D11): caller-supplied meta merges in last,
+            # but never overrides the authoritative fresh/resume computed here.
+            if meta:
+                fields.update({k: v for k, v in meta.items()
+                               if v is not None and k not in ("fresh", "resume")})
+            self.trace.event("controller.turn.start", **fields)
         try:
             events = self._run(command)
         except Exception as exc:  # noqa: BLE001
@@ -772,12 +859,20 @@ class CodexSession:
                                  controller="codex", role=self.speaker,
                                  thread_id=self.thread_id)
             self.on_thread_id(self.thread_id)
-        kinds = [parse_codex_event(obj).get("kind") for obj in events]
+        parsed_events = [parse_codex_event(obj) for obj in events]
+        kinds = [p.get("kind") for p in parsed_events]
         result = "error" if "error" in kinds else "denied" if "denied" in kinds else "ok"
+        # Best-effort controller-reported usage (#1/D2): the turn.completed event
+        # carries it when codex exposes it; otherwise None and the field is dropped.
+        usage = None
+        for p in parsed_events:
+            if p.get("kind") == "turn_completed" and isinstance(p.get("usage"), dict):
+                usage = p["usage"]
         if self.trace:
             self.trace.event("controller.turn.end", controller="codex",
                              role=self.speaker, result=result,
-                             thread_id=self.thread_id, event_count=len(events))
+                             thread_id=self.thread_id, event_count=len(events),
+                             usage=usage)
 
     def close(self):
         pass

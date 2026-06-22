@@ -13,7 +13,7 @@ rich / prompt_toolkit / questionary are imported lazily inside the TTY branches,
 importing this module (and running the fallback-path tests) never requires them
 installed. `cowork --check` verifies them for interactive use.
 
-Python 3.9+. Does not import co_plan_file.py.
+Python 3.9+.
 """
 
 import os

@@ -31,7 +31,7 @@ acknowledged that revision (`last_context_revision_seen`); a resumed CLI session
 that has not seen the latest revision gets it as an explicit wake block instead
 of being discarded.
 
-Python 3.9+, stdlib only. Does not import co_plan_file.py.
+Python 3.9+, stdlib only.
 """
 
 import glob

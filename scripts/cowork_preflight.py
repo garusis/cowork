@@ -2,7 +2,6 @@
 """cowork preflight: verify the interpreter and the CLI tools the selected
 controllers need exist before anything is spun up.
 
-Additive to the co-plan skill; does not import or modify co_plan_file.py.
 Python 3.9+, stdlib only.
 """
 
@@ -11,7 +10,7 @@ import shutil
 import sys
 
 # Interpreter floor. cowork targets 3.9 so it runs on the local interpreter
-# without forcing an upgrade. (co_plan_file.py keeps its own 3.10 requirement.)
+# without forcing an upgrade.
 MIN_PY = (3, 9)
 
 # Exact install commands surfaced when a required CLI tool is missing.
