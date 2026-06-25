@@ -834,6 +834,29 @@ def assemble_reviewer_handoff(verdict, review, artifact="intel"):
     return ""
 
 
+def assemble_user_question(text, artifact="intel"):
+    """Wrap a user's gate-time question in a harness-authored prompt.
+
+    The user picked "Ask a question" at the `ready_for_review` gate (not
+    "Request changes"). This is NOT reopened work: the role answers in chat and
+    leaves its artifact byte-identical, so the existing hash-gate auto-skips the
+    paired advisor on the unchanged follow-up. Putting the instruction at the
+    harness boundary makes the behavior robust regardless of role-contract
+    drift. The escape hatch is explicit: if the question genuinely surfaces new
+    work, the role may edit its %s and set needs_input itself — then bytes
+    change and a re-review is correct."""
+    return (
+        "[user question — answer in chat] The user asked a question at the "
+        "review gate. This is NOT a request to change the work. Answer it "
+        "conversationally in your reply. Do NOT edit your %s, and keep its "
+        "status at `ready_for_review` — you will return to the same gate so the "
+        "user can ask again, approve, or request changes. Only if the question "
+        "genuinely surfaces new work should you edit your %s and set status "
+        "back to `needs_input`.\n\n"
+        "Question: %s" % (artifact, artifact, text)
+    )
+
+
 def scout_reviewed_text(verdict=None, round_index=None, round_cap=None):
     """Marker shown to the user so they can see a review happened (D7).
 
@@ -2773,6 +2796,11 @@ _END = object()
 # iterating without writing their own feedback.
 _ITERATE = object()
 
+# Tags the ('_ASK', text) marker tuple returned by _read_review when the user
+# picks "Ask a question" at the review gate: the question is answered in chat
+# WITHOUT reopening work, editing the artifact, or re-running the advisor.
+_ASK = object()
+
 
 def _read_turn(io_in, io_out):
     """Read one working-turn reply. Blank input and a cancelled editor re-prompt;
@@ -2791,19 +2819,49 @@ def _read_turn(io_in, io_out):
         return reply
 
 
-def _read_review(io_in, io_out):
-    """At ready_for_review, decide approve-vs-revise. On a TTY this is an explicit
-    questionary confirm (#8); off a TTY it keeps the historical blank=finish /
-    text=revise contract so the scripted/test path is unchanged. Returns _END to
-    approve & finish, or the revision feedback text."""
+def _read_review(io_in, io_out, allow_ask=True):
+    """At ready_for_review, decide approve-vs-(ask)-vs-revise.
+
+    With `allow_ask` (the scout intel gate and planner plan gate) a TTY shows a
+    3-way questionary select (#8): 'Approve & finish' / 'Ask a question' /
+    'Request changes'. Without it (the builder build gate, which is out of the
+    approved scope for the question path) a TTY keeps the historical binary
+    confirm 'Approve & finish?' contract. Off a TTY both keep the historical
+    blank=finish / text=revise contract so the scripted/test path is unchanged.
+
+    Returns _END to approve & finish, the ('_ASK', text) marker tuple to ask a
+    question (answered in chat without reopening work; only when `allow_ask`),
+    or the revision feedback text to request changes."""
     if ui.is_tty(io_in) and ui.is_tty(io_out):
-        if ui.confirm("Approve & finish?"):
-            return _END
+        if not allow_ask:
+            # Builder gate: unchanged binary confirm contract.
+            if ui.confirm("Approve & finish?"):
+                return _END
+            while True:
+                fb = ui.prompt_user(io_in, io_out,
+                                    header="Revise — your feedback")
+                if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
+                    return _END
+                return fb
         while True:
-            fb = ui.prompt_user(io_in, io_out, header="Revise — your feedback")
+            choice = ui.select(
+                "Ready for review — what now?",
+                [("approve", "Approve & finish"),
+                 ("ask", "Ask a question"),
+                 ("changes", "Request changes")])
+            if choice == "approve":
+                return _END
+            if choice == "ask":
+                q = ui.prompt_user(io_in, io_out, header="Your question")
+                if q is ui.CANCEL or q is ui.EOF or q.strip() == "":
+                    # Nothing typed: re-show the gate rather than approve — a
+                    # blank question must never be read as a sign-off.
+                    continue
+                return (_ASK, q)
+            # 'changes' or a dismissed select (None): request changes, but never
+            # trap the user — a blank/cancelled feedback prompt approves.
+            fb = ui.prompt_user(io_in, io_out, header="Request changes — your feedback")
             if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
-                # Nothing to revise with: treat as approve so the user is never
-                # trapped at the gate.
                 return _END
             return fb
     line = io_in.readline()
@@ -3110,7 +3168,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                handoff_declined_text_fn=handoff_declined_text,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
                phase=None, is_resume=False, seed_artifact_paths=None,
-               on_first_send_accepted=None, headless=False):
+               on_first_send_accepted=None, headless=False,
+               review_allow_ask=True):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -3155,6 +3214,11 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     # invalidates inline and never sets the boolean, yet is still a reopen the
     # stale-no-op detector must cover (the general invariant, D1/D9).
     pending_reopen_reason = None
+    # Transient flag set at the review gate's "Ask a question" branch and
+    # consumed at the loop top: a user question is a NON-reopen turn (it never
+    # sets pending_reopen_reason), so it is tagged for per-turn accounting here
+    # without tripping the invalidate / stale-no-op / baseline machinery.
+    pending_user_question = False
     # Stale-no-op repair state: True between the firing of the single automatic
     # repair turn and its result (or a user-driven stuck-gate retry). When True,
     # the next send is re-checked for a no-op even without a fresh reopen.
@@ -3179,6 +3243,9 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             # Capture the reopen signal BEFORE the invalidate/reset block runs.
             reopened_this_turn = pending_reopen_reason is not None
             reopen_reason_this_turn = pending_reopen_reason
+            # Consume the transient user-question flag (a non-reopen turn).
+            question_turn = pending_user_question
+            pending_user_question = False
             if pending_reopens_work:
                 before_status = state_store.read_status(status_path)
                 changed = state_store.invalidate_ready_status(status_path)
@@ -3207,6 +3274,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 lead_kind = "handoff_wake"
             elif reopen_reason_this_turn:
                 lead_kind = "user_answer"
+            elif question_turn:
+                lead_kind = "user_question"
             elif pending is first:
                 lead_kind = "role_seed"
             else:
@@ -3697,7 +3766,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 elif dissent:
                     outcome = _read_review_dissent(io_in, io_out)
                 else:
-                    outcome = _read_review(io_in, io_out)
+                    outcome = _read_review(io_in, io_out,
+                                           allow_ask=review_allow_ask)
                 if outcome is _ITERATE:
                     # Hand the reviewer's unresolved findings straight back to
                     # the role — the user shouldn't have to retype them.
@@ -3722,6 +3792,24 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         status_path, ui.is_tty(io_out)), "done")
                     outcome_kind = "approved"
                     break
+                if (isinstance(outcome, tuple) and len(outcome) == 2
+                        and outcome[0] is _ASK):
+                    # "Ask a question": a NON-reopen turn. Send the question as an
+                    # ordinary pending turn; leave pending_reopens_work=False and
+                    # pending_reopen_reason=None so the invalidate / stale-no-op /
+                    # baseline machinery never fires — the role answers in chat,
+                    # the artifact stays byte-identical, and the existing
+                    # hash-gate auto-skips the advisor on the unchanged follow-up.
+                    question_text = outcome[1]
+                    pending = assemble_user_question(question_text, artifact_noun)
+                    pending_user_question = True
+                    if trace:
+                        trace.event(
+                            "user.action", role=role, action="question",
+                            gate="ready_for_review",
+                            **trace_store.prompt_meta(question_text,
+                                                      prefix="input"))
+                    continue
                 pending = outcome  # revision feedback → another turn
                 if trace:
                     trace.event("user.action", role=role, action="revise",
@@ -4448,6 +4536,9 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         done_text=lambda _p, en=False: builder_done_text(
             build_surface_path or "", en),
         artifact_noun="build",
+        # The approved scope is scout intel + planner plan only; the builder
+        # gate keeps its prior binary approve/revise contract (no ask path).
+        review_allow_ask=False,
         handoff_enabled=True, handoff_confirm=handoff_confirm,
         handoff_gate_text_fn=builder_handoff_gate_text,
         handoff_confirm_prompt="Hand the work back to the planner?",
