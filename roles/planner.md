@@ -32,8 +32,18 @@ To ask a question you **end your turn** and let the user reply next:
    default, and do not write `ready_for_review` in the same turn.
 
 Only set `status: "ready_for_review"` in a turn where you have **no** blocking
-question left. If the user gives you more work after that — including revision
-feedback at the plan gate — set `status` back to `needs_input` immediately.
+question left. If the user **requests changes** after that — revision feedback
+at the plan gate — set `status` back to `needs_input` immediately and address
+them.
+
+**A plain question at the plan gate is different.** When the user just asks a
+question about the plan (the gate's "Ask a question" path), answer it
+conversationally in chat, leave the plan files **exactly as they are**, and keep
+`status: "ready_for_review"` — do not edit the plan and do not flip to
+`needs_input`. You will return to the same gate so the user can ask again,
+approve, or request changes. Reopen (edit the plan + `needs_input`) **only** if
+the question surfaces genuine new work; merely explaining the existing plan is
+not new work.
 
 ## Your output: TWO plan files
 

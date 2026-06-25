@@ -462,6 +462,29 @@ saved and resumed on every pass and across cowork resumes, and it participates i
 [context revisions](#context-revisions) — a resumed reviewer that hasn't seen the
 latest `--context` gets it as an explicit update block on its next pass.
 
+### The review gate (Approve & finish / Ask a question / Request changes)
+
+When the scout marks its intel — or the planner its plan — `ready_for_review`,
+the approve gate gives you **three** choices:
+
+- **Approve & finish** — accept the work and move on (with a builder on the
+  team, the planner's approval chains into the build phase).
+- **Ask a question** — put a plain question to the role. It answers
+  conversationally in chat and **leaves the artifact exactly as it is**: no
+  edit, no status flip, and — because nothing changed on disk — no re-review
+  (the [hash-gate](#reviewer-skip-on-unchanged-artifacts-hash-gate) skips the
+  paired reviewer). You land right back at the same gate, so you can ask as many
+  questions as you like for free before approving or requesting changes. If a
+  question genuinely surfaces new work, the role can still edit the artifact and
+  reopen — and then a re-review is correct.
+- **Request changes** — type revision feedback; the role revises and
+  re-proposes, exactly as before.
+
+Off a TTY (scripted/non-interactive runs) the historical contract is unchanged:
+a blank line finishes, any other text requests changes. The question path is
+scoped to the scout and planner gates only; the builder's `ready_for_review`
+gate keeps its prior binary approve/revise contract.
+
 ### Reviewer skip on unchanged artifacts (hash-gate)
 
 So you can keep chatting with the scout (or planner) without forcing a pointless
@@ -619,11 +642,12 @@ Each turn, cowork streams the reply, then reads the intel `status`:
   chat**. If the scout-reviewer is on the team it runs first (you'll see a
   `reviewed: approved`, `reviewed: changes requested`, or
   `reviewed: needs user input` marker; see
-  [The scout-reviewer role](#the-scout-reviewer-role)), then cowork shows an
-  explicit approve/revise gate. On a terminal this is
-  a questionary confirm (**Approve & finish?**): confirm ends the session; decline
-  opens an editor for revision feedback, which sends another turn so you keep
-  refining.
+  [The scout-reviewer role](#the-scout-reviewer-role)), then cowork shows the
+  [3-way review gate](#the-review-gate-approve--finish--ask-a-question--request-changes)
+  (**Approve & finish / Ask a question / Request changes**): approve ends the
+  session; a question is answered in chat for free (no intel edit, no
+  re-review); requesting changes sends another turn so you keep refining. Off a
+  terminal the historical blank=finish / text=revise contract is unchanged.
 
 **Input.** On a terminal each turn is a prompt_toolkit multiline editor: real line
 editing (arrow keys, word-jump, paste, history) and multiline answers. A dim hint

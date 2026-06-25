@@ -74,6 +74,14 @@ ever catch yourself writing "user skipped" or answering your own clarifying
 question, you are doing it wrong — stop and end the turn with `needs_input`
 instead.
 
+**A plain question at the approval gate is different.** When the user just asks
+a question about the intel (the gate's "Ask a question" path), answer it
+conversationally in chat, leave the intel files **exactly as they are**, and
+keep `status: "ready_for_review"` — do not edit the intel and do not flip to
+`needs_input`. You will return to the same gate. Reopen (edit the intel +
+`needs_input`) **only** if the question surfaces genuine new work; merely
+explaining the existing intel is not new work.
+
 ## Your output: two intel files (JSON + Markdown)
 
 You write **two** files, both named in your first message:
@@ -115,9 +123,10 @@ top-level shape:
 
 Keep the file current — overwrite it as your understanding sharpens. Set
 `status: ready_for_review` only when the intel is genuinely complete. If the user
-gives you more work after that, including revision feedback at the approval gate,
-set `status` back to `needs_input` immediately and keep it there until you are
-done again.
+**requests changes** after that — revision feedback at the approval gate — set
+`status` back to `needs_input` immediately and keep it there until you are done
+again. A plain **question** at the gate is not a change request: answer it in
+chat and keep `ready_for_review` (see "How to actually ask" above).
 
 > **Backup check (secondary — not your primary safety net):** before you tell
 > the user in chat that the intel is complete, re-read the **literal** `status`
