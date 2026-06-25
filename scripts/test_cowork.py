@@ -3662,8 +3662,9 @@ class SelectTest(unittest.TestCase):
 
 
 class ScoutLoopTtyTest(unittest.TestCase):
-    """The review gate uses an explicit confirm on a TTY (#8). ui.confirm /
-    ui.prompt_user / ui.banner are patched so no real prompt/library is needed."""
+    """The review gate uses an explicit 3-way select on a TTY (#8): Approve &
+    finish / Ask a question / Request changes. ui.select / ui.prompt_user /
+    ui.banner are patched so no real prompt/library is needed."""
 
     def _intel(self):
         import tempfile
@@ -3688,31 +3689,50 @@ class ScoutLoopTtyTest(unittest.TestCase):
                 self.closed = True
         return FakeSession()
 
-    def test_review_confirm_approve(self):
+    def test_review_select_approve(self):
         import unittest.mock as mock
         intel = self._intel()
         sess = self._session(intel, ["ready_for_review"])
         with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "confirm", return_value=True) as conf:
+                mock.patch.object(cowork.ui, "select",
+                                  return_value="approve") as sel:
             rc = cowork._scout_loop(sess, "seed", intel, context="",
                                     io_in=FakeTTY(), io_out=FakeTTY())
         self.assertEqual(rc, 0)
         self.assertEqual(sess.sent, ["seed"])
-        conf.assert_called_once()
+        sel.assert_called_once()
 
-    def test_review_confirm_revise_then_approve(self):
+    def test_review_select_changes_then_approve(self):
         import unittest.mock as mock
         intel = self._intel()
         sess = self._session(intel, ["ready_for_review", "ready_for_review"])
         with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "confirm",
-                                  side_effect=[False, True]), \
+                mock.patch.object(cowork.ui, "select",
+                                  side_effect=["changes", "approve"]), \
                 mock.patch.object(cowork.ui, "prompt_user",
                                   return_value="please tweak X"):
             rc = cowork._scout_loop(sess, "seed", intel, context="",
                                     io_in=FakeTTY(), io_out=FakeTTY())
         self.assertEqual(rc, 0)
         self.assertEqual(sess.sent, ["seed", "please tweak X"])
+
+    def test_review_select_ask_then_approve(self):
+        # "Ask a question" at the normal gate: answered in chat, then approve.
+        import unittest.mock as mock
+        intel = self._intel()
+        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "select",
+                                  side_effect=["ask", "approve"]), \
+                mock.patch.object(cowork.ui, "prompt_user",
+                                  return_value="why this approach?"):
+            rc = cowork._scout_loop(sess, "seed", intel, context="",
+                                    io_in=FakeTTY(), io_out=FakeTTY())
+        self.assertEqual(rc, 0)
+        # The question rode to the role as an ordinary turn (not a revise), and
+        # the intel was never reopened.
+        self.assertEqual(len(sess.sent), 2)
+        self.assertIn("[user question", sess.sent[-1])
 
     def _always_revise_fn(self, finding="still not aligned"):
         """Revise for exactly REVIEW_ROUND_CAP rounds (hitting the dissent
@@ -3739,7 +3759,8 @@ class ScoutLoopTtyTest(unittest.TestCase):
                                **kw: banners.append((text, kind))), \
                 mock.patch.object(cowork.ui, "select",
                                   return_value="iterate") as sel, \
-                mock.patch.object(cowork.ui, "confirm", return_value=True):
+                mock.patch.object(cowork, "_read_review",
+                                  return_value=cowork._END):
             rc = cowork._scout_loop(sess, "seed", intel, context="",
                                     io_in=FakeTTY(), io_out=FakeTTY(),
                                     review_fn=rfn)
@@ -3769,7 +3790,8 @@ class ScoutLoopTtyTest(unittest.TestCase):
                                   return_value="tell"), \
                 mock.patch.object(cowork.ui, "prompt_user",
                                   return_value="") as pu, \
-                mock.patch.object(cowork.ui, "confirm", return_value=True):
+                mock.patch.object(cowork, "_read_review",
+                                  return_value=cowork._END):
             rc = cowork._scout_loop(sess, "seed", intel, context="",
                                     io_in=FakeTTY(), io_out=FakeTTY(),
                                     review_fn=rfn)
@@ -3788,7 +3810,8 @@ class ScoutLoopTtyTest(unittest.TestCase):
                 mock.patch.object(cowork.ui, "select", return_value="tell"), \
                 mock.patch.object(cowork.ui, "prompt_user",
                                   return_value="focus on the schema"), \
-                mock.patch.object(cowork.ui, "confirm", return_value=True):
+                mock.patch.object(cowork, "_read_review",
+                                  return_value=cowork._END):
             rc = cowork._scout_loop(sess, "seed", intel, context="",
                                     io_in=FakeTTY(), io_out=FakeTTY(),
                                     review_fn=rfn)
@@ -3804,16 +3827,16 @@ class ScoutLoopTtyTest(unittest.TestCase):
         with mock.patch.object(cowork.ui, "banner"), \
                 mock.patch.object(cowork.ui, "select",
                                   return_value="approve"), \
-                mock.patch.object(cowork.ui, "confirm") as conf:
+                mock.patch.object(cowork, "_read_review") as rr:
             rc = cowork._scout_loop(sess, "seed", intel, context="",
                                     io_in=FakeTTY(), io_out=FakeTTY(),
                                     review_fn=rfn)
         self.assertEqual(rc, 0)
         # approved straight from the dissent gate: no extra reviewer rounds,
-        # no plain confirm gate
+        # no plain approve gate
         self.assertEqual(rfn.calls["n"], cap)
         self.assertEqual(len(sess.sent), cap)  # seed + (cap-1) revise handoffs
-        conf.assert_not_called()
+        rr.assert_not_called()
 
 
 class ClaudeSessionTtyTest(unittest.TestCase):
@@ -6733,6 +6756,34 @@ class BuilderLoopTest(unittest.TestCase):
             on_outcome=lambda o, p: outcomes.append((o, p)))
         return rc, out.getvalue(), outcomes
 
+    def test_tty_gate_is_binary_no_ask(self):
+        # The builder gate keeps its prior binary confirm contract on a TTY:
+        # the scout/planner-only 'Ask a question' path must NOT appear here.
+        import unittest.mock as mock
+        status, review, pj, pm = self._paths()
+        sess = self._session(status, [{"status": "ready_for_review"}])
+
+        def runner(config, context, selected, p, review_path, **kw):
+            return {"verdict": "approve"}
+
+        config = cowork.default_config(["builder", "build-reviewer"])
+        config["builder"]["controller"] = "codex"
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "confirm",
+                                  return_value=True) as conf, \
+                mock.patch.object(cowork.ui, "select") as sel:
+            rc = cowork.run_builder(
+                config, "seed", ["builder", "build-reviewer"],
+                io_in=FakeTTY(), io_out=FakeTTY(),
+                build_status_path=status, build_review_path=review,
+                plan_json_path=pj, plan_md_path=pm,
+                session_factory=lambda *a, **k: sess,
+                reviewer_runner=runner,
+                on_outcome=lambda o, p: None)
+        self.assertEqual(rc, 0)
+        conf.assert_called_once()        # binary approve gate
+        sel.assert_not_called()          # no 3-way ask gate for the builder
+
     def test_needs_input_then_ready_then_approve(self):
         status, review, pj, pm = self._paths()
         sess = self._session(status, [{"status": "needs_input"},
@@ -8078,11 +8129,9 @@ class ReviewerFailureGateTest(unittest.TestCase):
         rfn = self._review_fn([])
         out = FakeTTY()
 
-        def fake_review(io_in, io_out, prompt=None):
-            return True  # confirm() at the user gate -> approve
-
         with mock.patch.object(cowork.ui, "select", return_value="skip-review"), \
-                mock.patch.object(cowork.ui, "confirm", return_value=True):
+                mock.patch.object(cowork, "_read_review",
+                                  return_value=cowork._END):
             rc, outcome, _ = cowork._role_loop(
                 self._session(path, ["ready_for_review"]), "seed", path,
                 context="", io_in=FakeTTY(), io_out=out, review_fn=rfn)
@@ -10418,6 +10467,301 @@ class RolePromptHeadlessDirectiveTest(unittest.TestCase):
             text = fh.read()
         self.assertIn("worktree", text.lower())
         self.assertIn("status", text.lower())
+
+
+class AssembleUserQuestionTest(unittest.TestCase):
+    """The harness-boundary prompt for a gate-time question."""
+
+    def test_carries_question_and_no_edit_instruction(self):
+        out = cowork.assemble_user_question("why mongo?", artifact="plan")
+        self.assertIn("why mongo?", out)
+        self.assertIn("answer", out.lower())
+        self.assertIn("plan", out)
+        self.assertIn("ready_for_review", out)
+        self.assertIn("Do NOT edit", out)
+        self.assertIn("not a request to change", out.lower())
+
+
+class ReadReviewThreeWayTest(unittest.TestCase):
+    """The 3-way review gate: Approve & finish / Ask a question / Request
+    changes on a TTY; the unchanged blank=finish / text=revise contract off
+    one."""
+
+    def _tty(self):
+        return FakeTTY(), FakeTTY()
+
+    def test_off_tty_blank_finishes(self):
+        self.assertIs(cowork._read_review(io.StringIO("\n"), io.StringIO()),
+                      cowork._END)
+        self.assertIs(cowork._read_review(io.StringIO(""), io.StringIO()),
+                      cowork._END)
+
+    def test_off_tty_text_revises(self):
+        self.assertEqual(
+            cowork._read_review(io.StringIO("change x\n"), io.StringIO()),
+            "change x")
+
+    def test_tty_approve_ends(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", return_value="approve"):
+            self.assertIs(cowork._read_review(i, o), cowork._END)
+
+    def test_tty_ask_returns_marker(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", return_value="ask"), \
+                mock.patch.object(ui, "prompt_user", return_value="why this?"):
+            out = cowork._read_review(i, o)
+        self.assertIsInstance(out, tuple)
+        self.assertIs(out[0], cowork._ASK)
+        self.assertEqual(out[1], "why this?")
+
+    def test_tty_ask_blank_reshows_gate_never_approves(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        sel = mock.Mock(side_effect=["ask", "approve"])
+        with mock.patch.object(ui, "select", sel), \
+                mock.patch.object(ui, "prompt_user", return_value="   "):
+            self.assertIs(cowork._read_review(i, o), cowork._END)
+        # A blank question re-showed the select rather than approving.
+        self.assertEqual(sel.call_count, 2)
+
+    def test_tty_changes_returns_text(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", return_value="changes"), \
+                mock.patch.object(ui, "prompt_user",
+                                  return_value="tighten scope"):
+            self.assertEqual(cowork._read_review(i, o), "tighten scope")
+
+    def test_tty_changes_blank_never_traps(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", return_value="changes"), \
+                mock.patch.object(ui, "prompt_user", return_value=""):
+            self.assertIs(cowork._read_review(i, o), cowork._END)
+
+    def test_tty_dismissed_select_never_traps(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", return_value=None), \
+                mock.patch.object(ui, "prompt_user", return_value=""):
+            self.assertIs(cowork._read_review(i, o), cowork._END)
+
+    def test_tty_no_ask_uses_binary_confirm(self):
+        # allow_ask=False (the builder gate) keeps the prior binary confirm
+        # contract: no select, no ask path.
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "confirm", return_value=True) as conf, \
+                mock.patch.object(ui, "select") as sel:
+            self.assertIs(cowork._read_review(i, o, allow_ask=False),
+                          cowork._END)
+        conf.assert_called_once()
+        sel.assert_not_called()
+
+    def test_tty_no_ask_decline_revises(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "confirm", return_value=False), \
+                mock.patch.object(ui, "prompt_user", return_value="fix it"), \
+                mock.patch.object(ui, "select") as sel:
+            self.assertEqual(cowork._read_review(i, o, allow_ask=False),
+                             "fix it")
+        sel.assert_not_called()
+
+
+class ReviewGateQuestionTest(unittest.TestCase):
+    """The "Ask a question" path end-to-end through the shared role loop: a
+    non-reopen turn that answers in chat, leaves the artifact byte-identical,
+    and lets the hash-gate auto-skip the paired advisor — no invalidate, no
+    stale-no-op, no re-review. Covered for both the planner/_role_loop generic
+    path and the scout loop."""
+
+    def _dir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        os.makedirs(os.path.join(d, ".cowork"), exist_ok=True)
+        # The skip-baseline state lives in a SEPARATE session file, never the
+        # reviewed status artifact.
+        spath = os.path.join(d, "session.json")
+        state_store.save(spath, {"team": [], "config": {}, "sessions": {}})
+        self._spath = spath
+        return d
+
+    def _trace(self, d):
+        return trace_store.Trace(os.path.join(d, ".cowork", "trace.X.jsonl"),
+                                 session_uuid="X", run_id="R")
+
+    def _events(self, d):
+        tpath = os.path.join(d, ".cowork", "trace.X.jsonl")
+        with open(tpath) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _raw_trace(self, d):
+        with open(os.path.join(d, ".cowork", "trace.X.jsonl")) as fh:
+            return fh.read()
+
+    _READY = {"status": "ready_for_review", "result": {}}
+
+    def _session(self, path, writes):
+        """`writes` is a per-send list: a dict is written as the status
+        artifact, None means the turn writes nothing (the question turn)."""
+        class ScriptedSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                w = writes.pop(0) if writes else None
+                if w is not None:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as fh:
+                        json.dump(w, fh)
+
+            def close(self):
+                self.closed = True
+        return ScriptedSession()
+
+    def _review_fn(self, verdicts):
+        calls = {"n": 0}
+
+        def review_fn(status_path, round_index):
+            calls["n"] += 1
+            return verdicts.pop(0) if verdicts else {"verdict": "approve"}
+        review_fn.calls = calls
+        return review_fn
+
+    def _bundle(self, spath, covered, reviewer_role):
+        # Mirrors run_flow.make_skip_baseline (see HashGateSkipTest._bundle).
+        holder = {"state": state_store.load(spath)}
+
+        def compute():
+            return state_store.composite_artifact_hash(covered)
+
+        def eligible(h):
+            return state_store.review_skip_eligible(
+                holder["state"], reviewer_role, 0, 0, h)
+
+        def record(h):
+            holder["state"] = state_store.record_review_baseline(
+                spath, reviewer_role, 0, 0, h, prior=holder["state"])
+        return cowork.SkipBaseline(compute, eligible, record)
+
+    def _assert_question_was_free(self, d, rfn, status_path,
+                                  question="why this approach?"):
+        events = self._events(d)
+        # The role artifact was never invalidated (no reopen).
+        self.assertFalse(any(e["event"] == "status.invalidated"
+                             for e in events))
+        # No stale-no-op fired even though the question turn wrote nothing.
+        self.assertFalse(any(e["event"] == "stale_noop" for e in events))
+        self.assertFalse(any(e["event"] == "stale_noop.unresolved"
+                             for e in events))
+        # The advisor ran exactly once (the original approve), then was skipped
+        # on the unchanged follow-up.
+        self.assertEqual(rfn.calls["n"], 1)
+        self.assertTrue(any(e["event"] == "review.skipped" for e in events))
+        # The question is recorded as a distinct, content-free user action.
+        q = [e for e in events if e["event"] == "user.action"
+             and e.get("action") == "question"]
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["gate"], "ready_for_review")
+        self.assertIn("input_sha256", q[0])
+        self.assertIn("input_bytes", q[0])
+        # The raw question text never lands in the trace (privacy).
+        self.assertNotIn(question, self._raw_trace(d))
+        # The gate was shown before AND after the question (re-shown).
+        gate_shows = [e for e in events if e["event"] == "gate.show"
+                      and e.get("gate") == "ready_for_review"]
+        self.assertGreaterEqual(len(gate_shows), 2)
+        # The status artifact is byte-identical to the approved READY bytes.
+        with open(status_path) as fh:
+            self.assertEqual(json.load(fh)["status"], "ready_for_review")
+
+    def test_question_gate_planner_role_loop(self):
+        import unittest.mock as mock
+        d = self._dir()
+        path = os.path.join(d, ".cowork", "planner.plan.X.json")
+        sess = self._session(path, [dict(self._READY)])  # only the seed writes
+        rfn = self._review_fn([{"verdict": "approve"}])
+        bundle = self._bundle(self._spath, [path], "planning-advisor")
+        trace = self._trace(d)
+        out = io.StringIO()
+        with mock.patch.object(
+                cowork, "_read_review",
+                side_effect=[(cowork._ASK, "why this approach?"), cowork._END]):
+            rc, outcome, _ = cowork._role_loop(
+                sess, "seed", path, context="",
+                io_in=io.StringIO(""), io_out=out,
+                review_fn=rfn, skip_baseline=bundle, trace=trace)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "approved")
+        # The question turn was tagged user_question (per-turn accounting).
+        starts = [e for e in self._events(d) if e["event"] == "role.send.start"]
+        self.assertIn("user_question",
+                      [e.get("prompt_kind") for e in starts])
+        self.assertIn("review skipped", out.getvalue())
+        self._assert_question_was_free(d, rfn, path)
+
+    def test_question_gate_scout_loop(self):
+        import unittest.mock as mock
+        d = self._dir()
+        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
+        intel_md = os.path.join(d, ".cowork", "scout.intel.X.md")
+        with open(intel, "w") as fh:
+            json.dump(dict(self._READY), fh)
+        with open(intel_md, "w") as fh:
+            fh.write("# intel markdown")
+        sess = self._session(intel, [dict(self._READY)])
+        rfn = self._review_fn([{"verdict": "approve"}])
+        bundle = self._bundle(self._spath, [intel, intel_md], "scout-reviewer")
+        trace = self._trace(d)
+        out = io.StringIO()
+        with mock.patch.object(
+                cowork, "_read_review",
+                side_effect=[(cowork._ASK, "why this approach?"), cowork._END]):
+            rc = cowork._scout_loop(
+                sess, "seed", intel, context="",
+                io_in=io.StringIO(""), io_out=out, review_fn=rfn,
+                intel_md_path=intel_md, skip_baseline=bundle, trace=trace)
+        self.assertEqual(rc, 0)
+        self.assertIn("review skipped", out.getvalue())
+        self._assert_question_was_free(d, rfn, intel)
+
+    def test_request_changes_still_reopens_as_revise(self):
+        # Regression: the 3-way "Request changes" path (a plain string from
+        # _read_review) still reopens work exactly like today's revise.
+        import unittest.mock as mock
+        d = self._dir()
+        path = os.path.join(d, ".cowork", "planner.plan.X.json")
+        sess = self._session(path, [
+            dict(self._READY),
+            {"status": "ready_for_review", "result": {"v": 2}}])  # revised bytes
+        rfn = self._review_fn([{"verdict": "approve"}, {"verdict": "approve"}])
+        bundle = self._bundle(self._spath, [path], "planning-advisor")
+        trace = self._trace(d)
+        with mock.patch.object(
+                cowork, "_read_review",
+                side_effect=["please tighten scope", cowork._END]):
+            rc, outcome, _ = cowork._role_loop(
+                sess, "seed", path, context="",
+                io_in=io.StringIO(""), io_out=io.StringIO(),
+                review_fn=rfn, skip_baseline=bundle, trace=trace)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "approved")
+        events = self._events(d)
+        revise = [e for e in events if e["event"] == "user.action"
+                  and e.get("action") == "revise"]
+        self.assertEqual(len(revise), 1)
+        self.assertEqual(revise[0]["gate"], "ready_for_review")
+        # Work was reopened: the artifact was invalidated and the advisor re-ran.
+        self.assertTrue(any(e["event"] == "status.invalidated"
+                            and e["changed"] for e in events))
+        self.assertEqual(rfn.calls["n"], 2)
 
 
 if __name__ == "__main__":
