@@ -198,6 +198,297 @@ class FlagAssemblyTest(unittest.TestCase):
         self.assertEqual(cmd[-1], "next")
 
 
+class ModelEffortFlagTest(unittest.TestCase):
+    """Per-role model + thinking-effort pins on the assembled CLI commands."""
+
+    def _c_values(self, cmd):
+        return [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "-c"]
+
+    def test_claude_command_model_effort(self):
+        cmd = bridge.build_claude_command(
+            "roles/scout.md", "implement", True, session_id="sid",
+            model="opus", effort="high")
+        self.assertEqual(cmd[cmd.index("--model") + 1], "opus")
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "high")
+        # Unset -> byte-identical to today (the CLI's own defaults apply).
+        self.assertEqual(
+            bridge.build_claude_command("roles/scout.md", "implement", True,
+                                        session_id="sid"),
+            bridge.build_claude_command("roles/scout.md", "implement", True,
+                                        session_id="sid", model=None,
+                                        effort=None))
+        self.assertNotIn(
+            "--model", bridge.build_claude_command(
+                "roles/scout.md", "implement", True, session_id="sid"))
+
+    def test_codex_model_args_shared_by_fresh_and_resume(self):
+        self.assertEqual(bridge.codex_model_args(), [])
+        # -c (not -m) so fresh and resume take the identical spelling: resume
+        # rejects -m but accepts -c.
+        self.assertEqual(
+            bridge.codex_model_args("gpt-5.4-codex", "high"),
+            ["-c", 'model="gpt-5.4-codex"',
+             "-c", 'model_reasoning_effort="high"'])
+        fresh = bridge.build_codex_command(
+            "P", "implement", True, model="gpt-5.4-codex", effort="high")
+        resume = bridge.build_codex_resume_command(
+            "thread-1", "P", "implement", True, model="gpt-5.4-codex",
+            effort="high")
+        for cmd in (fresh, resume):
+            self.assertIn('model="gpt-5.4-codex"', self._c_values(cmd))
+            self.assertIn('model_reasoning_effort="high"',
+                          self._c_values(cmd))
+            self.assertEqual(cmd[-1], "P")  # prompt stays last
+        self.assertNotIn("-m", fresh)
+        # Unset -> byte-identical to today.
+        self.assertEqual(
+            bridge.build_codex_command("P", "implement", True),
+            bridge.build_codex_command("P", "implement", True,
+                                       model=None, effort=None))
+
+
+class OpencodeBridgeTest(unittest.TestCase):
+    """opencode agent-file generation, command assembly, and event parsing."""
+
+    def test_permission_lines_per_mode(self):
+        # yolo implement -> no block (--auto rides on the command instead).
+        self.assertEqual(
+            bridge.opencode_permission_lines("implement", True), [])
+        plan = bridge.opencode_permission_lines("plan", True)
+        self.assertIn("  edit: deny", plan)
+        self.assertIn("  bash: ask", plan)  # ask auto-rejects headless
+        safe = bridge.opencode_permission_lines("implement", False,
+                                                external_dir=True)
+        self.assertIn("  edit: allow", safe)
+        self.assertIn("  external_directory: allow", safe)
+        # plan never grants the external dir (read-only stays read-only).
+        self.assertNotIn(
+            "  external_directory: allow",
+            bridge.opencode_permission_lines("plan", True, external_dir=True))
+
+    def test_agent_markdown_frontmatter_and_body(self):
+        md = bridge.opencode_agent_markdown(
+            "ROLE PROMPT", "plan", True, description="cowork scout role")
+        self.assertTrue(md.startswith("---\n"))
+        self.assertIn("description: cowork scout role", md)
+        self.assertIn("mode: primary", md)
+        self.assertIn("edit: deny", md)
+        self.assertTrue(md.rstrip().endswith("ROLE PROMPT"))
+        yolo_md = bridge.opencode_agent_markdown(
+            "R", "implement", True, description="d")
+        self.assertNotIn("permission:", yolo_md)
+
+    def test_ensure_opencode_agent_writes_and_regenerates(self):
+        import tempfile
+        base = tempfile.mkdtemp()
+        rp = os.path.join(base, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("BE THE SCOUT")
+        name = bridge.ensure_opencode_agent(rp, "scout", "implement", False,
+                                            base_dir=base)
+        self.assertEqual(name, "cowork-scout")
+        path = os.path.join(base, ".opencode", "agents", "cowork-scout.md")
+        with open(path) as fh:
+            content = fh.read()
+        self.assertIn("BE THE SCOUT", content)
+        self.assertIn("edit: allow", content)
+        # A config change regenerates the file with the new permissions.
+        bridge.ensure_opencode_agent(rp, "scout", "plan", True, base_dir=base)
+        with open(path) as fh:
+            self.assertIn("edit: deny", fh.read())
+
+    def test_build_opencode_command(self):
+        cmd = bridge.build_opencode_command(
+            "cowork-scout", "PROMPT", "implement", True,
+            model="anthropic/claude-sonnet-4-5", effort="max")
+        self.assertEqual(cmd[:4], ["opencode", "run", "--format", "json"])
+        self.assertEqual(cmd[cmd.index("--agent") + 1], "cowork-scout")
+        self.assertEqual(cmd[cmd.index("--model") + 1],
+                         "anthropic/claude-sonnet-4-5")
+        self.assertEqual(cmd[cmd.index("--variant") + 1], "max")
+        self.assertIn("--auto", cmd)
+        self.assertEqual(cmd[-1], "PROMPT")
+        # no-yolo and plan runs rely on agent permissions, never --auto.
+        self.assertNotIn("--auto", bridge.build_opencode_command(
+            "a", "P", "implement", False))
+        self.assertNotIn("--auto", bridge.build_opencode_command(
+            "a", "P", "plan", True))
+        # model/effort omitted -> flags omitted (CLI defaults apply).
+        bare = bridge.build_opencode_command("a", "P", "implement", True)
+        self.assertNotIn("--model", bare)
+        self.assertNotIn("--variant", bare)
+        res = bridge.build_opencode_command(
+            "a", "P", "implement", True, resume_session_id="ses_1")
+        self.assertEqual(res[res.index("--session") + 1], "ses_1")
+        self.assertEqual(res[-1], "P")
+
+    def test_parse_opencode_events(self):
+        self.assertEqual(
+            bridge.parse_opencode_event(
+                {"type": "text", "part": {"text": "hi"}}),
+            {"kind": "message", "text": "hi"})
+        self.assertEqual(
+            bridge.parse_opencode_event(
+                {"type": "tool", "part": {"tool": "bash"}}),
+            {"kind": "tool", "label": "using bash"})
+        done = bridge.parse_opencode_event(
+            {"type": "tool_use",
+             "part": {"tool": "bash", "state": {"status": "completed"}}})
+        self.assertEqual(done["kind"], "tool_done")
+        denied = bridge.parse_opencode_event(
+            {"type": "tool_use",
+             "part": {"state": {"status": "error",
+                                "error": "The user rejected permission to use "
+                                         "this specific tool call."}}})
+        self.assertEqual(denied["kind"], "denied")
+        err = bridge.parse_opencode_event(
+            {"type": "error",
+             "error": {"name": "APIError", "data": {"message": "boom"}}})
+        self.assertEqual(err, {"kind": "error", "text": "boom"})
+        fin = bridge.parse_opencode_event(
+            {"type": "step_finish",
+             "part": {"reason": "stop", "tokens": {"input": 5}}})
+        self.assertEqual(fin["kind"], "step_finish")
+        self.assertEqual(fin["reason"], "stop")
+        other = bridge.parse_opencode_event({"type": "step_start", "part": {}})
+        self.assertEqual(other["kind"], "other")
+
+    def test_capture_session_id_and_usage(self):
+        events = [
+            {"type": "step_start", "sessionID": "ses_A", "part": {}},
+            {"type": "step_finish", "sessionID": "ses_A",
+             "part": {"reason": "tool-calls",
+                      "tokens": {"input": 10, "output": 2, "reasoning": 3,
+                                 "cache": {"read": 7, "write": 1}}}},
+            {"type": "step_finish", "sessionID": "ses_A",
+             "part": {"reason": "stop", "tokens": {"input": 4, "output": 5}}},
+        ]
+        self.assertEqual(bridge.capture_opencode_session_id(events), "ses_A")
+        self.assertEqual(bridge.opencode_usage(events), {
+            "input_tokens": 14, "output_tokens": 10,
+            "cache_read_input_tokens": 7, "cache_creation_input_tokens": 1})
+        self.assertIsNone(bridge.opencode_usage([{"type": "text", "part": {}}]))
+        self.assertIsNone(bridge.capture_opencode_session_id(
+            [{"type": "text", "part": {}}]))
+
+
+class OpencodeSessionTest(unittest.TestCase):
+    """OpencodeSession turn behavior via a fake subprocess (no real CLI)."""
+
+    class FakeProc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    def _session(self, tmp, **kw):
+        rp = os.path.join(tmp, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("ROLE")
+        return bridge.OpencodeSession(rp, "implement", True,
+                                      agent_base_dir=tmp, **kw)
+
+    def test_fresh_send_captures_session_and_resumes(self):
+        import tempfile
+        import unittest.mock as mock
+        tmp = tempfile.mkdtemp()
+        lines = [
+            json.dumps({"type": "text", "sessionID": "ses_X",
+                        "part": {"text": "hello there"}}),
+            json.dumps({"type": "step_finish", "sessionID": "ses_X",
+                        "part": {"reason": "stop",
+                                 "tokens": {"input": 1, "output": 2}}}),
+        ]
+        got = {}
+        cmds = []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            return self.FakeProc(lines)
+
+        out = io.StringIO()
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=fake_popen):
+            s = self._session(tmp, io_out=out,
+                              on_session_id=lambda i: got.setdefault("id", i))
+            r1 = s.send("first")
+            r2 = s.send("second")
+        self.assertEqual(s.controller, "opencode")
+        self.assertTrue(r1["ok"])
+        self.assertTrue(r2["ok"])
+        self.assertEqual(got.get("id"), "ses_X")
+        self.assertEqual(r1["session_id"], "ses_X")
+        # fresh turn has no --session; the follow-up resumes the captured id.
+        self.assertNotIn("--session", cmds[0])
+        self.assertEqual(cmds[1][cmds[1].index("--session") + 1], "ses_X")
+        # both turns target the generated agent.
+        for cmd in cmds:
+            self.assertEqual(cmd[cmd.index("--agent") + 1], "cowork-scout")
+        self.assertIn("hello there", out.getvalue())
+
+    def test_constructor_resume_uses_session_flag(self):
+        import tempfile
+        import unittest.mock as mock
+        tmp = tempfile.mkdtemp()
+        lines = [json.dumps({"type": "text", "sessionID": "ses_R",
+                             "part": {"text": "resumed"}})]
+        cmds = []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            return self.FakeProc(lines)
+
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=fake_popen):
+            s = self._session(tmp, io_out=io.StringIO(),
+                              resume_session_id="ses_R")
+            r = s.send("continue")
+        self.assertTrue(r["ok"])
+        self.assertEqual(cmds[0][cmds[0].index("--session") + 1], "ses_R")
+
+    def test_denied_error_and_empty_stream(self):
+        import tempfile
+        import unittest.mock as mock
+        tmp = tempfile.mkdtemp()
+
+        def run_with(lines):
+            with mock.patch.object(bridge.subprocess, "Popen",
+                                   return_value=self.FakeProc(lines)):
+                out = io.StringIO()
+                s = self._session(tmp, io_out=out)
+                return s.send("go"), out.getvalue()
+
+        denied, text = run_with([json.dumps(
+            {"type": "tool_use", "sessionID": "ses_D",
+             "part": {"state": {"status": "error",
+                                "error": "The user rejected permission to use "
+                                         "this specific tool call."}}})])
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["result"], "denied")
+        self.assertIn("denied", text)
+
+        err, text = run_with([json.dumps(
+            {"type": "error", "sessionID": "ses_E",
+             "error": {"name": "APIError", "data": {"message": "boom"}}})])
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["result"], "error")
+        self.assertIn("boom", text)
+
+        empty, _ = run_with([])
+        self.assertFalse(empty["ok"])
+        self.assertEqual(empty.get("error_type"), "no_events")
+
+
 class StatusSpinnerTest(unittest.TestCase):
     def test_returns_fn_value_and_runs_it(self):
         seen = {}
@@ -317,29 +608,96 @@ class MenuTest(unittest.TestCase):
             cowork.select_team_interactive(checkbox_fn=lambda *a, **k: []), [])
 
     def test_configure_roles_accepts_defaults(self):
+        # One Enter: the start entry is the menu default, so returning the
+        # default accepts the whole config untouched.
         cfg = cowork.configure_roles_interactive(
             ["scout", "planning-advisor"],
-            select_fn=lambda opts, default=None, message="": "use these defaults",
-            checkbox_fn=lambda *a, **k: [])
+            select_fn=lambda opts, default=None, message="": default)
         self.assertEqual(cfg["scout"], cowork.DEFAULTS["scout"])
 
     def test_configure_roles_customizes(self):
+        picks = {"n": 0}
+
         def select_fn(opts, default=None, message=""):
-            if "use these defaults" in opts:        # the defaults-vs-customize gate
-                return "customize"
+            if cowork.START_CHOICE in opts:  # the table screen
+                picks["n"] += 1
+                return "scout" if picks["n"] == 1 else cowork.START_CHOICE
             if message.endswith("controller"):
                 return "codex"
-            if message.endswith("permissions"):
-                return "no-yolo"
-            if message.endswith("mode"):
-                return "implement"
-            return default
+            if message.endswith("access"):
+                return "safe (edits only, other commands denied)"
+            return default  # model + effort selects keep the default
         cfg = cowork.configure_roles_interactive(
             ["scout"], select_fn=select_fn,
-            checkbox_fn=lambda msg, opts, checked=None: ["scout"])
+            text_fn=lambda message, default="": default)
         self.assertEqual(cfg["scout"]["controller"], "codex")
         self.assertFalse(cfg["scout"]["yolo"])
         self.assertEqual(cfg["scout"]["mode"], "implement")
+        self.assertIsNone(cfg["scout"]["model"])
+        self.assertIsNone(cfg["scout"]["effort"])
+
+    def test_configure_roles_opencode_provider_model_effort(self):
+        picks = {"n": 0}
+
+        def select_fn(opts, default=None, message=""):
+            if cowork.START_CHOICE in opts:
+                picks["n"] += 1
+                return "builder" if picks["n"] == 1 else cowork.START_CHOICE
+            if message.endswith("controller"):
+                return "opencode"
+            if message.endswith("provider (opencode)"):
+                self.assertIn("anthropic", opts)
+                return "anthropic"
+            if message.endswith("model (anthropic)"):
+                return "anthropic/claude-sonnet-4-5"
+            if message.endswith("thinking effort (opencode)"):
+                self.assertIn("max", opts)  # provider-tailored levels
+                return "max"
+            return default
+        cfg = cowork.configure_roles_interactive(
+            ["builder"], select_fn=select_fn,
+            text_fn=lambda message, default="": default,
+            opencode_models_fn=lambda: {
+                "anthropic": ["anthropic/claude-sonnet-4-5",
+                              "anthropic/claude-opus-4-5"]})
+        self.assertEqual(cfg["builder"]["controller"], "opencode")
+        self.assertEqual(cfg["builder"]["model"], "anthropic/claude-sonnet-4-5")
+        self.assertEqual(cfg["builder"]["effort"], "max")
+
+    def test_configure_roles_switching_controller_resets_model_effort(self):
+        picks = {"n": 0}
+
+        def select_fn(opts, default=None, message=""):
+            if cowork.START_CHOICE in opts:
+                picks["n"] += 1
+                if picks["n"] == 1:
+                    return "scout"      # first edit: claude + opus + high
+                if picks["n"] == 2:
+                    return "scout"      # second edit: switch to codex
+                return cowork.START_CHOICE
+            if message.endswith("controller"):
+                return "claude" if picks["n"] == 1 else "codex"
+            if picks["n"] == 1 and message.endswith("model (claude)"):
+                return "opus"
+            if picks["n"] == 1 and message.endswith("thinking effort (claude)"):
+                return "high"
+            return default
+        cfg = cowork.configure_roles_interactive(
+            ["scout"], select_fn=select_fn,
+            text_fn=lambda message, default="": default)
+        # The claude model/effort never leak into the codex config.
+        self.assertEqual(cfg["scout"]["controller"], "codex")
+        self.assertIsNone(cfg["scout"]["model"])
+        self.assertIsNone(cfg["scout"]["effort"])
+
+    def test_list_opencode_models_parses_and_tolerates_failure(self):
+        parsed = cowork.list_opencode_models(
+            runner=lambda: "anthropic/claude-sonnet-4-5\nopenai/gpt-5.4\n"
+                           "openai/gpt-5.4-mini\nnot a model line\n")
+        self.assertEqual(parsed, {
+            "anthropic": ["anthropic/claude-sonnet-4-5"],
+            "openai": ["openai/gpt-5.4", "openai/gpt-5.4-mini"]})
+        self.assertEqual(cowork.list_opencode_models(runner=lambda: ""), {})
 
     def test_gather_context_eof_is_empty(self):
         self.assertEqual(
@@ -361,11 +719,15 @@ class MenuTest(unittest.TestCase):
 class ConfigTest(unittest.TestCase):
     def test_default_config_matches_defaults(self):
         cfg = cowork.default_config(cowork.ROLES)
-        # Roles default to implement mode (guardrailed by role spec, not plan).
+        # Roles default to implement mode (guardrailed by role spec, not plan)
+        # and to the controller CLI's own model/effort (None).
         self.assertEqual(cfg["scout"],
-                         {"controller": "claude", "yolo": True, "mode": "implement"})
+                         {"controller": "claude", "model": None, "effort": None,
+                          "yolo": True, "mode": "implement"})
         for role in cowork.ROLES:
             self.assertEqual(cfg[role]["mode"], "implement")
+            self.assertIsNone(cfg[role]["model"])
+            self.assertIsNone(cfg[role]["effort"])
 
     def test_apply_config_override(self):
         cfg = cowork.default_config(["scout"])
@@ -373,11 +735,37 @@ class ConfigTest(unittest.TestCase):
             cfg, "scout", ["codex", "no-yolo", "implement"])
         self.assertTrue(ok)
         self.assertEqual(
-            cfg["scout"], {"controller": "codex", "yolo": False, "mode": "implement"})
+            cfg["scout"], {"controller": "codex", "model": None, "effort": None,
+                           "yolo": False, "mode": "implement"})
         ok, _ = cowork.apply_config_override(cfg, "ghost", ["claude"])
         self.assertFalse(ok)
         ok, _ = cowork.apply_config_override(cfg, "scout", ["bogus"])
         self.assertFalse(ok)
+
+    def test_apply_config_override_opencode_model_effort(self):
+        cfg = cowork.default_config(["scout"])
+        ok, err = cowork.apply_config_override(
+            cfg, "scout", ["opencode", "model=openai/gpt-5.4", "effort=high"])
+        self.assertTrue(ok)
+        self.assertEqual(cfg["scout"]["controller"], "opencode")
+        self.assertEqual(cfg["scout"]["model"], "openai/gpt-5.4")
+        self.assertEqual(cfg["scout"]["effort"], "high")
+        # model=default / effort=default reset to the CLI's own setting.
+        ok, _ = cowork.apply_config_override(
+            cfg, "scout", ["model=default", "effort=default"])
+        self.assertTrue(ok)
+        self.assertIsNone(cfg["scout"]["model"])
+        self.assertIsNone(cfg["scout"]["effort"])
+        ok, _ = cowork.apply_config_override(cfg, "scout", ["speed=fast"])
+        self.assertFalse(ok)
+
+    def test_normalize_role_config_backfills_model_effort(self):
+        old = {"controller": "codex", "yolo": True, "mode": "implement"}
+        normalized = cowork.normalize_role_config(old)
+        self.assertEqual(normalized,
+                         {"controller": "codex", "model": None, "effort": None,
+                          "yolo": True, "mode": "implement"})
+        self.assertNotIn("model", old)  # input never mutated
 
 
 class ArgsPathTest(unittest.TestCase):
@@ -399,9 +787,20 @@ class ArgsPathTest(unittest.TestCase):
         ok, err = cowork.apply_config_args(cfg, ["scout=codex,no-yolo,implement"])
         self.assertTrue(ok)
         self.assertEqual(
-            cfg["scout"], {"controller": "codex", "yolo": False, "mode": "implement"})
+            cfg["scout"], {"controller": "codex", "model": None, "effort": None,
+                           "yolo": False, "mode": "implement"})
         ok, err = cowork.apply_config_args(cfg, ["scoutcodex"])  # no '='
         self.assertFalse(ok)
+        # key=value options ride in the same comma list; ROLE= splits on the
+        # FIRST '=' only, so model=/effort= survive intact.
+        ok, err = cowork.apply_config_args(
+            cfg, ["scout=opencode,model=anthropic/claude-sonnet-4-5,"
+                  "effort=max,yolo"])
+        self.assertTrue(ok)
+        self.assertEqual(
+            cfg["scout"],
+            {"controller": "opencode", "model": "anthropic/claude-sonnet-4-5",
+             "effort": "max", "yolo": True, "mode": "implement"})
 
     def test_resolve_context_text_and_file(self):
         args = self._args(["--context", "hello"])
@@ -1463,6 +1862,40 @@ class FallthroughTest(unittest.TestCase):
 
 
 class RunScoutTest(unittest.TestCase):
+    def test_run_scout_opencode_seeds_brief_plus_context_only(self):
+        import tempfile
+        config = {"scout": {"controller": "opencode", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        intel = os.path.join(tempfile.mkdtemp(), "scout.intel.json")
+        seen = {}
+        prompts = []
+
+        def factory(controller, resume_session_id=None, on_session_id=None):
+            seen["controller"] = controller
+            seen["resume_session_id"] = resume_session_id
+
+            class FakeScout:
+                def send(self, text, meta=None):
+                    prompts.append(text)
+                    return {"ok": True, "result": "ok"}
+
+                def close(self):
+                    pass
+            return FakeScout()
+
+        out = io.StringIO()
+        rc = cowork.run_scout(config, "build the thing", ["scout"],
+                              io_in=io.StringIO(""), io_out=out,
+                              intel_path=intel, session_factory=factory)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["controller"], "opencode")
+        self.assertIsNone(seen["resume_session_id"])
+        self.assertIn("build the thing", prompts[0])
+        # The role prompt is delivered via the generated agent file (system
+        # prompt), never inlined into the seed — unlike the codex path.
+        role_text = cowork.read_scout_prompt().strip()
+        self.assertNotIn(role_text[:80], prompts[0])
+
     def test_run_scout_claude_probe_fail_aborts(self):
         config = {"scout": {"controller": "claude", "yolo": True, "mode": "plan"}}
         out = io.StringIO()
@@ -1968,7 +2401,8 @@ class ScoutReviewerRegistrationTest(unittest.TestCase):
         self.assertNotIn("revisor", cowork.ROLES)  # reserved slot dropped
         self.assertEqual(
             cowork.DEFAULTS["scout-reviewer"],
-            {"controller": "codex", "yolo": True, "mode": "implement"})
+            {"controller": "codex", "model": None, "effort": None,
+             "yolo": True, "mode": "implement"})
 
     def test_role_prompt_file_exists(self):
         self.assertTrue(os.path.exists(cowork.SCOUT_REVIEWER_PROMPT_PATH))
@@ -4218,7 +4652,8 @@ class PlanningAdvisorRegistrationTest(unittest.TestCase):
         # inherits the old advisor defaults
         self.assertEqual(
             cowork.DEFAULTS["planning-advisor"],
-            {"controller": "codex", "yolo": True, "mode": "implement"})
+            {"controller": "codex", "model": None, "effort": None,
+             "yolo": True, "mode": "implement"})
 
     def test_role_prompt_files_exist(self):
         self.assertTrue(os.path.exists(cowork.PLANNER_PROMPT_PATH))
@@ -6403,10 +6838,12 @@ class BuildReviewerRegistrationTest(unittest.TestCase):
         self.assertNotIn("revisor", cowork.DEFAULTS)
         self.assertEqual(
             cowork.DEFAULTS["build-reviewer"],
-            {"controller": "codex", "yolo": True, "mode": "implement"})
+            {"controller": "codex", "model": None, "effort": None,
+             "yolo": True, "mode": "implement"})
         self.assertEqual(
             cowork.DEFAULTS["builder"],
-            {"controller": "claude", "yolo": True, "mode": "implement"})
+            {"controller": "claude", "model": None, "effort": None,
+             "yolo": True, "mode": "implement"})
 
     def test_role_prompt_files_exist(self):
         self.assertTrue(os.path.exists(cowork.BUILDER_PROMPT_PATH))
