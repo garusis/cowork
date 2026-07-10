@@ -30,7 +30,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -285,10 +287,10 @@ START_CHOICE = "✓ start with this config"
 DEFAULT_CHOICE = "default (the CLI's own setting)"
 CUSTOM_CHOICE = "custom…"
 
-# Curated model presets per controller. Claude aliases are stable; codex model
-# ids churn with releases, so codex offers default/custom only; opencode models
-# are discovered live from `opencode models` (only providers with credentials
-# appear there).
+# Curated model presets per controller — the silent FALLBACK when live
+# discovery fails. Live sources: claude from the public models.dev catalog
+# (keyless), codex from `codex debug models`, opencode from `opencode models`
+# (only providers with credentials appear there).
 MODEL_PRESETS = {
     "claude": ["opus", "sonnet", "haiku"],
     "codex": [],
@@ -351,14 +353,122 @@ def list_opencode_models(runner=None):
     return models
 
 
+def _run_codex_models():
+    """Raw `codex debug models` stdout ('' on any failure)."""
+    try:
+        res = subprocess.run(["codex", "debug", "models"], capture_output=True,
+                             text=True, timeout=10)
+    except Exception:  # noqa: BLE001 - a model list is never load-bearing
+        return ""
+    return res.stdout if res.returncode == 0 else ""
+
+
+def list_codex_models(runner=None):
+    """Parse the `codex debug models` JSON catalog into an ordered list of
+    {'slug', 'efforts'} dicts: visibility=='list' models only, ascending
+    priority (the vendor's flagship/newest-first display order). Empty list on
+    any failure — the picker falls back to MODEL_PRESETS."""
+    try:
+        data = json.loads((runner or _run_codex_models)() or "")
+        raw = data["models"]
+    except Exception:  # noqa: BLE001 - a model list is never load-bearing
+        return []
+    models = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict) or entry.get("visibility") != "list":
+            continue
+        slug = entry.get("slug")
+        if not isinstance(slug, str) or not slug:
+            continue
+        # Reasoning levels arrive as {'effort': ..., 'description': ...} dicts
+        # today; tolerate plain strings too.
+        efforts = []
+        for level in entry.get("supported_reasoning_levels") or []:
+            if isinstance(level, dict):
+                level = level.get("effort")
+            if isinstance(level, str) and level:
+                efforts.append(level)
+        priority = entry.get("priority")
+        if not isinstance(priority, (int, float)):
+            priority = float("inf")
+        models.append((priority, {"slug": slug, "efforts": efforts}))
+    models.sort(key=lambda pair: pair[0])
+    return [model for _, model in models]
+
+
+MODELS_DEV_URL = "https://models.dev/api.json"
+
+
+def _fetch_models_dev():
+    """Raw models.dev catalog JSON text ('' on any failure). models.dev
+    returns HTTP 403 to a bare urllib request, so the User-Agent header is
+    mandatory — without it discovery would silently fall back forever."""
+    req = urllib.request.Request(MODELS_DEV_URL,
+                                 headers={"User-Agent": "cowork/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.read().decode("utf-8")
+    except Exception:  # noqa: BLE001 - a model list is never load-bearing
+        return ""
+
+
+def list_claude_models(fetcher=None):
+    """Full claude model ids from the public models.dev catalog (keyless),
+    sorted newest-first by release_date. Empty list on any failure — the
+    picker falls back to the MODEL_PRESETS aliases."""
+    try:
+        data = json.loads((fetcher or _fetch_models_dev)() or "")
+        raw = data["anthropic"]["models"]
+    except Exception:  # noqa: BLE001 - a model list is never load-bearing
+        return []
+    models = []
+    for model_id, info in raw.items() if isinstance(raw, dict) else []:
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        released = info.get("release_date") if isinstance(info, dict) else None
+        models.append((released if isinstance(released, str) else "", model_id))
+    models.sort(reverse=True)
+    return [model_id for _, model_id in models]
+
+
+def preload_model_catalogs(opencode_models_fn=None, claude_models_fn=None,
+                           codex_models_fn=None):
+    """Fetch all live model catalogs concurrently, once per config-menu open,
+    so the pickers themselves never do I/O. Each discovery fn is bounded by
+    its own timeout and failure-silent, so the join is bounded too; a failed
+    source just leaves its controller on the preset fallback."""
+    fns = {
+        "opencode": opencode_models_fn or list_opencode_models,
+        "claude": claude_models_fn or list_claude_models,
+        "codex": codex_models_fn or list_codex_models,
+    }
+    results = {"opencode": {}, "claude": [], "codex": []}
+
+    def fetch(key):
+        try:
+            results[key] = fns[key]() or results[key]
+        except Exception:  # noqa: BLE001 - a model list is never load-bearing
+            pass
+
+    threads = [threading.Thread(target=fetch, args=(key,), daemon=True)
+               for key in fns]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
 def pick_model_interactive(role, controller, current, select_fn, text_fn,
-                           opencode_models_fn=None):
+                           opencode_models_fn=None, claude_models=None,
+                           codex_models=None):
     """One model pick for a role. Returns the model id or None (= default).
 
     opencode is a two-step pick — provider first (satisfying the provider
-    choice), then that provider's models — discovered live; claude offers its
-    stable aliases; codex goes straight to default/custom. Every path has a
-    custom… escape hatch to a free-text id."""
+    choice), then that provider's models — discovered live; claude and codex
+    offer their preloaded live catalogs (claude_models newest-first, codex
+    slugs flagship-first) and drop to the curated presets when discovery
+    failed. Every path has a custom… escape hatch to a free-text id."""
     if controller == "opencode":
         by_provider = (opencode_models_fn or list_opencode_models)()
         if by_provider:
@@ -382,7 +492,12 @@ def pick_model_interactive(role, controller, current, select_fn, text_fn,
         val = text_fn("%s model (provider/model, empty = default)" % role,
                       default=current or "")
         return val.strip() or None
-    presets = MODEL_PRESETS.get(controller) or []
+    if controller == "claude" and claude_models:
+        presets = list(claude_models)
+    elif controller == "codex" and codex_models:
+        presets = [model["slug"] for model in codex_models]
+    else:
+        presets = MODEL_PRESETS.get(controller) or []
     options = [DEFAULT_CHOICE] + presets + [CUSTOM_CHOICE]
     pick = select_fn(options,
                      default=current if current in presets else DEFAULT_CHOICE,
@@ -396,12 +511,20 @@ def pick_model_interactive(role, controller, current, select_fn, text_fn,
     return pick
 
 
-def pick_effort_interactive(role, controller, current, select_fn, model=None):
-    """One thinking-effort pick. Returns the level or None (= default)."""
+def pick_effort_interactive(role, controller, current, select_fn, model=None,
+                            codex_models=None):
+    """One thinking-effort pick. Returns the level or None (= default).
+    For codex, a model found in the preloaded catalog narrows the levels to
+    its supported_reasoning_levels; otherwise the generic list stands."""
     levels = EFFORT_CHOICES.get(controller) or []
     if controller == "opencode" and model and "/" in model:
         levels = OPENCODE_EFFORTS_BY_PROVIDER.get(
             model.split("/", 1)[0], levels)
+    if controller == "codex" and model:
+        for entry in codex_models or []:
+            if entry.get("slug") == model and entry.get("efforts"):
+                levels = entry["efforts"]
+                break
     options = [DEFAULT_CHOICE] + levels
     pick = select_fn(options,
                      default=current if current in levels else DEFAULT_CHOICE,
@@ -412,7 +535,8 @@ def pick_effort_interactive(role, controller, current, select_fn, model=None):
 
 
 def configure_role_interactive(role, cfg, select_fn, text_fn,
-                               opencode_models_fn=None):
+                               opencode_models_fn=None, claude_models=None,
+                               codex_models=None):
     """Edit one role in place: controller -> model -> effort -> access."""
     controller = select_fn(list(CONTROLLERS), default=cfg["controller"],
                            message=role + " controller")
@@ -423,10 +547,11 @@ def configure_role_interactive(role, cfg, select_fn, text_fn,
         cfg["controller"] = controller
     cfg["model"] = pick_model_interactive(
         role, cfg["controller"], cfg.get("model"), select_fn, text_fn,
-        opencode_models_fn=opencode_models_fn)
+        opencode_models_fn=opencode_models_fn, claude_models=claude_models,
+        codex_models=codex_models)
     cfg["effort"] = pick_effort_interactive(
         role, cfg["controller"], cfg.get("effort"), select_fn,
-        model=cfg.get("model"))
+        model=cfg.get("model"), codex_models=codex_models)
     labels = [label for label, _y, _m in ACCESS_CHOICES]
     pick = select_fn(labels, default=access_label(cfg),
                      message=role + " access")
@@ -436,15 +561,21 @@ def configure_role_interactive(role, cfg, select_fn, text_fn,
 
 
 def configure_roles_interactive(selected, select_fn=None, text_fn=None,
-                                opencode_models_fn=None):
+                                opencode_models_fn=None, claude_models_fn=None,
+                                codex_models_fn=None):
     """Step 2: one screen. The current config is shown as a table and the menu
     is 'start' (default — one Enter accepts everything) plus one entry per
     role; picking a role walks a short controller -> model -> effort -> access
     edit and returns to the same screen. No nested defaults-gate, no
-    role-checkbox re-pick."""
+    role-checkbox re-pick. Live model catalogs are preloaded once here and
+    reused across every role edit — the pickers never fetch."""
     select_fn = select_fn or _q_select
     text_fn = text_fn or _q_text
     config = default_config(selected)
+    catalogs = preload_model_catalogs(
+        opencode_models_fn=opencode_models_fn,
+        claude_models_fn=claude_models_fn,
+        codex_models_fn=codex_models_fn)
     while True:
         summary = format_config_summary(
             config, header="Team config (pick a role to edit it):")
@@ -455,7 +586,9 @@ def configure_roles_interactive(selected, select_fn=None, text_fn=None,
         if choice in config:
             configure_role_interactive(
                 choice, config[choice], select_fn, text_fn,
-                opencode_models_fn=opencode_models_fn)
+                opencode_models_fn=lambda: catalogs["opencode"],
+                claude_models=catalogs["claude"],
+                codex_models=catalogs["codex"])
 
 
 # --------------------------------------------------------------------------- #

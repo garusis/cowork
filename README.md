@@ -45,10 +45,17 @@ the run; cowork makes no git commit and opens no PR.
    plus one entry per role. Picking a role walks a short edit —
    controller (`claude`/`codex`/`opencode`) → model → thinking effort →
    access (`yolo` / `safe` / `read-only`) — and returns to the same screen.
-   For opencode the model pick is two steps: provider first (discovered live
-   from `opencode models`, so only providers you have credentials for appear),
-   then that provider's models. Model and effort default to the controller
-   CLI's own settings; every picker has a `custom…` free-text escape hatch.
+   Model lists are discovered live (preloaded once when this screen opens):
+   claude from the public [models.dev](https://models.dev) catalog (keyless,
+   full ids newest-first), codex from `codex debug models` (visible models in
+   the CLI's own flagship-first order, with the effort picker narrowed to the
+   chosen model's supported levels). For opencode the model pick is two steps:
+   provider first (discovered live from `opencode models`, so only providers
+   you have credentials for appear), then that provider's models. If discovery
+   fails (offline, CLI missing), the picker silently falls back to the curated
+   presets (claude aliases `opus`/`sonnet`/`haiku`, codex default/custom).
+   Model and effort default to the controller CLI's own settings; every picker
+   has a `custom…` free-text escape hatch.
 3. **Give context.** Type/paste the files/code/intent the work needs.
 
 The interactive UI uses [rich](https://github.com/Textualize/rich) (streaming

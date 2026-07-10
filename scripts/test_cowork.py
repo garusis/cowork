@@ -7,6 +7,7 @@ fakes; no real claude/codex CLI is spawned. Run:
     python3 -m unittest scripts/test_cowork.py
 """
 
+import collections
 import contextlib
 import io
 import json
@@ -592,6 +593,16 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(alerts, [])
 
 
+# configure_roles_interactive preloads live model catalogs on entry; menu
+# tests inject these no-op discovery fns so no test ever touches the network
+# or a real CLI.
+OFFLINE_CATALOGS = {
+    "opencode_models_fn": lambda: {},
+    "claude_models_fn": lambda: [],
+    "codex_models_fn": lambda: [],
+}
+
+
 class MenuTest(unittest.TestCase):
     """Interactive menus driven by injected ask-callables; questionary never runs."""
 
@@ -612,7 +623,8 @@ class MenuTest(unittest.TestCase):
         # default accepts the whole config untouched.
         cfg = cowork.configure_roles_interactive(
             ["scout", "planning-advisor"],
-            select_fn=lambda opts, default=None, message="": default)
+            select_fn=lambda opts, default=None, message="": default,
+            **OFFLINE_CATALOGS)
         self.assertEqual(cfg["scout"], cowork.DEFAULTS["scout"])
 
     def test_configure_roles_customizes(self):
@@ -629,7 +641,8 @@ class MenuTest(unittest.TestCase):
             return default  # model + effort selects keep the default
         cfg = cowork.configure_roles_interactive(
             ["scout"], select_fn=select_fn,
-            text_fn=lambda message, default="": default)
+            text_fn=lambda message, default="": default,
+            **OFFLINE_CATALOGS)
         self.assertEqual(cfg["scout"]["controller"], "codex")
         self.assertFalse(cfg["scout"]["yolo"])
         self.assertEqual(cfg["scout"]["mode"], "implement")
@@ -659,7 +672,8 @@ class MenuTest(unittest.TestCase):
             text_fn=lambda message, default="": default,
             opencode_models_fn=lambda: {
                 "anthropic": ["anthropic/claude-sonnet-4-5",
-                              "anthropic/claude-opus-4-5"]})
+                              "anthropic/claude-opus-4-5"]},
+            claude_models_fn=lambda: [], codex_models_fn=lambda: [])
         self.assertEqual(cfg["builder"]["controller"], "opencode")
         self.assertEqual(cfg["builder"]["model"], "anthropic/claude-sonnet-4-5")
         self.assertEqual(cfg["builder"]["effort"], "max")
@@ -684,7 +698,8 @@ class MenuTest(unittest.TestCase):
             return default
         cfg = cowork.configure_roles_interactive(
             ["scout"], select_fn=select_fn,
-            text_fn=lambda message, default="": default)
+            text_fn=lambda message, default="": default,
+            **OFFLINE_CATALOGS)
         # The claude model/effort never leak into the codex config.
         self.assertEqual(cfg["scout"]["controller"], "codex")
         self.assertIsNone(cfg["scout"]["model"])
@@ -698,6 +713,223 @@ class MenuTest(unittest.TestCase):
             "anthropic": ["anthropic/claude-sonnet-4-5"],
             "openai": ["openai/gpt-5.4", "openai/gpt-5.4-mini"]})
         self.assertEqual(cowork.list_opencode_models(runner=lambda: ""), {})
+
+    def test_list_codex_models_parses_orders_filters(self):
+        # Out-of-order priorities, one hidden model, reasoning levels as the
+        # CLI's {'effort': ...} dicts.
+        catalog = json.dumps({"models": [
+            {"slug": "gpt-5.4", "visibility": "list", "priority": 16,
+             "supported_reasoning_levels": [
+                 {"effort": "low"}, {"effort": "high"}]},
+            {"slug": "codex-auto-review", "visibility": "hide", "priority": 1,
+             "supported_reasoning_levels": [{"effort": "medium"}]},
+            {"slug": "gpt-5.5", "visibility": "list", "priority": 7,
+             "supported_reasoning_levels": [
+                 {"effort": "medium"}, {"effort": "xhigh"}, "high"]},
+            {"slug": "", "visibility": "list", "priority": 2},
+            "not a model entry",
+        ]})
+        self.assertEqual(cowork.list_codex_models(runner=lambda: catalog), [
+            {"slug": "gpt-5.5", "efforts": ["medium", "xhigh", "high"]},
+            {"slug": "gpt-5.4", "efforts": ["low", "high"]},
+        ])
+
+    def test_list_codex_models_failure_modes(self):
+        def boom():
+            raise RuntimeError("codex exploded")
+        for runner in (lambda: "", lambda: "not json",
+                       lambda: json.dumps({"nope": []}),
+                       lambda: json.dumps({"models": "garbage"}), boom):
+            self.assertEqual(cowork.list_codex_models(runner=runner), [])
+
+    def test_list_claude_models_sorts_newest_first(self):
+        catalog = json.dumps({"anthropic": {"models": {
+            "claude-opus-4-8": {"release_date": "2026-05-28"},
+            "claude-sonnet-5": {"release_date": "2026-06-29"},
+            "claude-undated": "not a dict",
+            "claude-fable-5": {"release_date": "2026-06-07"},
+        }}})
+        self.assertEqual(cowork.list_claude_models(fetcher=lambda: catalog),
+                         ["claude-sonnet-5", "claude-fable-5",
+                          "claude-opus-4-8", "claude-undated"])
+
+    def test_list_claude_models_failure_modes(self):
+        def boom():
+            raise RuntimeError("network down")
+        for fetcher in (lambda: "", lambda: "<html>403</html>",
+                        lambda: json.dumps({"openai": {}}),
+                        lambda: json.dumps({"anthropic": {"models": []}}),
+                        boom):
+            self.assertEqual(cowork.list_claude_models(fetcher=fetcher), [])
+
+    def test_fetch_models_dev_sends_user_agent(self):
+        # models.dev 403s bare urllib requests; a missing User-Agent would be
+        # a permanent silent fallback, so pin the header at the Request level.
+        seen = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            seen["user_agent"] = req.get_header("User-agent")
+            seen["url"] = req.full_url
+            return FakeResponse()
+
+        real = cowork.urllib.request.urlopen
+        cowork.urllib.request.urlopen = fake_urlopen
+        try:
+            self.assertEqual(cowork._fetch_models_dev(), "{}")
+        finally:
+            cowork.urllib.request.urlopen = real
+        self.assertEqual(seen["url"], cowork.MODELS_DEV_URL)
+        self.assertTrue((seen["user_agent"] or "").startswith("cowork/"))
+
+    def test_pick_model_claude_uses_live_catalog_newest_first(self):
+        live = ["claude-sonnet-5", "claude-fable-5", "claude-opus-4-8"]
+        seen = {}
+
+        def select_fn(opts, default=None, message=""):
+            seen["opts"] = opts
+            return "claude-fable-5"
+        pick = cowork.pick_model_interactive(
+            "scout", "claude", None, select_fn,
+            text_fn=lambda message, default="": default, claude_models=live)
+        self.assertEqual(pick, "claude-fable-5")
+        self.assertEqual(seen["opts"],
+                         [cowork.DEFAULT_CHOICE] + live + [cowork.CUSTOM_CHOICE])
+
+    def test_pick_model_codex_uses_live_catalog_priority_order(self):
+        live = [{"slug": "gpt-5.5", "efforts": ["low", "high"]},
+                {"slug": "gpt-5.4", "efforts": ["low"]}]
+        seen = {}
+
+        def select_fn(opts, default=None, message=""):
+            seen["opts"] = opts
+            return "gpt-5.5"
+        pick = cowork.pick_model_interactive(
+            "scout", "codex", None, select_fn,
+            text_fn=lambda message, default="": default, codex_models=live)
+        self.assertEqual(pick, "gpt-5.5")
+        self.assertEqual(seen["opts"],
+                         [cowork.DEFAULT_CHOICE, "gpt-5.5", "gpt-5.4",
+                          cowork.CUSTOM_CHOICE])
+
+    def test_pick_model_falls_back_to_presets_without_live_data(self):
+        seen = {}
+
+        def select_fn(opts, default=None, message=""):
+            seen[message] = opts
+            return cowork.DEFAULT_CHOICE
+        cowork.pick_model_interactive(
+            "scout", "claude", None, select_fn,
+            text_fn=lambda message, default="": default, claude_models=[])
+        cowork.pick_model_interactive(
+            "scout", "codex", None, select_fn,
+            text_fn=lambda message, default="": default, codex_models=[])
+        self.assertEqual(seen["scout model (claude)"],
+                         [cowork.DEFAULT_CHOICE, "opus", "sonnet", "haiku",
+                          cowork.CUSTOM_CHOICE])
+        self.assertEqual(seen["scout model (codex)"],
+                         [cowork.DEFAULT_CHOICE, cowork.CUSTOM_CHOICE])
+
+    def test_pick_effort_codex_uses_model_levels(self):
+        live = [{"slug": "gpt-5.5", "efforts": ["medium", "xhigh"]},
+                {"slug": "gpt-5.4", "efforts": []}]
+        seen = {}
+
+        def select_fn(opts, default=None, message=""):
+            seen["opts"] = opts
+            return "xhigh"
+        pick = cowork.pick_effort_interactive(
+            "scout", "codex", None, select_fn, model="gpt-5.5",
+            codex_models=live)
+        self.assertEqual(pick, "xhigh")
+        self.assertEqual(seen["opts"],
+                         [cowork.DEFAULT_CHOICE, "medium", "xhigh"])
+        # Unknown model (custom id) and empty catalog efforts both keep the
+        # generic codex list.
+        for model in ("gpt-6-custom", "gpt-5.4"):
+            cowork.pick_effort_interactive(
+                "scout", "codex", None, select_fn, model=model,
+                codex_models=live)
+            self.assertEqual(
+                seen["opts"],
+                [cowork.DEFAULT_CHOICE] + cowork.EFFORT_CHOICES["codex"])
+
+    def test_preload_model_catalogs_merges_and_tolerates_failure(self):
+        def boom():
+            raise RuntimeError("offline")
+        catalogs = cowork.preload_model_catalogs(
+            opencode_models_fn=lambda: {"openai": ["openai/gpt-5.4"]},
+            claude_models_fn=lambda: ["claude-sonnet-5"],
+            codex_models_fn=boom)
+        self.assertEqual(catalogs, {
+            "opencode": {"openai": ["openai/gpt-5.4"]},
+            "claude": ["claude-sonnet-5"],
+            "codex": []})
+
+    def test_configure_roles_preloads_each_catalog_once(self):
+        calls = collections.Counter()
+        picks = {"n": 0}
+
+        def select_fn(opts, default=None, message=""):
+            if cowork.START_CHOICE in opts:
+                picks["n"] += 1
+                if picks["n"] == 1:
+                    return "scout"
+                if picks["n"] == 2:
+                    return "builder"
+                return cowork.START_CHOICE
+            return default
+
+        def count(key, value):
+            def fn():
+                calls[key] += 1
+                return value
+            return fn
+        cowork.configure_roles_interactive(
+            ["scout", "builder"], select_fn=select_fn,
+            text_fn=lambda message, default="": default,
+            opencode_models_fn=count("opencode", {}),
+            claude_models_fn=count("claude", ["claude-sonnet-5"]),
+            codex_models_fn=count("codex", []))
+        self.assertEqual(calls,
+                         {"opencode": 1, "claude": 1, "codex": 1})
+
+    def test_configure_roles_codex_live_model_and_effort(self):
+        picks = {"n": 0}
+
+        def select_fn(opts, default=None, message=""):
+            if cowork.START_CHOICE in opts:
+                picks["n"] += 1
+                return "builder" if picks["n"] == 1 else cowork.START_CHOICE
+            if message.endswith("controller"):
+                return "codex"
+            if message.endswith("model (codex)"):
+                self.assertEqual(opts[1:3], ["gpt-5.5", "gpt-5.4"])
+                return "gpt-5.5"
+            if message.endswith("thinking effort (codex)"):
+                self.assertEqual(opts, [cowork.DEFAULT_CHOICE, "medium",
+                                        "xhigh"])
+                return "xhigh"
+            return default
+        cfg = cowork.configure_roles_interactive(
+            ["builder"], select_fn=select_fn,
+            text_fn=lambda message, default="": default,
+            opencode_models_fn=lambda: {},
+            claude_models_fn=lambda: [],
+            codex_models_fn=lambda: [
+                {"slug": "gpt-5.5", "efforts": ["medium", "xhigh"]},
+                {"slug": "gpt-5.4", "efforts": ["low"]}])
+        self.assertEqual(cfg["builder"]["model"], "gpt-5.5")
+        self.assertEqual(cfg["builder"]["effort"], "xhigh")
 
     def test_gather_context_eof_is_empty(self):
         self.assertEqual(
