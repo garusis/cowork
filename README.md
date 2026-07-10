@@ -184,7 +184,13 @@ echo "the brief" | ./cowork --team scout --context-file -
 
 - `--team` — comma-separated roles (default: all). Unknown roles error out.
 - `--config ROLE=opt,opt` — repeatable; tokens are any of
-  `claude|codex`, `yolo|no-yolo`, `plan|implement`.
+  `claude|codex`, `yolo|no-yolo`, `plan|implement`, `model=<id>`.
+  `model=<id>` pins the role to a specific model (claude `--model`, codex
+  `--model` / `-c model=…` on resume); `model=default` clears the pin. E.g.
+  `--config "scout=claude,model=claude-opus-4-8" --config "scout-reviewer=codex,model=gpt-5-codex"`
+  runs a scout/reviewer pair on two specific models so their evaluation scores
+  and token consumption can be compared (see
+  [Evaluation traceability](#evaluation-traceability)).
 - `--context TEXT` / `--context-file PATH` — initial context (`-` = stdin).
 - `--session-file PATH` — use a specific session store (default
   `./.cowork/session.json`).
@@ -280,7 +286,9 @@ the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
   `planner-review.json`, the builder's status file
   `builder.status.json` and build summary `builder.summary.md`, the
   build-reviewer's review file
-  `builder-review.json`, the aggregate peer-eval `scores.json`,
+  `builder-review.json`, the aggregate peer-eval `scores.json`, the
+  role-identity registry `identities.json` (which tool + model + provider
+  session id each role actually ran with),
   and the private orchestration trace `trace.jsonl`;
 - the **team** and **per-role config** — so the next run in the same directory
   does not re-ask them (you'll see `using saved session config`);
@@ -363,6 +371,35 @@ would contain prompt bodies are replaced with `<prompt>`. The trace is intended
 for local debugging with the `cowork-debug` skill, not for terminal output or a
 shareable transcript.
 
+### Evaluation traceability
+
+Every peer-evaluation entry in `scores.json` (schema 2) is stamped with full
+provenance so scores, outcomes, and token consumption can be analyzed per
+**tool + model** combination:
+
+- **who evaluated** — `evaluator_tool`, `evaluator_model`,
+  `evaluator_session_id` (the live identity of the session that produced the
+  scores, captured from the controller's own stream events — claude names its
+  model on the system-init event; codex falls back to the pinned
+  `model=<id>` when its events don't name one);
+- **who was evaluated** — `evaluatee_tool`, `evaluatee_model`,
+  `evaluatee_session_id`, looked up from the per-session `identities.json`
+  registry, which the orchestrator refreshes on every turn;
+- **what the evaluation cost** — the eval turn's controller-reported `usage`
+  (input/output/cache token counts) and wall-clock `duration_ms`, plus
+  `eval_turn_id` and `specs_in_turn`: a round-1 consumed-upstream bundle rides
+  the same send, so entries sharing an `eval_turn_id` share one turn's usage
+  (count it once, not per entry);
+- **what outcome it accompanied** — `reviewed_verdict`
+  (`approve`/`revise`/`needs_user`) on review-round entries, so score levels
+  can be correlated with round outcomes.
+
+`cowork --report [<session-uuid>]` renders the analysis: scores received per
+evaluatee tool+model (per-criterion averages), evaluation cost per evaluator
+tool+model (shared turns deduped), average score by verdict, and — from the
+trace — total turns + token usage per role/tool/model. Entries written before
+schema 2 still aggregate; they simply fold into `(unknown)` identity buckets.
+
 ### Context revisions
 
 Explicit context (`--context`/the goal prompt) is a **session-wide event**, not a
@@ -393,8 +430,15 @@ find the right thing to build, the way a good product conversation goes:
    done, intended behavior). It asks blocking questions rather than guessing.
 3. **Propose options** — when there are tradeoffs, it lays out concrete options
    *with a recommendation* instead of just asking open questions.
-4. **Iterate** — refines with you until you reach product consensus.
-5. **Hand off** — writes its intel and marks it ready for review.
+4. **Make the goal measurable** — turns the agreed goal into explicit
+   **success criteria** (1–5, each with a concrete measurement, an expected
+   result, and a must/should tier — the measurement fitting what's being
+   built: a bugfix by its reproduction, a feature by observable behavior, a
+   perf goal by a metric vs a baseline, a refactor by invariants + the suite).
+   A goal it can't make measurable becomes a blocking question, never an
+   assumption; the criteria freeze at approval.
+5. **Iterate** — refines with you until you reach product consensus.
+6. **Hand off** — writes its intel and marks it ready for review.
 
 Its **only write targets** are its two intel files,
 `~/.cowork/sessions/<session_uuid>/scout.intel.json` (machine source of truth +
@@ -411,10 +455,20 @@ deliverable:
 ```json
 { "session": "<uuid>", "role": "scout",
   "status": "needs_input | ready_for_review",
-  "result": { "objective": "…", "clarifications": [{"q":"…","a":"…"}],
+  "result": { "objective": "…",
+              "success_criteria": [{"statement":"…","measurement":"…",
+                                    "expected":"…","tier":"must|should"}],
+              "clarifications": [{"q":"…","a":"…"}],
               "relevant_code": "…", "open_unknowns": "…",
               "recommended_starting_point": "…", "plan?": "…" } }
 ```
+
+`result.success_criteria` is required: it is the measurable definition of
+"done" the user approves (rendered as a dedicated **Success criteria** section
+in `scout.intel.md`) and the contract the plan must cover. Intel that reaches
+review without a non-empty list gets an orchestrator **structural auto-finding**
+in the reviewer's brief (structure only — quality judgment stays with the
+reviewer).
 
 cowork reads only `status`. The asked questions and your answers are recorded in
 `result.clarifications`. If no `planner` role is on the team, the scout also
@@ -431,9 +485,11 @@ showing you the approve gate — orchestrator control flow, not a model deciding
 when to review. The reviewer starts from the **same context the scout was given**
 (the shared context + the team framing + the scout's current intel; never the
 scout's own write-target brief) and critically checks objective alignment,
-whether blocking product questions were buried as assumptions, whether cited
-discoveries hold up, and completeness — it is instructed to find gaps, not to
-rubber-stamp.
+**goal measurability** (each success criterion binary-decidable from its
+stated measurement, the measurement fitting what's being built, the `must`
+set covering the agreed goal), whether blocking product questions were buried
+as assumptions, whether cited discoveries hold up, and completeness — it is
+instructed to find gaps, not to rubber-stamp.
 
 It writes a verdict to its own file, `~/.cowork/sessions/<session_uuid>/scout-review.json`
 (its **only** write target, cleared before each pass so a stale verdict is never
@@ -515,8 +571,11 @@ The planner produces **two artifacts** (its only write targets):
 
 - `~/.cowork/sessions/<session_uuid>/planner.plan.json` — the **machine deliverable** and
   source of truth for downstream roles, carrying the dense engineering detail:
-  goal-coverage mapping, decisions with rationale, file/symbol-cited evidence,
-  per-file change lists, and the test inventory. Its top level mirrors the
+  goal-coverage mapping, a **criteria-coverage mapping**
+  (`result.criteria_coverage` — every intel success criterion mapped to named
+  steps and to the `result.verification` entry that measures it, or explicitly
+  marked unverifiable-in-build with a reason), decisions with rationale,
+  file/symbol-cited evidence, per-file change lists, and the test inventory. Its top level mirrors the
   scout intel (`{session, role, status, handoff?, result}`) and doubles as the
   planner's status channel
   (`needs_input | ready_for_review | handoff_back`).
@@ -540,7 +599,10 @@ Full spec: [roles/planner.md](roles/planner.md).
 The planning-advisor pairs with the planner exactly as the scout-reviewer pairs
 with the scout: each time the planner marks the plan `ready_for_review`, cowork
 deterministically runs the advisor against **both** plan artifacts before
-showing you the gate. Same verdict semantics — `approve` proceeds to your gate,
+showing you the gate. Its checks include **criteria coverage**: every intel
+success criterion mapped to steps and to a verification that measures what the
+criterion actually states — uncovered, mis-measured, weakened, or dropped
+criteria are findings. Same verdict semantics — `approve` proceeds to your gate,
 `revise` findings go back to the planner (bounded to 2 rounds, then the gate is
 shown with the advisor's unresolved notes attached; never a hard block),
 `needs_user` questions reach you only through the planner's faithful relay, and
