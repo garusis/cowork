@@ -1368,7 +1368,11 @@ class FramingTest(unittest.TestCase):
 
     def test_parse_codex_events(self):
         ts = bridge.parse_codex_event({"type": "thread.started", "thread_id": "T1"})
-        self.assertEqual(ts, {"kind": "thread_started", "thread_id": "T1"})
+        self.assertEqual(ts, {"kind": "thread_started", "thread_id": "T1",
+                              "model": None})
+        ts_model = bridge.parse_codex_event(
+            {"type": "thread.started", "thread_id": "T1", "model": "gpt-5.3"})
+        self.assertEqual(ts_model["model"], "gpt-5.3")
         msg = bridge.parse_codex_event(
             {"type": "item.completed", "item": {"type": "agent_message",
                                                 "text": "context map"}})
@@ -10762,6 +10766,537 @@ class ReviewGateQuestionTest(unittest.TestCase):
         self.assertTrue(any(e["event"] == "status.invalidated"
                             and e["changed"] for e in events))
         self.assertEqual(rfn.calls["n"], 2)
+
+
+# --------------------------------------------------------------------------- #
+# Eval traceability: model capture, per-role model pins, the role-identity     #
+# registry, eval-turn accounting stamps on scores.json, and the scores report. #
+# --------------------------------------------------------------------------- #
+
+
+class ModelFlagAssemblyTest(unittest.TestCase):
+    def test_claude_command_pins_model(self):
+        cmd = bridge.build_claude_command("roles/scout.md", "plan", True,
+                                          model="claude-opus-4-8")
+        i = cmd.index("--model")
+        self.assertEqual(cmd[i + 1], "claude-opus-4-8")
+        self.assertNotIn("--model",
+                         bridge.build_claude_command("roles/scout.md",
+                                                     "plan", True))
+
+    def test_codex_command_pins_model(self):
+        cmd = bridge.build_codex_command("p", "plan", True,
+                                         model="gpt-5-codex")
+        i = cmd.index("--model")
+        self.assertEqual(cmd[i + 1], "gpt-5-codex")
+        self.assertNotIn("--model",
+                         bridge.build_codex_command("p", "plan", True))
+
+    def test_codex_resume_pins_model_via_config_key(self):
+        cmd = bridge.build_codex_resume_command("T1", "p", "plan", True,
+                                                model="gpt-5-codex")
+        i = cmd.index('model="gpt-5-codex"')
+        self.assertEqual(cmd[i - 1], "-c")
+        # resume rejects --model; the pin must ride -c only
+        self.assertNotIn("--model", cmd)
+        # no pin -> no model config key at all (implement+yolo has no -c args)
+        self.assertNotIn("-c", bridge.build_codex_resume_command(
+            "T1", "p", "implement", True))
+
+
+class ModelConfigTest(unittest.TestCase):
+    def test_model_token_sets_and_clears(self):
+        config = {"scout": {"controller": "claude", "yolo": True,
+                            "mode": "implement"}}
+        ok, err = cowork.apply_config_override(
+            config, "scout", ["model=claude-opus-4-8"])
+        self.assertTrue(ok, err)
+        self.assertEqual(config["scout"]["model"], "claude-opus-4-8")
+        ok, _ = cowork.apply_config_override(config, "scout",
+                                             ["model=default"])
+        self.assertTrue(ok)
+        self.assertNotIn("model", config["scout"])
+        ok, err = cowork.apply_config_override(config, "scout", ["model="])
+        self.assertFalse(ok)
+        self.assertIn("model", err)
+
+    def test_config_args_parse_model_alongside_controller(self):
+        config = {"scout": {"controller": "claude", "yolo": True,
+                            "mode": "implement"}}
+        ok, err = cowork.apply_config_args(
+            config, ["scout=codex,model=gpt-5-codex"])
+        self.assertTrue(ok, err)
+        self.assertEqual(config["scout"]["controller"], "codex")
+        self.assertEqual(config["scout"]["model"], "gpt-5-codex")
+
+    def test_summary_shows_model_column_only_when_pinned(self):
+        config = {"scout": {"controller": "claude", "yolo": True,
+                            "mode": "implement"}}
+        plain = cowork.format_config_summary(config)
+        self.assertNotIn("model", plain)
+        config["scout"]["model"] = "claude-opus-4-8"
+        pinned = cowork.format_config_summary(config)
+        self.assertIn("model", pinned)
+        self.assertIn("claude-opus-4-8", pinned)
+
+
+class ModelCaptureTest(unittest.TestCase):
+    def test_parse_claude_system_event_carries_model(self):
+        parsed = bridge.parse_claude_event(
+            {"type": "system", "subtype": "init",
+             "model": "claude-opus-4-8"})
+        self.assertEqual(parsed["kind"], "system")
+        self.assertEqual(parsed["model"], "claude-opus-4-8")
+
+    def test_claude_send_returns_usage_model_duration(self):
+        import unittest.mock as mock
+
+        class FakeStdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = FakeStdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        lines = [
+            json.dumps({"type": "system", "subtype": "init",
+                        "model": "claude-opus-4-8"}),
+            json.dumps({"type": "result", "subtype": "success",
+                        "result": "ok", "session_id": "S1",
+                        "usage": {"input_tokens": 12, "output_tokens": 3}}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=FakeProc(lines)):
+            s = bridge.ClaudeSession("roles/scout.md", "plan", True,
+                                     io_out=io.StringIO())
+            res = s.send("hello")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["model"], "claude-opus-4-8")
+        self.assertEqual(s.model, "claude-opus-4-8")
+        self.assertEqual(res["usage"],
+                         {"input_tokens": 12, "output_tokens": 3})
+        self.assertIsInstance(res["duration_ms"], int)
+
+    def test_codex_send_returns_usage_model_duration(self):
+        s = bridge.CodexSession("plan", True, io_out=io.StringIO(),
+                                model="gpt-5-codex")
+        s._run = lambda command: [
+            {"type": "thread.started", "thread_id": "T1"},
+            {"type": "item.completed",
+             "item": {"type": "agent_message", "text": "hi"}},
+            {"type": "turn.completed",
+             "usage": {"input_tokens": 7, "output_tokens": 2}},
+        ]
+        res = s.send("hello")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["usage"],
+                         {"input_tokens": 7, "output_tokens": 2})
+        # No event named the live model -> fall back to the pinned one.
+        self.assertEqual(res["model"], "gpt-5-codex")
+        self.assertIsInstance(res["duration_ms"], int)
+
+    def test_codex_event_model_wins_over_pin(self):
+        s = bridge.CodexSession("plan", True, io_out=io.StringIO(),
+                                model="gpt-5-codex")
+        s._run = lambda command: [
+            {"type": "thread.started", "thread_id": "T1",
+             "model": "gpt-5.3-codex"},
+            {"type": "turn.completed", "usage": {}},
+        ]
+        res = s.send("hello")
+        self.assertEqual(res["model"], "gpt-5.3-codex")
+        self.assertEqual(s.model, "gpt-5.3-codex")
+
+
+class RoleIdentityRegistryTest(_EvalEnvMixin, unittest.TestCase):
+    def test_upsert_merges_and_never_erases_with_none(self):
+        path = os.path.join(self._tmpdir(), "identities.json")
+        self.assertTrue(state_store.upsert_role_identity(
+            path, "scout", {"tool": "claude",
+                            "model": "claude-opus-4-8",
+                            "session_id": "S1"}))
+        # A later observation without a model must not erase the known one.
+        self.assertTrue(state_store.upsert_role_identity(
+            path, "scout", {"tool": "claude", "model": None,
+                            "session_id": "S2"}))
+        data = state_store.read_role_identities(path)
+        self.assertEqual(data["scout"]["model"], "claude-opus-4-8")
+        self.assertEqual(data["scout"]["session_id"], "S2")
+
+    def test_read_tolerates_missing_and_malformed(self):
+        self.assertEqual(state_store.read_role_identities(None), {})
+        self.assertEqual(state_store.read_role_identities("/nope/x.json"), {})
+        path = os.path.join(self._tmpdir(), "identities.json")
+        with open(path, "w") as fh:
+            fh.write("not json")
+        self.assertEqual(state_store.read_role_identities(path), {})
+
+    def test_send_registers_role_identity(self):
+        d = self._tmpdir()
+
+        class FakeSession:
+            speaker = "scout"
+            controller = "claude"
+            model = "claude-opus-4-8"
+            session_id = None
+            extra_writable_dir = d
+
+            def send(self, text):
+                return {"ok": True, "result": "ok", "session_id": "SID-1"}
+        cowork._send(FakeSession(), "hello")
+        data = state_store.read_role_identities(
+            os.path.join(d, "identities.json"))
+        self.assertEqual(data["scout"], {"tool": "claude",
+                                         "model": "claude-opus-4-8",
+                                         "session_id": "SID-1"})
+
+    def test_send_skips_non_roles_and_attrless_fakes(self):
+        d = self._tmpdir()
+
+        class WorktreeSession:
+            speaker = "worktree"
+            controller = "claude"
+            extra_writable_dir = d
+
+            def send(self, text):
+                return None
+
+        class BareFake:
+            def send(self, text):
+                return None
+        cowork._send(WorktreeSession(), "x")
+        cowork._send(BareFake(), "x")
+        self.assertFalse(os.path.exists(os.path.join(d, "identities.json")))
+
+
+class EvalTraceabilityStampTest(_EvalEnvMixin, unittest.TestCase):
+    """scores.json entries carry evaluator+evaluatee tool/model and the eval
+    turn's usage accounting."""
+
+    def _session(self, scratch_writer, assets_dir):
+        class FakeSession:
+            speaker = "scout"
+            controller = "claude"
+            model = "claude-opus-4-8"
+            session_id = "EVALSID"
+            extra_writable_dir = assets_dir
+
+            def __init__(self):
+                self.io_out = io.StringIO()
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                if scratch_writer:
+                    scratch_writer(text)
+                return {"ok": True, "result": "ok",
+                        "usage": {"input_tokens": 20, "output_tokens": 5},
+                        "model": "claude-opus-4-8",
+                        "session_id": "EVALSID", "duration_ms": 42}
+        return FakeSession()
+
+    def _scratch_writer(self, path):
+        def write(_text):
+            with open(path, "w") as fh:
+                json.dump({"evaluations": [
+                    {"evaluatee": "scout-reviewer",
+                     "criteria": [{"name": "c1", "score": 4,
+                                   "feedback": "solid"}]}]}, fh)
+        return write
+
+    def test_entries_stamped_with_identity_usage_and_verdict(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        scores_path = state_store.scores_path_for("S")
+        assets_dir = os.path.dirname(scores_path)
+        # The reviewer's identity was registered by its own earlier turns.
+        state_store.upsert_role_identity(
+            os.path.join(assets_dir, "identities.json"), "scout-reviewer",
+            {"tool": "codex", "model": "gpt-5-codex", "session_id": "RSID"})
+        scratch = state_store.eval_scratch_path_for(d, "scout", "S")
+        sess = self._session(self._scratch_writer(scratch), assets_dir)
+        fn = cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", scratch, scores_path, "S")
+        fn(sess, {"verdict": "approve"}, 1)
+        data = self._scores("S")
+        self.assertEqual(data.get("schema"), 2)
+        entry = data["evaluations"][0]
+        self.assertEqual(entry["evaluator_tool"], "claude")
+        self.assertEqual(entry["evaluator_model"], "claude-opus-4-8")
+        self.assertEqual(entry["evaluator_session_id"], "EVALSID")
+        self.assertEqual(entry["evaluatee_tool"], "codex")
+        self.assertEqual(entry["evaluatee_model"], "gpt-5-codex")
+        self.assertEqual(entry["evaluatee_session_id"], "RSID")
+        self.assertEqual(entry["usage"],
+                         {"input_tokens": 20, "output_tokens": 5})
+        self.assertEqual(entry["duration_ms"], 42)
+        self.assertEqual(entry["specs_in_turn"], 1)
+        self.assertEqual(entry["reviewed_verdict"], "approve")
+        self.assertTrue(entry["eval_turn_id"])
+
+    def test_stale_sidecar_cleared_before_send(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        scores_path = state_store.scores_path_for("S")
+        scratch = state_store.eval_scratch_path_for(d, "scout", "S")
+        sidecar = cowork._eval_turn_sidecar_path(scratch)
+        with open(sidecar, "w") as fh:
+            fh.write('{"eval_turn_id": "STALE"}')
+
+        class NoWriteSession:
+            def __init__(self):
+                self.io_out = io.StringIO()
+
+            def send(self, text):
+                return None
+        fn = cowork._make_evaluate_fn(
+            "scout", "scout-reviewer", "scouting", scratch, scores_path, "S")
+        fn(NoWriteSession(), {"verdict": "revise"}, 1)
+        # scratch never written -> nothing aggregated; the STALE sidecar was
+        # cleared before the send and replaced by this turn's accounting.
+        self.assertIsNone(self._scores("S"))
+        with open(sidecar, "r") as fh:
+            side = json.load(fh)
+        self.assertNotEqual(side.get("eval_turn_id"), "STALE")
+
+    def test_aggregate_without_sidecar_keeps_legacy_shape(self):
+        self._scores_root()
+        d = self._cowork_dir()
+        scratch = state_store.eval_scratch_path_for(d, "scout", "S")
+        self._scratch_writer(scratch)("x")
+        ok = cowork._aggregate_eval(
+            scratch, state_store.scores_path_for("S"), "S", "scout",
+            "scouting", 1, {})
+        self.assertTrue(ok)
+        entry = self._scores("S")["evaluations"][0]
+        for key in ("evaluator_tool", "evaluatee_tool", "usage",
+                    "eval_turn_id", "reviewed_verdict"):
+            self.assertNotIn(key, entry)
+
+
+class ScoresReportTest(unittest.TestCase):
+    def _entry(self, **over):
+        entry = {
+            "evaluator": "scout", "evaluatee": "scout-reviewer",
+            "evaluator_tool": "claude", "evaluator_model": "opus",
+            "evaluatee_tool": "codex", "evaluatee_model": "gpt-5-codex",
+            "context": "review-round", "phase": "scouting", "round": 1,
+            "criteria": [{"name": "accuracy", "score": 4, "feedback": ""}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "duration_ms": 100, "eval_turn_id": "T-A",
+            "reviewed_verdict": "approve",
+        }
+        entry.update(over)
+        return entry
+
+    def test_shared_turn_usage_counted_once(self):
+        scores = {"evaluations": [
+            self._entry(),
+            self._entry(evaluatee="scout", evaluatee_tool="claude",
+                        evaluatee_model="opus", context="consumed-intel"),
+            self._entry(eval_turn_id="T-B", round=2,
+                        criteria=[{"name": "accuracy", "score": 2,
+                                   "feedback": ""}],
+                        reviewed_verdict="revise"),
+        ]}
+        summary = cowork_report.summarize_scores(scores)
+        cost = summary["eval_cost"][("scout", "claude", "opus")]
+        self.assertEqual(cost["entries"], 3)
+        self.assertEqual(cost["turns"], 2)          # T-A shared by 2 entries
+        self.assertEqual(cost["usage"]["input_tokens"], 20)  # 10 x 2, not x3
+        self.assertEqual(cost["duration_ms"], 200)
+        received = summary["received"][
+            ("scout-reviewer", "codex", "gpt-5-codex")]
+        self.assertEqual(received["score_count"], 2)
+        self.assertEqual(received["score_total"], 6)
+        self.assertEqual(received["criteria"]["accuracy"]["count"], 2)
+        verdicts = summary["score_by_verdict"]
+        self.assertEqual(verdicts["approve"]["total"], 4)
+        self.assertEqual(verdicts["revise"]["total"], 2)
+
+    def test_render_and_tolerance(self):
+        text = cowork_report.render_scores_report(
+            cowork_report.summarize_scores({"evaluations": [self._entry()]}))
+        self.assertIn("codex/gpt-5-codex", text)
+        self.assertIn("avg 4.00", text)
+        self.assertIn("approve", text)
+        empty = cowork_report.render_scores_report(
+            cowork_report.summarize_scores("/nope/scores.json"))
+        self.assertIn("no evaluations", empty)
+
+    def test_trace_usage_by_role_model(self):
+        events = [
+            {"event": "controller.turn.start", "role": "scout",
+             "controller": "claude", "prompt_bytes": 10},
+            {"event": "controller.turn.end", "role": "scout",
+             "controller": "claude", "model": "opus",
+             "usage": {"input_tokens": 9}},
+            {"event": "controller.turn.end", "role": "scout",
+             "controller": "claude", "model": "opus",
+             "usage": {"input_tokens": 1}},
+        ]
+        summary = cowork_report.summarize_trace(events)
+        bucket = summary["usage_by_role_model"][("scout", "claude", "opus")]
+        self.assertEqual(bucket["turns"], 2)
+        self.assertEqual(bucket["usage"]["input_tokens"], 10)
+        text = cowork_report.render_report(summary)
+        self.assertIn("claude/opus", text)
+
+
+# --------------------------------------------------------------------------- #
+# Measurable success criteria: the intel contract's structural check (the      #
+# auto-finding that rides the scout-reviewer brief) and the new eval criteria. #
+# --------------------------------------------------------------------------- #
+
+
+class SuccessCriteriaFlagTest(unittest.TestCase):
+    def _intel(self, payload):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        path = os.path.join(d, "scout.intel.X.json")
+        with open(path, "w") as fh:
+            if isinstance(payload, str):
+                fh.write(payload)
+            else:
+                json.dump(payload, fh)
+        return path
+
+    def test_flags_missing_or_empty_criteria(self):
+        for payload in (
+                {"status": "ready_for_review", "result": {}},
+                {"status": "ready_for_review",
+                 "result": {"success_criteria": []}},
+                {"status": "ready_for_review",
+                 "result": {"success_criteria": ["not-a-dict"]}},
+                {"status": "ready_for_review"},
+        ):
+            flag = cowork._success_criteria_flag(self._intel(payload))
+            self.assertIn("success_criteria", flag or "")
+
+    def test_silent_on_valid_criteria_and_unreadable_intel(self):
+        good = self._intel({"status": "ready_for_review", "result": {
+            "success_criteria": [{
+                "statement": "flag rides the brief",
+                "measurement": "unit test",
+                "expected": "auto-finding present",
+                "tier": "must"}]}})
+        self.assertIsNone(cowork._success_criteria_flag(good))
+        # tolerant: unreadable/malformed intel is the normal review path's
+        # problem, never a structural flag
+        self.assertIsNone(cowork._success_criteria_flag("/nope/intel.json"))
+        self.assertIsNone(
+            cowork._success_criteria_flag(self._intel("not json")))
+
+
+class StructuralFlagReachesReviewerTest(unittest.TestCase):
+    """Goal criterion: intel without success_criteria reaches review -> the
+    reviewer packet carries the auto-finding."""
+
+    def _paths(self, result):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
+        review = os.path.join(d, ".cowork", "scout-review.X.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review", "result": result}, fh)
+        return intel, review
+
+    def _factory(self, seen, review):
+        def factory(controller, io_out):
+            class FakeRevSession:
+                def send(self, text):
+                    seen["prompt"] = text
+                    with open(review, "w") as fh:
+                        json.dump({"verdict": "approve"}, fh)
+
+                def close(self):
+                    pass
+            return FakeRevSession()
+        return factory
+
+    def test_missing_criteria_intel_carries_auto_finding(self):
+        intel, review = self._paths({})
+        d = os.path.dirname(intel)
+        trace = trace_store.Trace(os.path.join(d, "trace.jsonl"),
+                                  session_uuid="X", run_id="R")
+        seen = {}
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=self._factory(seen, review), trace=trace)
+        self.assertIn("structural check", seen["prompt"])
+        self.assertIn("success_criteria", seen["prompt"])
+        with open(os.path.join(d, "trace.jsonl")) as fh:
+            events = [json.loads(l) for l in fh if l.strip()]
+        self.assertTrue(any(
+            e["event"] == "review.structural_flag"
+            and e["check"] == "success_criteria_missing" for e in events))
+
+    def test_intel_with_criteria_gets_no_flag(self):
+        intel, review = self._paths({"success_criteria": [{
+            "statement": "s", "measurement": "m", "expected": "e",
+            "tier": "must"}]})
+        seen = {}
+        cfg = cowork.default_config(["scout", "scout-reviewer"])
+        cowork.run_reviewer_once(
+            cfg, "goal", ["scout", "scout-reviewer"], intel, review,
+            session_factory=self._factory(seen, review))
+        self.assertNotIn("structural check", seen["prompt"])
+
+    def test_other_reviewers_never_flagged(self):
+        # planning-advisor reviews the plan JSON — the intel contract does not
+        # apply there, even when the artifact has no success_criteria.
+        plan, review = self._paths({})
+        seen = {}
+        cfg = cowork.default_config(["planner", "planning-advisor"])
+        cowork.run_reviewer_once(
+            cfg, "goal", ["planner", "planning-advisor"], plan, review,
+            session_factory=self._factory(seen, review),
+            reviewer_role="planning-advisor")
+        self.assertNotIn("structural check", seen["prompt"])
+
+
+class MeasurabilityEvalCriteriaTest(unittest.TestCase):
+    """Goal criterion: the eval matrix scores the scout on goal measurability
+    and the planner on criteria coverage, so scores.json analytics can compare
+    tool+model combos on producing measurable goals."""
+
+    def test_matrix_carries_new_criteria(self):
+        self.assertIn("goal measurability",
+                      cowork.EVAL_CRITERIA[("scout-reviewer", "scout")])
+        self.assertIn("criteria coverage",
+                      cowork.EVAL_CRITERIA[("planning-advisor", "planner")])
+
+    def test_eval_prompt_names_them(self):
+        prompt = cowork.assemble_eval_prompt(
+            "scout-reviewer", "/x/eval.json",
+            [{"evaluatee": "scout",
+              "criteria": cowork.EVAL_CRITERIA[("scout-reviewer", "scout")],
+              "artifact_block": "INTEL"}])
+        self.assertIn("goal measurability", prompt)
 
 
 if __name__ == "__main__":
