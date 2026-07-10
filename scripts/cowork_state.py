@@ -10,7 +10,10 @@ Schema (version 1):
     {
       "version": 1,
       "team": ["scout", "advisor", ...],
-      "config": {"scout": {"controller": "claude", "yolo": true, "mode": "plan"}, ...},
+      "config": {"scout": {"controller": "claude", "model": null,
+                           "effort": null, "yolo": true, "mode": "plan"}, ...},
+      # controller: claude | codex | opencode. model/effort: null = the
+      # controller CLI's own default; opencode models are "provider/model".
       "context": {                 # current shared session context (versioned)
         "text": "...",
         "hash": "<sha256>",
@@ -20,7 +23,8 @@ Schema (version 1):
       "sessions": {
         "scout": {"controller": "claude", "id": "<uuid>",   # claude session_id
                   "last_context_revision_seen": 3}
-        # or:    {"controller": "codex",  "id": "<thread_id>", ...}
+        # or:    {"controller": "codex",    "id": "<thread_id>", ...}
+        # or:    {"controller": "opencode", "id": "<ses_...>", ...}
       }
     }
 
@@ -762,6 +766,11 @@ def switch_role_controller(path, role, target_controller, prior=None,
     role_cfg = dict(config.get(role) or {})
     from_controller = role_cfg.get("controller")
     role_cfg["controller"] = target_controller
+    # Model ids and effort levels are controller-specific (e.g. opencode wants
+    # provider/model, claude wants an alias) — a switched role falls back to
+    # the new controller's own defaults instead of carrying a foreign id over.
+    role_cfg["model"] = None
+    role_cfg["effort"] = None
     config[role] = role_cfg
     state["config"] = config
 

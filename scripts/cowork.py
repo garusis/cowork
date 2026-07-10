@@ -123,19 +123,27 @@ ROLES = ["scout", SCOUT_REVIEWER, "planner", PLANNING_ADVISOR, "builder",
 # planner -> scout and builder -> planner are wired.
 HANDBACK_PREPROCESSOR = {"planner": "scout", "builder": "planner"}
 
-# Per-role defaults (controller, yolo, mode), all roles checked by default.
-# Roles default to implement mode (write-enabled) and are kept in their lane by
-# role-spec guardrails, not by plan mode.
+# Per-role defaults (controller, model, effort, yolo, mode), all roles checked
+# by default. Roles default to implement mode (write-enabled) and are kept in
+# their lane by role-spec guardrails, not by plan mode. `model`/`effort` default
+# to None = whatever the controller CLI itself defaults to; opencode models are
+# `provider/model` (the provider choice is embedded in the model id).
 DEFAULTS = {
-    "scout": {"controller": "claude", "yolo": True, "mode": "implement"},
-    SCOUT_REVIEWER: {"controller": "codex", "yolo": True, "mode": "implement"},
-    "planner": {"controller": "claude", "yolo": True, "mode": "implement"},
-    PLANNING_ADVISOR: {"controller": "codex", "yolo": True, "mode": "implement"},
-    "builder": {"controller": "claude", "yolo": True, "mode": "implement"},
-    BUILD_REVIEWER: {"controller": "codex", "yolo": True, "mode": "implement"},
+    "scout": {"controller": "claude", "model": None, "effort": None,
+              "yolo": True, "mode": "implement"},
+    SCOUT_REVIEWER: {"controller": "codex", "model": None, "effort": None,
+                     "yolo": True, "mode": "implement"},
+    "planner": {"controller": "claude", "model": None, "effort": None,
+                "yolo": True, "mode": "implement"},
+    PLANNING_ADVISOR: {"controller": "codex", "model": None, "effort": None,
+                       "yolo": True, "mode": "implement"},
+    "builder": {"controller": "claude", "model": None, "effort": None,
+                "yolo": True, "mode": "implement"},
+    BUILD_REVIEWER: {"controller": "codex", "model": None, "effort": None,
+                     "yolo": True, "mode": "implement"},
 }
 
-CONTROLLERS = ("claude", "codex")
+CONTROLLERS = ("claude", "codex", "opencode")
 ROLE_PROMPT_PATHS = {
     "scout": SCOUT_PROMPT_PATH,
     SCOUT_REVIEWER: SCOUT_REVIEWER_PROMPT_PATH,
@@ -177,6 +185,13 @@ def _q_select(options, default=None, message=""):
     return picked if picked is not None else default
 
 
+def _q_text(message, default=""):
+    """questionary free-text input. Returns `default` on cancel."""
+    import questionary
+    val = questionary.text(message, default=default).ask()
+    return default if val is None else val
+
+
 # --------------------------------------------------------------------------- #
 # Step 1: team checklist (interactive).                                       #
 # --------------------------------------------------------------------------- #
@@ -201,14 +216,27 @@ def default_config(selected):
     return {role: dict(DEFAULTS[role]) for role in selected}
 
 
+def normalize_role_config(cfg):
+    """Fill schema keys missing from older saved sessions (model/effort were
+    added later); never mutates the input."""
+    out = dict(cfg)
+    out.setdefault("model", None)
+    out.setdefault("effort", None)
+    return out
+
+
 def apply_config_override(config, role, tokens):
-    """Apply tokens (controller/yolo/no-yolo/plan/implement) to one role.
-    Returns (ok, error_or_None). Mutates config."""
+    """Apply tokens to one role. Returns (ok, error_or_None). Mutates config.
+
+    Plain tokens: a controller name (claude/codex/opencode), yolo/no-yolo,
+    plan/implement. Key=value tokens: model=<id> and effort=<level>
+    (model=default / effort=default reset to the controller CLI's default).
+    opencode models are provider/model, e.g. model=anthropic/claude-sonnet-4-5."""
     if role not in config:
         return False, "unknown or unselected role: %r" % role
     cfg = config[role]
     for token in tokens:
-        if token in ("claude", "codex"):
+        if token in CONTROLLERS:
             cfg["controller"] = token
         elif token == "yolo":
             cfg["yolo"] = True
@@ -216,6 +244,12 @@ def apply_config_override(config, role, tokens):
             cfg["yolo"] = False
         elif token in ("plan", "implement"):
             cfg["mode"] = token
+        elif "=" in token:
+            key, _, value = token.partition("=")
+            key, value = key.strip(), value.strip()
+            if key not in ("model", "effort"):
+                return False, "unknown option: %r" % token
+            cfg[key] = None if value in ("", "default") else value
         else:
             return False, "unknown option: %r" % token
     return True, None
@@ -223,9 +257,11 @@ def apply_config_override(config, role, tokens):
 
 def format_config_summary(config, header="Tool config:"):
     """Aligned per-role summary with a column header row."""
-    labels = ("role", "controller", "permissions", "mode")
+    labels = ("role", "controller", "model", "effort", "permissions", "mode")
     rows = [
         (role, config[role]["controller"],
+         config[role].get("model") or "default",
+         config[role].get("effort") or "default",
          "yolo" if config[role]["yolo"] else "no-yolo", config[role]["mode"])
         for role in ROLES if role in config
     ]
@@ -244,32 +280,182 @@ def format_config_summary(config, header="Tool config:"):
     return "\n".join(lines)
 
 
-def configure_roles_interactive(selected, select_fn=None, checkbox_fn=None):
-    """Step 2 via questionary. A fast path accepts the defaults (shown as the
-    summary); otherwise pick roles to customize and choose controller/yolo/mode."""
-    select_fn = select_fn or _q_select
-    checkbox_fn = checkbox_fn or _q_checkbox
-    config = default_config(selected)
-    summary = format_config_summary(config, header="Default tool config:")
-    choice = select_fn(["use these defaults", "customize"],
-                       default="use these defaults", message=summary)
-    if choice != "customize":
-        return config
-    to_customize = checkbox_fn("Customize which roles?", selected) or []
-    for role in selected:
-        if role not in to_customize:
+# Menu sentinels shared by the config screens.
+START_CHOICE = "✓ start with this config"
+DEFAULT_CHOICE = "default (the CLI's own setting)"
+CUSTOM_CHOICE = "custom…"
+
+# Curated model presets per controller. Claude aliases are stable; codex model
+# ids churn with releases, so codex offers default/custom only; opencode models
+# are discovered live from `opencode models` (only providers with credentials
+# appear there).
+MODEL_PRESETS = {
+    "claude": ["opus", "sonnet", "haiku"],
+    "codex": [],
+    "opencode": [],
+}
+
+# Thinking-effort levels per controller (claude --effort, codex
+# model_reasoning_effort, opencode --variant). opencode variants are
+# provider-specific; the per-provider map below refines the generic list once
+# a model is chosen.
+EFFORT_CHOICES = {
+    "claude": ["low", "medium", "high", "xhigh", "max"],
+    "codex": ["minimal", "low", "medium", "high", "xhigh"],
+    "opencode": ["minimal", "low", "medium", "high", "max"],
+}
+OPENCODE_EFFORTS_BY_PROVIDER = {
+    "anthropic": ["high", "max"],
+    "openai": ["none", "minimal", "low", "medium", "high", "xhigh"],
+    "google": ["low", "high"],
+}
+
+# One access pick sets both yolo and mode: plan+yolo is read-only anyway, so
+# the 2x2 grid collapses to the three combos that actually differ.
+ACCESS_CHOICES = (
+    ("yolo (full access, no approvals)", True, "implement"),
+    ("safe (edits only, other commands denied)", False, "implement"),
+    ("read-only (plan mode)", True, "plan"),
+)
+
+
+def access_label(cfg):
+    if cfg.get("mode") == "plan":
+        return ACCESS_CHOICES[2][0]
+    return ACCESS_CHOICES[0][0] if cfg.get("yolo") else ACCESS_CHOICES[1][0]
+
+
+def _run_opencode_models():
+    """Raw `opencode models` stdout ('' on any failure)."""
+    try:
+        res = subprocess.run(["opencode", "models"], capture_output=True,
+                             text=True, timeout=20)
+    except Exception:  # noqa: BLE001 - a model list is never load-bearing
+        return ""
+    return res.stdout if res.returncode == 0 else ""
+
+
+def list_opencode_models(runner=None):
+    """Parse `opencode models` (one provider/model per line, credentialed
+    providers only) into {provider: [full 'provider/model' ids]}. Empty dict
+    when opencode is missing or lists nothing — the picker falls back to free
+    text."""
+    out = (runner or _run_opencode_models)()
+    models = {}
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line or "/" not in line or " " in line:
             continue
-        cfg = config[role]
-        cfg["controller"] = select_fn(["claude", "codex"],
-                                      default=cfg["controller"],
-                                      message=role + " controller")
-        yolo = select_fn(["yolo", "no-yolo"],
-                         default="yolo" if cfg["yolo"] else "no-yolo",
-                         message=role + " permissions")
-        cfg["yolo"] = (yolo == "yolo")
-        cfg["mode"] = select_fn(["plan", "implement"], default=cfg["mode"],
-                                message=role + " mode")
-    return config
+        provider = line.split("/", 1)[0]
+        models.setdefault(provider, []).append(line)
+    return models
+
+
+def pick_model_interactive(role, controller, current, select_fn, text_fn,
+                           opencode_models_fn=None):
+    """One model pick for a role. Returns the model id or None (= default).
+
+    opencode is a two-step pick — provider first (satisfying the provider
+    choice), then that provider's models — discovered live; claude offers its
+    stable aliases; codex goes straight to default/custom. Every path has a
+    custom… escape hatch to a free-text id."""
+    if controller == "opencode":
+        by_provider = (opencode_models_fn or list_opencode_models)()
+        if by_provider:
+            providers = sorted(by_provider)
+            cur_provider = (current or "").split("/", 1)[0]
+            prov = select_fn(
+                [DEFAULT_CHOICE] + providers + [CUSTOM_CHOICE],
+                default=cur_provider if cur_provider in providers
+                else DEFAULT_CHOICE,
+                message="%s provider (opencode)" % role)
+            if prov is None or prov == DEFAULT_CHOICE:
+                return None
+            if prov != CUSTOM_CHOICE:
+                options = by_provider[prov] + [CUSTOM_CHOICE]
+                pick = select_fn(
+                    options,
+                    default=current if current in by_provider[prov] else None,
+                    message="%s model (%s)" % (role, prov))
+                if pick and pick != CUSTOM_CHOICE:
+                    return pick
+        val = text_fn("%s model (provider/model, empty = default)" % role,
+                      default=current or "")
+        return val.strip() or None
+    presets = MODEL_PRESETS.get(controller) or []
+    options = [DEFAULT_CHOICE] + presets + [CUSTOM_CHOICE]
+    pick = select_fn(options,
+                     default=current if current in presets else DEFAULT_CHOICE,
+                     message="%s model (%s)" % (role, controller))
+    if pick is None or pick == DEFAULT_CHOICE:
+        return None
+    if pick == CUSTOM_CHOICE:
+        val = text_fn("%s model id (empty = default)" % role,
+                      default=current or "")
+        return val.strip() or None
+    return pick
+
+
+def pick_effort_interactive(role, controller, current, select_fn, model=None):
+    """One thinking-effort pick. Returns the level or None (= default)."""
+    levels = EFFORT_CHOICES.get(controller) or []
+    if controller == "opencode" and model and "/" in model:
+        levels = OPENCODE_EFFORTS_BY_PROVIDER.get(
+            model.split("/", 1)[0], levels)
+    options = [DEFAULT_CHOICE] + levels
+    pick = select_fn(options,
+                     default=current if current in levels else DEFAULT_CHOICE,
+                     message="%s thinking effort (%s)" % (role, controller))
+    if pick is None or pick == DEFAULT_CHOICE:
+        return None
+    return pick
+
+
+def configure_role_interactive(role, cfg, select_fn, text_fn,
+                               opencode_models_fn=None):
+    """Edit one role in place: controller -> model -> effort -> access."""
+    controller = select_fn(list(CONTROLLERS), default=cfg["controller"],
+                           message=role + " controller")
+    if controller and controller != cfg["controller"]:
+        # Model ids/effort levels are controller-specific; never carry over.
+        cfg["model"] = None
+        cfg["effort"] = None
+        cfg["controller"] = controller
+    cfg["model"] = pick_model_interactive(
+        role, cfg["controller"], cfg.get("model"), select_fn, text_fn,
+        opencode_models_fn=opencode_models_fn)
+    cfg["effort"] = pick_effort_interactive(
+        role, cfg["controller"], cfg.get("effort"), select_fn,
+        model=cfg.get("model"))
+    labels = [label for label, _y, _m in ACCESS_CHOICES]
+    pick = select_fn(labels, default=access_label(cfg),
+                     message=role + " access")
+    for label, yolo, mode in ACCESS_CHOICES:
+        if pick == label:
+            cfg["yolo"], cfg["mode"] = yolo, mode
+
+
+def configure_roles_interactive(selected, select_fn=None, text_fn=None,
+                                opencode_models_fn=None):
+    """Step 2: one screen. The current config is shown as a table and the menu
+    is 'start' (default — one Enter accepts everything) plus one entry per
+    role; picking a role walks a short controller -> model -> effort -> access
+    edit and returns to the same screen. No nested defaults-gate, no
+    role-checkbox re-pick."""
+    select_fn = select_fn or _q_select
+    text_fn = text_fn or _q_text
+    config = default_config(selected)
+    while True:
+        summary = format_config_summary(
+            config, header="Team config (pick a role to edit it):")
+        choice = select_fn([START_CHOICE] + list(selected),
+                           default=START_CHOICE, message=summary)
+        if choice is None or choice == START_CHOICE:
+            return config
+        if choice in config:
+            configure_role_interactive(
+                choice, config[choice], select_fn, text_fn,
+                opencode_models_fn=opencode_models_fn)
 
 
 # --------------------------------------------------------------------------- #
@@ -327,7 +513,7 @@ def parse_switch_controller(value):
     if controller not in CONTROLLERS:
         raise argparse.ArgumentTypeError(
             "unknown controller %r for --switch-controller "
-            "(expected claude or codex)" % controller)
+            "(expected one of: %s)" % (controller, ", ".join(CONTROLLERS)))
     return role, controller
 
 
@@ -345,7 +531,10 @@ def build_parser():
     p.add_argument("--config", action="append", default=[],
                    metavar="ROLE=opt,opt",
                    help="per-role override, e.g. scout=codex,no-yolo,implement "
-                        "(repeatable)")
+                        "or builder=opencode,model=anthropic/claude-sonnet-4-5,"
+                        "effort=high (options: claude/codex/opencode, "
+                        "model=<id>, effort=<level>, yolo/no-yolo, "
+                        "plan/implement; repeatable)")
     p.add_argument("--context", help="initial context text (non-interactive)")
     p.add_argument("--context-file",
                    help="read initial context from a file, or '-' for stdin")
@@ -2015,8 +2204,19 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
             session = bridge.ClaudeSession(
                 WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
                 io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
-                extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=wt_config.get("model"), effort=wt_config.get("effort"))
         first = brief
+    elif controller == "opencode":
+        if session_factory:
+            session = session_factory("opencode")
+        else:
+            session = bridge.OpencodeSession(
+                WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
+                io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
+                extra_writable_dir=extra_writable_dir,
+                model=wt_config.get("model"), effort=wt_config.get("effort"))
+        first = brief  # role prompt rides in the generated agent file
     else:
         if session_factory:
             session = session_factory("codex")
@@ -2024,7 +2224,8 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
             session = bridge.CodexSession(
                 wt_config["mode"], wt_config["yolo"], io_out=io_out,
                 speaker=WORKTREE_ROLE, trace=trace,
-                extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=wt_config.get("model"), effort=wt_config.get("effort"))
         wt_role_text = _read_text(WORKTREE_PROMPT_PATH)
         first = assemble_codex_prompt(wt_role_text, "", brief)
         _emit_codex_role_prompt_bytes(trace, WORKTREE_ROLE, wt_role_text)
@@ -2541,7 +2742,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 prompt_path, cfg["mode"], cfg["yolo"],
                 io_out=review_io, speaker=reviewer_role, internal=surface,
                 resume_id=resume_id, on_session_id=cb, trace=trace,
-                extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=cfg.get("model"), effort=cfg.get("effort"))
         else:
             spawn = claude_spawn or bridge._real_claude_spawn
             ok, alert = bridge.probe_claude_stream_json(
@@ -2571,62 +2773,41 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 prompt_path, cfg["mode"], cfg["yolo"],
                 io_out=review_io, speaker=reviewer_role, internal=surface,
                 session_id=sid, on_session_id=cb, trace=trace,
-                extra_writable_dir=extra_writable_dir)
-        first = (brief + "\n\n" + ctx_block).strip()
-        try:
-            send_result = _send(session, first, meta=review_meta)
-            if not send_result.get("ok", True):
-                verdict = _controller_failure_verdict(send_result)
-                if trace:
-                    trace.event(
-                        "review.run.end", role=reviewer_role,
-                        result="controller_failed",
-                        controller_result=send_result.get("result"),
-                        error_type=send_result.get("error_type"),
-                        subtype=send_result.get("subtype"),
-                        verdict=None,
-                        malformed=True,
-                        prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
-                        context_revision=context_revision,
-                        fresh=not bool(resume_id), resume=bool(resume_id),
-                        artifacts=review_artifacts)
-                return verdict
-            verdict = state_store.read_review(review_path)
-            # The eval send must never reach the user even when the review turn
-            # is surfaced: mute the session around it (D-eval-stays-muted).
-            with _muted_session(session) if surface else contextlib.nullcontext():
-                _run_reviewer_eval(session, reviewer_role, eval_scratch_path,
-                                   eval_specs, trace=trace,
-                                   context_revision=context_revision,
-                                   artifact_paths=(meta_artifact_paths
-                                                   + [review_path]))
-        finally:
-            session.close()
-        if trace:
-            trace.event("review.run.end", role=reviewer_role,
-                        result="ok", verdict=(verdict or {}).get("verdict"),
-                        malformed=bool((verdict or {}).get("malformed")),
-                        prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
-                        context_revision=context_revision,
-                        fresh=not bool(resume_id), resume=bool(resume_id),
-                        artifacts=review_artifacts)
-        return verdict
-
-    # codex (default)
-    cb = (lambda i: on_session("codex", i)) if on_session else None
-    if resume_id:
-        prompt = (brief + "\n\n" + ctx_block).strip()  # thread already has role
-    else:
-        reviewer_role_text = _read_text(prompt_path)
-        prompt = assemble_codex_prompt(reviewer_role_text, brief, ctx_block)
-        _emit_codex_role_prompt_bytes(trace, reviewer_role, reviewer_role_text)
-    if session_factory:
-        session = session_factory("codex", review_io)
-    else:
-        session = bridge.CodexSession(
-            cfg["mode"], cfg["yolo"], io_out=review_io, speaker=reviewer_role,
-            internal=surface, resume_thread_id=resume_id, on_thread_id=cb,
-            trace=trace, extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=cfg.get("model"), effort=cfg.get("effort"))
+        prompt = (brief + "\n\n" + ctx_block).strip()
+    elif cfg["controller"] == "opencode":
+        # Role prompt rides in the generated agent file (system prompt, like
+        # claude) — never inlined into the reviewer prompt body.
+        cb = (lambda i: on_session("opencode", i)) if on_session else None
+        if session_factory:
+            session = session_factory("opencode", review_io)
+        else:
+            session = bridge.OpencodeSession(
+                prompt_path, cfg["mode"], cfg["yolo"], io_out=review_io,
+                speaker=reviewer_role, internal=surface,
+                resume_session_id=resume_id, on_session_id=cb, trace=trace,
+                extra_writable_dir=extra_writable_dir,
+                model=cfg.get("model"), effort=cfg.get("effort"))
+        prompt = (brief + "\n\n" + ctx_block).strip()
+    else:  # codex
+        cb = (lambda i: on_session("codex", i)) if on_session else None
+        if resume_id:
+            prompt = (brief + "\n\n" + ctx_block).strip()  # thread already has role
+        else:
+            reviewer_role_text = _read_text(prompt_path)
+            prompt = assemble_codex_prompt(reviewer_role_text, brief, ctx_block)
+            _emit_codex_role_prompt_bytes(trace, reviewer_role,
+                                          reviewer_role_text)
+        if session_factory:
+            session = session_factory("codex", review_io)
+        else:
+            session = bridge.CodexSession(
+                cfg["mode"], cfg["yolo"], io_out=review_io,
+                speaker=reviewer_role, internal=surface,
+                resume_thread_id=resume_id, on_thread_id=cb,
+                trace=trace, extra_writable_dir=extra_writable_dir,
+                model=cfg.get("model"), effort=cfg.get("effort"))
     try:
         send_result = _send(session, prompt, meta=review_meta)
         if not send_result.get("ok", True):
@@ -4213,7 +4394,49 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                     SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                     speaker="scout", session_id=session_id, resume_id=rid,
                     on_session_id=cb, trace=trace,
-                    extra_writable_dir=sessions_dir)
+                    extra_writable_dir=sessions_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if trace:
+                trace.event("role.end", role="scout", result="start_failed",
+                            error_type=type(exc).__name__)
+            io_out.write("cowork: failed to start scout controller: %s\n"
+                         % type(exc).__name__)
+            io_out.flush()
+            return 1
+        first = (brief + "\n\n" + context).strip()
+        return _scout_loop(session, first, intel_path, context, io_in, io_out,
+                           review_fn=review_fn, trace=trace,
+                           on_outcome=on_outcome, evaluate_fn=evaluate_fn,
+                           intel_md_path=intel_md_path,
+                           skip_baseline=skip_baseline,
+                           context_revision=(review_packet_ctx or {}).get(
+                               "context_revision"),
+                           is_resume=bool(resume_id),
+                           on_first_send_accepted=on_first_send_accepted,
+                           headless=headless)
+
+    if cfg["controller"] == "opencode":
+        # opencode delivers the role prompt as a generated agent file (a system
+        # prompt, like claude) — seed with brief + context only, never the role
+        # text.
+        if resume_id:
+            io_out.write("cowork: resuming opencode session %s\n" % resume_id)
+        cb = (lambda i: on_session("opencode", i)) if on_session else None
+        try:
+            if session_factory:
+                session = session_factory("opencode",
+                                          resume_session_id=resume_id,
+                                          on_session_id=cb)
+            else:
+                session = bridge.OpencodeSession(
+                    SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
+                    speaker="scout", resume_session_id=resume_id,
+                    on_session_id=cb, trace=trace,
+                    extra_writable_dir=sessions_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -4249,7 +4472,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="scout",
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
-            extra_writable_dir=sessions_dir)
+            extra_writable_dir=sessions_dir,
+            model=cfg.get("model"), effort=cfg.get("effort"))
     return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
                        review_fn=review_fn, trace=trace, on_outcome=on_outcome,
                        evaluate_fn=evaluate_fn, intel_md_path=intel_md_path,
@@ -4393,7 +4617,44 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                     PLANNER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                     speaker="planner", session_id=session_id, resume_id=rid,
                     on_session_id=cb, trace=trace,
-                    extra_writable_dir=sessions_dir)
+                    extra_writable_dir=sessions_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if trace:
+                trace.event("role.end", role="planner", result="start_failed",
+                            error_type=type(exc).__name__)
+            io_out.write("cowork: failed to start planner controller: %s\n"
+                         % type(exc).__name__)
+            io_out.flush()
+            report("ended", None)
+            return 1
+        first = (brief + "\n\n" + context).strip()
+        rc, outcome, payload = _role_loop(
+            session, first, plan_json_path, context, io_in, io_out,
+            on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
+        report(outcome, payload)
+        return rc
+
+    if cfg["controller"] == "opencode":
+        # Role prompt rides in the generated agent file (system prompt); the
+        # seed is brief + context only, fresh and resumed alike.
+        if resume_id:
+            io_out.write("cowork: resuming opencode session %s\n" % resume_id)
+        cb = (lambda i: on_session("opencode", i)) if on_session else None
+        try:
+            if session_factory:
+                session = session_factory("opencode",
+                                          resume_session_id=resume_id,
+                                          on_session_id=cb)
+            else:
+                session = bridge.OpencodeSession(
+                    PLANNER_PROMPT_PATH, cfg["mode"], cfg["yolo"],
+                    io_out=io_out, speaker="planner",
+                    resume_session_id=resume_id, on_session_id=cb, trace=trace,
+                    extra_writable_dir=sessions_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -4429,7 +4690,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="planner",
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
-            extra_writable_dir=sessions_dir)
+            extra_writable_dir=sessions_dir,
+            model=cfg.get("model"), effort=cfg.get("effort"))
     rc, outcome, payload = _role_loop(
         session, prompt, plan_json_path, context, io_in, io_out,
         on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
@@ -4581,7 +4843,44 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                     BUILDER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                     speaker="builder", session_id=session_id, resume_id=rid,
                     on_session_id=cb, trace=trace,
-                    extra_writable_dir=sessions_dir)
+                    extra_writable_dir=sessions_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if trace:
+                trace.event("role.end", role="builder", result="start_failed",
+                            error_type=type(exc).__name__)
+            io_out.write("cowork: failed to start builder controller: %s\n"
+                         % type(exc).__name__)
+            io_out.flush()
+            report("ended", None)
+            return 1
+        first = (brief + "\n\n" + context).strip()
+        rc, outcome, payload = _role_loop(
+            session, first, build_status_path, context, io_in, io_out,
+            on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
+        report(outcome, payload)
+        return rc
+
+    if cfg["controller"] == "opencode":
+        # Role prompt rides in the generated agent file (system prompt); the
+        # seed is brief + context only, fresh and resumed alike.
+        if resume_id:
+            io_out.write("cowork: resuming opencode session %s\n" % resume_id)
+        cb = (lambda i: on_session("opencode", i)) if on_session else None
+        try:
+            if session_factory:
+                session = session_factory("opencode",
+                                          resume_session_id=resume_id,
+                                          on_session_id=cb)
+            else:
+                session = bridge.OpencodeSession(
+                    BUILDER_PROMPT_PATH, cfg["mode"], cfg["yolo"],
+                    io_out=io_out, speaker="builder",
+                    resume_session_id=resume_id, on_session_id=cb, trace=trace,
+                    extra_writable_dir=sessions_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -4617,7 +4916,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="builder",
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
-            extra_writable_dir=sessions_dir)
+            extra_writable_dir=sessions_dir,
+            model=cfg.get("model"), effort=cfg.get("effort"))
     rc, outcome, payload = _role_loop(
         session, prompt, build_status_path, context, io_in, io_out,
         on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
@@ -4819,6 +5119,8 @@ def effective_phase_for(state, selected):
 
 
 def alternate_controller(controller):
+    """Fallback target when a switch is requested without an explicit target.
+    claude <-> codex stay a toggle; opencode falls back to claude."""
     return "codex" if controller == "claude" else "claude"
 
 
@@ -4832,7 +5134,7 @@ def validate_switch_role(role, target, phase, selected, state):
             "role %r is not switchable in the current %s phase; choose one of: %s."
             % (role, phase, ", ".join(PHASE_PAIRS.get(phase, ()))))
     if target not in CONTROLLERS:
-        return "controller must be claude or codex."
+        return "controller must be one of: %s." % ", ".join(CONTROLLERS)
     return None
 
 
@@ -5005,8 +5307,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             io_out.write("cowork: " + err + "\n")
             return 2
     elif reuse_config:
-        config = {r: dict(saved["config"][r]) for r in selected
-                  if r in saved["config"]}
+        # normalize: older saved sessions predate the model/effort keys.
+        config = {r: normalize_role_config(saved["config"][r])
+                  for r in selected if r in saved["config"]}
         io_out.write("cowork: using saved session config (%s)\n" % spath)
     elif interactive:
         config = configure_roles_interactive(selected)
@@ -5446,6 +5749,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         if wt_path is None:
             wt_name = explicit_name or default_worktree_name(session_uuid)
             wt_cfg = {"controller": getattr(args, "wt_controller", "claude"),
+                      "model": None, "effort": None,
                       "yolo": True, "mode": "implement"}
             artifact = run_worktree_fn(
                 wt_cfg, worktree_status_path, worktree_base, wt_name,

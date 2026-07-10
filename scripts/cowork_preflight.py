@@ -24,6 +24,10 @@ INSTALL_HINTS = {
         "npm install -g @openai/codex   (Node 18+)\n"
         "    or: brew install --cask codex"
     ),
+    "opencode": (
+        "curl -fsSL https://opencode.ai/install | bash\n"
+        "    or: npm install -g opencode-ai / brew install sst/tap/opencode"
+    ),
 }
 
 # Python packages powering the interactive UX: prompt_toolkit (conversation
@@ -125,15 +129,22 @@ def preflight(role_config, version_info=sys.version_info, which=shutil.which,
 
 def main(argv=None):
     """`cowork --check`-style entry: report preflight for all controllers."""
-    # Without a chosen team, check both controllers so the user learns what is
-    # missing up front.
+    # Without a chosen team, check the default controllers so the user learns
+    # what is missing up front. opencode is optional (it only matters if a role
+    # is configured to use it), so a missing opencode is reported as info and
+    # never fails the check.
     role_config = {
         "_claude": {"controller": "claude"},
         "_codex": {"controller": "codex"},
     }
     ok, alerts = preflight(role_config, interactive=True)
+    opencode_ok, _ = check_tools(["opencode"])
     if ok:
         print("cowork preflight: OK")
+        if not opencode_ok:
+            print("note: optional controller 'opencode' not found on PATH "
+                  "(only needed when a role is configured to use it).\n"
+                  "    Install it with: " + INSTALL_HINTS["opencode"])
         return 0
     sys.stderr.write("cowork preflight failed:\n")
     for alert in alerts:

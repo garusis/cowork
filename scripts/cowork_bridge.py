@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """cowork controller bridges.
 
-Two controller back-ends spin up a role's CLI and bridge its conversation to the
-user:
+Three controller back-ends spin up a role's CLI and bridge its conversation to
+the user:
 
 - claude: a persistent duplex process driven by stream-json on stdin/stdout.
 - codex: one-shot `codex exec --json` plus `codex exec resume <thread_id>` for
   each follow-up turn (codex exec has no persistent duplex stdin).
+- opencode: one-shot `opencode run --format json` per turn, resumed with
+  `--session <id>`. The role prompt is delivered as an opencode agent file
+  (`.opencode/agents/cowork-<role>.md`) regenerated on every spawn, so the
+  system prompt and per-mode permissions always match the current config.
 
 The command-assembly, message-framing, event-parsing, and probe logic are pure
 functions so they can be unit-tested with fakes; only the thin `*_spawn` drivers
@@ -98,7 +102,8 @@ def codex_mode_flags(mode, yolo):
 
 
 def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
-                         resume_id=None, extra_writable_dir=None):
+                         resume_id=None, extra_writable_dir=None,
+                         model=None, effort=None):
     """Full argv for a persistent duplex claude scout process.
 
     Pass `session_id` to pin a known UUID on a fresh session (so it can be saved
@@ -106,7 +111,10 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     `extra_writable_dir`, when set, is granted as an additional writable root
     via `--add-dir` so a no-yolo (acceptEdits) role can write its session
     artifacts even though they live outside cwd. Re-applied on every spawn
-    (fresh AND resume), so resumed Claude roles keep the grant."""
+    (fresh AND resume), so resumed Claude roles keep the grant.
+    `model`/`effort`, when set, pin the session model (`--model`) and thinking
+    effort (`--effort`: low|medium|high|xhigh|max); unset means the installed
+    CLI's own defaults, exactly as before."""
     cmd = [
         "claude",
         "-p",
@@ -125,6 +133,10 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         "--append-system-prompt-file",
         role_prompt_file,
     ] + claude_mode_flags(mode, yolo)
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
     if extra_writable_dir:
         cmd += ["--add-dir", extra_writable_dir]
     if resume_id:
@@ -134,7 +146,23 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     return cmd
 
 
-def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None):
+def codex_model_args(model=None, effort=None):
+    """Model/effort args shared by fresh and resume codex turns.
+
+    Both are expressed through `-c` config keys (`model`, `model_reasoning_effort`)
+    rather than `-m`, because `codex exec resume` rejects `-m` but accepts `-c`
+    — using one spelling keeps fresh and resumed turns byte-identical in intent.
+    Values are encoded as TOML basic strings via json.dumps."""
+    args = []
+    if model:
+        args += ["-c", "model=" + json.dumps(model)]
+    if effort:
+        args += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+    return args
+
+
+def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
+                        model=None, effort=None):
     """argv for the first one-shot codex exec turn. The role spec is prepended
     into prompt_text by the caller (no AGENTS.md is written into the repo).
 
@@ -148,6 +176,7 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None):
     return (
         ["codex", "exec", "--json", "--skip-git-repo-check"]
         + codex_mode_flags(mode, yolo)
+        + codex_model_args(model, effort)
         + (["--add-dir", extra_writable_dir] if extra_writable_dir else [])
         + [prompt_text]
     )
@@ -185,7 +214,8 @@ def codex_resume_mode_args(mode, yolo, extra_writable_dir=None):
 
 
 def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
-                               extra_writable_dir=None):
+                               extra_writable_dir=None, model=None,
+                               effort=None):
     """argv for a codex follow-up turn against an explicit thread id (never
     --last, which could grab a concurrent session in the same cwd).
 
@@ -200,8 +230,99 @@ def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
     return (
         ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
         + codex_resume_mode_args(mode, yolo, extra_writable_dir)
+        + codex_model_args(model, effort)
         + [thread_id, prompt_text]
     )
+
+
+# --------------------------------------------------------------------------- #
+# opencode: agent-file generation + command assembly.                          #
+# --------------------------------------------------------------------------- #
+
+# Generated agent files are named cowork-<role>.md so they never collide with a
+# user's own agents, and are regenerated on every spawn (mode/yolo live in the
+# frontmatter, so a config change must rewrite the file).
+OPENCODE_AGENT_PREFIX = "cowork-"
+OPENCODE_AGENT_SUBDIR = os.path.join(".opencode", "agents")
+
+
+def opencode_permission_lines(mode, yolo, external_dir=False):
+    """Frontmatter `permission:` lines for (mode, yolo).
+
+    opencode has no OS sandbox; permissions are the only guardrail, and in a
+    headless run (stdin is not a TTY) any rule that resolves to `ask` is
+    auto-rejected by opencode — so `ask` acts as a hard deny here:
+
+    - plan -> edit deny + bash ask (read-only-ish; opencode cannot allow only
+      read-only shell commands the way codex's read-only sandbox can).
+    - implement + no-yolo -> edit allow + bash ask (mirrors claude acceptEdits:
+      edits land, other commands are denied). `external_directory: allow` is
+      added when the role needs to write session artifacts outside cwd.
+    - implement + yolo -> no permission block; the run gets `--auto` instead
+      (auto-approve everything not explicitly denied).
+    """
+    if mode == "implement" and yolo:
+        return []
+    lines = ["permission:",
+             "  edit: %s" % ("deny" if mode == "plan" else "allow"),
+             "  bash: ask",
+             "  webfetch: allow"]
+    if mode != "plan" and external_dir:
+        lines.append("  external_directory: allow")
+    return lines
+
+
+def opencode_agent_markdown(role_prompt_text, mode, yolo, description,
+                            external_dir=False):
+    """Agent-file markdown: YAML frontmatter + the role prompt as the body."""
+    lines = ["---", "description: %s" % description, "mode: primary"]
+    lines += opencode_permission_lines(mode, yolo, external_dir=external_dir)
+    lines.append("---")
+    return "\n".join(lines) + "\n" + role_prompt_text.strip() + "\n"
+
+
+def ensure_opencode_agent(role_prompt_file, speaker, mode, yolo,
+                          base_dir=None, external_dir=False):
+    """Write `.opencode/agents/cowork-<speaker>.md` under base_dir (default cwd)
+    and return the agent name. Overwrites any previous file so the prompt and
+    permissions always reflect the current role config."""
+    base_dir = base_dir or os.getcwd()
+    agent_name = OPENCODE_AGENT_PREFIX + speaker
+    agent_dir = os.path.join(base_dir, OPENCODE_AGENT_SUBDIR)
+    os.makedirs(agent_dir, exist_ok=True)
+    with open(role_prompt_file, "r", encoding="utf-8") as fh:
+        role_text = fh.read()
+    content = opencode_agent_markdown(
+        role_text, mode, yolo,
+        description="cowork %s role (generated; do not edit)" % speaker,
+        external_dir=external_dir)
+    path = os.path.join(agent_dir, agent_name + ".md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    return agent_name
+
+
+def build_opencode_command(agent_name, prompt_text, mode, yolo, model=None,
+                           effort=None, resume_session_id=None):
+    """argv for one `opencode run` turn (fresh or resumed).
+
+    `--format json` gives JSONL events on stdout; `--print-logs` is NOT passed
+    (logs go to stderr anyway, which we discard). `model` is opencode's
+    `provider/model` form (e.g. `anthropic/claude-sonnet-4-5`) — the provider
+    choice is embedded in the model id. `effort` maps to `--variant`
+    (provider-specific reasoning effort). Yolo implement runs get `--auto`;
+    everything else relies on the generated agent's permission block (see
+    `opencode_permission_lines`)."""
+    cmd = ["opencode", "run", "--format", "json", "--agent", agent_name]
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--variant", effort]
+    if mode == "implement" and yolo:
+        cmd.append("--auto")
+    if resume_session_id:
+        cmd += ["--session", resume_session_id]
+    return cmd + [prompt_text]
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +490,78 @@ def capture_thread_id(events):
     return None
 
 
+# opencode auto-rejects any `ask` permission in a headless run with this error
+# on the tool call's state — the only denial signal in the event stream.
+_OPENCODE_DENIED_MARKER = "rejected permission"
+
+
+def parse_opencode_event(obj):
+    """Classify one `opencode run --format json` (JSONL) event.
+
+    Envelope: {"type": ..., "sessionID": "ses_...", "part": {...}}. Kinds map
+    onto the codex parser's vocabulary so OpencodeSession can mirror
+    CodexSession: message (text), tool (label), tool_done, denied, error,
+    step_finish (tokens/reason), other. Text events carry the COMPLETE text
+    block (opencode does not stream deltas in JSON mode).
+    """
+    etype = obj.get("type")
+    part = obj.get("part") or {}
+    if etype == "text":
+        return {"kind": "message", "text": part.get("text", "")}
+    if etype == "tool":
+        tool = part.get("tool") or "tool"
+        return {"kind": "tool", "label": "using %s" % tool}
+    if etype == "tool_use":
+        state = part.get("state") or {}
+        err = state.get("error") or ""
+        if (state.get("status") == "error"
+                and _OPENCODE_DENIED_MARKER in err.lower()):
+            return {"kind": "denied", "text": err}
+        return {"kind": "tool_done", "tool": part.get("tool")}
+    if etype == "step_finish":
+        return {"kind": "step_finish", "reason": part.get("reason"),
+                "tokens": part.get("tokens")}
+    if etype == "error":
+        err = obj.get("error") or {}
+        data = err.get("data") or {}
+        return {"kind": "error",
+                "text": data.get("message") or err.get("name") or "error"}
+    return {"kind": "other", "type": etype}
+
+
+def capture_opencode_session_id(events):
+    """Return the sessionID carried on the first event that has one, or None."""
+    for obj in events:
+        sid = obj.get("sessionID")
+        if sid:
+            return sid
+    return None
+
+
+def opencode_usage(events):
+    """Best-effort token usage summed over step_finish events, mapped onto the
+    claude-style key names the trace/report already understands. None when no
+    step reported tokens."""
+    totals = {"input_tokens": 0, "output_tokens": 0,
+              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    seen = False
+    for obj in events:
+        parsed = parse_opencode_event(obj)
+        if parsed["kind"] != "step_finish":
+            continue
+        tokens = parsed.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        seen = True
+        cache = tokens.get("cache") or {}
+        totals["input_tokens"] += int(tokens.get("input") or 0)
+        totals["output_tokens"] += (int(tokens.get("output") or 0)
+                                    + int(tokens.get("reasoning") or 0))
+        totals["cache_read_input_tokens"] += int(cache.get("read") or 0)
+        totals["cache_creation_input_tokens"] += int(cache.get("write") or 0)
+    return totals if seen else None
+
+
 def denial_message():
     return "denied: enable yolo or rerun this role with implement access"
 
@@ -522,7 +715,7 @@ class ClaudeSession:
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
                  session_id=None, resume_id=None, on_session_id=None,
                  region_factory=None, trace=None, extra_writable_dir=None,
-                 internal=False):
+                 internal=False, model=None, effort=None):
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.controller = "claude"
@@ -534,6 +727,8 @@ class ClaudeSession:
         self.trace = trace
         self.mode = mode
         self.yolo = yolo
+        self.model = model
+        self.effort = effort
         self.role_prompt_file = role_prompt_file
         self.session_id = session_id
         self.resume_id = resume_id
@@ -544,12 +739,14 @@ class ClaudeSession:
         self.extra_writable_dir = extra_writable_dir
         command = build_claude_command(role_prompt_file, mode, yolo,
                                        session_id=session_id, resume_id=resume_id,
-                                       extra_writable_dir=extra_writable_dir)
+                                       extra_writable_dir=extra_writable_dir,
+                                       model=model, effort=effort)
         if self.trace:
             self.trace.event(
                 "controller.spawn.start", controller="claude", role=speaker,
                 fresh=not bool(resume_id), resume=bool(resume_id), mode=mode,
-                yolo=yolo, cwd=os.getcwd(), role_prompt_file=role_prompt_file,
+                yolo=yolo, model=model, effort=effort, cwd=os.getcwd(),
+                role_prompt_file=role_prompt_file,
                 session_id=session_id, resume_id=resume_id,
                 **trace_store.command_meta(command))
             # Item #4 measurement: the static role markdown loaded via
@@ -770,9 +967,12 @@ class CodexSession:
 
     def __init__(self, mode, yolo, io_out=None, speaker="scout",
                  resume_thread_id=None, on_thread_id=None, trace=None,
-                 extra_writable_dir=None, internal=False):
+                 extra_writable_dir=None, internal=False, model=None,
+                 effort=None):
         self.mode = mode
         self.yolo = yolo
+        self.model = model
+        self.effort = effort
         self.controller = "codex"
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
@@ -852,7 +1052,8 @@ class CodexSession:
         if not self._started and not self._resuming_first:
             command = build_codex_command(
                 text, self.mode, self.yolo,
-                extra_writable_dir=self.extra_writable_dir)
+                extra_writable_dir=self.extra_writable_dir,
+                model=self.model, effort=self.effort)
             fresh = True
         else:
             if not self.thread_id:
@@ -866,15 +1067,16 @@ class CodexSession:
                                    error_type="missing_thread_id")
             command = build_codex_resume_command(
                 self.thread_id, text, self.mode, self.yolo,
-                extra_writable_dir=self.extra_writable_dir)
+                extra_writable_dir=self.extra_writable_dir,
+                model=self.model, effort=self.effort)
             fresh = False
         self._started = True
         if self.trace:
             fields = {
                 "controller": "codex", "role": self.speaker,
                 "fresh": fresh, "resume": not fresh, "mode": self.mode,
-                "yolo": self.yolo, "cwd": os.getcwd(),
-                "thread_id": self.thread_id,
+                "yolo": self.yolo, "model": self.model, "effort": self.effort,
+                "cwd": os.getcwd(), "thread_id": self.thread_id,
             }
             fields.update(trace_store.command_meta(command, prompt_text=text))
             # Per-turn accounting (#1/D11): caller-supplied meta merges in last,
@@ -921,6 +1123,179 @@ class CodexSession:
         return turn_result(
             result == "ok", result, denied=(result == "denied"),
             thread_id=self.thread_id)
+
+    def close(self):
+        pass
+
+
+class OpencodeSession:
+    """Turn-based opencode bridge: one `opencode run --format json` per send(),
+    resumed with `--session <ses_id>` once the first turn reveals the id.
+
+    Like claude (and unlike codex), the role prompt is a SYSTEM prompt — it is
+    delivered via a generated agent file, not inlined into the first user
+    message — so callers seed opencode sessions with `brief + context` only.
+    The agent file is (re)written on every construction, fresh AND resume,
+    because the per-mode permission block lives in its frontmatter."""
+
+    def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
+                 resume_session_id=None, on_session_id=None, trace=None,
+                 extra_writable_dir=None, internal=False, model=None,
+                 effort=None, agent_base_dir=None):
+        self.mode = mode
+        self.yolo = yolo
+        self.model = model
+        self.effort = effort
+        self.controller = "opencode"
+        self.io_out = io_out or sys.stdout
+        self.speaker = speaker
+        self.label = speaker_label(speaker)
+        self.internal = internal
+        self.role_prompt_file = role_prompt_file
+        self.session_id = resume_session_id
+        self.on_session_id = on_session_id
+        self.trace = trace
+        self.extra_writable_dir = extra_writable_dir
+        self._notified = False
+        self._resuming_first = resume_session_id is not None
+        self._started = False
+        self.agent_name = ensure_opencode_agent(
+            role_prompt_file, speaker, mode, yolo, base_dir=agent_base_dir,
+            external_dir=bool(extra_writable_dir))
+        if self.trace:
+            # The agent file is a SYSTEM prompt (mirrors ClaudeSession's
+            # role.prompt.bytes accounting, delivery-tagged for the report).
+            try:
+                rp_bytes = os.path.getsize(role_prompt_file)
+            except OSError:
+                rp_bytes = None
+            if rp_bytes is not None:
+                self.trace.event("role.prompt.bytes", role=speaker,
+                                 bytes=rp_bytes, delivery="opencode_agent")
+
+    def _run(self, command):
+        proc = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True,
+        )
+        events = []
+        tty = ui.is_tty(self.io_out)
+        wrote_label = {"done": False}
+        try:
+            with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    events.append(obj)
+                    parsed = parse_opencode_event(obj)
+
+                    def _emit(text, render=True):
+                        spin.stop()
+                        if not wrote_label["done"]:
+                            if self.internal:
+                                ui.internal_lead_in(self.io_out, tty)
+                            self.io_out.write(ui.label(self.speaker, tty))
+                            wrote_label["done"] = True
+                        if render:
+                            ui.render_markdown(self.io_out, text, enabled=tty,
+                                               internal=self.internal)
+                        else:
+                            self.io_out.write(text + "\n")
+                        self.io_out.flush()
+
+                    if parsed["kind"] == "message" and parsed.get("text"):
+                        _emit(parsed["text"])
+                    elif parsed["kind"] == "denied":
+                        _emit(denial_message(), render=False)
+                    elif parsed["kind"] == "error":
+                        _emit("[error] " + (parsed.get("text") or ""),
+                              render=False)
+                    elif parsed["kind"] == "tool" and not wrote_label["done"]:
+                        spin.set_label("%s %s" % (self.speaker, parsed["label"]))
+                    elif (parsed["kind"] == "tool_done"
+                          and not wrote_label["done"]):
+                        spin.set_label("%s working" % self.speaker)
+            proc.wait()
+        except KeyboardInterrupt:
+            _terminate(proc)
+            raise
+        return events
+
+    def send(self, text, meta=None):
+        resume_id = None
+        if self._started or self._resuming_first:
+            if not self.session_id:
+                self.io_out.write(
+                    "[error] no opencode session id; cannot continue\n")
+                self.io_out.flush()
+                if self.trace:
+                    self.trace.event("controller.turn.end",
+                                     controller="opencode", role=self.speaker,
+                                     result="error",
+                                     error_type="missing_session_id")
+                return turn_result(False, "error",
+                                   error_type="missing_session_id")
+            resume_id = self.session_id
+        fresh = resume_id is None
+        command = build_opencode_command(
+            self.agent_name, text, self.mode, self.yolo, model=self.model,
+            effort=self.effort, resume_session_id=resume_id)
+        self._started = True
+        if self.trace:
+            fields = {
+                "controller": "opencode", "role": self.speaker,
+                "fresh": fresh, "resume": not fresh, "mode": self.mode,
+                "yolo": self.yolo, "model": self.model, "effort": self.effort,
+                "cwd": os.getcwd(), "session_id": self.session_id,
+            }
+            fields.update(trace_store.command_meta(command, prompt_text=text))
+            if meta:
+                fields.update({k: v for k, v in meta.items()
+                               if v is not None and k not in ("fresh", "resume")})
+            self.trace.event("controller.turn.start", **fields)
+        try:
+            events = self._run(command)
+        except Exception as exc:  # noqa: BLE001
+            if self.trace:
+                self.trace.event("controller.turn.end", controller="opencode",
+                                 role=self.speaker, result="error",
+                                 error_type=type(exc).__name__)
+            return turn_result(False, "error", error_type=type(exc).__name__)
+        sid = capture_opencode_session_id(events)
+        if sid and not self.session_id:
+            self.session_id = sid
+            if self.trace:
+                self.trace.event("controller.session_id",
+                                 controller="opencode", role=self.speaker,
+                                 session_id=sid)
+        if self.session_id and self.on_session_id and not self._notified:
+            self._notified = True
+            self.on_session_id(self.session_id)
+        parsed_events = [parse_opencode_event(obj) for obj in events]
+        kinds = [p.get("kind") for p in parsed_events]
+        result = ("error" if "error" in kinds
+                  else "denied" if "denied" in kinds else "ok")
+        # A run that produced no events at all (spawn died before the stream)
+        # is an error, never a silent ok — mirrors the claude eof path.
+        if result == "ok" and not events:
+            result = "error"
+        usage = opencode_usage(events)
+        if self.trace:
+            self.trace.event("controller.turn.end", controller="opencode",
+                             role=self.speaker, result=result,
+                             session_id=self.session_id,
+                             event_count=len(events), usage=usage)
+        if result == "error" and not events:
+            return turn_result(False, "error", error_type="no_events",
+                               session_id=self.session_id)
+        return turn_result(
+            result == "ok", result, denied=(result == "denied"),
+            session_id=self.session_id)
 
     def close(self):
         pass
