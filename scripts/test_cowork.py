@@ -705,6 +705,94 @@ class MenuTest(unittest.TestCase):
         self.assertIsNone(cfg["scout"]["model"])
         self.assertIsNone(cfg["scout"]["effort"])
 
+    def test_configure_roles_back_only_when_allowed(self):
+        seen = {}
+
+        def select_fn(opts, default=None, message=""):
+            seen["opts"] = list(opts)
+            return cowork.START_CHOICE
+        cowork.configure_roles_interactive(
+            ["scout"], select_fn=select_fn,
+            text_fn=lambda message, default="": default, **OFFLINE_CATALOGS)
+        self.assertNotIn(cowork.BACK_CHOICE, seen["opts"])
+
+    def test_configure_roles_back_returns_sentinel(self):
+        result = cowork.configure_roles_interactive(
+            ["scout"],
+            select_fn=lambda opts, default=None, message="": cowork.BACK_CHOICE,
+            text_fn=lambda message, default="": default,
+            allow_back=True, **OFFLINE_CATALOGS)
+        self.assertIs(result, cowork.BACK)
+
+    def test_select_and_configure_back_keeps_edits_and_reopens_checkbox(self):
+        checkbox_calls = []
+        picks = {"n": 0}
+
+        def checkbox_fn(message, options, checked=None):
+            checkbox_calls.append(list(checked))
+            return (["scout", "builder"] if len(checkbox_calls) == 1
+                    else ["scout"])
+
+        def select_fn(opts, default=None, message=""):
+            if cowork.START_CHOICE in opts:  # the table screen
+                self.assertIn(cowork.BACK_CHOICE, opts)
+                picks["n"] += 1
+                if picks["n"] == 1:
+                    return "scout"              # edit scout first
+                if picks["n"] == 2:
+                    return cowork.BACK_CHOICE   # back to the checkbox
+                return cowork.START_CHOICE
+            if message.endswith("controller"):
+                return "codex"
+            return default
+        selected, cfg = cowork.select_and_configure_interactive(
+            checkbox_fn=checkbox_fn, select_fn=select_fn,
+            text_fn=lambda message, default="": default, **OFFLINE_CATALOGS)
+        # Checkbox: all roles preselected first, then the current picks.
+        self.assertEqual(checkbox_calls[0], cowork.ROLES)
+        self.assertEqual(checkbox_calls[1], ["scout", "builder"])
+        self.assertEqual(selected, ["scout"])
+        self.assertEqual(sorted(cfg), ["scout"])  # builder dropped on re-pick
+        self.assertEqual(cfg["scout"]["controller"], "codex")  # edit survived
+
+    def test_select_and_configure_cancel_returns_empty(self):
+        self.assertEqual(
+            cowork.select_and_configure_interactive(
+                checkbox_fn=lambda *a, **k: None, **OFFLINE_CATALOGS),
+            ([], {}))
+        self.assertEqual(
+            cowork.select_and_configure_interactive(
+                checkbox_fn=lambda *a, **k: [], **OFFLINE_CATALOGS),
+            ([], {}))
+
+    def test_select_and_configure_preloads_once_across_back_trips(self):
+        calls = collections.Counter()
+        rounds = {"n": 0}
+
+        def checkbox_fn(message, options, checked=None):
+            rounds["n"] += 1
+            return ["scout"]
+
+        def select_fn(opts, default=None, message=""):
+            if cowork.START_CHOICE in opts:
+                return (cowork.BACK_CHOICE if rounds["n"] == 1
+                        else cowork.START_CHOICE)
+            return default
+
+        def count(key, value):
+            def fn():
+                calls[key] += 1
+                return value
+            return fn
+        cowork.select_and_configure_interactive(
+            checkbox_fn=checkbox_fn, select_fn=select_fn,
+            text_fn=lambda message, default="": default,
+            opencode_models_fn=count("opencode", {}),
+            claude_models_fn=count("claude", []),
+            codex_models_fn=count("codex", []))
+        self.assertEqual(rounds["n"], 2)
+        self.assertEqual(calls, {"opencode": 1, "claude": 1, "codex": 1})
+
     def test_list_opencode_models_parses_and_tolerates_failure(self):
         parsed = cowork.list_opencode_models(
             runner=lambda: "anthropic/claude-sonnet-4-5\nopenai/gpt-5.4\n"
