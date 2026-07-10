@@ -41,8 +41,11 @@ the run; cowork makes no git commit and opens no PR.
    default. Space toggles, Enter confirms.
 2. **Configure each role.** One screen: the current config is shown as a table
    (controller · model · effort · permissions · mode) and the menu is
-   "✓ start with this config" (the default — one Enter accepts everything)
-   plus one entry per role. Picking a role walks a short edit —
+   "✓ start with this config" (the default — one Enter accepts everything),
+   one entry per role, and "← back: change team", which reopens the team
+   checkbox with your current picks checked — role edits survive the round
+   trip (a role dropped and re-added resets to its defaults). Picking a role
+   walks a short edit —
    controller (`claude`/`codex`/`opencode`) → model → thinking effort →
    access (`yolo` / `safe` / `read-only`) — and returns to the same screen.
    Model lists are discovered live (preloaded once when this screen opens):

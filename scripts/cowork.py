@@ -286,6 +286,9 @@ def format_config_summary(config, header="Tool config:"):
 START_CHOICE = "✓ start with this config"
 DEFAULT_CHOICE = "default (the CLI's own setting)"
 CUSTOM_CHOICE = "custom…"
+BACK_CHOICE = "← back: change team"
+# Returned by configure_roles_interactive when the user picks BACK_CHOICE.
+BACK = object()
 
 # Curated model presets per controller — the silent FALLBACK when live
 # discovery fails. Live sources: claude from the public models.dev catalog
@@ -562,25 +565,36 @@ def configure_role_interactive(role, cfg, select_fn, text_fn,
 
 def configure_roles_interactive(selected, select_fn=None, text_fn=None,
                                 opencode_models_fn=None, claude_models_fn=None,
-                                codex_models_fn=None):
+                                codex_models_fn=None, config=None,
+                                catalogs=None, allow_back=False):
     """Step 2: one screen. The current config is shown as a table and the menu
     is 'start' (default — one Enter accepts everything) plus one entry per
     role; picking a role walks a short controller -> model -> effort -> access
     edit and returns to the same screen. No nested defaults-gate, no
     role-checkbox re-pick. Live model catalogs are preloaded once here and
-    reused across every role edit — the pickers never fetch."""
+    reused across every role edit — the pickers never fetch.
+
+    With `allow_back` a '← back: change team' entry is appended and picking it
+    returns the BACK sentinel (the merged team screen loops to the checkbox).
+    `config`/`catalogs` let that caller keep role edits and preloaded catalogs
+    alive across back-and-forth trips."""
     select_fn = select_fn or _q_select
     text_fn = text_fn or _q_text
-    config = default_config(selected)
-    catalogs = preload_model_catalogs(
-        opencode_models_fn=opencode_models_fn,
-        claude_models_fn=claude_models_fn,
-        codex_models_fn=codex_models_fn)
+    if config is None:
+        config = default_config(selected)
+    if catalogs is None:
+        catalogs = preload_model_catalogs(
+            opencode_models_fn=opencode_models_fn,
+            claude_models_fn=claude_models_fn,
+            codex_models_fn=codex_models_fn)
+    options = ([START_CHOICE] + list(selected)
+               + ([BACK_CHOICE] if allow_back else []))
     while True:
         summary = format_config_summary(
             config, header="Team config (pick a role to edit it):")
-        choice = select_fn([START_CHOICE] + list(selected),
-                           default=START_CHOICE, message=summary)
+        choice = select_fn(options, default=START_CHOICE, message=summary)
+        if allow_back and choice == BACK_CHOICE:
+            return BACK
         if choice is None or choice == START_CHOICE:
             return config
         if choice in config:
@@ -589,6 +603,41 @@ def configure_roles_interactive(selected, select_fn=None, text_fn=None,
                 opencode_models_fn=lambda: catalogs["opencode"],
                 claude_models=catalogs["claude"],
                 codex_models=catalogs["codex"])
+
+
+def select_and_configure_interactive(checkbox_fn=None, select_fn=None,
+                                     text_fn=None, opencode_models_fn=None,
+                                     claude_models_fn=None,
+                                     codex_models_fn=None):
+    """Steps 1+2 as one navigable flow. Returns (selected, config).
+
+    Team checkbox -> config screen; the config screen's '← back: change team'
+    entry reopens the checkbox with the current picks checked. Role edits and
+    the preloaded model catalogs survive the round trip (a role dropped and
+    re-added does reset to its defaults). Cancelling the checkbox returns
+    ([], {}) — same 'nothing to do' contract as select_team_interactive."""
+    checkbox_fn = checkbox_fn or _q_checkbox
+    selected = list(ROLES)
+    config = {}
+    catalogs = None
+    while True:
+        picks = checkbox_fn("Choose your team (space toggles, enter confirms)",
+                            ROLES, checked=selected)
+        if not picks:  # None (cancelled) or empty selection
+            return [], {}
+        selected = [r for r in ROLES if r in picks]
+        config = {r: config[r] if r in config else dict(DEFAULTS[r])
+                  for r in selected}
+        if catalogs is None:  # preload once; back trips reuse it
+            catalogs = preload_model_catalogs(
+                opencode_models_fn=opencode_models_fn,
+                claude_models_fn=claude_models_fn,
+                codex_models_fn=codex_models_fn)
+        result = configure_roles_interactive(
+            selected, select_fn, text_fn, config=config, catalogs=catalogs,
+            allow_back=True)
+        if result is not BACK:
+            return selected, result
 
 
 # --------------------------------------------------------------------------- #
@@ -5604,7 +5653,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     reuse_config = (session_enabled and state_store.has_config(saved)
                     and not args.team and not args.config)
 
-    # Step 1: team.
+    # Step 1: team. When both team and config are interactive they run as one
+    # merged flow (checkbox <-> config screen with back navigation).
+    merged_config = None
     if args.team:
         selected, err = parse_team(args.team)
         if err:
@@ -5613,6 +5664,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             return 2
     elif reuse_config:
         selected = [r for r in ROLES if r in saved["team"]]
+    elif interactive and not args.config:
+        selected, merged_config = select_and_configure_interactive()
     elif interactive:
         selected = select_team_interactive()
     else:
@@ -5635,6 +5688,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         config = {r: normalize_role_config(saved["config"][r])
                   for r in selected if r in saved["config"]}
         io_out.write("cowork: using saved session config (%s)\n" % spath)
+    elif merged_config is not None:
+        config = merged_config
     elif interactive:
         config = configure_roles_interactive(selected)
     trace.event("run.config", selected=selected, reuse_config=reuse_config,
