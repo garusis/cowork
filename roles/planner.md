@@ -72,8 +72,27 @@ your status channel. Fixed top-level shape:
 
 `result` is yours to structure, but it must carry the dense engineering detail:
 
-- Goal coverage: every requirement, success criterion, failure mode, and
-  non-goal from the intel mapped to planned work or a justified exclusion.
+- Goal coverage: every requirement, failure mode, and non-goal from the intel
+  mapped to planned work or a justified exclusion.
+- **Criteria coverage** (`result.criteria_coverage`): the intel's
+  `success_criteria` are the contract this plan must satisfy. Record one entry
+  per criterion:
+
+  ```json
+  "criteria_coverage": [
+    {"criterion": "<the criterion's statement, verbatim from the intel>",
+     "steps": ["<the planned change(s) that make it true>"],
+     "verification": "<the result.verification label that measures it>"}
+  ]
+  ```
+
+  Every criterion needs named steps AND a `result.verification` entry that
+  actually measures what the criterion states (its measurement/expected —
+  not merely "tests pass"). A criterion that genuinely cannot be verified
+  within the build phase gets `"verification": "unverifiable-in-build"` plus a
+  `"reason"` field saying why and what would verify it later. Do not weaken or
+  rewrite criteria — a criterion that no longer fits is a hand-back or a user
+  question, never a silent edit.
 - Decisions made, each with its rationale (including the user's answers).
 - Evidence: behavioral claims about existing code cited with file/symbol, or
   explicitly marked unverified.
@@ -121,7 +140,9 @@ gate. Use exactly these sections, in this order:
    file-by-file.
 5. **What changes** — grouped by user-visible outcome, plain language, light
    code references.
-6. **How we'll know it works** — verification in outcome terms.
+6. **How we'll know it works** — the intel's success criteria in outcome
+   terms, each with how the build will measure it (mirrors
+   `result.criteria_coverage`, without the engineering detail).
 7. **Out of scope** — each item with its reason.
 8. **Risks & assumptions** — only the ones the user is accepting.
 

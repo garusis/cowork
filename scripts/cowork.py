@@ -770,6 +770,35 @@ def assemble_reviewer_brief(review_path,
     )
 
 
+def _success_criteria_flag(intel_path):
+    """Light structural check (measurable-goal contract): when scout intel
+    reaches review without a non-empty `result.success_criteria` list, return
+    an auto-finding note to ride the reviewer's prompt; else None.
+
+    Structure-only by design — the reviewer owns all quality judgment (are the
+    criteria decidable, do the measurements fit the build context); this just
+    catches the field being absent so prompt drift can't skip the contract
+    silently. Tolerant: unreadable/malformed intel yields None (handled by the
+    normal review path)."""
+    try:
+        with open(intel_path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return None
+    result = data.get("result") if isinstance(data, dict) else None
+    crit = (result.get("success_criteria")
+            if isinstance(result, dict) else None)
+    if isinstance(crit, list) and any(
+            isinstance(c, dict) and c for c in crit):
+        return None
+    return (
+        "Orchestrator structural check: the intel JSON carries no non-empty "
+        "`result.success_criteria` list. Treat this as a finding under your "
+        "goal-measurability criterion — the intel must define measurable "
+        "success criteria (statement, measurement, expected, tier) before it "
+        "can be approved.")
+
+
 def _intel_artifacts(intel_path, intel_md_path=None):
     arts = [{"label": "intel JSON (machine source of truth)",
              "path": intel_path, "kind": "json"}]
@@ -1004,6 +1033,7 @@ EVAL_CRITERIA = {
         "intel quality/completeness",
         "requirement-gathering quality (questions asked vs assumptions buried)",
         "goal alignment",
+        "goal measurability",
     ],
     ("planner", PLANNING_ADVISOR): [
         "accuracy of findings",
@@ -1014,6 +1044,7 @@ EVAL_CRITERIA = {
         "plan quality/feasibility",
         "responsiveness to feedback",
         "goal alignment",
+        "criteria coverage",
     ],
     ("planner", "scout"): [
         "usefulness/sufficiency of intel for planning",
@@ -2632,6 +2663,19 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     surface = surface_io_out is not None
     review_io = surface_io_out if surface else quiet
     brief = assemble_reviewer_brief(review_path, protected=protected)
+    # Measurable-goal structural check: scout intel that reached review without
+    # a non-empty result.success_criteria gets an auto-finding note in the
+    # reviewer's brief (fresh AND resume passes — the brief rides both). Scoped
+    # to the scout-reviewer: the other reviewers' artifacts (plan JSON, build
+    # status) carry their own contracts.
+    if reviewer_role == SCOUT_REVIEWER:
+        criteria_flag = _success_criteria_flag(intel_path)
+        if criteria_flag:
+            brief = brief + "\n\n" + criteria_flag
+            if trace:
+                trace.event("review.structural_flag", role=reviewer_role,
+                            check="success_criteria_missing",
+                            intel_path=intel_path)
     # Diff-packet context (#4): only built when a snapshot_dir is wired (the real
     # runners pass it). packet_ctx keys the per-reviewer snapshot by phase epoch
     # + context revision; a test runner / legacy direct call leaves it None and

@@ -21,13 +21,26 @@ at the gate). Read the shared initial context and both files, then check:
 0. **Markdown ↔ JSON consistency.** The `.md` is the user's review surface, so it
    must faithfully reflect the JSON: flag anything the markdown **under-reports,
    mis-reports, or contradicts** versus the JSON (a missing decision, a different
-   objective, a dropped out-of-scope item, a softened risk). A markdown that
+   objective, a dropped out-of-scope item, a softened risk, a missing or
+   weakened success criterion — the markdown needs its own "Success criteria"
+   section matching `result.success_criteria`). A markdown that
    reads cleaner than the JSON warrants is a `revise` — the user must not approve
    a summary that hides what the JSON actually says.
 
 1. **Objective alignment.** Does the scout's stated + interpreted objective match
    the original goal/context? Flag scope drift, invented scope, or a narrowed
    objective.
+1b. **Goal measurability.** The intel must carry `result.success_criteria`
+   (1–5 entries, each `{statement, measurement, expected, tier}`). Check each
+   criterion is **binary-decidable from its stated measurement** (a concrete
+   command, observation, or evidence source — decidable within the session),
+   that the measurement **fits what is being built** (a bugfix measured by its
+   reproduction, a feature by observable behavior, a perf goal by a metric vs
+   a named baseline, a refactor by invariants + the existing suite), and that
+   together the `must` criteria actually cover the agreed goal. Missing,
+   vague, or non-decidable criteria are a `revise` — cite the offending
+   criterion (or its absence). A criterion that only the user can settle
+   (an unconfirmed scope choice hiding inside "done") is a `needs_user`.
 2. **Clarifications.** For every `clarifications` Q/A: was a blocking product
    question actually resolved, or did the scout assume a default? Did the scout
    bury a blocking question as an "assumption"?

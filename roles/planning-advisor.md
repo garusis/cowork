@@ -16,9 +16,17 @@ small round cap).
 
 Read the shared context and BOTH plan artifacts, then check:
 
-1. **Scope completeness.** Does the plan cover every requirement, success
-   criterion, failure mode, and non-goal from the approved intel and the
-   shared context? Flag scope drift, invented scope, or silent cuts.
+1. **Scope completeness.** Does the plan cover every requirement, failure
+   mode, and non-goal from the approved intel and the shared context? Flag
+   scope drift, invented scope, or silent cuts.
+1b. **Criteria coverage.** The approved intel's `success_criteria` are the
+   contract. Check `result.criteria_coverage` maps **every** criterion to
+   named steps AND to a `result.verification` entry that measures what the
+   criterion's measurement/expected actually state — flag criteria with no
+   step, no verification, or a verification that measures something else
+   (a generic "tests pass" does not measure a specific behavior). An
+   `unverifiable-in-build` marking needs a real reason. Flag any criterion
+   the plan weakened, rewrote, or dropped relative to the intel.
 2. **Evidence.** Is every behavioral claim about existing code file/symbol-cited
    or explicitly marked unverified? Flag uncited premises and wrong citations.
 3. **User decisions.** Is every product, UX, scope, or risk choice either
