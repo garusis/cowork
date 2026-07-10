@@ -56,6 +56,25 @@ Notes:
   compatibility with legacy `.cowork/session.json` files when changing state.
 - Role status/review artifacts are JSON contracts read by the orchestrator.
   Keep schema changes reflected in roles, README, and tests.
+- Measurable-goal contract: scout intel must carry `result.success_criteria`
+  (1–5 of `{statement, measurement, expected, tier: must|should}`); the plan
+  must map each criterion in `result.criteria_coverage` to steps + a
+  `result.verification` entry. `_success_criteria_flag` (cowork.py) injects a
+  structure-only auto-finding into the scout-reviewer brief when the list is
+  missing/empty — quality judgment stays in the reviewer prompts
+  (scout-reviewer "goal measurability", planning-advisor "criteria coverage",
+  mirrored in EVAL_CRITERIA).
+- Evaluation traceability: `scores.json` entries (schema 2) are stamped with
+  evaluator/evaluatee tool+model+session-id, per-eval `usage`/`duration_ms`,
+  `eval_turn_id`/`specs_in_turn` (shared-turn dedupe), and `reviewed_verdict`.
+  The stamps come from two optional inputs read by `_aggregate_eval`: the
+  eval-turn sidecar `<scratch>.turn.json` (written by the eval sender) and the
+  per-session `identities.json` registry (refreshed by `_send` on every turn).
+  Both are tolerant — absent inputs reproduce the legacy entry shape, so test
+  fakes need no changes. Per-role model pins ride config token `model=<id>`
+  (claude `--model`; codex `--model` fresh / `-c model=…` on resume).
+  `cowork --report` appends the scores/usage analysis when `scores.json`
+  exists (`cowork_report.summarize_scores` / `render_scores_report`).
 
 ## Git worktrees
 

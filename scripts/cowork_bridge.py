@@ -28,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -414,7 +415,10 @@ def parse_claude_event(obj):
             "usage": _usage_from_result(obj),
         }
     if etype == "system":
-        return {"kind": "system", "subtype": obj.get("subtype", "")}
+        # The init system event names the live model (traceability: which
+        # model actually served this session, not just which was requested).
+        return {"kind": "system", "subtype": obj.get("subtype", ""),
+                "model": obj.get("model")}
     if etype == "stream_event":
         event = obj.get("event") or {}
         delta = event.get("delta") or {}
@@ -457,11 +461,15 @@ def parse_codex_event(obj):
     """
     etype = obj.get("type")
     if etype == "thread.started":
-        return {"kind": "thread_started", "thread_id": obj.get("thread_id")}
+        # `model` is best-effort: newer codex CLIs may name the live model on
+        # the thread event; absent on older versions and dropped downstream.
+        return {"kind": "thread_started", "thread_id": obj.get("thread_id"),
+                "model": obj.get("model")}
     if etype == "turn.started":
         return {"kind": "turn_started"}
     if etype == "turn.completed":
-        return {"kind": "turn_completed", "usage": obj.get("usage")}
+        return {"kind": "turn_completed", "usage": obj.get("usage"),
+                "model": obj.get("model")}
     if etype == "error":
         return {"kind": "error", "text": obj.get("message", "")}
     if etype in ("item.started", "item.completed"):
@@ -732,6 +740,11 @@ class ClaudeSession:
         self.role_prompt_file = role_prompt_file
         self.session_id = session_id
         self.resume_id = resume_id
+        # The LIVE model, captured from the first system-init event that names
+        # it (traceability: stamped on turn results and eval score entries).
+        # Distinct from `self.model`, the config-pinned request (None = the
+        # CLI's own default).
+        self.live_model = None
         # Markdown render region; injectable for tests. TTY: Rich Live streaming.
         # Non-TTY: raw passthrough, byte-identical to the historical stream.
         self._region_factory = region_factory or ui.StreamingMarkdown
@@ -795,6 +808,11 @@ class ClaudeSession:
             if meta:
                 fields.update({k: v for k, v in meta.items() if v is not None})
             self.trace.event("controller.turn.start", **fields)
+        turn_started = time.monotonic()
+
+        def _elapsed_ms():
+            return int((time.monotonic() - turn_started) * 1000)
+
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
         tty = ui.is_tty(self.io_out)
@@ -874,6 +892,13 @@ class ClaudeSession:
                                      session_id=sid)
                 self.on_session_id(sid)
             kind = parsed["kind"]
+            if (kind == "system" and parsed.get("model")
+                    and parsed["model"] != self.live_model):
+                self.live_model = parsed["model"]
+                if self.trace:
+                    self.trace.event("controller.model", controller="claude",
+                                     role=self.speaker,
+                                     model=self.live_model)
             if kind == "partial" and parsed.get("text"):
                 _feed(parsed["text"])
                 any_text = True
@@ -918,29 +943,37 @@ class ClaudeSession:
                         self.trace.event(
                             "controller.turn.end", controller="claude",
                             role=self.speaker, result="error",
-                            subtype=parsed.get("subtype"))
+                            subtype=parsed.get("subtype"),
+                            model=self.live_model or self.model, duration_ms=_elapsed_ms())
                     self.io_out.write(
                         ui.colorize("[error] " + (parsed.get("text") or ""),
                                     ui.RED, tty) + "\n")
                     self.io_out.flush()
                     return turn_result(
                         False, "error", subtype=parsed.get("subtype"),
-                        session_id=sid or self.session_id)
+                        session_id=sid or self.session_id,
+                        model=self.live_model or self.model, duration_ms=_elapsed_ms())
                 elif self.trace:
                     self.trace.event("controller.turn.end", controller="claude",
                                      role=self.speaker,
                                      result="denied" if denied else "ok",
                                      subtype=parsed.get("subtype"),
-                                     usage=parsed.get("usage"))
+                                     usage=parsed.get("usage"),
+                                     model=self.live_model or self.model,
+                                     duration_ms=_elapsed_ms())
                 self.io_out.flush()
                 if denied:
                     return turn_result(
                         False, "denied", denied=True,
                         subtype=parsed.get("subtype"),
-                        session_id=sid or self.session_id)
+                        session_id=sid or self.session_id,
+                        usage=parsed.get("usage"), model=self.live_model or self.model,
+                        duration_ms=_elapsed_ms())
                 return turn_result(
                     True, "ok", subtype=parsed.get("subtype"),
-                    session_id=sid or self.session_id)
+                    session_id=sid or self.session_id,
+                    usage=parsed.get("usage"), model=self.live_model or self.model,
+                    duration_ms=_elapsed_ms())
             self.io_out.flush()
         if spinner:
             spinner.stop()
@@ -983,6 +1016,11 @@ class CodexSession:
         self.thread_id = resume_thread_id
         self.on_thread_id = on_thread_id
         self.trace = trace
+        # The LIVE model, captured best-effort from codex events that name it
+        # (traceability: stamped on turn results and eval score entries).
+        # Distinct from `self.model`, the config-pinned request (None = the
+        # CLI's own default).
+        self.live_model = None
         # Granted as a writable root on the fresh exec turn AND re-granted on
         # every resume (via -c sandbox_workspace_write.writable_roots), so a
         # resumed no-yolo role keeps writing its session assets outside cwd.
@@ -1085,6 +1123,7 @@ class CodexSession:
                 fields.update({k: v for k, v in meta.items()
                                if v is not None and k not in ("fresh", "resume")})
             self.trace.event("controller.turn.start", **fields)
+        turn_started = time.monotonic()
         try:
             events = self._run(command)
         except Exception as exc:  # noqa: BLE001
@@ -1093,6 +1132,7 @@ class CodexSession:
                                  role=self.speaker, result="error",
                                  error_type=type(exc).__name__)
             return turn_result(False, "error", error_type=type(exc).__name__)
+        duration_ms = int((time.monotonic() - turn_started) * 1000)
         tid = capture_thread_id(events)
         if tid and not self.thread_id:
             self.thread_id = tid
@@ -1115,14 +1155,26 @@ class CodexSession:
         for p in parsed_events:
             if p.get("kind") == "turn_completed" and isinstance(p.get("usage"), dict):
                 usage = p["usage"]
+            if (p.get("kind") in ("thread_started", "turn_completed")
+                    and p.get("model") and p["model"] != self.live_model):
+                self.live_model = p["model"]
+                if self.trace:
+                    self.trace.event("controller.model", controller="codex",
+                                     role=self.speaker,
+                                     model=self.live_model)
+        # Older codex CLIs never name the live model in events; fall back to
+        # the config-pinned model so the stamp is still meaningful.
+        model = self.live_model or self.model
         if self.trace:
             self.trace.event("controller.turn.end", controller="codex",
                              role=self.speaker, result=result,
                              thread_id=self.thread_id, event_count=len(events),
-                             usage=usage)
+                             usage=usage, model=model,
+                             duration_ms=duration_ms)
         return turn_result(
             result == "ok", result, denied=(result == "denied"),
-            thread_id=self.thread_id)
+            thread_id=self.thread_id, usage=usage, model=model,
+            duration_ms=duration_ms)
 
     def close(self):
         pass
@@ -1258,6 +1310,7 @@ class OpencodeSession:
                 fields.update({k: v for k, v in meta.items()
                                if v is not None and k not in ("fresh", "resume")})
             self.trace.event("controller.turn.start", **fields)
+        turn_started = time.monotonic()
         try:
             events = self._run(command)
         except Exception as exc:  # noqa: BLE001
@@ -1266,6 +1319,7 @@ class OpencodeSession:
                                  role=self.speaker, result="error",
                                  error_type=type(exc).__name__)
             return turn_result(False, "error", error_type=type(exc).__name__)
+        duration_ms = int((time.monotonic() - turn_started) * 1000)
         sid = capture_opencode_session_id(events)
         if sid and not self.session_id:
             self.session_id = sid
@@ -1285,17 +1339,22 @@ class OpencodeSession:
         if result == "ok" and not events:
             result = "error"
         usage = opencode_usage(events)
+        # opencode events never name the live model, so the config-pinned one
+        # is the best identity available (None = the CLI's own default).
         if self.trace:
             self.trace.event("controller.turn.end", controller="opencode",
                              role=self.speaker, result=result,
                              session_id=self.session_id,
-                             event_count=len(events), usage=usage)
+                             event_count=len(events), usage=usage,
+                             model=self.model, duration_ms=duration_ms)
         if result == "error" and not events:
             return turn_result(False, "error", error_type="no_events",
-                               session_id=self.session_id)
+                               session_id=self.session_id,
+                               duration_ms=duration_ms)
         return turn_result(
             result == "ok", result, denied=(result == "denied"),
-            session_id=self.session_id)
+            session_id=self.session_id, usage=usage, model=self.model,
+            duration_ms=duration_ms)
 
     def close(self):
         pass
