@@ -202,8 +202,8 @@ def default_config(selected):
 
 
 def apply_config_override(config, role, tokens):
-    """Apply tokens (controller/yolo/no-yolo/plan/implement) to one role.
-    Returns (ok, error_or_None). Mutates config."""
+    """Apply tokens (controller/yolo/no-yolo/plan/implement/model=<id>) to one
+    role. Returns (ok, error_or_None). Mutates config."""
     if role not in config:
         return False, "unknown or unselected role: %r" % role
     cfg = config[role]
@@ -216,17 +216,33 @@ def apply_config_override(config, role, tokens):
             cfg["yolo"] = False
         elif token in ("plan", "implement"):
             cfg["mode"] = token
+        elif token.startswith("model="):
+            # Pin the role to a specific model id (e.g. model=claude-opus-4-8
+            # or model=gpt-5-codex); `model=default` clears the pin.
+            model = token[len("model="):].strip()
+            if not model:
+                return False, "empty model in %r" % token
+            if model == "default":
+                cfg.pop("model", None)
+            else:
+                cfg["model"] = model
         else:
             return False, "unknown option: %r" % token
     return True, None
 
 
 def format_config_summary(config, header="Tool config:"):
-    """Aligned per-role summary with a column header row."""
+    """Aligned per-role summary with a column header row. The model column
+    appears only when at least one role pins a model, so the default summary
+    stays byte-identical to the historical shape."""
+    any_model = any(config[r].get("model") for r in config)
     labels = ("role", "controller", "permissions", "mode")
+    if any_model:
+        labels += ("model",)
     rows = [
         (role, config[role]["controller"],
          "yolo" if config[role]["yolo"] else "no-yolo", config[role]["mode"])
+        + ((config[role].get("model") or "default",) if any_model else ())
         for role in ROLES if role in config
     ]
     if not rows:
@@ -406,6 +422,12 @@ def run_report(args, io_out=None):
             % (session_uuid, trace_path))
         return 1
     io_out.write(cowork_report.report_for_trace(trace_path, session_uuid))
+    # Evaluation analysis (scores + tool/model identity + per-eval usage)
+    # appended when this session recorded peer evaluations.
+    scores_path = state_store.scores_path_for(session_uuid)
+    if os.path.exists(scores_path):
+        io_out.write("\n")
+        io_out.write(cowork_report.report_for_scores(scores_path))
     io_out.flush()
     return 0
 
@@ -623,29 +645,66 @@ def _call_review_fn(review_fn, status_path, round_index, force_full_reread):
     return review_fn(status_path, round_index)
 
 
+def _record_role_identity(session, result=None):
+    """Upsert the session role's live identity — tool, model, provider session
+    id — into the per-session `identities.json` registry, so eval aggregation
+    can stamp the EVALUATEE's tool+model onto score entries.
+
+    Anchored on the session's `extra_writable_dir` (the session-assets dir for
+    every real role/reviewer session). Only eval-relevant roles (ROLES) are
+    registered; fake test sessions without the attrs no-op. Observational:
+    never raises."""
+    try:
+        role = getattr(session, "speaker", None)
+        directory = getattr(session, "extra_writable_dir", None)
+        if not role or role not in ROLES or not directory:
+            return
+        result = result if isinstance(result, dict) else {}
+        state_store.upsert_role_identity(
+            os.path.join(directory, "identities.json"), role, {
+                "tool": getattr(session, "controller", None),
+                "model": (result.get("model")
+                          or getattr(session, "model", None)
+                          or getattr(session, "requested_model", None)),
+                "session_id": (result.get("session_id")
+                               or result.get("thread_id")
+                               or getattr(session, "session_id", None)
+                               or getattr(session, "thread_id", None)),
+            })
+    except Exception:  # noqa: BLE001 - identity is observational only
+        pass
+
+
 def _send(session, text, meta=None):
     """Send one turn, passing per-turn accounting `meta` (#1) only when the
     session's send() accepts it. Real bridge sessions do; test-injected fake
     sessions keep their historical `send(text)` signature and receive no meta,
-    so the streaming/test contract stays byte-identical."""
+    so the streaming/test contract stays byte-identical.
+
+    Every turn also refreshes the role-identity registry (tool/model/session
+    id) from the session + its result — see `_record_role_identity`."""
     try:
         if meta is not None:
             try:
                 if "meta" in inspect.signature(session.send).parameters:
                     result = session.send(text, meta=meta)
-                    return result or bridge.turn_result(True, "ok")
+                    result = result or bridge.turn_result(True, "ok")
+                    _record_role_identity(session, result)
+                    return result
             except (ValueError, TypeError):
                 pass
         result = session.send(text)
         if result is None:
-            return bridge.turn_result(True, "ok")
-        if isinstance(result, dict):
+            result = bridge.turn_result(True, "ok")
+        elif isinstance(result, dict):
             if "ok" not in result:
                 result = dict(result, ok=True)
             if "result" not in result:
                 result = dict(result, result="ok" if result.get("ok") else "error")
-            return result
-        return bridge.turn_result(True, "ok")
+        else:
+            result = bridge.turn_result(True, "ok")
+        _record_role_identity(session, result)
+        return result
     except KeyboardInterrupt:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1186,6 +1245,80 @@ def plan_consumed_upstream(plan_json_path, plan_md_path, building_epoch):
     }
 
 
+def _eval_turn_sidecar_path(scratch_path):
+    """The eval-turn accounting sidecar that rides next to an eval scratch
+    file: written by the eval SENDER right after the turn, read back (and
+    stamped onto every aggregated entry) by `_aggregate_eval`."""
+    return scratch_path + ".turn.json" if scratch_path else None
+
+
+def _write_eval_turn_sidecar(scratch_path, session, send_result,
+                             eval_turn_id, specs_count, verdict=None):
+    """Persist one eval turn's accounting: the EVALUATOR's live identity
+    (tool + model + provider session id), the turn's controller-reported token
+    usage and wall-clock duration, and the round verdict being evaluated.
+
+    `specs_in_turn` records how many evaluations shared this single turn (a
+    round-1 consumed-upstream bundle rides the same send), so token analysis
+    can attribute the turn's usage once instead of double-counting it per
+    entry. Tolerant: never raises — accounting must not break an eval."""
+    path = _eval_turn_sidecar_path(scratch_path)
+    if not path:
+        return
+    send_result = send_result if isinstance(send_result, dict) else {}
+    info = {
+        "eval_turn_id": eval_turn_id,
+        "evaluator_tool": getattr(session, "controller", None),
+        "evaluator_model": (send_result.get("model")
+                            or getattr(session, "model", None)
+                            or getattr(session, "requested_model", None)),
+        "evaluator_session_id": (send_result.get("session_id")
+                                 or send_result.get("thread_id")
+                                 or getattr(session, "session_id", None)
+                                 or getattr(session, "thread_id", None)),
+        "usage": send_result.get("usage"),
+        "duration_ms": send_result.get("duration_ms"),
+        "specs_in_turn": specs_count,
+        "reviewed_verdict": (verdict or {}).get("verdict"),
+    }
+    try:
+        with open(path, "w") as fh:
+            json.dump({k: v for k, v in info.items() if v is not None},
+                      fh, indent=2, sort_keys=True)
+            fh.write("\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _read_eval_turn_sidecar(scratch_path):
+    path = _eval_turn_sidecar_path(scratch_path)
+    if not path:
+        return {}
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clear_eval_scratch(scratch_path, role, trace=None):
+    """Remove a stale eval scratch AND its turn sidecar before an eval send,
+    so a turn that writes nothing yields 'no entry' with no stale accounting."""
+    try:
+        os.remove(scratch_path)
+        if trace:
+            trace.event("eval.scratch.cleared", role=role, path=scratch_path)
+    except OSError:
+        pass
+    sidecar = _eval_turn_sidecar_path(scratch_path)
+    if sidecar:
+        try:
+            os.remove(sidecar)
+        except OSError:
+            pass
+
+
 def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
                     round_index, stamp_by_evaluatee, trace=None):
     """Read an evaluator's scratch file, stamp metadata, and append the
@@ -1209,6 +1342,20 @@ def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
                         round=round_index, count=0, result="malformed")
         return False
     stamp = _eval_timestamp()
+    # Traceability stamps: the eval turn's accounting sidecar (evaluator
+    # tool/model/session id, token usage, duration, shared-turn count, the
+    # verdict under evaluation) plus the per-session identity registry (the
+    # EVALUATEE's live tool/model/session id). Both are optional — a legacy
+    # or test path without them aggregates exactly as before.
+    turn_info = _read_eval_turn_sidecar(scratch_path)
+    identities = state_store.read_role_identities(
+        os.path.join(os.path.dirname(scores_path), "identities.json")
+        if scores_path else None)
+    turn_stamp = {k: turn_info.get(k) for k in (
+        "eval_turn_id", "evaluator_tool", "evaluator_model",
+        "evaluator_session_id", "usage", "duration_ms", "specs_in_turn")
+        if turn_info.get(k) is not None}
+    reviewed_verdict = turn_info.get("reviewed_verdict")
     stamped = []
     for entry in entries:
         entry = dict(entry)
@@ -1217,6 +1364,16 @@ def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
         entry["round"] = round_index
         entry["context"] = "review-round"
         entry.update(stamp_by_evaluatee.get(entry.get("evaluatee")) or {})
+        entry.update(turn_stamp)
+        if reviewed_verdict and entry["context"] == "review-round":
+            entry["reviewed_verdict"] = reviewed_verdict
+        evaluatee_identity = identities.get(entry.get("evaluatee"))
+        if isinstance(evaluatee_identity, dict):
+            for src, dst in (("tool", "evaluatee_tool"),
+                             ("model", "evaluatee_model"),
+                             ("session_id", "evaluatee_session_id")):
+                if evaluatee_identity.get(src) is not None:
+                    entry[dst] = evaluatee_identity[src]
         entry["timestamp"] = stamp
         stamped.append(entry)
     ok = state_store.append_score_entries(scores_path, session_uuid, stamped)
@@ -1255,15 +1412,10 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
 
     def evaluate_fn(session, verdict, round_index):
         # The scratch is per-turn output, not durable state: clear any prior
-        # round's file BEFORE the send so a turn that writes nothing yields
-        # 'no entry', never a re-read of the previous round's scores.
-        try:
-            os.remove(scratch_path)
-            if trace:
-                trace.event("eval.scratch.cleared", role=role,
-                            path=scratch_path)
-        except OSError:
-            pass
+        # round's file (and its accounting sidecar) BEFORE the send so a turn
+        # that writes nothing yields 'no entry', never a re-read of the
+        # previous round's scores.
+        _clear_eval_scratch(scratch_path, role, trace=trace)
         specs = [{
             "evaluatee": reviewer_role,
             "criteria": EVAL_CRITERIA[(role, reviewer_role)],
@@ -1305,12 +1457,19 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
         if len(specs) > 1:
             eval_artifacts = _artifact_descriptors(
                 consumed_upstream.get("artifact_paths"), delivery="path")
+        eval_turn_id = str(uuid.uuid4())
         with _muted_session(session):
-            _send(session, prompt, meta={
+            send_result = _send(session, prompt, meta={
                 "prompt_kind": "eval", "fresh": False, "resume": True,
                 "phase": phase, "round": round_index,
                 "context_revision": context_revision,
-                "artifacts": eval_artifacts})
+                "artifacts": eval_artifacts,
+                "eval_turn_id": eval_turn_id})
+        # Per-eval accounting (traceability): who evaluated (tool+model+session
+        # id), what the turn cost (usage/duration), and which verdict was under
+        # evaluation — stamped onto every aggregated entry below.
+        _write_eval_turn_sidecar(scratch_path, session, send_result,
+                                 eval_turn_id, len(specs), verdict=verdict)
         if len(specs) > 1:
             consumed_done["done"] = True
         _aggregate_eval(
@@ -2015,7 +2174,8 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
             session = bridge.ClaudeSession(
                 WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
                 io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
-                extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=wt_config.get("model"))
         first = brief
     else:
         if session_factory:
@@ -2024,7 +2184,8 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
             session = bridge.CodexSession(
                 wt_config["mode"], wt_config["yolo"], io_out=io_out,
                 speaker=WORKTREE_ROLE, trace=trace,
-                extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=wt_config.get("model"))
         wt_role_text = _read_text(WORKTREE_PROMPT_PATH)
         first = assemble_codex_prompt(wt_role_text, "", brief)
         _emit_codex_role_prompt_bytes(trace, WORKTREE_ROLE, wt_role_text)
@@ -2384,24 +2545,22 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
 
 
 def _run_reviewer_eval(session, reviewer_role, eval_scratch_path, eval_specs,
-                       trace=None, context_revision=None, artifact_paths=None):
+                       trace=None, context_revision=None, artifact_paths=None,
+                       verdict=None):
     """Send the reviewer its private evaluation turn on the still-open session
     (after its verdict was read back, before close — no resume round-trip).
 
     The reviewer already streams to a quiet sink, so no muting wrapper is
     needed. Failures are traced and swallowed: the eval is observational and
-    must never affect the verdict."""
+    must never affect the verdict. `verdict` (this pass's verdict dict, when
+    the caller has it) rides into the turn-accounting sidecar so aggregated
+    entries can correlate scores with the round's outcome."""
     if not (eval_specs and eval_scratch_path):
         return
     # Per-turn output, not durable state: clear any prior round's scratch
-    # BEFORE the send (mirrors the review-file clearing above).
-    try:
-        os.remove(eval_scratch_path)
-        if trace:
-            trace.event("eval.scratch.cleared", role=reviewer_role,
-                        path=eval_scratch_path)
-    except OSError:
-        pass
+    # (and its accounting sidecar) BEFORE the send (mirrors the review-file
+    # clearing above).
+    _clear_eval_scratch(eval_scratch_path, reviewer_role, trace=trace)
     if trace:
         trace.event("eval.request", evaluator=reviewer_role,
                     evaluatees=[s.get("evaluatee") for s in eval_specs],
@@ -2413,14 +2572,19 @@ def _run_reviewer_eval(session, reviewer_role, eval_scratch_path, eval_specs,
         # file by PATH (the reviewer-side eval specs name them as paths, and the
         # consumed-upstream evidence rides path-first after #2), so tag the
         # descriptors as path-first — no bodies are embedded here.
-        _send(session, assemble_eval_prompt(
+        eval_turn_id = str(uuid.uuid4())
+        send_result = _send(session, assemble_eval_prompt(
             reviewer_role, eval_scratch_path, eval_specs),
             meta={"prompt_kind": "eval", "fresh": False, "resume": True,
                   "phase": eval_specs[0].get("phase"),
                   "round": eval_specs[0].get("round"),
                   "context_revision": context_revision,
                   "artifacts": _artifact_descriptors(artifact_paths,
-                                                     delivery="path")})
+                                                     delivery="path"),
+                  "eval_turn_id": eval_turn_id})
+        _write_eval_turn_sidecar(eval_scratch_path, session, send_result,
+                                 eval_turn_id, len(eval_specs),
+                                 verdict=verdict)
     except Exception:  # noqa: BLE001 - eval must never break the review pass
         if trace:
             trace.event("eval.send.error", evaluator=reviewer_role)
@@ -2541,7 +2705,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 prompt_path, cfg["mode"], cfg["yolo"],
                 io_out=review_io, speaker=reviewer_role, internal=surface,
                 resume_id=resume_id, on_session_id=cb, trace=trace,
-                extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=cfg.get("model"))
         else:
             spawn = claude_spawn or bridge._real_claude_spawn
             ok, alert = bridge.probe_claude_stream_json(
@@ -2571,7 +2736,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 prompt_path, cfg["mode"], cfg["yolo"],
                 io_out=review_io, speaker=reviewer_role, internal=surface,
                 session_id=sid, on_session_id=cb, trace=trace,
-                extra_writable_dir=extra_writable_dir)
+                extra_writable_dir=extra_writable_dir,
+                model=cfg.get("model"))
         first = (brief + "\n\n" + ctx_block).strip()
         try:
             send_result = _send(session, first, meta=review_meta)
@@ -2599,7 +2765,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                                    eval_specs, trace=trace,
                                    context_revision=context_revision,
                                    artifact_paths=(meta_artifact_paths
-                                                   + [review_path]))
+                                                   + [review_path]),
+                                   verdict=verdict)
         finally:
             session.close()
         if trace:
@@ -2626,7 +2793,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=review_io, speaker=reviewer_role,
             internal=surface, resume_thread_id=resume_id, on_thread_id=cb,
-            trace=trace, extra_writable_dir=extra_writable_dir)
+            trace=trace, extra_writable_dir=extra_writable_dir,
+            model=cfg.get("model"))
     try:
         send_result = _send(session, prompt, meta=review_meta)
         if not send_result.get("ok", True):
@@ -2652,7 +2820,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                                eval_specs, trace=trace,
                                context_revision=context_revision,
                                artifact_paths=(meta_artifact_paths
-                                               + [review_path]))
+                                               + [review_path]),
+                               verdict=verdict)
     finally:
         session.close()
     if trace:
@@ -4213,7 +4382,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                     SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                     speaker="scout", session_id=session_id, resume_id=rid,
                     on_session_id=cb, trace=trace,
-                    extra_writable_dir=sessions_dir)
+                    extra_writable_dir=sessions_dir, model=cfg.get("model"))
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -4249,7 +4418,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="scout",
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
-            extra_writable_dir=sessions_dir)
+            extra_writable_dir=sessions_dir, model=cfg.get("model"))
     return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
                        review_fn=review_fn, trace=trace, on_outcome=on_outcome,
                        evaluate_fn=evaluate_fn, intel_md_path=intel_md_path,
@@ -4393,7 +4562,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                     PLANNER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                     speaker="planner", session_id=session_id, resume_id=rid,
                     on_session_id=cb, trace=trace,
-                    extra_writable_dir=sessions_dir)
+                    extra_writable_dir=sessions_dir, model=cfg.get("model"))
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -4429,7 +4598,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="planner",
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
-            extra_writable_dir=sessions_dir)
+            extra_writable_dir=sessions_dir, model=cfg.get("model"))
     rc, outcome, payload = _role_loop(
         session, prompt, plan_json_path, context, io_in, io_out,
         on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
@@ -4581,7 +4750,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                     BUILDER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                     speaker="builder", session_id=session_id, resume_id=rid,
                     on_session_id=cb, trace=trace,
-                    extra_writable_dir=sessions_dir)
+                    extra_writable_dir=sessions_dir, model=cfg.get("model"))
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -4617,7 +4786,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="builder",
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
-            extra_writable_dir=sessions_dir)
+            extra_writable_dir=sessions_dir, model=cfg.get("model"))
     rc, outcome, payload = _role_loop(
         session, prompt, build_status_path, context, io_in, io_out,
         on_first_send_accepted=on_first_send_accepted, **loop_kwargs)

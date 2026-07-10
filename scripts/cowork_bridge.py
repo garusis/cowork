@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -98,7 +99,7 @@ def codex_mode_flags(mode, yolo):
 
 
 def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
-                         resume_id=None, extra_writable_dir=None):
+                         resume_id=None, extra_writable_dir=None, model=None):
     """Full argv for a persistent duplex claude scout process.
 
     Pass `session_id` to pin a known UUID on a fresh session (so it can be saved
@@ -106,7 +107,9 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     `extra_writable_dir`, when set, is granted as an additional writable root
     via `--add-dir` so a no-yolo (acceptEdits) role can write its session
     artifacts even though they live outside cwd. Re-applied on every spawn
-    (fresh AND resume), so resumed Claude roles keep the grant."""
+    (fresh AND resume), so resumed Claude roles keep the grant.
+    `model`, when set, pins the role to a specific model via `--model`
+    (re-applied on resume too, so a resumed role keeps its pinned model)."""
     cmd = [
         "claude",
         "-p",
@@ -125,6 +128,8 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         "--append-system-prompt-file",
         role_prompt_file,
     ] + claude_mode_flags(mode, yolo)
+    if model:
+        cmd += ["--model", model]
     if extra_writable_dir:
         cmd += ["--add-dir", extra_writable_dir]
     if resume_id:
@@ -134,7 +139,8 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     return cmd
 
 
-def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None):
+def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
+                        model=None):
     """argv for the first one-shot codex exec turn. The role spec is prepended
     into prompt_text by the caller (no AGENTS.md is written into the repo).
 
@@ -148,6 +154,7 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None):
     return (
         ["codex", "exec", "--json", "--skip-git-repo-check"]
         + codex_mode_flags(mode, yolo)
+        + (["--model", model] if model else [])
         + (["--add-dir", extra_writable_dir] if extra_writable_dir else [])
         + [prompt_text]
     )
@@ -185,7 +192,7 @@ def codex_resume_mode_args(mode, yolo, extra_writable_dir=None):
 
 
 def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
-                               extra_writable_dir=None):
+                               extra_writable_dir=None, model=None):
     """argv for a codex follow-up turn against an explicit thread id (never
     --last, which could grab a concurrent session in the same cwd).
 
@@ -200,6 +207,10 @@ def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
     return (
         ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
         + codex_resume_mode_args(mode, yolo, extra_writable_dir)
+        # `codex exec resume` rejects `--model` but accepts the `-c model=...`
+        # config key (same mechanism as the re-applied sandbox), so a pinned
+        # model survives resume turns too. TOML basic string via json.dumps.
+        + (["-c", "model=" + json.dumps(model)] if model else [])
         + [thread_id, prompt_text]
     )
 
@@ -293,7 +304,10 @@ def parse_claude_event(obj):
             "usage": _usage_from_result(obj),
         }
     if etype == "system":
-        return {"kind": "system", "subtype": obj.get("subtype", "")}
+        # The init system event names the live model (traceability: which
+        # model actually served this session, not just which was requested).
+        return {"kind": "system", "subtype": obj.get("subtype", ""),
+                "model": obj.get("model")}
     if etype == "stream_event":
         event = obj.get("event") or {}
         delta = event.get("delta") or {}
@@ -336,11 +350,15 @@ def parse_codex_event(obj):
     """
     etype = obj.get("type")
     if etype == "thread.started":
-        return {"kind": "thread_started", "thread_id": obj.get("thread_id")}
+        # `model` is best-effort: newer codex CLIs may name the live model on
+        # the thread event; absent on older versions and dropped downstream.
+        return {"kind": "thread_started", "thread_id": obj.get("thread_id"),
+                "model": obj.get("model")}
     if etype == "turn.started":
         return {"kind": "turn_started"}
     if etype == "turn.completed":
-        return {"kind": "turn_completed", "usage": obj.get("usage")}
+        return {"kind": "turn_completed", "usage": obj.get("usage"),
+                "model": obj.get("model")}
     if etype == "error":
         return {"kind": "error", "text": obj.get("message", "")}
     if etype in ("item.started", "item.completed"):
@@ -522,7 +540,7 @@ class ClaudeSession:
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
                  session_id=None, resume_id=None, on_session_id=None,
                  region_factory=None, trace=None, extra_writable_dir=None,
-                 internal=False):
+                 internal=False, model=None):
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.controller = "claude"
@@ -537,6 +555,11 @@ class ClaudeSession:
         self.role_prompt_file = role_prompt_file
         self.session_id = session_id
         self.resume_id = resume_id
+        # The live model, captured from the first system-init event that names
+        # it (traceability: stamped on turn results and eval score entries).
+        # `requested_model` is the config-pinned model (None = CLI default).
+        self.model = None
+        self.requested_model = model
         # Markdown render region; injectable for tests. TTY: Rich Live streaming.
         # Non-TTY: raw passthrough, byte-identical to the historical stream.
         self._region_factory = region_factory or ui.StreamingMarkdown
@@ -544,7 +567,8 @@ class ClaudeSession:
         self.extra_writable_dir = extra_writable_dir
         command = build_claude_command(role_prompt_file, mode, yolo,
                                        session_id=session_id, resume_id=resume_id,
-                                       extra_writable_dir=extra_writable_dir)
+                                       extra_writable_dir=extra_writable_dir,
+                                       model=model)
         if self.trace:
             self.trace.event(
                 "controller.spawn.start", controller="claude", role=speaker,
@@ -598,6 +622,11 @@ class ClaudeSession:
             if meta:
                 fields.update({k: v for k, v in meta.items() if v is not None})
             self.trace.event("controller.turn.start", **fields)
+        turn_started = time.monotonic()
+
+        def _elapsed_ms():
+            return int((time.monotonic() - turn_started) * 1000)
+
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
         tty = ui.is_tty(self.io_out)
@@ -677,6 +706,12 @@ class ClaudeSession:
                                      session_id=sid)
                 self.on_session_id(sid)
             kind = parsed["kind"]
+            if (kind == "system" and parsed.get("model")
+                    and parsed["model"] != self.model):
+                self.model = parsed["model"]
+                if self.trace:
+                    self.trace.event("controller.model", controller="claude",
+                                     role=self.speaker, model=self.model)
             if kind == "partial" and parsed.get("text"):
                 _feed(parsed["text"])
                 any_text = True
@@ -721,29 +756,37 @@ class ClaudeSession:
                         self.trace.event(
                             "controller.turn.end", controller="claude",
                             role=self.speaker, result="error",
-                            subtype=parsed.get("subtype"))
+                            subtype=parsed.get("subtype"),
+                            model=self.model or self.requested_model, duration_ms=_elapsed_ms())
                     self.io_out.write(
                         ui.colorize("[error] " + (parsed.get("text") or ""),
                                     ui.RED, tty) + "\n")
                     self.io_out.flush()
                     return turn_result(
                         False, "error", subtype=parsed.get("subtype"),
-                        session_id=sid or self.session_id)
+                        session_id=sid or self.session_id,
+                        model=self.model or self.requested_model, duration_ms=_elapsed_ms())
                 elif self.trace:
                     self.trace.event("controller.turn.end", controller="claude",
                                      role=self.speaker,
                                      result="denied" if denied else "ok",
                                      subtype=parsed.get("subtype"),
-                                     usage=parsed.get("usage"))
+                                     usage=parsed.get("usage"),
+                                     model=self.model or self.requested_model,
+                                     duration_ms=_elapsed_ms())
                 self.io_out.flush()
                 if denied:
                     return turn_result(
                         False, "denied", denied=True,
                         subtype=parsed.get("subtype"),
-                        session_id=sid or self.session_id)
+                        session_id=sid or self.session_id,
+                        usage=parsed.get("usage"), model=self.model or self.requested_model,
+                        duration_ms=_elapsed_ms())
                 return turn_result(
                     True, "ok", subtype=parsed.get("subtype"),
-                    session_id=sid or self.session_id)
+                    session_id=sid or self.session_id,
+                    usage=parsed.get("usage"), model=self.model or self.requested_model,
+                    duration_ms=_elapsed_ms())
             self.io_out.flush()
         if spinner:
             spinner.stop()
@@ -770,7 +813,7 @@ class CodexSession:
 
     def __init__(self, mode, yolo, io_out=None, speaker="scout",
                  resume_thread_id=None, on_thread_id=None, trace=None,
-                 extra_writable_dir=None, internal=False):
+                 extra_writable_dir=None, internal=False, model=None):
         self.mode = mode
         self.yolo = yolo
         self.controller = "codex"
@@ -783,6 +826,11 @@ class CodexSession:
         self.thread_id = resume_thread_id
         self.on_thread_id = on_thread_id
         self.trace = trace
+        # The live model, captured best-effort from codex events that name it
+        # (traceability: stamped on turn results and eval score entries).
+        # `requested_model` is the config-pinned model (None = CLI default).
+        self.model = None
+        self.requested_model = model
         # Granted as a writable root on the fresh exec turn AND re-granted on
         # every resume (via -c sandbox_workspace_write.writable_roots), so a
         # resumed no-yolo role keeps writing its session assets outside cwd.
@@ -852,7 +900,8 @@ class CodexSession:
         if not self._started and not self._resuming_first:
             command = build_codex_command(
                 text, self.mode, self.yolo,
-                extra_writable_dir=self.extra_writable_dir)
+                extra_writable_dir=self.extra_writable_dir,
+                model=self.requested_model)
             fresh = True
         else:
             if not self.thread_id:
@@ -866,7 +915,8 @@ class CodexSession:
                                    error_type="missing_thread_id")
             command = build_codex_resume_command(
                 self.thread_id, text, self.mode, self.yolo,
-                extra_writable_dir=self.extra_writable_dir)
+                extra_writable_dir=self.extra_writable_dir,
+                model=self.requested_model)
             fresh = False
         self._started = True
         if self.trace:
@@ -883,6 +933,7 @@ class CodexSession:
                 fields.update({k: v for k, v in meta.items()
                                if v is not None and k not in ("fresh", "resume")})
             self.trace.event("controller.turn.start", **fields)
+        turn_started = time.monotonic()
         try:
             events = self._run(command)
         except Exception as exc:  # noqa: BLE001
@@ -891,6 +942,7 @@ class CodexSession:
                                  role=self.speaker, result="error",
                                  error_type=type(exc).__name__)
             return turn_result(False, "error", error_type=type(exc).__name__)
+        duration_ms = int((time.monotonic() - turn_started) * 1000)
         tid = capture_thread_id(events)
         if tid and not self.thread_id:
             self.thread_id = tid
@@ -913,14 +965,25 @@ class CodexSession:
         for p in parsed_events:
             if p.get("kind") == "turn_completed" and isinstance(p.get("usage"), dict):
                 usage = p["usage"]
+            if (p.get("kind") in ("thread_started", "turn_completed")
+                    and p.get("model") and p["model"] != self.model):
+                self.model = p["model"]
+                if self.trace:
+                    self.trace.event("controller.model", controller="codex",
+                                     role=self.speaker, model=self.model)
+        # Older codex CLIs never name the live model in events; fall back to
+        # the config-pinned model so the stamp is still meaningful.
+        model = self.model or self.requested_model
         if self.trace:
             self.trace.event("controller.turn.end", controller="codex",
                              role=self.speaker, result=result,
                              thread_id=self.thread_id, event_count=len(events),
-                             usage=usage)
+                             usage=usage, model=model,
+                             duration_ms=duration_ms)
         return turn_result(
             result == "ok", result, denied=(result == "denied"),
-            thread_id=self.thread_id)
+            thread_id=self.thread_id, usage=usage, model=model,
+            duration_ms=duration_ms)
 
     def close(self):
         pass

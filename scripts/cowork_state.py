@@ -472,6 +472,67 @@ def scores_path_for(session_uuid):
     return os.path.join(session_assets_dir(session_uuid), "scores.json")
 
 
+def identities_path_for(session_uuid):
+    """Path of the per-session role-identity registry: which tool (claude or
+    codex), live model, and provider session id each role actually ran with.
+    Written by the orchestrator on every turn; read at eval-aggregation time so
+    score entries can stamp the EVALUATEE's tool+model, not just the
+    evaluator's."""
+    return os.path.join(session_assets_dir(session_uuid), "identities.json")
+
+
+def upsert_role_identity(path, role, identity):
+    """Merge one role's identity dict into the registry at `path`.
+
+    Only non-None values are written, and known values are never overwritten
+    by None (a later turn that could not observe the model must not erase an
+    earlier observation). A no-change merge skips the write. Tolerant: any
+    OSError/ValueError yields False — identity is observational and must never
+    break a turn."""
+    if not (path and role and isinstance(identity, dict)):
+        return False
+    fresh = {k: v for k, v in identity.items() if v is not None}
+    if not fresh:
+        return False
+    try:
+        try:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            data = {}
+        current = data.get(role) if isinstance(data.get(role), dict) else {}
+        merged = dict(current)
+        merged.update(fresh)
+        if merged == current:
+            return True
+        data[role] = merged
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def read_role_identities(path):
+    """The registry as a dict, or {} when missing/malformed (tolerant)."""
+    if not path:
+        return {}
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def read_eval(path):
     """Return the normalized list of evaluation dicts from a scratch file, or
     [] when the file is missing, unreadable, or malformed (mirrors
@@ -658,7 +719,10 @@ def append_score_entries(scores_path, session_uuid, entries):
             data = None
         if (not isinstance(data, dict)
                 or not isinstance(data.get("evaluations"), list)):
-            data = {"session": session_uuid, "evaluations": []}
+            # schema 2: entries may carry evaluator/evaluatee tool+model,
+            # eval_turn_id, usage, duration_ms, specs_in_turn,
+            # reviewed_verdict traceability stamps.
+            data = {"session": session_uuid, "schema": 2, "evaluations": []}
         data["evaluations"].extend(entries)
         tmp = scores_path + ".tmp"
         with open(tmp, "w") as fh:

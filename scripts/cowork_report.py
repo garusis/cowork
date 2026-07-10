@@ -69,6 +69,10 @@ def summarize_trace(source):
     role_prompt_bytes = {}
     review_skips = []  # list of {role, reason}
     usage_by_controller = {}  # controller -> {token field -> sum}
+    # (role, controller, model) -> {"turns": n, "usage": {field -> sum}}:
+    # consumption per tool+model combo, joinable against the scores each
+    # combo received (see summarize_scores).
+    usage_by_role_model = {}
     turn_count = 0
 
     for obj in _iter_events(source):
@@ -138,6 +142,19 @@ def summarize_trace(source):
                     iv = _as_int(val)
                     if iv:
                         bucket[field] = bucket.get(field, 0) + iv
+            if name == "controller.turn.end":
+                rkey = (obj.get("role") or "(unknown)",
+                        obj.get("controller") or "(unknown)",
+                        obj.get("model") or "(unknown)")
+                rbucket = usage_by_role_model.setdefault(
+                    rkey, {"turns": 0, "usage": {}})
+                rbucket["turns"] += 1
+                if isinstance(usage, dict):
+                    for field, val in usage.items():
+                        iv = _as_int(val)
+                        if iv:
+                            rbucket["usage"][field] = (
+                                rbucket["usage"].get(field, 0) + iv)
         elif name == "review.skipped":
             review_skips.append({
                 "role": obj.get("role") or "(unknown)",
@@ -156,6 +173,7 @@ def summarize_trace(source):
         "role_prompt_bytes": role_prompt_bytes,
         "review_skips": review_skips,
         "usage_by_controller": usage_by_controller,
+        "usage_by_role_model": usage_by_role_model,
     }
 
 
@@ -266,9 +284,155 @@ def render_report(summary, session_uuid=None):
     else:
         lines.append("  (none reported by the CLIs this session)")
 
+    by_role_model = summary.get("usage_by_role_model") or {}
+    if by_role_model:
+        lines.append("")
+        lines.append("Turns + usage by role, tool, and model:")
+        for (role, controller, model), b in sorted(by_role_model.items()):
+            ident = controller if model == "(unknown)" else (
+                "%s/%s" % (controller, model))
+            parts = ", ".join("%s=%d" % (k, v)
+                              for k, v in sorted(b["usage"].items()))
+            lines.append("  %-18s %-28s %3d turns%s"
+                         % (role, ident, b["turns"],
+                            (", %s" % parts) if parts else ""))
+
+    return "\n".join(lines) + "\n"
+
+
+def summarize_scores(scores):
+    """Aggregate a scores.json dict (or path) into the evaluation-analysis
+    structure. Tolerant: missing/malformed input yields empty aggregates.
+
+    Three views over the schema-2 traceability stamps:
+    - received: scores each (evaluatee, tool, model) combo received — the
+      "which tool+model does better work" view (per-criterion averages).
+    - eval_cost: tokens/duration each (evaluator, tool, model) combo spent
+      producing evaluations. A shared turn (a round-1 consumed-upstream
+      bundle rides the same send) is counted ONCE via its eval_turn_id.
+    - score_by_verdict: average score grouped by the round's reviewed
+      verdict, correlating scores with outcomes.
+    Entries written before schema 2 lack the stamps and fold into the
+    "(unknown)" identity buckets."""
+    if isinstance(scores, str):
+        try:
+            with open(scores, "r") as fh:
+                scores = json.load(fh)
+        except (OSError, ValueError):
+            scores = None
+    entries = (scores or {}).get("evaluations")
+    entries = entries if isinstance(entries, list) else []
+    received = {}
+    eval_cost = {}
+    score_by_verdict = {}
+    seen_turns = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        criteria = [c for c in entry.get("criteria") or []
+                    if isinstance(c, dict)
+                    and isinstance(c.get("score"), int)]
+        rkey = (entry.get("evaluatee") or "(unknown)",
+                entry.get("evaluatee_tool") or "(unknown)",
+                entry.get("evaluatee_model") or "(unknown)")
+        rbucket = received.setdefault(
+            rkey, {"entries": 0, "score_total": 0, "score_count": 0,
+                   "criteria": {}})
+        rbucket["entries"] += 1
+        for crit in criteria:
+            score = crit["score"]
+            rbucket["score_total"] += score
+            rbucket["score_count"] += 1
+            cb = rbucket["criteria"].setdefault(
+                crit.get("name") or "(unnamed)", {"total": 0, "count": 0})
+            cb["total"] += score
+            cb["count"] += 1
+            verdict = entry.get("reviewed_verdict")
+            if verdict and entry.get("context") == "review-round":
+                vb = score_by_verdict.setdefault(
+                    verdict, {"total": 0, "count": 0})
+                vb["total"] += score
+                vb["count"] += 1
+        ekey = (entry.get("evaluator") or "(unknown)",
+                entry.get("evaluator_tool") or "(unknown)",
+                entry.get("evaluator_model") or "(unknown)")
+        ebucket = eval_cost.setdefault(
+            ekey, {"entries": 0, "turns": 0, "duration_ms": 0, "usage": {}})
+        ebucket["entries"] += 1
+        turn_id = entry.get("eval_turn_id")
+        if turn_id and turn_id in seen_turns:
+            continue  # shared turn: usage/duration already counted once
+        if turn_id:
+            seen_turns.add(turn_id)
+        ebucket["turns"] += 1
+        ebucket["duration_ms"] += _as_int(entry.get("duration_ms"))
+        for field, val in (entry.get("usage") or {}).items():
+            iv = _as_int(val)
+            if iv:
+                ebucket["usage"][field] = ebucket["usage"].get(field, 0) + iv
+    return {
+        "entry_count": len(entries),
+        "received": received,
+        "eval_cost": eval_cost,
+        "score_by_verdict": score_by_verdict,
+    }
+
+
+def _fmt_identity(key):
+    role, tool, model = key
+    ident = tool if model == "(unknown)" else "%s/%s" % (tool, model)
+    return "%-18s %s" % (role, ident)
+
+
+def render_scores_report(summary):
+    """Render the summarize_scores structure as a plain-text section."""
+    lines = []
+    head = "Evaluation scores (scores.json)"
+    lines.append(head)
+    lines.append("-" * len(head))
+    if not summary.get("entry_count"):
+        lines.append("  (no evaluations recorded this session)")
+        return "\n".join(lines) + "\n"
+    lines.append("Scores received, by evaluatee tool+model:")
+    rows = sorted(summary["received"].items(),
+                  key=lambda kv: -(kv[1]["score_total"]
+                                   / kv[1]["score_count"])
+                  if kv[1]["score_count"] else 0)
+    for key, b in rows:
+        avg = (b["score_total"] / b["score_count"]
+               if b["score_count"] else 0.0)
+        lines.append("  %s  avg %.2f over %d criteria (%d evals)"
+                     % (_fmt_identity(key), avg, b["score_count"],
+                        b["entries"]))
+        for name, cb in sorted(b["criteria"].items()):
+            lines.append("      %-38s %.2f x%d"
+                         % (name, cb["total"] / cb["count"], cb["count"]))
+    lines.append("")
+    lines.append("Evaluation cost, by evaluator tool+model "
+                 "(shared turns counted once):")
+    for key, b in sorted(summary["eval_cost"].items()):
+        parts = ", ".join("%s=%d" % (k, v)
+                          for k, v in sorted(b["usage"].items()))
+        lines.append("  %s  %d turns, %d entries%s%s"
+                     % (_fmt_identity(key), b["turns"], b["entries"],
+                        (", %s" % parts) if parts else "",
+                        (", %.1fs" % (b["duration_ms"] / 1000.0))
+                        if b["duration_ms"] else ""))
+    verdicts = summary.get("score_by_verdict") or {}
+    if verdicts:
+        lines.append("")
+        lines.append("Average score by reviewed verdict:")
+        for verdict, vb in sorted(verdicts.items()):
+            lines.append("  %-12s %.2f x%d"
+                         % (verdict, vb["total"] / vb["count"], vb["count"]))
     return "\n".join(lines) + "\n"
 
 
 def report_for_trace(trace_path, session_uuid=None):
     """Convenience: summarize + render a trace file in one call."""
     return render_report(summarize_trace(trace_path), session_uuid=session_uuid)
+
+
+def report_for_scores(scores_path):
+    """Convenience: summarize + render a scores.json file in one call."""
+    return render_scores_report(summarize_scores(scores_path))
