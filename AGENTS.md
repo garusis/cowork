@@ -22,8 +22,8 @@ python3 -m unittest scripts/test_cowork.py
 ```
 
 Notes:
-- The normal unit tests use fakes and should not spawn real Claude/Codex
-  sessions or make API calls.
+- The normal unit tests use fakes and should not spawn real
+  Claude/Codex/opencode sessions or make API calls.
 - `COWORK_LIVE=1 python3 -m unittest scripts/test_cowork.py` runs live CLI
   integration tests. Use it only when intentionally verifying installed
   controller behavior.
@@ -33,7 +33,9 @@ Notes:
 ## Session and generated state
 
 - `.cowork/`, `.plans/`, `.venv/`, and `.worktrees/` are local/generated and
-  gitignored.
+  gitignored. Roles on the `opencode` controller also generate
+  `.opencode/agents/cowork-<role>.md` agent files in the working directory
+  (rewritten every spawn — runtime state, not source).
 - Project-local `.cowork/session*.json` files are resumable session anchors.
   Treat them as runtime state, not source files.
 - Per-session artifacts live under `~/.cowork/sessions/<session_uuid>/`
@@ -43,9 +45,13 @@ Notes:
 
 ## Implementation notes
 
-- `scripts/cowork_bridge.py` owns Claude/Codex command assembly, event parsing,
-  stream handling, and probe behavior. Keep flag changes covered by focused
-  tests.
+- `scripts/cowork_bridge.py` owns Claude/Codex/opencode command assembly, event
+  parsing, stream handling, and probe behavior. Keep flag changes covered by
+  focused tests.
+- Controllers are `claude`, `codex`, and `opencode`. Each role config carries
+  `controller`, `model`, `effort`, `yolo`, `mode` — model/effort `None` means
+  the controller CLI's own default, and opencode model ids are
+  `provider/model`. Switching a role's controller resets its model/effort.
 - `scripts/cowork_state.py` owns session discovery and persistence. Preserve
   compatibility with legacy `.cowork/session.json` files when changing state.
 - Role status/review artifacts are JSON contracts read by the orchestrator.

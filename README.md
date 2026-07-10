@@ -1,8 +1,10 @@
 # cowork
 
 `cowork` is a terminal command that assembles a team of CLI-driven roles, spins
-up the controller CLI you pick for each role (`claude` or `codex`), and bridges
-that CLI's conversation straight to you.
+up the controller CLI you pick for each role (`claude`, `codex`, or
+`opencode`), and bridges that CLI's conversation straight to you. Every role
+can also pin a model and a thinking-effort level (and, with opencode, the
+provider — it is embedded in the `provider/model` id).
 
 This release implements the **foundation** and the **first two phases**:
 
@@ -37,9 +39,16 @@ the run; cowork makes no git commit and opens no PR.
 1. **Choose your team.** A checkbox menu of roles (`scout`, `scout-reviewer`,
    `planner`, `planning-advisor`, `builder`, `build-reviewer`), all checked by
    default. Space toggles, Enter confirms.
-2. **Configure each role.** Accept the defaults in one keystroke, or pick which
-   roles to customize and choose a controller (`claude`/`codex`), a yolo
-   (permission-bypass) toggle, and a mode (`plan`/`implement`) for each.
+2. **Configure each role.** One screen: the current config is shown as a table
+   (controller · model · effort · permissions · mode) and the menu is
+   "✓ start with this config" (the default — one Enter accepts everything)
+   plus one entry per role. Picking a role walks a short edit —
+   controller (`claude`/`codex`/`opencode`) → model → thinking effort →
+   access (`yolo` / `safe` / `read-only`) — and returns to the same screen.
+   For opencode the model pick is two steps: provider first (discovered live
+   from `opencode models`, so only providers you have credentials for appear),
+   then that provider's models. Model and effort default to the controller
+   CLI's own settings; every picker has a `custom…` free-text escape hatch.
 3. **Give context.** Type/paste the files/code/intent the work needs.
 
 The interactive UI uses [rich](https://github.com/Textualize/rich) (streaming
@@ -54,8 +63,8 @@ using the controller you chose, bridging its live conversation to your terminal.
 
 ### The bridge
 
-The two controllers are driven differently because their non-interactive modes
-differ:
+The three controllers are driven differently because their non-interactive
+modes differ:
 
 - **claude** runs as a single persistent duplex process
   (`claude -p --input-format stream-json --output-format stream-json`). Your
@@ -65,17 +74,31 @@ differ:
   `cowork` captures the session's `thread_id`; each follow-up turn is
   `codex exec resume <thread_id>`. (codex `exec` has no persistent stdin, so
   every turn is a fresh process resumed by id.)
+- **opencode** runs turn-based too: each turn is
+  `opencode run --format json`; the first turn reveals the session id
+  (`ses_…`) and follow-ups pass `--session <id>`. The role prompt is delivered
+  as a generated agent file (`.opencode/agents/cowork-<role>.md`, a system
+  prompt like claude's) rewritten on every spawn so it always matches the
+  current config.
 
 ### Controllers and modes
 
 The flags `cowork` emits per (controller, mode, yolo), verified against
-**Claude Code 2.1.x** and **codex-cli 0.133.x**:
+**Claude Code 2.1.x**, **codex-cli 0.133.x**, and **opencode 1.17.x**:
 
-| Setting | claude | codex |
-| --- | --- | --- |
-| plan mode | `--permission-mode plan` | `--sandbox read-only` |
-| implement, yolo off | `--permission-mode acceptEdits` | `--sandbox workspace-write` |
-| implement, yolo on | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
+| Setting | claude | codex | opencode |
+| --- | --- | --- | --- |
+| plan mode | `--permission-mode plan` | `--sandbox read-only` | agent `permission: edit: deny, bash: ask` |
+| implement, yolo off | `--permission-mode acceptEdits` | `--sandbox workspace-write` | agent `permission: edit: allow, bash: ask` |
+| implement, yolo on | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--auto` |
+
+Per-role **model** and **thinking effort**, when set (both default to the
+controller CLI's own setting):
+
+| | claude | codex | opencode |
+| --- | --- | --- | --- |
+| model | `--model <alias-or-id>` | `-c model="<id>"` | `--model <provider/model>` |
+| effort | `--effort <level>` (low…max) | `-c model_reasoning_effort="<level>"` | `--variant <level>` (provider-specific) |
 
 Notes:
 
@@ -83,20 +106,27 @@ Notes:
   is set entirely by the sandbox — there is no `--ask-for-approval` flag on
   `exec`. `cowork` also passes `--skip-git-repo-check` so it runs outside a git
   repo, and `codex exec resume` inherits the original session's sandbox (it
-  rejects `--sandbox`).
-- The `scout` role spec is preloaded into claude via `--append-system-prompt-file`
-  and into codex by prepending it to the prompt — `cowork` never writes an
-  `AGENTS.md` into your repo.
+  rejects `--sandbox`). Model/effort use `-c` (not `-m`) so fresh and resumed
+  turns take the identical spelling.
+- The `scout` role spec is preloaded into claude via `--append-system-prompt-file`,
+  into codex by prepending it to the prompt, and into opencode via the
+  generated `.opencode/agents/cowork-<role>.md` agent file — `cowork` never
+  writes an `AGENTS.md` into your repo.
 - **yolo off has no interactive approval relay** in this release: a tool the
   permission/sandbox level does not auto-allow is denied and surfaced to you as
   an error (the run does not hang). `scout`'s defaults are plan + yolo, where
   this never triggers.
+- opencode has **no OS sandbox**; its agent permission rules are the only
+  guardrail, and in a headless run any rule that resolves to `ask` is
+  auto-rejected by opencode (acts as a hard deny — the run never hangs). Its
+  plan mode is "no edits, no shell" rather than codex's read-only-commands
+  sandbox.
 
 ### Safety
 
-With yolo on, claude runs with `--dangerously-skip-permissions` and codex with
-`--dangerously-bypass-approvals-and-sandbox` — both bypass approval/sandbox
-guards. Run `cowork` in a trusted/isolated workspace.
+With yolo on, claude runs with `--dangerously-skip-permissions`, codex with
+`--dangerously-bypass-approvals-and-sandbox`, and opencode with `--auto` — all
+bypass approval/sandbox guards. Run `cowork` in a trusted/isolated workspace.
 
 ## Requirements
 
@@ -118,6 +148,10 @@ guards. Run `cowork` in a trusted/isolated workspace.
   - **Claude Code** — `npm install -g @anthropic-ai/claude-code`
   - **Codex CLI** — `npm install -g @openai/codex` (Node 18+) or
     `brew install --cask codex`
+  - **opencode** (optional) — `curl -fsSL https://opencode.ai/install | bash`,
+    `npm install -g opencode-ai`, or `brew install sst/tap/opencode`; then
+    authenticate providers with `opencode auth login` (the provider/model
+    picker lists whatever `opencode models` reports)
 
 `cowork --check` reports exactly which of these is missing. During a normal run,
 Python and interactive UI packages are checked up front, while controller CLIs
@@ -161,9 +195,12 @@ anytime with `cowork --check`.
 
 - **Team step:** a questionary checkbox menu (all roles preselected). Space
   toggles, Enter confirms.
-- **Config step:** the per-role defaults are printed as a table first, then you
-  pick "use these defaults" to continue instantly — or "customize", choose which
-  roles, and select controller/permissions/mode for each.
+- **Config step:** one screen. The current config is a table
+  (controller · model · effort · permissions · mode); the menu default is
+  "✓ start with this config" (one Enter continues), and picking a role instead
+  walks controller → model → effort → access for that role and returns to the
+  table. Access is a single pick: `yolo` (full access), `safe` (edits only), or
+  `read-only` (plan mode).
 - **Context step:** a multiline prompt_toolkit editor (Enter sends; Ctrl+J /
   Alt+Enter insert a newline).
 
@@ -177,6 +214,12 @@ interactive UI (and none of the pip packages are required):
 # scout only, codex controller, no yolo, implement mode, context inline
 ./cowork --team scout --config "scout=codex,no-yolo,implement" --context "Refactor the auth module"
 
+# builder on opencode with a pinned provider/model + effort
+./cowork --config "builder=opencode,model=anthropic/claude-sonnet-4-5,effort=max" --context "…"
+
+# pin the claude scout's model and thinking effort
+./cowork --config "scout=claude,model=opus,effort=high" --context "…"
+
 # context from a file (or '-' to read stdin)
 ./cowork --team scout --context-file ./brief.md
 echo "the brief" | ./cowork --team scout --context-file -
@@ -184,14 +227,17 @@ echo "the brief" | ./cowork --team scout --context-file -
 
 - `--team` — comma-separated roles (default: all). Unknown roles error out.
 - `--config ROLE=opt,opt` — repeatable; tokens are any of
-  `claude|codex`, `yolo|no-yolo`, `plan|implement`.
+  `claude|codex|opencode`, `model=<id>`, `effort=<level>`, `yolo|no-yolo`,
+  `plan|implement`. `model=default`/`effort=default` reset to the controller
+  CLI's own setting; opencode model ids are `provider/model`.
 - `--context TEXT` / `--context-file PATH` — initial context (`-` = stdin).
 - `--session-file PATH` — use a specific session store (default
   `./.cowork/session.json`).
 - `--no-session` — do not read or write the session store.
 - `--switch-controller ROLE=CONTROLLER` — update one current-phase role in an
-  existing saved session to `claude` or `codex`, then continue that session.
-  Examples:
+  existing saved session to `claude`, `codex`, or `opencode`, then continue
+  that session. A switch resets the role's model/effort pins (they are
+  controller-specific). Examples:
 
   ```bash
   ./cowork --switch-controller planner=codex
@@ -217,8 +263,8 @@ echo "the brief" | ./cowork --team scout --context-file -
   (it must exist and be git-registered) before switching into it. On a name
   clash, an explicit `NAME` stops (or reuses an exact match) rather than
   silently renaming; an auto name picks a free numbered variant.
-- `--wt-controller claude|codex` — controller for the worktree agent (default
-  `claude`).
+- `--wt-controller claude|codex|opencode` — controller for the worktree agent
+  (default `claude`).
 - `--headless` / `--auto` — drive the whole scout → plan → build flow with **no
   human gates**: leads never block (they record an assumption and proceed
   instead of asking), reviewers review with what they have (a would-be user
@@ -242,16 +288,16 @@ echo "the brief" | ./cowork --team scout --context-file -
   folder** (or point at it with `--session-file`) — resuming from *inside* the
   worktree will not find it.
 
-Defaults per role:
+Defaults per role (model/effort default to the controller CLI's own setting):
 
-| Role | Controller | yolo | Mode |
-| --- | --- | --- | --- |
-| scout | claude | on | implement |
-| scout-reviewer | codex | on | implement |
-| planner | claude | on | implement |
-| planning-advisor | codex | on | implement |
-| builder | claude | on | implement |
-| build-reviewer | codex | on | implement |
+| Role | Controller | Model | Effort | yolo | Mode |
+| --- | --- | --- | --- | --- | --- |
+| scout | claude | default | default | on | implement |
+| scout-reviewer | codex | default | default | on | implement |
+| planner | claude | default | default | on | implement |
+| planning-advisor | codex | default | default | on | implement |
+| builder | claude | default | default | on | implement |
+| build-reviewer | codex | default | default | on | implement |
 
 Roles default to **implement** mode (write-enabled). The user-facing roles are
 kept in their lane by **role-spec guardrails**, not by plan mode — the scout may
