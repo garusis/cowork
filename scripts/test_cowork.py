@@ -2051,6 +2051,25 @@ class FramingTest(unittest.TestCase):
         self.assertEqual(r["kind"], "result")
         self.assertFalse(r["is_error"])
 
+    def test_parse_claude_synthetic_api_error(self):
+        parsed = bridge.parse_claude_event({
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "error": "authentication_failed",
+            "message": {"content": [{"type": "text", "text":
+                                      "Failed to authenticate"}]},
+        })
+        self.assertEqual(parsed["kind"], "error")
+        self.assertEqual(parsed["error_type"], "authentication_failed")
+        self.assertIn("authenticate", parsed["text"])
+
+        system = bridge.parse_claude_event({
+            "type": "system", "subtype": "api_error",
+            "error": {"formatted": "401 OAuth token expired"},
+        })
+        self.assertEqual(system["kind"], "error")
+        self.assertEqual(system["error_type"], "api_error")
+
     def test_parse_claude_partial_text_delta(self):
         ev = {"type": "stream_event",
               "event": {"delta": {"type": "text_delta", "text": "hel"}}}
@@ -2314,9 +2333,12 @@ class ScoutLoopTest(unittest.TestCase):
                 self.sent.append(text)
                 st = statuses.pop(0) if statuses else "ready_for_review"
                 os.makedirs(os.path.dirname(intel_path), exist_ok=True)
+                result = {}
+                if st == "needs_input":
+                    result["pending_question"] = "What input should the scout use?"
                 with open(intel_path, "w") as fh:
                     json.dump({"session": "X", "role": "scout",
-                               "status": st, "result": {}}, fh)
+                               "status": st, "result": result}, fh)
 
             def close(self):
                 self.closed = True
@@ -2496,6 +2518,60 @@ class SessionClassTest(unittest.TestCase):
         self.assertEqual(result["result"], "error")
         self.assertEqual(result["subtype"], "error_during_execution")
         self.assertIn("limit reached", out.getvalue())
+
+    def test_claude_synthetic_auth_error_overrides_success_result(self):
+        """Regression: Claude can emit an API-error assistant message followed
+        by subtype=success with zero usage.  The turn must enter cowork's
+        controller-recovery gate instead of looking successful."""
+        import unittest.mock as mock
+
+        class FakeStdin:
+            def write(self, _text):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = FakeStdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        lines = [
+            json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "error": "authentication_failed",
+                "message": {"content": [{"type": "text", "text":
+                                          "Failed to authenticate. API Error: 401"}]},
+            }),
+            json.dumps({"type": "result", "subtype": "success",
+                        "result": "", "usage": {"input_tokens": 0,
+                                                  "output_tokens": 0}}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=FakeProc(lines)):
+            out = io.StringIO()
+            session = bridge.ClaudeSession(
+                "roles/scout.md", "implement", True, io_out=out)
+            result = session.send("go")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "authentication_failed")
+        self.assertEqual(out.getvalue().count("Failed to authenticate"), 1)
 
     def test_claude_session_separates_text_blocks(self):
         import unittest.mock as mock
@@ -2879,8 +2955,11 @@ class ScoutLoopReviewTest(unittest.TestCase):
                 self.sent.append(text)
                 st = statuses.pop(0) if statuses else "ready_for_review"
                 os.makedirs(os.path.dirname(intel_path), exist_ok=True)
+                result = {}
+                if st == "needs_input":
+                    result["pending_question"] = "What input should the scout use?"
                 with open(intel_path, "w") as fh:
-                    json.dump({"status": st}, fh)
+                    json.dump({"status": st, "result": result}, fh)
 
             def close(self):
                 self.closed = True
@@ -5008,9 +5087,13 @@ class PlannerLoopTest(unittest.TestCase):
                 self.sent.append(text)
                 entry = statuses.pop(0) if statuses else {"status": "ready_for_review"}
                 os.makedirs(os.path.dirname(plan_json), exist_ok=True)
+                payload = dict({"session": "X", "role": "planner",
+                                "result": {}}, **entry)
+                if payload.get("status") == "needs_input":
+                    payload.setdefault("result", {}).setdefault(
+                        "pending_question", "What input should the planner use?")
                 with open(plan_json, "w") as fh:
-                    json.dump(dict({"session": "X", "role": "planner",
-                                    "result": {}}, **entry), fh)
+                    json.dump(payload, fh)
 
             def close(self):
                 self.closed = True
@@ -5113,7 +5196,9 @@ class PlannerLoopTest(unittest.TestCase):
 
     def test_handoff_without_payload_degrades_to_needs_input(self):
         plan_json, plan_md = self._paths()
-        sess = self._session(plan_json, [{"status": "handoff_back"}])
+        sess = self._session(
+            plan_json,
+            [{"status": "handoff_back"}, {"status": "needs_input"}])
         gates = []
         rc, text, outcomes = self._run(
             plan_json, plan_md, sess, io.StringIO(""),  # EOF ends after gate
@@ -6549,8 +6634,11 @@ class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
             def send(self, text):
                 self.sent.append(text)
                 st = statuses.pop(0) if statuses else "ready_for_review"
+                result = {}
+                if st == "needs_input":
+                    result["pending_question"] = "What scope should the scout use?"
                 with open(intel_path, "w") as fh:
-                    json.dump({"status": st}, fh)
+                    json.dump({"status": st, "result": result}, fh)
 
             def close(self):
                 self.closed = True
@@ -7492,9 +7580,13 @@ class BuilderLoopTest(unittest.TestCase):
                 entry = statuses.pop(0) if statuses else {
                     "status": "ready_for_review"}
                 os.makedirs(os.path.dirname(status_path), exist_ok=True)
+                payload = dict({"session": "X", "role": "builder",
+                                "result": {}}, **entry)
+                if payload.get("status") == "needs_input":
+                    payload.setdefault("result", {}).setdefault(
+                        "pending_question", "What input should the builder use?")
                 with open(status_path, "w") as fh:
-                    json.dump(dict({"session": "X", "role": "builder",
-                                    "result": {}}, **entry), fh)
+                    json.dump(payload, fh)
 
             def close(self):
                 self.closed = True
@@ -10512,6 +10604,8 @@ class DocsChecklistTest(unittest.TestCase):
     def test_sections_1_to_4_checked(self):
         path = os.path.join(_HERE, "..", ".plans",
                             "cowork-token-reduction.md")
+        if not os.path.exists(path):
+            self.skipTest("local gitignored plan document is not present")
         with open(path, "r") as fh:
             text = fh.read()
         self.assertIn("## 1. Improve Prompt-Size Accounting ✅", text)
@@ -11331,6 +11425,755 @@ class ReadReviewThreeWayTest(unittest.TestCase):
             self.assertEqual(cowork._read_review(i, o, allow_ask=False),
                              "fix it")
         sel.assert_not_called()
+
+
+class _SelectRecorder:
+    """A ui.select stand-in that records the (key, label) choices it was shown
+    and returns a scripted key, so gate-label previews can be asserted verbatim
+    without a live terminal."""
+
+    def __init__(self, *keys):
+        self._keys = list(keys)
+        self.calls = []
+
+    def __call__(self, prompt, choices, ask_fn=None):
+        pairs = list(choices)
+        self.calls.append({
+            "prompt": prompt,
+            "keys": [k for k, _l in pairs],
+            "labels": [l for _k, l in pairs],
+        })
+        return self._keys.pop(0) if self._keys else None
+
+    @property
+    def keys(self):
+        return self.calls[-1]["keys"]
+
+    @property
+    def labels(self):
+        return self.calls[-1]["labels"]
+
+    @property
+    def prompt(self):
+        return self.calls[-1]["prompt"]
+
+    def label_for(self, key):
+        last = self.calls[-1]
+        return dict(zip(last["keys"], last["labels"]))[key]
+
+
+class _GateSession:
+    """A scripted session for the role loop: each send writes a status to the
+    status path (defaulting to ready_for_review)."""
+
+    def __init__(self, status_path, statuses=None):
+        self.sent = []
+        self.closed = False
+        self._path = status_path
+        self._statuses = list(statuses or [])
+
+    def send(self, text):
+        self.sent.append(text)
+        st = self._statuses.pop(0) if self._statuses else "ready_for_review"
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, "w") as fh:
+            json.dump({"status": st, "result": {}}, fh)
+
+    def close(self):
+        self.closed = True
+
+
+def _gate_status_path():
+    import tempfile
+    d = tempfile.mkdtemp()
+    return os.path.join(d, ".cowork", "x.json"), d
+
+
+class GatePreviewLabelTest(unittest.TestCase):
+    """Every normal review gate renders the pinned, phase- and team-aware
+    consequence previews. Covers all three gates named in criterion 1 (scout
+    ±planner, planner ±builder, and the builder approve label), plus a
+    run_scout->_scout_loop plumbing guard so scout previews are never silently
+    preview=None."""
+
+    def _render(self, allow_ask, preview, first_key="approve"):
+        import unittest.mock as mock
+        rec = _SelectRecorder(first_key)
+        with mock.patch.object(cowork.ui, "select", rec):
+            cowork._read_review(FakeTTY(), FakeTTY(),
+                                allow_ask=allow_ask, preview=preview)
+        return rec
+
+    def test_scout_gate_with_planner(self):
+        rec = self._render(True, cowork.make_gate_preview("scout", True, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve — continue to planning")
+        self.assertNotIn("finish", rec.label_for("approve"))
+        self.assertEqual(
+            rec.label_for("ask"),
+            "Ask a question — answered in chat; the intel stays as-is")
+        self.assertEqual(
+            rec.label_for("changes"),
+            "Request changes — the scout revises; you'll be asked for feedback")
+
+    def test_scout_gate_terminal_no_planner(self):
+        rec = self._render(True, cowork.make_gate_preview("scout", False, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish — intel is the deliverable")
+
+    def test_planner_gate_with_builder(self):
+        rec = self._render(True, cowork.make_gate_preview("planner", True, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve — continue to building")
+        self.assertNotIn("finish", rec.label_for("approve"))
+        self.assertEqual(
+            rec.label_for("ask"),
+            "Ask a question — answered in chat; the plan stays as-is")
+        self.assertEqual(
+            rec.label_for("changes"),
+            "Request changes — the planner revises; you'll be asked for "
+            "feedback")
+
+    def test_planner_gate_terminal_no_builder(self):
+        rec = self._render(True, cowork.make_gate_preview("planner", False, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish — plan is the deliverable")
+
+    def test_builder_gate_approve_label(self):
+        rec = self._render(False, cowork.make_gate_preview("builder", False, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish — review your working tree")
+
+    def test_scout_preview_threads_through_scout_loop(self):
+        # Plumbing guard: drive the gate through _scout_loop (not the reader in
+        # isolation) and assert the rendered approve label is the phase-truthful
+        # preview — i.e. the descriptor actually threads through _scout_loop's
+        # loop_kwargs and is NOT silently preview=None.
+        import unittest.mock as mock
+        path, d = _gate_status_path()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        sess = _GateSession(path, ["ready_for_review"])
+        rec = _SelectRecorder("approve")
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "select", rec):
+            cowork._scout_loop(
+                sess, "seed", path, context="",
+                io_in=FakeTTY(), io_out=FakeTTY(),
+                gate_preview=cowork.make_gate_preview("scout", True, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve — continue to planning")
+
+    def test_planner_preview_threads_through_role_loop(self):
+        # Lighter mirror for the planner path: _role_loop forwards gate_preview
+        # into the reader exactly as run_planner's loop_kwargs supply it.
+        import unittest.mock as mock
+        path, d = _gate_status_path()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        sess = _GateSession(path, ["ready_for_review"])
+        rec = _SelectRecorder("approve")
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "select", rec):
+            cowork._role_loop(
+                sess, "seed", path, context="",
+                io_in=FakeTTY(), io_out=FakeTTY(), role="planner",
+                artifact_noun="plan",
+                gate_preview=cowork.make_gate_preview("planner", True, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve — continue to building")
+
+    def test_builder_preview_threads_through_role_loop(self):
+        import unittest.mock as mock
+        path, d = _gate_status_path()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        sess = _GateSession(path, ["ready_for_review"])
+        rec = _SelectRecorder("approve")
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(cowork.ui, "select", rec):
+            cowork._role_loop(
+                sess, "seed", path, context="",
+                io_in=FakeTTY(), io_out=FakeTTY(), role="builder",
+                artifact_noun="build", review_allow_ask=False,
+                gate_preview=cowork.make_gate_preview("builder", False, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish — review your working tree")
+
+
+class BuilderGateSelectTest(unittest.TestCase):
+    """The builder gate is a 3-way select on a TTY (Approve & finish / Request
+    changes / Stop) with Approve default; off a TTY it keeps blank=finish /
+    text=revise with no Stop."""
+
+    def test_tty_three_way_labels_and_default(self):
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        rec = _SelectRecorder("approve")
+        with mock.patch.object(cowork.ui, "select", rec):
+            out = cowork._read_review(FakeTTY(), FakeTTY(),
+                                      allow_ask=False, preview=preview)
+        self.assertIs(out, cowork._END)
+        self.assertEqual(rec.keys, ["approve", "changes", "stop"])
+        self.assertEqual(rec.labels, [
+            "Approve & finish — review your working tree",
+            "Request changes — the builder revises; you'll be asked for feedback",
+            "Stop — session remains resumable"])
+        # Approve is the highlighted default (first); Stop is non-default (last).
+        self.assertEqual(rec.keys[0], "approve")
+        self.assertEqual(rec.keys[-1], "stop")
+
+    def test_tty_changes_returns_feedback(self):
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        with mock.patch.object(cowork.ui, "select", return_value="changes"), \
+                mock.patch.object(cowork.ui, "prompt_user",
+                                  return_value="tighten it"):
+            out = cowork._read_review(FakeTTY(), FakeTTY(),
+                                      allow_ask=False, preview=preview)
+        self.assertEqual(out, "tighten it")
+
+    def test_tty_stop_returns_stop(self):
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        with mock.patch.object(cowork.ui, "select", return_value="stop"):
+            out = cowork._read_review(FakeTTY(), FakeTTY(),
+                                      allow_ask=False, preview=preview)
+        self.assertIs(out, cowork._STOP)
+
+    def test_off_tty_unchanged_no_stop(self):
+        # Off a TTY the builder contract is byte-for-byte: blank=finish /
+        # text=revise, and no Stop is reachable (select is never consulted).
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        with mock.patch.object(cowork.ui, "select",
+                               side_effect=AssertionError("select off TTY")):
+            self.assertIs(
+                cowork._read_review(io.StringIO("\n"), io.StringIO(),
+                                    allow_ask=False, preview=preview),
+                cowork._END)
+            self.assertEqual(
+                cowork._read_review(io.StringIO("do X\n"), io.StringIO(),
+                                    allow_ask=False, preview=preview),
+                "do X")
+
+
+class DissentGateVariantTest(unittest.TestCase):
+    """The dissent gate renders four preview-labelled choices across the full
+    five-case phase/topology matrix; terminality (and thus the word 'finish')
+    depends on downstream team membership. Enter returns _ITERATE; cancelling a
+    preview-enabled menu follows the explicit Stop path."""
+
+    def _render(self, preview, first_key="iterate"):
+        import unittest.mock as mock
+        rec = _SelectRecorder(first_key)
+        with mock.patch.object(cowork.ui, "select", rec):
+            out = cowork._read_review_dissent(FakeTTY(), FakeTTY(),
+                                              preview=preview)
+        return rec, out
+
+    def _assert_roles(self, rec, role):
+        self.assertEqual(
+            rec.label_for("iterate"),
+            "Keep iterating — hand the reviewer's findings back to the %s" % role)
+        self.assertEqual(
+            rec.label_for("tell"),
+            "Tell it what to do — your instructions go to the %s" % role)
+
+    def test_scout_planner_non_terminal(self):
+        rec, _ = self._render(cowork.make_gate_preview("scout", True, True))
+        self._assert_roles(rec, "scout")
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve anyway — continue to planning")
+        self.assertNotIn("finish", rec.label_for("approve"))
+
+    def test_scout_no_planner_terminal(self):
+        rec, _ = self._render(cowork.make_gate_preview("scout", False, True))
+        self._assert_roles(rec, "scout")
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish anyway — accept despite the reviewer")
+
+    def test_planner_builder_non_terminal(self):
+        rec, _ = self._render(cowork.make_gate_preview("planner", True, True))
+        self._assert_roles(rec, "planner")
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve anyway — continue to building")
+        self.assertNotIn("finish", rec.label_for("approve"))
+
+    def test_planner_no_builder_terminal(self):
+        rec, _ = self._render(cowork.make_gate_preview("planner", False, True))
+        self._assert_roles(rec, "planner")
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish anyway — accept despite the reviewer")
+
+    def test_builder_terminal(self):
+        rec, _ = self._render(cowork.make_gate_preview("builder", False, True))
+        self._assert_roles(rec, "builder")
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish anyway — accept despite the reviewer")
+
+    def test_iterate_is_default_first_choice(self):
+        rec, out = self._render(cowork.make_gate_preview("scout", True, True))
+        self.assertEqual(rec.keys[0], "iterate")
+        self.assertIs(out, cowork._ITERATE)
+
+    def test_dismissed_returns_stop(self):
+        # Questionary returns None for a single Ctrl-C.  Cancellation must not
+        # silently resume iteration.
+        import unittest.mock as mock
+        with mock.patch.object(cowork.ui, "select", return_value=None):
+            out = cowork._read_review_dissent(
+                FakeTTY(), FakeTTY(),
+                preview=cowork.make_gate_preview("builder", False, True))
+        self.assertIs(out, cowork._STOP)
+
+
+class StopOutcomeTest(unittest.TestCase):
+    """The non-default Stop choice at every interactive gate returns _STOP and
+    drives a clean phase end (outcome 'ended') — no approval, no revise/iterate
+    turn, saved anchor untouched, and run_flow does not advance."""
+
+    def test_stop_present_and_non_default_all_gates(self):
+        import unittest.mock as mock
+        # scout/planner normal gate
+        rec = _SelectRecorder("stop")
+        with mock.patch.object(cowork.ui, "select", rec):
+            out = cowork._read_review(
+                FakeTTY(), FakeTTY(), allow_ask=True,
+                preview=cowork.make_gate_preview("scout", True, True))
+        self.assertIs(out, cowork._STOP)
+        self.assertIn("stop", rec.keys)
+        self.assertNotEqual(rec.keys[0], "stop")  # never the default
+        # builder gate
+        rec = _SelectRecorder("stop")
+        with mock.patch.object(cowork.ui, "select", rec):
+            out = cowork._read_review(
+                FakeTTY(), FakeTTY(), allow_ask=False,
+                preview=cowork.make_gate_preview("builder", False, True))
+        self.assertIs(out, cowork._STOP)
+        self.assertIn("stop", rec.keys)
+        self.assertNotEqual(rec.keys[0], "stop")
+        # dissent gate
+        rec = _SelectRecorder("stop")
+        with mock.patch.object(cowork.ui, "select", rec):
+            out = cowork._read_review_dissent(
+                FakeTTY(), FakeTTY(),
+                preview=cowork.make_gate_preview("scout", True, True))
+        self.assertIs(out, cowork._STOP)
+        self.assertIn("stop", rec.keys)
+        self.assertNotEqual(rec.keys[0], "stop")
+
+    def test_dismissed_preview_menus_follow_stop(self):
+        """A single Ctrl-C is surfaced by Questionary as None."""
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("scout", True, True)
+        with mock.patch.object(cowork.ui, "select", return_value=None), \
+                mock.patch.object(
+                    cowork.ui, "prompt_user",
+                    side_effect=AssertionError("cancel became feedback")):
+            self.assertIs(
+                cowork._read_review(FakeTTY(), FakeTTY(), allow_ask=True,
+                                    preview=preview),
+                cowork._STOP)
+
+        preview = cowork.make_gate_preview("builder", False, True)
+        with mock.patch.object(cowork.ui, "select", return_value=None), \
+                mock.patch.object(
+                    cowork.ui, "prompt_user",
+                    side_effect=AssertionError("cancel became feedback")):
+            self.assertIs(
+                cowork._read_review(FakeTTY(), FakeTTY(), allow_ask=False,
+                                    preview=preview),
+                cowork._STOP)
+
+    def test_role_loop_stop_ends_cleanly(self):
+        import unittest.mock as mock
+        path, d = _gate_status_path()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        sess = _GateSession(path, ["ready_for_review"])
+        banners = []
+        with mock.patch.object(
+                cowork.ui, "banner",
+                side_effect=lambda _io, text, kind="info", **kw:
+                banners.append(kind)), \
+                mock.patch.object(cowork.ui, "select", return_value="stop"):
+            rc, outcome, _ = cowork._role_loop(
+                sess, "seed", path, context="",
+                io_in=FakeTTY(), io_out=FakeTTY(), role="scout",
+                gate_preview=cowork.make_gate_preview("scout", True, True))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "ended")
+        # No approval: only the seed was sent, no revise/iterate turn queued.
+        self.assertEqual(sess.sent, ["seed"])
+        # No done banner.
+        self.assertNotIn("done", banners)
+        # The status on disk is left as the role wrote it (anchor untouched).
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["status"], "ready_for_review")
+
+    def test_run_flow_stop_does_not_advance(self):
+        # Genuine integration: run_flow -> a scout that drives the REAL role loop
+        # where the user picks Stop. The 'ended' outcome must not chain into
+        # planning, and the saved phase anchor must stay 'scouting'.
+        import unittest.mock as mock
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        spath = os.path.join(d, ".cowork", "session.json")
+        seen = {}
+
+        def stop_scout(config, context, selected, on_outcome=None,
+                       on_session=None, resume_id=None, intel_path=None,
+                       gate_preview=None, **kw):
+            seen["preview"] = gate_preview
+            sess = _GateSession(intel_path, ["ready_for_review"])
+            with mock.patch.object(cowork.ui, "banner"), \
+                    mock.patch.object(cowork.ui, "select", return_value="stop"):
+                rc, outcome, _ = cowork._role_loop(
+                    sess, "seed", intel_path, context="",
+                    io_in=FakeTTY(), io_out=FakeTTY(), role="scout",
+                    gate_preview=gate_preview)
+            if on_session and resume_id is None:
+                on_session("claude", "scout-1")
+            if on_outcome:
+                on_outcome(outcome)
+            return rc
+
+        planner_calls = []
+
+        def fake_planner(config, context, selected, on_outcome=None, **kw):
+            planner_calls.append(context)
+            if on_outcome:
+                on_outcome("approved", None)
+            return 0
+
+        rc = cowork.run_flow(
+            cowork.build_parser().parse_args(
+                ["--team", "scout,planner", "--context", "x",
+                 "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=stop_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        # Stop -> 'ended' -> planning never entered.
+        self.assertEqual(planner_calls, [])
+        self.assertEqual(state_store.get_phase(state_store.load(spath)),
+                         "scouting")
+        # run_flow computed a phase-truthful, team-aware descriptor (planner on
+        # team -> non-terminal 'continue to planning').
+        self.assertIsNotNone(seen["preview"])
+        self.assertFalse(seen["preview"].terminal)
+        self.assertEqual(seen["preview"].approve_suffix, "continue to planning")
+
+
+class StopLabelMatrixTest(unittest.TestCase):
+    """All three readers x session_enabled in {True, False} render the correct
+    Stop label variant and return _STOP; no gate text mentions Ctrl-C."""
+
+    def _stop_label(self, reader, allow_ask, preview):
+        import unittest.mock as mock
+        rec = _SelectRecorder("stop")
+        with mock.patch.object(cowork.ui, "select", rec):
+            if reader == "dissent":
+                out = cowork._read_review_dissent(FakeTTY(), FakeTTY(),
+                                                  preview=preview)
+            else:
+                out = cowork._read_review(FakeTTY(), FakeTTY(),
+                                          allow_ask=allow_ask, preview=preview)
+        self.assertIs(out, cowork._STOP)
+        return rec.label_for("stop"), rec.labels + [rec.prompt]
+
+    def test_matrix_labels_and_stop_outcome(self):
+        saved = "Stop — session remains resumable"
+        nosess = "Stop — end this run without approving"
+        specs = [
+            ("normal", True, "scout"),   # scout/planner select
+            ("builder", False, "builder"),
+            ("dissent", None, "scout"),
+        ]
+        all_text = []
+        for reader, allow_ask, role in specs:
+            for enabled, expected in ((True, saved), (False, nosess)):
+                downstream = True if role != "builder" else False
+                preview = cowork.make_gate_preview(role, downstream, enabled)
+                label, texts = self._stop_label(reader, allow_ask, preview)
+                self.assertEqual(label, expected)
+                all_text.extend(texts)
+        # No gate/finish text claims Ctrl-C stops.
+        joined = " ".join(all_text).lower()
+        self.assertNotIn("ctrl-c", joined)
+        self.assertNotIn("ctrl+c", joined)
+
+
+class OffTtyHeadlessContractTest(unittest.TestCase):
+    """Criterion 5: off-TTY and headless behavior is unchanged. Directly asserts
+    the observable contracts, not just aggregate green."""
+
+    def test_read_review_off_tty_both_allow_ask(self):
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("scout", True, True)
+        with mock.patch.object(cowork.ui, "select",
+                               side_effect=AssertionError("select off TTY")):
+            for allow_ask in (True, False):
+                self.assertIs(
+                    cowork._read_review(io.StringIO("\n"), io.StringIO(),
+                                        allow_ask=allow_ask, preview=preview),
+                    cowork._END)
+                self.assertIs(
+                    cowork._read_review(io.StringIO(""), io.StringIO(),
+                                        allow_ask=allow_ask, preview=preview),
+                    cowork._END)
+                self.assertEqual(
+                    cowork._read_review(io.StringIO("revise this\n"),
+                                        io.StringIO(),
+                                        allow_ask=allow_ask, preview=preview),
+                    "revise this")
+
+    def test_read_review_dissent_off_tty(self):
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        with mock.patch.object(cowork.ui, "select",
+                               side_effect=AssertionError("select off TTY")):
+            self.assertIs(
+                cowork._read_review_dissent(io.StringIO("\n"), io.StringIO(),
+                                            preview=preview),
+                cowork._END)
+            self.assertEqual(
+                cowork._read_review_dissent(io.StringIO("my note\n"),
+                                            io.StringIO(), preview=preview),
+                "my note")
+
+    def test_headless_approves_without_calling_readers(self):
+        import unittest.mock as mock
+        path, d = _gate_status_path()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        sess = _GateSession(path, ["ready_for_review"])
+        with mock.patch.object(cowork, "_read_review") as rr, \
+                mock.patch.object(cowork, "_read_review_dissent") as rrd:
+            rc, outcome, _ = cowork._role_loop(
+                sess, "seed", path, context="",
+                io_in=io.StringIO(""), io_out=io.StringIO(),
+                headless=True, role="scout",
+                gate_preview=cowork.make_gate_preview("scout", True, True))
+        self.assertEqual(outcome, "approved")
+        rr.assert_not_called()
+        rrd.assert_not_called()
+
+
+class NeedsInputQuestionContractTest(unittest.TestCase):
+    """Real wrappers never show an unexplained blank needs_input gate."""
+
+    def _path(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "planner.plan.X.json")
+
+    def _session(self, path, writes):
+        class ScriptedSession:
+            controller = "codex"
+
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                value = writes.pop(0)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as fh:
+                    json.dump(value, fh)
+
+            def close(self):
+                pass
+        return ScriptedSession()
+
+    def test_missing_question_gets_one_repair_then_surfaces_question(self):
+        path = self._path()
+        writes = [
+            {"status": "needs_input", "result": {}},
+            {"status": "needs_input",
+             "result": {"pending_question": "Ship behind a flag?"}},
+            {"status": "ready_for_review", "result": {}},
+        ]
+        session = self._session(path, writes)
+        out = io.StringIO()
+        rc, outcome, _ = cowork._role_loop(
+            session, "seed", path, context="",
+            io_in=io.StringIO("yes\n\n"), io_out=out, role="planner",
+            needs_input_text=cowork.planner_needs_input_text,
+            artifact_noun="plan", require_pending_question=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "approved")
+        self.assertEqual(session.sent[0], "seed")
+        self.assertIn("result.pending_question", session.sent[1])
+        self.assertEqual(session.sent[2], "yes")
+        self.assertIn("Ship behind a flag?", out.getvalue())
+        self.assertIn("No question was recorded", out.getvalue())
+
+    def test_second_missing_question_is_explicit_not_an_empty_gate(self):
+        path = self._path()
+        session = self._session(path, [
+            {"status": "needs_input", "result": {"revision": 1}},
+            {"status": "needs_input", "result": {"revision": 2}},
+        ])
+        out = io.StringIO()
+        rc, outcome, _ = cowork._role_loop(
+            session, "seed", path, context="",
+            io_in=io.StringIO("/stop\n"), io_out=out, role="planner",
+            needs_input_text=cowork.planner_needs_input_text,
+            artifact_noun="plan", require_pending_question=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "ended")
+        self.assertEqual(len(session.sent), 2)
+        self.assertIn("No question was provided after an automatic repair",
+                      out.getvalue())
+
+    def test_legacy_question_keys_remain_resumable(self):
+        path = self._path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump({"status": "needs_input",
+                       "result": {"questions": ["A or B?", "Now or later?"]}},
+                      fh)
+        self.assertEqual(cowork._pending_question(path),
+                         "- A or B?\n- Now or later?")
+
+
+class ControllerSwitchSurfaceTest(unittest.TestCase):
+    def test_internal_switch_packet_is_not_echoed_as_user_context(self):
+        path, directory = _gate_status_path()
+        self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
+        session = _GateSession(path, ["ready_for_review"])
+        out = io.StringIO()
+        packet = ("[controller switch handoff]\n"
+                  "<artifact path='secret'>INTERNAL PAYLOAD</artifact>")
+        rc, outcome, _ = cowork._role_loop(
+            session, "seed", path, context=packet,
+            io_in=io.StringIO("\n"), io_out=out, role="planner")
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "approved")
+        self.assertNotIn("INTERNAL PAYLOAD", out.getvalue())
+        self.assertNotIn("<artifact", out.getvalue())
+
+    def test_normal_user_context_is_still_shown(self):
+        path, directory = _gate_status_path()
+        self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
+        session = _GateSession(path, ["ready_for_review"])
+        out = io.StringIO()
+        cowork._role_loop(
+            session, "seed", path, context="normal shared context",
+            io_in=io.StringIO("\n"), io_out=out, role="planner")
+        self.assertIn("normal shared context", out.getvalue())
+
+
+class GateWrapperPlumbingTest(unittest.TestCase):
+    """Drive the REAL run_scout / run_planner / run_builder wrappers (not the
+    inner loops directly) to the gate reader and assert the rendered approve
+    label matches the supplied GatePreview. These fail if the gate_preview
+    forwarding is deleted from any wrapper's _scout_loop/_role_loop call — the
+    label would silently fall back to the plain 'Approve & finish'. The scout
+    case covers both topology variants (planner on and off the team)."""
+
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def _session(self, status_path, role):
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text, *a, **k):
+                self.sent.append(text)
+                os.makedirs(os.path.dirname(status_path), exist_ok=True)
+                with open(status_path, "w") as fh:
+                    json.dump({"session": "X", "role": role,
+                               "status": "ready_for_review", "result": {}}, fh)
+
+            def close(self):
+                pass
+        return FakeSession()
+
+    def _render_approve(self, run, status_path, role, gate_preview, **kw):
+        import unittest.mock as mock
+        sess = self._session(status_path, role)
+        rec = _SelectRecorder("approve")
+        # If the preview failed to thread through, the builder gate would fall
+        # back to ui.confirm (which would block on real input); fail fast and
+        # loud instead of hanging so the guard stays a clean assertion.
+        with mock.patch.object(cowork.ui, "banner"), \
+                mock.patch.object(
+                    cowork.ui, "confirm",
+                    side_effect=AssertionError("gate fell back to confirm — "
+                                               "preview not forwarded")), \
+                mock.patch.object(cowork.ui, "select", rec):
+            rc = run(io_in=FakeTTY(), io_out=FakeTTY(),
+                     session_factory=lambda *a, **k: sess,
+                     gate_preview=gate_preview,
+                     on_outcome=lambda *a, **k: None, **kw)
+        self.assertEqual(rc, 0)
+        return rec
+
+    def test_run_scout_wrapper_forwards_preview_planner_on_team(self):
+        d = self._tmp()
+        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
+        config = cowork.default_config(["scout"])
+        config["scout"]["controller"] = "codex"
+        rec = self._render_approve(
+            lambda **kw: cowork.run_scout(config, "seed", ["scout"],
+                                          intel_path=intel, **kw),
+            intel, "scout", cowork.make_gate_preview("scout", True, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve — continue to planning")
+
+    def test_run_scout_wrapper_forwards_preview_no_planner(self):
+        d = self._tmp()
+        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
+        config = cowork.default_config(["scout"])
+        config["scout"]["controller"] = "codex"
+        rec = self._render_approve(
+            lambda **kw: cowork.run_scout(config, "seed", ["scout"],
+                                          intel_path=intel, **kw),
+            intel, "scout", cowork.make_gate_preview("scout", False, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish — intel is the deliverable")
+
+    def test_run_planner_wrapper_forwards_preview(self):
+        d = self._tmp()
+        pj = os.path.join(d, ".cowork", "planner.plan.X.json")
+        pm = os.path.join(d, ".cowork", "planner.plan.X.md")
+        config = cowork.default_config(["planner"])
+        config["planner"]["controller"] = "codex"
+        rec = self._render_approve(
+            lambda **kw: cowork.run_planner(config, "seed", ["planner"],
+                                            plan_json_path=pj, plan_md_path=pm,
+                                            **kw),
+            pj, "planner", cowork.make_gate_preview("planner", True, True))
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve — continue to building")
+
+    def test_run_builder_wrapper_forwards_preview(self):
+        d = self._tmp()
+        base = os.path.join(d, ".cowork")
+        os.makedirs(base, exist_ok=True)
+        status = os.path.join(base, "builder.status.X.json")
+        pj = os.path.join(base, "planner.plan.X.json")
+        pm = os.path.join(base, "planner.plan.X.md")
+        with open(pj, "w") as fh:
+            json.dump({"status": "ready_for_review"}, fh)
+        with open(pm, "w") as fh:
+            fh.write("# PLAN")
+        config = cowork.default_config(["builder"])
+        config["builder"]["controller"] = "codex"
+        rec = self._render_approve(
+            lambda **kw: cowork.run_builder(config, "seed", ["builder"],
+                                            build_status_path=status,
+                                            plan_json_path=pj, plan_md_path=pm,
+                                            **kw),
+            status, "builder",
+            cowork.make_gate_preview("builder", False, True))
+        # The builder gate is a preview-enabled 3-way select in the wrapper.
+        self.assertEqual(rec.keys, ["approve", "changes", "stop"])
+        self.assertEqual(rec.label_for("approve"),
+                         "Approve & finish — review your working tree")
 
 
 class ReviewGateQuestionTest(unittest.TestCase):
