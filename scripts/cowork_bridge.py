@@ -393,6 +393,13 @@ def parse_claude_event(obj):
     if etype == "assistant":
         msg = obj.get("message", {}) or {}
         text = _text_from_content(msg.get("content"))
+        # Claude CLI may wrap an API/authentication failure in a synthetic
+        # assistant event and later emit a nominally successful zero-token
+        # result.  Preserve the provider's explicit error signal so callers do
+        # not mistake that turn for a successful role reply.
+        if obj.get("isApiErrorMessage") or obj.get("error"):
+            return {"kind": "error", "text": text,
+                    "error_type": obj.get("error") or "api_error"}
         # A denied/blocked tool surfaces as an error tool_result in the stream.
         for part in msg.get("content", []) if isinstance(msg.get("content"), list) else []:
             if isinstance(part, dict) and part.get("type") == "tool_result":
@@ -415,6 +422,12 @@ def parse_claude_event(obj):
             "usage": _usage_from_result(obj),
         }
     if etype == "system":
+        if obj.get("subtype") == "api_error":
+            error = obj.get("error") or {}
+            text = (error.get("formatted") or error.get("message")
+                    if isinstance(error, dict) else str(error))
+            return {"kind": "error", "text": text,
+                    "error_type": "api_error"}
         # The init system event names the live model (traceability: which
         # model actually served this session, not just which was requested).
         return {"kind": "system", "subtype": obj.get("subtype", ""),
@@ -818,6 +831,7 @@ class ClaudeSession:
         tty = ui.is_tty(self.io_out)
         any_text = False
         denied = False
+        controller_error = None
         region = None
         idle = "%s working" % self.speaker
         status_active = False  # the region currently shows a tool-activity row
@@ -930,6 +944,24 @@ class ClaudeSession:
                     self.trace.event("controller.denied", controller="claude",
                                      role=self.speaker)
                 self.io_out.write("\n" + ui.label(self.speaker, tty) + denial_message())
+            elif kind == "error":
+                # Keep reading until the result event so the persistent stream
+                # remains framed, but remember that a later synthetic success
+                # cannot override this provider error.
+                if controller_error is None:
+                    controller_error = {
+                        "error_type": parsed.get("error_type") or "api_error",
+                        "text": parsed.get("text") or "controller API error",
+                    }
+                    if spinner:
+                        spinner.stop()
+                    _clear_status()
+                    if region is not None:
+                        region.__exit__(None, None, None)
+                        region = None
+                    self.io_out.write(
+                        ui.colorize("[error] " + controller_error["text"],
+                                    ui.RED, tty) + "\n")
             elif kind == "result":
                 if spinner:
                     spinner.stop()
@@ -938,19 +970,24 @@ class ClaudeSession:
                     region.__exit__(None, None, None)  # finalize the render
                 elif denied:
                     self.io_out.write("\n")
-                if parsed.get("is_error"):
+                if parsed.get("is_error") or controller_error is not None:
+                    error_type = ((controller_error or {}).get("error_type")
+                                  or parsed.get("subtype") or "controller_error")
                     if self.trace:
                         self.trace.event(
                             "controller.turn.end", controller="claude",
                             role=self.speaker, result="error",
                             subtype=parsed.get("subtype"),
+                            error_type=error_type,
                             model=self.live_model or self.model, duration_ms=_elapsed_ms())
-                    self.io_out.write(
-                        ui.colorize("[error] " + (parsed.get("text") or ""),
-                                    ui.RED, tty) + "\n")
+                    if controller_error is None:
+                        self.io_out.write(
+                            ui.colorize("[error] " + (parsed.get("text") or ""),
+                                        ui.RED, tty) + "\n")
                     self.io_out.flush()
                     return turn_result(
                         False, "error", subtype=parsed.get("subtype"),
+                        error_type=error_type,
                         session_id=sid or self.session_id,
                         model=self.live_model or self.model, duration_ms=_elapsed_ms())
                 elif self.trace:

@@ -3355,6 +3355,137 @@ _ITERATE = object()
 # WITHOUT reopening work, editing the artifact, or re-running the advisor.
 _ASK = object()
 
+# Returned by the gate readers when the user picks the non-default "Stop"
+# choice (TTY only). _role_loop maps it to the clean-end path
+# (outcome_kind='ended'): no approval, no revision turn, no done banner — the
+# same terminal outcome as an off-TTY 'end', so run_flow never advances the
+# phase and the saved (resumable) session record is left intact.
+_STOP = object()
+
+
+# The phase- and team-aware facts run_flow supplies about what approval at a
+# given gate does, so the gate readers can render concise consequence previews
+# beside every choice. Built by make_gate_preview and threaded through the
+# run_* helpers into _role_loop, which passes it into the readers. When None
+# (the historical default) the readers keep their plain, preview-free labels so
+# no existing caller or test regresses.
+GatePreview = collections.namedtuple(
+    "GatePreview",
+    ["approve_suffix",    # e.g. 'continue to planning' | 'intel is the deliverable'
+     "terminal",          # True when approving ends the run (drives 'finish' wording)
+     "next_phase",        # 'planning' | 'building' | None (dissent approve-anyway)
+     "resuming_role",     # 'scout' | 'planner' | 'builder' (request-changes/ask/iterate/tell)
+     "artifact_noun",     # 'intel' | 'plan' | 'build' (ask 'stays as-is' clause)
+     "session_enabled"])  # drives the Stop label variant
+
+
+# The per-role approve descriptor: (next_phase_name, terminal_suffix, noun).
+# next_phase_name is None for the builder (approval is always terminal).
+_GATE_APPROVE = {
+    "scout": ("planning", "intel is the deliverable", "intel"),
+    "planner": ("building", "plan is the deliverable", "plan"),
+    "builder": (None, "review your working tree", "build"),
+}
+
+
+def make_gate_preview(role, downstream_on_team, session_enabled):
+    """Build the GatePreview for `role`'s review gate. `downstream_on_team` is
+    whether the phase that approval would chain into has its lead on the team
+    (a planner for the scout gate, a builder for the planner gate; ignored for
+    the always-terminal builder gate). Terminality — and thus whether 'finish'
+    appears — depends on that downstream membership, not the phase alone."""
+    next_phase_name, terminal_suffix, artifact_noun = _GATE_APPROVE[role]
+    if next_phase_name and downstream_on_team:
+        return GatePreview(
+            approve_suffix="continue to %s" % next_phase_name,
+            terminal=False, next_phase=next_phase_name, resuming_role=role,
+            artifact_noun=artifact_noun, session_enabled=session_enabled)
+    return GatePreview(
+        approve_suffix=terminal_suffix, terminal=True, next_phase=None,
+        resuming_role=role, artifact_noun=artifact_noun,
+        session_enabled=session_enabled)
+
+
+def _preview_approve_label(preview):
+    lead = "Approve & finish" if preview.terminal else "Approve"
+    return "%s — %s" % (lead, preview.approve_suffix)
+
+
+def _preview_ask_label(preview):
+    return ("Ask a question — answered in chat; the %s stays as-is"
+            % preview.artifact_noun)
+
+
+def _preview_changes_label(preview):
+    return ("Request changes — the %s revises; you'll be asked for feedback"
+            % preview.resuming_role)
+
+
+def _preview_stop_label(preview):
+    if preview.session_enabled:
+        return "Stop — session remains resumable"
+    return "Stop — end this run without approving"
+
+
+def _preview_dissent_iterate_label(preview):
+    return ("Keep iterating — hand the reviewer's findings back to the %s"
+            % preview.resuming_role)
+
+
+def _preview_dissent_tell_label(preview):
+    return ("Tell it what to do — your instructions go to the %s"
+            % preview.resuming_role)
+
+
+def _preview_dissent_approve_label(preview):
+    if preview.terminal:
+        return "Approve & finish anyway — accept despite the reviewer"
+    return "Approve anyway — continue to %s" % preview.next_phase
+
+
+def _pending_question(status_path):
+    """Return the question recorded by a ``needs_input`` status artifact.
+
+    ``result.pending_question`` is the canonical field.  The small legacy-key
+    fallback keeps resumable sessions written by older role prompts useful.
+    Invalid/missing artifacts simply return an empty string; status validation
+    remains tolerant everywhere else in the harness.
+    """
+    try:
+        with open(status_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    containers = [data]
+    if isinstance(data.get("result"), dict):
+        containers.insert(0, data["result"])
+    for container in containers:
+        for key in ("pending_question", "question", "questions",
+                    "open_questions"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, list):
+                parts = [str(item).strip() for item in value
+                         if isinstance(item, str) and item.strip()]
+                if parts:
+                    return "\n".join("- " + part for part in parts)
+    return ""
+
+
+def _missing_question_repair_prompt(artifact="intel"):
+    return (
+        "Your %s status says `needs_input`, but its JSON records no non-empty "
+        "`result.pending_question`. Repair the status artifact now: if a user "
+        "decision is truly required, record the exact question in "
+        "`result.pending_question`, keep `status: needs_input`, and ask that "
+        "same question plainly in your reply. If no decision is required, "
+        "finish the work and set `status: ready_for_review`. Do not wait for "
+        "an answer until the artifact contains the question." % artifact)
+
 
 def _read_turn(io_in, io_out):
     """Read one working-turn reply. Blank input and a cancelled editor re-prompt;
@@ -3373,38 +3504,81 @@ def _read_turn(io_in, io_out):
         return reply
 
 
-def _read_review(io_in, io_out, allow_ask=True):
+def _read_review(io_in, io_out, allow_ask=True, preview=None):
     """At ready_for_review, decide approve-vs-(ask)-vs-revise.
 
     With `allow_ask` (the scout intel gate and planner plan gate) a TTY shows a
-    3-way questionary select (#8): 'Approve & finish' / 'Ask a question' /
-    'Request changes'. Without it (the builder build gate, which is out of the
-    approved scope for the question path) a TTY keeps the historical binary
-    confirm 'Approve & finish?' contract. Off a TTY both keep the historical
-    blank=finish / text=revise contract so the scripted/test path is unchanged.
+    questionary select: 'Approve & finish' / 'Ask a question' / 'Request
+    changes', plus a non-default 'Stop' when a `preview` is supplied. Without
+    `allow_ask` (the builder build gate) a TTY with a `preview` shows a 3-way
+    select — Approve & finish / Request changes / Stop — while a preview-less
+    call keeps the historical binary confirm 'Approve & finish?' contract. Off a
+    TTY both keep the historical blank=finish / text=revise contract (no Stop)
+    so the scripted/test path is unchanged.
 
-    Returns _END to approve & finish, the ('_ASK', text) marker tuple to ask a
-    question (answered in chat without reopening work; only when `allow_ask`),
-    or the revision feedback text to request changes."""
+    When `preview` (a GatePreview) is given, every choice label carries a short,
+    phase- and team-aware consequence; when None the plain labels are used.
+
+    Returns _END to approve & finish, _STOP for the non-default Stop choice
+    or a dismissed preview-enabled menu such as Ctrl-C (clean exit), the
+    ('_ASK', text) marker tuple to ask a question (answered in chat without
+    reopening work; only when `allow_ask`), or revision feedback."""
     if ui.is_tty(io_in) and ui.is_tty(io_out):
         if not allow_ask:
-            # Builder gate: unchanged binary confirm contract.
-            if ui.confirm("Approve & finish?"):
-                return _END
+            if preview is None:
+                # Builder gate, preview-less: unchanged binary confirm contract.
+                if ui.confirm("Approve & finish?"):
+                    return _END
+                while True:
+                    fb = ui.prompt_user(io_in, io_out,
+                                        header="Revise — your feedback")
+                    if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
+                        return _END
+                    return fb
+            # Builder gate with a preview: a 3-way select so every consequence
+            # is visible before selection — Approve & finish / Request changes /
+            # Stop (non-default).
             while True:
+                choice = ui.select(
+                    "Ready for review — what now?",
+                    [("approve", _preview_approve_label(preview)),
+                     ("changes", _preview_changes_label(preview)),
+                     ("stop", _preview_stop_label(preview))])
+                if choice == "approve":
+                    return _END
+                if choice == "stop" or choice is None:
+                    # Questionary returns None for a dismissed menu, including
+                    # a single Ctrl-C.  Cancellation follows the explicit Stop
+                    # path; it must never be reinterpreted as a revision.
+                    return _STOP
+                # 'changes': request changes, but never trap the user — a
+                # blank/cancelled feedback finishes.
                 fb = ui.prompt_user(io_in, io_out,
-                                    header="Revise — your feedback")
+                                    header="Request changes — your feedback")
                 if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
                     return _END
                 return fb
+        approve_label = (_preview_approve_label(preview) if preview is not None
+                         else "Approve & finish")
+        ask_label = (_preview_ask_label(preview) if preview is not None
+                     else "Ask a question")
+        changes_label = (_preview_changes_label(preview) if preview is not None
+                         else "Request changes")
+        choices = [("approve", approve_label),
+                   ("ask", ask_label),
+                   ("changes", changes_label)]
+        if preview is not None:
+            choices.append(("stop", _preview_stop_label(preview)))
         while True:
-            choice = ui.select(
-                "Ready for review — what now?",
-                [("approve", "Approve & finish"),
-                 ("ask", "Ask a question"),
-                 ("changes", "Request changes")])
+            choice = ui.select("Ready for review — what now?", choices)
             if choice == "approve":
                 return _END
+            if choice == "stop" or (choice is None and preview is not None):
+                # Real run_flow gates always carry a preview.  There, a
+                # dismissed Questionary menu (notably Ctrl-C) is the same clean
+                # non-approving outcome as the visible Stop choice.  Preserve
+                # the preview-less compatibility path below.
+                return _STOP
             if choice == "ask":
                 q = ui.prompt_user(io_in, io_out, header="Your question")
                 if q is ui.CANCEL or q is ui.EOF or q.strip() == "":
@@ -3412,8 +3586,8 @@ def _read_review(io_in, io_out, allow_ask=True):
                     # blank question must never be read as a sign-off.
                     continue
                 return (_ASK, q)
-            # 'changes' or a dismissed select (None): request changes, but never
-            # trap the user — a blank/cancelled feedback prompt approves.
+            # 'changes' (or a dismissed legacy preview-less select): request
+            # changes, but never trap the user — blank feedback approves.
             fb = ui.prompt_user(io_in, io_out, header="Request changes — your feedback")
             if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
                 return _END
@@ -3424,31 +3598,50 @@ def _read_review(io_in, io_out, allow_ask=True):
     return line.rstrip("\n")
 
 
-def _read_review_dissent(io_in, io_out):
+def _read_review_dissent(io_in, io_out, preview=None):
     """The `ready_for_review` gate when the reviewer's round cap was exhausted
-    without approval. On a TTY a 3-way questionary select — the safe default
-    (Enter) keeps iterating on the reviewer's feedback, so unresolved dissent is
-    never approved by accident. 'Tell it what to do' prompts for custom
-    instructions; blank/dismissed input also falls back to iterating, never
-    approval. Off a TTY it keeps the historical blank=finish / text=revise
-    contract so the scripted/test path is unchanged.
+    without approval. On a TTY a questionary select — the safe default (Enter)
+    keeps iterating on the reviewer's feedback, so unresolved dissent is never
+    approved by accident. 'Tell it what to do' prompts for custom instructions;
+    blank custom input falls back to iterating. A dismissed preview-enabled
+    menu (including Ctrl-C) follows Stop. With a
+    `preview` (a GatePreview) a fourth non-default 'Stop' choice is added and
+    every label carries a phase-truthful consequence — the approve-anyway label
+    reads 'Approve & finish anyway' only when approval is terminal, else
+    'Approve anyway — continue to <phase>'. Off a TTY it keeps the historical
+    blank=finish / text=revise contract (no Stop) so the scripted/test path is
+    unchanged.
 
-    Returns _END to approve & finish, _ITERATE to hand the reviewer's unresolved
+    Returns _END to approve & finish, _STOP for the non-default Stop choice or
+    menu cancellation (clean exit), _ITERATE to hand the reviewer's unresolved
     findings back to the role, or the custom feedback text."""
     if ui.is_tty(io_in) and ui.is_tty(io_out):
+        if preview is not None:
+            choices = [
+                ("iterate", _preview_dissent_iterate_label(preview)),
+                ("tell", _preview_dissent_tell_label(preview)),
+                ("approve", _preview_dissent_approve_label(preview)),
+                ("stop", _preview_stop_label(preview))]
+        else:
+            choices = [
+                ("iterate", "Keep iterating on the reviewer's feedback"),
+                ("tell", "Tell it what to do"),
+                ("approve", "Approve & finish anyway")]
         choice = ui.select(
-            "Reviewer still requests changes — what now?",
-            [("iterate", "Keep iterating on the reviewer's feedback"),
-             ("tell", "Tell it what to do"),
-             ("approve", "Approve & finish anyway")])
+            "Reviewer still requests changes — what now?", choices)
         if choice == "approve":
             return _END
+        if choice == "stop" or (choice is None and preview is not None):
+            # Questionary cancellation/Ctrl-C follows the explicit Stop path
+            # on every preview-enabled real-flow gate.
+            return _STOP
         if choice == "tell":
             fb = ui.prompt_user(io_in, io_out, header="Your instructions")
             if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
                 return _ITERATE
             return fb
-        # 'iterate' or a dismissed select: the safe non-approving default.
+        # 'iterate' (or a dismissed legacy preview-less select): the safe
+        # non-approving default.
         return _ITERATE
     line = io_in.readline()
     if line == "" or line.strip() == "":
@@ -3723,7 +3916,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
                phase=None, is_resume=False, seed_artifact_paths=None,
                on_first_send_accepted=None, headless=False,
-               review_allow_ask=True):
+               review_allow_ask=True, gate_preview=None,
+               require_pending_question=False):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -3787,10 +3981,20 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     skip_review = False
     # Headless needs_input nudges fired this phase (HEADLESS_NUDGE_CAP backstop).
     headless_nudges = 0
+    # A real wrapper may require needs_input artifacts to record the question.
+    # One automatic repair is enough; a second malformed turn becomes an
+    # explicit diagnostic at the input gate instead of an invisible loop.
+    missing_question_repairs = 0
     outcome_kind = "ended"
     payload = None
     try:
-        if context.strip():
+        # Controller-switch packets are controller-only recovery context.  The
+        # switch itself already has a compact user-facing status line; echoing
+        # this packet here would dump artifacts and orchestration markup into
+        # the terminal as though the user had written it.
+        internal_switch_context = context.lstrip().startswith(
+            "[controller switch handoff]")
+        if context.strip() and not internal_switch_context:
             io_out.write(ui.label("you", ui.is_tty(io_out)) + context.strip() + "\n")
             io_out.flush()
         while True:
@@ -4018,6 +4222,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             if trace:
                 trace.event("status.read", role=role, path=status_path,
                             status=status)
+            if status != "needs_input":
+                missing_question_repairs = 0
             if handoff_enabled and status == "handoff_back":
                 note = state_store.read_handoff(status_path)
                 if trace:
@@ -4318,10 +4524,22 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     has_dissent=bool(dissent))
                     outcome = _END
                 elif dissent:
-                    outcome = _read_review_dissent(io_in, io_out)
+                    outcome = _read_review_dissent(io_in, io_out,
+                                                   preview=gate_preview)
                 else:
                     outcome = _read_review(io_in, io_out,
-                                           allow_ask=review_allow_ask)
+                                           allow_ask=review_allow_ask,
+                                           preview=gate_preview)
+                if outcome is _STOP:
+                    # The explicit non-default Stop choice (TTY only): a clean
+                    # exit — no approval, no revision turn, no done banner. This
+                    # mirrors the off-TTY 'end' path, so run_flow never advances
+                    # the phase and the saved (resumable) session is left intact.
+                    if trace:
+                        trace.event("user.action", role=role, action="stop",
+                                    gate="ready_for_review")
+                    outcome_kind = "ended"
+                    break
                 if outcome is _ITERATE:
                     # Hand the reviewer's unresolved findings straight back to
                     # the role — the user shouldn't have to retype them.
@@ -4376,10 +4594,45 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             else:
                 if status == "needs_input":
                     review_rounds = 0  # role re-opened work: fresh review budget
+                    pending_question = _pending_question(status_path)
+                    if pending_question:
+                        missing_question_repairs = 0
+                    elif (require_pending_question and not headless
+                          and missing_question_repairs == 0):
+                        # Do not present a blank "your answer" box when the role
+                        # failed its needs_input contract.  Give it one bounded
+                        # repair turn to either record the exact question or
+                        # finish the work and move to review.
+                        missing_question_repairs = 1
+                        if trace:
+                            trace.event(
+                                "status.invalid", role=role, path=status_path,
+                                status=status,
+                                reason="needs_input_without_question",
+                                repair_attempted=True)
+                        ui.banner(
+                            io_out,
+                            "%s\nNo question was recorded; asking %s to repair "
+                            "its status." % (needs_input_text(), role),
+                            "dissent")
+                        pending = _missing_question_repair_prompt(artifact_noun)
+                        pending_reopen_reason = "missing_question"
+                        continue
                     if trace:
                         trace.event("gate.show", role=role,
-                                    gate="needs_input", path=status_path)
-                    ui.banner(io_out, needs_input_text(), "needs_input")
+                                    gate="needs_input", path=status_path,
+                                    has_question=bool(pending_question),
+                                    missing_question_repaired=bool(
+                                        missing_question_repairs))
+                    gate_text = needs_input_text()
+                    if pending_question:
+                        gate_text += "\nquestion:\n" + pending_question
+                    elif require_pending_question:
+                        gate_text += (
+                            "\nNo question was provided after an automatic "
+                            "repair. Tell the role what to do, or type /stop "
+                            "to leave this phase.")
+                    ui.banner(io_out, gate_text, "needs_input")
                 if headless:
                     # No human to answer: re-send the canned nudge so the role
                     # records an assumption and proceeds (F2_roles_never_block).
@@ -4428,7 +4681,8 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
                 review_fn=None, trace=None, on_outcome=None,
                 evaluate_fn=None, intel_md_path=None, skip_baseline=None,
                 context_revision=None, is_resume=False,
-                on_first_send_accepted=None, headless=False):
+                on_first_send_accepted=None, headless=False,
+                gate_preview=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
     `run_flow` can chain into the planning phase on approval.
@@ -4441,7 +4695,8 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
         role="scout", review_fn=review_fn, trace=trace,
         reviewer_role=SCOUT_REVIEWER, evaluate_fn=evaluate_fn,
         skip_baseline=skip_baseline, context_revision=context_revision,
-        phase="scouting", is_resume=is_resume, headless=headless)
+        phase="scouting", is_resume=is_resume, headless=headless,
+        gate_preview=gate_preview, require_pending_question=True)
     if intel_md_path:
         loop_kwargs["review_text"] = (
             lambda _p, en=False: scout_review_text(intel_md_path, en))
@@ -4665,7 +4920,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               switch_controller_fn=None, reviewer_switch_note_fn=None,
               on_reviewer_switch_consumed=None,
               on_first_send_accepted=None,
-              reviewer_controller_check_fn=None, headless=False):
+              reviewer_controller_check_fn=None, headless=False,
+              gate_preview=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -4789,7 +5045,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                                "context_revision"),
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
-                           headless=headless)
+                           headless=headless, gate_preview=gate_preview)
 
     if cfg["controller"] == "opencode":
         # opencode delivers the role prompt as a generated agent file (a system
@@ -4830,7 +5086,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                                "context_revision"),
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
-                           headless=headless)
+                           headless=headless, gate_preview=gate_preview)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -4855,7 +5111,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                            "context_revision"),
                        is_resume=bool(resume_id),
                        on_first_send_accepted=on_first_send_accepted,
-                       headless=headless)
+                       headless=headless, gate_preview=gate_preview)
 
 
 def run_planner(config, context, selected, io_in=None, io_out=None,
@@ -4873,7 +5129,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None,
-                reviewer_controller_check_fn=None, headless=False):
+                reviewer_controller_check_fn=None, headless=False,
+                gate_preview=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -4953,7 +5210,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         evaluate_fn=evaluate_fn, skip_baseline=skip_baseline,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="planning", is_resume=bool(resume_id),
-        seed_artifact_paths=[intel_path], headless=headless)
+        seed_artifact_paths=[intel_path], headless=headless,
+        gate_preview=gate_preview, require_pending_question=True)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -5088,7 +5346,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None,
-                reviewer_controller_check_fn=None, headless=False):
+                reviewer_controller_check_fn=None, headless=False,
+                gate_preview=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -5171,8 +5430,12 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         done_text=lambda _p, en=False: builder_done_text(
             build_surface_path or "", en),
         artifact_noun="build",
-        # The approved scope is scout intel + planner plan only; the builder
-        # gate keeps its prior binary approve/revise contract (no ask path).
+        # review_allow_ask=False removes only the "Ask a question" choice from
+        # the builder gate (scoped to the scout/planner artifact gates). With a
+        # gate_preview the builder gate is still the preview-enabled 3-way CLI
+        # select — Approve & finish / Request changes / Stop (see _read_review);
+        # the plain binary approve/revise confirm survives only for the
+        # preview-less (gate_preview=None) compatibility path.
         review_allow_ask=False,
         handoff_enabled=True, handoff_confirm=handoff_confirm,
         handoff_gate_text_fn=builder_handoff_gate_text,
@@ -5181,7 +5444,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         evaluate_fn=evaluate_fn,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="building", is_resume=bool(resume_id),
-        seed_artifact_paths=[plan_json_path, plan_md_path], headless=headless)
+        seed_artifact_paths=[plan_json_path, plan_md_path], headless=headless,
+        gate_preview=gate_preview, require_pending_question=True)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -6444,6 +6708,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     if pending_switch_for("scout") else None),
                 reviewer_controller_check_fn=reviewer_controller_check,
                 headless=headless,
+                gate_preview=make_gate_preview(
+                    "scout", planner_on_team, session_enabled),
                 on_outcome=lambda o, p=None: outcome_box.update(
                     outcome=o, payload=p))
             if rc != 0:
@@ -6521,6 +6787,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     if pending_switch_for("planner") else None),
                 reviewer_controller_check_fn=reviewer_controller_check,
                 headless=headless,
+                gate_preview=make_gate_preview(
+                    "planner", builder_on_team, session_enabled),
                 on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
             if rc != 0:
                 action = recover_controller_failure("planner", "startup_or_probe")
@@ -6630,6 +6898,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 if pending_switch_for("builder") else None),
             reviewer_controller_check_fn=reviewer_controller_check,
             headless=headless,
+            gate_preview=make_gate_preview(
+                "builder", builder_on_team, session_enabled),
             on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
         if rc != 0:
             action = recover_controller_failure("builder", "startup_or_probe")
