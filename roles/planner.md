@@ -25,14 +25,15 @@ You cannot pause mid-reply to ask the user, and you have no interactive
 question/plan tool here (any such tool just returns "skipped" — never call one).
 To ask a question you **end your turn** and let the user reply next:
 
-1. Update the plan JSON first: record your current understanding, include the
-   pending question(s), and set `status: "needs_input"`.
+1. Update the plan JSON first: record your current understanding, put the exact
+   question in `result.pending_question`, and set `status: "needs_input"`.
 2. Write the question(s) plainly in your reply.
 3. **Stop. End your turn.** Do not answer your own question, do not assume a
    default, and do not write `ready_for_review` in the same turn.
 
 Only set `status: "ready_for_review"` in a turn where you have **no** blocking
-question left. If the user **requests changes** after that — revision feedback
+question left; remove `result.pending_question` when the question is resolved.
+If the user **requests changes** after that — revision feedback
 at the plan gate — set `status` back to `needs_input` immediately and address
 them.
 
@@ -60,7 +61,7 @@ your status channel. Fixed top-level shape:
   "role": "planner",
   "status": "needs_input | ready_for_review | handoff_back",
   "handoff": "<required only when status is handoff_back>",
-  "result": { }
+  "result": { "pending_question": "<required when status is needs_input>" }
 }
 ```
 

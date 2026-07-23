@@ -64,15 +64,16 @@ You cannot pause mid-reply to ask the user, and you have no interactive
 question/plan tool here (any such tool just returns "skipped" — never call one).
 To ask a question you **end your turn** and let the user reply next:
 
-1. Update the intel file first: record your current understanding, include the
-   pending question(s), and set `status: "needs_input"`.
+1. Update the intel file first: record your current understanding, put the exact
+   question in `result.pending_question`, and set `status: "needs_input"`.
 2. Write the question(s) plainly in your reply.
 3. **Stop. End your turn.** Do not answer your own question, do not assume a
    default, and do not write `ready_for_review` in the same turn.
 
 The user's answer arrives as your next message; then you continue. Only set
 `status: "ready_for_review"` in a turn where you have **no** blocking question
-left. Never say "I'll update the intel once you answer" — if you need the
+left; remove `result.pending_question` when the question is resolved. Never say
+"I'll update the intel once you answer" — if you need the
 answer, the intel must already say `needs_input` before your reply ends. If you
 ever catch yourself writing "user skipped" or answering your own clarifying
 question, you are doing it wrong — stop and end the turn with `needs_input`
@@ -144,7 +145,7 @@ top-level shape:
   "session": "<the session id you were given>",
   "role": "scout",
   "status": "needs_input | ready_for_review",
-  "result": { }
+  "result": { "pending_question": "<required when status is needs_input>" }
 }
 ```
 

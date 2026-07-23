@@ -572,28 +572,64 @@ saved and resumed on every pass and across cowork resumes, and it participates i
 [context revisions](#context-revisions) — a resumed reviewer that hasn't seen the
 latest `--context` gets it as an explicit update block on its next pass.
 
-### The review gate (Approve & finish / Ask a question / Request changes)
+### The review gate (Approve & finish / Ask a question / Request changes / Stop)
+
+Every interactive review gate spells out the consequence of each choice **as a
+label**, before you pick it, so nothing is a surprise. The approve wording is
+phase- and team-aware: the word **finish** appears only when approval actually
+ends the run.
 
 When the scout marks its intel — or the planner its plan — `ready_for_review`,
-the approve gate gives you **three** choices:
+the gate gives you these choices:
 
-- **Approve & finish** — accept the work and move on (with a builder on the
-  team, the planner's approval chains into the build phase).
+- **Approve** — accept the work. With a downstream role on the team the label
+  previews the transition (**continue to planning** at the scout gate when a
+  planner is on the team, **continue to building** at the planner gate when a
+  builder is on the team); otherwise it reads **Approve & finish** and names the
+  deliverable (intel or plan).
 - **Ask a question** — put a plain question to the role. It answers
-  conversationally in chat and **leaves the artifact exactly as it is**: no
-  edit, no status flip, and — because nothing changed on disk — no re-review
-  (the [hash-gate](#reviewer-skip-on-unchanged-artifacts-hash-gate) skips the
-  paired reviewer). You land right back at the same gate, so you can ask as many
+  conversationally in chat and **leaves the artifact exactly as it is** (the
+  label reads "the intel/plan stays as-is"): no edit, no status flip, and —
+  because nothing changed on disk — no re-review (the
+  [hash-gate](#reviewer-skip-on-unchanged-artifacts-hash-gate) skips the paired
+  reviewer). You land right back at the same gate, so you can ask as many
   questions as you like for free before approving or requesting changes. If a
   question genuinely surfaces new work, the role can still edit the artifact and
   reopen — and then a re-review is correct.
-- **Request changes** — type revision feedback; the role revises and
-  re-proposes, exactly as before.
+- **Request changes** — the role revises and you'll be asked for feedback; the
+  label names the resuming role ("the scout/planner/builder revises").
+- **Stop** — a non-default choice that exits the phase cleanly **without
+  approving and without requesting changes** (see the Stop wording below).
 
-Off a TTY (scripted/non-interactive runs) the historical contract is unchanged:
-a blank line finishes, any other text requests changes. The question path is
-scoped to the scout and planner gates only; the builder's `ready_for_review`
-gate keeps its prior binary approve/revise contract.
+The **builder** gate is a 3-way select on a TTY. **Approve & finish** previews
+finishing so you can review your working tree; **Request changes** has the
+builder revise from your feedback; **Stop** exits cleanly. It has no "Ask a
+question" choice.
+
+When the reviewer's round cap is reached without approval, the **dissent** gate
+offers four choices, with continued iteration as the safe default.
+**Keep iterating** hands the reviewer's findings back to the resuming role;
+**Tell it what to do** sends your instructions to that role; **Approve anyway**
+accepts despite the reviewer (the label reads "Approve anyway — continue to
+planning/building" on a non-terminal gate and "Approve & finish anyway" only
+when approval ends the run); **Stop** exits cleanly.
+
+The **Stop** label follows persistence. For a saved session it reads **Stop —
+session remains resumable**: the phase ends without approving, and the saved
+state is left intact so you can pick the run back up later (see
+[Sessions](#sessions)). Stopping never approves, never queues a revision,
+and never advances the phase.
+
+Under `--no-session` nothing is persisted, so the same Stop choice instead reads
+**Stop — end this run without approving**; the clean-exit outcome is identical.
+
+Cancelling any preview-enabled review menu (including a single **Ctrl-C**) takes
+that same Stop path. It never silently becomes "Request changes" or "Keep
+iterating".
+
+Off a TTY (scripted/non-interactive runs) the historical contract is unchanged
+and there is no Stop choice: a blank line finishes, any other text requests
+changes. The question path is scoped to the scout and planner gates only.
 
 ### Reviewer skip on unchanged artifacts (hash-gate)
 
@@ -752,18 +788,22 @@ Each turn, cowork streams the reply, then reads the intel `status`:
   then the reply renders **live as markdown** (Rich `Live`) under `scout ›` —
   length-independent, so replies taller than the screen still render. Off a
   terminal (piped/scripted), tokens stream raw with no rendering.
-- **`needs_input`** — scout asked you something (visible in its reply). cowork
-  shows a `scout needs your input` panel and waits for your answer.
+- **`needs_input`** — scout asked you something. The exact question is recorded
+  in `result.pending_question`, repeated in the `scout needs your input` panel,
+  and then cowork waits for your answer. If a role writes `needs_input` without
+  a question, cowork gives it one automatic repair turn instead of showing a
+  blank answer gate; a second malformed turn is called out explicitly.
 - **`ready_for_review`** — scout finished the intel and posts a **summary in the
   chat**. If the scout-reviewer is on the team it runs first (you'll see a
   `reviewed: approved`, `reviewed: changes requested`, or
   `reviewed: needs user input` marker; see
   [The scout-reviewer role](#the-scout-reviewer-role)), then cowork shows the
-  [3-way review gate](#the-review-gate-approve--finish--ask-a-question--request-changes)
-  (**Approve & finish / Ask a question / Request changes**): approve ends the
-  session; a question is answered in chat for free (no intel edit, no
-  re-review); requesting changes sends another turn so you keep refining. Off a
-  terminal the historical blank=finish / text=revise contract is unchanged.
+  [review gate](#the-review-gate-approve--finish--ask-a-question--request-changes--stop)
+  (**Approve & finish / Ask a question / Request changes / Stop**): approve
+  ends the session; a question is answered in chat for free (no intel edit, no
+  re-review); requesting changes sends another turn so you keep refining; and
+  Stop exits without approving. Off a terminal the historical blank=finish /
+  text=revise contract is unchanged.
 
 **Input.** On a terminal each turn is a prompt_toolkit multiline editor: real line
 editing (arrow keys, word-jump, paste, history) and multiline answers. A dim hint

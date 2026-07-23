@@ -24,11 +24,14 @@ You cannot pause mid-reply to ask the user, and you have no interactive
 question tool here (any such tool just returns "skipped" — never call one). To
 ask a question you **end your turn** and let the user reply next:
 
-1. Update the status JSON first: record your current state, include the pending
-   question(s), and set `status: "needs_input"`.
+1. Update the status JSON first: record your current state, put the exact
+   question in `result.pending_question`, and set `status: "needs_input"`.
 2. Write the question(s) plainly in your reply.
 3. **Stop. End your turn.** Do not answer your own question, and do not write
    `ready_for_review` in the same turn.
+
+Remove `result.pending_question` as soon as the question is resolved or the
+status moves away from `needs_input`.
 
 ### When to interrupt the user (the bar is high)
 
@@ -61,6 +64,7 @@ edit. Fixed top-level shape:
   "status": "needs_input | ready_for_review | handoff_back",
   "handoff": "<required only when status is handoff_back>",
   "result": {
+    "pending_question": "<required when status is needs_input>",
     "verification": [
       {"label": "unit tests", "command": "...", "ok": true,
        "output_excerpt": "...", "classification": "code | environment | uncertain"}
