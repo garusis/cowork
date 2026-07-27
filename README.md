@@ -91,6 +91,61 @@ modes differ:
   prompt like claude's) rewritten on every spawn so it always matches the
   current config.
 
+### Cross-role handoff (one file-only transport)
+
+Every hand-off between roles — scout↔scout-reviewer, scout→planner,
+planner↔planning-advisor, planner→builder, builder↔build-reviewer, both
+hand-backs, every controller switch, the peer evaluations, and context
+revision/resume — goes through **one shared, topology-driven transport**
+(`scripts/cowork_handoff.py`). A cross-role prompt carries only:
+
+- **absolute authoritative file paths** (each with size + sha256), which the
+  receiving CLI reads from disk — never the pasted body, findings, question,
+  hand-back payload, verdict, or context text; and
+- a few **content-free orchestration facts** (closed-schema enums like
+  role/phase/controller, counts, hashes, path/byte metadata, and normalized
+  reason codes).
+
+A declarative **edge registry** lists every hand-off in one place and a single
+renderer (`render_handoff`) is the only thing that emits a cross-role prompt, so
+a new role can't reintroduce a divergent "paste the body" pattern. It **fails
+closed on structure**: every artifact must be tagged with a declared source
+slot, every required slot must be filled (per-file cardinality, so a plan pair
+can't ship half), facts are validated against closed per-key enums, and the
+`ctx` composition is restricted to declared, type-checked keys — labels are
+registry-owned, so nothing free-form can ride through a label or ctx field. The
+same handoff object that builds the prompt also feeds the trace/token accounting
+(one source of truth, no re-inference). Reviewer findings and questions reach the
+user in the lead role's **own voice** — the lead reads the review file by path
+and relays it, so the single-voice behavior is unchanged. **Direct user
+messages to the active lead may remain inline**, both for the initial turn and
+later answers/revision feedback. Every cross-role re-delivery of that shared
+context — including the scout→planner and planner→builder seeds — carries it by
+path. Reviewers re-read the current authoritative files each round (there is no
+derived incremental-diff packet — a generated diff could go stale and compete
+with the real files). The invariant is enforced structurally, not by
+convention: a full-module AST analyzer flags any function that builds a prompt
+from a body-like input outside `render_handoff`, a registry-driven live-route
+matrix ties every role/pair to its required edges, and closed schemas reject
+free-form facts, undeclared `ctx`, and smuggled labels.
+
+Delivery is provenance-checked at the central controller gateway as well as at
+render time. Cross-role turns must arrive in an opaque envelope produced from
+one or more real `HandoffBlock`s; the envelope retains their registered edge
+identities and exact descriptors. Its delivered bytes are assembled inside the
+transport from those exact blocks plus typed static-role fragments; the factory
+does not accept an independent free-text body. Arbitrary prompt text plus forged
+`prompt_kind`/`artifacts` metadata is rejected before it reaches a controller.
+The only non-handoff envelopes come from closed constructors for the initial
+user turn, static role instructions, and user-facing lead follow-ups. Raw
+controller `.send()` remains private to that gateway.
+
+Roles and reviewer pairs are declared in the same canonical registry that
+drives role selection, fact validation, and topology validation. Every
+handoff-capable role must occur in the edge graph, and every reviewer pair must
+have its review-context edge; a role can opt out only through the explicit
+`non_handoff` classification used by the pre-phase worktree helper.
+
 ### Controllers and modes
 
 The flags `cowork` emits per (controller, mode, yolo), verified against
