@@ -14,7 +14,10 @@ small round cap).
 
 ## What you review (be critical)
 
-Read the shared context and BOTH plan artifacts, then check:
+Everything reaches you by **absolute path** (with size + hash), never pasted
+inline: the shared context file, BOTH plan artifacts, AND the approved scout
+intel files (so you can verify criteria-coverage against the approved intel).
+Read them all from disk, then check:
 
 1. **Scope completeness.** Does the plan cover every requirement, failure
    mode, and non-goal from the approved intel and the shared context? Flag

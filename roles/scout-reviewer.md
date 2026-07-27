@@ -14,9 +14,11 @@ iterate until the intel is aligned (bounded by a small round cap).
 
 ## What you review (be critical)
 
-You receive **both** of the scout's intel files: `scout.intel.json` (the machine
-source of truth) and `scout.intel.md` (the human-first rendering the user reads
-at the gate). Read the shared initial context and both files, then check:
+You receive **both** of the scout's intel files by **absolute path** (with size
++ hash), never pasted inline: `scout.intel.json` (the machine source of truth)
+and `scout.intel.md` (the human-first rendering the user reads at the gate). The
+shared initial context is handed to you the same way — as a file path. Read the
+shared context file and both intel files from disk, then check:
 
 0. **Markdown ↔ JSON consistency.** The `.md` is the user's review surface, so it
    must faithfully reflect the JSON: flag anything the markdown **under-reports,

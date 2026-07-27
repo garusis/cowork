@@ -12,9 +12,11 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2888,8 +2890,12 @@ class ReviewerContextTest(unittest.TestCase):
         selected = ["scout", "scout-reviewer"]
         ctx = cowork.assemble_reviewer_context(
             "add a dark-mode toggle", selected, intel)
-        self.assertIn("add a dark-mode toggle", ctx)      # shared user context
-        self.assertIn("dark mode toggle", ctx)            # intel JSON embedded
+        # File-only transport: neither the shared context text nor the intel
+        # body is embedded — both ride by PATH.
+        self.assertNotIn("add a dark-mode toggle", ctx)
+        self.assertNotIn("dark mode toggle", ctx)
+        self.assertIn(intel, ctx)                          # intel path present
+        self.assertIn(handoff.FULL_REREAD_INSTRUCTION, ctx)
         # B1: the scout's write-target brief must NOT leak into the reviewer.
         scout_brief = cowork.assemble_scout_brief(selected, intel)
         self.assertNotIn(scout_brief, ctx)
@@ -2906,20 +2912,33 @@ class ReviewerHandoffTest(unittest.TestCase):
     """Faithful-relay handoff template (pure string templating, no model call)."""
 
     def test_needs_user_carries_full_question_and_relay_instruction(self):
+        # File-only transport: the reviewer's user_question is NOT embedded; the
+        # lead is pointed at the review file PATH to read it and relay in its own
+        # voice (single-voice guardrail preserved).
+        import tempfile
+        review_path = os.path.join(tempfile.mkdtemp(), "review.json")
+        with open(review_path, "w") as fh:
+            fh.write(json.dumps({"user_question": "per-device or per-account?"}))
         out = cowork.assemble_reviewer_handoff(
-            "needs_user",
-            {"user_question": "Persist per-device, or per-account when logged in?"})
+            "needs_user", {"user_question": "per-device or per-account?"},
+            review_path=review_path)
         self.assertIn("[reviewer handoff]", out)
-        self.assertIn("Persist per-device, or per-account when logged in?", out)
+        self.assertNotIn("per-device or per-account?", out)   # not embedded
+        self.assertIn(review_path, out)                       # path present
         self.assertIn("NOT change its meaning", out)
         self.assertIn("needs_input", out)
 
     def test_revise_lists_findings(self):
+        import tempfile
+        review_path = os.path.join(tempfile.mkdtemp(), "review.json")
+        with open(review_path, "w") as fh:
+            fh.write(json.dumps({"findings": ["cited file is wrong"]}))
         out = cowork.assemble_reviewer_handoff(
-            "revise", {"findings": ["cited file is wrong", "tighten assumption Y"]})
+            "revise", {"findings": ["cited file is wrong"]},
+            review_path=review_path)
         self.assertIn("[reviewer handoff]", out)
-        self.assertIn("cited file is wrong", out)
-        self.assertIn("tighten assumption Y", out)
+        self.assertNotIn("cited file is wrong", out)          # not embedded
+        self.assertIn(review_path, out)                       # findings by path
         self.assertIn("ready_for_review", out)
 
     def test_approve_is_empty(self):
@@ -2990,7 +3009,10 @@ class ScoutLoopReviewTest(unittest.TestCase):
         self.assertEqual(len(sess.sent), 2)
         self.assertEqual(sess.sent[0], "seed")
         self.assertIn("[reviewer handoff]", sess.sent[1])
-        self.assertIn("fix the cited path", sess.sent[1])
+        # File-only transport: the finding is NOT embedded; the lead is pointed
+        # at the review file to read it.
+        self.assertNotIn("fix the cited path", sess.sent[1])
+        self.assertIn("review file", sess.sent[1])
         # ...and the reviewer ran twice; the user only saw the 'reviewed' marker.
         self.assertEqual(rfn.calls["n"], 2)
         text = out.getvalue()
@@ -3040,7 +3062,9 @@ class ScoutLoopReviewTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(sess.sent), 2)
         self.assertIn("[reviewer handoff]", sess.sent[1])
-        self.assertIn("per-device or per-account?", sess.sent[1])
+        # File-only transport: the user_question rides by review-file path.
+        self.assertNotIn("per-device or per-account?", sess.sent[1])
+        self.assertIn("review file", sess.sent[1])
         self.assertIn("needs_input", sess.sent[1])
 
     def test_missing_review_surfaces_failure_gate_not_silent_approve(self):
@@ -3605,7 +3629,9 @@ class ControllerSwitchLoopTest(unittest.TestCase):
                            {"fail": "rate_limit"}],
                 "io": "switch\n",
                 "review_fn": review_fn,
-                "expect": "fix risk",
+                # File-only transport: the findings ride by review-file path, so
+                # the preserved pending turn names the review file, not the body.
+                "expect": "review file",
             }
 
         def repair(path):
@@ -3919,9 +3945,14 @@ class ContextRevisionStoreTest(unittest.TestCase):
 
 class ContextUpdateBlockTest(unittest.TestCase):
     def test_block_framing(self):
-        block = cowork.context_update_block("the new goal")
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        block = cowork.context_update_block("the new goal", d, 3)
         self.assertIn("New user context was provided", block)
-        self.assertIn("<context>\nthe new goal\n</context>", block)
+        # File-only transport: the context text is NOT inlined; it rides by path.
+        self.assertNotIn("the new goal", block)
+        self.assertIn("context.rev3.md", block)
         self.assertIn("Keep prior session knowledge", block)
 
     def test_resumed_reviewer_prompt_includes_update_block(self):
@@ -3932,11 +3963,14 @@ class ContextUpdateBlockTest(unittest.TestCase):
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review"}, fh)
         ctx = cowork.assemble_reviewer_resume_context(
-            intel, context_update="redirected goal")
-        self.assertIn("<context>\nredirected goal\n</context>", ctx)
-        self.assertIn("ready_for_review", ctx)   # intel still included
-        # without an update there is no block
-        self.assertNotIn("<context>",
+            intel, context_update="redirected goal", assets_dir=d,
+            context_revision=1)
+        self.assertNotIn("redirected goal", ctx)       # not inlined
+        self.assertIn("New user context was provided", ctx)
+        self.assertIn("context.rev1.md", ctx)          # context by path
+        self.assertIn(intel, ctx)                      # intel still included
+        # without an update there is no wake block
+        self.assertNotIn("New user context was provided",
                          cowork.assemble_reviewer_resume_context(intel))
 
 
@@ -4058,7 +4092,9 @@ class ReviewerSessionFlowTest(unittest.TestCase):
         # scout gets the redirect wrapped in the wake block (same semantics the
         # reviewer gets: current context, keep prior memory only if compatible)
         self.assertIn("New user context was provided", rec[2]["context"])
-        self.assertIn("<context>\nredirected goal\n</context>", rec[2]["context"])
+        # File-only transport: the context rides by path, not inline.
+        self.assertNotIn("<context>", rec[2]["context"])
+        self.assertIn("context.rev2.md", rec[2]["context"])
         self.assertEqual(rec[2]["reviewer_context"], "redirected goal")
         self.assertEqual(rec[2]["reviewer_context_update"], "redirected goal")
         saved = state_store.load(spath)
@@ -4089,7 +4125,9 @@ class ReviewerSessionFlowTest(unittest.TestCase):
             io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_scout_fn=fake)
         self.assertEqual(rc, 0)
         self.assertIn("New user context was provided", rec[0])
-        self.assertIn("<context>\nunseen goal\n</context>", rec[0])
+        # File-only transport: context rides by path, not inline.
+        self.assertNotIn("<context>", rec[0])
+        self.assertIn("context.rev1.md", rec[0])
         # delivered + successful run -> acknowledged now
         self.assertEqual(state_store.get_seen_revision(
             state_store.load(spath), "scout"), 1)
@@ -4603,9 +4641,10 @@ class ScoutLoopTtyTest(unittest.TestCase):
                                     review_fn=rfn)
         self.assertEqual(rc, 0)
         sel.assert_called_once()
-        # iterate injected the reviewer's unresolved findings as the next turn
+        # iterate injected the reviewer hand-back (findings by review-file path)
         self.assertIn("[reviewer handoff]", sess.sent[-1])
-        self.assertIn("still not aligned", sess.sent[-1])
+        self.assertNotIn("still not aligned", sess.sent[-1])
+        self.assertIn("review file", sess.sent[-1])
         # fresh budget after iterate: reviewer ran once more and approved
         self.assertEqual(rfn.calls["n"], cap + 1)
         texts = [t for t, _k in banners]
@@ -5153,10 +5192,11 @@ class PlannerLoopTest(unittest.TestCase):
             plan_json, plan_md, sess, io.StringIO(""), reviewer_runner=runner)
         self.assertEqual(rc, 0)
         self.assertIn("[reviewer handoff]", sess.sent[1])
-        self.assertIn("cover migration risk", sess.sent[1])
+        # File-only transport: findings ride by review-file path, not embedded.
+        self.assertNotIn("cover migration risk", sess.sent[1])
+        self.assertIn("review file", sess.sent[1])
         # the planner is told about its PLAN, not the scout's intel
         self.assertIn("update your plan", sess.sent[1])
-        self.assertNotIn("intel", sess.sent[1])
         # single-voice: advisor findings never reach the user channel
         self.assertNotIn("cover migration risk", text)
         self.assertIn("reviewed: changes requested", text)
@@ -5230,15 +5270,19 @@ class PlannerSeedTest(unittest.TestCase):
         return path
 
     def test_planner_seed_carries_intel_and_context(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         intel = self._intel('{"status": "ready_for_review", "result": {"k": 1}}')
-        seed = cowork.assemble_planner_seed(intel, "the goal")
+        seed = cowork.assemble_planner_seed(intel, "the goal", assets_dir=d,
+                                            context_revision=1)
         self.assertIn("APPROVED", seed)
-        # #1: path-first — the intel path + a read-from-disk instruction, NOT
-        # the embedded JSON body.
+        # File-only cross-role seed: intel AND context ride by PATH, no bodies.
         self.assertIn(intel, seed)
         self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
         self.assertNotIn('"k": 1', seed)
-        self.assertIn("the goal", seed)
+        self.assertNotIn("the goal", seed)             # context not inline
+        self.assertIn(os.path.join(d, "context.rev1.md"), seed)
 
     def test_intel_updated_block_carries_intel(self):
         intel = self._intel('{"result": {"new": true}}')
@@ -5250,9 +5294,17 @@ class PlannerSeedTest(unittest.TestCase):
         self.assertNotIn('"new": true', block)
 
     def test_handoff_wake_block_carries_payload(self):
-        block = cowork.handoff_wake_block("narrow the scope to X")
-        self.assertIn("<handoff>\nnarrow the scope to X\n</handoff>", block)
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        block = cowork.handoff_wake_block("narrow the scope to X", d)
+        # File-only transport: the payload rides by PATH, not inline.
+        self.assertNotIn("narrow the scope to X", block)
+        self.assertIn("handback.scout.txt", block)
         self.assertIn("ready_for_review", block)
+        # the persisted file actually holds the payload
+        with open(os.path.join(d, "handback.scout.txt")) as fh:
+            self.assertEqual(fh.read(), "narrow the scope to X")
 
     def test_planner_brief_names_both_artifacts(self):
         brief = cowork.assemble_planner_brief("a.json", "a.md")
@@ -5261,18 +5313,34 @@ class PlannerSeedTest(unittest.TestCase):
         self.assertIn("ONLY write targets", brief)
 
     def test_advisor_context_carries_both_artifacts(self):
-        intel = self._intel('{"plan": "J"}')
-        md = intel + ".md"
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        pj = self._intel('{"plan": "J"}')
+        md = pj + ".md"
         with open(md, "w") as fh:
             fh.write("# MD PLAN")
-        ctx = cowork.assemble_advisor_context("goal", ["planner"], intel, md)
-        self.assertIn('"plan": "J"', ctx)
-        self.assertIn("# MD PLAN", ctx)
-        self.assertIn("goal", ctx)
+        ij = os.path.join(d, "scout.intel.json")
+        im = os.path.join(d, "scout.intel.md")
+        with open(ij, "w") as fh:
+            fh.write('{"intel": "I"}')
+        with open(im, "w") as fh:
+            fh.write("# INTEL MD")
+        # Route 4 multi-source: plan AND approved intel, all path-first.
+        ctx = cowork.assemble_advisor_context(
+            "goal", ["planner"], pj, md, intel_path=ij, intel_md_path=im)
+        self.assertNotIn('"plan": "J"', ctx)       # bodies not embedded
+        self.assertNotIn("# MD PLAN", ctx)
+        self.assertNotIn("goal", ctx)
+        self.assertIn(pj, ctx)                      # plan paths present
+        self.assertIn(md, ctx)
+        self.assertIn(ij, ctx)                      # approved intel paths present
+        self.assertIn(im, ctx)
         resumed = cowork.assemble_advisor_resume_context(
-            intel, md, context_update="new goal")
-        self.assertIn("<context>\nnew goal\n</context>", resumed)
-        self.assertIn("# MD PLAN", resumed)
+            pj, md, context_update="new goal", assets_dir=d, context_revision=1)
+        self.assertNotIn("new goal", resumed)
+        self.assertIn("context.rev1.md", resumed)
+        self.assertIn(md, resumed)
 
 
 class SwitchControllerFlowTest(unittest.TestCase):
@@ -5356,7 +5424,10 @@ class SwitchControllerFlowTest(unittest.TestCase):
         self.assertEqual(calls[0]["config"]["planner"]["controller"], "codex")
         self.assertIn("[controller switch handoff]", calls[0]["context"])
         self.assertIn("fresh codex provider conversation", calls[0]["context"])
-        self.assertIn('"finding": "keep"', calls[0]["context"])
+        # File-only transport: artifact bodies are NOT embedded; they ride by
+        # path (the switched role reads them from disk).
+        self.assertNotIn('"finding": "keep"', calls[0]["context"])
+        self.assertIn("session artifact", calls[0]["context"])
         saved = state_store.load(spath)
         self.assertEqual(saved["config"]["planner"]["controller"], "codex")
         self.assertEqual(
@@ -5384,6 +5455,41 @@ class SwitchControllerFlowTest(unittest.TestCase):
                             and e["controller"] == "codex"
                             and e["session_id"] == "new-codex-thread"
                             for e in events))
+
+    def test_pending_switch_resume_skips_new_goal_prompt(self):
+        import unittest.mock as mock
+
+        spath = self._saved_planning_session()
+        state = state_store.load(spath)
+        state_store.switch_role_controller(
+            spath, "planner", "codex", prior=state,
+            reason="cli", source="cli")
+        calls = []
+
+        def fake_planner(config, context, selected, on_outcome=None, **kw):
+            calls.append(context)
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_outcome:
+                on_outcome("approved", None)
+            return 0
+
+        with mock.patch.object(
+                cowork, "gather_context_interactive",
+                side_effect=AssertionError("saved switch must not ask a new goal")):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=fake_planner)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(calls[0], handoff.HandoffBlock)
+        self.assertIn("[controller switch handoff]", calls[0])
+        self.assertIsNone(
+            state_store.read_pending_switch(
+                state_store.load(spath), "planner"))
 
     def test_cli_switch_rejects_off_phase_role_without_mutating_state(self):
         spath = self._saved_planning_session()
@@ -5645,7 +5751,10 @@ class SwitchControllerFlowTest(unittest.TestCase):
                     run_planner_fn=fake_planner)
             self.assertEqual(rc, 0)
             self.assertEqual(len(calls), 1)
-            self.assertIn('"session": "PICK-2"', calls[0])
+            # File-only transport: the intel body is not embedded; the selected
+            # session (PICK-2) is identified by its intel FILE path.
+            self.assertNotIn('"session": "PICK-2"', calls[0])
+            self.assertIn(os.path.join("PICK-2", "scout.intel.json"), calls[0])
             self.assertEqual(
                 state_store.get_role_session(
                     state_store.load(paths[1]), "planner", "codex"),
@@ -5758,7 +5867,9 @@ class PhaseChainFlowTest(unittest.TestCase):
         # embedded intel body.
         self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
         self.assertNotIn('"finding": "F1"', seed)
-        self.assertIn("build the thing", seed)
+        # cross-role seed: context rides by PATH (persisted file), not inline.
+        self.assertNotIn("build the thing", seed)
+        self.assertIn("context.rev", seed)
         # planner artifacts carry uuid-free names; the session FOLDER isolates them
         self.assertIn("planner.plan.json", calls["planner"][0]["plan_json_path"])
         self.assertIn("planner.plan.md", calls["planner"][0]["plan_md_path"])
@@ -5925,8 +6036,9 @@ class PhaseChainFlowTest(unittest.TestCase):
         # scout ran twice: fresh, then resumed with the handoff wake block
         self.assertEqual(len(calls["scout"]), 2)
         self.assertEqual(calls["scout"][1]["resume_id"], "scout-1")
-        self.assertIn("<handoff>\nnarrow scope to auth\n</handoff>",
-                      calls["scout"][1]["context"])
+        # File-only transport: the hand-back payload rides by path, not inline.
+        self.assertNotIn("narrow scope to auth", calls["scout"][1]["context"])
+        self.assertIn("handback.scout.txt", calls["scout"][1]["context"])
         # the discovery responsibility rides BOTH the fresh seed and the
         # hand-back re-run seed, so the every-cycle subset confirmation holds.
         self.assertIn("Repository discovery", calls["scout"][0]["context"])
@@ -6013,14 +6125,19 @@ class PhaseChainFlowTest(unittest.TestCase):
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
         self.assertEqual(rc, 0)
-        # planner (resumed, unacked rev 2) got the new context as a wake block
-        self.assertIn("<context>\nnew direction\n</context>",
+        # planner (resumed, unacked rev 2) got the new context as a wake block,
+        # file-only (context by path, not inline).
+        self.assertIn("New user context was provided",
                       calls["planner"][0]["context"])
-        # scout got BOTH the unseen revision and the handoff payload
+        self.assertIn("context.rev2.md", calls["planner"][0]["context"])
+        self.assertNotIn("new direction", calls["planner"][0]["context"])
+        # scout got BOTH the unseen revision and the handoff payload, by path
         scout_ctx = calls["scout"][0]["context"]
         self.assertIn("New user context was provided", scout_ctx)
-        self.assertIn("<context>\nnew direction\n</context>", scout_ctx)
-        self.assertIn("<handoff>\nre-scope auth\n</handoff>", scout_ctx)
+        self.assertIn("context.rev2.md", scout_ctx)
+        self.assertNotIn("new direction", scout_ctx)
+        self.assertNotIn("re-scope auth", scout_ctx)
+        self.assertIn("handback.scout.txt", scout_ctx)
         # and the delivery is what justifies the ack
         self.assertEqual(state_store.get_seen_revision(
             state_store.load(spath), "scout"), 2)
@@ -6421,9 +6538,11 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         # io_out, and io_out is restored for later normal turns.
         self.assertEqual(real_out.getvalue(), "")
         self.assertIs(sess.io_out, real_out)
-        # the verdict JSON is embedded even on approve (evidence invariant)
-        self.assertIn('"verdict": "approve"', sess.sent[0])
-        self.assertIn("minor note", sess.sent[0])
+        # Route 12 file-only: the verdict JSON is NOT embedded; the eval evidence
+        # references it by path (read from disk before scoring).
+        self.assertNotIn('"verdict": "approve"', sess.sent[0])
+        self.assertNotIn("minor note", sess.sent[0])
+        self.assertIn(cowork.handoff.FULL_REREAD_INSTRUCTION, sess.sent[0])
         # privacy: the aggregate scores path never appears in the prompt
         self.assertNotIn(state_store.scores_path_for("S"), sess.sent[0])
         self.assertNotIn("scores.json", sess.sent[0])
@@ -6820,7 +6939,7 @@ class RunReviewerOnceEvalTest(_EvalEnvMixin, unittest.TestCase):
         factory, record = self._factory(review, scratch, payload)
         specs = [{"evaluatee": "scout",
                   "criteria": ["intel quality/completeness"],
-                  "artifact_block": "see your review file",
+                  "artifact_block": _eval_test_block(review),
                   "context": "review-round", "phase": "scouting", "round": 1}]
         cfg = cowork.default_config(["scout", "scout-reviewer"])
         verdict = cowork.run_reviewer_once(
@@ -6846,7 +6965,8 @@ class RunReviewerOnceEvalTest(_EvalEnvMixin, unittest.TestCase):
                  "criteria": [{"name": "c", "score": 5}]}]}, fh)
         factory, record = self._factory(review)  # eval turn writes nothing
         specs = [{"evaluatee": "scout", "criteria": ["c"],
-                  "artifact_block": "x", "context": "review-round",
+                  "artifact_block": _eval_test_block(review),
+                  "context": "review-round",
                   "phase": "scouting", "round": 2}]
         cfg = cowork.default_config(["scout", "scout-reviewer"])
         cowork.run_reviewer_once(
@@ -6887,7 +7007,8 @@ class RunReviewerOnceEvalTest(_EvalEnvMixin, unittest.TestCase):
             return FlakyRevSession()
 
         specs = [{"evaluatee": "scout", "criteria": ["c"],
-                  "artifact_block": "x", "context": "review-round",
+                  "artifact_block": _eval_test_block(review),
+                  "context": "review-round",
                   "phase": "scouting", "round": 1}]
         cfg = cowork.default_config(["scout", "scout-reviewer"])
         verdict = cowork.run_reviewer_once(
@@ -7338,17 +7459,21 @@ class BuilderSeedTest(unittest.TestCase):
         self.assertIn("commit", brief)            # no git commit
 
     def test_builder_seed_carries_plan_and_context(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         pj, pm = self._plan('{"result": {"k": 1}}', "# THE PLAN")
-        seed = cowork.assemble_builder_seed(pj, pm, "the goal")
+        seed = cowork.assemble_builder_seed(pj, pm, "the goal", assets_dir=d,
+                                            context_revision=1)
         self.assertIn("APPROVED", seed)
-        # #1: path-first — both plan paths + a read-from-disk instruction, NOT
-        # the embedded bodies.
+        # File-only cross-role seed: plan AND context ride by PATH, no bodies.
         self.assertIn(pj, seed)
         self.assertIn(pm, seed)
         self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
         self.assertNotIn('"k": 1', seed)
         self.assertNotIn("# THE PLAN", seed)
-        self.assertIn("the goal", seed)
+        self.assertNotIn("the goal", seed)             # context not inline
+        self.assertIn(os.path.join(d, "context.rev1.md"), seed)
 
     def test_plan_updated_block_carries_plan(self):
         pj, pm = self._plan('{"result": {"new": true}}', "# UPDATED")
@@ -7362,8 +7487,13 @@ class BuilderSeedTest(unittest.TestCase):
         self.assertNotIn("# UPDATED", block)
 
     def test_plan_handback_wake_block_carries_payload(self):
-        block = cowork.plan_handback_wake_block("re-plan the data layer")
-        self.assertIn("<handoff>\nre-plan the data layer\n</handoff>", block)
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        block = cowork.plan_handback_wake_block("re-plan the data layer", d)
+        # File-only transport: payload by PATH, not inline.
+        self.assertNotIn("re-plan the data layer", block)
+        self.assertIn("handback.planner.txt", block)
         self.assertIn("ready_for_review", block)
 
     def test_build_reviewer_context_embeds_plan_and_status_and_diff_note(self):
@@ -7373,18 +7503,23 @@ class BuilderSeedTest(unittest.TestCase):
             fh.write('{"status": "ready_for_review"}')
         ctx = cowork.assemble_build_reviewer_context(
             "goal", ["builder"], pj, pm, status)
-        self.assertIn('"plan": "J"', ctx)
-        self.assertIn("# MD PLAN", ctx)
-        self.assertIn("ready_for_review", ctx)
-        self.assertIn("goal", ctx)
+        # File-only transport: bodies are NOT embedded; artifacts ride by path.
+        self.assertNotIn('"plan": "J"', ctx)
+        self.assertNotIn("# MD PLAN", ctx)
+        self.assertNotIn("goal", ctx)
+        self.assertIn(pj, ctx)
+        self.assertIn(status, ctx)
         # the full-delta recipe: plain `git diff` is not enough — staged and
-        # untracked channels must be named.
+        # untracked channels must be named. It is content-free static text and
+        # stays inline.
         self.assertIn("git status --porcelain", ctx)
         self.assertIn("git diff HEAD", ctx)
         self.assertIn("untracked", ctx)
         resumed = cowork.assemble_build_reviewer_resume_context(
-            pj, pm, status, context_update="new goal")
-        self.assertIn("<context>\nnew goal\n</context>", resumed)
+            pj, pm, status, context_update="new goal", assets_dir=os.path.dirname(pj),
+            context_revision=1)
+        self.assertNotIn("new goal", resumed)
+        self.assertIn("context.rev1.md", resumed)
         self.assertIn("git status --porcelain", resumed)
         self.assertIn("untracked", resumed)
 
@@ -7403,8 +7538,12 @@ class BuilderSeedTest(unittest.TestCase):
         with open(status, "w") as fh:
             fh.write("{}")
         ctx = cowork.assemble_build_reviewer_context(
-            "g", ["builder"], pj, pm, status, baseline_note=dirty)
-        self.assertIn("dirty", ctx)
+            "g", ["builder"], pj, pm, status, baseline_note=dirty,
+            assets_dir=os.path.dirname(pj))
+        # The baseline metadata rides by PATH (persisted build_baseline.txt).
+        self.assertIn("build_baseline.txt", ctx)
+        with open(os.path.join(os.path.dirname(pj), "build_baseline.txt")) as fh:
+            self.assertIn("dirty", fh.read())
 
     def test_git_baseline_tolerates_non_repo(self):
         import tempfile
@@ -7672,7 +7811,9 @@ class BuilderLoopTest(unittest.TestCase):
             status, review, pj, pm, sess, io.StringIO(), reviewer_runner=runner)
         self.assertEqual(rc, 0)
         self.assertIn("[reviewer handoff]", sess.sent[1])
-        self.assertIn("out-of-plan change", sess.sent[1])
+        # File-only transport: findings ride by review-file path, not embedded.
+        self.assertNotIn("out-of-plan change", sess.sent[1])
+        self.assertIn("review file", sess.sent[1])
         self.assertIn("update your build", sess.sent[1])  # artifact_noun=build
         # single-voice: reviewer findings never reach the user channel
         self.assertNotIn("out-of-plan change", text)
@@ -7697,8 +7838,10 @@ class BuilderLoopTest(unittest.TestCase):
             status, review, pj, pm, sess, io.StringIO("flag it\n"),
             reviewer_runner=runner)
         self.assertEqual(rc, 0)
-        # the reviewer's question is relayed to the builder for faithful relay
-        self.assertIn("ship behind a flag or not?", sess.sent[1])
+        # File-only transport: the reviewer's question rides by review-file path;
+        # the builder reads it and relays in its own voice.
+        self.assertNotIn("ship behind a flag or not?", sess.sent[1])
+        self.assertIn("review file", sess.sent[1])
         self.assertIn("builder needs your input", text)
         self.assertEqual(outcomes, [("approved", None)])
 
@@ -7851,7 +7994,9 @@ class BuildPhaseFlowTest(unittest.TestCase):
         self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
         self.assertNotIn('"step": "S1"', seed)
         self.assertNotIn("# PLAN MD", seed)
-        self.assertIn("do it", seed)
+        # cross-role seed: context rides by PATH (persisted file), not inline.
+        self.assertNotIn("do it", seed)
+        self.assertIn("context.rev", seed)
         # builder artifacts carry uuid-free names; the session FOLDER isolates them
         self.assertIn("builder.status.json",
                       calls["builder"][0]["build_status_path"])
@@ -7900,8 +8045,9 @@ class BuildPhaseFlowTest(unittest.TestCase):
         # planner ran twice: fresh, then resumed with the handback wake block
         self.assertEqual(len(calls["planner"]), 2)
         self.assertEqual(calls["planner"][1]["resume_id"], "planner-1")
-        self.assertIn("<handoff>\nre-plan the data model\n</handoff>",
-                      calls["planner"][1]["context"])
+        # File-only transport: the hand-back payload rides by path, not inline.
+        self.assertNotIn("re-plan the data model", calls["planner"][1]["context"])
+        self.assertIn("handback.planner.txt", calls["planner"][1]["context"])
         # the building epoch bumps on each plan-approved -> building transition
         self.assertEqual(calls["builder"][0]["building_epoch"], 1)
         self.assertEqual(calls["builder"][1]["building_epoch"], 2)
@@ -8543,7 +8689,8 @@ class ReviewerSurfacingTest(unittest.TestCase):
             cfg, "goal", ["scout", "scout-reviewer"], intel, review,
             session_factory=factory, surface_io_out=surface,
             eval_scratch_path=scratch,
-            eval_specs=[{"evaluatee": "scout", "criteria": ["intel quality"]}])
+            eval_specs=[{"evaluatee": "scout", "criteria": ["intel quality"],
+                         "artifact_block": _eval_test_block(review)}])
         # The review turn was visible exactly once; the eval send was muted.
         self.assertEqual(surface.getvalue().count("MARK"), 1)
         self.assertTrue(os.path.exists(scratch))  # eval still produced its file
@@ -9042,14 +9189,16 @@ class ScoutIntelMdHelperTest(unittest.TestCase):
             fh.write("# MD-RENDERING")
         ctx = cowork.assemble_reviewer_context(
             "the goal", ["scout", "scout-reviewer"], intel, intel_md)
-        self.assertIn("JSON-OBJECTIVE", ctx)   # JSON embedded
-        self.assertIn("MD-RENDERING", ctx)      # markdown embedded
-        self.assertIn("CONSISTENT", ctx)        # the consistency instruction
-        # without the md path, only the JSON is embedded (back-compat)
+        # File-only transport: both intel files ride by PATH, not embedded.
+        self.assertNotIn("JSON-OBJECTIVE", ctx)
+        self.assertNotIn("MD-RENDERING", ctx)
+        self.assertIn(intel, ctx)               # JSON path present
+        self.assertIn(intel_md, ctx)            # markdown path present
+        # without the md path, only the JSON path is present (back-compat)
         ctx_json_only = cowork.assemble_reviewer_context(
             "the goal", ["scout"], intel)
-        self.assertIn("JSON-OBJECTIVE", ctx_json_only)
-        self.assertNotIn("MD-RENDERING", ctx_json_only)
+        self.assertIn(intel, ctx_json_only)
+        self.assertNotIn(intel_md, ctx_json_only)
 
     def test_reviewer_resume_context_embeds_both_intel_files(self):
         d = self._tmp()
@@ -9060,15 +9209,18 @@ class ScoutIntelMdHelperTest(unittest.TestCase):
         with open(intel_md, "w") as fh:
             fh.write("MD-RESUME-BODY")
         resumed = cowork.assemble_reviewer_resume_context(
-            intel, intel_md, context_update="redirected goal")
-        self.assertIn("<context>\nredirected goal\n</context>", resumed)
-        self.assertIn("ready_for_review", resumed)   # JSON
-        self.assertIn("MD-RESUME-BODY", resumed)      # markdown
+            intel, intel_md, context_update="redirected goal", assets_dir=d,
+            context_revision=1)
+        self.assertNotIn("redirected goal", resumed)
+        self.assertIn("context.rev1.md", resumed)     # context by path
+        self.assertIn(intel, resumed)                 # JSON path
+        self.assertIn(intel_md, resumed)              # markdown path
+        self.assertNotIn("MD-RESUME-BODY", resumed)   # body not embedded
         # back-compat: positional intel only still works (no md), no block
         plain = cowork.assemble_reviewer_resume_context(intel)
-        self.assertIn("ready_for_review", plain)
-        self.assertNotIn("MD-RESUME-BODY", plain)
-        self.assertNotIn("<context>", plain)
+        self.assertIn(intel, plain)
+        self.assertNotIn(intel_md, plain)
+        self.assertNotIn("New user context was provided", plain)
 
     def test_scout_gate_text_points_at_md_when_wired(self):
         # _scout_loop repoints the review/done surfaces at the intel markdown.
@@ -9143,19 +9295,22 @@ class BuilderSummaryMdHelperTest(unittest.TestCase):
                 fh.write(body)
         ctx = cowork.assemble_build_reviewer_context(
             "goal", ["builder"], pj, pm, status, build_summary_path=summary)
-        self.assertIn("SUMMARY-BODY", ctx)
-        self.assertIn("consistency-check", ctx)
-        # still embeds the rest + the diff recipe
-        self.assertIn('"plan": "J"', ctx)
+        # File-only transport: the summary rides by PATH, not embedded.
+        self.assertNotIn("SUMMARY-BODY", ctx)
+        self.assertIn(summary, ctx)
+        # the rest ride by path too + the content-free diff recipe stays inline
+        self.assertNotIn('"plan": "J"', ctx)
+        self.assertIn(pj, ctx)
         self.assertIn("git status --porcelain", ctx)
         resumed = cowork.assemble_build_reviewer_resume_context(
             pj, pm, status, build_summary_path=summary)
-        self.assertIn("SUMMARY-BODY", resumed)
+        self.assertNotIn("SUMMARY-BODY", resumed)
+        self.assertIn(summary, resumed)
         self.assertIn("git status --porcelain", resumed)
-        # back-compat: without a summary path, none is embedded
+        # back-compat: without a summary path, none is referenced
         ctx_no = cowork.assemble_build_reviewer_context(
             "goal", ["builder"], pj, pm, status)
-        self.assertNotIn("SUMMARY-BODY", ctx_no)
+        self.assertNotIn(summary, ctx_no)
 
     def test_builder_gate_text_points_at_summary(self):
         # builder_review_text / builder_done_text are overridden in run_builder
@@ -9656,7 +9811,12 @@ class PlannerHashGateRunTest(unittest.TestCase):
 
 import cowork_report  # noqa: E402
 import cowork_probe_cache as probe_cache  # noqa: E402
-import cowork_diffpacket as diffpacket  # noqa: E402
+import cowork_handoff as handoff  # noqa: E402
+# Back-compat alias: the retired cowork_diffpacket's one surviving path-first
+# primitive still referenced by tests (FULL_REREAD_INSTRUCTION) now lives in
+# cowork_handoff. (The old build_full_reread_packet second renderer was removed —
+# render_handoff is the only renderer.) Tests keep working through this alias.
+diffpacket = handoff
 
 
 def _claude_lines(usage=None):
@@ -9930,17 +10090,6 @@ class DeliveryAccountingTest(unittest.TestCase):
         self.assertEqual(diff[0]["delivery"], "diff")
         self.assertEqual(diff[0]["embedded_bytes"], 17)
 
-    def test_full_reread_packet_is_path_delivery_small_embedded(self):
-        p = self._file('{"finding": "SECRET-BODY"}' + " " * 500)
-        pkt = diffpacket.build_full_reread_packet(
-            [{"label": "intel", "path": p, "kind": "json"}])
-        self.assertEqual(pkt.delivery, "path")
-        self.assertNotIn("SECRET-BODY", pkt)            # body not embedded
-        self.assertIn(p, pkt)                           # path referenced
-        # embedded bytes ~ the descriptor line, far below the full body.
-        self.assertIn(p, pkt.embedded)
-        self.assertLess(pkt.embedded[p], os.path.getsize(p))
-
     def test_report_path_delivery_excludes_embedded_total(self):
         # A path-delivered artifact contributes its FULL size to "touched" but
         # 0 to the embedded total; an embedded one contributes its full body.
@@ -10104,190 +10253,6 @@ class ProbeCacheTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)  # no version -> always live-probe
 
 
-class DiffPacketTest(unittest.TestCase):
-    """#4: path-first diff packets + full-reread fallbacks (T7–T10, T12)."""
-
-    def setUp(self):
-        import tempfile
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
-        self.snap = os.path.join(self.dir, "snap")
-        os.makedirs(self.snap, exist_ok=True)
-        self.json_path = os.path.join(self.dir, "plan.json")
-        self.md_path = os.path.join(self.dir, "plan.md")
-
-    def _write(self, obj, md):
-        with open(self.json_path, "w") as fh:
-            json.dump(obj, fh)
-        with open(self.md_path, "w") as fh:
-            fh.write(md)
-
-    def _arts(self):
-        return [{"label": "plan JSON", "path": self.json_path, "kind": "json"},
-                {"label": "plan md", "path": self.md_path, "kind": "markdown"}]
-
-    def _packet(self, **kw):
-        return diffpacket.build_review_packet(
-            "advisor", 1, 3, self._arts(), self.snap, **kw)
-
-    def test_t10_fresh_is_full_reread_and_writes_snapshot(self):
-        self._write({"b": 2, "a": 1}, "# Plan\nbody")
-        pkt = self._packet(force_full_reread=True)
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
-        self.assertNotIn("unified diff", pkt.lower())
-        # The full JSON body is NOT embedded (only path + hash descriptors).
-        self.assertNotIn('"a": 1', pkt)
-        self.assertIn(self.json_path, pkt)
-        # A snapshot exists for the next round's diff.
-        self.assertTrue(os.path.exists(
-            diffpacket._snapshot_path(self.snap, "advisor")))
-
-    def test_t7_repeat_round_emits_diff_not_bodies(self):
-        self._write({"a": 1}, "# Plan\nold")
-        self._packet(force_full_reread=True)        # round 1: seed snapshot
-        self._write({"a": 2}, "# Plan\nnew")        # change both files
-        pkt = self._packet()                         # round 2: same key -> diff
-        self.assertIn(diffpacket.DIFF_INSTRUCTION, pkt)
-        self.assertIn("@@", pkt)                     # unified diff hunk
-        self.assertIn("+new", pkt)
-
-    def test_t7_json_canonicalized_so_key_churn_is_minimal(self):
-        self._write({"a": 1, "b": 2}, "same")
-        self._packet(force_full_reread=True)
-        # Rewrite with reordered keys + different whitespace, same content.
-        with open(self.json_path, "w") as fh:
-            fh.write('{\n  "b": 2,\n  "a": 1\n}\n')
-        pkt = self._packet()
-        self.assertIn(diffpacket.DIFF_INSTRUCTION, pkt)
-        self.assertIn("no changes", pkt.lower())
-
-    def test_t8_no_snapshot_forces_full_reread(self):
-        self._write({"a": 1}, "md")
-        pkt = self._packet()  # no prior snapshot for this key
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
-
-    def test_t8_context_rev_change_forces_full_reread(self):
-        self._write({"a": 1}, "md")
-        diffpacket.build_review_packet("advisor", 1, 3, self._arts(), self.snap,
-                                       force_full_reread=True)
-        # A different context revision -> different key -> no prior snapshot.
-        pkt = diffpacket.build_review_packet(
-            "advisor", 1, 99, self._arts(), self.snap)
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
-
-    def test_t8_canonicalization_failure_forces_full_reread(self):
-        self._write({"a": 1}, "md")
-        self._packet(force_full_reread=True)
-        # Corrupt the JSON so canonicalization fails on this round.
-        with open(self.json_path, "w") as fh:
-            fh.write("{not valid json")
-        pkt = self._packet()
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
-
-    def test_t8_diff_over_cap_forces_full_reread(self):
-        self._write({"a": 1}, "line\n")
-        self._packet(force_full_reread=True)
-        with open(self.md_path, "w") as fh:
-            fh.write("\n".join("changed-%d" % i for i in range(500)))
-        pkt = self._packet(diff_line_cap=10)
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
-
-    def test_t8_artifact_set_change_forces_full_reread(self):
-        # The snapshot key folds in the ordered artifact path set: a changed set
-        # (here, dropping the markdown) under the same epoch/revision has no
-        # prior snapshot and must full-reread rather than diff a new set.
-        self._write({"a": 1}, "md")
-        self._packet(force_full_reread=True)        # seed snapshot for 2 arts
-        json_only = [{"label": "plan JSON", "path": self.json_path,
-                      "kind": "json"}]
-        pkt = diffpacket.build_review_packet(
-            "advisor", 1, 3, json_only, self.snap)
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
-
-    def test_t12_force_full_reread_skips_diff_even_with_snapshot(self):
-        # The malformed/weak-verdict retry (D8): a prior snapshot exists and a
-        # diff WOULD be eligible, but force_full_reread bypasses it.
-        self._write({"a": 1}, "md")
-        self._packet(force_full_reread=True)
-        self._write({"a": 2}, "md2")
-        eligible = self._packet()                       # would be a diff
-        self.assertIn(diffpacket.DIFF_INSTRUCTION, eligible)
-        self._write({"a": 3}, "md3")
-        forced = self._packet(force_full_reread=True)   # retry: full reread
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, forced)
-        self.assertNotIn("@@", forced)
-
-
-class ReviewerPacketContextTest(unittest.TestCase):
-    """#4 wiring through the reviewer context assemblers (T9, T10)."""
-
-    def setUp(self):
-        import tempfile
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
-        self.snap = os.path.join(self.dir, "snap")
-        os.makedirs(self.snap, exist_ok=True)
-        self.pj = os.path.join(self.dir, "plan.json")
-        self.pm = os.path.join(self.dir, "plan.md")
-        self.status = os.path.join(self.dir, "status.json")
-        for p, body in ((self.pj, '{"k": "VALUE-IN-JSON"}'),
-                        (self.pm, "# Plan\nMD-BODY"),
-                        (self.status, '{"s": "STATUS-BODY"}')):
-            with open(p, "w") as fh:
-                fh.write(body)
-
-    def _ctx(self, role):
-        return {"reviewer_role": role, "epoch": 1, "context_revision": 0,
-                "snapshot_dir": self.snap}
-
-    def test_t10_advisor_fresh_is_path_first(self):
-        out = cowork.assemble_advisor_context(
-            "ctx", ["planner", "planning-advisor"], self.pj, self.pm,
-            packet_ctx=self._ctx("planning-advisor"))
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, out)
-        self.assertNotIn("VALUE-IN-JSON", out)   # body not embedded
-        self.assertNotIn("MD-BODY", out)
-        self.assertIn(self.pj, out)              # path present
-        # #3: the returned block carries its delivery so run_reviewer_once can
-        # tag descriptors truthfully without re-inferring the packet form.
-        self.assertEqual(getattr(out, "delivery", None), "path")
-
-    def test_t10_advisor_no_packet_ctx_is_embedded_delivery(self):
-        # Legacy full-embed fallback (no packet_ctx): bodies are embedded and
-        # the block reports the "embedded" delivery (a plain str -> default).
-        out = cowork.assemble_advisor_context(
-            "ctx", ["planner", "planning-advisor"], self.pj, self.pm)
-        self.assertIn("VALUE-IN-JSON", out)      # body embedded
-        self.assertEqual(getattr(out, "delivery", "embedded"), "embedded")
-
-    def test_t9_build_reviewer_packet_keeps_live_delta_recipe(self):
-        out = cowork.assemble_build_reviewer_resume_context(
-            self.pj, self.pm, self.status,
-            baseline_repos=None, packet_ctx=self._ctx("build-reviewer"),
-            force_full_reread=True)
-        # The embedded artifacts go path-first...
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, out)
-        self.assertNotIn("STATUS-BODY", out)
-        # ...but the live working-tree delta recipe is untouched.
-        self.assertIn("FULL working-tree delta", out)
-
-    def test_t9_build_reviewer_resume_emits_diff_on_repeat(self):
-        ctx = self._ctx("build-reviewer")
-        cowork.assemble_build_reviewer_resume_context(
-            self.pj, self.pm, self.status, packet_ctx=ctx,
-            force_full_reread=True)  # seed snapshot
-        with open(self.status, "w") as fh:
-            fh.write('{"s": "CHANGED-STATUS"}')
-        out = cowork.assemble_build_reviewer_resume_context(
-            self.pj, self.pm, self.status, packet_ctx=ctx)
-        self.assertIn(diffpacket.DIFF_INSTRUCTION, out)
-        self.assertIn("CHANGED-STATUS", out)     # diff shows the new line
-        self.assertIn("FULL working-tree delta", out)
-        # #3: a repeat round emits a diff -> the block reports "diff" delivery
-        # even after the context-update wake block is prepended.
-        self.assertEqual(getattr(out, "delivery", None), "diff")
-
-
 class TurnMetaWiringTest(unittest.TestCase):
     """#1 D11: lead + reviewer sends carry the full meta contract (T13)."""
 
@@ -10381,79 +10346,28 @@ class TurnMetaWiringTest(unittest.TestCase):
             cfg, "ctx", [cowork.SCOUT_REVIEWER], intel, review,
             session_factory=lambda c, io: Fake(),
             reviewer_role=cowork.SCOUT_REVIEWER,
+            context_fn=lambda ctx, sel, p, assets_dir=None,
+                context_revision=None: cowork.assemble_reviewer_context(
+                    ctx, sel, p, md, assets_dir=assets_dir,
+                    context_revision=context_revision),
             artifact_paths=[intel, md], phase="scouting", context_revision=4)
         m = captured["meta"]
         self.assertEqual(m["prompt_kind"], "reviewer_pass")
         self.assertEqual(m["phase"], "scouting")
         self.assertTrue(m["fresh"])
         self.assertEqual(m["context_revision"], 4)
-        # The FULL embedded artifact set is described, not just the primary path.
-        self.assertEqual([a["path"] for a in m["artifacts"]], [intel, md])
-        # No snapshot_dir wired -> legacy full-embed -> "embedded" delivery,
-        # embedded_bytes == full body bytes.
+        # SC5: the meta artifacts derive from the SAME handoff object the prompt
+        # was built from — file-only, so every artifact is "path" delivery with
+        # a small (descriptor-line) embedded byte count, never the full body. The
+        # intel + md paths are among the described artifacts (the shared context
+        # file rides too, hence >= the reviewed set).
+        paths = [a["path"] for a in m["artifacts"]]
+        self.assertIn(intel, paths)
+        self.assertIn(md, paths)
         for a in m["artifacts"]:
-            self.assertEqual(a["delivery"], "embedded")
-            self.assertEqual(a["embedded_bytes"], a["bytes"])
-
-    def test_reviewer_meta_delivery_is_derived_from_packet(self):
-        # #3 KEY: with a snapshot_dir wired the reviewer pass is path-first on a
-        # fresh send, and a diff on a repeat round against the same key — the
-        # meta delivery is DERIVED from the packet ctx_block actually carried,
-        # never a static 'embedded' default.
-        d = self._dir()
-        snap = os.path.join(d, "snap")
-        os.makedirs(snap)
-        intel = os.path.join(d, "intel.json")
-        md = os.path.join(d, "intel.md")
-        review = os.path.join(d, "review.json")
-        for p, body in ((intel, '{"v": 1}'), (md, "# MD\nbody")):
-            with open(p, "w") as fh:
-                fh.write(body)
-        captured = {}
-
-        class Fake:
-            def send(self, text, meta=None):
-                captured["meta"] = meta
-
-            def close(self):
-                pass
-
-        cfg = {cowork.SCOUT_REVIEWER: {"controller": "claude",
-                                       "mode": "plan", "yolo": True}}
-
-        def run(resume_id):
-            cowork.run_reviewer_once(
-                cfg, "ctx", [cowork.SCOUT_REVIEWER], intel, review,
-                session_factory=lambda c, io: Fake(),
-                reviewer_role=cowork.SCOUT_REVIEWER,
-                context_fn=lambda ctx, sel, p, packet_ctx=None:
-                    cowork.assemble_reviewer_context(
-                        ctx, sel, p, md, packet_ctx=packet_ctx),
-                resume_context_fn=lambda p, context_update=None,
-                    packet_ctx=None, force_full_reread=False:
-                    cowork.assemble_reviewer_resume_context(
-                        p, md, context_update=context_update,
-                        packet_ctx=packet_ctx,
-                        force_full_reread=force_full_reread),
-                artifact_paths=[intel, md], phase="scouting",
-                epoch=1, context_revision=0, snapshot_dir=snap,
-                resume_id=resume_id)
-
-        run(None)  # fresh: seeds the snapshot, path-first
-        for a in captured["meta"]["artifacts"]:
             self.assertEqual(a["delivery"], "path")
-            # ~descriptor-line size (path + hash + size), a small bounded
-            # overhead — the artifact BODY is never embedded.
-            self.assertLess(a["embedded_bytes"], 1024)
-        # Change both files, then resume against the same key -> a diff packet.
-        with open(intel, "w") as fh:
-            fh.write('{"v": 2}')
-        with open(md, "w") as fh:
-            fh.write("# MD\nbody changed")
-        run("scout-reviewer-1")
-        deliveries = {a["delivery"]
-                      for a in captured["meta"]["artifacts"]}
-        self.assertEqual(deliveries, {"diff"})
+            self.assertLess(a["embedded_bytes"], 1024)   # descriptor line only
+            self.assertNotEqual(a["embedded_bytes"], a["bytes"])
 
     def test_lead_eval_send_carries_meta(self):
         # #1 (review fix): the lead's peer-eval send (_make_evaluate_fn) goes
@@ -10517,9 +10431,11 @@ class TurnMetaWiringTest(unittest.TestCase):
             self.assertIn("bytes", a)
             self.assertIn("sha256", a)
 
-    def test_lead_eval_meta_has_no_artifacts_without_bundle(self):
-        # A later-round eval (no consumed-upstream bundle) embeds only the inline
-        # verdict, so it carries no embedded artifact files.
+    def test_lead_eval_meta_accounts_the_verdict_file_without_bundle(self):
+        # Route-12 SC5: a later-round eval (no consumed-upstream bundle) still
+        # references the reviewer's verdict by PATH, so its meta accounts exactly
+        # that one verdict file (path-first), derived from the verdict
+        # HandoffBlock — never None, never a re-inferred body.
         d = self._dir()
         scratch = os.path.join(d, "scratch.json")
         scores = os.path.join(d, "scores.json")
@@ -10535,7 +10451,11 @@ class TurnMetaWiringTest(unittest.TestCase):
         fn = cowork._make_evaluate_fn(
             "scout", cowork.SCOUT_REVIEWER, "scouting", scratch, scores, "UUID")
         fn(Fake(), {"verdict": "approve"}, 2)
-        self.assertIsNone(captured["meta"]["artifacts"])
+        arts = captured["meta"]["artifacts"]
+        self.assertIsNotNone(arts)
+        self.assertEqual(len(arts), 1)
+        self.assertEqual(arts[0]["delivery"], "path")
+        self.assertIn("sha256", arts[0])
 
     def test_review_run_end_carries_correlation_fields(self):
         # #4 (review fix): review.run.start AND review.run.end carry the full
@@ -10571,7 +10491,9 @@ class TurnMetaWiringTest(unittest.TestCase):
         self.assertEqual(end["context_revision"], 4)
         self.assertIn("fresh", end)
         self.assertIn("resume", end)
-        self.assertEqual([a["path"] for a in end["artifacts"]], [intel])
+        # SC5: the artifacts derive from the handoff object (the intel path is
+        # among them, alongside the persisted shared-context file).
+        self.assertIn(intel, [a["path"] for a in end["artifacts"]])
 
     def test_report_counts_artifact_bytes_across_send_types(self):
         # End-to-end: lead + reviewer + eval controller.turn.start events all
@@ -11128,8 +11050,10 @@ class HeadlessRoleLoopTest(unittest.TestCase):
             sess, "seed", path, context="", io_in=io.StringIO(""),
             io_out=out, headless=True, review_fn=rfn)
         self.assertEqual(outcome, "approved")
-        # the question reached the LEAD as a revise finding, not the user
-        self.assertIn("Support legacy X?", sess.sent[1])
+        # the question reached the LEAD via review-file path (not the user), and
+        # is never inlined into the lead prompt or the user channel.
+        self.assertIn("[reviewer handoff]", sess.sent[1])
+        self.assertNotIn("Support legacy X?", sess.sent[1])
         self.assertNotIn("Support legacy X?", out.getvalue())
 
     def test_reviewer_failure_skips_under_headless(self):
@@ -12573,7 +12497,8 @@ class RoleIdentityRegistryTest(_EvalEnvMixin, unittest.TestCase):
 
             def send(self, text):
                 return {"ok": True, "result": "ok", "session_id": "SID-1"}
-        cowork._send(FakeSession(), "hello")
+        cowork._send(
+            FakeSession(), cowork._user_lead_delivery("hello"))
         data = state_store.read_role_identities(
             os.path.join(d, "identities.json"))
         self.assertEqual(data["scout"], {"tool": "claude",
@@ -12594,8 +12519,10 @@ class RoleIdentityRegistryTest(_EvalEnvMixin, unittest.TestCase):
         class BareFake:
             def send(self, text):
                 return None
-        cowork._send(WorktreeSession(), "x")
-        cowork._send(BareFake(), "x")
+        cowork._send(
+            WorktreeSession(), cowork._worktree_seed_delivery("x"))
+        cowork._send(
+            BareFake(), cowork._worktree_seed_delivery("x"))
         self.assertFalse(os.path.exists(os.path.join(d, "identities.json")))
 
 
@@ -12907,6 +12834,1778 @@ class MeasurabilityEvalCriteriaTest(unittest.TestCase):
               "criteria": cowork.EVAL_CRITERIA[("scout-reviewer", "scout")],
               "artifact_block": "INTEL"}])
         self.assertIn("goal measurability", prompt)
+
+
+# --------------------------------------------------------------------------- #
+# The one file-only transport: choke-point, sentinel, structural, accounting.  #
+# --------------------------------------------------------------------------- #
+
+import ast as _ast  # noqa: E402
+
+_COWORK_SRC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "cowork.py")
+_HANDOFF_SRC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "cowork_handoff.py")
+
+# Fixed instruction strings that ONLY the shared transport (cowork_handoff.py)
+# may emit into a cross-role prompt. If any of these appears as a string literal
+# in cowork.py, some function is building a cross-role prompt outside the choke
+# point — exactly what SC1 forbids.
+_CROSS_ROLE_PROSE = [
+    "[reviewer handoff]",
+    "[controller switch handoff]",
+    "New user context was provided",
+    "handed the work back",
+    "handed the work back to you",
+    "APPROVED the scout intel",
+    "APPROVED the plan",
+    "Read the reviewer's",
+    "read them from disk",
+]
+
+
+def _abs_tmp(text="{}", suffix=".json"):
+    import tempfile
+    fd, p = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    return p
+
+
+def _eval_test_block(path):
+    return handoff.render_handoff(
+        "eval->reviewer_verdict",
+        artifacts=[{"path": os.path.abspath(path), "kind": "json",
+                    "source": "verdict"}])
+
+
+def _is_body_param(name):
+    """Return whether a parameter explicitly denotes authored/body content."""
+    n = (name or "").lower()
+    if n in {"findings", "verdict", "body", "content", "reviewed_text",
+             "verdict_text", "verdict_json", "artifact_text", "artifact_body",
+             "handoff_body", "intel_body", "plan_body", "payload", "payload_text",
+             "note", "note_text", "question", "question_text"}:
+        return True
+    return (n.endswith("_body") or n.endswith("_payload")
+            or ("artifact" in n
+                and any(t in n for t in ("text", "body", "json"))))
+
+
+def _functions_embedding_a_body(source):
+    """Reusable ALL-functions analyzer (no allow-list): return the names of every
+    function in `source` that constructs a prompt STRING (via `+`, `%`, `.format`,
+    or an f-string) from a BODY-LIKE parameter WITHOUT that string being produced
+    by handoff.render_handoff.
+
+    Conservative parameter->string dataflow propagates through assignments and
+    aliases (`x = payload`, `x = f"{payload}"`). Explicit body parameters are
+    always tainted. In addition, every parameter of a function whose name says
+    it is a relay is tainted regardless of parameter name: relays are the
+    architectural cross-role boundary and may return only transport-rendered
+    content, never a bespoke interpolated prompt. It flags the SPECIFIC tainted
+    string-build, NOT the whole function — a function is never exempted merely
+    because it also calls render_handoff elsewhere.
+
+    Two defense-in-depth checks, neither of which exempts a whole function for
+    calling render_handoff:
+      A. RETURN-based (defense-in-depth): a tainted string-build that is
+         returned. USER-FACING text producers are excluded here (name ends in
+         `_gate_text`/`_suffix`/`_label`/`_text`/`_banner`), because they render
+         reviewer output into the terminal for the USER (orchestrator->user),
+         which the design permits.
+      B. raw `.send` calls outside the central gateway are rejected regardless
+         of names. The sound central-gateway guarantee is runtime
+         `DeliveryEnvelope` provenance, tested separately — not AST inference."""
+    tree = _ast.parse(source)
+    _UI_SUFFIXES = ("_gate_text", "_suffix", "_label", "_text", "_banner")
+
+    def is_string_build(node):
+        if isinstance(node, _ast.BinOp) and isinstance(node.op,
+                                                       (_ast.Add, _ast.Mod)):
+            return True
+        if isinstance(node, _ast.JoinedStr):          # f-string
+            return True
+        if (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)
+                and node.func.attr == "format"):
+            return True
+        return False
+
+    def names_in(node):
+        return {n.id for n in _ast.walk(node) if isinstance(n, _ast.Name)}
+
+    def is_render_handoff(node):
+        return (isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Attribute)
+                and node.func.attr == "render_handoff")
+
+    def is_transport_sanitizer(node):
+        """Whether this exact call returns a path-only transport value."""
+        return (is_render_handoff(node)
+                or (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Name)
+                    and node.func.id == "_handback_payload_artifact"))
+
+    def unsanitized_names(node):
+        """Names outside sanitizer-call subexpressions.
+
+        A sanitizer cleans only its own return value.  In
+        `render_handoff(...) + payload`, the call contributes no taint but the
+        sibling `payload` still does; the whole expression is never blessed
+        merely because it contains a sanitizer somewhere below it.
+        """
+        if is_transport_sanitizer(node):
+            return set()
+        found = {node.id} if isinstance(node, _ast.Name) else set()
+        for child in _ast.iter_child_nodes(node):
+            found.update(unsanitized_names(child))
+        return found
+
+    def is_direct_send(node):
+        return (isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Attribute)
+                and node.func.attr == "send")
+
+    def propagate_taint(fn, initial):
+        tainted = set(initial)
+        changed = True
+        while changed:
+            changed = False
+            for stmt in _ast.walk(fn):
+                target = None
+                targets = []
+                if isinstance(stmt, _ast.Assign) and stmt.value is not None:
+                    target, targets = stmt.value, stmt.targets
+                elif isinstance(stmt, _ast.AnnAssign) and stmt.value is not None:
+                    target, targets = stmt.value, [stmt.target]
+                elif isinstance(stmt, _ast.NamedExpr):
+                    target, targets = stmt.value, [stmt.target]
+                if target is None or not (unsanitized_names(target) & tainted):
+                    continue
+                for assignment_target in targets:
+                    for nm in (n.id for n in _ast.walk(assignment_target)
+                               if isinstance(n, _ast.Name)):
+                        if nm not in tainted:
+                            tainted.add(nm)
+                            changed = True
+        return tainted
+
+    flagged = []
+    for fn in _ast.walk(tree):
+        if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+        a = fn.args
+        params = list(a.args + a.kwonlyargs + a.posonlyargs)
+        boundary_name = fn.name.lower()
+        prompt_boundary = any(word in boundary_name
+                              for word in ("relay", "dispatch", "forward"))
+        body_initial = {p.arg for p in params
+                        if prompt_boundary or _is_body_param(p.arg)}
+        if a.vararg and (prompt_boundary or _is_body_param(a.vararg.arg)):
+            body_initial.add(a.vararg.arg)
+        if a.kwarg and (prompt_boundary or _is_body_param(a.kwarg.arg)):
+            body_initial.add(a.kwarg.arg)
+        taint = propagate_taint(fn, body_initial)
+
+        # Remember variables that hold a tainted constructed string, including
+        # aliases of such variables, so `x = "Relay: " + payload; return x`
+        # is equivalent to returning the concatenation directly.
+        def constructed_string_vars(origin_taint):
+            found = set()
+            changed = True
+            while changed:
+                changed = False
+                for stmt in _ast.walk(fn):
+                    if not isinstance(stmt, (_ast.Assign, _ast.AnnAssign)):
+                        continue
+                    value = stmt.value
+                    if value is None:
+                        continue
+                    value_names = unsanitized_names(value)
+                    constructed = (
+                        any(is_string_build(n) for n in _ast.walk(value))
+                        and bool(value_names & origin_taint))
+                    aliased = bool(value_names & found)
+                    if not (constructed or aliased):
+                        continue
+                    targets = (stmt.targets if isinstance(stmt, _ast.Assign)
+                               else [stmt.target])
+                    for target in targets:
+                        for nm in (n.id for n in _ast.walk(target)
+                                   if isinstance(n, _ast.Name)):
+                            if nm not in found:
+                                found.add(nm)
+                                changed = True
+            return found
+
+        tainted_strings = constructed_string_vars(taint)
+        hit = False
+        if fn.name != "_send":
+            for node in _ast.walk(fn):
+                if not is_direct_send(node):
+                    continue
+                # The controller's raw `.send` is private to `_send`.  Forbid
+                # every other direct call unconditionally, so locally sourced
+                # authored text (not just parameter-origin taint) cannot create
+                # a second delivery gateway.
+                hit = True
+                break
+        # Check A (RETURN-based, defense-in-depth): a returned tainted
+        # string-build, unless this is a user-facing text producer.
+        if not hit and not fn.name.endswith(_UI_SUFFIXES):
+            for ret in _ast.walk(fn):
+                if not (isinstance(ret, _ast.Return) and ret.value is not None):
+                    continue
+                if names_in(ret.value) & tainted_strings:
+                    hit = True
+                    break
+                for node in _ast.walk(ret.value):
+                    if (is_string_build(node) and (names_in(node) & taint)
+                            and not is_render_handoff(node)):
+                        hit = True
+                        break
+                if hit:
+                    break
+        if hit:
+            flagged.append(fn.name)
+    return flagged
+
+
+class TransportChokePointTests(unittest.TestCase):
+    """SC1: every registry edge resolves through render_handoff, and no cross-
+    role prompt is emitted outside the single choke point."""
+
+    def _edge_artifacts(self, spec):
+        # Supply exactly the REQUIRED sources for an edge (plus one declared
+        # source when nothing is strictly required, e.g. the switch edge) so the
+        # choke point's source-cardinality enforcement is satisfied.
+        srcs = list(spec["required"]) or list(spec["sources"][:1])
+        return [{"label": s, "path": _abs_tmp(), "kind": "json", "source": s}
+                for s in srcs]
+
+    def _edge_facts(self, spec):
+        vals = {"team": ["scout"], "role": "scout", "phase": "scouting",
+                "from_controller": "claude", "to_controller": "codex",
+                "artifact_noun": "intel", "reason_code": "reviewer_failure",
+                "source_code": "gate"}
+        return {k: vals[k] for k in spec["facts"]}
+
+    def _edge_ctx(self, spec):
+        # Only "repos" has a simple always-valid value; context_update_prefix is
+        # optional, so leave it out.
+        return {"repos": []} if "repos" in (spec.get("ctx_keys") or ()) else None
+
+    def test_every_edge_resolves_and_supplies_its_required_sources(self):
+        # Enumerate EVERY registered edge and assert render_handoff resolves it
+        # into a HandoffBlock (the single renderer) when its REQUIRED sources are
+        # supplied — and that every required source's file path is present.
+        for edge_id, spec in handoff.EDGES.items():
+            arts = self._edge_artifacts(spec)
+            block = handoff.render_handoff(
+                edge_id, artifacts=arts, facts=self._edge_facts(spec),
+                ctx=self._edge_ctx(spec))
+            self.assertIsInstance(block, handoff.HandoffBlock)
+            self.assertEqual(block.edge_id, edge_id)
+            self.assertEqual(block.delivery, "path")
+            for a in arts:                       # every supplied path is present
+                self.assertIn(a["path"], block)
+
+    def test_missing_required_source_fails_closed(self):
+        # Every edge with a required source rejects a render that omits it (or
+        # supplies only an unrelated one) — SC1/SC2 fail closed on structure.
+        for edge_id, spec in handoff.EDGES.items():
+            if not spec["required"]:
+                continue
+            with self.assertRaises(handoff.MissingSourceError):
+                handoff.render_handoff(edge_id, artifacts=[],
+                                       facts=self._edge_facts(spec),
+                                       ctx=self._edge_ctx(spec))
+
+    def test_undeclared_source_is_rejected(self):
+        with self.assertRaises(handoff.MissingSourceError):
+            handoff.render_handoff(
+                "scout->planner:seed",
+                artifacts=[{"label": "x", "path": _abs_tmp(), "kind": "json",
+                            "source": "not_a_declared_source"}])
+
+    def test_route4_declares_and_requires_plan_and_both_intel_files(self):
+        spec = handoff.EDGES["planner->planning-advisor:review_ctx"]
+        # Multi-source AND per-file cardinality: both plan halves AND BOTH
+        # approved scout intel files (scout.intel.json + scout.intel.md) are
+        # required slots (decision 6 / SC2 name both intel files explicitly).
+        for s in ("context", "plan_json", "plan_md", "intel_json", "intel_md"):
+            self.assertIn(s, spec["sources"])
+            self.assertIn(s, spec["required"])
+
+    def test_route4_rejects_missing_intel_markdown(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        pj, pm, ij = (os.path.join(d, n) for n in
+                      ("plan.json", "plan.md", "scout.intel.json"))
+        for p in (pj, pm, ij):
+            with open(p, "w") as fh:
+                fh.write("{}")
+        # missing intel_md_path -> the route fails closed (per-file cardinality).
+        with self.assertRaises(handoff.MissingSourceError):
+            cowork.assemble_advisor_context(
+                "ctx", ["planner"], pj, pm, intel_path=ij, intel_md_path=None)
+
+    def test_peer_evaluation_edges_are_registered(self):
+        # Route 12 has real EDGES entries (verdict + consumed upstream), so eval
+        # evidence goes THROUGH render_handoff, not a bespoke renderer.
+        self.assertIn("eval->reviewer_verdict", handoff.EDGES)
+        self.assertIn("eval->upstream", handoff.EDGES)
+        self.assertEqual(
+            handoff.EDGES["eval->reviewer_verdict"]["required"], ["verdict"])
+
+    def test_unknown_edge_fails_closed(self):
+        with self.assertRaises(handoff.UnknownEdgeError):
+            handoff.render_handoff("no->such:edge", artifacts=[])
+
+    def test_no_cross_role_prose_literal_lives_in_cowork_py(self):
+        # AST/source inventory over ALL of cowork.py: every cross-role prompt
+        # instruction now lives in the transport registry, so none of the fixed
+        # cross-role prose may appear as a literal in cowork.py. A newly added
+        # bespoke builder that hardcodes cross-role prose is caught here.
+        src = Path(_COWORK_SRC_PATH).read_text()
+        for phrase in _CROSS_ROLE_PROSE:
+            self.assertNotIn(
+                phrase, src,
+                "cross-role prose %r must live in cowork_handoff.py, not "
+                "cowork.py (build it via render_handoff)" % phrase)
+        # ...and it DOES live in the transport module (sanity: the prose moved,
+        # it was not merely deleted).
+        hsrc = Path(_HANDOFF_SRC_PATH).read_text()
+        for phrase in ("[reviewer handoff]", "[controller switch handoff]",
+                       "New user context was provided"):
+            self.assertIn(phrase, hsrc)
+
+    # Every `handoff.<attr>` that cowork.py is ALLOWED to reference. Contains
+    # exactly ONE prompt renderer — render_handoff. If a new alternate renderer
+    # is added to the transport and used here, this set won't cover it and the
+    # full-module scan below fails.
+    _ALLOWED_HANDOFF_ATTRS = {
+        "render_handoff",           # THE only renderer
+        "compose_handoff_blocks",   # trusted block composer
+        "build_diff_recipe",        # content-free recipe sub-component (a str)
+        "persist_context_file", "persist_pending_turn_file",
+        "persist_switch_recovery_file", "persist_build_baseline_file",
+        "is_content_free_token", "_write_file", "SWITCH_HANDOFF_MARKER",
+        "HandoffBlock", "DeliveryEnvelope", "cross_role_delivery",
+        "direct_delivery", "_initial_user_text", "_static_role_text",
+        "_user_lead_reply", "STATIC_SEPARATOR", "FULL_REREAD_INSTRUCTION", "EDGES",
+        "ROLE_REGISTRY", "selectable_roles", "reviewer_pairs",
+        "validate_role_topology",
+        "MissingSourceError", "ContentFreeError", "ContextError",
+        "RelativePathError", "UnknownEdgeError",
+    }
+
+    def _render_handoff_edge_literals(self, tree):
+        # Every string edge_id literal passed as the 1st arg to a render_handoff
+        # call ANYWHERE in cowork.py (full-module call-site scan).
+        used = set()
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == "render_handoff"
+                    and node.args
+                    and isinstance(node.args[0], _ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                used.add(node.args[0].value)
+        return used
+
+    def test_render_handoff_is_the_only_transport_renderer(self):
+        # Full-module scan (NOT an allow-list of function names): every
+        # `handoff.<attr>` referenced ANYWHERE in cowork.py must be in the
+        # allow-list, which contains exactly one renderer (render_handoff). The
+        # deleted second renderer (build_full_reread_packet) must not reappear.
+        src = Path(_COWORK_SRC_PATH).read_text()
+        self.assertNotIn("build_full_reread_packet", src)
+        tree = _ast.parse(src)
+        used_attrs = set()
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Attribute)
+                    and isinstance(node.value, _ast.Name)
+                    and node.value.id == "handoff"):
+                used_attrs.add(node.attr)
+        rogue = used_attrs - self._ALLOWED_HANDOFF_ATTRS
+        self.assertEqual(
+            rogue, set(),
+            "cowork.py references undeclared transport attrs %s — a new alternate "
+            "renderer/helper must be reviewed (render_handoff is the only "
+            "renderer)" % sorted(rogue))
+        renderers = {a for a in used_attrs if a.endswith("render_handoff")}
+        self.assertEqual(renderers, {"render_handoff"})
+
+    def test_registry_live_route_matrix(self):
+        # Registry-driven bidirectional matrix over ALL render_handoff call sites:
+        # (a) every edge_id used in cowork.py is REGISTERED (no bespoke/unknown
+        #     edge can be rendered — a newly named role/edge in code without a
+        #     registry entry is caught here, and would also raise UnknownEdgeError
+        #     at runtime); (b) every REGISTERED edge is actually wired live in
+        #     cowork.py (no orphan edge silently bypasses coverage).
+        tree = _ast.parse(Path(_COWORK_SRC_PATH).read_text())
+        used = self._render_handoff_edge_literals(tree)
+        registered = set(handoff.EDGES)
+        self.assertEqual(
+            used - registered, set(),
+            "cowork.py renders unregistered edge(s): %s" % sorted(used - registered))
+        self.assertEqual(
+            registered - used, set(),
+            "registered edge(s) never rendered live in cowork.py: %s"
+            % sorted(registered - used))
+
+    def test_a_new_unregistered_edge_cannot_be_rendered(self):
+        # Regression: a newly named function/role that tries to render an edge
+        # the registry doesn't declare fails closed at the choke point.
+        with self.assertRaises(handoff.UnknownEdgeError):
+            handoff.render_handoff("newrole->other:made_up", artifacts=[])
+
+    def test_no_function_embeds_a_body_and_synthetic_bypass_is_caught(self):
+        # (a) The reusable ALL-functions analyzer finds NO function in cowork.py
+        # that builds a prompt from a body-like parameter (every body rides by
+        # path through render_handoff).
+        src = Path(_COWORK_SRC_PATH).read_text()
+        self.assertEqual(
+            _functions_embedding_a_body(src), [],
+            "a function embeds a body-like param into a prompt string")
+        # (b) PROVE arbitrary parameter names, aliases, and f-strings cannot
+        # evade the scan. These are the regressions the fixed-phrase /
+        # handoff-attr / render-call scans could not catch.
+        probes = [
+            ("artifact_text", "relay_to_new_agent",
+             "def relay_to_new_agent(artifact_text):\n"
+             "    return \"Review this candidate: \" + artifact_text\n"),
+            ("arbitrary payload name", "relay_to_new_agent",
+             "def relay_to_new_agent(payload):\n"
+             "    return \"Relay: \" + payload\n"),
+            ("alias", "relay_to_new_agent",
+             "def relay_to_new_agent(artifact_text):\n"
+             "    x = artifact_text\n"
+             "    return \"Relay: \" + x\n"),
+            ("f-string alias", "relay_to_new_agent",
+             "def relay_to_new_agent(value):\n"
+             "    alias = value\n"
+             "    return f\"Relay: {alias}\"\n"),
+            ("sanitizer plus tainted sibling", "relay_to_new_agent",
+             "def relay_to_new_agent(payload):\n"
+             "    x = handoff.render_handoff('edge') + payload\n"
+             "    return x\n"),
+            ("name-independent direct send", "dispatch",
+             "def dispatch(session, value):\n"
+             "    session.send(\"Relay: \" + value)\n"),
+            ("local source direct send", "deliver",
+             "def deliver(session):\n"
+             "    value = get_authored_body()\n"
+             "    session.send(\"Relay: \" + value)\n"),
+            ("dispatch return boundary", "dispatch",
+             "def dispatch(value):\n"
+             "    return \"Relay: \" + value\n"),
+        ]
+        for label, expected, probe in probes:
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _functions_embedding_a_body(src + "\n\n" + probe))
+
+    def test_role_pair_registry_is_tied_to_the_handoff_topology(self):
+        self.assertTrue(handoff.validate_role_topology())
+        self.assertEqual(cowork.ROLES, handoff.selectable_roles())
+        self.assertEqual(cowork._REVIEWER_EVALUATEE,
+                         handoff.reviewer_pairs())
+
+    def test_a_new_pair_without_edges_is_detected(self):
+        registry = dict(handoff.ROLE_REGISTRY)
+        registry["newlead"] = {"order": 20, "reviewer": "newreviewer"}
+        registry["newreviewer"] = {"order": 21, "reviews": "newlead"}
+        with self.assertRaisesRegex(ValueError, "no topology edge"):
+            handoff.validate_role_topology(registry)
+
+    def test_a_new_role_requires_edges_or_non_handoff_classification(self):
+        registry = dict(handoff.ROLE_REGISTRY)
+        registry["newrole"] = {"order": 20}
+        with self.assertRaisesRegex(ValueError, "no topology edge"):
+            handoff.validate_role_topology(registry)
+        registry["newrole"] = {"order": 20, "non_handoff": True}
+        self.assertTrue(handoff.validate_role_topology(registry))
+
+    def test_send_gateway_requires_opaque_transport_provenance(self):
+        class Session:
+            def send(self, _text, meta=None):
+                raise AssertionError("raw delivery reached controller")
+
+        forged = [
+            {"prompt_kind": "eval", "artifacts": None},
+            {"prompt_kind": "eval", "artifacts": "not-accounting"},
+            {"prompt_kind": object(), "artifacts": None},
+        ]
+        for meta in forged:
+            with self.subTest(meta=meta):
+                with self.assertRaisesRegex(TypeError, "DeliveryEnvelope"):
+                    cowork._send(Session(), "AUTHORED BODY", meta=meta)
+        local_authored = "Relay: " + "LOCAL AUTHORED BODY"
+        with self.assertRaisesRegex(TypeError, "DeliveryEnvelope"):
+            cowork._send(Session(), local_authored, meta={})
+        with self.assertRaises(TypeError):
+            handoff.DeliveryEnvelope("forged")
+        with self.assertRaises(TypeError):
+            handoff.HandoffBlock(
+                "FORGED_BLOCK_BODY",
+                edge_id="eval->reviewer_verdict", descriptors=[])
+        with self.assertRaises(TypeError):
+            handoff.direct_delivery("SMUGGLED CROSS-ROLE BODY")
+        valid_path = _abs_tmp("{}")
+        self.addCleanup(
+            lambda: os.path.exists(valid_path) and os.remove(valid_path))
+        valid = handoff.render_handoff(
+            "eval->reviewer_verdict",
+            artifacts=[{"path": valid_path, "kind": "json",
+                        "source": "verdict"}])
+        with self.assertRaises(TypeError):
+            handoff.cross_role_delivery("SMUGGLED SIBLING BODY", valid)
+        with self.assertRaisesRegex(TypeError, "lacks typed"):
+            cowork._lead_turn_delivery("SMUGGLED BESPOKE STRING")
+
+    def test_gateway_artifacts_derive_from_cross_role_envelope(self):
+        p = _abs_tmp("{}")
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        block = handoff.render_handoff(
+            "eval->reviewer_verdict",
+            artifacts=[{"path": p, "kind": "json", "source": "verdict"}])
+        envelope = cowork._cross_delivery(str(block), [block])
+        seen = {}
+
+        class Session:
+            def send(self, _text, meta=None):
+                seen["meta"] = meta
+                return {"ok": True, "result": "ok"}
+
+        cowork._send(
+            Session(), envelope,
+            meta={"artifacts": [{"path": "FORGED"}],
+                  "prompt_kind": "eval"})
+        self.assertEqual(seen["meta"]["artifacts"], envelope.descriptors)
+        self.assertNotIn({"path": "FORGED"}, seen["meta"]["artifacts"])
+
+    def test_delivery_factories_are_limited_to_boundary_wrappers(self):
+        tree = _ast.parse(Path(_COWORK_SRC_PATH).read_text())
+        allowed = {
+            "_initial_user_text": {"_initial_user_delivery"},
+            "_static_role_text": {
+                "_closed_static_delivery", "_codex_static_prefix_fragment",
+                "_cross_delivery", "_headless_lead_fragment",
+                "_repo_discovery_fragment",
+            },
+            "_user_lead_reply": {"_user_lead_delivery"},
+            "direct_delivery": {
+                "_initial_user_delivery", "_closed_static_delivery",
+                "_user_lead_delivery",
+            },
+            "cross_role_delivery": {"_cross_delivery"},
+        }
+        seen = {name: set() for name in allowed}
+        for fn in _ast.walk(tree):
+            if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            for call in _ast.walk(fn):
+                if not (isinstance(call, _ast.Call)
+                        and isinstance(call.func, _ast.Attribute)
+                        and isinstance(call.func.value, _ast.Name)
+                        and call.func.value.id == "handoff"):
+                    continue
+                name = call.func.attr
+                if name in allowed:
+                    seen[name].add(fn.name)
+        for name, callers in seen.items():
+            self.assertEqual(
+                callers, allowed[name],
+                "%s may only be called by approved boundary wrappers" % name)
+        cross_callers = set()
+        for fn in _ast.walk(tree):
+            if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            if any(isinstance(call, _ast.Call)
+                   and isinstance(call.func, _ast.Name)
+                   and call.func.id == "_cross_delivery"
+                   for call in _ast.walk(fn)):
+                cross_callers.add(fn.name)
+        self.assertEqual(
+            cross_callers,
+            {"_role_seed_delivery", "_lead_turn_delivery", "_eval_delivery",
+             "run_reviewer_once"})
+
+        wrapper_callers = {
+            "_closed_static_delivery": {
+                "_worktree_seed_delivery", "_repair_delivery",
+                "_missing_question_delivery", "_headless_nudge_delivery",
+                "_handoff_declined_delivery",
+            },
+            "_worktree_seed_delivery": {"run_worktree"},
+            "_repair_delivery": {"_role_loop"},
+            "_missing_question_delivery": {"_role_loop"},
+            "_headless_nudge_delivery": {"_role_loop"},
+            "_handoff_declined_delivery": {"_role_loop"},
+            "_codex_static_prefix_fragment": {"assemble_codex_prompt"},
+            "_headless_lead_fragment": {"run_flow", "with_headless_lead"},
+            "_repo_discovery_fragment": {"run_flow"},
+        }
+        actual = {name: set() for name in wrapper_callers}
+        for fn in _ast.walk(tree):
+            if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            for call in _ast.walk(fn):
+                if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Name):
+                    if call.func.id in actual:
+                        actual[call.func.id].add(fn.name)
+        self.assertEqual(actual, wrapper_callers)
+
+        boundary_callers = {
+            "_initial_user_delivery": {"_role_seed_delivery", "_role_loop"},
+            "_user_lead_delivery": {"_role_loop"},
+            "_role_seed_delivery": {
+                "assemble_codex_prompt", "run_scout", "run_planner",
+                "run_builder",
+            },
+            "_lead_turn_delivery": {"_role_loop"},
+            "_eval_delivery": {
+                "_make_evaluate_fn", "evaluate_fn", "_run_reviewer_eval"},
+        }
+        boundary_actual = {name: set() for name in boundary_callers}
+        for fn in _ast.walk(tree):
+            if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            for call in _ast.walk(fn):
+                if (isinstance(call, _ast.Call)
+                        and isinstance(call.func, _ast.Name)
+                        and call.func.id in boundary_actual):
+                    boundary_actual[call.func.id].add(fn.name)
+        self.assertEqual(boundary_actual, boundary_callers)
+
+        known_wrappers = set(wrapper_callers) | {
+            "_initial_user_delivery", "_user_lead_delivery",
+            "_cross_delivery", "_eval_delivery", "_lead_turn_delivery",
+            "_role_seed_delivery",
+        }
+
+        def rogue_delivery_calls(candidate_tree):
+            rogue = []
+            for fn in _ast.walk(candidate_tree):
+                if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    continue
+                for call in _ast.walk(fn):
+                    if (isinstance(call, _ast.Call)
+                            and isinstance(call.func, _ast.Name)
+                            and call.func.id.endswith("_delivery")
+                            and call.func.id not in known_wrappers):
+                        rogue.append((fn.name, call.func.id))
+            return rogue
+
+        self.assertEqual(rogue_delivery_calls(tree), [])
+        synthetic = (
+            Path(_COWORK_SRC_PATH).read_text()
+            + "\n\ndef new_role(session, shared_context_or_artifact_body):\n"
+              "    _send(session, "
+              "_static_role_delivery(shared_context_or_artifact_body))\n")
+        rogue = rogue_delivery_calls(_ast.parse(synthetic))
+        self.assertIn(("new_role", "_static_role_delivery"), rogue)
+
+        boundary_synthetic = (
+            Path(_COWORK_SRC_PATH).read_text()
+            + "\n\ndef new_role(shared_context_or_artifact_body):\n"
+              "    _user_lead_delivery(shared_context_or_artifact_body)\n"
+              "    _role_seed_delivery('brief', "
+              "shared_context_or_artifact_body)\n")
+        boundary_tree = _ast.parse(boundary_synthetic)
+        boundary_seen = {name: set() for name in boundary_callers}
+        for fn in _ast.walk(boundary_tree):
+            if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            for call in _ast.walk(fn):
+                if (isinstance(call, _ast.Call)
+                        and isinstance(call.func, _ast.Name)
+                        and call.func.id in boundary_seen):
+                    boundary_seen[call.func.id].add(fn.name)
+        self.assertIn("new_role",
+                      boundary_seen["_user_lead_delivery"]
+                      - boundary_callers["_user_lead_delivery"])
+        self.assertIn("new_role",
+                      boundary_seen["_role_seed_delivery"]
+                      - boundary_callers["_role_seed_delivery"])
+
+    def test_cross_role_envelope_retains_edge_and_descriptor_provenance(self):
+        p = _abs_tmp("{}")
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        block = handoff.render_handoff(
+            "eval->reviewer_verdict",
+            artifacts=[{"path": p, "kind": "json", "source": "verdict"}])
+        static_part = handoff._static_role_text("static + ")
+        envelope = handoff.cross_role_delivery(static_part, block)
+        self.assertEqual(envelope.delivery_class, "cross_role")
+        self.assertEqual(envelope.edge_ids, ("eval->reviewer_verdict",))
+        self.assertEqual(envelope.descriptors, block.descriptors)
+
+
+class SentinelTransportTests(unittest.TestCase):
+    """SC2: a marker planted in each body kind is ABSENT from every cross-role
+    prompt; the required ABSOLUTE path(s) are PRESENT; structural fail-closed."""
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.d, ignore_errors=True))
+
+    def _f(self, name, text):
+        p = os.path.join(self.d, name)
+        with open(p, "w") as fh:
+            fh.write(text)
+        return p
+
+    def test_reviewer_context_context_is_path_only(self):
+        intel = self._f("scout.intel.json", "{}")
+        ctx = cowork.assemble_reviewer_context(
+            "MARK_SHARED_CONTEXT", ["scout"], intel, assets_dir=self.d,
+            context_revision=1)
+        self.assertNotIn("MARK_SHARED_CONTEXT", ctx)
+        self.assertIn(intel, ctx)
+        self.assertIn(os.path.join(self.d, "context.rev1.md"), ctx)
+
+    def test_reviewer_handoff_findings_are_path_only(self):
+        review = self._f("scout-review.json",
+                         json.dumps({"findings": ["MARK_FINDING"],
+                                     "user_question": "MARK_QUESTION"}))
+        for verdict in ("revise", "needs_user"):
+            out = cowork.assemble_reviewer_handoff(
+                verdict, {"findings": ["MARK_FINDING"],
+                          "user_question": "MARK_QUESTION"},
+                review_path=review)
+            self.assertNotIn("MARK_FINDING", out)
+            self.assertNotIn("MARK_QUESTION", out)
+            self.assertIn(review, out)
+
+    def test_advisor_context_multi_source_paths_present_context_absent(self):
+        pj = self._f("plan.json", "{}")
+        pm = self._f("plan.md", "# plan")
+        ij = self._f("scout.intel.json", "{}")
+        im = self._f("scout.intel.md", "# intel")
+        ctx = cowork.assemble_advisor_context(
+            "MARK_CTX", ["planner"], pj, pm, intel_path=ij, intel_md_path=im,
+            assets_dir=self.d, context_revision=2)
+        self.assertNotIn("MARK_CTX", ctx)
+        for p in (pj, pm, ij, im):          # multi-source: plan AND intel paths
+            self.assertIn(p, ctx)
+
+    def test_build_reviewer_context_bodies_are_path_only(self):
+        pj = self._f("plan.json", "{}")
+        pm = self._f("plan.md", "# plan")
+        status = self._f("builder.status.json", "{}")
+        summary = self._f("builder.summary.md", "MARK_SUMMARY")
+        ctx = cowork.assemble_build_reviewer_context(
+            "MARK_CTX", ["builder"], pj, pm, status,
+            build_summary_path=summary, assets_dir=self.d, context_revision=1)
+        self.assertNotIn("MARK_CTX", ctx)
+        self.assertNotIn("MARK_SUMMARY", ctx)
+        for p in (pj, status, summary):
+            self.assertIn(p, ctx)
+
+    def test_handback_wakes_are_path_only(self):
+        s = cowork.handoff_wake_block("MARK_PAYLOAD_A", self.d)
+        self.assertNotIn("MARK_PAYLOAD_A", s)
+        self.assertIn(os.path.join(self.d, "handback.scout.txt"), s)
+        p = cowork.plan_handback_wake_block("MARK_PAYLOAD_B", self.d)
+        self.assertNotIn("MARK_PAYLOAD_B", p)
+        self.assertIn(os.path.join(self.d, "handback.planner.txt"), p)
+
+    def test_context_update_is_path_only(self):
+        block = cowork.context_update_block("MARK_CTX", self.d, 5)
+        self.assertNotIn("MARK_CTX", block)
+        self.assertIn(os.path.join(self.d, "context.rev5.md"), block)
+
+    def test_switch_bodies_are_path_only_facts_are_inline(self):
+        art = self._f("scout.intel.json", "MARK_ARTIFACT_BODY")
+        note = cowork.switch_handoff_packet(
+            "planner", "planning",
+            {"from_controller": "claude", "to_controller": "codex",
+             "reason": "a free form multi word reason", "source": "gate"},
+            artifact_paths=[art], shared_context="MARK_SHARED",
+            pending_turn="MARK_PENDING_TURN", assets_dir=self.d)
+        # every body kind rides by path, absent from the prompt
+        self.assertNotIn("MARK_ARTIFACT_BODY", note)
+        self.assertNotIn("MARK_SHARED", note)
+        self.assertNotIn("MARK_PENDING_TURN", note)
+        self.assertNotIn("a free form multi word reason", note)  # free-form -> file
+        self.assertIn(art, note)                                 # artifact path
+        self.assertIn("switch.pending_turn.planner.txt", note)   # pending by path
+        self.assertIn("switch.recovery.planner.txt", note)       # reason by path
+        # closed-schema facts DO ride inline
+        self.assertIn("planning", note)
+        self.assertIn("claude -> codex", note)
+        self.assertIn("gate", note)                              # normalized code
+
+    def test_eval_verdict_is_path_only(self):
+        # Route 12 through the REGISTERED edge: the verdict body is absent, its
+        # path present. Exercised via render_handoff (the real renderer), and via
+        # the actual eval-assembly path (assemble_eval_prompt).
+        review = self._f("review.json", json.dumps({"verdict": "MARK_VERDICT"}))
+        block = handoff.render_handoff(
+            "eval->reviewer_verdict",
+            artifacts=[{"label": "verdict", "path": review, "kind": "json",
+                        "source": "verdict"}])
+        self.assertEqual(block.edge_id, "eval->reviewer_verdict")
+        self.assertNotIn("MARK_VERDICT", block)
+        self.assertIn(review, block)
+        prompt = cowork.assemble_eval_prompt(
+            "planner", os.path.join(self.d, "eval.json"),
+            [{"evaluatee": "planning-advisor", "criteria": ["x"],
+              "artifact_block": block}])
+        self.assertNotIn("MARK_VERDICT", prompt)   # body absent from real prompt
+        self.assertIn(review, prompt)              # path present
+
+    def test_eval_upstream_is_path_only(self):
+        # The second route-12 edge (consumed-upstream evidence) is likewise
+        # path-only through the registered edge.
+        intel = self._f("scout.intel.json", json.dumps({"x": "MARK_UPSTREAM"}))
+        block = handoff.render_handoff(
+            "eval->upstream",
+            artifacts=[{"label": "scout intel", "path": intel, "kind": "json",
+                        "source": "upstream"}])
+        self.assertEqual(block.edge_id, "eval->upstream")
+        self.assertNotIn("MARK_UPSTREAM", block)
+        self.assertIn(intel, block)
+
+    def test_untagged_artifact_is_rejected(self):
+        # SC1/SC2 fail closed: an artifact with no source cannot ride any edge.
+        intel = self._f("scout.intel.json", "{}")
+        with self.assertRaises(handoff.MissingSourceError):
+            handoff.render_handoff(
+                "scout->planner:seed",
+                artifacts=[{"label": "x", "path": intel, "kind": "json"}])
+
+    def test_partial_multi_file_source_is_rejected(self):
+        # Per-file cardinality: shipping only plan_json to an edge that requires
+        # BOTH plan halves is rejected (set-presence would have let it pass).
+        pj = self._f("plan.json", "{}")
+        with self.assertRaises(handoff.MissingSourceError):
+            handoff.render_handoff(
+                "planner->builder:seed",
+                artifacts=[{"label": "plan json", "path": pj, "kind": "json",
+                            "source": "plan_json"}])   # plan_md missing
+        # and the build-reviewer edge rejects a missing status/baseline path
+        pm = self._f("plan.md", "# p")
+        with self.assertRaises(handoff.MissingSourceError):
+            handoff.render_handoff(
+                "builder->build-reviewer:review_resume",
+                artifacts=[{"label": "pj", "path": pj, "kind": "json",
+                            "source": "plan_json"},
+                           {"label": "pm", "path": pm, "kind": "markdown",
+                            "source": "plan_md"}],   # build_status/baseline missing
+                facts={"team": []}, ctx={"repos": []})
+
+    def test_seed_context_is_path_only(self):
+        # Both cross-role seeds (scout->planner, planner->builder) carry the
+        # shared context by PATH — NOT inline. Only the original user->scout
+        # prompt inlines user text.
+        intel = self._f("scout.intel.json", "{}")
+        seed = cowork.assemble_planner_seed(
+            intel, "MARK_SEED_CONTEXT", assets_dir=self.d, context_revision=1)
+        self.assertNotIn("MARK_SEED_CONTEXT", seed)   # context NOT inline
+        self.assertIn(intel, seed)
+        self.assertIn(os.path.join(self.d, "context.rev1.md"), seed)
+        pj = self._f("plan.json", "{}")
+        pm = self._f("plan.md", "# p")
+        bseed = cowork.assemble_builder_seed(
+            pj, pm, "MARK_SEED_CONTEXT2", assets_dir=self.d, context_revision=2)
+        self.assertNotIn("MARK_SEED_CONTEXT2", bseed)
+        self.assertIn(pj, bseed)
+        self.assertIn(os.path.join(self.d, "context.rev2.md"), bseed)
+
+    def test_relative_path_rejected_absolute_missing_degrades(self):
+        with self.assertRaises(handoff.RelativePathError):
+            handoff.render_handoff(
+                "context->update",
+                artifacts=[{"label": "x", "path": "rel/path.md",
+                            "kind": "markdown", "source": "context"}])
+        # absolute-but-missing degrades to a "(missing on disk)" descriptor
+        block = handoff.render_handoff(
+            "context->update",
+            artifacts=[{"label": "x", "path": os.path.join(self.d, "nope.md"),
+                        "kind": "markdown", "source": "context"}])
+        self.assertIn("(missing on disk)", block)
+
+    def test_free_form_fact_value_rejected(self):
+        ctxf = self._f("context.rev1.md", "ctx")
+        intel = self._f("scout.intel.json", "{}")
+        arts = [{"path": ctxf, "kind": "markdown", "source": "context"},
+                {"path": intel, "kind": "json", "source": "intel_json"}]
+        with self.assertRaises(handoff.ContentFreeError):
+            handoff.render_handoff(
+                "scout->scout-reviewer:review_ctx", artifacts=arts,
+                facts={"team": ["scout", "a free-form authored value"]})
+
+    def test_unknown_one_token_team_role_raises(self):
+        # Probe case: a single-token value that is NOT a real role (would pass a
+        # naive token check) is rejected by the closed per-key enum schema.
+        ctxf = self._f("context.rev1.md", "ctx")
+        intel = self._f("scout.intel.json", "{}")
+        arts = [{"path": ctxf, "kind": "markdown", "source": "context"},
+                {"path": intel, "kind": "json", "source": "intel_json"}]
+        with self.assertRaises(handoff.ContentFreeError):
+            handoff.render_handoff(
+                "scout->scout-reviewer:review_ctx", artifacts=arts,
+                facts={"team": ["not-a-real-role"]})
+
+    def test_caller_supplied_label_cannot_appear_in_the_prompt(self):
+        # Probe case: labels are registry-owned; a body smuggled as an artifact
+        # `label` never reaches the emitted prompt.
+        ctxf = self._f("context.rev1.md", "ctx")
+        block = handoff.render_handoff(
+            "context->update",
+            artifacts=[{"label": "SMUGGLED_BODY_VIA_LABEL", "path": ctxf,
+                        "kind": "markdown", "source": "context"}])
+        self.assertNotIn("SMUGGLED_BODY_VIA_LABEL", block)
+        self.assertIn(ctxf, block)
+
+    def test_undeclared_ctx_key_raises(self):
+        # Probe case: an undeclared ctx key (a body-smuggle vector) is rejected.
+        ctxf = self._f("context.rev1.md", "ctx")
+        with self.assertRaises(handoff.ContextError):
+            handoff.render_handoff(
+                "context->update",
+                artifacts=[{"path": ctxf, "kind": "markdown",
+                            "source": "context"}],
+                ctx={"evil_body": "Review this: <secret>"})
+
+    def test_free_form_ctx_value_raises(self):
+        # Probe case: a declared ctx key with an ill-typed / free-form value is
+        # rejected — a context-update prefix must be a HandoffBlock, and `repos`
+        # must be validated {abs path, bool} metadata, never free text.
+        intel = self._f("scout.intel.json", "{}")
+        with self.assertRaises(handoff.ContextError):
+            handoff.render_handoff(
+                "scout->scout-reviewer:review_resume",
+                artifacts=[{"path": intel, "kind": "json",
+                            "source": "intel_json"}],
+                facts={"team": []},
+                ctx={"context_update_prefix": "NOT A HANDOFFBLOCK"})
+        pj = self._f("plan.json", "{}")
+        pm = self._f("plan.md", "# p")
+        status = self._f("s.json", "{}")
+        base = self._f("b.txt", "b")
+        arts = [{"path": pj, "kind": "json", "source": "plan_json"},
+                {"path": pm, "kind": "markdown", "source": "plan_md"},
+                {"path": status, "kind": "json", "source": "build_status"},
+                {"path": base, "kind": "markdown", "source": "build_baseline"}]
+        with self.assertRaises(handoff.ContextError):
+            handoff.render_handoff(
+                "builder->build-reviewer:review_resume", artifacts=arts,
+                facts={"team": []},
+                ctx={"repos": "rm -rf / ; not repo metadata"})
+
+
+class NoEmbedStructuralTests(unittest.TestCase):
+    """SC3: no cross-role builder splices a body into its prompt string, and the
+    diff/snapshot machinery is gone."""
+
+    def test_no_body_is_spliced_into_any_render_handoff_call(self):
+        # Full call-site scan (NOT an allow-list of function names): NO
+        # render_handoff call ANYWHERE in cowork.py may pass a `_read_text(...)`
+        # result (a file BODY) inside its artifacts/facts/ctx. The transport
+        # carries paths; a body read into an argument would defeat that.
+        tree = _ast.parse(Path(_COWORK_SRC_PATH).read_text())
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == "render_handoff"):
+                for sub in _ast.walk(node):
+                    if (isinstance(sub, _ast.Call)
+                            and isinstance(sub.func, _ast.Name)
+                            and sub.func.id == "_read_text"):
+                        self.fail("a render_handoff call splices _read_text(body) "
+                                  "into its arguments — bodies must ride by path")
+
+    def test_diffpacket_module_is_gone(self):
+        with self.assertRaises(ImportError):
+            __import__("cowork_diffpacket")
+
+    def test_no_diff_snapshot_machinery_in_transport(self):
+        for attr in ("build_review_packet", "DIFF_INSTRUCTION",
+                     "DEFAULT_DIFF_LINE_CAP", "_snapshot_path",
+                     "_store_snapshot"):
+            self.assertFalse(hasattr(handoff, attr),
+                             "diff/snapshot symbol %r must not exist" % attr)
+
+
+class AccountingDerivationTests(unittest.TestCase):
+    """SC5: trace + report/eval accounting derive from the SAME handoff object
+    the prompt is built from, not a re-inferred packet form."""
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.d, ignore_errors=True))
+
+    def test_handoff_block_carries_its_own_descriptors(self):
+        intel = os.path.join(self.d, "scout.intel.json")
+        with open(intel, "w") as fh:
+            fh.write('{"a": 1}')
+        block = cowork.assemble_reviewer_context(
+            "ctx", ["scout"], intel, assets_dir=self.d, context_revision=1)
+        # The block exposes the content-free descriptor records the prompt was
+        # built from — one per artifact, all "path" delivery, small embedded.
+        self.assertTrue(block.descriptors)
+        paths = [d["path"] for d in block.descriptors]
+        self.assertIn(intel, paths)
+        for d in block.descriptors:
+            self.assertEqual(d["delivery"], "path")
+            self.assertIn("sha256", d)
+            self.assertIn("bytes", d)
+            self.assertLess(d["embedded_bytes"], 1024)
+
+    def test_trace_meta_is_the_same_object_descriptors(self):
+        # run_reviewer_once tags the turn's artifact descriptors from the SAME
+        # HandoffBlock it sent as the prompt — not a second _artifact_descriptors
+        # pass that re-reads files.
+        intel = os.path.join(self.d, "scout.intel.json")
+        with open(intel, "w") as fh:
+            fh.write('{"a": 1}')
+        review = os.path.join(self.d, "review.json")
+        captured = {}
+
+        class Fake:
+            def send(self, text, meta=None):
+                captured["meta"] = meta
+                captured["text"] = text
+
+            def close(self):
+                pass
+
+        cfg = {cowork.SCOUT_REVIEWER: {"controller": "claude",
+                                       "mode": "plan", "yolo": True}}
+        cowork.run_reviewer_once(
+            cfg, "ctx", [cowork.SCOUT_REVIEWER], intel, review,
+            session_factory=lambda c, io: Fake(),
+            reviewer_role=cowork.SCOUT_REVIEWER, extra_writable_dir=self.d,
+            phase="scouting", context_revision=1)
+        # The reviewed intel path is described, tagged path-first with a
+        # descriptor-line embedded byte count (never the full body).
+        arts = captured["meta"]["artifacts"]
+        recs = {a["path"]: a for a in arts}
+        self.assertIn(intel, recs)
+        for a in arts:
+            self.assertEqual(a["delivery"], "path")
+            self.assertNotEqual(a["embedded_bytes"], a["bytes"])
+
+    def test_report_counts_path_delivery_from_descriptors(self):
+        # The report aggregates the same descriptor records without re-inferring.
+        summary = cowork_report.summarize_trace([
+            {"event": "controller.turn.start", "role": "scout-reviewer",
+             "controller": "claude", "prompt_kind": "reviewer_pass",
+             "prompt_bytes": 100, "fresh": True,
+             "artifacts": [{"path": "/a/intel.json", "bytes": 500,
+                            "delivery": "path", "embedded_bytes": 80}]},
+        ])
+        db = summary["delivery_breakdown"]
+        self.assertIn("path", db)
+        self.assertEqual(db["path"]["embedded"], 80)
+        self.assertEqual(db["path"]["touched"], 500)
+
+    class _EvalFake:
+        def __init__(self):
+            self.io_out = io.StringIO()
+            self.metas = []
+
+        def send(self, text, meta=None):
+            self.metas.append(meta)
+            return {"ok": True, "result": "ok"}
+
+        def close(self):
+            pass
+
+    def _wire_eval(self, role="scout", reviewer=None, phase="scouting",
+                   consumed_upstream=None, review_path=None):
+        reviewer = reviewer or cowork.SCOUT_REVIEWER
+        scratch = os.path.join(self.d, "eval.%s.json" % role)
+        scores = os.path.join(self.d, "scores.json")
+        return cowork._make_evaluate_fn(
+            role, reviewer, phase, scratch, scores, "S",
+            consumed_upstream=consumed_upstream, review_path=review_path)
+
+    def test_eval_send_verdict_only_accounts_the_verdict_file(self):
+        # Route-12 SC5: a verdict-only eval turn's meta artifacts derive from the
+        # verdict HandoffBlock — the review file is present (not None as before).
+        review = os.path.join(self.d, "review.json")
+        with open(review, "w") as fh:
+            fh.write(json.dumps({"verdict": "approve"}))
+        fn = self._wire_eval(review_path=review)
+        sess = self._EvalFake()
+        fn(sess, {"verdict": "approve"}, 2)
+        arts = sess.metas[0]["artifacts"]
+        self.assertIsNotNone(arts)               # was None pre-fix
+        paths = [a["path"] for a in arts]
+        self.assertIn(os.path.abspath(review), paths)
+        for a in arts:
+            self.assertEqual(a["delivery"], "path")
+            self.assertIn("sha256", a)
+
+    def test_eval_send_verdict_plus_upstream_accounts_both(self):
+        # Route-12 SC5: when the round-1 consumed-upstream bundle rides, the meta
+        # aggregates BOTH the verdict file and the upstream file descriptors from
+        # the two HandoffBlocks — not a separate re-read of only the upstream.
+        # The planner evaluating the advisor consumes the scout intel upstream.
+        review = os.path.join(self.d, "review.json")
+        intel = os.path.join(self.d, "scout.intel.json")
+        for p, b in ((review, '{"verdict": "revise"}'), (intel, '{"x": 1}')):
+            with open(p, "w") as fh:
+                fh.write(b)
+        consumed = {"role": "scout", "label": "scout intel",
+                    "artifact_paths": [intel], "epoch_field": "planning_epoch",
+                    "epoch_value": 1, "context": "consumed-intel"}
+        fn = self._wire_eval(role="planner", reviewer=cowork.PLANNING_ADVISOR,
+                             phase="planning", consumed_upstream=consumed,
+                             review_path=review)
+        sess = self._EvalFake()
+        fn(sess, {"verdict": "revise"}, 1)       # round 1 -> bundle rides
+        arts = sess.metas[0]["artifacts"]
+        paths = [a["path"] for a in arts]
+        self.assertIn(os.path.abspath(review), paths)   # verdict file
+        self.assertIn(intel, paths)                     # upstream file
+        for a in arts:
+            self.assertEqual(a["delivery"], "path")
+
+    def test_fresh_and_resumed_e2e_trace_descriptors_are_identical_and_zero_embedded(self):
+        # Fresh run + resumed run e2e: role.send.start and matching controller.turn.start
+        # carry IDENTICAL descriptors, and all path-only descriptors have embedded_bytes == 0.
+        plan_json = os.path.join(self.d, "planner.plan.json")
+        plan_md = os.path.join(self.d, "planner.plan.md")
+        status_path = os.path.join(self.d, "builder.status.json")
+        summary_path = os.path.join(self.d, "builder.summary.md")
+        review_path = os.path.join(self.d, "builder-review.json")
+        ctx_file = os.path.join(self.d, "context.rev0.md")
+
+        for p, body in (
+            (plan_json, '{"result": {}}'),
+            (plan_md, '# plan'),
+            (status_path, json.dumps({"status": "ready_for_review", "result": {}})),
+            (summary_path, '# summary'),
+            (review_path, json.dumps({"verdict": "approve", "findings": []})),
+            (ctx_file, '# context'),
+        ):
+            with open(p, "w") as fh:
+                fh.write(body)
+
+        trace_log = os.path.join(self.d, "trace.jsonl")
+        trace = trace_store.Trace(trace_log, session_uuid="X", run_id="R")
+
+        class FakeBridgeSession:
+            controller = "claude"
+            speaker = "builder"
+
+            def __init__(self, tr, writes=None):
+                self.trace = tr
+                self.sent = []
+                self.writes = list(writes or [])
+
+            def send(self, text, meta=None):
+                self.sent.append(text)
+                fields = {"controller": "claude", "role": self.speaker}
+                fields.update(trace_store.prompt_meta(text))
+                if meta:
+                    fields.update({k: v for k, v in meta.items() if v is not None})
+                self.trace.event("controller.turn.start", **fields)
+                if self.writes:
+                    w = self.writes.pop(0)
+                    with open(status_path, "w") as fh:
+                        json.dump(w, fh)
+                return {"ok": True, "result": "ok"}
+
+            def close(self):
+                pass
+
+        # 1. Fresh turn
+        seed = cowork.assemble_builder_seed(plan_json, plan_md, "fresh goal", assets_dir=self.d, context_revision=0)
+        sess1 = FakeBridgeSession(trace, writes=[{"status": "ready_for_review", "result": {"v": 1}}])
+        rc1, outcome1, _ = cowork._role_loop(
+            sess1, seed, status_path, context="", seed_artifact_paths=[plan_json, plan_md],
+            io_in=io.StringIO(""), io_out=io.StringIO(), role="builder", trace=trace,
+            is_resume=False)
+        self.assertEqual(rc1, 0)
+
+        # 2. Resumed turn
+        seed_res = cowork.assemble_builder_seed(plan_json, plan_md, "resumed goal", assets_dir=self.d, context_revision=0)
+        sess2 = FakeBridgeSession(trace, writes=[{"status": "ready_for_review", "result": {"v": 2}}])
+        rc2, outcome2, _ = cowork._role_loop(
+            sess2, seed_res, status_path, context="", seed_artifact_paths=[plan_json, plan_md],
+            io_in=io.StringIO(""), io_out=io.StringIO(), role="builder", trace=trace,
+            is_resume=True)
+        self.assertEqual(rc2, 0)
+
+        # Read trace events
+        with open(trace_log, "r") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+
+        role_sends = [e for e in events if e.get("event") == "role.send.start"]
+        ctrl_starts = [e for e in events if e.get("event") == "controller.turn.start"]
+
+        self.assertEqual(len(role_sends), 2)
+        self.assertEqual(len(ctrl_starts), 2)
+
+        for rs, cs in zip(role_sends, ctrl_starts):
+            self.assertEqual(rs["artifacts"], cs["artifacts"])
+            self.assertTrue(len(rs["artifacts"]) > 0)
+            for art in rs["artifacts"]:
+                if art.get("delivery") == "path":
+                    self.assertEqual(art["embedded_bytes"], 0)
+
+    def test_genuine_process_boundary_end_exit_replay_once_and_clear_on_success(self):
+        # Requirement: Real Python subprocess boundary test verifying:
+        # Failure -> choose End/exit -> new process resume -> replay once -> subsequent resume does not replay.
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        spath = os.path.join(d, ".cowork", "session.json")
+        suid = "subprocess-boundary-uuid"
+        state_store.ensure_session(spath, None, suid)
+        state_store.save_phase(spath, "building")
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+
+        plan_json = os.path.join(intel_dir, "planner.plan.json")
+        plan_md = os.path.join(intel_dir, "planner.plan.md")
+        build_status = os.path.join(intel_dir, "builder.status.json")
+        with open(plan_json, "w") as fh:
+            fh.write('{"result": {}}')
+        with open(plan_md, "w") as fh:
+            fh.write("# plan")
+        with open(build_status, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+
+        direct_request = "Clean up temp files from previous run"
+
+        # --- PROCESS 1 (Subprocess): Send fails -> choose End/exit ---
+        p1_code = f"""
+import sys, os, json, io
+sys.path.insert(0, '{_HERE}')
+import cowork, cowork_state as state_store
+
+spath = {json.dumps(spath)}
+build_status = {json.dumps(build_status)}
+direct_request = {json.dumps(direct_request)}
+
+class FailingSession:
+    controller = "claude"
+    def send(self, text, meta=None):
+        return {{"ok": False, "result": "error", "error_type": "rate_limit"}}
+    def close(self): pass
+
+def fake_run_builder(config, context, selected, **kwargs):
+    sess = FailingSession()
+    on_outcome = kwargs.get("on_outcome")
+    save_pending_turn_fn = kwargs.get("save_pending_turn_fn")
+    rc, outcome, payload = cowork._role_loop(
+        sess, direct_request, build_status, context="",
+        io_in=io.StringIO("end\\n"), io_out=io.StringIO(),
+        role="builder", save_pending_turn_fn=save_pending_turn_fn,
+        spath=spath)
+    if on_outcome:
+        on_outcome(outcome, payload)
+    return rc
+
+args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+rc = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
+sys.exit(rc)
+"""
+        proc1 = subprocess.run([sys.executable, "-c", p1_code], capture_output=True, text=True)
+        self.assertEqual(proc1.returncode, 0)
+
+        # VERIFY PROCESS 1 DISK STATE: pending_turn was persisted BEFORE process exit on choosing End!
+        disk_state_p1 = state_store.load(spath)
+        pending_p1 = state_store.read_pending_switch(disk_state_p1, "builder")
+        self.assertIsNotNone(pending_p1)
+        self.assertEqual(pending_p1.get("pending_turn"), direct_request)
+
+        # --- PROCESS 2 (Subprocess): Fresh Python process resumes -> replays once & succeeds ---
+        p2_log = os.path.join(d, "p2_sent.txt")
+        p2_code = f"""
+import sys, os, json, io
+sys.path.insert(0, '{_HERE}')
+import cowork, cowork_state as state_store
+
+spath = {json.dumps(spath)}
+build_status = {json.dumps(build_status)}
+log_path = {json.dumps(p2_log)}
+
+class SuccessfulSession:
+    controller = "claude"
+    def send(self, text, meta=None):
+        with open(log_path, "a") as fh:
+            fh.write(str(text) + "\\n---END_SEND---\\n")
+        return {{"ok": True, "result": "ok"}}
+    def close(self): pass
+
+def fake_run_builder(config, context, selected, **kwargs):
+    sess = SuccessfulSession()
+    on_outcome = kwargs.get("on_outcome")
+    on_first_send_accepted = kwargs.get("on_first_send_accepted")
+    save_pending_turn_fn = kwargs.get("save_pending_turn_fn")
+    rc, outcome, payload = cowork._role_loop(
+        sess, context, build_status, context="",
+        io_in=io.StringIO(""), io_out=io.StringIO(),
+        role="builder", on_first_send_accepted=on_first_send_accepted,
+        save_pending_turn_fn=save_pending_turn_fn,
+        spath=spath)
+    if on_outcome:
+        on_outcome(outcome, payload)
+    return rc
+
+args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+rc = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
+sys.exit(rc)
+"""
+        proc2 = subprocess.run([sys.executable, "-c", p2_code], capture_output=True, text=True)
+        self.assertEqual(proc2.returncode, 0)
+
+        # VERIFY PROCESS 2 REPLAY BY PATH:
+        self.assertTrue(os.path.exists(p2_log))
+        with open(p2_log, "r") as fh:
+            p2_sent_text = fh.read()
+        self.assertIn("switch.pending_turn.builder.txt", p2_sent_text)
+
+        # VERIFY PROCESS 2 CLEARANCE: pending_turn cleared from spath on success!
+        disk_state_p2 = state_store.load(spath)
+        pending_p2 = state_store.read_pending_switch(disk_state_p2, "builder")
+        self.assertIsNone(pending_p2)
+
+        # --- PROCESS 3 (Subprocess): Subsequent resume does NOT replay the pending turn ---
+        p3_log = os.path.join(d, "p3_sent.txt")
+        p3_code = f"""
+import sys, os, json, io
+sys.path.insert(0, '{_HERE}')
+import cowork, cowork_state as state_store
+
+spath = {json.dumps(spath)}
+build_status = {json.dumps(build_status)}
+log_path = {json.dumps(p3_log)}
+
+class SuccessfulSession:
+    controller = "claude"
+    def send(self, text, meta=None):
+        with open(log_path, "a") as fh:
+            fh.write(str(text) + "\\n---END_SEND---\\n")
+        return {{"ok": True, "result": "ok"}}
+    def close(self): pass
+
+def fake_run_builder(config, context, selected, **kwargs):
+    sess = SuccessfulSession()
+    on_outcome = kwargs.get("on_outcome")
+    rc, outcome, payload = cowork._role_loop(
+        sess, context, build_status, context="",
+        io_in=io.StringIO(""), io_out=io.StringIO(),
+        role="builder", spath=spath)
+    if on_outcome:
+        on_outcome(outcome, payload)
+    return rc
+
+args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+rc = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
+sys.exit(rc)
+"""
+        proc3 = subprocess.run([sys.executable, "-c", p3_code], capture_output=True, text=True)
+        self.assertEqual(proc3.returncode, 0)
+
+        if os.path.exists(p3_log):
+            with open(p3_log, "r") as fh:
+                p3_sent_text = fh.read()
+            self.assertNotIn("switch.pending_turn.builder.txt", p3_sent_text)
+
+    def test_failure_retry_failure_performs_two_failed_sends_and_retains(self):
+        # Requirement: failure->retry->failure performs TWO failed sends and retains pending_turn.
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        spath = os.path.join(d, ".cowork", "session.json")
+        suid = "retry-failed-twice-uuid"
+        state_store.ensure_session(spath, None, suid)
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+        build_status = os.path.join(intel_dir, "builder.status.json")
+        with open(build_status, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+
+        direct_request = "Retry task"
+        sends = []
+
+        class FailingSession:
+            controller = "claude"
+            def send(self, text, meta=None):
+                sends.append(text)
+                return {"ok": False, "result": "error", "error_type": "rate_limit"}
+            def close(self): pass
+
+        rc, outcome, payload = cowork._role_loop(
+            FailingSession(), direct_request, build_status, context="",
+            io_in=io.StringIO("retry\nend\n"), io_out=io.StringIO(),
+            role="builder", spath=spath)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "ended")
+        # ASSERT SEND COUNT IS EXACTLY TWO
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(str(sends[0]), direct_request)
+        self.assertEqual(str(sends[1]), direct_request)
+
+        # ASSERT DISK RETAINS PENDING TURN
+        disk_state = state_store.load(spath)
+        pending = state_store.read_pending_switch(disk_state, "builder")
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.get("pending_turn"), direct_request)
+
+    def test_initial_success_later_failure_retry_success_performs_three_sends_and_clears(self):
+        # Requirement: initial success -> later failure -> retry success performs THREE sends total
+        # and clears pending_turn; a following process does not replay it.
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        spath = os.path.join(d, ".cowork", "session.json")
+        suid = "three-sends-uuid"
+        state_store.ensure_session(spath, None, suid)
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+        build_status = os.path.join(intel_dir, "builder.status.json")
+        with open(build_status, "w") as fh:
+            json.dump({"status": "ready_for_review", "result": {}}, fh)
+
+        sends = []
+
+        class SequenceSession:
+            controller = "claude"
+            def __init__(self):
+                self.count = 0
+            def send(self, text, meta=None):
+                sends.append(text)
+                self.count += 1
+                if self.count == 1:
+                    # Send 1: Initial turn succeeds
+                    return {"ok": True, "result": "ok"}
+                elif self.count == 2:
+                    # Send 2: Later direct turn fails
+                    return {"ok": False, "result": "error", "error_type": "rate_limit"}
+                else:
+                    # Send 3: Retry send succeeds and writes ready_for_review
+                    with open(build_status, "w") as fh:
+                        json.dump({"status": "ready_for_review", "result": {"v": 2}}, fh)
+                    return {"ok": True, "result": "ok"}
+            def close(self): pass
+
+        sess = SequenceSession()
+        # Simulated user interaction:
+        # 1. Initial turn runs (succeeds). Status is ready_for_review.
+        # 2. User inputs "later direct request" -> sends (fails).
+        # 3. Failure gate: user selects "retry".
+        # 4. Retry sends "later direct request" -> succeeds.
+        # 5. Review gate off-TTY: blank line ("\n") approves -> finish.
+        inputs = "later direct request\nretry\n\n"
+
+        rc, outcome, payload = cowork._role_loop(
+            sess, "initial turn", build_status, context="",
+            io_in=io.StringIO(inputs), io_out=io.StringIO(),
+            role="builder", spath=spath)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "approved")
+        # ASSERT SEND COUNT IS EXACTLY THREE
+        self.assertEqual(len(sends), 3)
+
+        # ASSERT DISK CLEARS PENDING TURN
+        disk_state = state_store.load(spath)
+        pending = state_store.read_pending_switch(disk_state, "builder")
+        self.assertIsNone(pending)
+
+        # FOLLOWING PROCESS RESUME: does not replay
+        p2_sends = []
+        class ResumeSession:
+            controller = "claude"
+            def send(self, text, meta=None):
+                p2_sends.append(text)
+                return {"ok": True, "result": "ok"}
+            def close(self): pass
+
+        def fake_run_builder(config, context, selected, **kwargs):
+            r_sess = ResumeSession()
+            return cowork._role_loop(
+                r_sess, context, build_status, context="",
+                io_in=io.StringIO("approve\n"), io_out=io.StringIO(),
+                role="builder", spath=spath)[0]
+
+        args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+        state_store.save_phase(spath, "building")
+        rc2 = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
+        self.assertEqual(rc2, 0)
+
+        if p2_sends:
+            self.assertNotIn("switch.pending_turn.builder.txt", str(p2_sends[0]))
+
+    def test_failure_retry_success_leaves_needs_input_and_eof_returns_ended_and_clears(self):
+        # Requirement: failure -> Retry -> successful send leaves needs_input (or reaches input gate) -> EOF:
+        # Asserts exact send count (2 sends), outcome == "ended" (NOT None),
+        # pending_turn cleared from disk after successful retry send, and no replay on subsequent process resume.
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        spath = os.path.join(d, ".cowork", "session.json")
+        suid = "retry-needs-input-uuid"
+        state_store.ensure_session(spath, None, suid)
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+        build_status = os.path.join(intel_dir, "builder.status.json")
+        with open(build_status, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+
+        direct_request = "Incomplete task needing user input"
+        sends = []
+
+        class SequenceSession:
+            controller = "claude"
+            def __init__(self):
+                self.count = 0
+            def send(self, text, meta=None):
+                sends.append(text)
+                self.count += 1
+                if self.count == 1:
+                    # Send 1: Fails
+                    return {"ok": False, "result": "error", "error_type": "rate_limit"}
+                else:
+                    # Send 2: Retry send succeeds (status file remains needs_input)
+                    return {"ok": True, "result": "ok"}
+            def close(self): pass
+
+        sess = SequenceSession()
+        # Input sequence:
+        # 1. Failure gate: user inputs "retry\n".
+        # 2. Retry send runs and succeeds. Status is needs_input.
+        # 3. needs_input gate: user inputs EOF ("\n" or "") -> _read_turn returns _END.
+        inputs = "retry\n\n"
+
+        rc, outcome, payload = cowork._role_loop(
+            sess, direct_request, build_status, context="",
+            io_in=io.StringIO(inputs), io_out=io.StringIO(),
+            role="builder", spath=spath)
+
+        # 1. Assert return code and outcome is "ended" (NOT None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "ended")
+
+        # 2. Assert exact send count is TWO (Send 1 failed, Send 2 retry succeeded)
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(str(sends[0]), direct_request)
+        self.assertEqual(str(sends[1]), direct_request)
+
+        # 3. Assert pending_turn was CLEARED from disk after successful accepted retry send
+        disk_state = state_store.load(spath)
+        pending = state_store.read_pending_switch(disk_state, "builder")
+        self.assertIsNone(pending)
+
+        # 4. Assert following process resume does NOT replay the accepted turn
+        p2_sends = []
+        class ResumeSession:
+            controller = "claude"
+            def send(self, text, meta=None):
+                p2_sends.append(text)
+                return {"ok": True, "result": "ok"}
+            def close(self): pass
+
+        def fake_run_builder(config, context, selected, **kwargs):
+            r_sess = ResumeSession()
+            return cowork._role_loop(
+                r_sess, context, build_status, context="",
+                io_in=io.StringIO(""), io_out=io.StringIO(),
+                role="builder", spath=spath)[0]
+
+        args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+        state_store.save_phase(spath, "building")
+        rc2 = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
+        self.assertEqual(rc2, 0)
+
+        if p2_sends:
+            self.assertNotIn("switch.pending_turn.builder.txt", str(p2_sends[0]))
+
+    def test_e2e_switch_plus_seed_preserves_provenance(self):
+        # Requirement: switch+seed composition preserves HandoffBlock provenance,
+        # passes cross_role DeliveryEnvelope, carries both edge IDs, deduplicates paths,
+        # and role.send.start artifacts exactly equal controller.turn.start artifacts.
+        suid = "switch-seed-uuid"
+        spath = os.path.join(self.d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+
+        plan_json = os.path.join(intel_dir, "planner.plan.json")
+        plan_md = os.path.join(intel_dir, "planner.plan.md")
+        build_status = os.path.join(intel_dir, "builder.status.json")
+        ctx_file = os.path.join(intel_dir, "context.rev1.md")
+        for p, b in ((plan_json, '{"result": {}}'), (plan_md, '# plan'),
+                     (build_status, json.dumps({"status": "ready_for_review", "result": {}})),
+                     (ctx_file, '# context')):
+            with open(p, "w") as fh: fh.write(b)
+
+        # Switch block + Builder seed block
+        ps = {"from_controller": "claude", "to_controller": "opencode", "reason": "cli"}
+        switch_pkt = cowork.switch_handoff_packet(
+            "builder", "building", ps,
+            artifact_paths=[plan_json, plan_md, build_status],
+            shared_context="Shared Goal", assets_dir=intel_dir, context_revision=1)
+
+        seed = cowork.assemble_builder_seed(plan_json, plan_md, "Shared Goal", assets_dir=intel_dir, context_revision=1)
+
+        composed = (
+            handoff.compose_handoff_blocks(
+                switch_pkt, handoff.STATIC_SEPARATOR, seed)
+            if switch_pkt else seed)
+        brief = cowork.assemble_builder_brief(build_status)
+        envelope = cowork._role_seed_delivery(brief, composed)
+
+        # Assert final envelope is cross_role
+        self.assertEqual(envelope.delivery_class, "cross_role")
+        self.assertIn("controller->switch", envelope.edge_ids)
+        self.assertIn("planner->builder:seed", envelope.edge_ids)
+
+        # Assert every delivered path appears exactly once in descriptors
+        paths = [d["path"] for d in envelope.descriptors]
+        self.assertEqual(len(paths), len(set(paths)), "descriptors contain duplicate paths: %s" % paths)
+
+        # Assert role.send.start artifacts exactly equal controller.turn.start
+        trace_log = os.path.join(self.d, "trace.jsonl")
+        trace = trace_store.Trace(trace_log, session_uuid=suid, run_id="R")
+
+        captured = {}
+        class FakeSess:
+            controller = "opencode"
+            speaker = "builder"
+            def send(self, text, meta=None):
+                captured["meta"] = meta
+                trace.event("controller.turn.start", controller="opencode", role="builder", **(meta or {}))
+                return {"ok": True, "result": "ok"}
+            def close(self): pass
+
+        rc, outcome, _ = cowork._role_loop(
+            FakeSess(), envelope, build_status, context="",
+            io_in=io.StringIO(""), io_out=io.StringIO(),
+            role="builder", trace=trace)
+
+        self.assertEqual(rc, 0)
+        with open(trace_log, "r") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+
+        rs = [e for e in events if e.get("event") == "role.send.start"][0]
+        cs = [e for e in events if e.get("event") == "controller.turn.start"][0]
+        self.assertEqual(rs["artifacts"], cs["artifacts"])
+
+    def test_e2e_context_update_plus_reviewer_resume_scout_and_build(self):
+        # Requirement: context-update + reviewer resume for scout-reviewer and build-reviewer
+        # carries both edge IDs and includes context.revX.md and artifacts in descriptors without duplicate paths.
+        suid = "rev-resume-uuid"
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+
+        intel_json = os.path.join(intel_dir, "scout.intel.json")
+        intel_md = os.path.join(intel_dir, "scout.intel.md")
+        plan_json = os.path.join(intel_dir, "planner.plan.json")
+        plan_md = os.path.join(intel_dir, "planner.plan.md")
+        build_status = os.path.join(intel_dir, "builder.status.json")
+        ctx_file = os.path.join(intel_dir, "context.rev3.md")
+        for p, b in ((intel_json, '{"a": 1}'), (intel_md, '# intel'),
+                     (plan_json, '{"b": 2}'), (plan_md, '# plan'),
+                     (build_status, '{"status": "ready_for_review"}'),
+                     (ctx_file, '# rev 3 context')):
+            with open(p, "w") as fh: fh.write(b)
+
+        # 1. Scout Reviewer Resume with context update
+        scout_rev_block = cowork.assemble_reviewer_resume_context(
+            intel_json, intel_md, context_update="Updated context text",
+            assets_dir=intel_dir, context_revision=3)
+
+        self.assertIn("context->update", getattr(scout_rev_block, "edge_ids", ()))
+        self.assertIn("scout->scout-reviewer:review_resume", getattr(scout_rev_block, "edge_ids", ()))
+
+        scout_paths = [d["path"] for d in scout_rev_block.descriptors]
+        self.assertIn(ctx_file, scout_paths)
+        self.assertNotIn(os.path.join(intel_dir, "context.rev0.md"), scout_paths)
+        self.assertEqual(len(scout_paths), len(set(scout_paths)))
+
+        # 2. Build Reviewer Resume with context update
+        build_rev_block = cowork.assemble_build_reviewer_resume_context(
+            plan_json, plan_md, build_status, context_update="Updated context text",
+            assets_dir=intel_dir, context_revision=3)
+
+        self.assertIn("context->update", getattr(build_rev_block, "edge_ids", ()))
+        self.assertIn("builder->build-reviewer:review_resume", getattr(build_rev_block, "edge_ids", ()))
+
+        build_paths = [d["path"] for d in build_rev_block.descriptors]
+        self.assertIn(ctx_file, build_paths)
+        self.assertNotIn(os.path.join(intel_dir, "context.rev0.md"), build_paths)
+        self.assertEqual(len(build_paths), len(set(build_paths)))
+
+    def test_e2e_headless_seed_and_discovery_handback_provenance(self):
+        # Requirement: headless seed and discovery+handback composition preserve cross_role envelope provenance.
+        suid = "headless-disc-uuid"
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+        plan_json = os.path.join(intel_dir, "planner.plan.json")
+        plan_md = os.path.join(intel_dir, "planner.plan.md")
+        for p, b in ((plan_json, '{"result": {}}'), (plan_md, '# plan')):
+            with open(p, "w") as fh: fh.write(b)
+
+        # Headless seed
+        builder_seed = cowork.assemble_builder_seed(plan_json, plan_md, "Goal", assets_dir=intel_dir, context_revision=1)
+        composed_headless = handoff.compose_handoff_blocks(
+            cowork._headless_lead_fragment(),
+            handoff.STATIC_SEPARATOR,
+            builder_seed)
+        env1 = cowork._role_seed_delivery("brief", composed_headless)
+        self.assertEqual(env1.delivery_class, "cross_role")
+        self.assertIn("planner->builder:seed", env1.edge_ids)
+
+        # Discovery + Handback
+        wake = cowork.plan_handback_wake_block("re-investigate", intel_dir)
+        composed_discovery = handoff.compose_handoff_blocks(
+            cowork._repo_discovery_fragment([], intel_dir),
+            handoff.STATIC_SEPARATOR,
+            wake)
+        env2 = cowork._role_seed_delivery("scout brief", composed_discovery)
+        self.assertEqual(env2.delivery_class, "cross_role")
+        self.assertIn("builder->planner:handback_wake", env2.edge_ids)
+
+    def test_e2e_nonzero_revision_switch_uses_current_revision_and_deduplicates(self):
+        # Requirement: nonzero-revision switch uses current context revision (no rev0 fallback)
+        # and deduplicates overlapping plan/context paths.
+        suid = "nonzero-switch-uuid"
+        intel_dir = state_store.session_assets_dir(suid)
+        os.makedirs(intel_dir, exist_ok=True)
+
+        plan_json = os.path.join(intel_dir, "planner.plan.json")
+        plan_md = os.path.join(intel_dir, "planner.plan.md")
+        build_status = os.path.join(intel_dir, "builder.status.json")
+        ctx_file = os.path.join(intel_dir, "context.rev2.md")
+        for p, b in ((plan_json, '{"result": {}}'), (plan_md, '# plan'),
+                     (build_status, '{"status": "ready_for_review"}'),
+                     (ctx_file, '# rev 2 context')):
+            with open(p, "w") as fh: fh.write(b)
+
+        ps = {"from_controller": "claude", "to_controller": "opencode", "reason": "cli"}
+        switch_pkt = cowork.switch_handoff_packet(
+            "builder", "building", ps,
+            artifact_paths=[plan_json, plan_md, build_status],
+            shared_context="Context Rev 2 Text", assets_dir=intel_dir, context_revision=2)
+
+        self.assertIn("context.rev2.md", str(switch_pkt))
+        self.assertNotIn("context.rev0.md", str(switch_pkt))
+
+        seed = cowork.assemble_builder_seed(plan_json, plan_md, "Context Rev 2 Text", assets_dir=intel_dir, context_revision=2)
+        composed = handoff.compose_handoff_blocks(
+            switch_pkt, handoff.STATIC_SEPARATOR, seed)
+        env = cowork._role_seed_delivery("brief", composed)
+
+        self.assertEqual(env.delivery_class, "cross_role")
+        self.assertNotIn("context.rev0.md", str(env))
+
+        paths = [d["path"] for d in env.descriptors]
+        self.assertIn(ctx_file, paths)
+        self.assertEqual(len(paths), len(set(paths)), "overlapping paths were duplicated: %s" % paths)
 
 
 if __name__ == "__main__":

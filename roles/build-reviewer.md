@@ -43,9 +43,13 @@ files. For **each** named root:
   finding (the plan asks for X and nothing was done). **Ignore repos the plan
   does not list.**
 
-Read the shared context, BOTH plan artifacts (JSON + markdown), the builder's
-status JSON (its verification log), the builder's **summary markdown**
-(`builder.summary.md`, when provided), and the diff, then check:
+The shared context, BOTH plan artifacts (JSON + markdown), the builder's status
+JSON (its verification log), the builder's **summary markdown**
+(`builder.summary.md`, when provided), and the build-baseline metadata all reach
+you by **absolute path** (with size + hash), never pasted inline — read them from
+disk. (The working-tree **delta** is the exception: it is never a stored file;
+you capture it live yourself, per the recipe above, so it can never go stale.)
+With those files and the live delta, check:
 
 0. **Summary ↔ delta consistency.** The summary is the user's review surface for
    the build, so it must faithfully reflect what was actually done: flag anything

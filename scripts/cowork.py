@@ -30,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -42,7 +43,7 @@ import cowork_preflight as preflight  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_report  # noqa: E402
-import cowork_diffpacket as diffpacket  # noqa: E402
+import cowork_handoff as handoff  # noqa: E402
 import cowork_ui as ui  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -113,11 +114,11 @@ HEADLESS_NUDGE_CAP = 5
 # build-reviewer occupies the paired-reviewer slot the `revisor` name once
 # reserved; `revisor` is dropped (a future sequential plan-revisor would get a
 # new name).
-SCOUT_REVIEWER = "scout-reviewer"
-PLANNING_ADVISOR = "planning-advisor"
-BUILD_REVIEWER = "build-reviewer"
-ROLES = ["scout", SCOUT_REVIEWER, "planner", PLANNING_ADVISOR, "builder",
-         BUILD_REVIEWER]
+SCOUT_REVIEWER = handoff.ROLE_REGISTRY["scout"]["reviewer"]
+PLANNING_ADVISOR = handoff.ROLE_REGISTRY["planner"]["reviewer"]
+BUILD_REVIEWER = handoff.ROLE_REGISTRY["builder"]["reviewer"]
+ROLES = handoff.selectable_roles()
+handoff.validate_role_topology()
 
 # Hand-back contract: a user-facing role may set `status: "handoff_back"` (plus
 # a `handoff` payload) in its status file to hand the work back to its
@@ -949,7 +950,11 @@ def read_scout_prompt(path=SCOUT_PROMPT_PATH):
 
 
 def assemble_codex_prompt(role_text, team_note, context):
-    return "\n\n".join([role_text.strip(), team_note.strip(), context.strip()]).strip()
+    static_prefix = (str(role_text or "").strip() + ("\n\n" + str(team_note or "").strip() if str(team_note or "").strip() else "")).strip()
+    if isinstance(context, handoff.HandoffBlock):
+        static_part = _codex_static_prefix_fragment(role_text, team_note)
+        return handoff.compose_handoff_blocks(static_part, context)
+    return _role_seed_delivery(static_prefix, str(context) if context else "")
 
 
 def _emit_codex_role_prompt_bytes(trace, role, role_text):
@@ -1030,6 +1035,142 @@ def _record_role_identity(session, result=None):
         pass
 
 
+def _initial_user_delivery(text):
+    return handoff.direct_delivery(handoff._initial_user_text(text))
+
+
+def _closed_static_delivery(text):
+    """Low-level mint used only by purpose-specific static boundaries."""
+    return handoff.direct_delivery(handoff._static_role_text(text))
+
+
+def _codex_static_prefix_fragment(role_text, team_note):
+    """Typed static prefix for a fresh Codex role prompt."""
+    prefix = (
+        str(role_text or "").strip()
+        + ("\n\n" + str(team_note or "").strip()
+           if str(team_note or "").strip() else "")
+    ).strip()
+    return handoff._static_role_text(prefix + "\n\n")
+
+
+def _headless_lead_fragment():
+    """The one closed runtime note that may prefix a cross-role lead seed."""
+    return handoff._static_role_text(HEADLESS_LEAD_NOTE)
+
+
+def _repo_discovery_fragment(candidates, base):
+    """Typed standing repo-discovery instruction for scout turns."""
+    return handoff._static_role_text(
+        assemble_repo_discovery_note(candidates, base))
+
+
+def _worktree_seed_delivery(text):
+    return _closed_static_delivery(text)
+
+
+def _repair_delivery(artifact_noun):
+    return _closed_static_delivery(_repair_prompt(artifact_noun))
+
+
+def _missing_question_delivery(artifact_noun):
+    return _closed_static_delivery(
+        _missing_question_repair_prompt(artifact_noun))
+
+
+def _headless_nudge_delivery(artifact_noun):
+    return _closed_static_delivery(_headless_nudge_text(artifact_noun))
+
+
+def _handoff_declined_delivery(text_fn):
+    if text_fn not in (handoff_declined_text, handoff_declined_to_planner_text):
+        raise TypeError("handoff-declined text must use a closed static source")
+    return _closed_static_delivery(text_fn())
+
+
+def _user_lead_delivery(text):
+    return handoff.direct_delivery(handoff._user_lead_reply(text))
+
+
+def _is_known_static_fragment(s):
+    t = str(s or "").strip()
+    if not t:
+        return True
+    if getattr(s, "kind", None) == "static_role" or type(s).__name__ == "_BoundaryText":
+        return True
+    known_markers = (
+        HEADLESS_LEAD_NOTE, HEADLESS_REVIEWER_NOTE,
+    )
+    if any(t in str(k).strip() for k in known_markers if k):
+        return True
+    if ("private evaluation request" in t
+            or "Write your verdict" in t
+            or "scout for a cowork" in t
+            or "planner for a cowork" in t
+            or "builder for a cowork" in t
+            or "scout-reviewer" in t
+            or "planning-advisor" in t
+            or "build-reviewer" in t
+            or "declined" in t):
+        return True
+    return False
+
+
+def _cross_delivery(text, blocks, static_fragments=(), trust_static=False):
+    """Split exact rendered blocks from static instructions, then compose."""
+    parts = []
+    remainder = str(text)
+    trusted_static = {str(fragment) for fragment in static_fragments}
+    for block in blocks:
+        marker = str(block)
+        before, found, remainder = remainder.partition(marker)
+        if not found:
+            raise ValueError("delivered cross-role text omits its handoff block")
+        if before:
+            if (not trust_static
+                    and before not in trusted_static
+                    and not _is_known_static_fragment(before)):
+                raise TypeError("cannot mint static role fragment from arbitrary text: %r" % (before,))
+            parts.append(handoff._static_role_text(before))
+        parts.append(block)
+    if remainder:
+        if (not trust_static
+                and remainder not in trusted_static
+                and not _is_known_static_fragment(remainder)):
+            raise TypeError("cannot mint static role fragment from arbitrary text: %r" % (remainder,))
+        parts.append(handoff._static_role_text(remainder))
+    return handoff.cross_role_delivery(*parts)
+
+
+def _role_seed_delivery(brief, context):
+    """Compose a first role turn without losing handoff provenance."""
+    text = (str(brief or "") + "\n\n" + str(context or "")).strip()
+    if isinstance(context, handoff.HandoffBlock):
+        brief_prefix = (
+            str(brief).strip() + "\n\n" if str(brief or "").strip() else "")
+        return _cross_delivery(
+            text, [context], static_fragments=[brief_prefix])
+    return _initial_user_delivery(text)
+
+
+def _lead_turn_delivery(value):
+    """Classify one lead continuation through closed transport constructors."""
+    if isinstance(value, handoff.DeliveryEnvelope):
+        return value
+    if isinstance(value, handoff.HandoffBlock):
+        return _cross_delivery(str(value), [value])
+    raise TypeError("lead turn lacks typed user/static/handoff provenance")
+
+
+def _eval_delivery(prompt, specs):
+    blocks = [s.get("artifact_block") for s in specs or []
+              if isinstance(s.get("artifact_block"), handoff.HandoffBlock)]
+    # assemble_eval_prompt owns every byte outside the exact renderer blocks.
+    # _eval_delivery is an inventoried boundary, so those generated evaluation
+    # instructions are the permitted static fragments for this one envelope.
+    return _cross_delivery(prompt, blocks, trust_static=True)
+
+
 def _send(session, text, meta=None):
     """Send one turn, passing per-turn accounting `meta` (#1) only when the
     session's send() accepts it. Real bridge sessions do; test-injected fake
@@ -1037,7 +1178,20 @@ def _send(session, text, meta=None):
     so the streaming/test contract stays byte-identical.
 
     Every turn also refreshes the role-identity registry (tool/model/session
-    id) from the session + its result — see `_record_role_identity`."""
+    id) from the session + its result — see `_record_role_identity`.
+
+    The gateway accepts ONLY an opaque transport-produced DeliveryEnvelope:
+    either cross-role provenance originating in render_handoff, or one of the
+    closed direct-user/static constructors. Raw controller send remains private
+    to this function."""
+    if not isinstance(text, handoff.DeliveryEnvelope):
+        raise TypeError("_send requires a transport-produced DeliveryEnvelope")
+    if text.delivery_class == "cross_role":
+        # SC5 at the final gateway: controller-visible accounting comes from
+        # the same opaque envelope that supplies the delivered bytes. Caller
+        # metadata cannot forge, omit, or independently re-infer artifacts.
+        meta = dict(meta or {})
+        meta["artifacts"] = [dict(rec) for rec in text.descriptors]
     try:
         if meta is not None:
             try:
@@ -1156,125 +1310,120 @@ def _success_criteria_flag(intel_path):
 
 def _intel_artifacts(intel_path, intel_md_path=None):
     arts = [{"label": "intel JSON (machine source of truth)",
-             "path": intel_path, "kind": "json"}]
+             "path": intel_path, "kind": "json", "source": "intel_json"}]
     if intel_md_path:
         arts.append({"label": "intel markdown (the user's review surface)",
-                     "path": intel_md_path, "kind": "markdown"})
+                     "path": intel_md_path, "kind": "markdown",
+                     "source": "intel_md"})
     return arts
 
 
-def _review_packet(packet_ctx, artifacts, force_full_reread=False):
-    """Build the path-first embedded-artifact block via the diff-packet helper
-    (#4). `packet_ctx` carries {reviewer_role, epoch, context_revision,
-    snapshot_dir}; returns None when packet_ctx is absent (legacy full-embed
-    callers fall back to embedding bodies). The returned value is a
-    diffpacket.Packet (a str subclass) carrying its delivery mode + per-path
-    embedded bytes (#3)."""
-    if not packet_ctx:
-        return None
-    return diffpacket.build_review_packet(
-        packet_ctx["reviewer_role"], packet_ctx["epoch"],
-        packet_ctx["context_revision"], artifacts, packet_ctx["snapshot_dir"],
-        force_full_reread=force_full_reread)
+def _tempfile_artifact(text, label, kind="markdown", prefix="cowork_handoff_",
+                       suffix=".txt", source=None):
+    """Fallback: materialize `text` to a CONTENT-DETERMINISTIC path under the
+    system temp dir and return its descriptor artifact dict. Used when no
+    session-assets dir is available (direct calls/tests) so a cross-role prompt
+    is still path-only. The filename is keyed by a hash of (prefix, label, text)
+    so identical inputs always resolve to the SAME path — cross-run prompts stay
+    byte-stable (no random tmp suffix leaking into the prompt)."""
+    digest = hashlib.sha256(
+        ("%s\x1f%s\x1f%s" % (prefix, label, text or "")).encode("utf-8")
+    ).hexdigest()[:16]
+    path = os.path.join(tempfile.gettempdir(), "%s%s%s" % (prefix, digest, suffix))
+    try:
+        with open(path, "w") as fh:
+            fh.write(text or "")
+    except OSError:
+        pass
+    return {"label": label, "path": os.path.abspath(path), "kind": kind,
+            "source": source}
 
 
-def _carry_delivery(text, src):
-    """Wrap an assembled reviewer-context string so its caller can read how the
-    embedded artifacts were actually delivered (#3) without re-inferring the
-    packet form. `src` is the diffpacket.Packet the assembler spliced in (or an
-    already-wrapped body being re-prefixed with a context-update block);
-    delivery + per-path embedded bytes are copied off it. When `src` carries no
-    delivery (a legacy full-embed body — a plain str), the text is returned
-    unwrapped, so a caller reading getattr(block, "delivery", "embedded") sees
-    "embedded" there. Transparent as a plain str either way."""
-    delivery = getattr(src, "delivery", None)
-    if delivery is None:
-        return text
-    return diffpacket.Packet(text, delivery=delivery,
-                             embedded=getattr(src, "embedded", None))
+def _shared_context_artifact(context, assets_dir=None, revision=None):
+    """Materialize the shared session context to a revision-keyed authoritative
+    file and return its descriptor artifact dict (tagged source "context"), so a
+    cross-role prompt carries the context by PATH (never inline). Under a session
+    this writes to the session-assets dir; standalone (no dir — direct
+    calls/tests) it writes to a fresh tempfile. The prompt is always path-only
+    either way.
+
+    Tolerant: a write failure yields an artifact whose path still points at the
+    intended file, which the transport degrades to a "(missing on disk)"
+    descriptor — it never raises."""
+    label = "shared session context (same the reviewed role was given)"
+    path = handoff.persist_context_file(assets_dir, revision, context or "")
+    if path is None:
+        return _tempfile_artifact(context, label, kind="markdown",
+                                  prefix="cowork_context_", suffix=".md",
+                                  source="context")
+    return {"label": label, "path": os.path.abspath(path), "kind": "markdown",
+            "source": "context"}
+
+
+def _handback_payload_artifact(payload, assets_dir=None, filename=None,
+                               label="hand-back note", source="payload"):
+    """Materialize a hand-back payload (free-form authored text) to a file and
+    return its descriptor artifact dict (tagged `source`), so the edge carries it
+    by PATH."""
+    path = handoff._write_file(assets_dir, filename or "handback.txt",
+                               payload or "") if assets_dir else None
+    if path is None:
+        return _tempfile_artifact(payload, label, kind="markdown",
+                                  prefix="cowork_handback_", suffix=".txt",
+                                  source=source)
+    return {"label": label, "path": os.path.abspath(path), "kind": "markdown",
+            "source": source}
 
 
 def assemble_reviewer_context(context, selected, intel_path, intel_md_path=None,
-                              packet_ctx=None):
-    """The reviewer's situational context: the SAME initial `context` the scout
-    received, the team framing, and the scout's current intel to review.
-
-    When `intel_md_path` is given, BOTH the intel JSON (machine source of truth)
-    and the intel markdown (the user's review surface) are embedded, so the
-    scout-reviewer reviews both and can check the markdown stays CONSISTENT with
-    the JSON (it must not under- or mis-report it).
-
-    With `packet_ctx` (#4) the intel bodies are NOT embedded: a path-first
-    full-reread packet (paths + hashes + sizes + read-from-disk instruction) is
-    sent and a snapshot is written for the next round's diff. The fresh path
-    always uses full-reread (no diff is possible yet, D6).
+                              assets_dir=None, context_revision=None):
+    """The reviewer's situational context, delivered FILE-ONLY via the shared
+    transport: the SAME shared session context the scout received (materialized
+    to a revision-keyed file, referenced by path — never embedded), the team
+    framing, and the scout's current intel to review (JSON, and markdown when
+    given — both by path). No body is inlined; the reviewer reads the files from
+    disk.
 
     Deliberately excludes the scout's write-target `brief` / `first` payload —
     that carries the scout's own guardrail and would mis-instruct the reviewer."""
-    team = ", ".join(selected) if selected else "(unspecified)"
-    packet = _review_packet(
-        packet_ctx, _intel_artifacts(intel_path, intel_md_path),
-        force_full_reread=True)
-    if packet is not None:
-        return _carry_delivery(
-            "Shared initial context — this is the SAME context the scout was "
-            "given:\n%s\n\n"
-            "Team on this session: %s\n\n"
-            "Review the scout's current intel critically against the context "
-            "above.\n\n%s" % (context.strip(), team, packet), packet)
-    intel_text = _read_text(intel_path)
-    if intel_md_path:
-        return (
-            "Shared initial context — this is the SAME context the scout was "
-            "given:\n%s\n\n"
-            "Team on this session: %s\n\n"
-            "The scout's current intel JSON (the machine source of truth — "
-            "review it critically against the context above):\n%s\n\n"
-            "The scout's current intel markdown (the user's review surface — "
-            "check it stays small, scannable, and CONSISTENT with the JSON):\n%s"
-            % (context.strip(), team, intel_text.strip(),
-               _read_text(intel_md_path).strip())
-        )
-    return (
-        "Shared initial context — this is the SAME context the scout was given:\n"
-        "%s\n\n"
-        "Team on this session: %s\n\n"
-        "The scout's current intel (review it critically against the context "
-        "above):\n%s" % (context.strip(), team, intel_text.strip())
-    )
+    artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
+    artifacts.extend(_intel_artifacts(intel_path, intel_md_path))
+    return handoff.render_handoff(
+        "scout->scout-reviewer:review_ctx",
+        artifacts=artifacts, facts={"team": list(selected or [])})
 
 
-def assemble_reviewer_handoff(verdict, review, artifact="intel"):
-    """Build the role-facing handoff string from a reviewer verdict dict.
+def assemble_reviewer_handoff(verdict, review, artifact="intel",
+                              review_path=None):
+    """Build the role-facing hand-back string (routes 2/5/8) via the shared
+    transport. The reviewer's findings / user_question are NOT embedded: the
+    lead's prompt names the REVIEW FILE path and instructs it to read the
+    findings (and the user_question, for needs_user) there and relay them in its
+    own voice — preserving the single-voice, faithful-relay guardrail while
+    keeping the transport file-only. `artifact` names what was reviewed ("intel"
+    for the scout, "plan" for the planner, "build" for the builder). Returns ""
+    for `approve` (no handoff; fall through to the user gate).
 
-    Pure string templating — NO second model call. This is the reviewed role's
-    half of the faithful-relay guardrail: for `needs_user` it carries the
-    reviewer's FULL `user_question` plus an instruction to relay it without
-    changing its meaning or dropping context. `artifact` names what was
-    reviewed ("intel" for the scout, "plan" for the planner). Returns "" for
-    `approve` (no handoff; fall through to the user gate)."""
-    review = review or {}
-    findings = review.get("findings") or []
+    `review_path` is the reviewer's verdict file; when absent (a legacy/test
+    call passing only the verdict dict), the verdict is materialized to a
+    tempfile so the transport still carries a real path."""
+    if verdict not in ("needs_user", "revise"):
+        return ""
+    if review_path:
+        art = {"label": "reviewer verdict + findings (JSON)",
+               "path": os.path.abspath(review_path), "kind": "json",
+               "source": "review"}
+    else:
+        art = _handback_payload_artifact(
+            json.dumps(review or {}, indent=2, sort_keys=True),
+            label="reviewer verdict + findings (JSON)", source="review")
+        art["kind"] = "json"
+    facts = {"artifact_noun": artifact}
     if verdict == "needs_user":
-        question = (review.get("user_question") or "").strip()
-        return (
-            "[reviewer handoff] Before this can go to the user for approval, a "
-            "blocking product question is unresolved. Put this question to the "
-            "user in your own next reply. You MAY rephrase it into your own voice, "
-            "but you must NOT change its meaning or omit any part of its context. "
-            "Then set status back to needs_input.\n\n"
-            "Question: %s" % question
-        )
-    if verdict == "revise":
-        bullet = "\n".join("- " + str(f) for f in findings) if findings else \
-            "- (no specific findings provided)"
-        return (
-            "[reviewer handoff] A reviewer checked your %s and it is not ready "
-            "to hand off yet. Address the following, update your %s, and set "
-            "status back to ready_for_review when done. Do not mention the "
-            "reviewer to the user.\n%s" % (artifact, artifact, bullet)
-        )
-    return ""
+        return handoff.render_handoff(
+            "reviewer->lead:handback_needs_user", artifacts=[art], facts=facts)
+    return handoff.render_handoff(
+        "reviewer->lead:handback_revise", artifacts=[art], facts=facts)
 
 
 def assemble_user_question(text, artifact="intel"):
@@ -1430,18 +1579,36 @@ EVAL_CRITERIA = {
 }
 
 # Which user-facing role a paired reviewer evaluates on its eval turn.
-_REVIEWER_EVALUATEE = {SCOUT_REVIEWER: "scout", PLANNING_ADVISOR: "planner",
-                       BUILD_REVIEWER: "builder"}
+_REVIEWER_EVALUATEE = handoff.reviewer_pairs()
+
+
+def _eval_artifact_descriptors(specs):
+    """SC5: the per-turn artifact descriptors for an eval send, aggregated from
+    the SAME `handoff.HandoffBlock`s that built the prompt — each spec's
+    `artifact_block` carries the content-free `.descriptors` (verdict path,
+    consumed-upstream paths) it emitted, so the trace/report never re-read or
+    re-infer them. Returns None when no descriptors are present (a legacy/test
+    spec whose artifact_block is a plain string)."""
+    out = []
+    seen = set()
+    for spec in specs or []:
+        for rec in getattr(spec.get("artifact_block"), "descriptors", None) or []:
+            path = rec.get("path")
+            if path and path not in seen:
+                seen.add(path)
+                out.append(rec)
+    return out or None
 
 
 def assemble_eval_prompt(evaluator, scratch_path, specs):
     """The private evaluation request sent to `evaluator` on its own session.
 
     `specs` is a list of {evaluatee, criteria, artifact_block} dicts — the
-    artifact_block embeds the evidence (the full verdict JSON for
-    role->reviewer evals; the full approved scout intel JSON for ->scout
-    evals) so the prompt is self-contained for every verdict kind. The
-    aggregate scores path is deliberately never part of this prompt."""
+    artifact_block is a path-first descriptor block (paths + hashes + a
+    read-from-disk instruction) naming the evidence FILES (the reviewer's verdict
+    file for role->reviewer evals; the approved upstream artifact files for
+    ->scout / ->planner evals), never their bodies. The aggregate scores path is
+    deliberately never part of this prompt."""
     blocks = []
     for spec in specs:
         criteria = "\n".join("- " + c for c in spec["criteria"])
@@ -1564,15 +1731,9 @@ def _consumed_upstream_spec(consumed, scores_path, evaluator, round_index):
             else None):
         return "deduped"
     text = "\n\n".join(_read_text(p).strip() for p in paths)
-    label = consumed.get("label") or "upstream artifact"
-    arts = [{"label": label, "path": p,
-             "kind": "json" if str(p).endswith(".json") else "markdown"}
-            for p in paths]
-    packet = diffpacket.build_full_reread_packet(
-        arts,
-        header_label="The %s this phase consumed (current files on disk — the "
-                     "authoritative source of truth; read them before scoring):"
-                     % label)
+    arts = [{"path": p, "kind": "json" if str(p).endswith(".json") else
+             "markdown", "source": "upstream"} for p in paths]
+    packet = handoff.render_handoff("eval->upstream", artifacts=arts)
     spec = {
         "evaluatee": evaluatee,
         "criteria": EVAL_CRITERIA[(evaluator, evaluatee)],
@@ -1773,20 +1934,20 @@ def _aggregate_eval(scratch_path, scores_path, session_uuid, evaluator, phase,
 def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
                       session_uuid, intel_path=None, planning_epoch=None,
                       consumed_upstream=None, trace=None, intel_md_path=None,
-                      context_revision=None):
+                      context_revision=None, review_path=None):
     """Build the role-side `evaluate_fn(session, verdict, round_index)` for
     `_role_loop`, or None when eval is not wired (missing paths).
 
     The closure sends the eval prompt on the role's own persistent session
     with its output muted (the eval is private), reads the role's scratch
-    back, and aggregates. The verdict JSON is always embedded — on approve the
-    findings never reach the role via the reviewer handoff, so embedding keeps
-    the prompt self-contained for every verdict kind.
+    back, and aggregates. The reviewer's verdict is referenced by the REVIEW
+    FILE PATH (route 12: never embedded) — the role reads the verdict + findings
+    from disk, so the prompt stays file-only for every verdict kind.
 
     When a phase consumes an upstream artifact (the planning phase consumes the
     scout intel; the building phase consumes the approved plan), the FIRST eval
     turn additionally bundles a once-per-phase consumed-upstream eval with that
-    artifact embedded. `consumed_upstream` names it; for back-compat callers may
+    artifact carried by path. `consumed_upstream` names it; for back-compat callers may
     instead pass `intel_path`/`planning_epoch` and the scout descriptor is built
     for them."""
     if not (scratch_path and scores_path and session_uuid):
@@ -1802,12 +1963,20 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
         # that writes nothing yields 'no entry', never a re-read of the
         # previous round's scores.
         _clear_eval_scratch(scratch_path, role, trace=trace)
+        if review_path:
+            verdict_art = {"label": "reviewer verdict + findings (JSON)",
+                           "path": os.path.abspath(review_path), "kind": "json",
+                           "source": "verdict"}
+        else:
+            verdict_art = _handback_payload_artifact(
+                json.dumps(verdict or {}, indent=2, sort_keys=True),
+                label="reviewer verdict + findings (JSON)", source="verdict")
+            verdict_art["kind"] = "json"
         specs = [{
             "evaluatee": reviewer_role,
             "criteria": EVAL_CRITERIA[(role, reviewer_role)],
-            "artifact_block":
-                "The reviewer's full verdict JSON for this round:\n%s"
-                % json.dumps(verdict or {}, indent=2, sort_keys=True),
+            "artifact_block": handoff.render_handoff(
+                "eval->reviewer_verdict", artifacts=[verdict_art]),
             "context": "review-round",
         }]
         # The consumed-upstream bundle rides only the FIRST eval turn of the
@@ -1829,23 +1998,15 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
                         evaluatees=[s["evaluatee"] for s in specs],
                         phase=phase, round=round_index)
         prompt = assemble_eval_prompt(role, scratch_path, specs)
-        # Per-turn accounting (#1/D11): the lead's eval is a follow-up turn on
-        # its own still-open session (a resume). The reviewer's verdict is
-        # embedded inline (not a file); the only embedded ARTIFACT FILES are the
-        # consumed-upstream bundle (scout intel for the planner eval; plan
-        # JSON+md for the builder eval), and only when it rides this turn
-        # (len(specs) > 1). The scratch file is the eval's OUTPUT target (cleared
-        # above), so it is never an embedded artifact.
-        # The consumed-upstream bundle now rides path-first (#2), so its
-        # artifact files are referenced by path, not embedded — tag the
-        # descriptors accordingly so the report does not over-count them.
-        eval_artifacts = None
-        if len(specs) > 1:
-            eval_artifacts = _artifact_descriptors(
-                consumed_upstream.get("artifact_paths"), delivery="path")
+        # Per-turn accounting (#1/D11, SC5): the eval's artifact descriptors are
+        # taken from the SAME handoff objects that built the prompt — every
+        # spec's `artifact_block` is a HandoffBlock, so its `.descriptors` (the
+        # verdict file path-first, plus the consumed-upstream files when they
+        # ride this turn) are aggregated here rather than re-read/re-inferred.
+        eval_artifacts = _eval_artifact_descriptors(specs)
         eval_turn_id = str(uuid.uuid4())
         with _muted_session(session):
-            send_result = _send(session, prompt, meta={
+            send_result = _send(session, _eval_delivery(prompt, specs), meta={
                 "prompt_kind": "eval", "fresh": False, "resume": True,
                 "phase": phase, "round": round_index,
                 "context_revision": context_revision,
@@ -1865,61 +2026,33 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
     return evaluate_fn
 
 
-def context_update_block(text):
-    """Wake block for any role resuming a CLI session that has not acknowledged
-    the current session context revision. Role-agnostic: scout, scout-reviewer,
-    and future roles all receive the same framing."""
-    return (
-        "New user context was provided for this resumed cowork session.\n\n"
-        "Treat this as the current task context. Keep prior session knowledge "
-        "only where it remains compatible.\n\n"
-        "<context>\n%s\n</context>" % text.strip()
-    )
+def context_update_block(text, assets_dir=None, revision=None):
+    """Wake block (route 13) for any role resuming a CLI session that has not
+    acknowledged the current session context revision. Role-agnostic. The
+    context text is materialized to a revision-keyed authoritative file and
+    referenced by PATH via the shared transport — never inlined."""
+    return handoff.render_handoff(
+        "context->update",
+        artifacts=[_shared_context_artifact(text, assets_dir, revision)])
 
 
 def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
-                                     context_update=None, packet_ctx=None,
-                                     force_full_reread=False):
-    """Lighter context for a RESUMED reviewer session: its thread already holds
-    the role + the prior context, so only the updated intel is sent — plus a
-    context-update wake block when the session context changed since the
-    reviewer last acknowledged it. When `intel_md_path` is given, BOTH the
-    updated intel JSON and markdown are sent (the reviewer reviews both).
-
-    With `packet_ctx` (#4) the bodies are replaced by a diff packet when
-    eligible (prior snapshot for this epoch+context_revision, canonicalizable,
-    within the size cap), else a path-first full-reread packet. `force_full_reread`
-    (the malformed/weak-verdict retry, D8) forces the full-reread packet."""
-    packet = _review_packet(
-        packet_ctx, _intel_artifacts(intel_path, intel_md_path),
-        force_full_reread=force_full_reread)
-    if packet is not None:
-        body = _carry_delivery(
-            "The scout has updated its intel since your last review. Re-review "
-            "against the current task context and write your verdict to the "
-            "review file again.\n\n%s" % packet, packet)
-    elif intel_md_path:
-        body = (
-            "The scout has updated its intel since your last review. Re-review "
-            "both current artifacts below against the current task context, and "
-            "write your verdict to the review file again.\n\n"
-            "Current intel JSON:\n%s\n\n"
-            "Current intel markdown (check it stays consistent with the JSON):"
-            "\n%s"
-            % (_read_text(intel_path).strip(),
-               _read_text(intel_md_path).strip())
-        )
-    else:
-        body = (
-            "The scout has updated its intel since your last review. Re-review "
-            "the current intel below against the current task context, and "
-            "write your verdict to the review file again:\n%s"
-            % _read_text(intel_path).strip()
-        )
+                                     context_update=None, assets_dir=None,
+                                     context_revision=None):
+    """Lighter context for a RESUMED reviewer session, delivered FILE-ONLY via
+    the shared transport: its thread already holds the role + the prior context,
+    so only the updated intel is sent (by path — JSON, and markdown when given).
+    When the session context changed since the reviewer last acknowledged it
+    (`context_update` is the un-acked context text), a context-update wake block
+    referencing the persisted context FILE is prepended. No body is inlined."""
+    prefix = None
     if context_update:
-        return _carry_delivery(
-            context_update_block(context_update) + "\n\n" + body, body)
-    return body
+        prefix = context_update_block(context_update, assets_dir,
+                                      context_revision)
+    return handoff.render_handoff(
+        "scout->scout-reviewer:review_resume",
+        artifacts=_intel_artifacts(intel_path, intel_md_path),
+        ctx={"context_update_prefix": prefix} if prefix else None)
 
 
 def make_scout_reviewer_runner(intel_md_path, trace=None,
@@ -1935,28 +2068,28 @@ def make_scout_reviewer_runner(intel_md_path, trace=None,
     def runner(config, context, selected, intel_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None, surface_io_out=None,
-               epoch=None, context_revision=None, snapshot_dir=None,
-               force_full_reread=False):
+               context_revision=None):
         return run_reviewer_once(
             config, context, selected, intel_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
             extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
-            epoch=epoch, context_revision=context_revision,
-            snapshot_dir=snapshot_dir, force_full_reread=force_full_reread,
+            context_revision=context_revision,
             artifact_paths=[intel_path, intel_md_path], phase="scouting",
             reviewer_role=SCOUT_REVIEWER,
             prompt_path=SCOUT_REVIEWER_PROMPT_PATH,
             protected="the scout intel files (JSON and markdown)",
-            context_fn=lambda ctx, sel, p, packet_ctx=None:
+            context_fn=lambda ctx, sel, p, assets_dir=None,
+                context_revision=None:
                 assemble_reviewer_context(
-                    ctx, sel, p, intel_md_path, packet_ctx=packet_ctx),
-            resume_context_fn=lambda p, context_update=None, packet_ctx=None,
-                force_full_reread=False:
+                    ctx, sel, p, intel_md_path, assets_dir=assets_dir,
+                    context_revision=context_revision),
+            resume_context_fn=lambda p, context_update=None, assets_dir=None,
+                context_revision=None:
                 assemble_reviewer_resume_context(
                     p, intel_md_path, context_update=context_update,
-                    packet_ctx=packet_ctx, force_full_reread=force_full_reread))
+                    assets_dir=assets_dir, context_revision=context_revision))
     # See make_planning_advisor_runner: marks a real surface-capable closure.
     runner._coplan_surface_capable = True
     return runner
@@ -1983,49 +2116,35 @@ def assemble_planner_brief(plan_json_path, plan_md_path, caveman_available=None)
     )
 
 
-def assemble_planner_seed(intel_path, context):
-    """The fresh planner's situational context: a path-first FULL-REREAD packet
-    for the approved scout intel (#1 — the body is read from disk, not embedded)
-    plus the current shared session context. The artifact SET (intel JSON) is
-    unchanged; only the delivery is path-first."""
-    packet = diffpacket.build_full_reread_packet(
-        _intel_artifacts(intel_path),
-        header_label="Approved scout intel (current file on disk — the "
-                     "authoritative source of truth):")
-    return (
-        "The scout phase is complete and the user APPROVED the scout intel. "
-        "Digest it and drive the planning conversation.\n\n"
-        "%s\n\n"
-        "Current shared context:\n%s" % (packet, (context or "").strip())
-    )
+def assemble_planner_seed(intel_path, context, assets_dir=None,
+                          context_revision=None):
+    """The fresh planner's situational context (route 3), FILE-ONLY: the approved
+    scout intel AND the shared session context, both carried by PATH via the
+    shared transport. scout->planner is a cross-role handoff, so the context is
+    persisted and referenced by path — never inlined (only the original
+    user->scout prompt inlines user text)."""
+    artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
+    artifacts.extend(_intel_artifacts(intel_path))
+    return handoff.render_handoff("scout->planner:seed", artifacts=artifacts)
 
 
 def intel_updated_block(intel_path):
-    """Wake block for a resumed planner after a hand-back round trip: the scout
-    re-ran its full cycle and the user approved the UPDATED intel. The intel is
-    delivered path-first (#1 — read from disk, not embedded)."""
-    packet = diffpacket.build_full_reread_packet(
-        _intel_artifacts(intel_path),
-        header_label="Updated approved intel (current file on disk — the "
-                     "authoritative source of truth):")
-    return (
-        "The scout intel changed since you started planning: your hand-back was "
-        "executed, the scout re-investigated, and the user approved the updated "
-        "intel. Digest it and continue planning. Keep prior plan content "
-        "only where it remains compatible.\n\n"
-        "%s" % packet
-    )
+    """Wake block (route 3, resume) for a resumed planner after a hand-back round
+    trip: the scout re-ran its full cycle and the user approved the UPDATED
+    intel. The intel is carried path-first via the shared transport."""
+    return handoff.render_handoff(
+        "scout->planner:intel_updated", artifacts=_intel_artifacts(intel_path))
 
 
-def handoff_wake_block(payload):
-    """Wake block for the scout session resumed by a planner hand-back."""
-    return (
-        "The planner handed the work back to you mid-planning (the user "
-        "confirmed the hand-back). Re-run your full cycle: investigate, clarify "
-        "with the user, update your intel file, and set status "
-        "ready_for_review when done.\n\n"
-        "<handoff>\n%s\n</handoff>" % (payload or "").strip()
-    )
+def handoff_wake_block(payload, assets_dir=None):
+    """Wake block (route 9) for the scout session resumed by a planner hand-back.
+    The planner's hand-back payload (free-form authored text) is materialized to
+    a file and carried by PATH via the shared transport — never inlined."""
+    return handoff.render_handoff(
+        "planner->scout:handback_wake",
+        artifacts=[_handback_payload_artifact(
+            payload, assets_dir, filename="handback.scout.txt",
+            label="planner hand-back note")])
 
 
 def handoff_declined_text():
@@ -2082,51 +2201,36 @@ def assemble_builder_brief(build_status_path, build_summary_path=None,
     )
 
 
-def assemble_builder_seed(plan_json_path, plan_md_path, context):
-    """The fresh builder's situational context: a path-first FULL-REREAD packet
-    for the approved plan (#1 — JSON + markdown read from disk, not embedded)
-    plus the current shared session context. The artifact SET (plan JSON + MD)
-    is unchanged; only the delivery is path-first."""
-    packet = diffpacket.build_full_reread_packet(
-        _plan_artifacts(plan_json_path, plan_md_path),
-        header_label="Approved plan (current files on disk — the authoritative "
-                     "source of truth):")
-    return (
-        "The planning phase is complete and the user APPROVED the plan. "
-        "Execute it: make the code changes, verify them, and drive the build "
-        "conversation.\n\n"
-        "%s\n\n"
-        "Current shared context:\n%s" % (packet, (context or "").strip())
-    )
+def assemble_builder_seed(plan_json_path, plan_md_path, context,
+                          assets_dir=None, context_revision=None):
+    """The fresh builder's situational context (route 6), FILE-ONLY: the approved
+    plan (JSON + markdown) AND the shared session context, both carried by PATH
+    via the shared transport. planner->builder is a cross-role handoff, so the
+    context is persisted and referenced by path — never inlined."""
+    artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
+    artifacts.extend(_plan_artifacts(plan_json_path, plan_md_path))
+    return handoff.render_handoff("planner->builder:seed", artifacts=artifacts)
 
 
 def plan_updated_block(plan_json_path, plan_md_path):
-    """Wake block for a resumed builder after a hand-back round trip: the
-    builder handed back to the planner, the planner re-planned, and the user
-    approved the UPDATED plan. The plan is delivered path-first (#1 — read from
-    disk, not embedded)."""
-    packet = diffpacket.build_full_reread_packet(
-        _plan_artifacts(plan_json_path, plan_md_path),
-        header_label="Updated approved plan (current files on disk — the "
-                     "authoritative source of truth):")
-    return (
-        "The plan changed since you started building: your hand-back was "
-        "executed, the planner re-planned, and the user approved the UPDATED "
-        "plan. Digest the changes and continue building. Keep prior work "
-        "only where it remains compatible.\n\n"
-        "%s" % packet
-    )
+    """Wake block (route 6, resume) for a resumed builder after a hand-back round
+    trip: the builder handed back to the planner, the planner re-planned, and the
+    user approved the UPDATED plan. The plan is carried path-first via the shared
+    transport."""
+    return handoff.render_handoff(
+        "planner->builder:plan_updated",
+        artifacts=_plan_artifacts(plan_json_path, plan_md_path))
 
 
-def plan_handback_wake_block(payload):
-    """Wake block for the planner session resumed by a builder hand-back."""
-    return (
-        "The builder handed the work back to you mid-build (the user confirmed "
-        "the hand-back). Re-plan as needed: digest the builder's note, update "
-        "your plan files, clarify with the user, and set status "
-        "ready_for_review when done.\n\n"
-        "<handoff>\n%s\n</handoff>" % (payload or "").strip()
-    )
+def plan_handback_wake_block(payload, assets_dir=None):
+    """Wake block (route 10) for the planner session resumed by a builder
+    hand-back. The builder's hand-back payload (free-form authored text) is
+    materialized to a file and carried by PATH via the shared transport."""
+    return handoff.render_handoff(
+        "builder->planner:handback_wake",
+        artifacts=[_handback_payload_artifact(
+            payload, assets_dir, filename="handback.planner.txt",
+            label="builder hand-back note")])
 
 
 def handoff_declined_to_planner_text():
@@ -2141,110 +2245,87 @@ def handoff_declined_to_planner_text():
 def _plan_artifacts(plan_json_path, plan_md_path):
     return [
         {"label": "plan JSON (machine source of truth)",
-         "path": plan_json_path, "kind": "json"},
+         "path": plan_json_path, "kind": "json", "source": "plan_json"},
         {"label": "plan markdown (the user's review surface)",
-         "path": plan_md_path, "kind": "markdown"},
+         "path": plan_md_path, "kind": "markdown", "source": "plan_md"},
     ]
 
 
 def assemble_advisor_context(context, selected, plan_json_path, plan_md_path,
-                             packet_ctx=None):
-    """The planning-advisor's situational context: the shared session context,
-    the team framing, and BOTH planner artifacts to review.
-
-    With `packet_ctx` (#4) the plan bodies are replaced by a path-first
-    full-reread packet (fresh path always full-reread, D6); a snapshot is
-    written for the next round's diff."""
-    team = ", ".join(selected) if selected else "(unspecified)"
-    packet = _review_packet(
-        packet_ctx, _plan_artifacts(plan_json_path, plan_md_path),
-        force_full_reread=True)
-    if packet is not None:
-        return _carry_delivery(
-            "Shared session context — this is the SAME context the planner was "
-            "given:\n%s\n\n"
-            "Team on this session: %s\n\n"
-            "Review the planner's current plan critically against the context "
-            "above.\n\n%s" % (context.strip(), team, packet), packet)
-    return (
-        "Shared session context — this is the SAME context the planner was "
-        "given:\n%s\n\n"
-        "Team on this session: %s\n\n"
-        "The planner's current plan JSON (the machine source of truth — review "
-        "it critically against the context above):\n%s\n\n"
-        "The planner's current plan markdown (the user's review surface — check "
-        "it stays small, scannable, and consistent with the JSON):\n%s"
-        % (context.strip(), team, _read_text(plan_json_path).strip(),
-           _read_text(plan_md_path).strip())
-    )
+                             intel_path=None, intel_md_path=None,
+                             assets_dir=None, context_revision=None):
+    """The planning-advisor's situational context (route 4), delivered FILE-ONLY
+    via the shared transport: the shared session context (by path), the team
+    framing, BOTH planner artifacts to review, AND the approved scout intel
+    (JSON + markdown) the plan must cover — every one by path, no body inlined.
+    Route 4 is the explicit multi-source edge carrying plan AND intel paths."""
+    artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
+    artifacts.extend(_plan_artifacts(plan_json_path, plan_md_path))
+    # Route 4 is a MULTI-SOURCE edge: it also carries the approved scout intel
+    # paths so the advisor can verify the plan's criteria-coverage against the
+    # approved intel.
+    if intel_path:
+        artifacts.extend(_intel_artifacts(intel_path, intel_md_path))
+    return handoff.render_handoff(
+        "planner->planning-advisor:review_ctx",
+        artifacts=artifacts, facts={"team": list(selected or [])})
 
 
 def assemble_advisor_resume_context(plan_json_path, plan_md_path,
-                                    context_update=None, packet_ctx=None,
-                                    force_full_reread=False):
-    """Lighter context for a RESUMED planning-advisor session: only the updated
-    plan artifacts — plus a context-update wake block when the session context
-    changed since the advisor last acknowledged it.
-
-    With `packet_ctx` (#4) the bodies are replaced by a diff packet when
-    eligible, else a path-first full-reread packet; `force_full_reread` forces
-    the full-reread packet (the malformed/weak-verdict retry, D8)."""
-    packet = _review_packet(
-        packet_ctx, _plan_artifacts(plan_json_path, plan_md_path),
-        force_full_reread=force_full_reread)
-    if packet is not None:
-        body = _carry_delivery(
-            "The planner has updated its plan since your last review. Re-review "
-            "against the current task context and write your verdict to the "
-            "review file again.\n\n%s" % packet, packet)
-    else:
-        body = (
-            "The planner has updated its plan since your last review. Re-review "
-            "both current artifacts below against the current task context, and "
-            "write your verdict to the review file again.\n\n"
-            "Current plan JSON:\n%s\n\n"
-            "Current plan markdown:\n%s"
-            % (_read_text(plan_json_path).strip(),
-               _read_text(plan_md_path).strip())
-        )
+                                    context_update=None, assets_dir=None,
+                                    context_revision=None):
+    """Lighter context for a RESUMED planning-advisor session, delivered
+    FILE-ONLY via the shared transport: only the updated plan artifacts (by
+    path) — plus a context-update wake block referencing the persisted context
+    FILE when the session context changed since the advisor last acknowledged
+    it. No body is inlined."""
+    prefix = None
     if context_update:
-        return _carry_delivery(
-            context_update_block(context_update) + "\n\n" + body, body)
-    return body
+        prefix = context_update_block(context_update, assets_dir,
+                                      context_revision)
+    return handoff.render_handoff(
+        "planner->planning-advisor:review_resume",
+        artifacts=_plan_artifacts(plan_json_path, plan_md_path),
+        facts={"team": []},
+        ctx={"context_update_prefix": prefix} if prefix else None)
 
 
 def make_planning_advisor_runner(plan_md_path, trace=None,
-                                 extra_writable_dir=None):
+                                 extra_writable_dir=None, intel_path=None,
+                                 intel_md_path=None):
     """Build the real (non-test) reviewer runner for the planning phase: a
     `run_reviewer_once` closure carrying the advisor role, prompt, and the
-    dual-artifact context assemblers. `extra_writable_dir` is the relocated
-    session-assets root, granted to the advisor CLI so its review/eval writes
-    (now outside cwd) succeed on the no-yolo path."""
+    context assemblers. Route 4 is multi-source: `intel_path`/`intel_md_path`
+    are the approved scout intel the advisor also receives (by path) so it can
+    verify plan criteria-coverage against the approved intel. `extra_writable_dir`
+    is the relocated session-assets root, granted to the advisor CLI so its
+    review/eval writes (now outside cwd) succeed on the no-yolo path."""
     def runner(config, context, selected, plan_json_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None, surface_io_out=None,
-               epoch=None, context_revision=None, snapshot_dir=None,
-               force_full_reread=False):
+               context_revision=None):
         return run_reviewer_once(
             config, context, selected, plan_json_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
             extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
-            epoch=epoch, context_revision=context_revision,
-            snapshot_dir=snapshot_dir, force_full_reread=force_full_reread,
+            context_revision=context_revision,
             artifact_paths=[plan_json_path, plan_md_path], phase="planning",
             reviewer_role=PLANNING_ADVISOR,
             prompt_path=PLANNING_ADVISOR_PROMPT_PATH,
             protected="the planner's plan files",
-            context_fn=lambda ctx, sel, p, packet_ctx=None:
+            context_fn=lambda ctx, sel, p, assets_dir=None,
+                context_revision=None:
                 assemble_advisor_context(
-                    ctx, sel, p, plan_md_path, packet_ctx=packet_ctx),
-            resume_context_fn=lambda p, context_update=None, packet_ctx=None,
-                force_full_reread=False:
+                    ctx, sel, p, plan_md_path, intel_path=intel_path,
+                    intel_md_path=intel_md_path, assets_dir=assets_dir,
+                    context_revision=context_revision),
+            resume_context_fn=lambda p, context_update=None, assets_dir=None,
+                context_revision=None:
                 assemble_advisor_resume_context(
                     p, plan_md_path, context_update=context_update,
-                    packet_ctx=packet_ctx, force_full_reread=force_full_reread))
+                    assets_dir=assets_dir, context_revision=context_revision))
     # Marks this as a real run_reviewer_once closure (vs. a test-injected
     # reviewer_runner) so make_review_fn forwards surface_io_out only to runners
     # that accept it — test runners keep a byte-identical signature.
@@ -2586,7 +2667,8 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
         first = assemble_codex_prompt(wt_role_text, "", brief)
         _emit_codex_role_prompt_bytes(trace, WORKTREE_ROLE, wt_role_text)
     try:
-        _send(session, first, meta={"prompt_kind": "worktree_seed",
+        _send(session, _worktree_seed_delivery(first),
+              meta={"prompt_kind": "worktree_seed",
                                     "phase": "worktree"})
     finally:
         session.close()
@@ -2694,149 +2776,66 @@ def build_baselines_note(entries):
 
 
 def _build_diff_recipe(repos=None, baseline_note=""):
-    """The full-delta capture recipe handed to the build-reviewer. Plain
-    `git diff` is NOT enough — it misses staged changes and untracked new files
-    (and the builder creates files), so the recipe names every channel.
-
-    `repos` is the EXPLICIT selected repo-root list, each entry
-    ``{"path", "has_head"}``. When given, the recipe enumerates EVERY root and
-    branches the capture per root: a root WITH a baseline HEAD uses
-    ``git -C <root> diff HEAD``; a root with NO HEAD (unborn repo / non-git
-    fallback) must NOT run ``git diff HEAD`` (it fails 'bad revision HEAD') and
-    uses ``status --porcelain`` + ``diff --cached`` + ``diff`` + untracked reads.
-    The union of per-root deltas is the review unit. When `repos` is empty the
-    recipe falls back to the single process-cwd form (back-compat)."""
-    note = ("\n" + baseline_note) if baseline_note else ""
-    if not repos:
-        return (
-            "The unit of review is the builder's FULL working-tree delta against "
-            "this plan. The delta is NOT embedded here — capture the COMPLETE "
-            "delta yourself. Plain `git diff` is insufficient: it omits STAGED "
-            "changes and UNTRACKED new files (and the builder creates files). Run:"
-            "\n  - `git status --porcelain` — every staged, unstaged, and "
-            "untracked path at a glance;"
-            "\n  - `git diff HEAD` (or `git diff --stat HEAD` first, then targeted "
-            "`git diff HEAD -- <path>`) — all tracked staged+unstaged changes since "
-            "the last commit;"
-            "\n  - read each untracked/new file directly — it will NOT appear in "
-            "`git diff`."
-            "%s"
-            "\nReview the full delta critically against the plan and context "
-            "above." % note)
-
-    blocks = []
-    for r in repos:
-        path = r.get("path", ".")
-        if r.get("has_head"):
-            blocks.append(
-                "  Repo %s (has a baseline commit):"
-                "\n    - `git -C %s status --porcelain` — staged, unstaged, and "
-                "untracked paths;"
-                "\n    - `git -C %s diff HEAD` (or `git -C %s diff --stat HEAD` "
-                "first, then targeted `git -C %s diff HEAD -- <path>`) — all "
-                "tracked staged+unstaged changes since the last commit;"
-                "\n    - read each untracked/new file under %s directly — it "
-                "will NOT appear in `git diff`."
-                % (path, path, path, path, path, path))
-        else:
-            blocks.append(
-                "  Repo %s (NO baseline commit — unborn repo or non-git "
-                "fallback; do NOT run `git diff HEAD`, it fails):"
-                "\n    - `git -C %s status --porcelain` — every path at a glance;"
-                "\n    - `git -C %s diff --cached` and `git -C %s diff` — staged "
-                "and unstaged changes;"
-                "\n    - read untracked/new files under %s directly."
-                % (path, path, path, path, path))
-    return (
-        "The unit of review is the builder's FULL working-tree delta against "
-        "this plan, taken as the UNION of the deltas of EACH of these selected "
-        "repo roots. The delta is NOT embedded here — capture the COMPLETE delta "
-        "yourself, per root. Plain `git diff` is insufficient: it omits STAGED "
-        "changes and UNTRACKED new files (and the builder creates files). "
-        "Capture the delta of EACH of these repos:"
-        "\n%s"
-        "%s"
-        "\nReview the union of per-root deltas critically against the plan and "
-        "context above. An empty delta in a repo the plan touches is a finding; "
-        "ignore repos the plan does not list."
-        % ("\n".join(blocks), note))
-
-
-def _build_summary_block(build_summary_path):
-    """The build-reviewer-facing block embedding the builder's markdown summary,
-    or "" when no summary path is wired (back-compat). The reviewer must
-    consistency-check it against the actual working-tree delta + status JSON
-    (D9) — the summary is the user's build-gate surface, so an unreviewed or
-    mis-reporting summary must never reach the user."""
-    if not build_summary_path:
-        return ""
-    return (
-        "The builder's current markdown summary (the user's review surface — "
-        "consistency-check it against the working-tree delta and the status "
-        "JSON; it must not under- or mis-report what was actually built):\n%s"
-        "\n\n" % _read_text(build_summary_path).strip())
+    """Back-compat thin wrapper: the build-reviewer's live-delta capture recipe
+    is now OWNED by the transport (`handoff.build_diff_recipe`), which builds it
+    from validated repo metadata so no free-form text can ride through it. The
+    build-baseline note is a separate path-first artifact, so `baseline_note` is
+    no longer folded in here (kept for signature compatibility)."""
+    return handoff.build_diff_recipe(repos)
 
 
 def _build_reviewer_artifacts(plan_json_path, plan_md_path, build_status_path,
                               build_summary_path=None):
     arts = [
         {"label": "approved plan JSON (machine source of truth)",
-         "path": plan_json_path, "kind": "json"},
+         "path": plan_json_path, "kind": "json", "source": "plan_json"},
         {"label": "approved plan markdown", "path": plan_md_path,
-         "kind": "markdown"},
+         "kind": "markdown", "source": "plan_md"},
         {"label": "builder status JSON (status + verification log)",
-         "path": build_status_path, "kind": "json"},
+         "path": build_status_path, "kind": "json", "source": "build_status"},
     ]
     if build_summary_path:
         arts.append({"label": "builder markdown summary (the user's review "
-                     "surface)", "path": build_summary_path, "kind": "markdown"})
+                     "surface)", "path": build_summary_path, "kind": "markdown",
+                     "source": "build_summary"})
     return arts
 
 
 def assemble_build_reviewer_context(context, selected, plan_json_path,
                                     plan_md_path, build_status_path,
                                     baseline_note="", baseline_repos=None,
-                                    build_summary_path=None, packet_ctx=None):
-    """The build-reviewer's situational context: the shared session context,
-    the team framing, BOTH plan artifacts, the builder's status JSON, the
-    builder's markdown summary (when wired), and the full-delta capture recipe
-    (the delta is NOT embedded — a stale snapshot would mis-review).
+                                    build_summary_path=None, assets_dir=None,
+                                    context_revision=None):
+    """The build-reviewer's situational context (route 7), delivered FILE-ONLY
+    via the shared transport: the shared session context, BOTH plan artifacts,
+    the builder's status JSON, the builder's markdown summary (when wired), and
+    the build-baseline metadata — every one by PATH. The live working-tree delta
+    is NOT embedded (a stale snapshot would mis-review): the build-reviewer
+    captures it itself via the diff recipe (content-free static instructions).
     `baseline_repos` is the explicit selected repo-root list (each
-    ``{path, has_head}``) that drives the per-root capture recipe.
+    ``{path, has_head}``) that drives the per-root capture recipe."""
+    artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
+    artifacts.extend(_build_reviewer_artifacts(
+        plan_json_path, plan_md_path, build_status_path, build_summary_path))
+    artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
+    return handoff.render_handoff(
+        "builder->build-reviewer:review_ctx",
+        artifacts=artifacts, facts={"team": list(selected or [])},
+        ctx={"repos": list(baseline_repos or [])})
 
-    With `packet_ctx` (#4/D9) the embedded artifacts (plan JSON+md, status JSON,
-    summary) become a path-first full-reread packet; the live working-tree delta
-    recipe is left untouched."""
-    team = ", ".join(selected) if selected else "(unspecified)"
-    packet = _review_packet(
-        packet_ctx, _build_reviewer_artifacts(
-            plan_json_path, plan_md_path, build_status_path, build_summary_path),
-        force_full_reread=True)
-    if packet is not None:
-        return _carry_delivery(
-            "Shared session context — this is the SAME context the builder was "
-            "given:\n%s\n\n"
-            "Team on this session: %s\n\n"
-            "%s\n\n"
-            "%s"
-            % (context.strip(), team, packet,
-               _build_diff_recipe(baseline_repos, baseline_note)), packet)
-    return (
-        "Shared session context — this is the SAME context the builder was "
-        "given:\n%s\n\n"
-        "Team on this session: %s\n\n"
-        "The approved plan JSON the builder is executing (the machine source "
-        "of truth — review the build against it):\n%s\n\n"
-        "The approved plan markdown (the human-readable summary):\n%s\n\n"
-        "The builder's current status JSON (its status + verification log):"
-        "\n%s\n\n"
-        "%s"
-        "%s"
-        % (context.strip(), team, _read_text(plan_json_path).strip(),
-           _read_text(plan_md_path).strip(),
-           _read_text(build_status_path).strip(),
-           _build_summary_block(build_summary_path),
-           _build_diff_recipe(baseline_repos, baseline_note)))
+
+def _build_baseline_artifact(baseline_note, assets_dir=None):
+    """Materialize the build-baseline / repo metadata note (content-free: per-
+    root commit sha, dirty flag, repo list) to a file and return its descriptor
+    artifact so the build-reviewer edge carries it by path."""
+    label = "build-baseline metadata (per-root start commit + dirty flag)"
+    path = handoff.persist_build_baseline_file(assets_dir, baseline_note or "")
+    if path is None:
+        return _tempfile_artifact(baseline_note, label, kind="markdown",
+                                  prefix="cowork_baseline_", suffix=".txt",
+                                  source="build_baseline")
+    return {"label": label, "path": os.path.abspath(path), "kind": "markdown",
+            "source": "build_baseline"}
 
 
 def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
@@ -2845,52 +2844,23 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
                                            baseline_note="",
                                            baseline_repos=None,
                                            build_summary_path=None,
-                                           packet_ctx=None,
-                                           force_full_reread=False):
-    """Lighter context for a RESUMED build-reviewer session: its thread already
-    holds the role + the prior context, so only the updated artifacts are sent
-    — plus a context-update wake block when the session context changed since
-    the reviewer last acknowledged it. The full delta is still read live; the
-    builder's markdown summary (when wired) is re-sent for the consistency
-    check.
-
-    With `packet_ctx` (#4/D9) the embedded artifacts become a diff packet when
-    eligible, else a path-first full-reread packet; `force_full_reread` forces
-    the full-reread packet. The live delta recipe is untouched."""
-    packet = _review_packet(
-        packet_ctx, _build_reviewer_artifacts(
-            plan_json_path, plan_md_path, build_status_path, build_summary_path),
-        force_full_reread=force_full_reread)
-    if packet is not None:
-        body = _carry_delivery(
-            "The builder has updated its work since your last review. Re-review "
-            "the current full working-tree delta against the plan and the "
-            "builder's current status, and write your verdict to the review "
-            "file again.\n\n"
-            "%s\n\n"
-            "%s"
-            % (packet, _build_diff_recipe(baseline_repos, baseline_note)),
-            packet)
-    else:
-        body = (
-            "The builder has updated its work since your last review. Re-review "
-            "the current full working-tree delta against the plan and the "
-            "builder's current status below, and write your verdict to the "
-            "review file again.\n\n"
-            "Current plan JSON:\n%s\n\n"
-            "Current plan markdown:\n%s\n\n"
-            "Current builder status JSON:\n%s\n\n"
-            "%s"
-            "%s"
-            % (_read_text(plan_json_path).strip(),
-               _read_text(plan_md_path).strip(),
-               _read_text(build_status_path).strip(),
-               _build_summary_block(build_summary_path),
-               _build_diff_recipe(baseline_repos, baseline_note)))
+                                           assets_dir=None,
+                                           context_revision=None):
+    """Lighter context for a RESUMED build-reviewer session, delivered FILE-ONLY
+    via the shared transport: only the updated artifacts are sent by PATH (plan,
+    status, summary, build-baseline) — plus a context-update wake block
+    referencing the persisted context FILE when the session context changed. The
+    full delta is still read live via the diff recipe; no body is inlined."""
+    artifacts = list(_build_reviewer_artifacts(
+        plan_json_path, plan_md_path, build_status_path, build_summary_path))
+    artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
+    ctx = {"repos": list(baseline_repos or [])}
     if context_update:
-        return _carry_delivery(
-            context_update_block(context_update) + "\n\n" + body, body)
-    return body
+        ctx["context_update_prefix"] = context_update_block(
+            context_update, assets_dir, context_revision)
+    return handoff.render_handoff(
+        "builder->build-reviewer:review_resume",
+        artifacts=artifacts, facts={"team": []}, ctx=ctx)
 
 
 def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
@@ -2907,34 +2877,34 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
     def runner(config, context, selected, build_status_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None, surface_io_out=None,
-               epoch=None, context_revision=None, snapshot_dir=None,
-               force_full_reread=False):
+               context_revision=None):
         return run_reviewer_once(
             config, context, selected, build_status_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
             extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
-            epoch=epoch, context_revision=context_revision,
-            snapshot_dir=snapshot_dir, force_full_reread=force_full_reread,
+            context_revision=context_revision,
             artifact_paths=[plan_json_path, plan_md_path, build_status_path,
                             build_summary_path], phase="building",
             reviewer_role=BUILD_REVIEWER,
             prompt_path=BUILD_REVIEWER_PROMPT_PATH,
             protected="the builder's working-tree delta and status file",
-            context_fn=lambda ctx, sel, p, packet_ctx=None:
+            context_fn=lambda ctx, sel, p, assets_dir=None,
+                context_revision=None:
                 assemble_build_reviewer_context(
                     ctx, sel, plan_json_path, plan_md_path, p,
                     baseline_note=baseline_note, baseline_repos=baseline_repos,
-                    build_summary_path=build_summary_path, packet_ctx=packet_ctx),
-            resume_context_fn=lambda p, context_update=None, packet_ctx=None,
-                force_full_reread=False:
+                    build_summary_path=build_summary_path, assets_dir=assets_dir,
+                    context_revision=context_revision),
+            resume_context_fn=lambda p, context_update=None, assets_dir=None,
+                context_revision=None:
                 assemble_build_reviewer_resume_context(
                     plan_json_path, plan_md_path, p,
                     context_update=context_update, baseline_note=baseline_note,
                     baseline_repos=baseline_repos,
                     build_summary_path=build_summary_path,
-                    packet_ctx=packet_ctx, force_full_reread=force_full_reread))
+                    assets_dir=assets_dir, context_revision=context_revision))
     # See make_planning_advisor_runner: marks a real surface-capable closure.
     runner._coplan_surface_capable = True
     return runner
@@ -2964,19 +2934,18 @@ def _run_reviewer_eval(session, reviewer_role, eval_scratch_path, eval_specs,
                     round=eval_specs[0].get("round"))
     try:
         # An eval is always a follow-up turn on the still-open reviewer session,
-        # so it is a resume; it references the reviewed artifact + the review
-        # file by PATH (the reviewer-side eval specs name them as paths, and the
-        # consumed-upstream evidence rides path-first after #2), so tag the
-        # descriptors as path-first — no bodies are embedded here.
+        # so it is a resume. SC5: the artifact descriptors are aggregated from
+        # the SAME handoff objects that built the eval prompt (each spec's
+        # artifact_block is a HandoffBlock) — never re-inferred from a path list.
         eval_turn_id = str(uuid.uuid4())
-        send_result = _send(session, assemble_eval_prompt(
-            reviewer_role, eval_scratch_path, eval_specs),
+        eval_prompt = assemble_eval_prompt(
+            reviewer_role, eval_scratch_path, eval_specs)
+        send_result = _send(session, _eval_delivery(eval_prompt, eval_specs),
             meta={"prompt_kind": "eval", "fresh": False, "resume": True,
                   "phase": eval_specs[0].get("phase"),
                   "round": eval_specs[0].get("round"),
                   "context_revision": context_revision,
-                  "artifacts": _artifact_descriptors(artifact_paths,
-                                                     delivery="path"),
+                  "artifacts": _eval_artifact_descriptors(eval_specs),
                   "eval_turn_id": eval_turn_id})
         _write_eval_turn_sidecar(eval_scratch_path, session, send_result,
                                  eval_turn_id, len(eval_specs),
@@ -2995,8 +2964,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                       protected="the scout intel file",
                       eval_scratch_path=None, eval_specs=None,
                       extra_writable_dir=None, surface_io_out=None,
-                      epoch=None, context_revision=None, snapshot_dir=None,
-                      force_full_reread=False, artifact_paths=None, phase=None):
+                      context_revision=None, artifact_paths=None, phase=None):
     """Spawn (or resume) a paired reviewer for one pass and return its verdict.
 
     Role-generic: by default this is the scout-reviewer reviewing the scout
@@ -3041,46 +3009,35 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 trace.event("review.structural_flag", role=reviewer_role,
                             check="success_criteria_missing",
                             intel_path=intel_path)
-    # Diff-packet context (#4): only built when a snapshot_dir is wired (the real
-    # runners pass it). packet_ctx keys the per-reviewer snapshot by phase epoch
-    # + context revision; a test runner / legacy direct call leaves it None and
-    # the assemblers fall back to embedding full bodies.
-    packet_ctx = None
-    if snapshot_dir is not None:
-        packet_ctx = {"reviewer_role": reviewer_role, "epoch": epoch,
-                      "context_revision": context_revision,
-                      "snapshot_dir": snapshot_dir}
-    # Build the reviewer context FIRST (before the trace + accounting) so the
-    # delivery the packet actually chose — path / diff / embedded — is known and
-    # can tag every descriptor truthfully (#3). The form is dynamic: a resumed
-    # reviewer with a prior snapshot may get a diff; a fresh/legacy one gets a
-    # full-reread or (no packet_ctx) the embedded fallback. ctx_block is a
-    # diffpacket.Packet carrying .delivery + per-path .embedded when a packet
-    # rode, else a plain str (delivery defaults to "embedded").
+    # Build the reviewer context FIRST (before the trace + accounting) via the
+    # shared FILE-ONLY transport. The shared session context is materialized to a
+    # revision-keyed file under the session-assets dir and referenced by PATH; a
+    # standalone/test call (no dir) writes a tempfile. ctx_block is a
+    # handoff.HandoffBlock carrying .delivery ("path") + per-path .embedded +
+    # the content-free .descriptors the trace/report accounting derive from (SC5).
+    assets_dir = extra_writable_dir
     if resume_id:
         ctx_block = (resume_context_fn or assemble_reviewer_resume_context)(
-            intel_path, context_update=context_update, packet_ctx=packet_ctx,
-            force_full_reread=force_full_reread)
+            intel_path, context_update=context_update, assets_dir=assets_dir,
+            context_revision=context_revision)
     else:
         ctx_block = (context_fn or assemble_reviewer_context)(
-            context, selected, intel_path, packet_ctx=packet_ctx)
+            context, selected, intel_path, assets_dir=assets_dir,
+            context_revision=context_revision)
     # Per-turn accounting (#1/D11) merged into the bridge's controller.turn.start:
-    # what kind of prompt, fresh-vs-resume, the FULL reviewed artifact-set
-    # descriptors (every embedded artifact, not just the primary path) tagged by
-    # the delivery ctx_block actually used, the phase, and the context revision.
-    # role/controller are set by the bridge itself. The single review_artifacts
-    # value is reused across the fresh AND resume sends and all run.start/run.end
-    # traces — one truthful delivery tag for the whole pass.
+    # what kind of prompt, fresh-vs-resume, and the FULL reviewed artifact-set
+    # descriptors — derived from the SAME handoff object the prompt was built
+    # from (SC5), never re-inferred. role/controller are set by the bridge
+    # itself. The single review_artifacts value is reused across the fresh AND
+    # resume sends and all run.start/run.end traces.
     meta_artifact_paths = artifact_paths or [intel_path]
-    review_delivery = getattr(ctx_block, "delivery", "embedded")
-    review_embedded = getattr(ctx_block, "embedded", None)
-    review_artifacts = _artifact_descriptors(
-        meta_artifact_paths, delivery=review_delivery, embedded=review_embedded)
+    review_artifacts = getattr(ctx_block, "descriptors", None) or \
+        _artifact_descriptors(meta_artifact_paths, delivery="path")
     if trace:
         trace.event("review.run.start", role=reviewer_role,
                     controller=cfg["controller"], resume=bool(resume_id),
                     fresh=not bool(resume_id), prompt_kind="reviewer_pass",
-                    phase=phase, epoch=epoch, context_revision=context_revision,
+                    phase=phase, context_revision=context_revision,
                     artifacts=review_artifacts,
                     intel_path=intel_path, review_path=review_path,
                     context_update=bool(context_update))
@@ -3100,7 +3057,6 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         "phase": phase,
         "fresh": not bool(resume_id),
         "resume": bool(resume_id),
-        "epoch": epoch,
         "context_revision": context_revision,
         "artifacts": review_artifacts,
     }
@@ -3132,7 +3088,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                                 verdict=None,
                                 controller_failure=True,
                                 prompt_kind="reviewer_pass", phase=phase,
-                                epoch=epoch, context_revision=context_revision,
+                                context_revision=context_revision,
                                 fresh=not bool(resume_id),
                                 resume=bool(resume_id),
                                 artifacts=review_artifacts)
@@ -3181,7 +3137,9 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 trace=trace, extra_writable_dir=extra_writable_dir,
                 model=cfg.get("model"), effort=cfg.get("effort"))
     try:
-        send_result = _send(session, prompt, meta=review_meta)
+        send_result = _send(
+            session, _cross_delivery(prompt, [ctx_block]),
+            meta=review_meta)
         if not send_result.get("ok", True):
             verdict = _controller_failure_verdict(send_result)
             if trace:
@@ -3193,7 +3151,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                     subtype=send_result.get("subtype"),
                     verdict=None,
                     malformed=True,
-                    prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
+                    prompt_kind="reviewer_pass", phase=phase,
                     context_revision=context_revision,
                     fresh=not bool(resume_id), resume=bool(resume_id),
                     artifacts=review_artifacts)
@@ -3213,7 +3171,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         trace.event("review.run.end", role=reviewer_role, result="ok",
                     verdict=(verdict or {}).get("verdict"),
                     malformed=bool((verdict or {}).get("malformed")),
-                    prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
+                    prompt_kind="reviewer_pass", phase=phase,
                     context_revision=context_revision,
                     fresh=not bool(resume_id), resume=bool(resume_id),
                     artifacts=review_artifacts)
@@ -3916,8 +3874,10 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
                phase=None, is_resume=False, seed_artifact_paths=None,
                on_first_send_accepted=None, headless=False,
-               review_allow_ask=True, gate_preview=None,
-               require_pending_question=False):
+                review_allow_ask=True, gate_preview=None,
+                 require_pending_question=False, review_path=None,
+                 save_pending_turn_fn=None, clear_pending_turn_fn=None,
+                 spath=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -3953,7 +3913,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     declined → the status is downgraded and the role continues with a declined
     note. A `handoff_back` without a payload degrades to the needs-input gate
     (never an implicit hand-back)."""
-    pending = first
+    # `_role_loop` is the actual initial lead boundary. Production callers
+    # already pass a typed seed; direct/test callers enter through this one
+    # closed initial-user constructor rather than a generic lead fallback.
+    pending = (first if isinstance(
+        first, (handoff.DeliveryEnvelope, handoff.HandoffBlock))
+               else _initial_user_delivery(first))
+    first = pending
     pending_reopens_work = False
     # A source-tagged reason set at every work-reopening site (one of
     # 'user_revise'/'user_iterate'/'user_answer'/'reviewer_needs_user'/
@@ -3993,7 +3959,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
         # this packet here would dump artifacts and orchestration markup into
         # the terminal as though the user had written it.
         internal_switch_context = context.lstrip().startswith(
-            "[controller switch handoff]")
+            handoff.SWITCH_HANDOFF_MARKER)
         if context.strip() and not internal_switch_context:
             io_out.write(ui.label("you", ui.is_tty(io_out)) + context.strip() + "\n")
             io_out.flush()
@@ -4047,16 +4013,21 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             # of a non-resumed launch is fresh; a resumed launch and every
             # continuation turn are resume turns.
             first_send = pending is first
-            lead_artifacts = list(seed_artifact_paths or []) if first_send else []
-            lead_artifacts.append(status_path)
+            delivery = _lead_turn_delivery(pending)
+            lead_artifacts = (
+                [dict(rec) for rec in delivery.descriptors]
+                if delivery.descriptors
+                else _artifact_descriptors(
+                    (list(seed_artifact_paths or []) if first_send else []) + [status_path],
+                    delivery="path")
+            )
             lead_meta = {
                 "prompt_kind": lead_kind,
                 "phase": phase,
                 "fresh": first_send and not is_resume,
                 "resume": is_resume or not first_send,
                 "context_revision": context_revision,
-                "artifacts": _artifact_descriptors(lead_artifacts,
-                                                   delivery="path"),
+                "artifacts": lead_artifacts,
             }
             if trace:
                 trace.event("role.fingerprint.before", role=role,
@@ -4069,7 +4040,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             context_revision=context_revision,
                             artifacts=lead_meta["artifacts"],
                             **trace_store.prompt_meta(pending))
-            send_result = _send(session, pending, meta=lead_meta)
+            send_result = _send(
+                session, delivery, meta=lead_meta)
             if trace:
                 trace.event("role.send.end", role=role,
                             ok=bool(send_result.get("ok", True)),
@@ -4083,6 +4055,10 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             size=fp_after["size"], exists=fp_after["exists"])
             if (not send_result.get("ok", True)
                     and fp_after["sha256"] == fp_before["sha256"]):
+                if save_pending_turn_fn and pending:
+                    save_pending_turn_fn(role, pending)
+                elif spath and pending:
+                    state_store.save_pending_turn(spath, role, pending)
                 if trace:
                     trace.event("controller.failure", role=role, phase=phase,
                                 reason="send_failed",
@@ -4099,6 +4075,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     gate="controller_failure", action="end")
                     outcome_kind = "ended"
                     break
+                outcome_kind = None
                 while True:
                     ui.banner(io_out, _controller_failure_text(
                         role, getattr(session, "controller", "configured"),
@@ -4111,6 +4088,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         if trace:
                             trace.event("user.action", role=role,
                                         action="controller_failure_retry")
+                        outcome_kind = None
                         break
                     if action is _CTRL_SWITCH:
                         if trace:
@@ -4133,10 +4111,14 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 if outcome_kind in ("switch_controller", "ended"):
                     break
                 continue
-            if (first_send and send_result.get("ok", True)
-                    and on_first_send_accepted):
-                on_first_send_accepted()
-                on_first_send_accepted = None
+            if send_result.get("ok", True):
+                if first_send and on_first_send_accepted:
+                    on_first_send_accepted()
+                    on_first_send_accepted = None
+                if clear_pending_turn_fn:
+                    clear_pending_turn_fn(role)
+                elif spath:
+                    state_store.clear_pending_switch(spath, role)
             # Stale-no-op detection: a reopened (or in-repair) turn that left the
             # status file byte-identical made no progress. Both-missing
             # (None == None) also counts as a no-op — the role never wrote.
@@ -4156,7 +4138,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             before_sha256=fp_before["sha256"],
                             after_sha256=fp_after["sha256"],
                             repair_attempted=True)
-                    pending = _repair_prompt(artifact_noun)
+                    pending = _repair_delivery(artifact_noun)
                     continue
                 # Second consecutive no-op: the automatic repair failed. Show the
                 # visible stuck gate instead of looping forever.
@@ -4195,7 +4177,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if trace:
                         trace.event("user.action", role=role,
                                     action="stuck_retry")
-                    pending = _repair_prompt(artifact_noun)
+                    pending = _repair_delivery(artifact_noun)
                     in_repair = True  # re-checked; re-shows gate if still stuck
                     continue
                 if gate_decision is _STUCK_SWITCH:
@@ -4265,7 +4247,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     reason="handoff_declined",
                                     before_status=decl_before,
                                     after_status=decl_after)
-                    pending = handoff_declined_text_fn()
+                    pending = _handoff_declined_delivery(
+                        handoff_declined_text_fn)
                     # Detection keys off the reason, not the boolean: this branch
                     # invalidates inline and intentionally does not set
                     # pending_reopens_work, so the top-of-loop invalidate is not
@@ -4469,7 +4452,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         elif v == "needs_user" and has_question:
                             review_rounds = 0
                             pending = assemble_reviewer_handoff(
-                                "needs_user", verdict, artifact=artifact_noun)
+                                "needs_user", verdict, artifact=artifact_noun,
+                                review_path=review_path)
                             pending_reopens_work = True
                             pending_reopen_reason = "reviewer_needs_user"
                             if trace:
@@ -4481,7 +4465,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             # A legitimate revise (reviewer wants changes): hand
                             # back to the role for another pass.
                             pending = assemble_reviewer_handoff(
-                                "revise", verdict, artifact=artifact_noun)
+                                "revise", verdict, artifact=artifact_noun,
+                                review_path=review_path)
                             pending_reopens_work = True
                             pending_reopen_reason = "reviewer_revise"
                             if trace:
@@ -4544,7 +4529,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     # Hand the reviewer's unresolved findings straight back to
                     # the role — the user shouldn't have to retype them.
                     pending = assemble_reviewer_handoff(
-                        "revise", dissent_verdict, artifact=artifact_noun)
+                        "revise", dissent_verdict, artifact=artifact_noun,
+                        review_path=review_path)
                     if trace:
                         trace.event("user.action", role=role,
                                     action="iterate_review",
@@ -4573,7 +4559,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     # the artifact stays byte-identical, and the existing
                     # hash-gate auto-skips the advisor on the unchanged follow-up.
                     question_text = outcome[1]
-                    pending = assemble_user_question(question_text, artifact_noun)
+                    pending = _user_lead_delivery(
+                        assemble_user_question(question_text, artifact_noun))
                     pending_user_question = True
                     if trace:
                         trace.event(
@@ -4582,7 +4569,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             **trace_store.prompt_meta(question_text,
                                                       prefix="input"))
                     continue
-                pending = outcome  # revision feedback → another turn
+                pending = _user_lead_delivery(
+                    outcome)  # revision feedback → another turn
                 if trace:
                     trace.event("user.action", role=role, action="revise",
                                 gate="ready_for_review",
@@ -4615,7 +4603,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             "%s\nNo question was recorded; asking %s to repair "
                             "its status." % (needs_input_text(), role),
                             "dissent")
-                        pending = _missing_question_repair_prompt(artifact_noun)
+                        pending = _missing_question_delivery(artifact_noun)
                         pending_reopen_reason = "missing_question"
                         continue
                     if trace:
@@ -4651,7 +4639,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         trace.event("headless.auto", role=role,
                                     gate="needs_input", action="nudge",
                                     nudges=headless_nudges)
-                    pending = _headless_nudge_text(artifact_noun)
+                    pending = _headless_nudge_delivery(artifact_noun)
                     pending_reopens_work = True
                     pending_reopen_reason = "user_answer"
                     continue
@@ -4659,8 +4647,9 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 if outcome is _END:
                     if trace:
                         trace.event("user.action", role=role, action="eof")
+                    outcome_kind = "ended"
                     break
-                pending = outcome
+                pending = _user_lead_delivery(outcome)
                 if trace:
                     trace.event("user.action", role=role, action="answer",
                                 **trace_store.prompt_meta(outcome, prefix="input"))
@@ -4682,7 +4671,8 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
                 evaluate_fn=None, intel_md_path=None, skip_baseline=None,
                 context_revision=None, is_resume=False,
                 on_first_send_accepted=None, headless=False,
-                gate_preview=None):
+                gate_preview=None, review_path=None,
+                save_pending_turn_fn=None, clear_pending_turn_fn=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
     `run_flow` can chain into the planning phase on approval.
@@ -4696,7 +4686,9 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
         reviewer_role=SCOUT_REVIEWER, evaluate_fn=evaluate_fn,
         skip_baseline=skip_baseline, context_revision=context_revision,
         phase="scouting", is_resume=is_resume, headless=headless,
-        gate_preview=gate_preview, require_pending_question=True)
+        gate_preview=gate_preview, require_pending_question=True,
+        review_path=review_path, save_pending_turn_fn=save_pending_turn_fn,
+        clear_pending_turn_fn=clear_pending_turn_fn)
     if intel_md_path:
         loop_kwargs["review_text"] = (
             lambda _p, en=False: scout_review_text(intel_md_path, en))
@@ -4748,7 +4740,7 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     Peer evaluation (when `eval_scratch_path`/`scores_path`/`session_uuid` are
     wired): every pass also carries the reviewer's eval specs into the runner —
     always the reviewer->role spec, plus the once-per-phase ->scout spec (the
-    approved intel JSON embedded, read at eval time) in the planning phase.
+    approved intel JSON carried by path, read from disk at eval time) in the planning phase.
     After the runner returns, the reviewer's scratch is read back, stamped,
     and appended to the aggregate — the evaluator is never given the
     aggregate path (the scratch itself stays under the session-assets home,
@@ -4761,11 +4753,8 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     evaluatee = _REVIEWER_EVALUATEE.get(reviewer_role)
     # Diff-packet snapshot scope (#4): keyed by reviewer role + phase epoch +
     # context revision, stored under the session-assets dir. Only wired when both
-    # a session_uuid and a review_packet_ctx (epoch + context_revision) are
-    # present; the real runners / default run_reviewer_once accept the params,
+    # present; the real runners / default run_reviewer_once accept the param,
     # test-injected runners do not (kept byte-identical).
-    packet_snapshot_dir = (state_store.session_assets_dir(session_uuid)
-                           if (session_uuid and review_packet_ctx) else None)
     if consumed_upstream is None:
         consumed_upstream = _scout_consumed_upstream(
             intel_path, planning_epoch, intel_md_path)
@@ -4823,26 +4812,31 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
         # test-injected runners stay byte-identical.
         if phase is not None and reviewer_runner is None:
             kwargs["phase"] = phase
-        # Diff-packet params (#4) ride the same surface-capable guard: the
-        # default run_reviewer_once and the real runner closures accept them;
+        # Context-revision (#4) rides the same surface-capable guard so the
+        # transport can key the persisted shared-context file by revision: the
+        # default run_reviewer_once and the real runner closures accept it;
         # test-injected runners stay byte-identical (no new kwargs).
-        if packet_snapshot_dir is not None and (
+        if review_packet_ctx and (
                 reviewer_runner is None
                 or getattr(runner, "_coplan_surface_capable", False)):
-            kwargs["epoch"] = review_packet_ctx.get("epoch")
             kwargs["context_revision"] = review_packet_ctx.get(
                 "context_revision")
-            kwargs["snapshot_dir"] = packet_snapshot_dir
-            kwargs["force_full_reread"] = force_full_reread
         specs = None
         if eval_enabled and evaluatee:
             specs = [{
                 "evaluatee": evaluatee,
                 "criteria": EVAL_CRITERIA[(reviewer_role, evaluatee)],
-                "artifact_block":
-                    "The verdict you just wrote for this round is your own "
-                    "review file:\n  %s\nEvaluate the %s's artifact you just "
-                    "reviewed:\n  %s" % (review_path, evaluatee, artifact_path),
+                # Route 12 through the choke point: the reviewer's own verdict
+                # file and the artifact it reviewed, both path-first.
+                "artifact_block": handoff.render_handoff(
+                    "eval->reviewer_verdict", artifacts=[
+                        {"label": "your verdict file", "path":
+                         os.path.abspath(review_path), "kind": "json",
+                         "source": "verdict"},
+                        {"label": "the %s artifact you reviewed" % evaluatee,
+                         "path": os.path.abspath(artifact_path),
+                         "kind": "json" if str(artifact_path).endswith(".json")
+                         else "markdown", "source": "reviewed"}]),
                 "context": "review-round",
                 "phase": phase, "round": round_index,
             }]
@@ -4921,7 +4915,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               on_reviewer_switch_consumed=None,
               on_first_send_accepted=None,
               reviewer_controller_check_fn=None, headless=False,
-              gate_preview=None):
+              gate_preview=None, save_pending_turn_fn=None,
+              clear_pending_turn_fn=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -4977,7 +4972,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
             "scout", SCOUT_REVIEWER, "scouting", eval_scratch_path,
-            scores_path, session_uuid, trace=trace,
+            scores_path, session_uuid, trace=trace, review_path=review_path,
             context_revision=(review_packet_ctx or {}).get("context_revision"))
     if resume_id and not context.strip():
         context = "Continue the session."
@@ -5035,7 +5030,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                          % type(exc).__name__)
             io_out.flush()
             return 1
-        first = (brief + "\n\n" + context).strip()
+        first = _role_seed_delivery(brief, context)
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
                            on_outcome=on_outcome, evaluate_fn=evaluate_fn,
@@ -5045,7 +5040,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                                "context_revision"),
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
-                           headless=headless, gate_preview=gate_preview)
+                           headless=headless, gate_preview=gate_preview,
+                           review_path=review_path)
 
     if cfg["controller"] == "opencode":
         # opencode delivers the role prompt as a generated agent file (a system
@@ -5076,7 +5072,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                          % type(exc).__name__)
             io_out.flush()
             return 1
-        first = (brief + "\n\n" + context).strip()
+        first = _role_seed_delivery(brief, context)
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
                            on_outcome=on_outcome, evaluate_fn=evaluate_fn,
@@ -5086,7 +5082,10 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                                "context_revision"),
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
-                           headless=headless, gate_preview=gate_preview)
+                           headless=headless, gate_preview=gate_preview,
+                           review_path=review_path,
+                           save_pending_turn_fn=save_pending_turn_fn,
+                           clear_pending_turn_fn=clear_pending_turn_fn)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -5111,7 +5110,10 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                            "context_revision"),
                        is_resume=bool(resume_id),
                        on_first_send_accepted=on_first_send_accepted,
-                       headless=headless, gate_preview=gate_preview)
+                        headless=headless, gate_preview=gate_preview,
+                        review_path=review_path,
+                        save_pending_turn_fn=save_pending_turn_fn,
+                        clear_pending_turn_fn=clear_pending_turn_fn)
 
 
 def run_planner(config, context, selected, io_in=None, io_out=None,
@@ -5130,7 +5132,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None,
                 reviewer_controller_check_fn=None, headless=False,
-                gate_preview=None):
+                gate_preview=None, save_pending_turn_fn=None,
+                clear_pending_turn_fn=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -5155,7 +5158,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
     runner = reviewer_runner or make_planning_advisor_runner(
-        plan_md_path, trace=trace, extra_writable_dir=sessions_dir)
+        plan_md_path, trace=trace, extra_writable_dir=sessions_dir,
+        intel_path=intel_path, intel_md_path=intel_md_path)
     review_fn = make_review_fn(
         config,
         reviewer_context if reviewer_context is not None else context,
@@ -5181,7 +5185,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             "planner", PLANNING_ADVISOR, "planning", eval_scratch_path,
             scores_path, session_uuid, intel_path=intel_path,
             planning_epoch=planning_epoch, intel_md_path=intel_md_path,
-            trace=trace,
+            trace=trace, review_path=review_path,
             context_revision=(review_packet_ctx or {}).get("context_revision"))
     if resume_id and not context.strip():
         context = "Continue the session."
@@ -5211,7 +5215,9 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="planning", is_resume=bool(resume_id),
         seed_artifact_paths=[intel_path], headless=headless,
-        gate_preview=gate_preview, require_pending_question=True)
+        gate_preview=gate_preview, require_pending_question=True,
+        review_path=review_path, save_pending_turn_fn=save_pending_turn_fn,
+        clear_pending_turn_fn=clear_pending_turn_fn)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -5261,7 +5267,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             io_out.flush()
             report("ended", None)
             return 1
-        first = (brief + "\n\n" + context).strip()
+        first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, plan_json_path, context, io_in, io_out,
             on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
@@ -5297,7 +5303,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             io_out.flush()
             report("ended", None)
             return 1
-        first = (brief + "\n\n" + context).strip()
+        first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, plan_json_path, context, io_in, io_out,
             on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
@@ -5347,7 +5353,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None,
                 reviewer_controller_check_fn=None, headless=False,
-                gate_preview=None):
+                gate_preview=None, save_pending_turn_fn=None,
+                clear_pending_turn_fn=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -5400,6 +5407,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         evaluate_fn = _make_evaluate_fn(
             "builder", BUILD_REVIEWER, "building", eval_scratch_path,
             scores_path, session_uuid, consumed_upstream=consumed, trace=trace,
+            review_path=build_review_path,
             context_revision=(review_packet_ctx or {}).get("context_revision"))
     if resume_id and not context.strip():
         context = "Continue the session."
@@ -5445,7 +5453,9 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="building", is_resume=bool(resume_id),
         seed_artifact_paths=[plan_json_path, plan_md_path], headless=headless,
-        gate_preview=gate_preview, require_pending_question=True)
+        gate_preview=gate_preview, require_pending_question=True,
+        review_path=build_review_path, save_pending_turn_fn=save_pending_turn_fn,
+        clear_pending_turn_fn=clear_pending_turn_fn)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
@@ -5493,7 +5503,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             io_out.flush()
             report("ended", None)
             return 1
-        first = (brief + "\n\n" + context).strip()
+        first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, build_status_path, context, io_in, io_out,
             on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
@@ -5529,7 +5539,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             io_out.flush()
             report("ended", None)
             return 1
-        first = (brief + "\n\n" + context).strip()
+        first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, build_status_path, context, io_in, io_out,
             on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
@@ -5776,41 +5786,133 @@ def validate_switch_role(role, target, phase, selected, state):
 
 
 def switch_handoff_packet(role, phase, pending_switch, artifact_paths=None,
-                          shared_context="", pending_turn=None):
-    """Fresh-provider handoff text prepended to a switched role/reviewer."""
+                          shared_context="", pending_turn=None, assets_dir=None,
+                          context_revision=None):
+    """Fresh-provider controller-switch handoff (route 11), delivered FILE-ONLY
+    via the shared transport. The switch carries only content-free facts inline
+    (phase, role, from/to controller, and a NORMALIZED reason/source CODE when
+    one exists); every body — the shared context, the artifact files, any
+    free-form switch reason/source/diagnostic, and the failed pending turn — is
+    materialized to a file (or already on disk) and carried by PATH. The switched
+    role reads them from disk and then processes the failed pending turn."""
     if not pending_switch:
         return ""
-    from_controller = pending_switch.get("from_controller") or "unknown"
-    to_controller = pending_switch.get("to_controller") or "unknown"
-    lines = [
-        "[controller switch handoff]",
-        "You are continuing an existing cowork %s phase as %s." % (phase, role),
-        "Controller switched: %s -> %s." % (from_controller, to_controller),
-        "This is a fresh %s provider conversation. Hidden chat history from %s "
-        "is not available; cowork-visible session state, artifacts, shared "
-        "context, and the working tree continue." % (to_controller, from_controller),
-    ]
-    if pending_switch.get("reason"):
-        lines.append("Switch reason: %s." % pending_switch.get("reason"))
-    if pending_switch.get("source"):
-        lines.append("Switch source: %s." % pending_switch.get("source"))
+    facts = {
+        "phase": phase or "unknown",
+        "role": role or "unknown",
+        "from_controller": pending_switch.get("from_controller") or "unknown",
+        "to_controller": pending_switch.get("to_controller") or "unknown",
+    }
+    artifacts = []
     if shared_context:
-        lines.extend(["", "<shared_context>", shared_context.strip(),
-                      "</shared_context>"])
+        artifacts.append(_shared_context_artifact(shared_context, assets_dir, context_revision))
+    # Free-form reason/source (whitespace / authored text) rides a file; a
+    # normalized single-token code may ride inline as a content-free fact.
+    recovery_bits = []
+    for key, fact_key in (("reason", "reason_code"), ("source", "source_code")):
+        value = pending_switch.get(key)
+        if not value:
+            continue
+        if handoff.is_content_free_token(value):
+            facts[fact_key] = value
+        else:
+            recovery_bits.append("%s: %s" % (key, value))
+    if recovery_bits:
+        path = handoff.persist_switch_recovery_file(
+            assets_dir, role, "\n".join(recovery_bits))
+        artifacts.append(
+            (path and {"label": "switch recovery note (free-form)",
+                       "path": os.path.abspath(path), "kind": "markdown",
+                       "source": "recovery"})
+            or _tempfile_artifact("\n".join(recovery_bits),
+                                  "switch recovery note (free-form)",
+                                  prefix="cowork_switch_", suffix=".txt",
+                                  source="recovery"))
     for path in artifact_paths or []:
         if not path:
             continue
-        lines.extend(["", "<artifact path=%r>" % path, _read_text(path),
-                      "</artifact>"])
+        abs_p = os.path.abspath(path)
+        if any(a.get("path") == abs_p for a in artifacts):
+            continue
+        artifacts.append({"label": "session artifact (%s)"
+                          % os.path.basename(path),
+                          "path": abs_p,
+                          "kind": "json" if str(path).endswith(".json")
+                          else "markdown", "source": "artifacts"})
     if pending_turn:
-        lines.extend([
-            "",
-            "<failed_pending_turn>",
-            pending_turn.strip(),
-            "</failed_pending_turn>",
-            "Process the failed pending turn above after orienting yourself.",
-        ])
-    return "\n".join(lines).strip()
+        path = handoff.persist_pending_turn_file(assets_dir, role, pending_turn)
+        artifacts.append(
+            (path and {"label": "failed pending turn (process it after "
+                       "orienting)", "path": os.path.abspath(path),
+                       "kind": "markdown", "source": "pending_turn"})
+            or _tempfile_artifact(pending_turn, "failed pending turn (process "
+                                  "it after orienting)",
+                                  prefix="cowork_pending_", suffix=".txt",
+                                  source="pending_turn"))
+    return handoff.render_handoff(
+        "controller->switch", artifacts=artifacts, facts=facts)
+
+
+def pending_resume_packet(role, phase, pending_entry, artifact_paths=None,
+                          shared_context="", pending_turn=None, assets_dir=None,
+                          context_revision=None):
+    """Same-controller failed-turn resume handoff (edge lead->pending_resume), delivered
+    FILE-ONLY via the shared transport without switch markers or fake switch premises.
+    """
+    if not (pending_entry or pending_turn):
+        return ""
+    facts = {
+        "phase": phase or "unknown",
+        "role": role or "unknown",
+    }
+    artifacts = []
+    if shared_context:
+        artifacts.append(_shared_context_artifact(shared_context, assets_dir, context_revision))
+    recovery_bits = []
+    if isinstance(pending_entry, dict):
+        for key, fact_key in (("reason", "reason_code"), ("source", "source_code")):
+            value = pending_entry.get(key)
+            if not value:
+                continue
+            if handoff.is_content_free_token(value):
+                facts[fact_key] = value
+            else:
+                recovery_bits.append("%s: %s" % (key, value))
+    if recovery_bits:
+        path = handoff.persist_switch_recovery_file(
+            assets_dir, role, "\n".join(recovery_bits))
+        artifacts.append(
+            (path and {"label": "switch recovery note (free-form)",
+                       "path": os.path.abspath(path), "kind": "markdown",
+                       "source": "recovery"})
+            or _tempfile_artifact("\n".join(recovery_bits),
+                                  "switch recovery note (free-form)",
+                                  prefix="cowork_switch_", suffix=".txt",
+                                  source="recovery"))
+    for path in artifact_paths or []:
+        if not path:
+            continue
+        abs_p = os.path.abspath(path)
+        if any(a.get("path") == abs_p for a in artifacts):
+            continue
+        artifacts.append({"label": "session artifact (%s)"
+                          % os.path.basename(path),
+                          "path": abs_p,
+                          "kind": "json" if str(path).endswith(".json")
+                          else "markdown", "source": "artifacts"})
+    pt = pending_turn or (pending_entry.get("pending_turn") if isinstance(pending_entry, dict) else None)
+    if pt:
+        path = handoff.persist_pending_turn_file(assets_dir, role, pt)
+        artifacts.append(
+            (path and {"label": "failed pending turn (process it after "
+                       "orienting)", "path": os.path.abspath(path),
+                       "kind": "markdown", "source": "pending_turn"})
+            or _tempfile_artifact(pt, "failed pending turn (process "
+                                  "it after orienting)",
+                                  prefix="cowork_pending_", suffix=".txt",
+                                  source="pending_turn"))
+    return handoff.render_handoff(
+        "lead->pending_resume", artifacts=artifacts, facts=facts)
 
 
 def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
@@ -6031,6 +6133,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
     pending_switches = {}
     pending_switch_turns = {}
+    if session_enabled and holder.get("state"):
+        for r, entry in (holder["state"].get("pending_switches") or {}).items():
+            if isinstance(entry, dict) and entry.get("pending_turn"):
+                pending_switch_turns[r] = entry["pending_turn"]
 
     def check_controller_tool(controller):
         return preflight.check_tools(
@@ -6048,7 +6154,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     alerts_count=len(alerts))
         return alerts
 
-    def switch_controller(role, reason=None, target=None, source="gate"):
+    def switch_controller(role, reason=None, target=None, source="gate", pending_turn=None):
         if role not in config:
             io_out.write("cowork: cannot switch %s — role is not configured.\n"
                          % role)
@@ -6099,10 +6205,11 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             "source": source,
             "created": time.time(),
         }
+        pt = pending_turn if pending_turn is not None else pending_switch_turns.get(role)
         if session_enabled:
             holder["state"] = state_store.switch_role_controller(
                 spath, role, target, prior=holder["state"], reason=reason,
-                source=source, created=entry["created"])
+                source=source, created=entry["created"], pending_turn=pt)
             # Keep the in-memory config in lockstep with the saved config.
             config[role] = dict(holder["state"]["config"][role])
         else:
@@ -6208,6 +6315,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # resume of the current phase's user-facing role.
     lead_role = PHASE_LEADS[phase]
     lead_resume_id = role_resume_id(lead_role)
+    lead_switch_pending = bool(
+        session_enabled
+        and state_store.read_pending_switch(holder["state"], lead_role))
     if lead_resume_id:
         trace.event("run.resume", role=lead_role,
                     controller=config[lead_role]["controller"],
@@ -6215,7 +6325,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
     # Step 3: context. On a resume, skip the goal prompt and auto-continue.
     context = resolve_context(
-        args, resuming=bool(lead_resume_id) or bool(args.switch_controller))
+        args, resuming=(bool(lead_resume_id)
+                        or bool(args.switch_controller)
+                        or lead_switch_pending))
 
     # Context invariant: explicit context is a session-wide event. Persist it as
     # the CURRENT session context (bumping the revision when it changed), and
@@ -6248,9 +6360,13 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         (F2_roles_never_block, runtime activation of the prompt layer)."""
         if not headless:
             return seed
-        body = (seed or "").strip()
-        return (HEADLESS_LEAD_NOTE + "\n\n" + body) if body \
-            else HEADLESS_LEAD_NOTE
+        note = HEADLESS_LEAD_NOTE
+        if not seed:
+            return note
+        if isinstance(seed, handoff.HandoffBlock):
+            return handoff.compose_handoff_blocks(
+                _headless_lead_fragment(), handoff.STATIC_SEPARATOR, seed)
+        return (str(note) + "\n\n" + str(seed).strip()).strip()
 
     # The reviewer context passed to every paired reviewer this run: under
     # --headless it carries the runtime headless reviewer note so the reviewer
@@ -6276,11 +6392,15 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         trace.event("context.gap", role=role, revision=current_rev,
                     context_revision=current_rev,
                     delivered=True, reason="phase_invocation")
-        block = context_update_block(gap)
-        seed = (seed or "").strip()
-        if not seed or seed == gap.strip():
+        block = context_update_block(gap, intel_dir, current_rev)
+        if not seed or (isinstance(seed, str) and str(seed).strip() == gap.strip()):
             return block
-        return block + "\n\n" + seed
+        if (isinstance(seed, handoff.HandoffBlock)
+                or getattr(seed, "kind", None) == "static_role"):
+            return handoff.compose_handoff_blocks(
+                block, handoff.STATIC_SEPARATOR, seed)
+        raise TypeError(
+            "context-update handoff cannot be combined with untyped seed text")
 
     def reviewer_gap(reviewer_role):
         """The context-update wake block for a RESUMED paired reviewer that has
@@ -6423,6 +6543,11 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                      % (wt_path, wt_branch))
         io_out.flush()
 
+    def save_pending_turn_for(role, pending_text):
+        if session_enabled:
+            holder["state"] = state_store.save_pending_turn(
+                spath, role, pending_text, prior=holder["state"])
+
     def pending_switch_for(role):
         if session_enabled:
             return state_store.read_pending_switch(holder["state"], role)
@@ -6457,27 +6582,58 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         return []
 
     def switch_note_for(role):
-        return switch_handoff_packet(
-            role, phase, pending_switch_for(role),
+        ps = pending_switch_for(role)
+        pt = pending_switch_turns.get(role)
+        if pt is None and ps and isinstance(ps, dict):
+            pt = ps.get("pending_turn")
+        if not ps and not pt:
+            return ""
+        from_c = ps.get("from_controller") if isinstance(ps, dict) else None
+        to_c = ps.get("to_controller") if isinstance(ps, dict) else None
+        if from_c and to_c and from_c != to_c:
+            return switch_handoff_packet(
+                role, phase, ps,
+                artifact_paths=switch_artifacts_for(role),
+                shared_context=shared_context,
+                pending_turn=pt,
+                assets_dir=intel_dir,
+                context_revision=current_rev)
+        return pending_resume_packet(
+            role, phase, ps,
             artifact_paths=switch_artifacts_for(role),
             shared_context=shared_context,
-            pending_turn=pending_switch_turns.get(role))
+            pending_turn=pt,
+            assets_dir=intel_dir,
+            context_revision=current_rev)
 
     def seed_with_switch_note(role, seed):
         note = switch_note_for(role)
         if not note:
             return seed
-        seed = (seed or "").strip()
-        return (note + "\n\n" + seed) if seed else note
+        if not seed:
+            return note
+        if isinstance(note, handoff.HandoffBlock):
+            if (isinstance(seed, handoff.HandoffBlock)
+                    or getattr(seed, "kind", None) == "static_role"):
+                return handoff.compose_handoff_blocks(
+                    note, handoff.STATIC_SEPARATOR, seed)
+            raise TypeError(
+                "controller-switch handoff cannot be combined with untyped "
+                "seed text")
+        raise TypeError("controller-switch note lacks handoff provenance")
 
     def prepare_fresh_seed_after_switch(role):
         if role == "scout":
-            return with_discovery(shared_context)
+            # The switch packet already carries the shared-context FILE path.
+            # Re-inlining shared_context here would both duplicate it and erase
+            # the handoff provenance required by the send boundary.
+            return with_discovery("")
         if role == "planner":
-            return assemble_planner_seed(intel_path, shared_context)
+            return assemble_planner_seed(intel_path, shared_context, intel_dir, current_rev)
         if role == "builder":
             return assemble_builder_seed(
-                plan_json_path, plan_md_path, shared_context)
+                plan_json_path, plan_md_path, shared_context,
+                intel_dir, current_rev)
         return shared_context
 
     # Peer-evaluation assets: a per-role scratch file (each evaluator's only
@@ -6628,6 +6784,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # discover-and-confirm responsibility survives every cycle.
     repo_candidates = discover_git_roots(run_cwd)
     repo_discovery_note = assemble_repo_discovery_note(repo_candidates, run_cwd)
+    repo_discovery_fragment = _repo_discovery_fragment(
+        repo_candidates, run_cwd)
 
     def with_discovery(seed):
         # Prepend the discovery note to EVERY scout seed — fresh, plain resume,
@@ -6636,10 +6794,19 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # task, so a plain auto-continue resume still carries no new goal (the
         # note alone, never a re-injected user goal). An empty seed collapses to
         # the note alone — no trailing blank lines.
-        seed = (seed or "").strip()
-        return (repo_discovery_note + "\n\n" + seed) if seed else repo_discovery_note
+        if not seed:
+            return repo_discovery_fragment
+        if isinstance(seed, handoff.HandoffBlock):
+            return handoff.compose_handoff_blocks(
+                repo_discovery_fragment, handoff.STATIC_SEPARATOR, seed)
+        return (str(repo_discovery_note) + "\n\n" + str(seed).strip()).strip()
 
-    scout_seed = with_discovery(context)
+    # A resumed scout receives any unseen context through context->update and
+    # otherwise gets only the standing discovery reminder.  Re-injecting the
+    # raw saved goal here would duplicate it beside the path-only update block
+    # and destroy the typed cross-role provenance.
+    scout_seed = with_discovery(
+        "" if role_resume_id("scout") else context)
     planner_seed = None
     builder_seed = None
     if phase == "planning":
@@ -6651,7 +6818,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         if role_resume_id("planner"):
             planner_seed = context
         else:
-            planner_seed = assemble_planner_seed(intel_path, shared_context)
+            planner_seed = assemble_planner_seed(intel_path, shared_context, intel_dir, current_rev)
     elif phase == "building":
         # Resuming into the building phase. A saved builder session continues
         # with the (possibly new) context; a building phase persisted WITHOUT a
@@ -6661,7 +6828,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             builder_seed = context
         else:
             builder_seed = assemble_builder_seed(
-                plan_json_path, plan_md_path, shared_context)
+                plan_json_path, plan_md_path, shared_context,
+                intel_dir, current_rev)
     while True:
         if phase == "scouting":
             if "scout" not in selected:
@@ -6710,6 +6878,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 headless=headless,
                 gate_preview=make_gate_preview(
                     "scout", planner_on_team, session_enabled),
+                save_pending_turn_fn=save_pending_turn_for,
+                clear_pending_turn_fn=clear_pending_switch_for,
                 on_outcome=lambda o, p=None: outcome_box.update(
                     outcome=o, payload=p))
             if rc != 0:
@@ -6743,7 +6913,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     planner_seed = intel_updated_block(intel_path)
                 else:
                     planner_seed = assemble_planner_seed(
-                        intel_path, shared_context)
+                        intel_path, shared_context, intel_dir, current_rev)
                 continue
             break
 
@@ -6789,6 +6959,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 headless=headless,
                 gate_preview=make_gate_preview(
                     "planner", builder_on_team, session_enabled),
+                save_pending_turn_fn=save_pending_turn_for,
+                clear_pending_turn_fn=clear_pending_switch_for,
                 on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
             if rc != 0:
                 action = recover_controller_failure("planner", "startup_or_probe")
@@ -6824,7 +6996,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                             **trace_store.prompt_meta(
                                 planner_box["payload"] or "", prefix="payload"))
                 scout_seed = with_discovery(
-                    handoff_wake_block(planner_box["payload"]))
+                    handoff_wake_block(planner_box["payload"], intel_dir))
                 planner_seed = None
                 continue
             if (rc == 0 and planner_box["outcome"] == "approved"
@@ -6843,7 +7015,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         plan_json_path, plan_md_path)
                 else:
                     builder_seed = assemble_builder_seed(
-                        plan_json_path, plan_md_path, shared_context)
+                        plan_json_path, plan_md_path, shared_context,
+                        intel_dir, current_rev)
                 continue
             if (rc == 0 and planner_box["outcome"] == "approved"
                     and not builder_on_team):
@@ -6900,6 +7073,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             headless=headless,
             gate_preview=make_gate_preview(
                 "builder", builder_on_team, session_enabled),
+            save_pending_turn_fn=save_pending_turn_for,
+            clear_pending_turn_fn=clear_pending_switch_for,
             on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
         if rc != 0:
             action = recover_controller_failure("builder", "startup_or_probe")
@@ -6931,7 +7106,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         to_role=HANDBACK_PREPROCESSOR["builder"],
                         **trace_store.prompt_meta(
                             builder_box["payload"] or "", prefix="payload"))
-            planner_seed = plan_handback_wake_block(builder_box["payload"])
+            planner_seed = plan_handback_wake_block(
+                builder_box["payload"], intel_dir)
             builder_seed = None
             continue
         # Build approval is terminal for this run (the phase stays `building`,
