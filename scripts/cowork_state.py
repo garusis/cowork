@@ -795,6 +795,18 @@ def save_role_session(path, role, controller, session_id, prior=None):
     return state
 
 
+def save_pending_turn(path, role, text, prior=None):
+    """Persist a failed direct turn for `role` so any future resume or switch replays it."""
+    state = dict(prior or load(path) or {})
+    pending = dict(state.get("pending_switches") or {})
+    entry = dict(pending.get(role) or {})
+    entry["pending_turn"] = text
+    pending[role] = entry
+    state["pending_switches"] = pending
+    save(path, state)
+    return state
+
+
 def read_pending_switch(state, role):
     """Return the pending fresh-provider handoff metadata for `role`, if any."""
     entry = ((state or {}).get("pending_switches") or {}).get(role)
@@ -815,7 +827,8 @@ def clear_pending_switch(path, role, prior=None):
 
 
 def switch_role_controller(path, role, target_controller, prior=None,
-                           reason=None, source=None, created=None):
+                           reason=None, source=None, created=None,
+                           pending_turn=None):
     """Persist a controller switch for one role.
 
     The visible cowork session continues, but the provider-specific hidden
@@ -846,13 +859,18 @@ def switch_role_controller(path, role, target_controller, prior=None,
     state["sessions"] = sessions
 
     pending = dict(state.get("pending_switches") or {})
-    pending[role] = {
+    prev_entry = pending.get(role) or {}
+    switch_entry = {
         "from_controller": from_controller,
         "to_controller": target_controller,
         "reason": reason,
         "source": source,
         "created": created if created is not None else time.time(),
     }
+    pt = pending_turn if pending_turn is not None else prev_entry.get("pending_turn")
+    if pt is not None:
+        switch_entry["pending_turn"] = pt
+    pending[role] = switch_entry
     state["pending_switches"] = pending
     save(path, state)
     return state
