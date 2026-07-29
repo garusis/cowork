@@ -7,16 +7,25 @@ fakes; no real claude/codex CLI is spawned. Run:
     python3 -m unittest scripts/test_cowork.py
 """
 
+import array
+import ast
 import collections
 import contextlib
+import errno
+import fcntl
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import select as select_mod
 import shutil
 import subprocess
 import sys
 import tempfile
+import termios
+import threading
+import time
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +37,7 @@ import cowork_preflight as preflight  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_ui as ui  # noqa: E402
+import cowork_policy as policy  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
 # that exercise the real libraries skip when they are absent — same pattern as the
@@ -3409,8 +3419,8 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertTrue(inv)
         # The previously-ambiguous changed:false case is now self-explanatory:
         # the event records the REAL on-disk status before and after.
-        self.assertEqual(inv[0]["before_status"], "ready_for_review")
-        self.assertEqual(inv[0]["after_status"], "needs_input")
+        self.assertEqual(inv[0]["before"], "ready_for_review")
+        self.assertEqual(inv[0]["after"], "needs_input")
 
     # A genuinely-new artifact written on the reopened turn (different raw
     # bytes) — used for the content-changing no-false-positive half of T7.
@@ -6314,7 +6324,12 @@ class EvalStateStoreTest(_EvalEnvMixin, unittest.TestCase):
                      {"name": "helpfulness", "score": 0},
                      {"name": "noise", "score": "4", "feedback": 12},
                      {"name": "", "score": 3},          # nameless: dropped
-                     {"name": "bad", "score": "x"},     # unscorable: dropped
+                     # CV-019: an unscoreable criterion SURVIVES as
+                     # insufficient_evidence. Dropping it shrank the
+                     # denominator, so the criteria an evaluator could judge
+                     # looked like the whole picture.
+                     {"name": "bad", "score": "x"},
+                     {"name": "n/a", "score": "not_applicable"},
                      "not a dict",
                  ],
                  "enhancement_suggestions": "tighten findings"},
@@ -6328,11 +6343,17 @@ class EvalStateStoreTest(_EvalEnvMixin, unittest.TestCase):
         self.assertEqual(entry["evaluatee"], "scout-reviewer")
         self.assertEqual(entry["enhancement_suggestions"], "tighten findings")
         crits = {c["name"]: c for c in entry["criteria"]}
-        self.assertEqual(set(crits), {"accuracy", "helpfulness", "noise"})
+        self.assertEqual(set(crits),
+                         {"accuracy", "helpfulness", "noise", "bad", "n/a"})
         self.assertEqual(crits["accuracy"]["score"], 5)    # clamped down
         self.assertEqual(crits["helpfulness"]["score"], 1)  # clamped up
         self.assertEqual(crits["noise"]["score"], 4)        # coerced
         self.assertEqual(crits["noise"]["feedback"], "12")  # stringified
+        # Honest non-numeric values are first-class scores, not missing ones.
+        self.assertEqual(crits["bad"]["score"], "insufficient_evidence")
+        self.assertEqual(crits["n/a"]["score"], "not_applicable")
+        self.assertFalse(state_store.is_numeric_score(crits["bad"]["score"]))
+        self.assertTrue(state_store.is_numeric_score(crits["noise"]["score"]))
 
     def test_append_score_entries_fresh_then_append(self):
         self._scores_root()
@@ -6516,11 +6537,11 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         return write
 
     def test_none_without_paths(self):
-        self.assertIsNone(cowork._make_evaluate_fn(
+        self.assertIsNone(cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", None, "/s", "S"))
-        self.assertIsNone(cowork._make_evaluate_fn(
+        self.assertIsNone(cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", "/p", None, "S"))
-        self.assertIsNone(cowork._make_evaluate_fn(
+        self.assertIsNone(cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", "/p", "/s", None))
 
     def test_eval_turn_is_muted_and_aggregated_with_stamps(self):
@@ -6529,7 +6550,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         scratch = state_store.eval_scratch_path_for(d, "scout", "S")
         sess = self._session(self._scratch_writer(scratch))
         real_out = sess.io_out
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", scratch,
             state_store.scores_path_for("S"), "S")
         verdict = {"verdict": "approve", "findings": ["minor note"]}
@@ -6567,7 +6588,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         self._scratch_writer(scratch)("prior round")   # stale but valid
         sess = self._session(scratch_writer=None)      # writes nothing
         trace = self._trace(d)
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", scratch,
             state_store.scores_path_for("S"), "S", trace=trace)
         fn(sess, {"verdict": "revise"}, 2)
@@ -6590,7 +6611,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
                 fh.write("not json")
         sess = self._session(bad_writer)
         trace = self._trace(d)
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", scratch,
             state_store.scores_path_for("S"), "S", trace=trace)
         fn(sess, {"verdict": "approve"}, 1)
@@ -6612,7 +6633,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         def writer(text):
             self._scratch_writer(scratch, writers["evaluatees"])(text)
         sess = self._session(writer)
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "planner", "planning-advisor", "planning", scratch,
             state_store.scores_path_for("S"), "S", intel_path=intel)
         fn(sess, {"verdict": "revise"}, 1)
@@ -6649,7 +6670,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         scratch = state_store.eval_scratch_path_for(d, "planner", "S")
 
         def make_fn():
-            return cowork._make_evaluate_fn(
+            return cowork._legacy_make_evaluate_fn(
                 "planner", "planning-advisor", "planning", scratch,
                 state_store.scores_path_for("S"), "S", intel_path=intel,
                 planning_epoch=1)
@@ -6673,7 +6694,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         scratch = state_store.eval_scratch_path_for(d, "planner", "S")
         sess = self._session(self._scratch_writer(
             scratch, ("planning-advisor",)))
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "planner", "planning-advisor", "planning", scratch,
             state_store.scores_path_for("S"), "S",
             intel_path=os.path.join(d, "missing.json"))
@@ -6690,7 +6711,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         scratch = state_store.eval_scratch_path_for(d, "planner", "S")
         sess = self._session(self._scratch_writer(
             scratch, ("planning-advisor",)))
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "planner", "planning-advisor", "planning", scratch,
             state_store.scores_path_for("S"), "S", intel_path=intel)
         fn(sess, {"verdict": "revise"}, 1)          # intel missing: no bundle
@@ -6717,7 +6738,7 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
         scratch = state_store.eval_scratch_path_for(d, "planner", "S")
 
         def make_fn(epoch):
-            return cowork._make_evaluate_fn(
+            return cowork._legacy_make_evaluate_fn(
                 "planner", "planning-advisor", "planning", scratch,
                 state_store.scores_path_for("S"), "S", intel_path=intel,
                 planning_epoch=epoch)
@@ -6880,7 +6901,7 @@ class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
                 pass
 
         sess = FakeSession()
-        efn = cowork._make_evaluate_fn(
+        efn = cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", scratch,
             state_store.scores_path_for("X"), "X")
         rc = cowork._scout_loop(
@@ -7020,8 +7041,17 @@ class RunReviewerOnceEvalTest(_EvalEnvMixin, unittest.TestCase):
 
 
 class MakeReviewFnEvalTest(_EvalEnvMixin, unittest.TestCase):
-    """review_fn computes the reviewer's eval specs, hands them to the runner,
-    and aggregates the reviewer's scratch after the pass."""
+    """review_fn computes the reviewer's eval specs and SEALS AND QUEUES them.
+
+    The specs are deliberately NOT handed to the runner any more (D2): passing
+    them made the reviewer score its own round on its own session, which is the
+    isolation violation the queue exists to remove. An isolated evaluator drains
+    the queue at phase end.
+    """
+
+    def _queued(self, session_uuid="S"):
+        return cowork_eval.read_queue(
+            state_store.evaluation_queue_path_for(session_uuid))
 
     def _runner(self, scratch_entries=None):
         seen = []
@@ -7031,7 +7061,10 @@ class MakeReviewFnEvalTest(_EvalEnvMixin, unittest.TestCase):
                    eval_scratch_path=None, eval_specs=None):
             seen.append({"eval_scratch_path": eval_scratch_path,
                          "eval_specs": eval_specs})
-            if eval_scratch_path and scratch_entries is not None:
+            # The runner no longer receives specs (D2), so a fake that wrote a
+            # scratch from them writes nothing. Kept so the parameter shape is
+            # still exercised.
+            if eval_scratch_path and scratch_entries is not None and eval_specs:
                 with open(eval_scratch_path, "w") as fh:
                     json.dump({"evaluations": [
                         {"evaluatee": e,
@@ -7072,21 +7105,28 @@ class MakeReviewFnEvalTest(_EvalEnvMixin, unittest.TestCase):
             scores_path=state_store.scores_path_for("S"), session_uuid="S")
         fn(os.path.join(d, "scout.intel.S.json"), 1)
         fn(os.path.join(d, "scout.intel.S.json"), 2)
+        # ISOLATION: the runner is given the scratch path but NEVER the specs,
+        # so the reviewer's own session cannot score the round.
         for call in runner.seen:
             self.assertEqual(call["eval_scratch_path"], scratch)
-            self.assertEqual(
-                [s["evaluatee"] for s in call["eval_specs"]], ["scout"])
-        data = self._scores("S")
-        self.assertEqual(len(data["evaluations"]), 2)
-        for i, entry in enumerate(data["evaluations"]):
-            self.assertEqual(entry["evaluator"], "scout-reviewer")
+            self.assertIsNone(call["eval_specs"])
+        # Nothing is scored yet — that is the point of deferring it.
+        self.assertEqual((self._scores("S") or {}).get("evaluations") or [],
+                         [])
+        # One self-contained queue entry per round, each with sealed evidence.
+        queued = [q for q in self._queued() if q.get("state") == "pending"]
+        self.assertEqual(len(queued), 2)
+        for i, entry in enumerate(queued):
+            self.assertEqual(entry["evaluator_seat"], "scout-reviewer")
             self.assertEqual(entry["evaluatee"], "scout")
             self.assertEqual(entry["phase"], "scouting")
             self.assertEqual(entry["round"], i + 1)
-            self.assertEqual(entry["context"], "review-round")
-        # Q3a: the scratch remains in .cowork after aggregation (overwritten
-        # per round; staleness is handled by clearing BEFORE each eval send)
-        self.assertTrue(os.path.exists(scratch))
+            self.assertTrue(entry["envelope"]["envelope_id"])
+            self.assertTrue(entry["envelope"]["artifacts"])
+            # The scratch path travels WITH the entry, because the process that
+            # drains it may not be this one.
+            self.assertEqual(entry["scratch_path"], scratch)
+        # No scratch is written during the round any more: nothing scored.
 
     def test_planning_first_round_bundles_scout_spec_once(self):
         self._scores_root()
@@ -7108,26 +7148,18 @@ class MakeReviewFnEvalTest(_EvalEnvMixin, unittest.TestCase):
         fn(os.path.join(d, "planner.plan.S.json"), 1)
         fn(os.path.join(d, "planner.plan.S.json"), 2)
         fn(os.path.join(d, "planner.plan.S.json"), 1)   # reset: no re-bundle
-        first = [s["evaluatee"] for s in runner.seen[0]["eval_specs"]]
-        self.assertEqual(first, ["planner", "scout"])
-        # the ->scout spec sends the intel path-first (#2 — path + read
-        # instruction, not the body)
-        scout_spec = runner.seen[0]["eval_specs"][1]
-        self.assertNotIn("F-INTEL", scout_spec["artifact_block"])
-        self.assertIn(intel, scout_spec["artifact_block"])
-        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION,
-                      scout_spec["artifact_block"])
-        self.assertEqual(scout_spec["context"], "consumed-intel")
-        for later in runner.seen[1:]:
-            self.assertEqual(
-                [s["evaluatee"] for s in later["eval_specs"]], ["planner"])
-        data = self._scores("S")
-        self.assertEqual(len(data["evaluations"]), 4)   # 2 + 1 + 1
-        scout_entries = [e for e in data["evaluations"]
-                         if e["evaluatee"] == "scout"]
-        self.assertEqual(len(scout_entries), 1)
-        self.assertEqual(scout_entries[0]["evaluator"], "planning-advisor")
-        self.assertEqual(scout_entries[0]["context"], "consumed-intel")
+        # The specs never reach the runner; the consumed-upstream bundle is
+        # recorded on the queued entry instead.
+        for call in runner.seen:
+            self.assertIsNone(call["eval_specs"])
+        queued = [q for q in self._queued() if q.get("state") == "pending"]
+        self.assertEqual(len(queued), 3)
+        # Exactly ONE of the three carries the consumed-intel bundle: it rides
+        # round 1 only, and a later round-1 must not re-bundle it.
+        bundled = [q for q in queued
+                   if q.get("consumed_context") == "consumed-intel"]
+        self.assertEqual(len(bundled), 1)
+        self.assertEqual(bundled[0]["evaluator_seat"], "planning-advisor")
 
     def test_scout_spec_not_repeated_across_resume(self):
         # A FRESH review_fn (new make_review_fn construction, e.g. a cowork
@@ -7153,30 +7185,34 @@ class MakeReviewFnEvalTest(_EvalEnvMixin, unittest.TestCase):
         runner1 = self._runner(
             scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
         make_fn(runner1)(os.path.join(d, "planner.plan.S.json"), 1)
-        self.assertEqual([s["evaluatee"] for s in runner1.seen[0]["eval_specs"]],
-                         ["planner", "scout"])
+        bundled = [q for q in self._queued()
+                   if q.get("consumed_context") == "consumed-intel"]
+        self.assertEqual(len(bundled), 1)
+        # A resume BEFORE the queue drains must not re-bundle. The scores-based
+        # dedupe alone cannot see this: between enqueue and drain the entry
+        # exists with no score, so the queue is checked too.
         runner2 = self._runner(
             scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
         make_fn(runner2)(os.path.join(d, "planner.plan.S.json"), 1)  # resume
-        self.assertEqual([s["evaluatee"] for s in runner2.seen[0]["eval_specs"]],
-                         ["planner"])
-        data = self._scores("S")
-        scout_entries = [e for e in data["evaluations"]
-                         if e["evaluatee"] == "scout"]
-        self.assertEqual(len(scout_entries), 1)
-        # ...but a NEW planning phase (hand-back round trip bumps the epoch)
-        # is evaluated again, even with byte-identical re-approved intel.
-        runner3 = self._runner(
-            scratch_entries=lambda specs: [s["evaluatee"] for s in specs])
-        make_fn(runner3, epoch=2)(os.path.join(d, "planner.plan.S.json"), 1)
-        self.assertEqual([s["evaluatee"] for s in runner3.seen[0]["eval_specs"]],
-                         ["planner", "scout"])
-        self.assertEqual(runner3.seen[0]["eval_specs"][1]["planning_epoch"], 2)
+        bundled = [q for q in self._queued()
+                   if q.get("consumed_context") == "consumed-intel"]
+        self.assertEqual(len(bundled), 1)
 
 
 class EvalEndToEndTest(_EvalEnvMixin, unittest.TestCase):
-    """Fake-session end-to-end: both sides of a pairing land in scores.json
-    with correct stamps, and no eval content reaches the user output."""
+    """Fake-session end-to-end: both sides of a pairing are SEALED AND QUEUED
+    with correct stamps, and no eval content reaches the user output.
+
+    Scores no longer land during the round (D2/P12): the round enqueues and
+    keeps going, and an isolated evaluator drains the queue at phase end. What
+    the round is responsible for is that both seats are queued exactly once,
+    with sealed evidence — which is what these assert.
+    """
+
+    def _queued(self, session_uuid="S"):
+        return [q for q in cowork_eval.read_queue(
+            state_store.evaluation_queue_path_for(session_uuid))
+            if q.get("state") == "pending"]
 
     def test_scout_phase_two_evals_per_round(self):
         self._scores_root()
@@ -7245,18 +7281,19 @@ class EvalEndToEndTest(_EvalEnvMixin, unittest.TestCase):
             reviewer_eval_scratch_path=rev_scratch,
             scores_path=scores_path, session_uuid="S")
         self.assertEqual(rc, 0)
-        data = self._scores("S")
-        self.assertEqual(len(data["evaluations"]), 2)   # one per side
-        by_evaluator = {e["evaluator"]: e for e in data["evaluations"]}
-        self.assertEqual(set(by_evaluator),
-                         {"scout", "scout-reviewer"})
-        self.assertEqual(by_evaluator["scout"]["evaluatee"], "scout-reviewer")
-        self.assertEqual(by_evaluator["scout-reviewer"]["evaluatee"], "scout")
-        for entry in data["evaluations"]:
+        queued = self._queued()
+        self.assertEqual(len(queued), 2)   # one per side
+        by_seat = {q["evaluator_seat"]: q for q in queued}
+        self.assertEqual(set(by_seat), {"scout", "scout-reviewer"})
+        self.assertEqual(by_seat["scout"]["evaluatee"], "scout-reviewer")
+        self.assertEqual(by_seat["scout-reviewer"]["evaluatee"], "scout")
+        for entry in queued:
             self.assertEqual(entry["phase"], "scouting")
             self.assertEqual(entry["round"], 1)
-            self.assertEqual(entry["context"], "review-round")
-            self.assertIn("timestamp", entry)
+            self.assertIn("queued_at", entry)
+            # Sealed AFTER the verdict was written and validated (CV-008).
+            self.assertTrue(entry["envelope"]["envelope_id"])
+            self.assertTrue(entry["envelope"]["sealed_at"])
         # privacy: no eval text in the user output; no scores path in prompts
         text = out.getvalue()
         self.assertNotIn("on point", text)
@@ -7336,20 +7373,22 @@ class EvalEndToEndTest(_EvalEnvMixin, unittest.TestCase):
             on_outcome=lambda o, p: outcomes.append(o))
         self.assertEqual(rc, 0)
         self.assertEqual(outcomes, ["approved"])
-        data = self._scores("S")
-        # first planning round: 2 counterpart evals + 2 ->scout evals
-        self.assertEqual(len(data["evaluations"]), 4)
-        pairs = sorted((e["evaluator"], e["evaluatee"], e["context"])
-                       for e in data["evaluations"])
-        self.assertEqual(pairs, [
-            ("planner", "planning-advisor", "review-round"),
-            ("planner", "scout", "consumed-intel"),
-            ("planning-advisor", "planner", "review-round"),
-            ("planning-advisor", "scout", "consumed-intel"),
-        ])
-        for entry in data["evaluations"]:
+        # First planning round: one queued entry per seat, each carrying the
+        # once-per-phase consumed-intel bundle. Four SCORES will exist once the
+        # queue drains; four QUEUE ENTRIES would mean the bundle was queued as
+        # its own entry, which it is not.
+        queued = self._queued()
+        self.assertEqual(
+            sorted((q["evaluator_seat"], q["evaluatee"],
+                    q.get("consumed_context")) for q in queued),
+            [("planner", "planning-advisor", "consumed-intel"),
+             ("planning-advisor", "planner", "consumed-intel")])
+        for entry in queued:
             self.assertEqual(entry["phase"], "planning")
             self.assertEqual(entry["round"], 1)
+        # Still unscored: deferring is the point.
+        self.assertEqual((self._scores("S") or {}).get("evaluations") or [],
+                         [])
 
 
 # --------------------------------------------------------------------------- #
@@ -8241,7 +8280,7 @@ class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
         pj, pm = self._plan(d)
         scratch = state_store.eval_scratch_path_for(d, "builder", "S")
         consumed = cowork.plan_consumed_upstream(pj, pm, 1)
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "builder", "build-reviewer", "building", scratch,
             state_store.scores_path_for("S"), "S", consumed_upstream=consumed)
         sess = self._session(scratch, ("build-reviewer", "planner"))
@@ -8271,7 +8310,7 @@ class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
         scratch = state_store.eval_scratch_path_for(d, "builder", "S")
 
         def make_fn(epoch):
-            return cowork._make_evaluate_fn(
+            return cowork._legacy_make_evaluate_fn(
                 "builder", "build-reviewer", "building", scratch,
                 state_store.scores_path_for("S"), "S",
                 consumed_upstream=cowork.plan_consumed_upstream(pj, pm, epoch))
@@ -9810,8 +9849,27 @@ class PlannerHashGateRunTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 import cowork_report  # noqa: E402
+import cowork_measure  # noqa: E402
+import cowork_ingest  # noqa: E402
+import cowork_ledger  # noqa: E402
+import cowork_eval  # noqa: E402
+import cowork_pricing  # noqa: E402
 import cowork_probe_cache as probe_cache  # noqa: E402
 import cowork_handoff as handoff  # noqa: E402
+
+
+def _render_summary(summary, session_uuid=None):
+    """Render a legacy trace SUMMARY through the pure renderer.
+
+    `cowork_report.render_report` now takes the measurement RECORD and nothing
+    else (D3), so a summary reaches it the same way the real report does: as
+    `record.trace_summary`. Tests that predate the record keep asserting on the
+    same rendered content without reintroducing a second rendering path.
+    """
+    record = {"schema_version": cowork_measure.SCHEMA_VERSION,
+              "session": session_uuid,
+              "trace_summary": cowork_measure._jsonable_summary(summary)}
+    return cowork_report.render_report(record)
 # Back-compat alias: the retired cowork_diffpacket's one surviving path-first
 # primitive still referenced by tests (FULL_REREAD_INSTRUCTION) now lives in
 # cowork_handoff. (The old build_full_reread_packet second renderer was removed —
@@ -9984,7 +10042,7 @@ class ReportTest(unittest.TestCase):
         ]
 
     def test_t3_aggregation(self):
-        s = cowork_report.summarize_trace(self._synthetic())
+        s = cowork_measure.summarize_trace(self._synthetic())
         self.assertEqual(s["turn_count"], 2)
         self.assertEqual(s["bytes_by_role_controller"][("scout", "claude")], 100)
         self.assertEqual(
@@ -9999,19 +10057,23 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(s["usage_by_controller"]["codex"]["input_tokens"], 50)
 
     def test_t3_render_has_sections(self):
-        text = cowork_report.render_report(
-            cowork_report.summarize_trace(self._synthetic()), "UUID")
-        for needle in ("Prompt bytes by role", "Prompt bytes by prompt kind",
-                       "Largest single prompts", "Artifact contribution",
-                       "Artifact delivery breakdown",
-                       "Role/system-prompt bytes by role",
-                       "Review-skip hits", "Controller-reported usage"):
+        text = _render_summary(
+            cowork_measure.summarize_trace(self._synthetic()), "UUID")
+        # Section headings changed with the D3 rewrite: the report now renders
+        # the RECORD, and the prompt-byte views live under one "Prompt bytes"
+        # section fed from `record.trace_summary`. The content asserted here is
+        # the same; only the labels moved.
+        for needle in ("by role + controller", "by prompt kind",
+                       "largest single prompts", "artifact contribution",
+                       "artifact delivery",
+                       "role/system prompts",
+                       "review-skip hits", "controller-reported usage"):
             self.assertIn(needle, text)
 
     def test_probe_end_usage_is_summarized(self):
         # #2 (review fix): usage on controller.probe.end is aggregated too, not
         # only controller.turn.end.
-        s = cowork_report.summarize_trace([
+        s = cowork_measure.summarize_trace([
             {"event": "controller.probe.end", "controller": "claude",
              "result": "ok", "usage": {"input_tokens": 5, "output_tokens": 1}},
             {"event": "controller.turn.end", "controller": "claude",
@@ -10022,8 +10084,8 @@ class ReportTest(unittest.TestCase):
 
     def test_t3_malformed_lines_never_raise(self):
         # A trace of pure garbage yields an empty (no-turns) report.
-        text = cowork_report.render_report(
-            cowork_report.summarize_trace(["x", "{", "[}"]))
+        text = _render_summary(
+            cowork_measure.summarize_trace(["x", "{", "[}"]))
         self.assertIn("No controller turns", text)
 
     def test_t4_report_flag_end_to_end(self):
@@ -10044,7 +10106,7 @@ class ReportTest(unittest.TestCase):
             out = io.StringIO()
             rc = cowork.run_report(args, io_out=out)
             self.assertEqual(rc, 0)
-            self.assertIn("Prompt bytes by prompt kind", out.getvalue())
+            self.assertIn("by prompt kind", out.getvalue())
             self.assertIn(uuid, out.getvalue())
             # Unknown session -> a clean exit 1, no crash.
             args2 = cowork.build_parser().parse_args(["--report", "no-such"])
@@ -10093,7 +10155,7 @@ class DeliveryAccountingTest(unittest.TestCase):
     def test_report_path_delivery_excludes_embedded_total(self):
         # A path-delivered artifact contributes its FULL size to "touched" but
         # 0 to the embedded total; an embedded one contributes its full body.
-        s = cowork_report.summarize_trace([
+        s = cowork_measure.summarize_trace([
             {"event": "controller.turn.start", "role": "build-reviewer",
              "controller": "claude", "prompt_kind": "reviewer_pass",
              "prompt_bytes": 200, "resume": True,
@@ -10110,12 +10172,12 @@ class DeliveryAccountingTest(unittest.TestCase):
         self.assertEqual(s["delivery_breakdown"]["path"]["touched"], 900)
         self.assertEqual(s["delivery_breakdown"]["path"]["embedded"], 0)
         self.assertEqual(s["delivery_breakdown"]["embedded"]["embedded"], 300)
-        text = cowork_report.render_report(s)
+        text = _render_summary(s)
         self.assertIn("touched 900 B", text)
         self.assertIn("embedded 0 B", text)
 
     def test_report_role_prompt_bytes_section(self):
-        s = cowork_report.summarize_trace([
+        s = cowork_measure.summarize_trace([
             {"event": "role.prompt.bytes", "role": "planner",
              "bytes": 12000, "delivery": "codex_inline"},
             {"event": "role.prompt.bytes", "role": "scout-reviewer",
@@ -10130,8 +10192,8 @@ class DeliveryAccountingTest(unittest.TestCase):
         self.assertEqual(rp[("planner", "codex_inline")]["bytes"], 24000)
         self.assertEqual(rp[("planner", "codex_inline")]["launches"], 2)
         self.assertEqual(rp[("scout-reviewer", "claude_system")]["bytes"], 9000)
-        text = cowork_report.render_report(s)
-        self.assertIn("Role/system-prompt bytes by role", text)
+        text = _render_summary(s)
+        self.assertIn("role/system prompts", text)
         self.assertIn("codex_inline", text)
         self.assertIn("claude_system", text)
 
@@ -10384,7 +10446,7 @@ class TurnMetaWiringTest(unittest.TestCase):
             def send(self, text, meta=None):
                 captured["meta"] = meta
 
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "scout", cowork.SCOUT_REVIEWER, "scouting", scratch, scores,
             "UUID", context_revision=7)
         fn(Fake(), {"verdict": "approve"}, 2)
@@ -10418,7 +10480,7 @@ class TurnMetaWiringTest(unittest.TestCase):
             def send(self, text, meta=None):
                 captured["meta"] = meta
 
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "planner", cowork.PLANNING_ADVISOR, "planning", scratch, scores,
             "UUID", consumed_upstream=consumed, context_revision=3)
         fn(Fake(), {"verdict": "approve"}, 1)   # round 1 -> bundle rides
@@ -10448,7 +10510,7 @@ class TurnMetaWiringTest(unittest.TestCase):
             def send(self, text, meta=None):
                 captured["meta"] = meta
 
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "scout", cowork.SCOUT_REVIEWER, "scouting", scratch, scores, "UUID")
         fn(Fake(), {"verdict": "approve"}, 2)
         arts = captured["meta"]["artifacts"]
@@ -10512,7 +10574,7 @@ class TurnMetaWiringTest(unittest.TestCase):
              "controller": "claude", "prompt_kind": "eval",
              "prompt_bytes": 40, "resume": True},
         ]
-        s = cowork_report.summarize_trace(trace)
+        s = cowork_measure.summarize_trace(trace)
         self.assertEqual(set(s["bytes_by_kind"]),
                          {"role_seed", "reviewer_pass", "eval"})
         self.assertEqual(s["artifact_bytes"]["plan.md"]["bytes"], 20)
@@ -10546,6 +10608,16 @@ def _init_git_repo():
     subprocess.run(["git", "init", "-q", d], check=True)
     subprocess.run(["git", "-C", d, "config", "user.email", "t@t"], check=True)
     subprocess.run(["git", "-C", d, "config", "user.name", "t"], check=True)
+    # Commit signing OFF in the scratch repo. A unit test that creates a
+    # throwaway repo must not depend on the developer's global signing setup:
+    # with `commit.gpgsign=true` in ~/.gitconfig these commits go through the
+    # real signing agent, so an agent that is locked, timed out or simply
+    # absent fails the commit with exit 128 and takes eleven unrelated
+    # worktree tests down with it. Nothing here is testing signatures.
+    subprocess.run(["git", "-C", d, "config", "commit.gpgsign", "false"],
+                   check=True)
+    subprocess.run(["git", "-C", d, "config", "tag.gpgsign", "false"],
+                   check=True)
     with open(os.path.join(d, "f.txt"), "w") as fh:
         fh.write("x")
     subprocess.run(["git", "-C", d, "add", "."], check=True)
@@ -11262,8 +11334,8 @@ class AssembleUserQuestionTest(unittest.TestCase):
 
 
 class ReadReviewThreeWayTest(unittest.TestCase):
-    """The 3-way review gate: Approve & finish / Ask a question / Request
-    changes on a TTY; the unchanged blank=finish / text=revise contract off
+    """The 3-way review gate: Ask a question / Request changes / Approve &
+    finish on a TTY; the unchanged blank=finish / text=revise contract off
     one."""
 
     def _tty(self):
@@ -11314,23 +11386,29 @@ class ReadReviewThreeWayTest(unittest.TestCase):
                                   return_value="tighten scope"):
             self.assertEqual(cowork._read_review(i, o), "tighten scope")
 
-    def test_tty_changes_blank_never_traps(self):
+    def test_tty_changes_blank_reshows_gate_never_approves(self):
+        # Blank feedback re-opens the gate; it is never a sign-off (D4).
         import unittest.mock as mock
         i, o = self._tty()
-        with mock.patch.object(ui, "select", return_value="changes"), \
+        sel = mock.Mock(side_effect=["changes", "approve"])
+        with mock.patch.object(ui, "select", sel), \
                 mock.patch.object(ui, "prompt_user", return_value=""):
             self.assertIs(cowork._read_review(i, o), cowork._END)
+        self.assertEqual(sel.call_count, 2)
 
-    def test_tty_dismissed_select_never_traps(self):
+    def test_tty_dismissed_select_stops(self):
+        # Cancelling a menu is never an approval — it takes the Stop path even
+        # on the preview-less compatibility gate.
         import unittest.mock as mock
         i, o = self._tty()
         with mock.patch.object(ui, "select", return_value=None), \
-                mock.patch.object(ui, "prompt_user", return_value=""):
-            self.assertIs(cowork._read_review(i, o), cowork._END)
+                mock.patch.object(ui, "prompt_user", return_value="") as pu:
+            self.assertIs(cowork._read_review(i, o), cowork._STOP)
+        pu.assert_not_called()
 
     def test_tty_no_ask_uses_binary_confirm(self):
-        # allow_ask=False (the builder gate) keeps the prior binary confirm
-        # contract: no select, no ask path.
+        # allow_ask=False (the builder gate) keeps the binary confirm contract:
+        # no select, no ask path — but constructed with default=False (D3).
         import unittest.mock as mock
         i, o = self._tty()
         with mock.patch.object(ui, "confirm", return_value=True) as conf, \
@@ -11338,6 +11416,7 @@ class ReadReviewThreeWayTest(unittest.TestCase):
             self.assertIs(cowork._read_review(i, o, allow_ask=False),
                           cowork._END)
         conf.assert_called_once()
+        self.assertIs(conf.call_args.kwargs["default"], False)
         sel.assert_not_called()
 
     def test_tty_no_ask_decline_revises(self):
@@ -11350,6 +11429,18 @@ class ReadReviewThreeWayTest(unittest.TestCase):
                              "fix it")
         sel.assert_not_called()
 
+    def test_tty_no_ask_decline_blank_reasks_confirm(self):
+        # A declined confirm with blank feedback loops back to the confirm
+        # instead of finishing.
+        import unittest.mock as mock
+        i, o = self._tty()
+        conf = mock.Mock(side_effect=[False, True])
+        with mock.patch.object(ui, "confirm", conf), \
+                mock.patch.object(ui, "prompt_user", return_value="  "):
+            self.assertIs(cowork._read_review(i, o, allow_ask=False),
+                          cowork._END)
+        self.assertEqual(conf.call_count, 2)
+
 
 class _SelectRecorder:
     """A ui.select stand-in that records the (key, label) choices it was shown
@@ -11360,12 +11451,15 @@ class _SelectRecorder:
         self._keys = list(keys)
         self.calls = []
 
-    def __call__(self, prompt, choices, ask_fn=None):
+    def __call__(self, prompt, choices, ask_fn=None, **kwargs):
+        # **kwargs absorbs the activation handles (io_in / io_out / gate /
+        # on_discard / on_drain_fail) the protected gate readers now pass.
         pairs = list(choices)
         self.calls.append({
             "prompt": prompt,
             "keys": [k for k, _l in pairs],
             "labels": [l for _k, l in pairs],
+            "kwargs": dict(kwargs),
         })
         return self._keys.pop(0) if self._keys else None
 
@@ -11523,9 +11617,9 @@ class GatePreviewLabelTest(unittest.TestCase):
 
 
 class BuilderGateSelectTest(unittest.TestCase):
-    """The builder gate is a 3-way select on a TTY (Approve & finish / Request
-    changes / Stop) with Approve default; off a TTY it keeps blank=finish /
-    text=revise with no Stop."""
+    """The builder gate is a 3-way select on a TTY (Request changes / Approve &
+    finish / Stop) with Request changes highlighted; off a TTY it keeps
+    blank=finish / text=revise with no Stop."""
 
     def test_tty_three_way_labels_and_default(self):
         import unittest.mock as mock
@@ -11535,13 +11629,13 @@ class BuilderGateSelectTest(unittest.TestCase):
             out = cowork._read_review(FakeTTY(), FakeTTY(),
                                       allow_ask=False, preview=preview)
         self.assertIs(out, cowork._END)
-        self.assertEqual(rec.keys, ["approve", "changes", "stop"])
+        self.assertEqual(rec.keys, ["changes", "approve", "stop"])
         self.assertEqual(rec.labels, [
-            "Approve & finish — review your working tree",
             "Request changes — the builder revises; you'll be asked for feedback",
+            "Approve & finish — review your working tree",
             "Stop — session remains resumable"])
-        # Approve is the highlighted default (first); Stop is non-default (last).
-        self.assertEqual(rec.keys[0], "approve")
+        # Approve is NOT the highlighted default; Stop is still last.
+        self.assertNotEqual(rec.keys[0], "approve")
         self.assertEqual(rec.keys[-1], "stop")
 
     def test_tty_changes_returns_feedback(self):
@@ -12095,7 +12189,7 @@ class GateWrapperPlumbingTest(unittest.TestCase):
             status, "builder",
             cowork.make_gate_preview("builder", False, True))
         # The builder gate is a preview-enabled 3-way select in the wrapper.
-        self.assertEqual(rec.keys, ["approve", "changes", "stop"])
+        self.assertEqual(rec.keys, ["changes", "approve", "stop"])
         self.assertEqual(rec.label_for("approve"),
                          "Approve & finish — review your working tree")
 
@@ -12572,7 +12666,7 @@ class EvalTraceabilityStampTest(_EvalEnvMixin, unittest.TestCase):
             {"tool": "codex", "model": "gpt-5-codex", "session_id": "RSID"})
         scratch = state_store.eval_scratch_path_for(d, "scout", "S")
         sess = self._session(self._scratch_writer(scratch), assets_dir)
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", scratch, scores_path, "S")
         fn(sess, {"verdict": "approve"}, 1)
         data = self._scores("S")
@@ -12606,7 +12700,7 @@ class EvalTraceabilityStampTest(_EvalEnvMixin, unittest.TestCase):
 
             def send(self, text):
                 return None
-        fn = cowork._make_evaluate_fn(
+        fn = cowork._legacy_make_evaluate_fn(
             "scout", "scout-reviewer", "scouting", scratch, scores_path, "S")
         fn(NoWriteSession(), {"verdict": "revise"}, 1)
         # scratch never written -> nothing aggregated; the STALE sidecar was
@@ -12656,7 +12750,9 @@ class ScoresReportTest(unittest.TestCase):
                                    "feedback": ""}],
                         reviewed_verdict="revise"),
         ]}
-        summary = cowork_report.summarize_scores(scores)
+        # `summarize_scores` moved to the BUILD side: it reads a raw source, so
+        # it cannot live in the pure renderer.
+        summary = cowork_measure.summarize_scores(scores)
         cost = summary["eval_cost"][("scout", "claude", "opus")]
         self.assertEqual(cost["entries"], 3)
         self.assertEqual(cost["turns"], 2)          # T-A shared by 2 entries
@@ -12672,14 +12768,28 @@ class ScoresReportTest(unittest.TestCase):
         self.assertEqual(verdicts["revise"]["total"], 2)
 
     def test_render_and_tolerance(self):
-        text = cowork_report.render_scores_report(
-            cowork_report.summarize_scores({"evaluations": [self._entry()]}))
-        self.assertIn("codex/gpt-5-codex", text)
-        self.assertIn("avg 4.00", text)
+        # The scores section is now rendered FROM THE RECORD like every other
+        # figure: built into `record.scores_summary` with its averages already
+        # computed, then looked up. It used to be computed by the report from
+        # raw scores.json AFTER render_report had run, which printed figures
+        # that appeared nowhere in the authoritative record.
+        summary = cowork_measure.summarize_scores(
+            {"evaluations": [self._entry()]})
+        record = {"schema_version": cowork_measure.SCHEMA_VERSION,
+                  "scores_summary": cowork_measure._jsonable_scores(summary)}
+        text = cowork_report.render_report(record)
+        self.assertIn("codex", text)
+        self.assertIn("gpt-5-codex", text)
+        self.assertIn("4.00", text)
         self.assertIn("approve", text)
-        empty = cowork_report.render_scores_report(
-            cowork_report.summarize_scores("/nope/scores.json"))
-        self.assertIn("no evaluations", empty)
+        # A session with no evaluations simply omits the section rather than
+        # printing an empty one.
+        empty_record = {
+            "schema_version": cowork_measure.SCHEMA_VERSION,
+            "scores_summary": cowork_measure._jsonable_scores(
+                cowork_measure.summarize_scores(None))}
+        self.assertNotIn("legacy pooled view",
+                         cowork_report.render_report(empty_record))
 
     def test_trace_usage_by_role_model(self):
         events = [
@@ -12692,11 +12802,11 @@ class ScoresReportTest(unittest.TestCase):
              "controller": "claude", "model": "opus",
              "usage": {"input_tokens": 1}},
         ]
-        summary = cowork_report.summarize_trace(events)
+        summary = cowork_measure.summarize_trace(events)
         bucket = summary["usage_by_role_model"][("scout", "claude", "opus")]
         self.assertEqual(bucket["turns"], 2)
         self.assertEqual(bucket["usage"]["input_tokens"], 10)
-        text = cowork_report.render_report(summary)
+        text = _render_summary(summary)
         self.assertIn("claude/opus", text)
 
 
@@ -13440,7 +13550,13 @@ class TransportChokePointTests(unittest.TestCase):
                 "_worktree_seed_delivery", "_repair_delivery",
                 "_missing_question_delivery", "_headless_nudge_delivery",
                 "_handoff_declined_delivery",
+                # The unverified-readiness hand-back: a static template with a
+                # normalized reason code substituted in. The reason comes from
+                # a closed set computed by _record_readiness, never from role
+                # output, so nothing free-form rides this boundary.
+                "_unverified_readiness_delivery",
             },
+            "_unverified_readiness_delivery": {"_role_loop"},
             "_worktree_seed_delivery": {"run_worktree"},
             "_repair_delivery": {"_role_loop"},
             "_missing_question_delivery": {"_role_loop"},
@@ -13468,8 +13584,12 @@ class TransportChokePointTests(unittest.TestCase):
                 "run_builder",
             },
             "_lead_turn_delivery": {"_role_loop"},
+            # `_score_queued_entry` is the D2 isolated-evaluator dispatch; the
+            # in-session closure survives only as `_legacy_make_evaluate_fn`,
+            # the prompt/spec builder that dispatch reuses.
             "_eval_delivery": {
-                "_make_evaluate_fn", "evaluate_fn", "_run_reviewer_eval"},
+                "_legacy_make_evaluate_fn", "evaluate_fn",
+                "_run_reviewer_eval", "_score_queued_entry"},
         }
         boundary_actual = {name: set() for name in boundary_callers}
         for fn in _ast.walk(tree):
@@ -13897,7 +14017,7 @@ class AccountingDerivationTests(unittest.TestCase):
 
     def test_report_counts_path_delivery_from_descriptors(self):
         # The report aggregates the same descriptor records without re-inferring.
-        summary = cowork_report.summarize_trace([
+        summary = cowork_measure.summarize_trace([
             {"event": "controller.turn.start", "role": "scout-reviewer",
              "controller": "claude", "prompt_kind": "reviewer_pass",
              "prompt_bytes": 100, "fresh": True,
@@ -13926,7 +14046,7 @@ class AccountingDerivationTests(unittest.TestCase):
         reviewer = reviewer or cowork.SCOUT_REVIEWER
         scratch = os.path.join(self.d, "eval.%s.json" % role)
         scores = os.path.join(self.d, "scores.json")
-        return cowork._make_evaluate_fn(
+        return cowork._legacy_make_evaluate_fn(
             role, reviewer, phase, scratch, scores, "S",
             consumed_upstream=consumed_upstream, review_path=review_path)
 
@@ -14608,5 +14728,6483 @@ sys.exit(rc)
         self.assertEqual(len(paths), len(set(paths)), "overlapping paths were duplicated: %s" % paths)
 
 
+# --------------------------------------------------------------------------- #
+# Session controller policy.                                                   #
+#                                                                              #
+# A session may declare which controllers it is ALLOWED to use. The policy is   #
+# persisted, changed together with any number of role remappings as ONE         #
+# validated all-or-nothing transition, and enforced by a single fail-closed     #
+# guard in front of every place cowork starts a controller.                     #
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingPopen:
+    """Records every argv a bridge tried to spawn and returns an inert process.
+
+    Used to prove "zero processes of controller X were started": nothing hangs,
+    nothing real runs, and the full argv list is available for assertions."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, command, *args, **kwargs):
+        self.calls.append(list(command))
+        return _InertProc()
+
+    def controllers(self):
+        return [c[0] for c in self.calls if c]
+
+
+class _BridgeSubprocess:
+    """A stand-in for the bridge's `subprocess` module: only `Popen` is
+    replaced, so patching it never disturbs cowork's own `subprocess.run`
+    calls (the git build baseline, preflight)."""
+
+    def __init__(self, real, popen):
+        self._real = real
+        self.Popen = popen
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def patch_bridge_popen(popen):
+    import unittest.mock as mock
+    return mock.patch.object(
+        bridge, "subprocess", _BridgeSubprocess(bridge.subprocess, popen))
+
+
+class _InertProc:
+    def __init__(self):
+        self.stdout = io.StringIO("")
+        self.stdin = io.StringIO()
+        self.returncode = 0
+
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+class _RecordingClaudeSpawn:
+    """A claude stream-json probe double: records the probe and returns a
+    minimal valid event sequence so the probe reports success."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, command, stdin_text):
+        self.calls.append(list(command))
+        return [{"type": "result", "subtype": "success"}]
+
+
+class ControllerPolicyTestBase(unittest.TestCase):
+    """Isolated sessions root + an unconditional active-policy reset, so the
+    process-global holder never leaks between tests (or into the pre-existing
+    suite, which never activates a policy and therefore always sees the
+    unrestricted default)."""
+
+    def setUp(self):
+        policy.deactivate()
+        self.addCleanup(policy.deactivate)
+        # FAIL FAST, NEVER BLOCK. cowork.gather_context_interactive reads the
+        # REAL sys.stdin (via ui.prompt_user), not the io_in handed to run_flow,
+        # so any test that reaches the goal prompt would hang the whole suite on
+        # a terminal read instead of failing. Stub it so that path raises
+        # immediately and names itself; tests that need context must pass
+        # --context (or resume a session that already has a lead session id).
+        import unittest.mock as mock
+        def _no_prompt(*a, **kw):
+            raise AssertionError(
+                "run_flow reached the interactive goal prompt "
+                "(gather_context_interactive). A controller-policy test must "
+                "never depend on real stdin: pass --context, or resume a "
+                "session whose lead role already has a saved session id.")
+        patcher = mock.patch.object(
+            cowork, "gather_context_interactive", _no_prompt)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def _dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def _tmp_session(self):
+        return os.path.join(self._dir(), ".cowork", "session.json")
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _sha(self, path):
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def _events(self, spath):
+        saved = state_store.load(spath)
+        trace_path = trace_store.trace_path_for(
+            state_store.get_session_uuid(saved))
+        if not os.path.exists(trace_path):
+            return []
+        with open(trace_path, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _session(self, uuid_str, phase, controllers, team=None, policy_value="",
+                 spath=None):
+        """Build a saved session with explicit per-role controllers and an
+        optional raw controller_policy value (pass a value to set it; the
+        default sentinel leaves the key absent)."""
+        spath = spath or self._tmp_session()
+        team = team or list(controllers)
+        state = state_store.ensure_session(spath, None, uuid_str)
+        cfg = cowork.default_config(team)
+        for role, controller in controllers.items():
+            cfg[role] = dict(cfg[role], controller=controller)
+        state = state_store.save_config(spath, team, cfg, prior=state)
+        state = state_store.save_phase(spath, phase, prior=state)
+        if policy_value != "":
+            state = dict(state)
+            state["controller_policy"] = policy_value
+            state_store.save(spath, state)
+        return spath
+
+
+class ControllerPolicyStateTest(ControllerPolicyTestBase):
+    """cowork_state: reading, writing, and the one-write transition."""
+
+    def test_absent_policy_reads_as_unrestricted(self):
+        state = {"team": [], "config": {}, "sessions": {}}
+        self.assertEqual(state_store.read_controller_policy(state),
+                         ("unrestricted", None))
+        self.assertIsNone(state_store.get_allowed_controllers(state))
+
+    def test_valid_policy_reads_normalized(self):
+        state = {"controller_policy": {"allowed": ["codex", "claude"]}}
+        kind, value = state_store.read_controller_policy(state)
+        self.assertEqual(kind, "allowed")
+        self.assertEqual(value, ("claude", "codex"))
+        self.assertEqual(state_store.get_allowed_controllers(state),
+                         ("claude", "codex"))
+
+    def test_every_malformed_shape_reads_invalid_and_never_none(self):
+        for raw in ("claude,codex", None, 7, [], {}, {"allowed": None},
+                    {"allowed": "claude"}, {"allowed": []},
+                    {"allowed": ["claude", "vim"]},
+                    {"allowed": ["claude", 3]}):
+            with self.subTest(raw=raw):
+                state = {"controller_policy": raw}
+                kind, value = state_store.read_controller_policy(state)
+                self.assertEqual(kind, "invalid")
+                self.assertEqual(value, raw)
+                with self.assertRaises(state_store.InvalidControllerPolicy):
+                    state_store.get_allowed_controllers(state)
+
+    def test_transition_without_set_policy_leaves_policy_byte_identical(self):
+        spath = self._session("STATE-PRESERVE", "planning",
+                              {"planner": "claude"},
+                              team=["scout", "planner"],
+                              policy_value={"allowed": ["claude", "codex"],
+                                            "updated": 1.5, "source": "cli"})
+        before = state_store.load(spath)["controller_policy"]
+        state = state_store.apply_controller_transition(
+            spath, [("planner", "codex")], prior=state_store.load(spath))
+        self.assertEqual(state["controller_policy"], before)
+        self.assertEqual(
+            state_store.load(spath)["controller_policy"], before)
+        self.assertEqual(
+            state_store.load(spath)["config"]["planner"]["controller"], "codex")
+
+    def test_transition_set_policy_writes_and_removes(self):
+        spath = self._session("STATE-SET", "planning", {"planner": "claude"},
+                              team=["scout", "planner"])
+        state_store.apply_controller_transition(
+            spath, [], allowed=("codex", "claude"), set_policy=True,
+            prior=state_store.load(spath), source="cli")
+        saved = state_store.load(spath)
+        self.assertEqual(saved["controller_policy"]["allowed"],
+                         ["claude", "codex"])
+        self.assertEqual(saved["controller_policy"]["source"], "cli")
+        # Every role controller is untouched by a policy-only change.
+        self.assertEqual(saved["config"]["planner"]["controller"], "claude")
+
+        state_store.apply_controller_transition(
+            spath, [], allowed=None, set_policy=True,
+            prior=state_store.load(spath))
+        self.assertNotIn("controller_policy", state_store.load(spath))
+
+    def test_transition_replaces_an_invalid_policy(self):
+        spath = self._session("STATE-REPAIR", "planning", {"planner": "claude"},
+                              team=["scout", "planner"],
+                              policy_value={"allowed": ["nope"]})
+        state_store.apply_controller_transition(
+            spath, [], allowed=("claude",), set_policy=True,
+            prior=state_store.load(spath))
+        self.assertEqual(
+            state_store.read_controller_policy(state_store.load(spath)),
+            ("allowed", ("claude",)))
+
+    def test_transition_performs_exactly_one_save(self):
+        spath = self._session("STATE-ONEWRITE", "building",
+                              {"builder": "opencode",
+                               cowork.BUILD_REVIEWER: "opencode"},
+                              team=["scout", "builder", cowork.BUILD_REVIEWER])
+        saves = []
+        real_save = state_store.save
+
+        def counting_save(path, state):
+            saves.append(path)
+            return real_save(path, state)
+
+        import unittest.mock as mock
+        with mock.patch.object(state_store, "save", counting_save):
+            state_store.apply_controller_transition(
+                spath, [("builder", "codex"),
+                        (cowork.BUILD_REVIEWER, "claude")],
+                allowed=("claude", "codex"), set_policy=True,
+                prior=state_store.load(spath), source="cli")
+        self.assertEqual(saves, [spath])
+
+    def test_transition_rejects_unknown_role_before_mutating(self):
+        spath = self._session("STATE-UNKNOWN", "planning",
+                              {"planner": "claude"}, team=["scout", "planner"])
+        before = self._sha(spath)
+        with self.assertRaises(ValueError):
+            state_store.apply_controller_transition(
+                spath, [("builder", "codex")], prior=state_store.load(spath))
+        self.assertEqual(self._sha(spath), before)
+
+    def test_apply_role_switch_parity_with_switch_role_controller(self):
+        team = ["scout", "planner"]
+        a = self._session("PARITY-A", "planning", {"planner": "claude"},
+                          team=team)
+        b = self._session("PARITY-B", "planning", {"planner": "claude"},
+                          team=team)
+        state_store.switch_role_controller(
+            a, "planner", "codex", prior=state_store.load(a),
+            reason="cli", source="cli", created=42.0)
+        state_store.apply_controller_transition(
+            b, [("planner", "codex")], prior=state_store.load(b),
+            reason="cli", source="cli", created=42.0)
+        left, right = state_store.load(a), state_store.load(b)
+        for key in ("config", "sessions", "pending_switches"):
+            self.assertEqual(left.get(key), right.get(key), key)
+        entry = right["pending_switches"]["planner"]
+        self.assertEqual(entry["from_controller"], "claude")
+        self.assertEqual(entry["to_controller"], "codex")
+        self.assertIsNone(right["config"]["planner"]["model"])
+        self.assertIsNone(right["config"]["planner"]["effort"])
+
+    def test_multi_role_transition_marks_every_remapped_role(self):
+        spath = self._session("STATE-MULTI", "building",
+                              {"builder": "opencode",
+                               cowork.BUILD_REVIEWER: "opencode"},
+                              team=["scout", "builder", cowork.BUILD_REVIEWER])
+        state_store.save_role_session(
+            spath, "builder", "opencode", "ses_old",
+            prior=state_store.load(spath))
+        state_store.apply_controller_transition(
+            spath, [("builder", "codex"),
+                    (cowork.BUILD_REVIEWER, "claude")],
+            allowed=("claude", "codex"), set_policy=True,
+            prior=state_store.load(spath), source="cli")
+        saved = state_store.load(spath)
+        self.assertEqual(saved["config"]["builder"]["controller"], "codex")
+        self.assertEqual(
+            saved["config"][cowork.BUILD_REVIEWER]["controller"], "claude")
+        self.assertNotIn("id", saved["sessions"]["builder"])
+        for role in ("builder", cowork.BUILD_REVIEWER):
+            self.assertIn(role, saved["pending_switches"])
+
+
+class ControllerPolicyProposalTest(ControllerPolicyTestBase):
+    """The three-way proposal model in isolation."""
+
+    def test_preserve_and_all_are_distinct_and_neither_is_none(self):
+        self.assertIsNot(policy.PRESERVE, policy.ALL)
+        self.assertIsNotNone(policy.PRESERVE)
+        self.assertIsNotNone(policy.ALL)
+        self.assertIsNot(policy.PRESERVE, None)
+        self.assertIsNot(policy.ALL, None)
+        # Truthy, so `if proposal.policy:` cannot read PRESERVE as "unset".
+        self.assertTrue(policy.PRESERVE)
+        self.assertTrue(policy.ALL)
+
+    def test_parse_allowed(self):
+        for value in ("all", "ALL", " All "):
+            self.assertIs(policy.parse_allowed(value), policy.ALL)
+        self.assertEqual(policy.parse_allowed("codex,claude"),
+                         ("claude", "codex"))
+        self.assertEqual(policy.parse_allowed(" CLAUDE , claude "), ("claude",))
+        for bad in ("", " , ", "vim", "claude,vim", "all,claude"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    policy.parse_allowed(bad)
+
+    def test_effective_allowed_resolves_all_three_states(self):
+        saved = ("claude", "codex")
+        self.assertEqual(policy.effective_allowed(policy.PRESERVE, saved),
+                         saved)
+        self.assertIsNone(policy.effective_allowed(policy.PRESERVE, None))
+        self.assertIsNone(policy.effective_allowed(policy.ALL, saved))
+        self.assertEqual(policy.effective_allowed(("codex",), saved),
+                         ("codex",))
+
+    def test_interactive_mapping_rule(self):
+        saved = ("claude", "codex")
+        # PRESERVE is checked FIRST: an untouched pre-checked set is a no-op.
+        self.assertIs(cowork.interactive_proposal_policy(
+            ["codex", "claude"], saved), policy.PRESERVE)
+        self.assertIs(cowork.interactive_proposal_policy(
+            list(policy.CONTROLLERS), saved), policy.ALL)
+        self.assertEqual(cowork.interactive_proposal_policy(["codex"], saved),
+                         ("codex",))
+        # Unrestricted session: both rules would fire on "all three"; the
+        # PRESERVE rule needs a saved set, so this is unambiguously ALL.
+        self.assertIs(cowork.interactive_proposal_policy(
+            list(policy.CONTROLLERS), None), policy.ALL)
+
+    def test_is_allowed_and_eligible(self):
+        self.assertTrue(policy.is_allowed(None, "opencode"))
+        self.assertFalse(policy.is_allowed(("claude",), "opencode"))
+        self.assertEqual(policy.eligible(None, "claude"),
+                         ["codex", "opencode"])
+        self.assertEqual(policy.eligible(("claude", "codex"), "claude"),
+                         ["codex"])
+        self.assertEqual(policy.eligible(("claude",), "claude"), [])
+
+    def test_guard_blocks_and_traces_before_anything_runs(self):
+        class Rec:
+            def __init__(self):
+                self.events = []
+
+            def event(self, name, **fields):
+                self.events.append((name, fields))
+
+        rec = Rec()
+        with policy.restricted(("claude", "codex"), trace=rec, phase="building"):
+            self.assertIsNone(policy.guard("claude", role="builder"))
+            with self.assertRaises(policy.DispatchBlocked) as ctx:
+                policy.guard("opencode", role="builder", kind="setup")
+        self.assertEqual(rec.events[0][0], "controller.dispatch.blocked")
+        fields = rec.events[0][1]
+        self.assertEqual(fields["role"], "builder")
+        self.assertEqual(fields["phase"], "building")
+        self.assertEqual(fields["requested_controller"], "opencode")
+        self.assertEqual(fields["allowed"], ["claude", "codex"])
+        self.assertEqual(fields["kind"], "setup")
+        self.assertIn("does not allow", str(ctx.exception))
+        # The holder is restored on exit.
+        self.assertIsNone(policy.active_allowed())
+
+    def test_invalid_active_policy_blocks_every_controller(self):
+        policy.activate_invalid({"allowed": "oops"})
+        for controller in policy.CONTROLLERS:
+            with self.subTest(controller=controller):
+                with self.assertRaises(policy.DispatchBlocked):
+                    policy.guard(controller, role="scout")
+
+
+class ControllerPolicyGuardStructureTest(ControllerPolicyTestBase):
+    """The AST inventory: every entry point that creates a controller process or
+    writes provider-specific setup must be guarded, and every in-tree call site
+    must route through one of those guarded entry points."""
+
+    GUARDED = {
+        "ClaudeSession.__init__": "claude",
+        "CodexSession.__init__": "codex",
+        "OpencodeSession.__init__": "opencode",
+        "probe_claude_stream_json": "claude",
+        "ensure_opencode_agent": "opencode",
+        "build_opencode_command": "opencode",
+    }
+
+    @staticmethod
+    def _first_statement(fn):
+        body = list(fn.body)
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body = body[1:]  # skip the docstring
+        return body[0] if body else None
+
+    @classmethod
+    def _is_guard_call(cls, node):
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            return False
+        func = node.value.func
+        return (isinstance(func, ast.Attribute) and func.attr == "guard"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "policy")
+
+    @classmethod
+    def unguarded_entry_points(cls, source):
+        """Names of guarded-entry definitions in `source` whose first statement
+        is not a `policy.guard(...)` call."""
+        tree = ast.parse(source)
+        found = []
+        for node in ast.walk(tree):
+            name = None
+            if isinstance(node, ast.ClassDef) and node.name in (
+                    "ClaudeSession", "CodexSession", "OpencodeSession"):
+                for item in node.body:
+                    if (isinstance(item, ast.FunctionDef)
+                            and item.name == "__init__"):
+                        name = "%s.__init__" % node.name
+                        if not cls._is_guard_call(cls._first_statement(item)):
+                            found.append(name)
+                continue
+            if isinstance(node, ast.FunctionDef) and node.name in cls.GUARDED:
+                if not cls._is_guard_call(cls._first_statement(node)):
+                    found.append(node.name)
+        return found
+
+    @classmethod
+    def defined_entry_points(cls, source):
+        tree = ast.parse(source)
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name in (
+                    "ClaudeSession", "CodexSession", "OpencodeSession"):
+                for item in node.body:
+                    if (isinstance(item, ast.FunctionDef)
+                            and item.name == "__init__"):
+                        names.add("%s.__init__" % node.name)
+            elif isinstance(node, ast.FunctionDef) and node.name in cls.GUARDED:
+                names.add(node.name)
+        return names
+
+    @classmethod
+    def unrouted_call_sites(cls, source):
+        """Constructions/calls of a guarded entry point that do NOT go through
+        the bridge module, i.e. bypass its guard."""
+        tree = ast.parse(source)
+        bare = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in (
+                    "ClaudeSession", "CodexSession", "OpencodeSession",
+                    "probe_claude_stream_json", "ensure_opencode_agent",
+                    "build_opencode_command"):
+                bare.append(func.id)
+        return bare
+
+    def _source(self, name):
+        with open(os.path.join(_HERE, name), "r") as fh:
+            return fh.read()
+
+    def test_every_bridge_entry_point_is_guarded(self):
+        source = self._source("cowork_bridge.py")
+        defined = self.defined_entry_points(source)
+        self.assertEqual(defined, set(self.GUARDED),
+                         "the guarded-entry inventory drifted from the bridge")
+        self.assertEqual(self.unguarded_entry_points(source), [])
+
+    def test_no_cowork_call_site_bypasses_the_bridge(self):
+        for name in ("cowork.py", "cowork_bridge.py"):
+            with self.subTest(module=name):
+                # Inside the bridge, a bare call IS the guarded definition's own
+                # module — those are checked by the definition test above.
+                if name == "cowork_bridge.py":
+                    continue
+                self.assertEqual(self.unrouted_call_sites(self._source(name)),
+                                 [])
+
+    def test_the_checker_catches_a_deliberately_unguarded_site(self):
+        """The inventory must not be able to pass vacuously."""
+        fixture = (
+            "class ClaudeSession:\n"
+            "    def __init__(self, a):\n"
+            "        '''docstring'''\n"
+            "        self.a = a\n"
+            "\n"
+            "def ensure_opencode_agent(x):\n"
+            "    policy.guard('opencode')\n"
+            "    return x\n"
+            "\n"
+            "def launch():\n"
+            "    return ClaudeSession(1)\n"
+        )
+        self.assertEqual(self.unguarded_entry_points(fixture),
+                         ["ClaudeSession.__init__"])
+        self.assertEqual(self.unrouted_call_sites(fixture), ["ClaudeSession"])
+
+
+class ControllerPolicyDispatchTest(ControllerPolicyTestBase):
+    """Every launch path fails closed: lead, paired reviewer, resume, recovery
+    relaunch, and the worktree agent — plus headless."""
+
+    def _run(self, spath, argv=None, **kwargs):
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args((argv or [])
+                       + ["--session-file", spath, "--context", "policy test"]),
+            io_in=kwargs.pop("io_in", io.StringIO()), io_out=out,
+            which=lambda c: "/bin/" + c, **kwargs)
+        return rc, out.getvalue()
+
+    def test_lead_launch_is_blocked_with_zero_processes(self):
+        spath = self._session(
+            "DISPATCH-LEAD", "scouting", {"scout": "opencode"},
+            team=["scout"],
+            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
+                          "source": "cli"})
+        popen = _RecordingPopen()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen):
+            rc, out = self._run(spath)
+        self.assertEqual(rc, 1)
+        self.assertIn("scout is configured for opencode", out)
+        self.assertIn("allowed: claude, codex", out)
+        self.assertEqual(popen.calls, [])
+        blocked = [e for e in self._events(spath)
+                   if e["event"] == "controller.dispatch.blocked"]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["role"], "scout")
+        self.assertEqual(blocked[0]["phase"], "scouting")
+        self.assertEqual(blocked[0]["requested_controller"], "opencode")
+        self.assertEqual(blocked[0]["allowed"], ["claude", "codex"])
+
+    def test_resume_of_a_restricted_session_is_blocked(self):
+        spath = self._session(
+            "DISPATCH-RESUME", "planning",
+            {"planner": "opencode"}, team=["scout", "planner"],
+            policy_value={"allowed": ["codex"], "updated": 1.0,
+                          "source": "cli"})
+        state_store.save_role_session(spath, "planner", "opencode", "ses_x",
+                                      prior=state_store.load(spath))
+        popen = _RecordingPopen()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen):
+            rc, out = self._run(spath)
+        self.assertEqual(rc, 1)
+        self.assertIn("planner is configured for opencode", out)
+        self.assertEqual(popen.calls, [])
+
+    def test_paired_reviewer_launch_is_blocked_with_zero_processes(self):
+        config = cowork.default_config(["planner", cowork.PLANNING_ADVISOR])
+        config[cowork.PLANNING_ADVISOR]["controller"] = "opencode"
+        popen = _RecordingPopen()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen):
+            with policy.restricted(("claude", "codex")):
+                verdict = cowork.run_reviewer_once(
+                    config, "ctx", ["planner", cowork.PLANNING_ADVISOR],
+                    os.path.join(self._dir(), "plan.json"),
+                    os.path.join(self._dir(), "review.json"),
+                    reviewer_role=cowork.PLANNING_ADVISOR,
+                    prompt_path=cowork.PLANNING_ADVISOR_PROMPT_PATH)
+        self.assertTrue(cowork._is_review_failure(verdict))
+        self.assertIn("does not allow",
+                      verdict.get("controller_failure_alert") or "")
+        self.assertEqual(popen.calls, [])
+
+    def test_worktree_agent_launch_is_blocked_with_zero_processes(self):
+        popen = _RecordingPopen()
+        out = io.StringIO()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen):
+            with policy.restricted(("codex",)):
+                artifact = cowork.run_worktree(
+                    {"controller": "claude", "model": None, "effort": None,
+                     "yolo": True, "mode": "implement"},
+                    os.path.join(self._dir(), "worktree.status.json"),
+                    self._dir(), "wt-name", False,
+                    io_in=io.StringIO(), io_out=out)
+        self.assertIsNone(artifact)
+        self.assertIn("does not allow", out.getvalue())
+        self.assertEqual(popen.calls, [])
+
+    def test_recovery_relaunch_offers_only_allowed_controllers(self):
+        spath = self._session(
+            "DISPATCH-RECOVER", "scouting", {"scout": "codex"},
+            team=["scout"],
+            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
+                          "source": "cli"})
+        # A saved lead session id makes this a RESUME: resolve_context returns ""
+        # without ever reaching the interactive goal prompt.
+        state_store.save_role_session(spath, "scout", "codex", "codex-thread",
+                                      prior=state_store.load(spath))
+        calls = []
+
+        def fake_scout(config, context, selected, on_session=None,
+                       on_outcome=None, **kw):
+            calls.append(config["scout"]["controller"])
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        def which(cmd):
+            return None if cmd == "codex" else "/bin/" + cmd
+
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        out = io.StringIO()
+        with mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath]),
+                io_in=io.StringIO("switch claude\n"), io_out=out,
+                which=which, run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["claude"])
+        # The gate named the permitted controller instead of "the alternate".
+        self.assertIn("move this role to claude", out.getvalue())
+        self.assertNotIn("the alternate controller", out.getvalue())
+
+    def test_recovery_gate_states_when_no_controller_is_eligible(self):
+        spath = self._session(
+            "DISPATCH-NOELIGIBLE", "scouting", {"scout": "codex"},
+            team=["scout"],
+            policy_value={"allowed": ["codex"], "updated": 1.0,
+                          "source": "cli"})
+
+        def which(cmd):
+            return None if cmd == "codex" else "/bin/" + cmd
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "policy test"]),
+            io_in=io.StringIO("\n"), io_out=out, which=which,
+            run_scout_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 1)
+        self.assertIn("leaves no other controller available", out.getvalue())
+        self.assertNotIn("the alternate controller", out.getvalue())
+
+    def test_headless_block_exits_without_rendering_a_gate(self):
+        spath = self._session(
+            "DISPATCH-HEADLESS", "scouting", {"scout": "opencode"},
+            team=["scout"],
+            policy_value={"allowed": ["claude"], "updated": 1.0,
+                          "source": "cli"})
+        popen = _RecordingPopen()
+        import unittest.mock as mock
+        out = io.StringIO()
+        with patch_bridge_popen(popen):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath, "--headless",
+                            "--context", "go"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("does not allow", out.getvalue())
+        self.assertNotIn("what now?", out.getvalue())
+        self.assertEqual(popen.calls, [])
+
+    def test_blocked_opencode_dispatch_writes_no_agent_file(self):
+        base = self._dir()
+        with policy.restricted(("claude", "codex")):
+            with self.assertRaises(policy.DispatchBlocked):
+                bridge.OpencodeSession(
+                    cowork.SCOUT_PROMPT_PATH, "implement", True,
+                    io_out=io.StringIO(), speaker="scout",
+                    agent_base_dir=base)
+            with self.assertRaises(policy.DispatchBlocked):
+                bridge.ensure_opencode_agent(
+                    cowork.SCOUT_PROMPT_PATH, "scout", "implement", True,
+                    base_dir=base)
+            with self.assertRaises(policy.DispatchBlocked):
+                bridge.build_opencode_command("cowork-scout", "hi",
+                                              "implement", True)
+        self.assertFalse(os.path.exists(os.path.join(base, ".opencode")))
+
+
+class ControllerPolicyMalformedTest(ControllerPolicyTestBase):
+    """A damaged saved policy fails CLOSED: nothing launches, nothing is
+    written, and one command repairs it."""
+
+    MALFORMED = ("claude,codex", None, 7, [], {}, {"allowed": []},
+                 {"allowed": "claude"}, {"allowed": ["claude", "vim"]})
+
+    def test_every_malformed_shape_aborts_with_no_process_and_no_write(self):
+        import unittest.mock as mock
+        for index, raw in enumerate(self.MALFORMED):
+            with self.subTest(raw=raw):
+                spath = self._session(
+                    "MALFORMED-%d" % index, "scouting", {"scout": "claude"},
+                    team=["scout"], policy_value=raw)
+                before = self._sha(spath)
+                popen = _RecordingPopen()
+                out = io.StringIO()
+                with patch_bridge_popen(popen):
+                    rc = cowork.run_flow(
+                        self._args(["--session-file", spath]),
+                        io_in=io.StringIO(), io_out=out,
+                        which=lambda c: "/bin/" + c)
+                self.assertEqual(rc, 2)
+                self.assertIn("unreadable", out.getvalue())
+                self.assertIn(spath, out.getvalue())
+                self.assertIn("--allow-controllers", out.getvalue())
+                self.assertIn("controller_policy", out.getvalue())
+                self.assertEqual(popen.calls, [])
+                self.assertEqual(self._sha(spath), before)
+                self.assertFalse(
+                    os.path.exists(os.path.join(os.path.dirname(spath),
+                                                ".opencode")))
+                events = self._events(spath)
+                invalid = [e for e in events
+                           if e["event"] == "controller.policy.invalid"]
+                self.assertEqual(len(invalid), 1)
+                self.assertEqual(invalid[0]["session_file"], spath)
+                self.assertTrue(invalid[0]["repairable"])
+
+    def test_a_lone_switch_cannot_repair_and_takes_the_same_abort(self):
+        spath = self._session(
+            "MALFORMED-PRESERVE", "planning", {"planner": "claude"},
+            team=["scout", "planner"], policy_value={"allowed": []})
+        before = self._sha(spath)
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        out = io.StringIO()
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--switch-controller", "planner=codex"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertEqual(rc, 2)
+        self.assertIn("unreadable", out.getvalue())
+        self.assertEqual(popen.calls, [])
+        self.assertEqual(claude_spawn.calls, [])
+        self.assertEqual(self._sha(spath), before)
+
+    def test_allow_controllers_repairs_and_resumes(self):
+        spath = self._session(
+            "MALFORMED-REPAIR", "planning", {"planner": "codex"},
+            team=["scout", "planner"], policy_value="garbage")
+        calls = []
+
+        def fake_planner(config, context, selected, on_outcome=None, **kw):
+            calls.append(config["planner"]["controller"])
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        # Seed with the on-disk (corrupt) value so the transition registers as a
+        # CHANGE rather than as the first thing observed.
+        policy_writes = [state_store.load(spath).get("controller_policy")]
+        real_save = state_store.save
+
+        def counting_save(path, state):
+            if path == spath:
+                current = state.get("controller_policy")
+                if not policy_writes or policy_writes[-1] != current:
+                    policy_writes.append(current)
+            return real_save(path, state)
+
+        import unittest.mock as mock
+        out = io.StringIO()
+        with mock.patch.object(state_store, "save", counting_save):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath, "--context", "policy test",
+                            "--allow-controllers", "claude,codex"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["codex"])
+        self.assertEqual(
+            state_store.read_controller_policy(state_store.load(spath)),
+            ("allowed", ("claude", "codex")))
+        # Exactly one write CHANGED the policy: garbage -> the repaired set.
+        # (Other saves in the run — session bootstrap, context — leave it alone.)
+        self.assertEqual(policy_writes,
+                         ["garbage",
+                          state_store.load(spath)["controller_policy"]],
+                         "exactly one write changed the policy: garbage -> "
+                         "the repaired set")
+
+    def test_check_and_report_still_work_against_a_corrupt_session(self):
+        spath = self._session(
+            "MALFORMED-READONLY", "scouting", {"scout": "claude"},
+            team=["scout"], policy_value={"allowed": ["vim"]})
+        self.assertEqual(cowork.main(["--check"]), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cowork.main(["--report", "MALFORMED-READONLY",
+                              "--allow-controllers", "claude"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot be combined with --report", err.getvalue())
+        # And the plain read-only form is unaffected by the corrupt policy.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cowork.main(["--report", "MALFORMED-READONLY"])
+        self.assertNotIn("unreadable", out.getvalue())
+
+
+class ControllerPolicyTransitionTest(ControllerPolicyTestBase):
+    """The update is atomic: rejected leaves the file untouched with nothing
+    resumed; accepted persists as one write that completes before any dispatch."""
+
+    def _planning(self, uuid_str, controllers=None, policy_value=""):
+        team = ["scout", "planner", cowork.PLANNING_ADVISOR]
+        return self._session(
+            uuid_str, "planning",
+            controllers or {"planner": "claude",
+                            cowork.PLANNING_ADVISOR: "codex"},
+            team=team, policy_value=policy_value)
+
+    def _reject_case(self, spath, argv, expected):
+        before = self._sha(spath)
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        dispatched = []
+        import unittest.mock as mock
+        out = io.StringIO()
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(argv + ["--session-file", spath]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: dispatched.append(1) or 0)
+        self.assertNotEqual(rc, 0)
+        self.assertIn(expected, out.getvalue())
+        self.assertEqual(self._sha(spath), before)
+        self.assertEqual(dispatched, [])
+        self.assertEqual(popen.calls, [])
+        return out.getvalue()
+
+    def test_rejected_updates_leave_the_session_byte_identical(self):
+        cases = [
+            ({"policy_value": {"allowed": ["claude", "codex"], "updated": 1.0,
+                               "source": "cli"}},
+             ["--switch-controller", "planner=opencode"],
+             "this session allows only claude, codex"),
+            ({}, ["--switch-controller", "nosuch=codex"], None),
+            ({}, ["--switch-controller", "scout=codex"],
+             "not switchable in the current planning phase"),
+            ({}, ["--allow-controllers", "opencode"],
+             "would no longer allow"),
+            ({}, ["--switch-controller", "planner=codex",
+                  "--switch-controller", "planner=opencode"],
+             "two different controllers"),
+            # A role named twice is rejected even when the targets AGREE:
+            # applying the same switch twice would read the already-switched
+            # controller on the second pass and write a from == to marker.
+            ({}, ["--switch-controller", "planner=codex",
+                  "--switch-controller", "planner=codex"],
+             "was named twice"),
+        ]
+        for index, (kwargs, argv, expected) in enumerate(cases):
+            with self.subTest(argv=argv):
+                if expected is None:
+                    # An unknown role is rejected by the argument parser.
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit):
+                            self._args(argv)
+                    continue
+                spath = self._planning("TRANSITION-R%d" % index, **kwargs)
+                text = self._reject_case(spath, argv, expected)
+                rejected = [e for e in self._events(spath)
+                            if e["event"] == "controller.policy.rejected"]
+                self.assertEqual(len(rejected), 1, text)
+                self.assertFalse(rejected[0]["persisted"])
+
+    def test_a_role_named_twice_is_rejected_even_when_targets_agree(self):
+        """Direct, fast counterpart to the end-to-end rejection case: the
+        validator itself must refuse ANY second occurrence of a role, so the
+        transition can never apply one role switch twice (the second pass would
+        read the already-switched controller and write a from == to marker)."""
+        spath = self._planning("TRANSITION-DUP-DIRECT")
+        state = state_store.load(spath)
+        for mappings, expected in (
+                ((("planner", "codex"), ("planner", "codex")), "was named twice"),
+                ((("planner", "codex"), ("planner", "claude")),
+                 "two different controllers")):
+            with self.subTest(mappings=mappings):
+                effective, err, warnings = cowork.validate_controller_proposal(
+                    policy.ControllerProposal(policy.PRESERVE, mappings, "cli"),
+                    None, "planning",
+                    ["scout", "planner", cowork.PLANNING_ADVISOR], state)
+                self.assertIsNotNone(err)
+                self.assertIn(expected, err)
+                self.assertIn("planner", err)
+                self.assertEqual(warnings, [])
+        # The single-occurrence form stays valid.
+        _eff, err, _w = cowork.validate_controller_proposal(
+            policy.ControllerProposal(policy.PRESERVE,
+                                      (("planner", "codex"),), "cli"),
+            None, "planning",
+            ["scout", "planner", cowork.PLANNING_ADVISOR], state)
+        self.assertIsNone(err)
+
+    def test_empty_allowed_set_is_a_parse_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self._args(["--allow-controllers", ""])
+
+    def test_accepted_update_writes_once_then_dispatches(self):
+        spath = self._planning("TRANSITION-OK")
+        timeline = []
+        real_save = state_store.save
+
+        def recording_save(path, state):
+            if path == spath and state.get("controller_policy"):
+                timeline.append("write")
+            return real_save(path, state)
+
+        claude_spawn = _RecordingClaudeSpawn()
+
+        def probing_spawn(command, stdin_text):
+            timeline.append("probe")
+            return claude_spawn(command, stdin_text)
+
+        def fake_planner(config, context, selected, on_outcome=None, **kw):
+            timeline.append("dispatch")
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        import unittest.mock as mock
+        with mock.patch.object(state_store, "save", recording_save), \
+                mock.patch.object(bridge, "_real_claude_spawn", probing_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--allow-controllers", "claude,codex",
+                            "--switch-controller",
+                            "%s=claude" % cowork.PLANNING_ADVISOR]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(timeline.count("write"), 1)
+        write_at = timeline.index("write")
+        self.assertTrue(all(t == "probe" for t in timeline[:write_at]),
+                        timeline)
+        self.assertTrue(all(t == "dispatch" for t in timeline[write_at + 1:]),
+                        timeline)
+
+    def test_no_spawn_ever_targets_a_controller_outside_the_effective_set(self):
+        popen = _RecordingPopen()
+        import unittest.mock as mock
+        for index, argv in enumerate([
+                ["--allow-controllers", "claude,codex"],
+                ["--allow-controllers", "codex",
+                 "--switch-controller", "planner=codex"],
+                ["--switch-controller", "planner=codex"]]):
+            with self.subTest(argv=argv):
+                spath = self._planning(
+                    "TRANSITION-S%d" % index,
+                    policy_value={"allowed": ["claude", "codex"],
+                                  "updated": 1.0, "source": "cli"})
+                with patch_bridge_popen(popen):
+                    cowork.run_flow(
+                        self._args(argv + ["--session-file", spath,
+                                           "--context", "policy test"]),
+                        io_in=io.StringIO(), io_out=io.StringIO(),
+                        which=lambda c: "/bin/" + c,
+                        run_planner_fn=lambda *a, **k: 0)
+                self.assertNotIn("opencode", popen.controllers())
+
+    def test_policy_only_change_leaves_every_role_controller_untouched(self):
+        spath = self._planning("TRANSITION-POLICY-ONLY")
+        before = state_store.load(spath)["config"]
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "policy test",
+                        "--allow-controllers", "claude,codex"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(state_store.load(spath)["config"], before)
+        self.assertEqual(
+            state_store.load(spath)["controller_policy"]["allowed"],
+            ["claude", "codex"])
+
+
+class ControllerPolicyCliTest(ControllerPolicyTestBase):
+    """The non-interactive surface."""
+
+    def _planning(self, uuid_str, **kw):
+        return self._session(
+            uuid_str, "planning",
+            {"planner": "claude", cowork.PLANNING_ADVISOR: "codex"},
+            team=["scout", "planner", cowork.PLANNING_ADVISOR], **kw)
+
+    def test_switch_controller_is_repeatable(self):
+        args = self._args(["--switch-controller", "planner=codex",
+                           "--switch-controller", "planning-advisor=claude"])
+        self.assertEqual(args.switch_controller,
+                         [("planner", "codex"), ("planning-advisor", "claude")])
+        self.assertEqual(self._args([]).switch_controller, [])
+
+    def test_allow_controllers_parses_to_the_three_way_representation(self):
+        self.assertIsNone(self._args([]).allow_controllers)
+        self.assertIs(self._args(["--allow-controllers", "all"])
+                      .allow_controllers, policy.ALL)
+        self.assertEqual(self._args(["--allow-controllers", "codex,claude"])
+                         .allow_controllers, ("claude", "codex"))
+
+    def test_help_lists_every_supported_controller(self):
+        """`--help` must not under-report what the flags accept.
+
+        The parser, the README and the policy all support opencode, so help text
+        naming only claude and codex would be a false source of truth. Derived
+        from CONTROLLERS so a new controller cannot silently go undocumented."""
+        help_text = cowork.build_parser().format_help()
+        # rindex: the options section, not the usage line at the top.
+        switch = help_text[help_text.rindex("--switch-controller ROLE"):]
+        switch = switch[:switch.index("--allow-controllers")]
+        for controller in policy.CONTROLLERS:
+            self.assertIn(controller, switch,
+                          "--switch-controller help omits %r" % controller)
+        self.assertNotIn("to claude or codex", switch)
+        # And the parser genuinely accepts each of them.
+        for controller in policy.CONTROLLERS:
+            args = self._args(["--switch-controller", "planner=%s" % controller])
+            self.assertEqual(args.switch_controller, [("planner", controller)])
+        allow = help_text[help_text.index("--allow-controllers LIST"):]
+        self.assertIn("all", allow)
+
+    def test_allow_controllers_parse_errors(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            for bad in ("", "vim", "claude,vim", "all,claude"):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(SystemExit):
+                        self._args(["--allow-controllers", bad])
+
+    def test_combined_flags_apply_policy_and_mappings_together(self):
+        spath = self._planning("CLI-COMBINED")
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        with mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--allow-controllers", "claude,codex",
+                            "--switch-controller", "planner=codex",
+                            "--switch-controller",
+                            "%s=claude" % cowork.PLANNING_ADVISOR]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        saved = state_store.load(spath)
+        self.assertEqual(saved["controller_policy"]["allowed"],
+                         ["claude", "codex"])
+        self.assertEqual(saved["config"]["planner"]["controller"], "codex")
+        self.assertEqual(
+            saved["config"][cowork.PLANNING_ADVISOR]["controller"], "claude")
+
+    def test_allow_controllers_all_lifts_the_restriction(self):
+        spath = self._planning(
+            "CLI-ALL", policy_value={"allowed": ["claude", "codex"],
+                                     "updated": 1.0, "source": "cli"})
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "policy test",
+                        "--allow-controllers", "all"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("controller_policy", state_store.load(spath))
+
+    def test_allow_controllers_conflicts_with_session_shape_flags(self):
+        spath = self._planning("CLI-CONFLICT")
+        before = self._sha(spath)
+        for extra in (["--no-session"], ["--new"], ["--team", "planner"],
+                      ["--config", "planner=codex"]):
+            with self.subTest(extra=extra):
+                out = io.StringIO()
+                rc = cowork.run_flow(
+                    self._args(["--session-file", spath,
+                                "--allow-controllers", "claude"] + extra),
+                    io_in=io.StringIO(), io_out=out,
+                    which=lambda c: "/bin/" + c,
+                    run_planner_fn=lambda *a, **k: 0)
+                self.assertEqual(rc, 2)
+                self.assertIn("--allow-controllers cannot be combined", out.getvalue())
+                self.assertEqual(self._sha(spath), before)
+
+    def test_allow_controllers_needs_a_loadable_session_with_config(self):
+        spath = self._tmp_session()
+        os.makedirs(os.path.dirname(spath), exist_ok=True)
+        with open(spath, "w") as fh:
+            fh.write("{not valid json")
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--allow-controllers", "claude"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertEqual(rc, 2)
+        self.assertIn("--allow-controllers: session file is not a loadable",
+                      out.getvalue())
+
+        bare = self._tmp_session()
+        state_store.ensure_session(bare, None, "CLI-NOCONFIG")
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", bare,
+                        "--allow-controllers", "claude"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertEqual(rc, 2)
+        self.assertIn("--allow-controllers requires a saved session",
+                      out.getvalue())
+
+    def test_allow_controllers_conflicts_with_check_and_report(self):
+        for flag in ("--check", "--report"):
+            with self.subTest(flag=flag):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = cowork.main(["--allow-controllers", "claude", flag])
+                self.assertEqual(rc, 2)
+                self.assertIn("--allow-controllers cannot be combined with %s"
+                              % flag, err.getvalue())
+
+
+class ControllerPolicyInteractiveTest(ControllerPolicyTestBase):
+    """The interactive action and the flags must agree, byte for byte."""
+
+    def _planning(self, uuid_str, cwd=None, **kw):
+        spath = (state_store.new_session_path(cwd, uuid_str) if cwd
+                 else self._tmp_session())
+        return self._session(
+            uuid_str, "planning",
+            {"planner": "claude", cowork.PLANNING_ADVISOR: "codex"},
+            team=["scout", "planner", cowork.PLANNING_ADVISOR],
+            spath=spath, **kw)
+
+    @contextlib.contextmanager
+    def _chdir(self, d):
+        prev = os.getcwd()
+        os.chdir(d)
+        try:
+            yield
+        finally:
+            os.chdir(prev)
+
+    def test_select_session_returns_the_action_and_asks_nothing_else(self):
+        cwd = self._dir()
+        self._planning("INTERACTIVE-PICK", cwd=cwd)
+        asked = []
+
+        def select_fn(prompt, choices):
+            asked.append(prompt)
+            keys = [k for k, _l in choices]
+            if "controllers" in keys:
+                return "controllers"
+            return keys[0]
+
+        with self._chdir(cwd):
+            choice = cowork.select_session(
+                self._args([]), FakeTTY(), FakeTTY(), select_fn=select_fn)
+        self.assertEqual(choice.action, "edit_controllers")
+        self.assertIsNotNone(choice.path)
+        # Two prompts only: the menu and the picker — no controller questions.
+        self.assertEqual(len(asked), 2)
+        self.assertTrue(all("controller" not in p.lower()
+                            or "Change" in p or "Switch" in p for p in asked))
+
+    def test_third_entry_is_absent_off_a_tty_and_under_flags(self):
+        cwd = self._dir()
+        self._planning("INTERACTIVE-REACH", cwd=cwd)
+        seen = []
+
+        def select_fn(prompt, choices):
+            seen.append([k for k, _l in choices])
+            return choices[0][0]
+
+        with self._chdir(cwd):
+            # Piped/scripted: no menu at all.
+            choice = cowork.select_session(
+                self._args([]), io.StringIO(), io.StringIO(),
+                select_fn=select_fn)
+            self.assertIsNone(choice.action)
+            self.assertEqual(seen, [])
+            for argv in (["--new"], ["--no-session"],
+                         ["--headless", "--context", "x"]):
+                choice = cowork.select_session(
+                    self._args(argv), FakeTTY(), FakeTTY(),
+                    select_fn=select_fn)
+                self.assertIsNone(choice.action)
+            self.assertTrue(all("controllers" not in keys for keys in seen))
+
+    def _drive(self, spath, chosen, moves, confirms):
+        """Run the guided flow at run_flow's call site with scripted prompts."""
+        import unittest.mock as mock
+        picks = list(moves)
+        answers = list(confirms)
+        out = io.StringIO()
+
+        def multiselect_fn(prompt, choices, selected=(), ask_fn=None, **kwargs):
+            return list(chosen.pop(0)) if chosen else None
+
+        def select_fn(prompt, choices, ask_fn=None, **kwargs):
+            return picks.pop(0) if picks else None
+
+        def confirm_fn(prompt, ask_fn=None, **kwargs):
+            return answers.pop(0) if answers else False
+
+        def fake_select_session(args, io_in, io_out, select_fn=None, now=None):
+            return cowork.SessionChoice(path=spath, action="edit_controllers")
+
+        claude_spawn = _RecordingClaudeSpawn()
+        self.dispatched = []
+
+        def fake_planner(*a, **k):
+            self.dispatched.append(1)
+            return 0
+
+        with mock.patch.object(cowork, "select_session", fake_select_session), \
+                mock.patch.object(ui, "multiselect", multiselect_fn), \
+                mock.patch.object(ui, "select", select_fn), \
+                mock.patch.object(ui, "confirm", confirm_fn), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--context", "policy test"]),
+                io_in=io.StringIO(), io_out=out,
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=fake_planner)
+        return rc, out.getvalue()
+
+    def test_interactive_and_cli_produce_identical_state(self):
+        interactive = self._planning("INTERACTIVE-EQ-A")
+        cli = self._planning("INTERACTIVE-EQ-B")
+        rc, _ = self._drive(interactive, [["claude", "codex"]], [], [True])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.dispatched, [1])  # resumed, and only after the write
+        rc = cowork.run_flow(
+            self._args(["--session-file", cli, "--context", "policy test",
+                        "--allow-controllers", "claude,codex"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        left = state_store.load(interactive)
+        right = state_store.load(cli)
+        self.assertEqual(left["controller_policy"]["allowed"],
+                         right["controller_policy"]["allowed"])
+        self.assertEqual(left["config"], right["config"])
+
+    def test_preserve_parity_untouched_set_matches_a_lone_switch(self):
+        saved = {"allowed": ["claude", "codex"], "updated": 3.0,
+                 "source": "cli"}
+        # The planner sits OUTSIDE the saved allowed set, so both surfaces have
+        # the same job: move it, and leave the policy exactly as it is.
+        interactive = self._session(
+            "INTERACTIVE-PRESERVE-A", "planning",
+            {"planner": "opencode", cowork.PLANNING_ADVISOR: "codex"},
+            team=["scout", "planner", cowork.PLANNING_ADVISOR],
+            policy_value=dict(saved))
+        cli = self._session(
+            "INTERACTIVE-PRESERVE-B", "planning",
+            {"planner": "opencode", cowork.PLANNING_ADVISOR: "codex"},
+            team=["scout", "planner", cowork.PLANNING_ADVISOR],
+            policy_value=dict(saved))
+        # Leaving the pre-checked boxes untouched must NOT rewrite the policy.
+        rc, _ = self._drive(interactive, [["claude", "codex"]], ["codex"],
+                            [True])
+        self.assertEqual(rc, 0)
+        rc = cowork.run_flow(
+            self._args(["--session-file", cli,
+                        "--switch-controller", "planner=codex"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        left, right = state_store.load(interactive), state_store.load(cli)
+        self.assertEqual(left["controller_policy"], saved)
+        self.assertEqual(right["controller_policy"], saved)
+        self.assertEqual(left["controller_policy"],
+                         right["controller_policy"])
+        self.assertEqual(left["config"], right["config"])
+        self.assertEqual(left["config"]["planner"]["controller"], "codex")
+
+    def test_all_parity_checking_every_controller_matches_allow_all(self):
+        saved = {"allowed": ["claude", "codex"], "updated": 3.0,
+                 "source": "cli"}
+        interactive = self._planning("INTERACTIVE-ALL-A",
+                                     policy_value=dict(saved))
+        cli = self._planning("INTERACTIVE-ALL-B", policy_value=dict(saved))
+        rc, _ = self._drive(interactive, [list(policy.CONTROLLERS)], [], [True])
+        self.assertEqual(rc, 0)
+        rc = cowork.run_flow(
+            self._args(["--session-file", cli, "--context", "policy test",
+                        "--allow-controllers", "all"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("controller_policy", state_store.load(interactive))
+        self.assertNotIn("controller_policy", state_store.load(cli))
+
+    def test_decline_reopens_the_allowed_set_prompt_once(self):
+        spath = self._planning("INTERACTIVE-DECLINE")
+        rc, out = self._drive(
+            spath, [["codex"], ["claude", "codex"]],
+            ["codex", "codex"], [False, True])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            state_store.load(spath)["controller_policy"]["allowed"],
+            ["claude", "codex"])
+
+    def test_dismissing_a_prompt_cancels_cleanly_with_no_write(self):
+        spath = self._planning("INTERACTIVE-CANCEL")
+        before = self._sha(spath)
+        rc, out = self._drive(spath, [], [], [])
+        self.assertEqual(rc, 0)
+        self.assertIn("cancelled; nothing to do.", out)
+        self.assertEqual(self._sha(spath), before)
+        self.assertEqual(self.dispatched, [])
+
+    def test_guided_flow_remaps_a_now_disallowed_current_phase_role(self):
+        spath = self._planning("INTERACTIVE-REMAP")
+        rc, out = self._drive(spath, [["codex"]], ["codex"], [True])
+        self.assertEqual(rc, 0)
+        saved = state_store.load(spath)
+        self.assertEqual(saved["controller_policy"]["allowed"], ["codex"])
+        self.assertEqual(saved["config"]["planner"]["controller"], "codex")
+
+
+class ControllerPolicyGateOptionsTest(ControllerPolicyTestBase):
+    """The recovery gates under a policy — and byte-identical without one."""
+
+    def test_policy_free_text_and_sentinels_are_unchanged(self):
+        text = cowork._stuck_gate_text("/tmp/s.json", "planner")
+        self.assertIn("switch-controller (move this role to the alternate "
+                      "controller)", text)
+        self.assertIn(", or end (end this phase cleanly).", text)
+        self.assertIs(
+            cowork._read_stuck_gate(io.StringIO("switch\n"), io.StringIO()),
+            cowork._STUCK_SWITCH)
+        self.assertIs(
+            cowork._read_controller_failure_gate(
+                io.StringIO("switch\n"), io.StringIO()), cowork._CTRL_SWITCH)
+        self.assertIs(
+            cowork._read_reviewer_fail_gate(
+                io.StringIO("switch\n"), io.StringIO()), cowork._REVFAIL_SWITCH)
+        self.assertIn("the alternate controller",
+                      cowork._controller_failure_text("planner", "codex", "x"))
+        self.assertIn("the alternate controller",
+                      cowork._reviewer_fail_gate_text("planning-advisor",
+                                                      "planner"))
+
+    def test_restricted_gates_offer_exactly_allowed_minus_current(self):
+        eligible = cowork.eligible_controllers(
+            "codex", ("claude", "codex"))
+        self.assertEqual(eligible, ["claude"])
+        for text in (cowork._stuck_gate_text("/tmp/s.json", "planner",
+                                             eligible=eligible),
+                     cowork._controller_failure_text("planner", "codex", "x",
+                                                     eligible=eligible),
+                     cowork._reviewer_fail_gate_text("planning-advisor",
+                                                     "planner",
+                                                     eligible=eligible)):
+            self.assertIn("claude", text)
+            self.assertNotIn("the alternate controller", text)
+            self.assertNotIn("opencode", text)
+        for reader in (cowork._read_stuck_gate,
+                       cowork._read_controller_failure_gate,
+                       cowork._read_reviewer_fail_gate):
+            for token in ("switch claude", "switch-controller=claude",
+                          "switch"):
+                with self.subTest(reader=reader.__name__, token=token):
+                    action = reader(io.StringIO(token + "\n"), io.StringIO(),
+                                    eligible=eligible)
+                    self.assertEqual(action, cowork._SwitchTo("claude"))
+
+    def test_no_eligible_controller_drops_the_switch_option(self):
+        for text in (cowork._stuck_gate_text("/tmp/s.json", "planner",
+                                             eligible=[]),
+                     cowork._controller_failure_text("planner", "codex", "x",
+                                                     eligible=[]),
+                     cowork._reviewer_fail_gate_text("planning-advisor",
+                                                     "planner", eligible=[])):
+            self.assertNotIn("switch-controller", text)
+            self.assertIn("leaves no other controller available", text)
+        self.assertIs(
+            cowork._read_stuck_gate(io.StringIO("switch\n"), io.StringIO(),
+                                    eligible=[]), cowork._STUCK_END)
+
+    def test_gate_eligible_for_reads_the_active_policy(self):
+        self.assertIsNone(cowork.gate_eligible_for("claude"))
+        with policy.restricted(("claude", "codex")):
+            self.assertEqual(cowork.gate_eligible_for("claude"), ["codex"])
+        policy.activate_invalid("garbage")
+        self.assertEqual(cowork.gate_eligible_for("claude"), [])
+
+    def test_gate_switch_on_a_restricted_session_preserves_the_policy(self):
+        saved = {"allowed": ["claude", "codex"], "updated": 9.0,
+                 "source": "cli"}
+        spath = self._session(
+            "GATE-PRESERVE", "scouting", {"scout": "codex"}, team=["scout"],
+            policy_value=dict(saved))
+        # Resume (saved lead session id), so no interactive goal prompt.
+        state_store.save_role_session(spath, "scout", "codex", "codex-thread",
+                                      prior=state_store.load(spath))
+
+        def which(cmd):
+            return None if cmd == "codex" else "/bin/" + cmd
+
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        with mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath]),
+                io_in=io.StringIO("switch claude\n"), io_out=io.StringIO(),
+                which=which, run_scout_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        after = state_store.load(spath)
+        self.assertEqual(after["controller_policy"], saved)
+        self.assertEqual(after["config"]["scout"]["controller"], "claude")
+
+
+class ControllerPolicyOrch023Test(ControllerPolicyTestBase):
+    """ORCH-023 end to end: builder AND its reviewer both on opencode, one
+    command restricts the session and moves both, then the session resumes —
+    and no opencode process is ever started."""
+
+    def _building_session(self):
+        team = ["scout", "planner", "builder", cowork.BUILD_REVIEWER]
+        spath = self._session(
+            "ORCH-023", "building",
+            {"builder": "opencode", cowork.BUILD_REVIEWER: "opencode"},
+            team=team)
+        state = state_store.save_role_session(
+            spath, "builder", "opencode", "ses_builder",
+            prior=state_store.load(spath))
+        state_store.save_role_session(
+            spath, cowork.BUILD_REVIEWER, "opencode", "ses_reviewer",
+            prior=state)
+        intel_dir = state_store.session_assets_dir("ORCH-023")
+        os.makedirs(intel_dir, exist_ok=True)
+        for name in ("planner.plan.json",):
+            with open(os.path.join(intel_dir, name), "w") as fh:
+                json.dump({"status": "ready_for_review", "result": {}}, fh)
+        return spath
+
+    def test_restrict_and_remap_then_resume_starts_no_opencode(self):
+        spath = self._building_session()
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        agent_writes = []
+        real_ensure = bridge.ensure_opencode_agent
+
+        def recording_agent(*a, **kw):
+            agent_writes.append(a)
+            return real_ensure(*a, **kw)
+
+        import unittest.mock as mock
+        out = io.StringIO()
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn), \
+                mock.patch.object(bridge, "ensure_opencode_agent",
+                                  recording_agent):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath, "--context", "policy test",
+                            "--allow-controllers", "codex,claude",
+                            "--switch-controller", "builder=codex",
+                            "--switch-controller",
+                            "%s=claude" % cowork.BUILD_REVIEWER]),
+                io_in=io.StringIO(), io_out=out,
+                which=lambda c: "/bin/" + c,
+                run_builder_fn=lambda *a, **k: 0)
+
+            self.assertEqual(rc, 0)
+            saved = state_store.load(spath)
+            self.assertEqual(saved["controller_policy"]["allowed"],
+                             ["claude", "codex"])
+            self.assertEqual(saved["config"]["builder"]["controller"], "codex")
+            self.assertEqual(
+                saved["config"][cowork.BUILD_REVIEWER]["controller"], "claude")
+
+            # ...and the resume leg, running the REAL builder path (no fake
+            # runner), so the spawn recorder sees what a resume actually starts.
+            cowork.run_flow(
+                self._args(["--session-file", spath, "--context", "policy test"]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c)
+
+        # The resume really did launch the builder — on codex, not opencode.
+        self.assertIn("codex", popen.controllers())
+        self.assertEqual([c for c in popen.controllers() if c == "opencode"],
+                         [])
+        self.assertEqual(agent_writes, [])
+        self.assertEqual(
+            [c for c in claude_spawn.calls if c and c[0] == "opencode"], [])
+        # The policy really is in force at the end of the run.
+        with self.assertRaises(policy.DispatchBlocked):
+            policy.guard("opencode", role="builder")
+
+
+class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
+    """Nothing old breaks, and everything new is traced."""
+
+    def _planning(self, uuid_str, **kw):
+        return self._session(
+            uuid_str, "planning",
+            {"planner": "claude", cowork.PLANNING_ADVISOR: "codex"},
+            team=["scout", "planner", cowork.PLANNING_ADVISOR], **kw)
+
+    def test_policy_free_resume_activates_nothing_and_dispatches_freely(self):
+        spath = self._planning("BACKCOMPAT-FREE")
+        seen = []
+
+        def fake_planner(config, context, selected, on_outcome=None, **kw):
+            seen.append(policy.active_meta()["mode"])
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "policy test"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, ["unrestricted"])
+        self.assertNotIn("controller_policy", state_store.load(spath))
+        self.assertEqual(
+            [e for e in self._events(spath)
+             if e["event"].startswith("controller.policy")], [])
+        # An unrestricted session can still start opencode.
+        self.assertIsNone(policy.guard("opencode", role="planner"))
+
+    def test_resume_never_reads_interactive_stdin(self):
+        """A resume must not touch real stdin.
+
+        `gather_context_interactive` reads the process's REAL stdin (through
+        `ui.prompt_user`), NOT the `io_in` handed to run_flow — so a resume that
+        fell through to the goal prompt would block on a terminal read rather
+        than fail. This pins the resume branch shut for BOTH a policy-free and a
+        restricted session: sys.stdin is replaced with an object that raises on
+        any access, and the prompt itself is stubbed to raise."""
+        import unittest.mock as mock
+
+        class ExplodingStdin:
+            def __getattr__(self, name):
+                raise AssertionError(
+                    "run_flow touched real stdin (sys.stdin.%s) on a resume"
+                    % name)
+
+        cases = [
+            ("STDIN-FREE", ""),
+            ("STDIN-RESTRICTED", {"allowed": ["claude", "codex"],
+                                  "updated": 1.0, "source": "cli"}),
+        ]
+        for uuid_str, policy_value in cases:
+            with self.subTest(policy=policy_value or "absent"):
+                spath = self._planning(uuid_str, policy_value=policy_value)
+                # A saved lead session id is what makes this a resume.
+                state_store.save_role_session(
+                    spath, "planner", "claude", "claude-session",
+                    prior=state_store.load(spath))
+                seen = []
+
+                def fake_planner(config, context, selected, on_outcome=None,
+                                 **kw):
+                    seen.append(context)
+                    if kw.get("on_first_send_accepted"):
+                        kw["on_first_send_accepted"]()
+                    if on_outcome:
+                        on_outcome("ended", None)
+                    return 0
+
+                # The base class already stubs gather_context_interactive to
+                # raise; this additionally proves nothing else reads stdin.
+                with mock.patch.object(sys, "stdin", ExplodingStdin()):
+                    rc = cowork.run_flow(
+                        self._args(["--session-file", spath]),
+                        io_in=io.StringIO(), io_out=io.StringIO(),
+                        which=lambda c: "/bin/" + c,
+                        run_planner_fn=fake_planner)
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(seen), 1)
+
+    def test_the_prompt_stub_would_catch_a_regression(self):
+        """The stub above is only meaningful if it actually fires: a NON-resume
+        with no --context does reach the goal prompt, and must fail loudly
+        instead of blocking on a terminal read."""
+        spath = self._planning("STDIN-NONRESUME")  # no saved lead session id
+        with self.assertRaises(AssertionError) as ctx:
+            cowork.run_flow(
+                self._args(["--session-file", spath]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: 0)
+        self.assertIn("interactive goal prompt", str(ctx.exception))
+
+    def test_lone_switch_under_policy_keeps_the_allowed_set_byte_identical(self):
+        saved = {"allowed": ["claude", "codex"], "updated": 11.0,
+                 "source": "cli"}
+        spath = self._planning("BACKCOMPAT-LONE-OK", policy_value=dict(saved))
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "planner=codex"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        after = state_store.load(spath)
+        self.assertEqual(after["controller_policy"], saved)
+        self.assertEqual(after["config"]["planner"]["controller"], "codex")
+        change = [e for e in self._events(spath)
+                  if e["event"] == "controller.policy.change"]
+        self.assertEqual(len(change), 1)
+        self.assertEqual(change[0]["policy_action"], "preserve")
+
+    def test_lone_switch_to_a_forbidden_target_is_rejected_untouched(self):
+        saved = {"allowed": ["claude", "codex"], "updated": 11.0,
+                 "source": "cli"}
+        spath = self._planning("BACKCOMPAT-LONE-BAD", policy_value=dict(saved))
+        before = self._sha(spath)
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        dispatched = []
+        import unittest.mock as mock
+        out = io.StringIO()
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--switch-controller", "planner=opencode"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: dispatched.append(1) or 0)
+        self.assertEqual(rc, 2)
+        self.assertIn("this session allows only claude, codex", out.getvalue())
+        self.assertEqual(self._sha(spath), before)
+        self.assertEqual(popen.calls, [])
+        self.assertEqual(claude_spawn.calls, [])
+        self.assertEqual(dispatched, [])
+        rejected = [e for e in self._events(spath)
+                    if e["event"] == "controller.policy.rejected"]
+        self.assertEqual(len(rejected), 1)
+
+    def test_the_four_trace_events_carry_their_documented_fields(self):
+        # change (set) + rejected
+        spath = self._planning("BACKCOMPAT-TRACE")
+        cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "policy test",
+                        "--allow-controllers", "claude,codex"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        change = [e for e in self._events(spath)
+                  if e["event"] == "controller.policy.change"][-1]
+        for field in ("policy_action", "to_allowed", "source", "phase"):
+            self.assertIn(field, change)
+        self.assertEqual(change["policy_action"], "set")
+        self.assertEqual(change["to_allowed"], ["claude", "codex"])
+
+        out = io.StringIO()
+        cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--switch-controller", "planner=opencode"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            run_planner_fn=lambda *a, **k: 0)
+        rejected = [e for e in self._events(spath)
+                    if e["event"] == "controller.policy.rejected"][-1]
+        for field in ("reason", "source", "persisted", "policy_action",
+                      "effective_allowed"):
+            self.assertIn(field, rejected)
+
+        # invalid
+        bad = self._planning("BACKCOMPAT-TRACE-BAD", policy_value=[])
+        cowork.run_flow(
+            self._args(["--session-file", bad, "--context", "policy test"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        invalid = [e for e in self._events(bad)
+                   if e["event"] == "controller.policy.invalid"][-1]
+        for field in ("session_file", "raw_policy_type", "reason",
+                      "repairable"):
+            self.assertIn(field, invalid)
+
+        # blocked
+        blocked_session = self._session(
+            "BACKCOMPAT-TRACE-BLOCK", "scouting", {"scout": "opencode"},
+            team=["scout"],
+            policy_value={"allowed": ["claude"], "updated": 1.0,
+                          "source": "cli"})
+        cowork.run_flow(
+            self._args(["--session-file", blocked_session,
+                        "--context", "policy test"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c)
+        blocked = [e for e in self._events(blocked_session)
+                   if e["event"] == "controller.dispatch.blocked"][-1]
+        for field in ("role", "phase", "requested_controller", "allowed",
+                      "kind"):
+            self.assertIn(field, blocked)
+
+
+class ControllerPolicyDocsTest(unittest.TestCase):
+    """The README must actually describe the feature, so the docs cannot
+    silently drift from it."""
+
+    @staticmethod
+    def _flow(text):
+        """Collapse markdown line wrapping so a phrase assertion is not defeated
+        by where a sentence happens to break across lines."""
+        return " ".join(text.split())
+
+    @classmethod
+    def _section(cls, heading):
+        start = cls.text.index(heading)
+        end = cls.text.index("###", start + 10)
+        return cls._flow(cls.text[start:end])
+
+    @classmethod
+    def setUpClass(cls):
+        readme = os.path.join(os.path.dirname(_HERE), "README.md")
+        with open(readme, "r") as fh:
+            cls.text = fh.read()
+        cls.section = cls._section("### Controller policy")
+
+    @classmethod
+    def _switching_section(cls):
+        return cls._section("### Controller switching")
+
+    def test_the_existing_controller_switching_section_is_intact(self):
+        self.assertIn("### Controller switching", self.text)
+        self.assertIn("./cowork --switch-controller planner=codex", self.text)
+        self.assertIn("V1 is manual only.", self.text)
+
+    def test_switching_section_describes_the_file_only_handoff(self):
+        """The handoff packet is file-only: bodies ride by PATH and only
+        content-free routing facts are inline. Documentation claiming artifact
+        `contents` travel inline would contradict the implementation."""
+        section = self._switching_section()
+        self.assertIn("file-only", section.lower())
+        for phrase in ("by file path", "content-free"):
+            self.assertIn(phrase, section.lower())
+        # Each body-carrying member is named as travelling by path.
+        for member in ("shared session context", "artifacts",
+                       "recovery", "pending turn"):
+            self.assertIn(member, section.lower())
+
+    def test_switching_section_does_not_claim_inline_bodies(self):
+        """Guard against the specific wording that was wrong: artifact paths
+        'and contents' inline."""
+        section = self._switching_section().lower()
+        for banned in ("paths and contents", "and contents",
+                       "artifact contents", "inlined into the packet"):
+            self.assertNotIn(banned, section,
+                             "the switching section still claims inline "
+                             "bodies: %r" % banned)
+
+    def test_section_covers_the_allowed_set_and_absent_means_unrestricted(self):
+        self.assertIn("allowed", self.section.lower())
+        self.assertIn("unrestricted", self.section.lower())
+
+    def test_section_covers_both_flag_forms(self):
+        self.assertIn("--allow-controllers", self.section)
+        self.assertIn("--allow-controllers all", self.section)
+        self.assertIn("--switch-controller", self.section)
+        self.assertIn("repeatable", self.section.lower())
+
+    def test_section_states_a_switch_never_changes_the_allowed_set(self):
+        self.assertIn("never changes the allowed set", self.section)
+
+    def test_section_covers_the_interactive_equivalent(self):
+        self.assertIn("Change this session's controllers", self.section)
+
+    def test_section_covers_the_ordering_and_all_or_nothing_guarantee(self):
+        for phrase in ("all-or-nothing", "before anything resumes",
+                       "single write"):
+            self.assertIn(phrase, self.section)
+
+    def test_section_covers_current_phase_versus_other_roles(self):
+        self.assertIn("current phase", self.section)
+        self.assertIn("warning", self.section.lower())
+
+    def test_section_covers_recovery_gates_including_no_eligible(self):
+        self.assertIn("recovery", self.section.lower())
+        self.assertIn("no eligible controller", self.section.lower())
+
+    def test_section_covers_the_unreadable_policy_repair_route(self):
+        self.assertIn("unreadable", self.section.lower())
+        self.assertIn("controller_policy", self.section)
+
+    def test_flag_reference_mentions_both_flags(self):
+        self.assertIn("- `--allow-controllers LIST`", self.text)
+        self.assertIn("repeatable", self.text)
+
+
+# --------------------------------------------------------------------------- #
+# UX-011 — the gate input activation boundary.                                 #
+# --------------------------------------------------------------------------- #
+
+_PTY_OK = hasattr(os, "openpty") and sys.platform != "win32"
+
+# Every pty rendezvous is bounded so a hang fails loudly at a NAMED step instead
+# of blocking the suite.
+_PTY_STEP_TIMEOUT = 25.0
+
+
+def _fionread(fd):
+    """Bytes waiting on `fd` — the same primitive the boundary uses, so the
+    tests can wait for a payload to really be queued instead of sleeping."""
+    buf = array.array("i", [0])
+    fcntl.ioctl(fd, termios.FIONREAD, buf, True)
+    return int(buf[0])
+
+
+def _raw_no_echo(fd):
+    """Put a pty into byte-at-a-time, no-echo mode.
+
+    No ECHO so the captured transcript contains ONLY what cowork itself wrote.
+    That is deliberate and is what the leak assertions are about: cowork does
+    not read, keep, record or replay discarded input, and terminal-local echo of
+    the user's own keystrokes is the terminal's doing, not a cowork leak. A real
+    terminal DOES echo type-ahead while a role turn runs — cowork never touches
+    the ECHO flag — and README's 'Gates ignore input typed before they were
+    ready' says so explicitly; `test_cowork_never_promises_to_suppress_echo`
+    below pins the two together. Leaving echo on here would mix the user's own
+    keystrokes into the transcript and make the leak probes meaningless.
+
+    No ICANON so bytes reach the input queue immediately and FIONREAD counts are
+    exact. And no CR/NL translation, so a typed Return stays a Return whether or
+    not an application has entered raw mode yet — prompt_toolkit clears the same
+    input flags, so this only removes a start-up race the real terminal does not
+    have."""
+    attrs = termios.tcgetattr(fd)
+    attrs[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)   # iflag
+    attrs[3] &= ~(termios.ECHO | termios.ICANON)                   # lflag
+    attrs[6][termios.VMIN] = 0
+    attrs[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+class _PtyStream:
+    """A stream backed by a REAL pty fd: `is_tty()` is true and `fileno()` is a
+    genuine terminal, so the activation boundary fully engages without spawning
+    a subprocess. Captures everything cowork writes."""
+
+    def __init__(self, fd):
+        self._fd = fd
+        self.chunks = []
+
+    def fileno(self):
+        return self._fd
+
+    def isatty(self):
+        return True
+
+    def write(self, text):
+        self.chunks.append(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    @property
+    def text(self):
+        return "".join(self.chunks)
+
+
+class _Handlers(list):
+    """The minimal shape of prompt_toolkit's `after_render` Event: `+=` to
+    subscribe, `fire()` to run."""
+
+    def __iadd__(self, handler):
+        self.append(handler)
+        return self
+
+    def fire(self):
+        for handler in list(self):
+            handler(None)
+
+
+class _StubApp:
+    """A stand-in for a widget's prompt_toolkit Application: running it fires
+    the first render (where arm_activation drains) and then returns either the
+    STALE sentinel it was exited with, or its scripted result."""
+
+    def __init__(self, result=None, renders=1):
+        self.after_render = _Handlers()
+        self.result = result
+        self.renders = renders
+        self.exits = []
+        self.ran = 0
+
+    def exit(self, result=None):
+        self.exits.append(result)
+
+    def run(self):
+        self.ran += 1
+        for _ in range(self.renders):
+            self.after_render.fire()
+        if self.exits:
+            return self.exits[-1]
+        return self.result
+
+
+class GateBoundaryFixture(unittest.TestCase):
+    """Shared pty-fd plumbing for the in-process boundary tests."""
+
+    def pty_pair(self):
+        master, slave = os.openpty()
+        self.addCleanup(self._close, master)
+        self.addCleanup(self._close, slave)
+        _raw_no_echo(slave)
+        return master, slave
+
+    @staticmethod
+    def _close(fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def queue(self, master, slave, payload):
+        """Write `payload` to the terminal and BLOCK until it is really sitting
+        on the input queue, so nothing downstream races the write."""
+        data = payload.encode() if isinstance(payload, str) else payload
+        os.write(master, data)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if _fionread(slave) >= len(data):
+                return len(data)
+            time.sleep(0.005)
+        self.fail("payload never reached the terminal input queue")
+
+    def streams(self):
+        master, slave = self.pty_pair()
+        return master, slave, _PtyStream(slave), _PtyStream(slave)
+
+
+class GateDrainPrimitiveTest(GateBoundaryFixture):
+    """_gate_fd / _pending_input / _drop_terminal_input against a bare pty."""
+
+    def test_gate_fd_is_none_off_a_terminal(self):
+        self.assertIsNone(ui._gate_fd(io.StringIO()))
+        self.assertIsNone(ui._gate_fd(FakeTTY()))     # claims isatty, no fileno
+        self.assertIsNone(ui._gate_fd(object()))
+
+    def test_gate_fd_is_the_descriptor_on_a_real_terminal(self):
+        _master, slave = self.pty_pair()
+        self.assertEqual(ui._gate_fd(_PtyStream(slave)), slave)
+
+    def test_pending_counts_without_reading_and_flush_clears(self):
+        master, slave = self.pty_pair()
+        self.assertEqual(ui._pending_input(slave), (False, 0))
+        self.queue(master, slave, "hello there")
+        pending, count = ui._pending_input(slave)
+        self.assertTrue(pending)
+        self.assertEqual(count, 11)
+        # Counting must not consume: the bytes are still queued.
+        self.assertEqual(_fionread(slave), 11)
+        result = ui._drop_terminal_input(slave)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.pending)
+        self.assertEqual(result.count, 11)
+        self.assertEqual(_fionread(slave), 0)
+
+    def test_pending_is_zero_on_a_missing_fd(self):
+        self.assertEqual(ui._pending_input(None), (False, 0))
+        empty = ui._drop_terminal_input(None)
+        self.assertTrue(empty.ok)
+        self.assertFalse(empty.pending)
+
+    def test_select_fallback_reports_pending_without_a_count(self):
+        import unittest.mock as mock
+        master, slave = self.pty_pair()
+        self.queue(master, slave, "abc")
+        with mock.patch.object(ui.fcntl, "ioctl",
+                               side_effect=OSError(errno.ENOTTY, "nope")):
+            pending, count = ui._pending_input(slave)
+            self.assertTrue(pending)
+            self.assertIsNone(count)
+            # …and the flush still runs, so the bytes are still discarded.
+            result = ui._drop_terminal_input(slave)
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.count)
+        self.assertEqual(_fionread(slave), 0)
+
+    def test_tcflush_failure_is_reported_not_swallowed(self):
+        import unittest.mock as mock
+        master, slave = self.pty_pair()
+        self.queue(master, slave, "abc")
+        with mock.patch.object(ui.termios, "tcflush",
+                               side_effect=OSError(errno.ENOTTY, "nope")):
+            result = ui._drop_terminal_input(slave)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.errno_name, "ENOTTY")
+        # The bytes really are still queued — which is why the caller must not
+        # proceed as if they were gone.
+        self.assertEqual(_fionread(slave), 3)
+
+    def test_no_discard_path_helper_ever_reads_the_bytes(self):
+        """Reading discarded content — even to measure it — would materialize it
+        in Python. Assert os.read is never reachable from the discard path."""
+        import unittest.mock as mock
+        master, slave = self.pty_pair()
+        self.queue(master, slave, "secret-payload")
+        with mock.patch.object(ui.os, "read",
+                               side_effect=AssertionError("os.read on the "
+                                                          "discard path")):
+            act = ui.begin_gate(_PtyStream(slave), _PtyStream(slave),
+                                gate="g")
+        self.assertTrue(act.safe)
+        self.assertTrue(act.pending)
+
+    def test_count_is_clamped(self):
+        master, slave = self.pty_pair()
+        # Just over the cap, but inside the tty's own buffer.
+        self.queue(master, slave, "x" * (ui.GATE_DISCARD_CAP + 10))
+        act = ui.begin_gate(_PtyStream(slave), _PtyStream(slave), gate="g")
+        self.assertEqual(act.count, ui.GATE_DISCARD_CAP)
+
+    def test_clamp_helper(self):
+        self.assertIsNone(ui._clamp_count(None))
+        self.assertEqual(ui._clamp_count(3), 3)
+        self.assertEqual(ui._clamp_count(ui.GATE_DISCARD_CAP * 10),
+                         ui.GATE_DISCARD_CAP)
+
+
+@unittest.skipUnless(HAS_UI_DEPS, "prompt_toolkit not installed")
+class DropTypeaheadTest(unittest.TestCase):
+    """The second stale-input channel: prompt_toolkit's process-global typeahead
+    bucket, which replays leftover key presses into the NEXT application before
+    it draws."""
+
+    @contextlib.contextmanager
+    def _session(self):
+        from prompt_toolkit.application.current import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        with create_pipe_input() as pipe_in:
+            with create_app_session(input=pipe_in, output=DummyOutput()):
+                yield pipe_in
+
+    def _presses(self, *datas):
+        from prompt_toolkit.key_binding.key_processor import KeyPress
+        return [KeyPress("x", data) for data in datas]
+
+    def test_counts_characters_and_empties_the_bucket(self):
+        from prompt_toolkit.input import typeahead as pt_typeahead
+        with self._session() as pipe_in:
+            pt_typeahead.store_typeahead(pipe_in, self._presses("\r", "abc"))
+            self.assertEqual(ui._drop_typeahead(), (True, 4))
+            self.assertEqual(pt_typeahead.get_typeahead(pipe_in), [])
+
+    def test_second_call_is_a_no_op(self):
+        from prompt_toolkit.input import typeahead as pt_typeahead
+        with self._session() as pipe_in:
+            pt_typeahead.store_typeahead(pipe_in, self._presses("\r"))
+            self.assertEqual(ui._drop_typeahead(), (True, 1))
+            self.assertEqual(ui._drop_typeahead(), (True, 0))
+
+    def test_a_bucket_that_cannot_be_emptied_reports_failure(self):
+        """Fail closed: those key presses would be replayed into the next
+        application before it draws."""
+        import unittest.mock as mock
+        from prompt_toolkit.input import typeahead as pt_typeahead
+        with self._session() as pipe_in:
+            pt_typeahead.store_typeahead(pipe_in, self._presses("\r"))
+            with mock.patch.object(pt_typeahead, "clear_typeahead",
+                                   side_effect=RuntimeError("wedged")):
+                self.assertEqual(ui._drop_typeahead(), (False, 0))
+
+    def test_begin_gate_clears_the_bucket_before_a_widget_opens(self):
+        from prompt_toolkit.input import typeahead as pt_typeahead
+        master, slave = os.openpty()
+        self.addCleanup(lambda: os.close(master))
+        self.addCleanup(lambda: os.close(slave))
+        _raw_no_echo(slave)
+        with self._session() as pipe_in:
+            pt_typeahead.store_typeahead(pipe_in, self._presses("\r\r"))
+            act = ui.begin_gate(_PtyStream(slave), _PtyStream(slave), gate="g")
+        self.assertTrue(act.safe)
+        self.assertTrue(act.pending)
+        self.assertEqual(act.count, 2)
+
+
+class GateNoticeTest(unittest.TestCase):
+    """The notices are short, content-free and never carry payload text."""
+
+    def test_discard_notice_with_and_without_a_count(self):
+        out = FakeTTY()
+        ui.discard_notice(out, 12)
+        text = out.getvalue()
+        self.assertIn("12", text)
+        self.assertIn("ignored", text.lower())
+        self.assertIn("again", text.lower())
+        out2 = FakeTTY()
+        ui.discard_notice(out2, None)
+        self.assertNotRegex(out2.getvalue(), r"\d")
+        self.assertIn("ignored", out2.getvalue().lower())
+
+    def test_discard_notice_clamps(self):
+        out = FakeTTY()
+        ui.discard_notice(out, ui.GATE_DISCARD_CAP)
+        self.assertIn("%d+" % ui.GATE_DISCARD_CAP, out.getvalue())
+
+    def test_failure_notices_say_the_gate_will_not_run(self):
+        out = FakeTTY()
+        ui.drain_failed_notice(out)
+        self.assertIn("not be run", out.getvalue())
+        out2 = FakeTTY()
+        ui.gate_abandoned_notice(out2)
+        self.assertIn("without approving", out2.getvalue())
+
+
+class GateOffTerminalNoOpTest(unittest.TestCase):
+    """Off a real terminal, and with ask_fn injected, the boundary is inert and
+    every existing call shape behaves exactly as it always has."""
+
+    def test_begin_gate_is_a_no_op_off_a_terminal(self):
+        act = ui.begin_gate(FakeTTY(), FakeTTY(), gate="g")
+        self.assertTrue(act.safe)
+        self.assertFalse(act.pending)
+        self.assertFalse(act.active)
+
+    def test_arm_activation_tolerates_a_missing_app_and_fd(self):
+        act = ui.begin_gate(FakeTTY(), FakeTTY(), gate="g")
+        ui.arm_activation(None, act, None)              # no app
+        ui.arm_activation(object(), act, None)          # no fd
+        ui.arm_activation(object(), act, 1)             # no after_render
+        self.assertFalse(act.active)
+
+    def test_select_and_confirm_keep_the_legacy_call_shape(self):
+        self.assertEqual(ui.select("p", [("a", "A")], ask_fn=lambda: "a"), "a")
+        self.assertIs(ui.confirm("p", ask_fn=lambda: True), True)
+        self.assertIs(ui.confirm("p", ask_fn=lambda: None), False)
+
+    def test_ask_fn_wins_even_with_terminal_handles(self):
+        calls = []
+        ui.select("p", [("a", "A")], ask_fn=lambda: calls.append(1) or "a",
+                  io_in=FakeTTY(), io_out=FakeTTY(), gate="g")
+        self.assertEqual(calls, [1])
+
+    def test_prompt_user_off_tty_is_byte_identical(self):
+        self.assertIs(ui.prompt_user(io.StringIO(""), io.StringIO()), ui.EOF)
+        self.assertEqual(ui.prompt_user(io.StringIO("\n"), io.StringIO()), "")
+        self.assertEqual(ui.prompt_user(io.StringIO("hi\n"), io.StringIO()),
+                         "hi")
+
+
+@unittest.skipUnless(HAS_UI_DEPS, "questionary not installed")
+class ConfirmDefaultTest(unittest.TestCase):
+    """ui.confirm's new `default` parameter (D3)."""
+
+    def test_defaults_to_true_and_forwards(self):
+        import unittest.mock as mock
+        import questionary
+        with mock.patch.object(questionary, "confirm") as qc:
+            qc.return_value.ask.return_value = True
+            ui.confirm("Approve & finish?")
+            self.assertIs(qc.call_args.kwargs["default"], True)
+            qc.reset_mock()
+            qc.return_value.ask.return_value = False
+            ui.confirm("Approve & finish?", default=False)
+            self.assertIs(qc.call_args.kwargs["default"], False)
+
+
+class DrainFailedSentinelTest(unittest.TestCase):
+    """The sentinel makes 'an unmapped caller fails loudly' true rather than
+    aspirational."""
+
+    def test_bool_raises(self):
+        with self.assertRaises(TypeError):
+            bool(ui.DRAIN_FAILED)
+        with self.assertRaises(TypeError):
+            if ui.DRAIN_FAILED:      # the `if ui.confirm(...)` hazard
+                pass
+
+    def test_has_no_strip(self):
+        self.assertFalse(hasattr(ui.DRAIN_FAILED, "strip"))
+
+    def test_is_outside_every_other_return_domain(self):
+        for other in (ui.CANCEL, ui.EOF, ui.STALE, None, "", True, False):
+            self.assertIsNot(ui.DRAIN_FAILED, other)
+
+
+class _GateWrapperFixture(GateBoundaryFixture):
+    """Recording callbacks matching cowork_ui's single declared signature."""
+
+    def _record(self):
+        discards, failures = [], []
+
+        def on_discard(gate, epoch, phase, count):
+            discards.append({"gate": gate, "epoch": epoch, "phase": phase,
+                             "count": count})
+
+        def on_drain_fail(gate, epoch, phase, reason, errno_name,
+                          typeahead_cleared, reopens):
+            failures.append({"gate": gate, "epoch": epoch, "phase": phase,
+                             "reason": reason, "errno_name": errno_name,
+                             "typeahead_cleared": typeahead_cleared,
+                             "reopens": reopens})
+
+        return discards, failures, on_discard, on_drain_fail
+
+
+class GateWrapperLoopTest(_GateWrapperFixture):
+    """The single wrapper loop: exactly one notice and one callback per gate
+    open, from this layer only."""
+
+    def test_clean_queue_produces_no_notice_and_no_event(self):
+        """The no-routine-false-warnings half of the contract: a warning always
+        means real observed input."""
+        _master, _slave, io_in, io_out = self.streams()
+        discards, failures, on_d, on_f = self._record()
+        app = _StubApp(result="approve")
+        out = ui._run_gate(io_in, io_out, "g", on_d, on_f,
+                           lambda: (app, app.run))
+        self.assertEqual(out, "approve")
+        self.assertEqual(discards, [])
+        self.assertEqual(failures, [])
+        self.assertEqual(io_out.text, "")
+
+    def test_observed_queue_produces_exactly_one_notice_and_one_event(self):
+        master, slave, io_in, io_out = self.streams()
+        self.queue(master, slave, "typed ahead")
+        discards, failures, on_d, on_f = self._record()
+        app = _StubApp(result="approve")
+        out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
+                           lambda: (app, app.run))
+        self.assertEqual(out, "approve")
+        self.assertEqual(len(discards), 1)
+        self.assertEqual(discards[0]["phase"], "pre_render")
+        self.assertEqual(discards[0]["count"], 11)
+        self.assertEqual(discards[0]["gate"], "ready_for_review")
+        self.assertEqual(failures, [])
+        self.assertEqual(io_out.text.count("ignored"), 1)
+
+
+class GateReopenTest(_GateWrapperFixture):
+    """Re-opening after a post-render discard: a full gate open every time —
+    drain, a new Activation, a fresh widget, exactly one handler — bounded by
+    GATE_REOPEN_LIMIT so a stuck key cannot livelock the gate."""
+
+    def test_post_render_arrival_reopens_once_with_one_notice(self):
+        """Input landing while the gate draws: the widget exits STALE, the
+        wrapper reports ONCE and re-opens a live gate."""
+        master, slave, io_in, io_out = self.streams()
+        discards, failures, on_d, on_f = self._record()
+        built = []
+
+        def build():
+            app = _StubApp(result="approve")
+            if not built:
+                # First attempt only: bytes land while it is drawing.
+                original = app.run
+
+                def run():
+                    self.queue(master, slave, "\r")
+                    return original()
+
+                built.append(app)
+                return app, run
+            built.append(app)
+            return app, app.run
+
+        out = ui._run_gate(io_in, io_out, "g", on_d, on_f, build)
+        self.assertEqual(out, "approve")
+        self.assertEqual(len(built), 2)
+        self.assertEqual(len(discards), 1, discards)
+        self.assertEqual(discards[0]["phase"], "post_render")
+        self.assertEqual(io_out.text.count("ignored"), 1)
+        # Each attempt is armed exactly once — no handler accumulation.
+        self.assertEqual(len(built[0].after_render), 1)
+        self.assertEqual(len(built[1].after_render), 1)
+        # Every re-open is a FULL gate open, so the epoch advances.
+        self.assertNotEqual(built[0], built[1])
+
+    def test_arm_activation_is_one_shot(self):
+        """Later redraws never drain, so a genuine in-box paste is never
+        over-discarded."""
+        master, slave, io_in, io_out = self.streams()
+        act = ui.begin_gate(io_in, io_out, gate="g")
+        app = _StubApp(result="typed")
+        ui.arm_activation(app, act, slave)
+        app.after_render.fire()                    # the first render: drains
+        self.assertTrue(act.active)
+        # Now the user pastes into the OPEN, activated editor.
+        self.queue(master, slave, "in-box paste")
+        app.after_render.fire()                    # a cursor-move redraw…
+        app.after_render.fire()                    # …and the render_as_done one
+        self.assertEqual(_fionread(slave), len("in-box paste"))
+        self.assertEqual(app.exits, [])
+
+    def test_reopen_limit_fails_closed_without_a_discard_event(self):
+        master, slave, io_in, io_out = self.streams()
+        discards, failures, on_d, on_f = self._record()
+
+        def build():
+            app = _StubApp(result="approve")
+            original = app.run
+
+            def run():
+                self.queue(master, slave, "\r")
+                return original()
+
+            return app, run
+
+        out = ui._run_gate(io_in, io_out, "g", on_d, on_f, build)
+        self.assertIs(out, ui.DRAIN_FAILED)
+        # The final attempt reports the abandonment and NOTHING else.
+        self.assertEqual(len(discards), ui.GATE_REOPEN_LIMIT - 1)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["reason"], "reopen_limit")
+        self.assertEqual(failures[0]["reopens"], ui.GATE_REOPEN_LIMIT)
+        self.assertIsNone(failures[0]["errno_name"])
+        self.assertIsNone(failures[0]["typeahead_cleared"])
+        self.assertEqual(io_out.text.count("without approving"), 1)
+
+
+class DrainFailedTraceOrderingTest(_GateWrapperFixture):
+    """A failed drain emits input.drain_failed and NEVER input.discarded; a
+    recovered drain emits the inverse; a successful post-render drop emits
+    exactly one event and one notice (the double-emit regression guard)."""
+
+    def test_pre_render_drain_failure_fails_closed(self):
+        import unittest.mock as mock
+        master, slave, io_in, io_out = self.streams()
+        self.queue(master, slave, "\r")
+        discards, failures, on_d, on_f = self._record()
+        opened = []
+
+        def build():
+            opened.append(1)
+            app = _StubApp(result="approve")
+            return app, app.run
+
+        with mock.patch.object(ui.termios, "tcflush",
+                               side_effect=OSError(errno.ENOTTY, "nope")) as tf:
+            out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
+                               build)
+        self.assertIs(out, ui.DRAIN_FAILED)
+        self.assertEqual(opened, [])            # the gate never ran
+        self.assertEqual(discards, [])          # nothing was really discarded
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["reason"], "tcflush")
+        self.assertEqual(failures[0]["errno_name"], "ENOTTY")
+        self.assertIs(failures[0]["typeahead_cleared"], True)
+        self.assertIsNone(failures[0]["reopens"])
+        self.assertEqual(io_out.text.count("could not clear"), 1)
+        # It retried before giving up.
+        self.assertEqual(tf.call_count, ui.GATE_DRAIN_RETRIES)
+
+    def test_transient_failure_then_success_proceeds_with_no_banner(self):
+        import unittest.mock as mock
+        master, slave, io_in, io_out = self.streams()
+        self.queue(master, slave, "abc")
+        discards, failures, on_d, on_f = self._record()
+        real = ui.termios.tcflush
+        calls = []
+
+        def flaky(fd, queue):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError(errno.EINTR, "interrupted")
+            return real(fd, queue)
+
+        app = _StubApp(result="approve")
+        with mock.patch.object(ui.termios, "tcflush", flaky):
+            out = ui._run_gate(io_in, io_out, "g", on_d, on_f,
+                               lambda: (app, app.run))
+        self.assertEqual(out, "approve")
+        self.assertEqual(failures, [])
+        self.assertEqual(len(discards), 1)
+        self.assertNotIn("could not clear", io_out.text)
+
+    def test_post_render_drain_failure_fails_closed(self):
+        import unittest.mock as mock
+        master, slave, io_in, io_out = self.streams()
+        discards, failures, on_d, on_f = self._record()
+        real = ui.termios.tcflush
+        state = {"opened": False}
+
+        def build():
+            app = _StubApp(result="approve")
+            original = app.run
+
+            def run():
+                state["opened"] = True
+                return original()
+
+            return app, run
+
+        def only_fail_after_open(fd, queue):
+            if state["opened"]:
+                raise OSError(errno.EIO, "gone")
+            return real(fd, queue)
+
+        with mock.patch.object(ui.termios, "tcflush", only_fail_after_open):
+            out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
+                               build)
+        self.assertIs(out, ui.DRAIN_FAILED)
+        self.assertEqual(discards, [])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["phase"], "post_render")
+        self.assertEqual(failures[0]["reason"], "tcflush")
+        self.assertEqual(failures[0]["errno_name"], "EIO")
+        # post-render failures did NOT clear the typeahead bucket.
+        self.assertIs(failures[0]["typeahead_cleared"], False)
+        self.assertEqual(io_out.text.count("could not clear"), 1)
+
+
+class DrainSamplingWindowTest(GateBoundaryFixture):
+    """The amended criterion 2 contract (user decision D5), pinned from both
+    sides so it can drift back to neither a false promise nor a noisy warning."""
+
+    def test_gap_arrival_is_discarded_but_unmentioned(self):
+        import unittest.mock as mock
+        master, slave, io_in, io_out = self.streams()
+        events = []
+        real = ui.termios.tcflush
+        injected = {"done": False}
+
+        def inject_then_flush(fd, queue):
+            # EXACTLY the gap: after _pending_input sampled, before tcflush.
+            if not injected["done"]:
+                injected["done"] = True
+                self.queue(master, slave, "\r\r\r")
+            return real(fd, queue)
+
+        app = _StubApp(result="ask")
+        with mock.patch.object(ui.termios, "tcflush", inject_then_flush):
+            out = ui._run_gate(
+                io_in, io_out, "g",
+                lambda **kw: events.append(kw), None,
+                lambda: (app, app.run))
+        self.assertEqual(out, "ask")
+        # Discarded: the bytes are gone and selected nothing.
+        self.assertEqual(_fionread(slave), 0)
+        # …and, as documented, unmentioned.
+        self.assertEqual(events, [])
+        self.assertEqual(io_out.text, "")
+
+    def test_empty_queue_never_warns(self):
+        _master, _slave, io_in, io_out = self.streams()
+        events = []
+        app = _StubApp(result="ask")
+        ui._run_gate(io_in, io_out, "g", lambda **kw: events.append(kw), None,
+                     lambda: (app, app.run))
+        self.assertEqual(events, [])
+        self.assertEqual(io_out.text, "")
+
+    def test_observed_input_warns_exactly_once(self):
+        master, slave, io_in, io_out = self.streams()
+        self.queue(master, slave, "hello")
+        events = []
+        app = _StubApp(result="ask")
+        ui._run_gate(io_in, io_out, "g", lambda **kw: events.append(kw), None,
+                     lambda: (app, app.run))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(io_out.text.count("ignored"), 1)
+
+
+class GateTraceClosureTest(unittest.TestCase):
+    """run_flow's closures match cowork_ui's single declared signature, and the
+    emitted field sets are exactly what the plan declares."""
+
+    def _trace(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "trace.jsonl")
+        return trace_store.Trace(path, session_uuid="s", run_id="r"), path
+
+    def _records(self, path):
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _fields(self, record):
+        return {k: v for k, v in record.items()
+                if k not in ("ts", "event", "event_id", "run_id",
+                             "session_uuid")}
+
+    def test_no_trace_means_no_callbacks(self):
+        self.assertEqual(cowork._gate_trace_callbacks(None, "scout"),
+                         (None, None))
+
+    def test_discard_event_fields(self):
+        trace, path = self._trace()
+        on_discard, _fail = cowork._gate_trace_callbacks(trace, "planner")
+        on_discard(gate="ready_for_review", epoch=7, phase="pre_render",
+                   count=12)
+        rec = self._records(path)[0]
+        self.assertEqual(rec["event"], "input.discarded")
+        self.assertEqual(self._fields(rec),
+                         {"role": "planner", "gate": "ready_for_review",
+                          "epoch": 7, "phase": "pre_render", "chars": 12})
+
+    def test_discard_event_omits_chars_when_unknown(self):
+        trace, path = self._trace()
+        on_discard, _fail = cowork._gate_trace_callbacks(trace, "scout")
+        on_discard(gate="g", epoch=1, phase="pre_render", count=None)
+        rec = self._records(path)[0]
+        self.assertNotIn("chars", rec)
+        self.assertEqual(self._fields(rec),
+                         {"role": "scout", "gate": "g", "epoch": 1,
+                          "phase": "pre_render"})
+
+    def test_drain_failed_event_fields(self):
+        trace, path = self._trace()
+        _d, on_drain_fail = cowork._gate_trace_callbacks(trace, "builder")
+        on_drain_fail(gate="ready_for_review", epoch=3, phase="pre_render",
+                      reason="tcflush", errno_name="ENOTTY",
+                      typeahead_cleared=True, reopens=None)
+        rec = self._records(path)[0]
+        self.assertEqual(rec["event"], "input.drain_failed")
+        self.assertEqual(self._fields(rec),
+                         {"role": "builder", "gate": "ready_for_review",
+                          "epoch": 3, "phase": "pre_render",
+                          "reason": "tcflush", "errno": "ENOTTY",
+                          "typeahead_cleared": True})
+
+    def test_gate_abandoned_event_fields(self):
+        trace, path = self._trace()
+        _d, on_drain_fail = cowork._gate_trace_callbacks(trace, "builder")
+        on_drain_fail(gate="ready_for_review", epoch=4, phase="post_render",
+                      reason="reopen_limit", errno_name=None,
+                      typeahead_cleared=None, reopens=3)
+        rec = self._records(path)[0]
+        self.assertEqual(rec["event"], "input.gate_abandoned")
+        self.assertEqual(self._fields(rec),
+                         {"role": "builder", "gate": "ready_for_review",
+                          "epoch": 4, "phase": "post_render",
+                          "reason": "reopen_limit", "reopens": 3})
+
+    def test_closures_take_the_declared_keyword_arity(self):
+        import inspect
+        trace, _path = self._trace()
+        on_discard, on_drain_fail = cowork._gate_trace_callbacks(trace, "scout")
+        self.assertEqual(
+            list(inspect.signature(on_discard).parameters),
+            ["gate", "epoch", "phase", "count"])
+        self.assertEqual(
+            list(inspect.signature(on_drain_fail).parameters),
+            ["gate", "epoch", "phase", "reason", "errno_name",
+             "typeahead_cleared", "reopens"])
+
+    def test_no_content_derived_field_is_ever_emitted(self):
+        trace, path = self._trace()
+        on_discard, on_drain_fail = cowork._gate_trace_callbacks(trace, "scout")
+        on_discard(gate="g", epoch=1, phase="pre_render", count=5)
+        on_drain_fail(gate="g", epoch=1, phase="pre_render", reason="tcflush",
+                      errno_name="EIO", typeahead_cleared=True, reopens=None)
+        blob = json.dumps(self._records(path))
+        for banned in ("sha256", "prompt_bytes", "text", "data"):
+            self.assertNotIn(banned, blob)
+
+
+class DrainFailedMappingTest(unittest.TestCase):
+    """Every protected call site in every reader maps ui.DRAIN_FAILED to a named
+    non-approving constant, BEFORE any other test on the value."""
+
+    def _tty(self):
+        return FakeTTY(), FakeTTY()
+
+    def _failing(self):
+        import unittest.mock as mock
+        return mock.Mock(return_value=ui.DRAIN_FAILED)
+
+    def test_read_review_select_site(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        pu = mock.Mock()
+        with mock.patch.object(ui, "select", self._failing()), \
+                mock.patch.object(ui, "prompt_user", pu):
+            self.assertIs(cowork._read_review(i, o), cowork._STOP)
+        pu.assert_not_called()
+
+    def test_read_review_changes_feedback_site(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        sel = mock.Mock(return_value="changes")
+        with mock.patch.object(ui, "select", sel), \
+                mock.patch.object(ui, "prompt_user", self._failing()):
+            self.assertIs(cowork._read_review(i, o), cowork._STOP)
+        self.assertEqual(sel.call_count, 1)
+
+    def test_read_review_question_site(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", mock.Mock(return_value="ask")), \
+                mock.patch.object(ui, "prompt_user", self._failing()):
+            self.assertIs(cowork._read_review(i, o), cowork._STOP)
+
+    def test_read_review_preview_less_confirm_site(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        pu = mock.Mock()
+        with mock.patch.object(ui, "confirm", self._failing()), \
+                mock.patch.object(ui, "prompt_user", pu):
+            self.assertIs(cowork._read_review(i, o, allow_ask=False),
+                          cowork._STOP)
+        pu.assert_not_called()
+
+    def test_read_review_preview_less_feedback_site(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        conf = mock.Mock(return_value=False)
+        with mock.patch.object(ui, "confirm", conf), \
+                mock.patch.object(ui, "prompt_user", self._failing()):
+            self.assertIs(cowork._read_review(i, o, allow_ask=False),
+                          cowork._STOP)
+        self.assertEqual(conf.call_count, 1)
+
+    def test_read_review_builder_preview_sites(self):
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", self._failing()):
+            self.assertIs(cowork._read_review(i, o, allow_ask=False,
+                                              preview=preview), cowork._STOP)
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", mock.Mock(return_value="changes")), \
+                mock.patch.object(ui, "prompt_user", self._failing()):
+            self.assertIs(cowork._read_review(i, o, allow_ask=False,
+                                              preview=preview), cowork._STOP)
+
+    def test_read_review_dissent_sites(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", self._failing()):
+            self.assertIs(cowork._read_review_dissent(i, o), cowork._STOP)
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", mock.Mock(return_value="tell")), \
+                mock.patch.object(ui, "prompt_user", self._failing()):
+            self.assertIs(cowork._read_review_dissent(i, o), cowork._STOP)
+
+    def test_recovery_gates_map_to_their_own_safe_constants(self):
+        import unittest.mock as mock
+        cases = [
+            (cowork._read_stuck_gate, cowork._STUCK_END),
+            (cowork._read_controller_failure_gate, cowork._CTRL_END),
+            (cowork._read_reviewer_fail_gate, cowork._REVFAIL_END),
+        ]
+        for reader, expected in cases:
+            with self.subTest(reader=reader.__name__):
+                i, o = self._tty()
+                with mock.patch.object(ui, "select", self._failing()):
+                    self.assertIs(reader(i, o), expected)
+
+    def test_reviewer_failure_never_maps_to_skip(self):
+        """_REVFAIL_SKIP would advance the work past a review that never
+        happened."""
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", self._failing()):
+            self.assertIsNot(cowork._read_reviewer_fail_gate(i, o),
+                             cowork._REVFAIL_SKIP)
+
+    def test_handoff_confirm_declines(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        with mock.patch.object(ui, "confirm", self._failing()):
+            self.assertIs(cowork._read_handoff_confirm(i, o), False)
+
+    def test_free_form_sites_intercept_before_strip(self):
+        """cowork.py's three feedback sites call fb.strip(); the sentinel has no
+        .strip(), so an unmapped site would raise AttributeError."""
+        import unittest.mock as mock
+        for kwargs in ({}, {"allow_ask": False},
+                       {"allow_ask": False,
+                        "preview": cowork.make_gate_preview("builder", False,
+                                                            True)}):
+            with self.subTest(kwargs=sorted(kwargs)):
+                i, o = self._tty()
+                sel = mock.Mock(return_value="changes")
+                conf = mock.Mock(return_value=False)
+                with mock.patch.object(ui, "select", sel), \
+                        mock.patch.object(ui, "confirm", conf), \
+                        mock.patch.object(ui, "prompt_user", self._failing()):
+                    self.assertIs(cowork._read_review(i, o, **kwargs),
+                                  cowork._STOP)
+
+
+class ReviewApprovalPathsTest(unittest.TestCase):
+    """D3 + D4: no approval by omission. Every route that could finish the run
+    is enumerated, and every loop still has a working way out."""
+
+    def _tty(self):
+        return FakeTTY(), FakeTTY()
+
+    def _preview(self, role="builder"):
+        return cowork.make_gate_preview(role, False, True)
+
+    EMPTY = ["", "   ", "\t\n ", ui.CANCEL, ui.EOF]
+
+    def test_ask_menu_blank_feedback_never_approves(self):
+        import unittest.mock as mock
+        for blank in self.EMPTY:
+            with self.subTest(blank=repr(blank)):
+                i, o = self._tty()
+                sel = mock.Mock(side_effect=["changes", "stop"])
+                with mock.patch.object(ui, "select", sel), \
+                        mock.patch.object(ui, "prompt_user",
+                                          return_value=blank):
+                    self.assertIs(cowork._read_review(i, o), cowork._STOP)
+                self.assertEqual(sel.call_count, 2)
+
+    def test_builder_preview_menu_blank_feedback_never_approves(self):
+        import unittest.mock as mock
+        for blank in self.EMPTY:
+            with self.subTest(blank=repr(blank)):
+                i, o = self._tty()
+                sel = mock.Mock(side_effect=["changes", "stop"])
+                with mock.patch.object(ui, "select", sel), \
+                        mock.patch.object(ui, "prompt_user",
+                                          return_value=blank):
+                    self.assertIs(
+                        cowork._read_review(i, o, allow_ask=False,
+                                            preview=self._preview()),
+                        cowork._STOP)
+                self.assertEqual(sel.call_count, 2)
+
+    def test_preview_less_confirm_blank_feedback_never_approves(self):
+        import unittest.mock as mock
+        for blank in self.EMPTY:
+            with self.subTest(blank=repr(blank)):
+                i, o = self._tty()
+                conf = mock.Mock(side_effect=[False, True])
+                with mock.patch.object(ui, "confirm", conf), \
+                        mock.patch.object(ui, "prompt_user",
+                                          return_value=blank):
+                    self.assertIs(cowork._read_review(i, o, allow_ask=False),
+                                  cowork._END)
+                # It re-asked instead of finishing on the blank answer.
+                self.assertEqual(conf.call_count, 2)
+
+    def test_preview_less_confirm_is_built_with_default_false(self):
+        import unittest.mock as mock
+        i, o = self._tty()
+        conf = mock.Mock(return_value=True)
+        with mock.patch.object(ui, "confirm", conf):
+            cowork._read_review(i, o, allow_ask=False)
+        self.assertIs(conf.call_args.kwargs["default"], False)
+
+    def test_dismissed_menu_stops_everywhere(self):
+        import unittest.mock as mock
+        cases = [
+            ({}, cowork._STOP),
+            ({"preview": cowork.make_gate_preview("scout", True, False)},
+             cowork._STOP),
+            ({"allow_ask": False, "preview": cowork.make_gate_preview(
+                "builder", False, True)}, cowork._STOP),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=sorted(kwargs)):
+                i, o = self._tty()
+                pu = mock.Mock()
+                with mock.patch.object(ui, "select", return_value=None), \
+                        mock.patch.object(ui, "prompt_user", pu):
+                    self.assertIs(cowork._read_review(i, o, **kwargs), expected)
+                pu.assert_not_called()
+
+    def test_every_loop_still_has_an_escape(self):
+        import unittest.mock as mock
+        # Menu: explicit Stop.
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", return_value="stop"):
+            self.assertIs(cowork._read_review(i, o), cowork._STOP)
+        # Menu: non-empty feedback.
+        i, o = self._tty()
+        with mock.patch.object(ui, "select", return_value="changes"), \
+                mock.patch.object(ui, "prompt_user", return_value="do x"):
+            self.assertEqual(cowork._read_review(i, o), "do x")
+        # Confirm loop: Yes.
+        i, o = self._tty()
+        with mock.patch.object(ui, "confirm", return_value=True):
+            self.assertIs(cowork._read_review(i, o, allow_ask=False),
+                          cowork._END)
+        # Confirm loop: non-empty feedback.
+        i, o = self._tty()
+        with mock.patch.object(ui, "confirm", return_value=False), \
+                mock.patch.object(ui, "prompt_user", return_value="do x"):
+            self.assertEqual(cowork._read_review(i, o, allow_ask=False), "do x")
+
+    def test_off_tty_blank_finish_contract_is_untouched(self):
+        self.assertIs(cowork._read_review(io.StringIO("\n"), io.StringIO()),
+                      cowork._END)
+        self.assertIs(cowork._read_review(io.StringIO(""), io.StringIO()),
+                      cowork._END)
+        self.assertIs(cowork._read_review(io.StringIO("   \n"), io.StringIO()),
+                      cowork._END)
+        self.assertIs(
+            cowork._read_review(io.StringIO("\n"), io.StringIO(),
+                                allow_ask=False), cowork._END)
+        self.assertIs(
+            cowork._read_review_dissent(io.StringIO("\n"), io.StringIO()),
+            cowork._END)
+
+
+class GateDefaultsTest(unittest.TestCase):
+    """'Approve & finish' is never the highlighted default at any consequential
+    gate, and Stop is never first."""
+
+    TERMINAL = ("approve", "stop", "end")
+
+    def _assert_safe_order(self, keys):
+        self.assertTrue(keys, "the menu showed no choices")
+        self.assertNotIn(keys[0], self.TERMINAL,
+                         "the highlighted choice is consequential: %r" % keys)
+        self.assertNotEqual(keys[0], "stop")
+
+    def test_scout_and_planner_gates(self):
+        import unittest.mock as mock
+        for role, terminal in (("scout", False), ("planner", False),
+                               ("scout", True), ("planner", True)):
+            with self.subTest(role=role, terminal=terminal):
+                preview = cowork.make_gate_preview(role, not terminal, False)
+                rec = _SelectRecorder("stop")
+                with mock.patch.object(cowork.ui, "select", rec):
+                    cowork._read_review(FakeTTY(), FakeTTY(), preview=preview)
+                self._assert_safe_order(rec.keys)
+                self.assertEqual(rec.keys[0], "ask")
+                self.assertEqual(rec.keys[-1], "stop")
+
+    def test_scout_gate_without_preview(self):
+        import unittest.mock as mock
+        rec = _SelectRecorder("changes")
+        with mock.patch.object(cowork.ui, "select", rec), \
+                mock.patch.object(cowork.ui, "prompt_user", return_value="x"):
+            cowork._read_review(FakeTTY(), FakeTTY())
+        self._assert_safe_order(rec.keys)
+        self.assertEqual(rec.keys, ["ask", "changes", "approve"])
+
+    def test_builder_gate(self):
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        rec = _SelectRecorder("stop")
+        with mock.patch.object(cowork.ui, "select", rec):
+            cowork._read_review(FakeTTY(), FakeTTY(), allow_ask=False,
+                                preview=preview)
+        self.assertEqual(rec.keys, ["changes", "approve", "stop"])
+        self._assert_safe_order(rec.keys)
+
+    def test_dissent_gate(self):
+        import unittest.mock as mock
+        for preview in (None, cowork.make_gate_preview("planner", True, False)):
+            with self.subTest(preview=bool(preview)):
+                rec = _SelectRecorder("iterate")
+                with mock.patch.object(cowork.ui, "select", rec):
+                    cowork._read_review_dissent(FakeTTY(), FakeTTY(),
+                                                preview=preview)
+                self._assert_safe_order(rec.keys)
+                self.assertEqual(rec.keys[0], "iterate")
+
+    def test_recovery_gates(self):
+        import unittest.mock as mock
+        readers = [cowork._read_stuck_gate,
+                   cowork._read_controller_failure_gate,
+                   cowork._read_reviewer_fail_gate]
+        for reader in readers:
+            for eligible in (None, ["claude"], []):
+                with self.subTest(reader=reader.__name__, eligible=eligible):
+                    rec = _SelectRecorder("retry")
+                    with mock.patch.object(cowork.ui, "select", rec):
+                        reader(FakeTTY(), FakeTTY(), eligible=eligible)
+                    self._assert_safe_order(rec.keys)
+                    self.assertEqual(rec.keys[0], "retry")
+                    self.assertEqual(rec.keys[-1], "end")
+
+
+class NegativeControlOracleTest(unittest.TestCase):
+    """ADJUDICATION RECORD for the adapted negative-control oracle.
+
+    The approved plan (user decision D2) required the 'it still breaks without
+    the fix' proof to positively assert `cowork._END`. That literal oracle is
+    UNSATISFIABLE once the same plan's D3 and D4 are applied, and this class
+    proves why rather than asserting it in prose:
+
+      * D4 reorders both review menus so 'approve' is never first, and
+      * D3 builds the preview-less confirm with default=False,
+
+    so the recorded incident's leftover — a single Return — can no longer reach
+    approve even with the boundary completely neutralised. The failure the
+    ticket exists to prevent is 'stale input drives a consequential gate'; on
+    today's menus a bare Return expresses that as a SELECTION, not as an
+    approval.
+
+    The adapted oracle is therefore: with the boundary neutralised, stale input
+    alone must produce a SELECTION at the later gate. That is strictly weaker as
+    an assertion but strictly WIDER as a detector — every _END is a selection,
+    so anything the original oracle would have caught, this one catches too (see
+    test_adapted_oracle_is_a_superset). The _END case is not abandoned either:
+    GateActivationIncidentPtyTest.test_approval_reproduces_without_the_boundary
+    asserts the outcome IS _END using a leftover that navigates onto approve,
+    which shows the boundary alone still gates a full approval.
+
+    REVIEWER ADJUDICATION: this substitution was escalated in the build status
+    as a deviation from a user-approved requirement and reviewed; the review
+    approved the build with the adapted oracle in place. These tests exist so
+    the adjudication is enforced by the suite rather than resting on a verdict
+    recorded in a session artifact — if a future change makes the literal _END
+    oracle satisfiable again, test_literal_end_oracle_is_unsatisfiable FAILS and
+    forces the substitution to be revisited."""
+
+    def _tty(self):
+        return FakeTTY(), FakeTTY()
+
+    def test_literal_end_oracle_is_unsatisfiable(self):
+        """A bare Return cannot reach approve at ANY review gate, so a negative
+        control replaying the recorded leftover cannot assert _END."""
+        import unittest.mock as mock
+        # Menu gates: a bare Return takes the highlighted choice, which D4
+        # guarantees is not approve.
+        for kwargs in ({}, {"preview": cowork.make_gate_preview("scout", True,
+                                                                False)},
+                       {"allow_ask": False,
+                        "preview": cowork.make_gate_preview("builder", False,
+                                                            True)}):
+            with self.subTest(kwargs=sorted(kwargs)):
+                rec = _SelectRecorder("stop")
+                with mock.patch.object(cowork.ui, "select", rec):
+                    cowork._read_review(*self._tty(), **kwargs)
+                self.assertNotEqual(
+                    rec.keys[0], "approve",
+                    "D4 regressed: a stray Return would approve again")
+        # The preview-less confirm: a bare Return takes the default, which D3
+        # guarantees is No.
+        conf = mock.Mock(return_value=True)
+        with mock.patch.object(cowork.ui, "confirm", conf):
+            cowork._read_review(*self._tty(), allow_ask=False)
+        self.assertIs(conf.call_args.kwargs["default"], False,
+                      "D3 regressed: a stray Return would approve again")
+
+    def test_adapted_oracle_is_a_superset(self):
+        """Every outcome the literal oracle would flag is also flagged by the
+        adapted one, so widening the oracle cannot hide a reproduction."""
+        # _END is only reachable through an explicit approve selection (or an
+        # explicit Yes at the confirm) — i.e. a selection always happened first.
+        import unittest.mock as mock
+        rec = _SelectRecorder("approve")
+        with mock.patch.object(cowork.ui, "select", rec):
+            out = cowork._read_review(*self._tty())
+        self.assertIs(out, cowork._END)
+        self.assertEqual(len(rec.calls), 1,
+                         "an _END outcome implies exactly one selection")
+
+    def test_both_oracles_are_still_exercised_by_the_pty_suite(self):
+        """The adaptation must not quietly become 'we stopped checking'."""
+        names = set(dir(GateActivationIncidentPtyTest))
+        adapted = {n for n in names
+                   if n.startswith("test_variant_")
+                   and n.endswith("_reproduces_without_the_boundary")}
+        self.assertEqual(
+            sorted(adapted),
+            ["test_variant_a_reproduces_without_the_boundary",
+             "test_variant_b_reproduces_without_the_boundary",
+             "test_variant_c_reproduces_without_the_boundary"],
+            "expected one adapted-oracle negative control per variant A/B/C")
+        self.assertIn("test_approval_reproduces_without_the_boundary", names,
+                      "the positive _END reproduction must remain")
+        self.assertIn("test_the_same_payload_approves_nothing_when_protected",
+                      names, "the protected mirror must remain")
+
+    def test_the_adapted_oracle_asserts_a_real_selection(self):
+        """The adapted oracle's signal is the nested feedback editor opening,
+        which can only follow a menu selection — not merely 'no exception'."""
+        import unittest.mock as mock
+        preview = cowork.make_gate_preview("builder", False, True)
+        headers = []
+
+        def record(io_in, io_out, header=None, **kwargs):
+            headers.append(header)
+            return "feedback from stale bytes"
+
+        with mock.patch.object(cowork.ui, "select", return_value="changes"), \
+                mock.patch.object(cowork.ui, "prompt_user", record):
+            out = cowork._read_review(*self._tty(), allow_ask=False,
+                                      preview=preview)
+        self.assertEqual(out, "feedback from stale bytes")
+        self.assertEqual(headers, ["Request changes — your feedback"],
+                         "the pty oracle keys on this exact header")
+
+
+class PromptUserGateOptInTest(GateBoundaryFixture):
+    """The boundary is opt-in and keyed on `gate`. Ordinary context and turn
+    prompts (gate=None) keep legacy behavior and must NEVER see DRAIN_FAILED —
+    their callers consume the result as text, so a sentinel they never asked for
+    would raise instead of re-prompting."""
+
+    class _StubSession:
+        def __init__(self, text="typed"):
+            self.text = text
+            self.calls = 0
+            self.app = None
+
+        def prompt(self, *a, **kw):
+            self.calls += 1
+            return self.text
+
+    def _factory(self, session):
+        return lambda: session
+
+    def test_gate_none_runs_no_drain_and_no_notice(self):
+        import unittest.mock as mock
+        master, slave, io_in, io_out = self.streams()
+        self.queue(master, slave, "typed ahead")
+        session = self._StubSession("answer")
+        with mock.patch.object(ui, "begin_gate") as begun, \
+                mock.patch.object(ui, "arm_activation") as armed:
+            out = ui.prompt_user(io_in, io_out, header="your answer",
+                                 session_factory=self._factory(session))
+        self.assertEqual(out, "answer")
+        begun.assert_not_called()
+        armed.assert_not_called()
+        self.assertEqual(io_out.text, "")
+
+    def test_gate_none_never_returns_drain_failed(self):
+        """Even with every stale-input channel failing."""
+        import unittest.mock as mock
+        _master, _slave, io_in, io_out = self.streams()
+        session = self._StubSession("answer")
+        with mock.patch.object(ui.termios, "tcflush",
+                               side_effect=OSError(errno.ENOTTY, "nope")), \
+                mock.patch.object(ui, "_drop_typeahead",
+                                  return_value=(False, 0)):
+            out = ui.prompt_user(io_in, io_out, header="your answer",
+                                 session_factory=self._factory(session))
+        self.assertEqual(out, "answer")
+        self.assertIsNot(out, ui.DRAIN_FAILED)
+        self.assertEqual(session.calls, 1)
+
+    def test_gate_none_still_returns_eof_and_text_unchanged(self):
+        _master, _slave, io_in, io_out = self.streams()
+        session = self._StubSession("  trailing\n")
+        self.assertEqual(
+            ui.prompt_user(io_in, io_out, session_factory=self._factory(session)),
+            "  trailing")
+
+    def test_named_gate_does_run_the_boundary(self):
+        master, slave, io_in, io_out = self.streams()
+        self.queue(master, slave, "typed ahead")
+        session = self._StubSession("answer")
+        out = ui.prompt_user(io_in, io_out, header="Your question",
+                             session_factory=self._factory(session),
+                             gate="review_question")
+        self.assertEqual(out, "answer")
+        self.assertIn("ignored", io_out.text)
+
+    def test_named_gate_can_return_drain_failed(self):
+        import unittest.mock as mock
+        _master, _slave, io_in, io_out = self.streams()
+        session = self._StubSession("answer")
+        with mock.patch.object(ui.termios, "tcflush",
+                               side_effect=OSError(errno.ENOTTY, "nope")):
+            out = ui.prompt_user(io_in, io_out, header="Your question",
+                                 session_factory=self._factory(session),
+                                 gate="review_question")
+        self.assertIs(out, ui.DRAIN_FAILED)
+        self.assertEqual(session.calls, 0)
+
+    def test_only_gate_readers_name_a_gate(self):
+        """The non-gate prompts in cowork.py must not acquire a `gate=` by
+        accident, and every gate reader's prompt must keep one."""
+        with open(os.path.join(_HERE, "cowork.py")) as fh:
+            tree = ast.parse(fh.read())
+        seen = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                func = call.func
+                if getattr(func, "attr", None) != "prompt_user":
+                    continue
+                if getattr(getattr(func, "value", None), "id", None) != "ui":
+                    continue
+                gated = any(kw.arg == "gate" for kw in call.keywords)
+                seen.setdefault(node.name, set()).add(gated)
+        self.assertTrue(seen, "no ui.prompt_user call sites found")
+        # Legacy, must stay unprotected: _read_turn does reply.strip() and
+        # gather_context_interactive returns the text straight to the caller,
+        # so neither can survive being handed a sentinel.
+        for name in ("_read_turn", "gather_context_interactive"):
+            self.assertIn(name, seen)
+            self.assertEqual(seen[name], {False},
+                             "%s must not name a gate" % name)
+        # Every gate reader's free-form prompt must be protected.
+        for name in ("_read_review", "_read_review_dissent"):
+            self.assertIn(name, seen)
+            self.assertEqual(seen[name], {True},
+                             "%s has an unprotected prompt_user" % name)
+
+
+class GateFailClosedChannelsTest(_GateWrapperFixture):
+    """Every stale-input channel fails CLOSED. A channel that cannot be cleared
+    leaves replayable keys armed, which is the incident mechanism — so it must
+    never be swallowed."""
+
+    def test_typeahead_failure_fails_closed(self):
+        import unittest.mock as mock
+        _master, _slave, io_in, io_out = self.streams()
+        discards, failures, on_d, on_f = self._record()
+        opened = []
+        with mock.patch.object(ui, "_drop_typeahead", return_value=(False, 0)):
+            out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
+                               lambda: opened.append(1) or (None, lambda: "x"))
+        self.assertIs(out, ui.DRAIN_FAILED)
+        self.assertEqual(opened, [])            # the gate never ran
+        self.assertEqual(discards, [])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["reason"], "typeahead")
+        self.assertIs(failures[0]["typeahead_cleared"], False)
+        self.assertIsNone(failures[0]["errno_name"])
+        self.assertIn("could not clear", io_out.text)
+
+    def test_typeahead_import_absence_is_not_a_failure(self):
+        ok, count = ui._drop_typeahead()
+        self.assertIs(ok, True)
+        self.assertEqual(count, 0)
+
+    def test_tcflush_failure_reports_whether_typeahead_was_cleared(self):
+        import unittest.mock as mock
+        _master, _slave, io_in, io_out = self.streams()
+        _d, failures, on_d, on_f = self._record()
+        with mock.patch.object(ui.termios, "tcflush",
+                               side_effect=OSError(errno.ENOTTY, "x")), \
+                mock.patch.object(ui, "_drop_typeahead",
+                                  return_value=(False, 0)):
+            ui._run_gate(io_in, io_out, "g", on_d, on_f,
+                         lambda: (None, lambda: "x"))
+        self.assertEqual(failures[0]["reason"], "tcflush")
+        # BOTH channels failed, so the flag must not claim the bucket was clear.
+        self.assertIs(failures[0]["typeahead_cleared"], False)
+
+    def test_key_queue_failure_fails_closed(self):
+        _master, slave, io_in, io_out = self.streams()
+        discards, failures, on_d, on_f = self._record()
+
+        class _Boom:
+            def empty_queue(self):
+                raise RuntimeError("key processor is wedged")
+
+        def build():
+            app = _StubApp(result="approve")
+            app.key_processor = _Boom()
+            return app, app.run
+
+        out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f, build)
+        self.assertIs(out, ui.DRAIN_FAILED)
+        self.assertEqual(discards, [])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["reason"], "key_queue")
+        self.assertEqual(failures[0]["phase"], "post_render")
+        self.assertIs(failures[0]["typeahead_cleared"], False)
+        self.assertIn("could not clear", io_out.text)
+
+    def test_flush_keys_failure_fails_closed(self):
+        _master, slave, io_in, io_out = self.streams()
+        _d, failures, on_d, on_f = self._record()
+
+        class _BoomInput:
+            def flush_keys(self):
+                raise RuntimeError("input is wedged")
+
+        def build():
+            app = _StubApp(result="approve")
+            app.input = _BoomInput()
+            return app, app.run
+
+        out = ui._run_gate(io_in, io_out, "g", on_d, on_f, build)
+        self.assertIs(out, ui.DRAIN_FAILED)
+        self.assertEqual(failures[0]["reason"], "key_queue")
+
+    def test_missing_queues_are_tolerated_not_failed(self):
+        """A stub app with no key_processor/input has nothing to drop, which is
+        not the same as failing to drop it."""
+        _master, _slave, io_in, io_out = self.streams()
+        _d, failures, on_d, on_f = self._record()
+        app = _StubApp(result="approve")
+        out = ui._run_gate(io_in, io_out, "g", on_d, on_f,
+                           lambda: (app, app.run))
+        self.assertEqual(out, "approve")
+        self.assertEqual(failures, [])
+
+    def test_every_failure_reason_traces_as_drain_failed_not_abandoned(self):
+        """Routing is by outcome: only reopen_limit is an abandonment."""
+        trace_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, trace_dir, ignore_errors=True)
+        path = os.path.join(trace_dir, "trace.jsonl")
+        trace = trace_store.Trace(path, session_uuid="s", run_id="r")
+        _d, on_drain_fail = cowork._gate_trace_callbacks(trace, "builder")
+        for reason in ("tcflush", "typeahead", "key_queue"):
+            on_drain_fail(gate="g", epoch=1, phase="pre_render", reason=reason,
+                          errno_name=None, typeahead_cleared=False,
+                          reopens=None)
+        on_drain_fail(gate="g", epoch=2, phase="post_render",
+                      reason="reopen_limit", errno_name=None,
+                      typeahead_cleared=None, reopens=3)
+        with open(path) as fh:
+            events = [json.loads(line)["event"] for line in fh if line.strip()]
+        self.assertEqual(events, ["input.drain_failed"] * 3
+                         + ["input.gate_abandoned"])
+
+
+class GateDocumentedContractTest(unittest.TestCase):
+    """The README's boundary section must describe what the code ACTUALLY
+    guarantees. The discard guarantee is about cowork: it never reads, keeps,
+    records or replays type-ahead. It is NOT a promise that the characters stay
+    off your screen — while a role turn runs no prompt_toolkit application is
+    attached, so the terminal driver echoes them itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        readme = os.path.join(os.path.dirname(_HERE), "README.md")
+        with open(readme, "r") as fh:
+            cls.text = fh.read()
+        start = cls.text.index("### Gates ignore input typed before they were")
+        section = cls.text[start:cls.text.index("###", start + 10)]
+        # Collapse the prose wrapping so phrase assertions are about wording,
+        # not about where a line happens to break.
+        cls.section = " ".join(section.lower().split())
+
+    def test_cowork_never_touches_the_terminal_echo_flag(self):
+        """The premise of the documented wording: no shipped module suppresses
+        echo, so the README must not claim type-ahead goes unechoed."""
+        for name in sorted(os.listdir(_HERE)):
+            if not name.endswith(".py") or name.startswith("test_"):
+                continue
+            with open(os.path.join(_HERE, name)) as fh:
+                source = fh.read()
+            for token in ("ECHO", "tcsetattr", "cfmakeraw", "tty.setraw"):
+                self.assertNotIn(
+                    token, source,
+                    "%s touches the terminal mode; the README's echo wording "
+                    "would need revisiting" % name)
+
+    def test_cowork_never_promises_to_suppress_echo(self):
+        self.assertNotIn("echoed", self.section)
+        self.assertNotIn("never echo", self.section)
+        # …and it says plainly what really happens instead.
+        self.assertIn("terminal echoes your", self.section)
+        self.assertIn("does not mean cowork received it", self.section)
+
+    def test_the_narrow_guarantee_is_stated(self):
+        for promise in ("never reads", "never keeps", "never records",
+                        "never replays"):
+            self.assertIn(promise, self.section)
+
+    def test_the_observation_bound_notice_contract_is_stated(self):
+        self.assertIn("discarding is absolute", self.section)
+        self.assertIn("best-effort", self.section)
+        self.assertIn("cannot select anything", self.section)
+        self.assertIn("never warns", self.section)
+
+    def test_the_notice_exposes_at_most_a_count(self):
+        """The strongest claim the implementation supports: FIONREAD may be
+        unavailable, in which case the notice has no number at all."""
+        self.assertIn("at most a count", self.section)
+        self.assertIn("without a number", self.section)
+        # …and it must not promise a count unconditionally.
+        self.assertNotIn("always shows how many", self.section)
+
+    def test_the_count_is_obtained_without_reading_the_input(self):
+        self.assertIn("asks the operating system how many bytes", self.section)
+        self.assertIn("rather than looking at them", self.section)
+
+    def test_fail_closed_covers_every_channel(self):
+        for channel in ("terminal's own queue", "replay buffer",
+                        "key buffers"):
+            self.assertIn(channel, self.section)
+
+    def test_the_fail_closed_and_no_switch_contract_is_stated(self):
+        self.assertIn("refuses to run the gate", self.section)
+        self.assertIn("without approving", self.section)
+        self.assertIn("no environment variable and no flag", self.section)
+
+
+class NoGateKillSwitchTest(unittest.TestCase):
+    """D2: no production switch may disable the safety boundary."""
+
+    SOURCES = ("cowork_ui.py", "cowork.py")
+    # Every shipped module, so a switch cannot be smuggled in via a helper.
+    ALL_SOURCES = tuple(sorted(
+        name for name in os.listdir(_HERE)
+        if name.endswith(".py") and not name.startswith("test_")))
+
+    def _env_names(self, filename):
+        """Every environment-variable name the module reads."""
+        with open(os.path.join(_HERE, filename)) as fh:
+            tree = ast.parse(fh.read())
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                attr = getattr(func, "attr", None)
+                # ONLY genuine environment reads: `os.environ.get(...)` and
+                # `os.getenv(...)`. A bare `.get("...")` on any dict used to
+                # count, which made every ordinary dict lookup look like an
+                # environment variable — `summary.get("drained")` tripped the
+                # DRAIN ban with no environment variable anywhere in sight.
+                # Narrowing this makes the guard sharper, not weaker: every real
+                # env read still goes through one of these two forms.
+                is_environ_get = (
+                    attr == "get"
+                    and getattr(getattr(func, "value", None), "attr", None)
+                    == "environ")
+                if (is_environ_get or attr == "getenv") and node.args:
+                    if isinstance(node.args[0], ast.Constant) and \
+                            isinstance(node.args[0].value, str):
+                        names.add(node.args[0].value)
+            if isinstance(node, ast.Subscript):
+                value = node.value
+                if getattr(value, "attr", None) == "environ":
+                    idx = node.slice
+                    if isinstance(idx, ast.Constant) and \
+                            isinstance(idx.value, str):
+                        names.add(idx.value)
+        return names
+
+    def test_no_boundary_disabling_environment_variable(self):
+        banned = ("GATE", "ACTIVATION", "BOUNDARY", "DISCARD", "DRAIN",
+                  "TYPEAHEAD", "FLUSH", "UNSAFE", "NO_GUARD")
+        for filename in self.ALL_SOURCES:
+            for name in self._env_names(filename):
+                for token in banned:
+                    self.assertNotIn(
+                        token, name.upper(),
+                        "%s reads %s, which looks like a boundary switch"
+                        % (filename, name))
+
+    def test_production_env_surface_is_unchanged(self):
+        """The COWORK_* environment surface is a closed, reviewed set.
+
+        Every entry is a ROOT REDIRECT — it points a reader at a different
+        directory or file. None of them changes behaviour, relaxes a boundary or
+        turns a check off, which is what the surrounding tests exist to prevent.
+        Adding one is a deliberate act that has to be made here.
+
+        - COWORK_PROBE_CACHE / COWORK_SESSIONS_ROOT: pre-existing.
+        - COWORK_CLAUDE_PROJECTS_ROOT / COWORK_CODEX_SESSIONS_ROOT (P9): where
+          controller-log ingestion looks. Fixtures point these at fake logs, so
+          a test never reads — or even opens — a real controller session.
+        - COWORK_PRICING_SNAPSHOT (P8): where the pricing snapshot is read from,
+          so an operator can supply captured prices without editing the repo
+          copy (which would be stale by construction).
+        """
+        seen = set()
+        for filename in self.ALL_SOURCES:
+            seen |= {n for n in self._env_names(filename)
+                     if n.startswith("COWORK")}
+        self.assertEqual(seen, {
+            "COWORK_PROBE_CACHE", "COWORK_SESSIONS_ROOT",
+            "COWORK_CLAUDE_PROJECTS_ROOT", "COWORK_CODEX_SESSIONS_ROOT",
+            "COWORK_PRICING_SNAPSHOT",
+        })
+
+    def test_the_ui_module_reads_only_term(self):
+        """cowork_ui carries the whole boundary and reads exactly one
+        environment variable — TERM, for colour detection."""
+        self.assertEqual(self._env_names("cowork_ui.py"), {"TERM"})
+
+    def test_no_conditional_bypass_in_the_wrapper_loop(self):
+        """`_run_gate` must call begin_gate unconditionally — no `if` guarding
+        the boundary itself."""
+        import inspect
+        src = inspect.getsource(ui._run_gate)
+        self.assertIn("begin_gate(io_in, io_out, gate=gate)", src)
+        self.assertNotIn("environ", src)
+        self.assertNotIn("getenv", src)
+
+
+class _PtyGateDriver:
+    """Drives cowork's REAL gate functions in a child process attached to a real
+    pseudo-terminal (user decision D1 — no reimplementation, no stand-ins for
+    the code under test).
+
+    Two side channels keep every step deterministic instead of timed:
+      * a CONTROL pipe (child -> parent) carrying JSON step markers, and
+      * a GO pipe (parent -> child) so the child only advances once the parent
+        has finished setting up (e.g. queued a payload on the tty).
+
+    The pty itself carries only what a real user would type."""
+
+    def __init__(self, testcase, body, env=None):
+        self.tc = testcase
+        self.dir = tempfile.mkdtemp()
+        testcase.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.script = os.path.join(self.dir, "driver.py")
+        with open(self.script, "w") as fh:
+            fh.write(_DRIVER_PREAMBLE % {"scripts": _HERE} + body)
+        self._closed = False
+        self.master, self.slave = os.openpty()
+        _raw_no_echo(self.slave)
+        # A real window size, so prompt_toolkit lays the menu out deterministically
+        # instead of against openpty's default 0x0.
+        fcntl.ioctl(self.slave, termios.TIOCSWINSZ,
+                    array.array("h", [24, 100, 0, 0]))
+        self.ctrl_r, ctrl_w = os.pipe()
+        go_r, self.go_w = os.pipe()
+        child_env = dict(os.environ)
+        child_env.update({
+            "TERM": "xterm",
+            # Deterministic rendering under a pty: no cursor-position requests.
+            "PROMPT_TOOLKIT_NO_CPR": "1",
+            "COWORK_SESSIONS_ROOT": os.path.join(self.dir, "sessions"),
+            "PYTHONPATH": _HERE,
+            "PYTHONUNBUFFERED": "1",
+            "COWORK_CTRL_FD": str(ctrl_w),
+            "COWORK_GO_FD": str(go_r),
+        })
+        child_env.update(env or {})
+        self.proc = subprocess.Popen(
+            [sys.executable, self.script],
+            stdin=self.slave, stdout=self.slave, stderr=self.slave,
+            env=child_env, pass_fds=(ctrl_w, go_r), cwd=self.dir)
+        os.close(ctrl_w)
+        os.close(go_r)
+        self._buf = b""
+        self._out = bytearray()
+        self._out_lock = threading.Lock()
+        self._pump = threading.Thread(target=self._read_master, daemon=True)
+        self._pump.start()
+        testcase.addCleanup(self.close)
+
+    # -- terminal ---------------------------------------------------------- #
+
+    def _read_master(self):
+        while True:
+            try:
+                chunk = os.read(self.master, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            with self._out_lock:
+                self._out.extend(chunk)
+
+    @property
+    def output(self):
+        with self._out_lock:
+            return bytes(self._out).decode("utf-8", "replace")
+
+    def queue(self, payload):
+        """Type `payload` and block until it is really on the tty input queue,
+        so nothing downstream races the write."""
+        data = payload.encode() if isinstance(payload, str) else payload
+        os.write(self.master, data)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if _fionread(self.slave) >= len(data):
+                return
+            time.sleep(0.005)
+        self.tc.fail("payload never reached the terminal input queue")
+
+    def send(self, payload):
+        """Fresh, post-activation input: written and NOT waited on, because an
+        activated gate consumes it immediately."""
+        data = payload.encode() if isinstance(payload, str) else payload
+        os.write(self.master, data)
+
+    # -- control channels -------------------------------------------------- #
+
+    def go(self):
+        os.write(self.go_w, b"go\n")
+
+    def event(self, expected=None, timeout=_PTY_STEP_TIMEOUT, step=""):
+        deadline = time.time() + timeout
+        while b"\n" not in self._buf:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                self.tc.fail(
+                    "timed out at step %r waiting for %r.\nterminal:\n%s"
+                    % (step or expected, expected, self.output[-2000:]))
+            readable, _w, _x = select_mod.select([self.ctrl_r], [], [],
+                                                 min(remaining, 0.5))
+            if not readable:
+                if self.proc.poll() is not None:
+                    self.tc.fail(
+                        "driver exited (rc=%s) at step %r before %r.\n"
+                        "terminal:\n%s"
+                        % (self.proc.returncode, step or expected, expected,
+                           self.output[-2000:]))
+                continue
+            chunk = os.read(self.ctrl_r, 4096)
+            if not chunk:
+                self.tc.fail(
+                    "driver closed the control pipe at step %r before %r.\n"
+                    "terminal:\n%s"
+                    % (step or expected, expected, self.output[-2000:]))
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        record = json.loads(line.decode())
+        if record.get("kind") == "error":
+            self.tc.fail("driver raised at step %r: %s"
+                         % (step or expected, record.get("detail")))
+        if expected is not None:
+            self.tc.assertEqual(record.get("kind"), expected,
+                                "unexpected step marker: %r" % (record,))
+        return record
+
+    def no_event(self, window=1.5):
+        """Assert NOTHING is reported for `window` seconds — the gate consumed
+        nothing and is still waiting."""
+        readable, _w, _x = select_mod.select([self.ctrl_r], [], [], window)
+        if readable:
+            chunk = os.read(self.ctrl_r, 4096)
+            self._buf += chunk
+            self.tc.fail("the gate produced an outcome with no fresh input: %r"
+                         % (self._buf.decode(errors="replace"),))
+
+    def wait_for_output(self, needle, timeout=_PTY_STEP_TIMEOUT):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if needle in self.output:
+                return True
+            time.sleep(0.02)
+        self.tc.fail("never saw %r on the terminal.\nterminal:\n%s"
+                     % (needle, self.output[-2000:]))
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._shut(self.go_w)
+        if self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+        # The parent's own copy of the slave keeps the master from EVER seeing
+        # EOF, so it must be closed FIRST — otherwise the pump thread stays
+        # blocked in os.read and closing the master blocks behind it on macOS.
+        self._shut(self.slave)
+        self._pump.join(timeout=5)
+        self._shut(self.master)
+        self._shut(self.ctrl_r)
+
+    @staticmethod
+    def _shut(fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# The driver runs in its own process, attached to the pty. Everything it needs
+# lives here; each test appends only its own body.
+_DRIVER_PREAMBLE = '''\
+import json, os, sys, traceback
+
+sys.path.insert(0, %(scripts)r)
+
+_CTRL = int(os.environ["COWORK_CTRL_FD"])
+_GO = int(os.environ["COWORK_GO_FD"])
+
+
+def emit(kind, **fields):
+    fields["kind"] = kind
+    os.write(_CTRL, (json.dumps(fields) + "\\n").encode())
+
+
+def wait_go():
+    """Block until the parent says the terminal is set up as the step needs."""
+    buf = b""
+    while b"\\n" not in buf:
+        chunk = os.read(_GO, 1)
+        if not chunk:
+            return
+        buf += chunk
+
+
+import cowork_ui as ui
+import cowork
+
+
+def no_boundary_begin_gate(io_in, io_out, gate=None):
+    """TEST-OWNED negative control (D2). It PRESERVES the wrapper contract —
+    a real, valid Activation — while performing no terminal drain and no
+    typeahead clear, so the wrapper renders no notice, emits no callback, and
+    runs the widget exactly as the pre-fix code did. A plain no-op stub is not
+    valid: the wrapper reads act.safe immediately and would raise instead of
+    reproducing the bug. Production ships no such switch."""
+    act = ui.Activation(gate=gate, epoch=0)
+    act.pending = False
+    act.count = 0
+    act.safe = True
+    act.errno_name = None
+    act.typeahead_cleared = False
+    return act
+
+
+def no_boundary_arm_activation(app, activation, fd):
+    """Installs no after_render handler, so the widget never exits STALE."""
+    return None
+
+
+def disable_boundary():
+    ui.begin_gate = no_boundary_begin_gate
+    ui.arm_activation = no_boundary_arm_activation
+
+
+def announce_activation():
+    """Emit 'activated' once the REAL first-render drain has run for a widget,
+    so the parent knows fresh input will now be honoured. This is the rendezvous
+    that replaces sleeping. Test-owned: production has no such hook."""
+    real = ui.arm_activation
+
+    def arm_and_announce(app, activation, fd):
+        real(app, activation, fd)
+        after = getattr(app, "after_render", None)
+        if after is None:
+            return
+        state = {"done": False}
+
+        def announce(_sender=None):
+            if state["done"]:
+                return
+            state["done"] = True
+            emit("activated")
+
+        after += announce
+
+    ui.arm_activation = arm_and_announce
+
+
+def watch_gate_prompts():
+    """Emit 'gate-prompt' whenever the REVIEW gate opens a nested editor. That
+    can only happen once a choice has been selected at the menu, so it is a
+    positive signal that something drove the gate."""
+    real = ui.prompt_user
+
+    def traced(io_in, io_out, header=None, **kwargs):
+        if header and header != "your answer":
+            emit("gate-prompt", header=header)
+        return real(io_in, io_out, header=header, **kwargs)
+
+    ui.prompt_user = traced
+
+
+def setup_mode():
+    """Negative control (no boundary) or the protected rendezvous."""
+    watch_gate_prompts()
+    if os.environ.get("COWORK_TEST_NO_BOUNDARY"):
+        disable_boundary()
+        return False
+    announce_activation()
+    return True
+
+
+def answer_event(answer):
+    if answer is ui.EOF:
+        emit("answer-returned", answer=None, release="eof")
+    elif answer is ui.CANCEL:
+        emit("answer-returned", answer=None, release="cancel")
+    else:
+        emit("answer-returned", answer=answer, release="text")
+
+
+def review_gate(allow_ask=False, role="builder"):
+    preview = cowork.make_gate_preview(role, False, True)
+    return cowork._read_review(sys.stdin, sys.stdout, allow_ask=allow_ask,
+                               preview=preview)
+
+
+def name_of(outcome):
+    for label in ("_END", "_STOP", "_ITERATE"):
+        if outcome is getattr(cowork, label):
+            return label
+    if isinstance(outcome, tuple):
+        return "ask"
+    return "feedback"
+
+'''
+
+_DRIVER_EPILOGUE = '''
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException:
+        emit("error", detail=traceback.format_exc())
+        raise
+'''
+
+# The recorded incident's shape: a multi-line answer whose first LF submits a
+# partial answer, leaving the remainder to be replayed into a much later gate.
+# The marker exists only so the leak assertions have something unmistakable to
+# look for.
+_LEAK_MARKER = "ZQX-LEAK-MARKER-7731"
+_INCIDENT_SEGMENT_1 = "the first part of my answer %s" % _LEAK_MARKER
+_INCIDENT_TAIL = "\r"
+_INCIDENT_PAYLOAD = _INCIDENT_SEGMENT_1 + "\r" + _INCIDENT_TAIL
+
+
+@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
+class GateActivationIncidentPtyTest(unittest.TestCase):
+    """Criterion 1: the recorded incident cannot recur for ANY plausible
+    delivery of the original payload.
+
+    Variant A — the whole payload queued before the editor opens.
+    Variant B — an unframed payload split across the live editor and its
+                teardown (the recorded shape: a partial answer IS recorded).
+    Variant C — a real bracketed paste plus a stray Return during teardown.
+
+    Each variant also runs with the boundary neutralised in test code, where the
+    failure MUST still reproduce."""
+
+    # -- protected mode ---------------------------------------------------- #
+
+    def _assert_gate_consumed_nothing(self, driver):
+        """The review gate is protected, so whatever the editor left behind was
+        cleared before the menu drew. The gate is still awaiting input, and a
+        FRESH Ctrl-C proves it is live while taking the non-approving path."""
+        driver.event("intervening-turn", step="intervening turn")
+        driver.event("gate-open", step="review gate")
+        driver.event("activated", step="gate activated")
+        driver.no_event(window=1.5)
+        driver.send("\x03")
+        outcome = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(outcome["outcome"], "_STOP")
+
+    def test_variant_a_queued_before_the_editor(self):
+        driver = _PtyGateDriver(self, _INCIDENT_BODY)
+        # Type ahead while NO application is attached: the bytes sit in the tty
+        # queue and the unprotected turn editor reads them when it opens, just
+        # as it does in production.
+        driver.event("ready", step="startup")
+        driver.queue(_INCIDENT_PAYLOAD)
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        answer = driver.event("answer-returned", step="editor release")
+        # The partial answer IS recorded — the recorded incident's own shape.
+        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
+        self.assertEqual(answer["release"], "text")
+        # …and the tail it left in the typeahead bucket reaches the gate, where
+        # begin_gate clears it. This is THE production defense path.
+        #
+        # (No leak probe here: the payload was genuinely typed into the editor,
+        # so the editor legitimately renders it. Leak probes belong to
+        # GateDiscardLeakPtyTest, which queues the payload straight at a gate
+        # where nothing may echo it.)
+        self._assert_gate_consumed_nothing(driver)
+
+    def test_variant_b_split_across_the_editor_and_teardown(self):
+        driver = _PtyGateDriver(self, _INCIDENT_BODY)
+        driver.event("ready", step="startup")
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        # The payload arrives at a LIVE editor: its own first LF submits segment
+        # one, and the remainder is left unprocessed at teardown — the exact
+        # recorded shape, where a partial answer IS kept.
+        driver.send(_INCIDENT_PAYLOAD)
+        answer = driver.event("answer-returned", step="editor release")
+        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
+        self._assert_gate_consumed_nothing(driver)
+
+    def test_variant_c_framed_paste_plus_stray_return(self):
+        driver = _PtyGateDriver(self, _INCIDENT_BODY)
+        driver.event("ready", step="startup")
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        # A REAL bracketed paste lands whole in the open editor, an explicit
+        # Enter submits it, and the trailing Return is the teardown leftover.
+        driver.send("\x1b[200~" + _PASTE_BODY + "\x1b[201~" + "\r" + "\r")
+        answer = driver.event("answer-returned", step="editor release")
+        self.assertEqual(answer["answer"], _PASTE_BODY)
+        self._assert_gate_consumed_nothing(driver)
+
+    def test_a_gated_editor_also_discards_type_ahead(self):
+        """The gate-scoped prompts that DO name a gate — the review gate's
+        question and feedback editors — discard type-ahead at the editor itself
+        rather than relying on the next gate. Covered separately because the
+        per-turn editor above is deliberately unprotected in production."""
+        driver = _PtyGateDriver(self, _GATED_EDITOR_BODY)
+        driver.event("ready", step="startup")
+        driver.queue(_INCIDENT_PAYLOAD)
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        driver.event("activated", step="editor activated")
+        driver.wait_for_output("ignored")
+        driver.no_event(window=1.0)
+        # A FRESH Ctrl-D is the only input allowed to have an effect here.
+        driver.send("\x04")
+        answer = driver.event("answer-returned", step="editor release")
+        self.assertIsNone(answer["answer"])
+        self.assertEqual(answer["release"], "eof")
+        self.assertNotIn(_LEAK_MARKER, driver.output)
+
+    # -- negative control -------------------------------------------------- #
+    #
+    # The protected control sequence is NOT executable here: no notice is ever
+    # emitted and no Ctrl-D is needed, because the payload's own LF submits.
+
+    def _assert_stale_input_drove_the_gate(self, driver):
+        """The positive reproduction: with the boundary neutralised the leftover
+        Return SELECTS a choice at the later gate, which opens the nested
+        feedback editor — all with no fresh input whatsoever. A negative control
+        that raises, hangs, or produces nothing fails here as a broken harness
+        rather than passing as a reproduction."""
+        selected = driver.event("gate-prompt", step="stale selection")
+        self.assertEqual(selected["header"], "Request changes — your feedback")
+        driver.send("driven by stale input\r")
+        outcome = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(outcome["outcome"], "feedback")
+
+    def test_variant_a_reproduces_without_the_boundary(self):
+        driver = _PtyGateDriver(self, _INCIDENT_BODY,
+                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
+        driver.event("ready", step="startup")
+        driver.queue(_INCIDENT_PAYLOAD)
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        # The stale payload drives the editor with no fresh input at all.
+        answer = driver.event("answer-returned", step="editor release")
+        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
+        self.assertEqual(answer["release"], "text")
+        driver.event("intervening-turn", step="intervening turn")
+        driver.event("gate-open", step="review gate")
+        self._assert_stale_input_drove_the_gate(driver)
+
+    def test_variant_b_reproduces_without_the_boundary(self):
+        driver = _PtyGateDriver(self, _INCIDENT_BODY,
+                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
+        driver.event("ready", step="startup")
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        driver.send(_INCIDENT_PAYLOAD)
+        answer = driver.event("answer-returned", step="editor release")
+        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
+        driver.event("intervening-turn", step="intervening turn")
+        driver.event("gate-open", step="review gate")
+        self._assert_stale_input_drove_the_gate(driver)
+
+    def test_variant_c_reproduces_without_the_boundary(self):
+        driver = _PtyGateDriver(self, _INCIDENT_BODY,
+                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
+        driver.event("ready", step="startup")
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        driver.send("\x1b[200~" + _PASTE_BODY + "\x1b[201~" + "\r" + "\r")
+        answer = driver.event("answer-returned", step="editor release")
+        self.assertEqual(answer["answer"], _PASTE_BODY)
+        driver.event("intervening-turn", step="intervening turn")
+        driver.event("gate-open", step="review gate")
+        self._assert_stale_input_drove_the_gate(driver)
+
+    def test_approval_reproduces_without_the_boundary(self):
+        """The positive half: with the boundary neutralised, stale bytes drive
+        the gate all the way to APPROVAL with no fresh input at all.
+
+        The leftover carries the arrow key that lands on approve. That is
+        needed because the menu reorder (D4) and the default=False confirm (D3)
+        are a SECOND, independent line of defense that the negative control
+        deliberately does NOT disable — so a bare Return, which is what the
+        recorded incident replayed into an approve-first menu, no longer
+        reaches approve on its own. Neutralising the boundary alone is enough
+        to let stale input select an approval; that is what this asserts."""
+        driver = _PtyGateDriver(self, _INCIDENT_BODY,
+                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
+        driver.event("ready", step="startup")
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        # Segment one + submit, then the leftover: down-arrow onto 'approve'
+        # and a Return. All of it is one unframed burst into the live editor.
+        driver.send(_INCIDENT_SEGMENT_1 + "\r" + "\x1b[B" + "\r")
+        driver.event("answer-returned", step="editor release")
+        driver.event("intervening-turn", step="intervening turn")
+        driver.event("gate-open", step="review gate")
+        outcome = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(outcome["outcome"], "_END")
+
+    def test_the_same_payload_approves_nothing_when_protected(self):
+        """The mirror of the case above with the boundary in place."""
+        driver = _PtyGateDriver(self, _INCIDENT_BODY)
+        driver.event("ready", step="startup")
+        driver.go()
+        driver.event("editor-open", step="editor open")
+        driver.send(_INCIDENT_SEGMENT_1 + "\r" + "\x1b[B" + "\r")
+        driver.event("answer-returned", step="editor release")
+        self._assert_gate_consumed_nothing(driver)
+
+
+# PRODUCTION FIDELITY. cowork._read_turn opens the per-turn answer editor with
+# NO gate (cowork.py:3503), so the editor is deliberately unprotected here too.
+# That is what makes this a replay of the real incident rather than of a
+# configuration cowork does not ship: the editor CONSUMES the payload, leaves
+# its tail in prompt_toolkit's cross-application typeahead bucket exactly as the
+# recorded incident did, and the only thing standing between that tail and the
+# later review gate is begin_gate's typeahead clear at the gate itself.
+_INCIDENT_BODY = '''
+def main():
+    setup_mode()
+    emit("ready")
+    wait_go()
+    emit("editor-open")
+    answer = ui.prompt_user(sys.stdin, sys.stdout, header="your answer")
+    answer_event(answer)
+    # The intervening role / reviewer / evaluation turns. Only these are
+    # simulated: this repo has no controller-command override, which is why the
+    # driver calls the gate functions directly (user decision D1).
+    emit("intervening-turn")
+    emit("gate-open")
+    outcome = review_gate()
+    emit("gate-outcome", outcome=name_of(outcome))
+''' + _DRIVER_EPILOGUE
+
+# The gate-scoped editor: what the review gate's own question/feedback prompts
+# do. Unlike the per-turn editor above, these DO name a gate, so the boundary
+# runs at the editor itself.
+_GATED_EDITOR_BODY = '''
+def main():
+    # Only the activation rendezvous — no gate-prompt watcher, which exists for
+    # the review-menu oracle and would fire on this editor's own header.
+    announce_activation()
+    emit("ready")
+    wait_go()
+    emit("editor-open")
+    answer = ui.prompt_user(sys.stdin, sys.stdout,
+                            header="Request changes — your feedback",
+                            gate="review_feedback")
+    answer_event(answer)
+''' + _DRIVER_EPILOGUE
+
+_PASTE_BODY = ("first paragraph of the pasted answer\n"
+               "\n"
+               "second paragraph, still one paste\n"
+               "third line of the second paragraph")
+
+
+@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
+class GateActivationBoundaryPtyTest(unittest.TestCase):
+    """Criterion 2: a gate becomes active only after it is fully rendered."""
+
+    def test_bytes_queued_before_the_gate_draws(self):
+        driver = _PtyGateDriver(self, _GATE_ONLY_BODY)
+        driver.event("ready", step="startup")
+        driver.queue("\r\r\r")
+        driver.go()
+        driver.event("gate-open", step="review gate")
+        driver.wait_for_output("ignored")
+        driver.wait_for_output("what now?")
+        driver.no_event(window=1.5)
+        driver.send("\x03")
+        outcome = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(outcome["outcome"], "_STOP")
+
+    def test_bytes_injected_while_the_gate_is_drawing(self):
+        driver = _PtyGateDriver(self, _GATE_DURING_RENDER_BODY)
+        driver.event("ready", step="startup")
+        driver.go()
+        # A deterministic rendezvous, not a sleep: the driver's own render hook
+        # signals, the parent queues, and only then does the drain run.
+        driver.event("rendering", step="first render")
+        driver.queue("\r\r")
+        driver.go()
+        driver.wait_for_output("ignored")
+        driver.wait_for_output("what now?")
+        driver.no_event(window=1.5)
+        driver.send("\x03")
+        outcome = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(outcome["outcome"], "_STOP")
+
+
+_GATE_ONLY_BODY = '''
+def main():
+    emit("ready")
+    wait_go()
+    emit("gate-open")
+    outcome = review_gate()
+    emit("gate-outcome", outcome=name_of(outcome))
+''' + _DRIVER_EPILOGUE
+
+# The during-render rendezvous lives HERE, in test-owned code, not in
+# production: it wraps the real arm_activation and pauses between installing the
+# handler and letting the drain run.
+_GATE_DURING_RENDER_BODY = '''
+_real_arm = ui.arm_activation
+# Fires for the FIRST render of the FIRST attempt only: the gate that follows
+# the STALE re-open must proceed normally, with nothing left to rendezvous on.
+_rendezvous = {"done": False}
+
+
+def arm_with_rendezvous(app, activation, fd):
+    if getattr(app, "after_render", None) is None:
+        return _real_arm(app, activation, fd)
+
+    def announce(_sender=None):
+        if _rendezvous["done"]:
+            return
+        _rendezvous["done"] = True
+        emit("rendering")
+        wait_go()
+
+    app.after_render += announce
+    return _real_arm(app, activation, fd)
+
+
+def main():
+    emit("ready")
+    wait_go()
+    ui.arm_activation = arm_with_rendezvous
+    outcome = review_gate()
+    emit("gate-outcome", outcome=name_of(outcome))
+''' + _DRIVER_EPILOGUE
+
+
+@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
+class GateDiscardLeakPtyTest(unittest.TestCase):
+    """Criterion 3: discarded input is never retained or exposed."""
+
+    def _probes(self, payload):
+        probes = [payload, _LEAK_MARKER]
+        probes += [_LEAK_MARKER[i:i + 6]
+                   for i in range(0, len(_LEAK_MARKER) - 6, 4)]
+        probes.append(hashlib.sha256(payload.encode()).hexdigest())
+        return probes
+
+    def test_nothing_leaks_to_the_terminal_or_the_trace(self):
+        driver = _PtyGateDriver(self, _LEAK_BODY)
+        driver.event("ready", step="startup")
+        driver.queue(_INCIDENT_PAYLOAD)
+        driver.go()
+        driver.event("gate-open", step="review gate")
+        driver.event("activated", step="gate activated")
+        driver.wait_for_output("ignored")
+        driver.send("\x03")
+        record = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(record["outcome"], "_STOP")
+        blob = driver.output + json.dumps(record["events"])
+        for probe in self._probes(_INCIDENT_PAYLOAD):
+            self.assertNotIn(probe, blob, "leaked %r" % probe)
+
+    def test_discard_event_field_set(self):
+        driver = _PtyGateDriver(self, _LEAK_BODY)
+        driver.event("ready", step="startup")
+        driver.queue(_INCIDENT_PAYLOAD)
+        driver.go()
+        driver.event("gate-open", step="review gate")
+        driver.event("activated", step="gate activated")
+        driver.wait_for_output("ignored")
+        driver.send("\x03")
+        record = driver.event("gate-outcome", step="gate outcome")
+        discards = [e for e in record["events"]
+                    if e["event"] == "input.discarded"]
+        self.assertEqual(len(discards), 1, record["events"])
+        fields = {k: v for k, v in discards[0].items()
+                  if k not in ("ts", "event", "event_id", "run_id",
+                             "session_uuid")}
+        self.assertEqual(set(fields),
+                         {"role", "gate", "epoch", "phase", "chars"})
+        self.assertEqual(fields["chars"], len(_INCIDENT_PAYLOAD))
+
+    def test_discard_event_omits_chars_when_fionread_fails(self):
+        driver = _PtyGateDriver(self, _LEAK_BODY,
+                                env={"COWORK_TEST_NO_FIONREAD": "1"})
+        driver.event("ready", step="startup")
+        driver.queue(_INCIDENT_PAYLOAD)
+        driver.go()
+        driver.event("gate-open", step="review gate")
+        driver.event("activated", step="gate activated")
+        driver.wait_for_output("ignored")
+        driver.send("\x03")
+        record = driver.event("gate-outcome", step="gate outcome")
+        discards = [e for e in record["events"]
+                    if e["event"] == "input.discarded"]
+        self.assertEqual(len(discards), 1, record["events"])
+        fields = {k: v for k, v in discards[0].items()
+                  if k not in ("ts", "event", "event_id", "run_id",
+                             "session_uuid")}
+        self.assertEqual(set(fields), {"role", "gate", "epoch", "phase"})
+
+
+_TRACE_SETUP = '''
+import cowork_trace as trace_store
+
+_TRACE_PATH = os.path.join(os.environ["COWORK_SESSIONS_ROOT"], "trace.jsonl")
+_trace = trace_store.Trace(_TRACE_PATH, session_uuid="pty", run_id="pty")
+_on_discard, _on_drain_fail = cowork._gate_trace_callbacks(_trace, "builder")
+
+
+def traced_review_gate(allow_ask=False, role="builder"):
+    preview = cowork.make_gate_preview(role, False, True)
+    return cowork._read_review(sys.stdin, sys.stdout, allow_ask=allow_ask,
+                               preview=preview, on_discard=_on_discard,
+                               on_drain_fail=_on_drain_fail)
+
+
+def trace_records():
+    if not os.path.exists(_TRACE_PATH):
+        return []
+    with open(_TRACE_PATH) as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+'''
+
+_LEAK_BODY = _TRACE_SETUP + '''
+
+def _no_fionread(*args, **kwargs):
+    raise OSError("FIONREAD unavailable")
+
+
+def main():
+    if os.environ.get("COWORK_TEST_NO_FIONREAD"):
+        ui.fcntl.ioctl = _no_fionread
+    setup_mode()
+    emit("ready")
+    wait_go()
+    emit("gate-open")
+    outcome = traced_review_gate()
+    emit("gate-outcome", outcome=name_of(outcome), events=trace_records())
+''' + _DRIVER_EPILOGUE
+
+
+@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
+class GateFramedPastePtyTest(unittest.TestCase):
+    """Criterion 4: the boundary must not over-discard genuine in-box input."""
+
+    def test_framed_paste_into_an_activated_editor_is_recorded_whole(self):
+        driver = _PtyGateDriver(self, _FRAMED_PASTE_BODY)
+        driver.event("ready", step="startup")
+        driver.event("editor-open", step="first editor")
+        driver.event("activated", step="first editor activated")
+        driver.send("\x1b[200~" + _PASTE_BODY + "\x1b[201~" + "\r")
+        first = driver.event("answer-returned", step="first answer")
+        self.assertEqual(first["answer"], _PASTE_BODY)
+        # …and nothing is left over for the NEXT prompt.
+        driver.event("editor-open", step="second editor")
+        driver.event("activated", step="second editor activated")
+        self.assertNotIn("ignored", driver.output)
+        driver.send("second\r")
+        second = driver.event("answer-returned", step="second answer")
+        self.assertEqual(second["answer"], "second")
+
+
+# A GATED editor on purpose: over-discarding is only possible where the boundary
+# actually runs, so this uses a real gate name from the review gate's own
+# prompts rather than the unprotected per-turn editor.
+_FRAMED_PASTE_BODY = '''
+def main():
+    setup_mode()
+    emit("ready")
+    for _ in range(2):
+        emit("editor-open")
+        answer = ui.prompt_user(sys.stdin, sys.stdout, header="your answer",
+                                gate="review_feedback")
+        answer_event(answer)
+''' + _DRIVER_EPILOGUE
+
+
+@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
+class GateDrainFailurePtyTest(unittest.TestCase):
+    """Fail-closed at a REAL protected gate, with a Return already queued."""
+
+    def test_pre_open_failure_refuses_to_run_the_gate(self):
+        driver = _PtyGateDriver(self, _DRAIN_FAIL_BODY,
+                                env={"COWORK_TEST_FAIL_TCFLUSH": "pre"})
+        driver.event("ready", step="startup")
+        driver.queue("\r")
+        driver.go()
+        driver.event("gate-open", step="review gate")
+        record = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(record["outcome"], "_STOP")
+        self.assertIn("could not clear", driver.output)
+        failures = [e for e in record["events"]
+                    if e["event"] == "input.drain_failed"]
+        self.assertEqual(len(failures), 1, record["events"])
+        self.assertIs(failures[0]["typeahead_cleared"], True)
+        self.assertEqual(failures[0]["phase"], "pre_render")
+        self.assertEqual(
+            [e for e in record["events"] if e["event"] == "input.discarded"],
+            [])
+        # No selection was ever made from the queued Return.
+        self.assertNotIn("user.action", json.dumps(record["events"]))
+
+    def test_post_render_failure_refuses_to_run_the_gate(self):
+        driver = _PtyGateDriver(self, _DRAIN_FAIL_BODY,
+                                env={"COWORK_TEST_FAIL_TCFLUSH": "post"})
+        driver.event("ready", step="startup")
+        driver.go()
+        driver.event("gate-open", step="review gate")
+        record = driver.event("gate-outcome", step="gate outcome")
+        self.assertEqual(record["outcome"], "_STOP")
+        # The post-render case is the one that would otherwise end the phase
+        # silently, so the banner must be visible.
+        self.assertIn("could not clear", driver.output)
+        failures = [e for e in record["events"]
+                    if e["event"] == "input.drain_failed"]
+        self.assertEqual(len(failures), 1, record["events"])
+        self.assertIs(failures[0]["typeahead_cleared"], False)
+        self.assertEqual(failures[0]["phase"], "post_render")
+        self.assertEqual(
+            [e for e in record["events"] if e["event"] == "input.discarded"],
+            [])
+
+
+_DRAIN_FAIL_BODY = _TRACE_SETUP + '''
+import errno as _errno
+
+_real_tcflush = ui.termios.tcflush
+_state = {"opened": False}
+
+
+def failing_tcflush(fd, queue):
+    mode = os.environ.get("COWORK_TEST_FAIL_TCFLUSH")
+    if mode == "pre":
+        raise OSError(_errno.ENOTTY, "forced")
+    if mode == "post" and _state["opened"]:
+        raise OSError(_errno.ENOTTY, "forced")
+    return _real_tcflush(fd, queue)
+
+
+_real_arm = ui.arm_activation
+
+
+def arm_marking_open(app, activation, fd):
+    _state["opened"] = True
+    return _real_arm(app, activation, fd)
+
+
+def main():
+    ui.termios.tcflush = failing_tcflush
+    ui.arm_activation = arm_marking_open
+    emit("ready")
+    wait_go()
+    emit("gate-open")
+    outcome = traced_review_gate()
+    emit("gate-outcome", outcome=name_of(outcome), events=trace_records())
+''' + _DRIVER_EPILOGUE
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# The five frozen measurement criteria.                                       #
+#                                                                             #
+# Each criterion is decided by ONE named procedure over ONE fixture set — a    #
+# test class here plus a report run listed in the plan's verification block —  #
+# never by anyone's summary of what the code does.                            #
+# --------------------------------------------------------------------------- #
+
+_FIXTURES = os.path.join(_HERE, "fixtures", "measurement")
+
+
+class _MeasurementFixtureMixin:
+    """Points the session root at the fixture folder, so a report over a
+    fixture takes exactly the code path a real session takes (P10) — no
+    test-only flag, and therefore no code path the real run never exercises."""
+
+    def _fixture_root(self):
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = _FIXTURES
+        self.addCleanup(self._restore_root, prior)
+        return _FIXTURES
+
+    def _restore_root(self, prior):
+        if prior is None:
+            os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        else:
+            os.environ["COWORK_SESSIONS_ROOT"] = prior
+
+    def _drop_record(self, name):
+        path = os.path.join(_FIXTURES, name, "measurement.json")
+        if os.path.exists(path):
+            os.remove(path)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+
+    def _build(self, name):
+        self._fixture_root()
+        self._drop_record(name)
+        return cowork_measure.build_record(name)
+
+    def _report(self, name, argv=None):
+        self._fixture_root()
+        out = io.StringIO()
+        args = cowork.build_parser().parse_args(
+            ["--report", name] + list(argv or []))
+        rc = cowork.run_report(args, io_out=out)
+        return rc, out.getvalue()
+
+
+class MeasurementWorkRecordTests(_MeasurementFixtureMixin, unittest.TestCase):
+    """C1 — every unit of controller cost is attributable to exactly one
+    immutable, classified unit of work, and a resumed Codex turn reports what
+    THAT turn cost rather than the whole thread's running total."""
+
+    FIXTURE = "c1-turn-lifecycle"
+
+    def test_work_meta_shape_and_ansi_stripping(self):
+        meta = trace_store.work_meta("W1", "productive",
+                                     usage_scope="turn_native",
+                                     duration_ms=1200)
+        self.assertEqual(meta["work_id"], "W1")
+        self.assertEqual(meta["work_class"], "productive")
+        self.assertEqual(meta["duration_ms"], 1200)
+        # CV-002: a model name read off a styled line carries an ANSI fragment.
+        # It must never reach the record.
+        ident = trace_store.identity_meta(
+            controller="claude", model="\x1b[1mclaude-opus-5\x1b[0m",
+            model_source="live_event", controller_session_id="S1")
+        self.assertEqual(ident["model"], "claude-opus-5")
+        self.assertNotIn("[1m", ident["model"])
+        self.assertEqual(ident["model_source"], "live_event")
+        # An unknown source is named, never silently promoted to live_event.
+        self.assertEqual(
+            trace_store.identity_meta(model="x", model_source="nonsense"
+                                      )["model_source"], "unknown")
+
+    def test_every_trace_event_carries_an_event_id(self):
+        # P16: `triggering_event_id` needs a referent, and it is minted here so
+        # every emission site gains identity at once.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            trace = trace_store.Trace(path, session_uuid="S")
+            first = trace.event("a.b")
+            second = trace.event("c.d")
+            self.assertTrue(first and second and first != second)
+            with open(path) as fh:
+                events = [json.loads(line) for line in fh if line.strip()]
+            self.assertEqual([e["event_id"] for e in events], [first, second])
+
+    def test_codex_cumulative_becomes_this_turns_own_cost(self):
+        session = bridge.CodexSession.__new__(bridge.CodexSession)
+        session._cumulative_usage = None
+        session._baseline_state = "fresh"
+        # First reading on the thread: the running total IS this turn's cost.
+        usage, scope = session._turn_usage(
+            {"input_tokens": 1000, "output_tokens": 100})
+        self.assertEqual(scope, "turn_delta")
+        self.assertEqual(usage["input_tokens"], 1000)
+        # Second turn: the counter has grown to 2500, but THIS turn cost 1500.
+        # Reporting 2500 would re-charge the first turn to the second.
+        usage, scope = session._turn_usage(
+            {"input_tokens": 2500, "output_tokens": 260})
+        self.assertEqual(scope, "turn_delta")
+        self.assertEqual(usage["input_tokens"], 1500)
+        self.assertEqual(usage["output_tokens"], 160)
+
+    def test_a_backwards_counter_is_incomparable_not_clamped(self):
+        session = bridge.CodexSession.__new__(bridge.CodexSession)
+        session._cumulative_usage = None
+        session._baseline_state = "fresh"
+        session._turn_usage({"input_tokens": 5000})
+        usage, scope = session._turn_usage({"input_tokens": 100})
+        # No honest per-turn figure exists. Clamping to 0 would report the turn
+        # as free; inventing one would be worse.
+        self.assertEqual(scope, "incomparable")
+        self.assertIsNone(usage)
+
+    def test_claude_usage_native_is_preserved_verbatim(self):
+        record = self._build(self.FIXTURE)
+        done = record["work"]["W-done"]
+        self.assertEqual(done["usage_scope"], "turn_native")
+        self.assertEqual(done["usage"], done["usage_native"])
+
+    def test_all_terminal_states_are_distinct_classes(self):
+        record = self._build(self.FIXTURE)
+        classes = {wid: w["work_class"] for wid, w in record["work"].items()}
+        self.assertEqual(classes["W-probe"], "probe")
+        self.assertEqual(classes["W-done"], "productive")
+        self.assertEqual(classes["W-inflight"], "in_flight")
+        self.assertEqual(classes["W-failed"], "failed")
+        # Cancellation is NOT a flavour of failure.
+        self.assertEqual(classes["W-cancelled"], "cancelled")
+        self.assertEqual(classes["W-eval"], "evaluation")
+
+    def test_an_in_flight_turn_reports_unknown_duration_never_zero(self):
+        record = self._build(self.FIXTURE)
+        self.assertEqual(record["work"]["W-inflight"]["duration_ms"],
+                         cowork_measure.UNKNOWN)
+        # And it is not silently left in the class it was launched with.
+        self.assertEqual(record["work"]["W-inflight"]["intended_class"],
+                         "productive")
+
+    def test_a_cancelled_turn_keeps_its_duration(self):
+        record = self._build(self.FIXTURE)
+        self.assertEqual(record["work"]["W-cancelled"]["duration_ms"], 7000)
+
+    def test_the_codex_figure_is_the_turns_own_cost(self):
+        record = self._build(self.FIXTURE)
+        evaluation_class = record["cost"]["by_class"]["evaluation"]
+        # 1200 is this turn's own input; 5000 is the thread's running total.
+        # The whole cumulative-Codex defect is the difference between them.
+        self.assertEqual(evaluation_class["usage"]["input_tokens"], 1200)
+        self.assertNotEqual(evaluation_class["usage"]["input_tokens"], 5000)
+        self.assertEqual(record["work"]["W-eval"]["usage_native"]
+                         ["input_tokens"], 5000)
+
+    def test_cost_classes_are_exclusive_and_reconcile(self):
+        record = self._build(self.FIXTURE)
+        cost = record["cost"]
+        self.assertTrue(cost["reconciled"], cost["unreconciled"])
+        self.assertEqual(cost["unreconciled"], {})
+        # Exclusive: the per-class turn counts sum to the classified turns, so
+        # no turn is counted in two classes.
+        counted = sum(b["turns"] for b in cost["by_class"].values())
+        self.assertEqual(counted + cost["unclassified"]["turns"]
+                         + cost["incomparable"]["turns"],
+                         len(record["work"]))
+
+    def test_user_wait_comes_only_from_its_own_spans(self):
+        record = self._build(self.FIXTURE)
+        self.assertEqual(record["duration"]["by_class"]["user_wait_ms"], 12000)
+        self.assertEqual(len(record["duration"]["user_wait_spans"]), 1)
+
+    def test_a_resumed_session_does_not_report_the_whole_thread(self):
+        # THE defect finding 1 named. A resumed session's first cumulative
+        # reading includes turns this process never ran, so returning it whole
+        # is exactly the cumulative-Codex bug wearing a delta's label.
+        session = bridge.CodexSession.__new__(bridge.CodexSession)
+        session._cumulative_usage = None
+        session._baseline_state = "unseeded"
+        usage, scope = session._turn_usage({"input_tokens": 5000})
+        self.assertEqual(scope, "incomparable")
+        self.assertIsNone(usage)
+        # ...and the NEXT turn, which now has a baseline, is a real delta.
+        usage, scope = session._turn_usage({"input_tokens": 6200})
+        self.assertEqual(scope, "turn_delta")
+        self.assertEqual(usage["input_tokens"], 1200)
+
+    def test_a_seeded_resumed_baseline_yields_the_turns_own_share(self):
+        session = bridge.CodexSession.__new__(bridge.CodexSession)
+        session._cumulative_usage = {"input_tokens": 3800}   # seeded at resume
+        session._baseline_state = "seeded"
+        usage, scope = session._turn_usage({"input_tokens": 5000})
+        self.assertEqual(scope, "turn_delta")
+        self.assertEqual(usage["input_tokens"], 1200)
+
+    def test_a_rejected_turn_is_not_reported_as_an_orphan(self):
+        work, orphans = cowork_measure.build_work([
+            {"event": "controller.turn.rejected", "work_id": "W-rej",
+             "work_class": "failed", "duration_ms": 0, "role": "builder",
+             "controller": "codex", "ts": "2026-07-28T10:00:00Z"}])
+        # It never began, by design. Calling that an orphan reports a
+        # deliberate terminal state as a defect in the record.
+        self.assertEqual(work["W-rej"]["work_state"], "rejected")
+        self.assertEqual(orphans, [])
+
+    def test_an_unpaired_wait_end_contributes_no_time(self):
+        total, spans, unresolved = cowork_measure.user_wait_from_spans([
+            {"event": "user.wait.end", "work_id": "WAIT-x",
+             "duration_ms": 999999, "outcome": "answered"}])
+        # Its start is not in this trace, so the span is unverifiable and must
+        # not enter the one figure that comes only from paired spans.
+        self.assertEqual(total, 0)
+        self.assertEqual(spans, [])
+        self.assertIn("WAIT-x", unresolved)
+
+    def test_reconciliation_names_its_basis_and_checks_independently(self):
+        record = self._build(self.FIXTURE)
+        cost = record["cost"]
+        # The classified-vs-turn check proves classification lost nothing; it
+        # is NOT a provider comparison, and the record says so rather than
+        # letting the report claim more than it verified.
+        self.assertIn("classification", cost["basis"])
+        check = cost["independent_check"]
+        self.assertEqual(check["state"], "ok")
+        self.assertTrue(check["comparable"])
+        self.assertEqual(check["mismatches"], {})
+        # Codex's cumulative turns are excluded rather than summed.
+        self.assertGreaterEqual(check["not_comparable_turns"], 1)
+
+    def test_a_divergent_provider_counter_is_reported_not_absorbed(self):
+        work = {"W1": {"work_class": "productive", "usage_scope": "turn_native",
+                       "usage": {"input_tokens": 100},
+                       "usage_native": {"input_tokens": 140}}}
+        check = cowork_measure._native_cross_check(work)
+        self.assertEqual(check["state"], "diverged")
+        self.assertEqual(check["mismatches"]["input_tokens"], 40)
+
+    def test_fixture_report_runs_clean(self):
+        rc, text = self._report(self.FIXTURE)
+        self.assertEqual(rc, 0)
+        self.assertIn("cancelled", text)
+        self.assertIn("in_flight", text)
+
+
+class MeasurementEvidenceLedgerTests(_MeasurementFixtureMixin,
+                                     unittest.TestCase):
+    """C2 — no value claim is bound to evidence it did not see, and every
+    durable claim is checkable against an orchestrator-owned ledger."""
+
+    FIXTURE = "c2-finding-lifecycle"
+
+    def test_sealing_happens_after_the_artifact_is_written(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "verdict.json")
+            # CV-008's root cause: hashing at block-build time, BEFORE the
+            # reviewer had written the file.
+            envelope = handoff.seal_envelope([{"path": path}])
+            self.assertFalse(envelope.artifacts[0]["present"])
+            # A missing artifact gets NO digest. The empty-file digest would
+            # claim "there was content, and it was empty" — a different and
+            # false statement, and exactly the substitution that made a missing
+            # file look like evidence.
+            self.assertIsNone(envelope.artifacts[0]["sha256"])
+            self.assertNotEqual(
+                envelope.artifacts[0]["sha256"],
+                hashlib.sha256(b"").hexdigest())
+            with open(path, "w") as fh:
+                json.dump({"verdict": "approve"}, fh)
+            sealed = handoff.seal_envelope([{"path": path}])
+            self.assertTrue(sealed.artifacts[0]["present"])
+            self.assertTrue(sealed.artifacts[0]["sha256"])
+            self.assertTrue(sealed.complete)
+
+    def test_a_failed_validation_is_sealed_as_invalid_not_as_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "verdict.json")
+            with open(path, "w") as fh:
+                fh.write("{ not json")
+            envelope = handoff.seal_envelope(
+                [{"path": path}], validate=cowork._validated_verdict_file)
+            self.assertTrue(envelope.artifacts[0]["present"])
+            self.assertFalse(envelope.artifacts[0]["validated"])
+            self.assertIsNone(envelope.artifacts[0]["sha256"])
+            self.assertFalse(envelope.complete)
+
+    def test_a_changed_artifact_verifies_as_changed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "verdict.json")
+            with open(path, "w") as fh:
+                json.dump({"verdict": "approve"}, fh)
+            envelope = handoff.seal_envelope([{"path": path}])
+            self.assertEqual(handoff.verify_envelope(envelope)["state"], "ok")
+            with open(path, "w") as fh:
+                json.dump({"verdict": "revise"}, fh)   # replaced mid-flight
+            result = handoff.verify_envelope(envelope)
+            self.assertEqual(result["state"], "changed")
+            self.assertEqual(result["changed"], [path])
+
+    def test_ledger_mints_ids_and_supersedes_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.jsonl")
+            first = cowork_ledger.append_finding(path, summary="a",
+                                                 severity="blocking")
+            second = cowork_ledger.append_finding(path, summary="b",
+                                                  severity="minor")
+            self.assertEqual([first["id"], second["id"]], ["F-0001", "F-0002"])
+            third = cowork_ledger.append_finding(path, summary="a revised",
+                                                 supersedes="F-0001")
+            records = cowork_ledger.read_ledger(path)
+            # Append-only: the superseded record is still on disk, byte for
+            # byte, with a marker after it.
+            self.assertEqual(records[0]["summary"], "a")
+            self.assertEqual(cowork_ledger.current_state(records, "F-0001"),
+                             "superseded")
+            self.assertEqual(third["supersedes"], "F-0001")
+
+    def test_a_withdrawn_finding_survives_as_withdrawn(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.jsonl")
+            cowork_ledger.append_finding(path, summary="wrong constant")
+            cowork_ledger.withdraw(path, "F-0001", reason="it was correct")
+            collapsed = cowork_ledger.collapse(
+                cowork_ledger.read_ledger(path))
+            # Retracting a false finding is good work; erasing it would make it
+            # indistinguishable from never having looked.
+            self.assertIn("F-0001", collapsed)
+            self.assertEqual(collapsed["F-0001"]["state"], "withdrawn")
+            self.assertEqual(collapsed["F-0001"]["summary"], "wrong constant")
+
+    def test_an_approving_round_counts_zero_corrective_findings(self):
+        # CV-030: the raw length of `findings` counted an approval's prose.
+        approval = {"verdict": "approve",
+                    "summary": "clean build",
+                    "findings": ["nice work", "well tested", "good docs"]}
+        self.assertEqual(cowork._corrective_finding_count(approval), 0)
+        revise = {"verdict": "revise", "corrective_findings": [
+            {"summary": "missing guard", "severity": "blocking"},
+            {"summary": "typo", "severity": "minor"}]}
+        self.assertEqual(cowork._corrective_finding_count(revise), 2)
+        # A typed approval is zero even with a summary present.
+        self.assertEqual(cowork._corrective_finding_count(
+            {"verdict": "approve", "corrective_findings": [],
+             "summary": "all good"}), 0)
+
+    def test_invented_and_withdrawn_citations_are_caught(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.jsonl")
+            cowork_ledger.append_finding(path, summary="real")
+            cowork_ledger.append_finding(path, summary="retracted")
+            cowork_ledger.withdraw(path, "F-0002")
+            records = cowork_ledger.read_ledger(path)
+            result = cowork_ledger.validate_citations(
+                records, ["F-0001", "F-0002", "F-0099"])
+            self.assertEqual(result["valid"], ["F-0001"])
+            self.assertEqual(result["withdrawn"], ["F-0002"])
+            self.assertEqual(result["invented"], ["F-0099"])
+
+    def test_reconciliation_is_idempotent_and_mints_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.jsonl")
+            observation = {"controller_session_id": "S1",
+                           "tool_call_id": "call_1",
+                           "command_identity": "pytest <arg>",
+                           "exit_status": 0, "adjudication": "pass"}
+            first = cowork_ledger.reconcile_attempts(path, [observation])
+            self.assertEqual(first["minted"], ["V-0001"])
+            # Replaying the SAME log appends nothing: ten report runs cannot
+            # inflate the attempt count or renumber history.
+            with open(path) as fh:
+                before = fh.read()
+            second = cowork_ledger.reconcile_attempts(path, [observation])
+            self.assertEqual(second["minted"], [])
+            self.assertEqual(second["unchanged"], 1)
+            with open(path) as fh:
+                self.assertEqual(fh.read(), before)
+
+    def test_a_changed_attempt_supersedes_rather_than_rewrites(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.jsonl")
+            key = {"controller_session_id": "S1", "tool_call_id": "call_1"}
+            cowork_ledger.reconcile_attempts(
+                path, [dict(key, exit_status=1, adjudication="fail")])
+            cowork_ledger.reconcile_attempts(
+                path, [dict(key, exit_status=0, adjudication="pass")])
+            records = cowork_ledger.read_ledger(path)
+            collapsed = cowork_ledger.collapse(cowork_ledger.read_ledger(path))
+            # One controller natural key keeps one stable V id. Both readings
+            # remain append-only history, but only the latest is active.
+            self.assertEqual([r["id"] for r in records],
+                             ["V-0001", "V-0001"])
+            self.assertEqual(records[0]["adjudication"], "fail")
+            self.assertEqual(collapsed["V-0001"]["adjudication"], "pass")
+            active = cowork_ledger.active_attempts(records)
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0]["attempt_key"], "S1:call_1")
+
+    def test_an_unresolved_attempt_is_never_closed_by_a_later_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.jsonl")
+            key = {"controller_session_id": "S1", "tool_call_id": "call_1"}
+            cowork_ledger.reconcile_attempts(
+                path, [dict(key, adjudication="unresolved", timed_out=True)])
+            cowork_ledger.reconcile_attempts(
+                path, [dict(key, adjudication="pass", exit_status=0)])
+            collapsed = cowork_ledger.collapse(cowork_ledger.read_ledger(path))
+            # "Re-run until it passes" must not launder a hang into a pass.
+            self.assertEqual(collapsed["V-0001"]["adjudication"], "unresolved")
+            self.assertNotIn("V-0002", collapsed)
+
+    def test_an_incomplete_log_observation_resolves_when_result_arrives(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.jsonl")
+            key = {"controller_session_id": "S1", "tool_call_id": "call_1"}
+            cowork_ledger.reconcile_attempts(path, [
+                dict(key, adjudication="unresolved", interrupted=True,
+                     timed_out=False)
+            ])
+            cowork_ledger.reconcile_attempts(path, [
+                dict(key, adjudication="pass", interrupted=False,
+                     timed_out=False, exit_status=0)
+            ])
+            records = cowork_ledger.read_ledger(path)
+            self.assertEqual([r["id"] for r in records],
+                             ["V-0001", "V-0001"])
+            self.assertEqual(
+                cowork_ledger.active_attempts(records)[0]["adjudication"],
+                "pass")
+
+    def test_active_attempt_count_equals_unique_natural_key_count(self):
+        records = [
+            {"id": "V-0001", "kind": "attempt", "attempt_key": "S:c1",
+             "recorded_at": "2026-07-29T10:00:00Z",
+             "state": "superseded", "adjudication": "fail"},
+            {"id": "V-0002", "kind": "attempt", "attempt_key": "S:c1",
+             "recorded_at": "2026-07-29T10:01:00Z",
+             "state": "open", "adjudication": "pass"},
+            {"id": "V-0003", "kind": "attempt", "attempt_key": "S:c2",
+             "recorded_at": "2026-07-29T10:02:00Z",
+             "state": "open", "adjudication": "pass"},
+        ]
+        active = cowork_ledger.active_attempts(records)
+        self.assertEqual(len(active),
+                         len({r["attempt_key"] for r in records}))
+
+    def test_the_evaluator_prompt_shows_what_was_sealed(self):
+        # Finding 1: sealing the chain and then not delivering it protects
+        # evidence the evaluator never receives.
+        with tempfile.TemporaryDirectory() as d:
+            current = os.path.join(d, "verdict-r2.json")
+            prior = os.path.join(d, "verdict-r1.json")
+            for path in (current, prior):
+                with open(path, "w") as fh:
+                    json.dump({"verdict": "revise"}, fh)
+            envelope = handoff.seal_envelope([
+                {"path": current, "label": "reviewer verdict + findings"},
+                {"path": prior, "label": "prior round verdict",
+                 "prior_round": 1}])
+            artifacts = cowork._envelope_artifacts(
+                {"envelope": envelope.as_dict()})
+            paths = [a["path"] for a in artifacts]
+            self.assertIn(current, paths)
+            self.assertIn(prior, paths)
+            # The prior round rides the upstream slot, so the transport will
+            # actually carry it.
+            slots = {a["path"]: a["source"] for a in artifacts}
+            self.assertEqual(slots[prior], "upstream")
+            block = handoff.render_handoff("eval->reviewer_verdict",
+                                           artifacts=artifacts)
+            self.assertIn(current, block)
+            self.assertIn(prior, block)
+
+    def test_an_artifact_sealed_as_absent_is_never_shown(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "gone.json")
+            envelope = handoff.seal_envelope([{"path": missing}])
+            # Putting its path in front of an evaluator would invite reading
+            # whatever is there NOW, which is the binding the seal prevents.
+            self.assertEqual(
+                cowork._envelope_artifacts({"envelope": envelope.as_dict()}),
+                [])
+
+    def test_report_over_the_finding_lifecycle_fixture(self):
+        record = self._build(self.FIXTURE)
+        findings = record["findings"]
+        self.assertEqual(findings["withdrawn"], 1)
+        self.assertEqual(findings["confirmed"], 1)
+        cohorts = record["score_cohorts"]
+        unverifiable = sum(c["unverifiable"] for c in cohorts.values())
+        # Two bad evaluator claims: an invented round and a withdrawn finding
+        # counted as real.
+        self.assertEqual(unverifiable, 2)
+        # not_applicable is a real value, counted in its own bucket and kept
+        # out of every average.
+        na = sum(c["not_applicable"] for c in cohorts.values())
+        self.assertEqual(na, 1)
+        for cohort in cohorts.values():
+            if not cohort["count"]:
+                self.assertEqual(cohort["average"], cowork_measure.UNKNOWN)
+
+    def test_building_a_report_never_mutates_the_ledger(self):
+        self._fixture_root()
+        path = os.path.join(_FIXTURES, self.FIXTURE, "ledger.jsonl")
+        with open(path, "rb") as fh:
+            before = fh.read()
+        for _ in range(10):
+            self._drop_record(self.FIXTURE)
+            cowork_measure.build_record(self.FIXTURE)
+        # Ten report runs leave the ledger byte-identical: the record builder
+        # reads history and never writes it.
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+
+class MeasurementIngestionTests(_MeasurementFixtureMixin, unittest.TestCase):
+    """C3 — tool and verification work is known from the controllers' own logs
+    rather than from agent prose."""
+
+    FIXTURE = "c3-controller-log"
+
+    def _log(self, name):
+        return os.path.join(_FIXTURES, self.FIXTURE, "controller_logs",
+                            "claude", "-fixture-c3", name)
+
+    def test_read_only_is_asserted_not_assumed(self):
+        result = cowork_ingest.ingest_claude(self._log("S-c3.jsonl"))
+        self.assertEqual(result.state, "ok")
+        # The digest is taken before and after the read, so "read-only" is
+        # evidence in the record rather than a promise in a docstring.
+        self.assertTrue(result.read_only_verified)
+        self.assertEqual(result.digest_before, result.digest_after)
+
+    def test_the_four_failure_modes(self):
+        missing = cowork_ingest.ingest_claude(self._log("nope.jsonl"))
+        self.assertEqual(missing.state, "missing")
+        unrecognised = cowork_ingest.ingest_claude(
+            self._log("S-unrecognised.jsonl"))
+        self.assertEqual(unrecognised.state, "unrecognised")
+        truncated = cowork_ingest.ingest_claude(self._log("S-truncated.jsonl"))
+        self.assertEqual(truncated.state, "truncated")
+        # A truncated tail keeps what came before it and SAYS what was lost.
+        self.assertTrue(truncated.evidence_lost)
+        with tempfile.TemporaryDirectory() as d:
+            unreadable = cowork_ingest.ingest_claude(d)  # a directory
+            self.assertEqual(unreadable.state, "unreadable")
+        # None of the four raised, and none produced a figure.
+        for result in (missing, unrecognised, truncated):
+            self.assertEqual(result.turns, [] if not result.turns
+                             else result.turns)
+
+    def test_a_zero_test_run_that_exits_zero_fails(self):
+        # THE point of criterion 3: exit status alone certifies nothing.
+        self.assertEqual(
+            cowork_ingest.adjudicate(0, executed_count=0), "fail")
+        self.assertEqual(
+            cowork_ingest.adjudicate(0, executed_count=12), "pass")
+        # And a run short of what was expected fails too.
+        self.assertEqual(
+            cowork_ingest.adjudicate(0, executed_count=5, expected_count=859),
+            "fail")
+
+    def test_a_negative_assertion_passes_on_a_nonzero_exit(self):
+        self.assertEqual(
+            cowork_ingest.adjudicate(1, expected_polarity="pass_on_nonzero"),
+            "pass")
+        self.assertEqual(
+            cowork_ingest.adjudicate(0, expected_polarity="pass_on_nonzero"),
+            "fail")
+
+    def test_an_unreadable_exit_status_is_unknown_never_a_pass(self):
+        self.assertEqual(cowork_ingest.adjudicate(None), "unknown")
+        self.assertIsNone(cowork_ingest.parse_exit_status("no status here"))
+
+    def test_codex_function_call_exit_status_is_ingested(self):
+        # Current Codex rollouts use function_call/exec_command and report
+        # "Process exited with code N". The older custom_tool_call shape says
+        # "Script completed"; both must remain readable.
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "rollout-function-call.jsonl")
+            records = [
+                {
+                    "timestamp": "2026-07-29T19:15:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "T-function-call"},
+                },
+                {
+                    "timestamp": "2026-07-29T19:15:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call-function",
+                        "arguments": json.dumps({
+                            "cmd": "python -m unittest example.Tests"
+                        }),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-29T19:15:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-function",
+                        "output": (
+                            "Process exited with code 0\n"
+                            "Ran 3 tests in 0.01s\nOK\n"
+                            "The report retained one earlier timed out attempt\n"
+                        ),
+                    },
+                },
+            ]
+            with open(log, "w") as fh:
+                for record in records:
+                    fh.write(json.dumps(record) + "\n")
+            result = cowork_ingest.ingest_codex(log)
+        self.assertEqual(result.state, "ok")
+        self.assertEqual(len(result.verification_attempts), 1)
+        attempt = result.verification_attempts[0]
+        self.assertEqual(attempt["exit_status"], 0)
+        self.assertEqual(attempt["executed_count"], 3)
+        self.assertEqual(attempt["adjudication"], "pass")
+        self.assertFalse(attempt["timed_out"])
+
+    def test_codex_yielded_exec_is_joined_to_its_wait_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "rollout-yielded-exec.jsonl")
+            records = [
+                {
+                    "timestamp": "2026-07-29T19:24:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "T-yielded"},
+                },
+                {
+                    "timestamp": "2026-07-29T19:24:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call-exec",
+                        "input": (
+                            'tools.exec_command({"cmd":'
+                            '"python -m unittest example.AllTests"})'
+                        ),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-29T19:24:12Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-exec",
+                        "output": "Script running with cell ID 20\n",
+                    },
+                },
+                {
+                    "timestamp": "2026-07-29T19:24:13Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "wait",
+                        "call_id": "call-wait",
+                        "arguments": json.dumps({"cell_id": "20"}),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-29T19:24:39Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-wait",
+                        "output": [
+                            {"type": "input_text",
+                             "text": "Script completed\n"},
+                            {"type": "input_text",
+                             "text": "Ran 977 tests in 30.4s\nOK\n"},
+                        ],
+                    },
+                },
+            ]
+            with open(log, "w") as fh:
+                for record in records:
+                    fh.write(json.dumps(record) + "\n")
+            result = cowork_ingest.ingest_codex(log)
+        self.assertEqual(result.state, "ok")
+        self.assertEqual(len(result.verification_attempts), 1)
+        attempt = result.verification_attempts[0]
+        self.assertEqual(attempt["tool_call_id"], "call-exec")
+        self.assertEqual(attempt["exit_status"], 0)
+        self.assertEqual(attempt["executed_count"], 977)
+        self.assertEqual(attempt["adjudication"], "pass")
+
+    def test_codex_yielded_exec_at_eof_reconciles_when_wait_arrives(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "rollout-yielded-eof.jsonl")
+            ledger_path = os.path.join(d, "ledger.jsonl")
+            records = [
+                {
+                    "timestamp": "2026-07-29T20:05:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "T-yielded-eof"},
+                },
+                {
+                    "timestamp": "2026-07-29T20:05:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call-exec",
+                        "input": (
+                            'tools.exec_command({"cmd":'
+                            '"python -m unittest example.AllTests"})'
+                        ),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-29T20:05:12Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-exec",
+                        "output": "Script running with cell ID 42\n",
+                    },
+                },
+            ]
+
+            def write_log():
+                with open(log, "w") as fh:
+                    for record in records:
+                        fh.write(json.dumps(record) + "\n")
+
+            write_log()
+            pending = cowork_ingest.ingest_codex(log)
+            self.assertEqual(len(pending.verification_attempts), 1)
+            first = pending.verification_attempts[0]
+            self.assertEqual(first["tool_call_id"], "call-exec")
+            self.assertEqual(first["adjudication"], "unresolved")
+            self.assertFalse(first["timed_out"])
+            initial = cowork_ledger.reconcile_attempts(
+                ledger_path, pending.verification_attempts)
+            self.assertEqual(initial["minted"], ["V-0001"])
+
+            records.extend([
+                {
+                    "timestamp": "2026-07-29T20:05:13Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "wait",
+                        "call_id": "call-wait",
+                        "arguments": json.dumps({"cell_id": "42"}),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-29T20:05:39Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-wait",
+                        "output": (
+                            "Script completed\n"
+                            "Ran 8 tests in 0.1s\nOK\n"
+                        ),
+                    },
+                },
+            ])
+            write_log()
+            completed = cowork_ingest.ingest_codex(log)
+            self.assertEqual(len(completed.verification_attempts), 1)
+            final = completed.verification_attempts[0]
+            self.assertEqual(final["tool_call_id"], "call-exec")
+            self.assertEqual(final["adjudication"], "pass")
+            revised = cowork_ledger.reconcile_attempts(
+                ledger_path, completed.verification_attempts)
+            self.assertEqual(revised["minted"], [])
+            active = cowork_ledger.active_attempts(
+                cowork_ledger.read_ledger(ledger_path))
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0]["id"], "V-0001")
+            self.assertEqual(active[0]["attempt_key"],
+                             "T-yielded-eof:call-exec")
+            self.assertEqual(active[0]["adjudication"], "pass")
+
+    def test_a_timeout_is_terminal(self):
+        self.assertEqual(cowork_ingest.adjudicate(0, timed_out=True),
+                         "unresolved")
+        self.assertEqual(cowork_ingest.adjudicate(0, interrupted=True),
+                         "unresolved")
+
+    def test_commands_are_reduced_to_a_content_free_identity(self):
+        identity = cowork_ingest.sanitize_command(
+            "pytest -q tests/test_customer_secrets.py")
+        self.assertNotIn("customer", identity)
+        self.assertNotIn("secrets", identity)
+        self.assertTrue(identity.startswith("pytest -q"))
+
+    def test_a_quoted_operator_is_not_a_command_boundary(self):
+        # `rg 'write|patch|apply'` is ONE search, not four commands. Splitting
+        # on the alternation invented programs, one of which looked like a run.
+        identity = cowork_ingest.sanitize_command("rg 'write|patch|apply' src")
+        self.assertEqual(identity.count("&&"), 0)
+        self.assertFalse(cowork_ingest.has_pipeline("rg 'a|b' src"))
+        self.assertTrue(cowork_ingest.has_pipeline("pytest | tail"))
+
+    def test_a_test_run_hidden_behind_a_cd_is_still_a_test_run(self):
+        identity = cowork_ingest.sanitize_command(
+            "cd /repo && python -m unittest suite | tail -5")
+        intent, is_verify = cowork_ingest.classify_command(identity)
+        self.assertEqual(intent, "verify")
+        self.assertTrue(is_verify)
+
+    def test_ingestion_extracts_the_fixture_attempts(self):
+        result = cowork_ingest.ingest_claude(self._log("S-c3.jsonl"))
+        by_call = {a["tool_call_id"]: a for a in result.tool_activity}
+        self.assertEqual(by_call["t_zero"]["adjudication"], "fail")
+        self.assertEqual(by_call["t_red"]["adjudication"], "fail")
+        self.assertEqual(by_call["t_green"]["adjudication"], "pass")
+        self.assertEqual(by_call["t_timeout"]["adjudication"], "unresolved")
+        # A call with no result never completed and is recorded as unresolved
+        # rather than dropped — an interrupted command is exactly what a
+        # summary would quietly omit.
+        self.assertEqual(by_call["t_orphan"]["adjudication"], "unresolved")
+        self.assertTrue(by_call["t_orphan"]["interrupted"])
+        # The mutation is recorded, and nothing claims it was restored.
+        self.assertTrue(result.mutations)
+        self.assertIsNone(result.mutations[0]["restored"])
+
+    def test_every_attempt_carries_the_honest_unknown_fields(self):
+        result = cowork_ingest.ingest_claude(self._log("S-c3.jsonl"))
+        for attempt in result.tool_activity:
+            # P17: neither controller exposes this, so it is PRESENT and
+            # honestly `unknown` rather than invented.
+            self.assertEqual(attempt["tty_stdin_mode"], "unknown")
+
+    def test_extraction_is_content_free(self):
+        result = cowork_ingest.ingest_claude(self._log("S-c3.jsonl"))
+        serialized = json.dumps(result.as_dict())
+        # No body substring from the log survives into what is persisted.
+        for body in ("FAILED (failures=3)", "Ran 12 tests", "edited"):
+            self.assertNotIn(body, serialized)
+
+    def test_observations_are_id_free(self):
+        result = cowork_ingest.ingest_claude(self._log("S-c3.jsonl"))
+        for observation in cowork_ingest.observations_for({"builder": result}):
+            # Ingestion mints NOTHING; the ledger is the only minting point.
+            self.assertNotIn("id", observation)
+            self.assertTrue(cowork_ledger.attempt_key(observation))
+
+    def test_malformed_tool_input_never_raises(self):
+        # The ingester promises never to raise. A Bash tool_use whose input is
+        # null or not a dict used to hit an UnboundLocalError, because the
+        # fingerprint was assigned only inside the isinstance branch and read
+        # unconditionally.
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "S-bad.jsonl")
+            records = []
+            for index, bad_input in enumerate((None, "a string", 42, [])):
+                records.append({
+                    "type": "assistant", "sessionId": "S-bad",
+                    "timestamp": "2026-07-29T10:0%d:00Z" % index,
+                    "message": {"usage": {"input_tokens": 1},
+                                "content": [{"type": "tool_use",
+                                             "id": "bad%d" % index,
+                                             "name": "Bash",
+                                             "input": bad_input}]}})
+            with open(log, "w") as fh:
+                for rec in records:
+                    fh.write(json.dumps(rec) + "\n")
+            result = cowork_ingest.ingest_claude(log)
+            self.assertEqual(result.state, "ok")
+            self.assertEqual(len(result.tool_activity), 4)
+            for call in result.tool_activity:
+                # No command could be read, and that is stated rather than
+                # guessed at.
+                self.assertIsNone(call["command_identity"])
+                self.assertIsNone(call["command_fingerprint"])
+
+    def test_a_deleted_log_does_not_break_a_run(self):
+        results = cowork_ingest.ingest_session(
+            {"builder": {"tool": "claude", "session_id": "gone"}},
+            claude_root="/nonexistent")
+        self.assertEqual(results["builder"].state, "missing")
+        self.assertEqual(cowork_ingest.observations_for(results), [])
+
+    def test_the_full_attempt_contract_is_present(self):
+        # Finding 3: ingesting logs is not the same as implementing the frozen
+        # attempt contract. Every required field must be on every attempt.
+        record = self._build("c3-controller-log")
+        attempts = record["verification_attempts"]
+        self.assertTrue(attempts)
+        for attempt in attempts:
+            for field in ("adjudication", "tty_stdin_mode", "attempt_number",
+                          "retries", "retry_state", "overlap_state",
+                          "evidence_safety"):
+                self.assertIn(field, attempt, attempt.get("id"))
+            self.assertIn(attempt["adjudication"], cowork_ingest.ADJUDICATIONS)
+            if attempt["adjudication"] != "pass":
+                self.assertIn(attempt.get("failure_class"),
+                              cowork_ingest.FAILURE_CLASSES)
+
+    def test_failures_are_classed_not_lumped(self):
+        classify = cowork_ingest.classify_failure
+        self.assertEqual(classify("ModuleNotFoundError: no module named x",
+                                  "fail"), "environment_dependency")
+        self.assertEqual(classify("bash: pytest: command not found", "fail"),
+                         "environment_dependency")
+        self.assertEqual(classify("Ran 0 tests\nOK", "fail"), "test_harness")
+        self.assertEqual(classify("conftest.py collection error", "fail"),
+                         "test_harness")
+        self.assertEqual(classify("AssertionError: 3 != 4", "fail"),
+                         "product_regression")
+        self.assertEqual(classify("connection reset by peer", "unresolved"),
+                         "flaky")
+        # No signal at all: `unknown`, never a guess that puts an environment
+        # problem on the builder's account.
+        self.assertEqual(classify("something went sideways", "fail"),
+                         "unknown")
+        self.assertIsNone(classify("OK", "pass"))
+
+    def test_retries_overlap_and_unsafe_evidence_are_visible(self):
+        record = self._build("c3-controller-log")
+        attempts = record["verification_attempts"]
+        by_id = {a["id"]: a for a in attempts}
+        # A re-run of the same command identity is a RETRY, so "we ran it until
+        # it passed" cannot read as one clean pass.
+        retried = [a for a in attempts if a.get("retries")]
+        self.assertTrue(retried)
+        self.assertEqual(retried[0]["retry_state"], "retry")
+        # Two runs whose windows intersect were in flight together.
+        overlapping = [a for a in attempts
+                       if a.get("overlap_state") == "overlapping"]
+        self.assertEqual(len(overlapping), 2)
+        # A run whose tree was mutated mid-flight is REFUSED, not counted.
+        refused = [a for a in attempts
+                   if a.get("evidence_safety") == "refused"]
+        self.assertTrue(refused)
+        self.assertTrue(refused[0]["refusal_reason"])
+        # ...and an ordinary run after an ordinary edit is NOT refused, because
+        # editing files is the entire point of a build.
+        accepted = [a for a in attempts
+                    if a.get("evidence_safety") == "accepted"]
+        self.assertTrue(accepted)
+
+    def test_tool_activity_and_recurrences_reach_the_record(self):
+        record = self._build("c3-controller-log")
+        activity = record["tool_activity"]
+        self.assertEqual(set(activity), {"builder", "build-reviewer"})
+        self.assertTrue(activity["builder"]["calls"])
+        self.assertIn("verify", activity["builder"]["by_intent"])
+        self.assertTrue(activity["builder"]["unrestored_mutations"])
+        # Recurrence is a LIST of repeats, so one-offs are not inflated.
+        self.assertIsInstance(record["environment_recurrences"], list)
+        text = self._report("c3-controller-log")[1]
+        self.assertIn("Tool activity by role", text)
+        self.assertIn("EVIDENCE REFUSED", text)
+        self.assertIn("OVERLAPPING", text)
+
+    def test_fixture_report_runs_clean(self):
+        rc, text = self._report(self.FIXTURE)
+        self.assertEqual(rc, 0)
+        self.assertIn("Verification attempts", text)
+
+
+class MeasurementEvaluationTelemetryTests(_MeasurementFixtureMixin,
+                                          unittest.TestCase):
+    """C4 — measurement is passive, optional and comparable, and the run's own
+    telemetry is honest."""
+
+    FIXTURES = ("c4-multi-round-all-rounds", "c4-multi-round-final-round",
+                "c4-multi-round-sampled", "c4-multi-round-off")
+
+    def test_the_four_policy_values(self):
+        self.assertEqual(
+            [cowork_eval.decide("all_rounds", r)["selected"]
+             for r in (1, 2, 3, 4)], [True] * 4)
+        self.assertEqual(
+            [cowork_eval.decide("off", r)["selected"] for r in (1, 2, 3, 4)],
+            [False] * 4)
+        # A live round cannot know it is the last one, so `final_round`
+        # enqueues every round as a CANDIDATE and each supersedes the previous;
+        # only the survivor per phase is scored at drain time. Requiring an
+        # is_final_round flag no caller could supply selected nothing at all.
+        for round_index in (1, 2, 3, 4):
+            decision = cowork_eval.decide("final_round", round_index)
+            self.assertTrue(decision["selected"])
+            self.assertTrue(decision["supersedes_earlier_candidates"])
+
+    def test_the_sampled_rule_is_deterministic_and_strictly_between(self):
+        selected = [r for r in (1, 2, 3, 4)
+                    if cowork_eval.decide("sampled", r)["selected"]]
+        # 0 < selected < all, deterministically, with the rule recorded.
+        self.assertEqual(selected, [1, 3])
+        self.assertEqual(cowork_eval.decide("sampled", 1)["rule"],
+                         cowork_eval.SAMPLED_RULE)
+        self.assertTrue(cowork_eval.decide("sampled", 2)["reason"])
+
+    def test_mismatched_observed_digest_blocks_readiness(self):
+        command = "python -m unittest example.Tests"
+        claims, _ = cowork_measure.join_claims_and_attempts(
+            [{"label": "suite", "command": command, "ok": True,
+              "source_manifest": "current"}],
+            [{"id": "V-0001",
+              "command_fingerprint":
+                  cowork_ingest.command_fingerprint(command),
+              "adjudication": "pass", "pipeline": False,
+              "started_at": "2026-07-29T20:00:00Z",
+              "observed_source_digest": "different"}],
+        )
+        corroborating = claims[0]["corroborating_attempts"][0]
+        self.assertEqual(corroborating["observed_source_digest"], "different")
+        reason = cowork_measure.blocks_readiness(
+            claims[0], manifest="current",
+            newest_mtime=cowork_measure.SourceClock(0.0),
+        )
+        self.assertIn("different tree", reason)
+
+    def test_an_unknown_policy_falls_back_rather_than_disabling_scoring(self):
+        # Measurement must never break a run — and a typo must not silently
+        # turn scoring off, which is the direction that loses data.
+        self.assertEqual(cowork_eval.decide("nonsense", 1)["policy"],
+                         "all_rounds")
+        self.assertTrue(cowork_eval.decide("nonsense", 1)["selected"])
+
+    def test_seal_and_enqueue_writes_before_the_round_continues(self):
+        with tempfile.TemporaryDirectory() as d:
+            queue = os.path.join(d, "q.jsonl")
+            self.assertTrue(cowork_eval.enqueue(
+                queue, {"entry_id": "E1", "phase": "building", "round": 1}))
+            self.assertTrue(os.path.exists(queue))
+            self.assertEqual(
+                [e["entry_id"] for e in cowork_eval.pending_entries(queue)],
+                ["E1"])
+
+    def test_a_queue_left_by_a_killed_process_drains_on_the_next_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            queue = os.path.join(d, "q.jsonl")
+            artifact = os.path.join(d, "verdict.json")
+            with open(artifact, "w") as fh:
+                json.dump({"verdict": "approve"}, fh)
+            envelope = handoff.seal_envelope([{"path": artifact}])
+            cowork_eval.enqueue(queue, {"entry_id": "E1",
+                                        "envelope": envelope.as_dict()})
+            # A new process reads the queue from disk with the ORIGINAL sealed
+            # digests: a session killed mid-phase costs a delay, not the scores.
+            pending = cowork_eval.pending_entries(queue)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(
+                pending[0]["envelope"]["artifacts"][0]["sha256"],
+                envelope.artifacts[0]["sha256"])
+            seen = []
+            summary = cowork_eval.drain(
+                queue, lambda e, v: seen.append((e["entry_id"], v)) or True)
+            self.assertEqual(summary["drained"], 1)
+            self.assertEqual(seen[0][1]["state"], "ok")
+            # Drained entries are not drained twice.
+            self.assertEqual(cowork_eval.pending_entries(queue), [])
+
+    def test_evidence_changed_in_the_queue_scores_unverifiable(self):
+        with tempfile.TemporaryDirectory() as d:
+            queue = os.path.join(d, "q.jsonl")
+            artifact = os.path.join(d, "verdict.json")
+            with open(artifact, "w") as fh:
+                json.dump({"verdict": "approve"}, fh)
+            envelope = handoff.seal_envelope([{"path": artifact}])
+            cowork_eval.enqueue(queue, {"entry_id": "E1",
+                                        "envelope": envelope.as_dict()})
+            with open(artifact, "w") as fh:
+                json.dump({"verdict": "revise"}, fh)   # changed while queued
+            seen = []
+            summary = cowork_eval.drain(
+                queue, lambda e, v: seen.append(v) or True)
+            # Marked unverifiable rather than re-hashed to the current file —
+            # re-hashing would make every score verifiable by construction.
+            self.assertEqual(summary["unverifiable"], 1)
+            self.assertEqual(seen[0]["state"], "changed")
+
+    def test_a_failed_drain_stays_pending_and_is_reported_as_pending(self):
+        with tempfile.TemporaryDirectory() as d:
+            queue = os.path.join(d, "q.jsonl")
+            cowork_eval.enqueue(queue, {"entry_id": "E1"})
+            summary = cowork_eval.drain(queue, lambda e, v: False)
+            self.assertEqual(summary["drained"], 0)
+            self.assertEqual(summary["pending"], 1)
+            # Not silently dropped: the next drain retries it.
+            self.assertEqual(
+                [e["entry_id"] for e in cowork_eval.pending_entries(queue)],
+                ["E1"])
+
+    def test_a_bad_entry_never_breaks_the_drain(self):
+        with tempfile.TemporaryDirectory() as d:
+            queue = os.path.join(d, "q.jsonl")
+            cowork_eval.enqueue(queue, {"entry_id": "E1"})
+
+            def explode(entry, verification):
+                raise RuntimeError("evaluator blew up")
+
+            summary = cowork_eval.drain(queue, explode)
+            self.assertEqual(summary["state"], "ok")
+            self.assertEqual(summary["failed"], 1)
+
+    def test_the_evaluator_keeps_the_seats_controller_and_model(self):
+        identities = {"builder": {"tool": "codex", "model": "gpt-5.6-sol"}}
+        identity = cowork_eval.evaluator_identity(identities, "builder")
+        # Collapsing evaluations onto one controller would break comparability
+        # with the sessions already recorded.
+        self.assertEqual(identity["tool"], "codex")
+        self.assertEqual(identity["model"], "gpt-5.6-sol")
+        self.assertEqual(
+            cowork_eval.evaluator_identity({}, "builder")["state"], "unknown")
+
+    def test_the_isolation_invariant_holds_on_every_fixture(self):
+        for name in self.FIXTURES:
+            record = self._build(name)
+            operational = {"S-op"}
+            events = self._events(name)
+            violations = cowork_eval.isolation_violations(events, operational)
+            self.assertEqual(violations, [], name)
+            # And no evaluation turn shares the operational session id.
+            for entry in record["work"].values():
+                if entry.get("work_class") == "evaluation":
+                    self.assertNotIn(
+                        (entry.get("identity") or {})
+                        .get("controller_session_id"), operational, name)
+
+    def test_the_ordering_invariant_holds_on_every_fixture(self):
+        for name in self.FIXTURES:
+            violations = cowork_eval.ordering_violations(self._events(name))
+            # Scoring must never sit between a reviewer's verdict and the fix
+            # going back to the role.
+            self.assertEqual(violations, [], name)
+
+    def _events(self, name):
+        path = os.path.join(_FIXTURES, name, "trace.jsonl")
+        with open(path) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_each_policy_scores_a_different_amount(self):
+        counts = {}
+        for name in self.FIXTURES:
+            record = self._build(name)
+            counts[name] = record["cost"]["by_class"]["evaluation"]["turns"]
+        self.assertEqual(counts["c4-multi-round-all-rounds"], 4)
+        self.assertEqual(counts["c4-multi-round-final-round"], 1)
+        self.assertEqual(counts["c4-multi-round-off"], 0)
+        sampled = counts["c4-multi-round-sampled"]
+        # Strictly between: a "sampled" policy that scored none or all would be
+        # indistinguishable from `off` or `all_rounds`.
+        self.assertGreater(sampled, 0)
+        self.assertLess(sampled, 4)
+
+    def test_recovery_is_counted_as_recovery_not_progress(self):
+        record = self._build("c4-multi-round-all-rounds")
+        self.assertEqual(record["cost"]["by_class"]["recovery"]["turns"], 1)
+        replay = record["replay"]
+        self.assertTrue(replay)
+        # A replay of unchanged work is worth nothing new, and says so.
+        self.assertEqual(replay[0]["new_findings"], 0)
+        self.assertEqual(replay[0]["marginal_value"], 0)
+        self.assertEqual(replay[0]["attributed_to"], "recovery")
+
+    def test_status_transitions_are_honest(self):
+        for event in self._events("c4-multi-round-all-rounds"):
+            if event.get("event") != "status.invalidated":
+                continue
+            # CV-016: the REQUESTED transition and the OBSERVED one are
+            # distinct fields, and the event only fires when state moved.
+            self.assertIn("requested_status", event)
+            self.assertNotEqual(event["before"], event["after"])
+            self.assertTrue(event["reason"])
+            # P16: the referent exists.
+            self.assertTrue(event["triggering_event_id"])
+
+    def test_final_round_resolves_finality_at_drain_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            queue = os.path.join(d, "q.jsonl")
+            for rnd in (1, 2, 3):
+                decision = cowork_eval.decide("final_round", rnd)
+                self.assertTrue(decision["selected"], "round %d" % rnd)
+                cowork_eval.enqueue(queue, {
+                    "entry_id": "E%d" % rnd, "phase": "building",
+                    "round": rnd, "evaluator_seat": "builder",
+                    "policy_decision": decision})
+            # A recovery drain with NO finality signal must score nothing:
+            # the phase may still produce a later round.
+            scored = []
+            recovery = cowork_eval.drain(
+                queue, lambda e, v: scored.append(e["round"]) or True)
+            self.assertEqual(scored, [])
+            self.assertEqual(recovery["held"], 3)
+            self.assertEqual(len(cowork_eval.pending_entries(queue)), 3)
+            # Once the phase is CLOSED, only its last round is scored and the
+            # earlier candidates are retired explicitly.
+            summary = cowork_eval.drain(
+                queue, lambda e, v: scored.append(e["round"]) or True,
+                phase_closed=lambda phase: phase == "building")
+            self.assertEqual(scored, [3])
+            self.assertEqual(summary["superseded"], 2)
+            self.assertEqual(cowork_eval.pending_entries(queue), [])
+
+    def test_a_crash_cannot_make_final_round_score_a_non_final_round(self):
+        # The regression finding 2 asked for. A drain also runs at the NEXT
+        # SESSION START, where round 1 would be the only candidate present. If
+        # that resolved it as final, round 2 would be scored later as well —
+        # two rounds scored under a policy that promises one.
+        with tempfile.TemporaryDirectory() as d:
+            queue = os.path.join(d, "q.jsonl")
+            decision = cowork_eval.decide("final_round", 1)
+            cowork_eval.enqueue(queue, {
+                "entry_id": "E1", "phase": "building", "round": 1,
+                "evaluator_seat": "builder", "policy_decision": decision})
+            scored = []
+            # ...the killed process's next start: phase finality unknown.
+            cowork_eval.drain(queue,
+                              lambda e, v: scored.append(e["round"]) or True)
+            self.assertEqual(scored, [])
+            # ...the run continues and produces round 2.
+            cowork_eval.enqueue(queue, {
+                "entry_id": "E2", "phase": "building", "round": 2,
+                "evaluator_seat": "builder",
+                "policy_decision": cowork_eval.decide("final_round", 2)})
+            cowork_eval.drain(queue,
+                              lambda e, v: scored.append(e["round"]) or True,
+                              phase_closed=lambda phase: True)
+            # Exactly ONE round scored, and it is the real final one.
+            self.assertEqual(scored, [2])
+
+    def test_final_round_selects_something_in_a_live_run(self):
+        # The regression finding 3 asked for: no production caller can supply
+        # is_final_round, so a policy that required it selected NOTHING.
+        selected = [r for r in (1, 2, 3, 4)
+                    if cowork_eval.decide("final_round", r)["selected"]]
+        self.assertTrue(selected)
+
+    def test_truncated_logs_keep_the_evidence_before_the_cut(self):
+        path = os.path.join(
+            _FIXTURES, "c3-controller-log", "controller_logs", "codex",
+            "sessions", "2026", "07", "28",
+            "rollout-2026-07-28T12-20-00-T-trunc.jsonl")
+        result = cowork_ingest.ingest_codex(path)
+        self.assertEqual(result.state, "truncated")
+        observations = cowork_ingest.observations_for({"builder": result})
+        # Dropping a truncated log entirely loses every attempt it DID record,
+        # widening the loss far beyond the cut tail.
+        self.assertTrue(observations)
+        for observation in observations:
+            self.assertEqual(observation["source_state"], "truncated")
+            self.assertTrue(observation["evidence_lost_after"])
+
+    def test_the_c3_report_actually_contains_ingested_evidence(self):
+        record = self._build("c3-controller-log")
+        states = {role: ing["state"]
+                  for role, ing in record["ingestion"].items()}
+        # BOTH controller formats, actually read, in the named acceptance
+        # fixture — not merely exercised by unit tests off to the side.
+        self.assertEqual(set(states.values()), {"ok"})
+        self.assertEqual(set(states), {"builder", "build-reviewer"})
+        for ing in record["ingestion"].values():
+            self.assertTrue(ing["read_only_verified"])
+        attempts = record["verification_attempts"]
+        self.assertTrue(attempts)
+        by_adjudication = {}
+        for attempt in attempts:
+            by_adjudication.setdefault(attempt["adjudication"], []).append(
+                attempt)
+        # A zero-test run that exited 0 FAILS, a timeout is unresolved and
+        # terminal, and a red run survives alongside the later green one.
+        self.assertTrue(by_adjudication.get("fail"))
+        self.assertTrue(by_adjudication.get("unresolved"))
+        self.assertTrue(by_adjudication.get("pass"))
+        zero_test = [a for a in attempts
+                     if a.get("executed_count") == 0]
+        self.assertTrue(zero_test)
+        for attempt in zero_test:
+            self.assertEqual(attempt["exit_status"], 0)
+            self.assertEqual(attempt["adjudication"], "fail")
+
+    def test_every_policy_fixture_reports_clean(self):
+        for name in self.FIXTURES:
+            rc, text = self._report(name)
+            self.assertEqual(rc, 0, name)
+            self.assertIn("Cost by class", text)
+
+
+class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
+                                    unittest.TestCase):
+    """C5 — the report says only what the record knows."""
+
+    FIXTURE = "c5-provenance-replay"
+    RECORD_SAYS = 7      # the pre-built record's productive turn count
+    TRACE_SAYS = 2       # what a rebuild from its own trace would produce
+
+    def test_the_renderer_refuses_a_raw_source(self):
+        # A renderer that quietly accepted a path could load it, and then it
+        # would be computing again.
+        with self.assertRaises(cowork_report.RawSourceRejected):
+            cowork_report.render_report("/some/trace.jsonl")
+        with self.assertRaises(cowork_report.RawSourceRejected):
+            cowork_report.render_report(None)
+
+    def test_the_report_prints_the_records_value_not_the_traces(self):
+        self._fixture_root()
+        out = io.StringIO()
+        args = cowork.build_parser().parse_args(["--report", self.FIXTURE])
+        self.assertEqual(cowork.run_report(args, io_out=out), 0)
+        text = out.getvalue()
+        # THIS is what makes renderer purity decidable rather than merely
+        # re-exercised: the fixture's record disagrees with its own trace, so a
+        # renderer that recomputed would print the trace's number.
+        self.assertIn("%d turns" % self.RECORD_SAYS, text)
+        self.assertNotIn("%d turns" % self.TRACE_SAYS, text)
+
+    def test_a_rebuild_prints_the_traces_value_instead(self):
+        self._fixture_root()
+        record_path = os.path.join(_FIXTURES, self.FIXTURE,
+                                   "measurement.json")
+        with open(record_path, "rb") as fh:
+            original = fh.read()
+        def _restore():
+            # Only when the bytes actually differ. Rewriting identical content
+            # still bumps the mtime, so this cleanup moved a SOURCE file's
+            # clock on every suite run — which then made every attempt that
+            # preceded it look stale to the freshness gate.
+            try:
+                with open(record_path, "rb") as fh:
+                    if fh.read() == original:
+                        return
+            except OSError:
+                pass
+            with open(record_path, "wb") as fh:
+                fh.write(original)
+
+        self.addCleanup(_restore)
+        out = io.StringIO()
+        args = cowork.build_parser().parse_args(
+            ["--report", self.FIXTURE, "--rebuild"])
+        self.assertEqual(cowork.run_report(args, io_out=out), 0)
+        # The counterpart half: rebuilding really does produce a different
+        # number, so the test above is a real discriminator.
+        self.assertIn("%d turns" % self.TRACE_SAYS, out.getvalue())
+
+    def test_a_stale_record_warns_and_still_renders_the_record(self):
+        self._fixture_root()
+        record = cowork_measure.load_record(self.FIXTURE)
+        provenance = cowork_measure.check_provenance(self.FIXTURE, record)
+        self.assertEqual(provenance["state"], "stale")
+        self.assertIn("trace", provenance["diverged"])
+        banner = cowork_report.render_provenance_banner(provenance)
+        self.assertIn("stale record", banner)
+        # The banner names sources and timestamps ONLY. A measurement figure in
+        # it would mean the provenance check had computed one, and "the report
+        # computes nothing" would stop being literally true. (Checked against
+        # rendered figures, not bare digits — a timestamp contains digits.)
+        self.assertNotIn("%d turns" % self.RECORD_SAYS, banner)
+        for figure_word in ("input_tokens", "output_tokens", "turns",
+                            "avg", "unpriced"):
+            self.assertNotIn(figure_word, banner)
+
+    def test_the_provenance_result_is_never_passed_to_the_renderer(self):
+        import inspect
+        signature = inspect.signature(cowork_report.render_report)
+        self.assertEqual(list(signature.parameters), ["record"])
+        with self.assertRaises(TypeError):
+            cowork_report.render_report({}, "session-must-come-from-record")
+
+    def test_rendering_functions_do_not_aggregate_figures(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(cowork_report))
+        offenders = []
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not (node.name == "render_report"
+                    or node.name.startswith("_section_")
+                    or node.name == "_attempt_rollups"):
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call) \
+                        and isinstance(child.func, ast.Name) \
+                        and child.func.id in ("len", "sum"):
+                    offenders.append("%s:%s" % (node.name, child.func.id))
+        self.assertEqual(offenders, [])
+
+    def test_a_provenance_failure_still_renders(self):
+        result = cowork_measure.check_provenance("nope", {"built_at": "x"})
+        self.assertEqual(result["state"], cowork_measure.UNKNOWN)
+        self.assertIn("provenance unknown",
+                      cowork_report.render_provenance_banner(result))
+
+    def test_every_printed_figure_resolves_to_a_record_field(self):
+        # Checked against a FULLY BUILT record: the c5 fixture is deliberately
+        # minimal (it exists to disagree with its trace on one figure), so it
+        # is the wrong subject for "does every declared path exist".
+        record = self._build("c1-turn-lifecycle")
+        lineage = cowork_report.rendered_lineage(record)
+        self.assertTrue(lineage)
+        unresolved = [figure for figure, info in lineage.items()
+                      if not info["resolved"]]
+        # A field renamed on the build side surfaces as a broken lineage rather
+        # than as a silently missing line in the output.
+        self.assertEqual(unresolved, [])
+
+    def test_a_report_with_no_record_builds_one_and_says_so(self):
+        # A WRITABLE session (not a checked-in fixture): the record lifecycle
+        # is build-once-then-load, and a fixture deliberately never persists,
+        # so testing the lifecycle against one would test the opposite rule.
+        with tempfile.TemporaryDirectory() as d:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = d
+            self.addCleanup(self._restore_root, prior)
+            session = os.path.join(d, "S1")
+            os.makedirs(session)
+            src = os.path.join(_FIXTURES, "c1-turn-lifecycle")
+            for name in ("trace.jsonl", "identities.json", "scores.json"):
+                shutil.copy(os.path.join(src, name),
+                            os.path.join(session, name))
+            out = io.StringIO()
+            args = cowork.build_parser().parse_args(["--report", "S1"])
+            self.assertEqual(cowork.run_report(args, io_out=out), 0)
+            self.assertIn("no measurement record yet", out.getvalue())
+            # ...and a second report LOADS rather than rebuilding.
+            second = io.StringIO()
+            self.assertEqual(cowork.run_report(args, io_out=second), 0)
+            self.assertNotIn("no measurement record yet", second.getvalue())
+
+    def test_a_tracked_fixture_report_never_writes_to_the_fixture(self):
+        """A checked-in fixture is source truth the criteria are decided on.
+
+        Persisting a record or reconciling a ledger into one made verification
+        mutate the very tree it was verifying — every run invalidated its own
+        predecessors, and the gate could never be satisfied.
+        """
+        self._fixture_root()
+        target = os.path.join(_FIXTURES, "c2-finding-lifecycle")
+        ledger_path = os.path.join(target, "ledger.jsonl")
+        with open(ledger_path, "rb") as fh:
+            before = fh.read()
+        record_path = os.path.join(target, "measurement.json")
+        existed = os.path.exists(record_path)
+        out = io.StringIO()
+        args = cowork.build_parser().parse_args(
+            ["--report", "c2-finding-lifecycle"])
+        self.assertEqual(cowork.run_report(args, io_out=out), 0)
+        with open(ledger_path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(os.path.exists(record_path), existed)
+
+    def test_a_class_with_no_measured_turn_is_unknown_not_zero(self):
+        # Finding 7: the report was printing `0.0 s` for classes nothing was
+        # measured for, while the record simultaneously said the figure was
+        # unavailable — breaking its own "nothing missing becomes 0" rule.
+        by_class = cowork_measure.duration_by_class(
+            {"W1": {"work_class": "productive", "duration_ms": 5000}},
+            user_wait_ms=0, user_wait_spans=[])
+        self.assertEqual(by_class["productive_ms"], 5000)
+        self.assertEqual(by_class["review_ms"], cowork_measure.UNKNOWN)
+        # No spans at all means unknown waiting, not zero waiting.
+        self.assertEqual(by_class["user_wait_ms"], cowork_measure.UNKNOWN)
+        record = {"schema_version": 1, "duration": {"by_class": by_class,
+                                                    "user_wait_spans": []}}
+        text = cowork_report.render_report(record)
+        self.assertIn("review", text)
+        self.assertNotIn("review         0.0 s", text)
+        self.assertIn("user_wait is UNKNOWN", text)
+
+    def test_a_legacy_session_renders_no_fabricated_zeros(self):
+        record = self._build("c1-turn-lifecycle")
+        by_class = record["duration"]["by_class"]
+        # Classes this fixture never exercised must not claim zero duration.
+        self.assertEqual(by_class["recovery_ms"], cowork_measure.UNKNOWN)
+        self.assertEqual(by_class["review_ms"], cowork_measure.UNKNOWN)
+        # ...and one it did exercise carries its real figure.
+        self.assertEqual(by_class["cancelled_ms"], 7000)
+
+    def test_json_prints_the_authoritative_record(self):
+        self._fixture_root()
+        out = io.StringIO()
+        args = cowork.build_parser().parse_args(
+            ["--report", self.FIXTURE, "--json"])
+        self.assertEqual(cowork.run_report(args, io_out=out), 0)
+        parsed = json.loads(out.getvalue())
+        self.assertEqual(parsed["schema_version"], 1)
+        self.assertEqual(
+            parsed["cost"]["by_class"]["productive"]["turns"],
+            self.RECORD_SAYS)
+
+    def test_unpriced_is_never_rendered_as_zero(self):
+        snapshot = cowork_pricing.load_snapshot()
+        # Real prices in a repo are stale by construction, so the shipped
+        # snapshot is empty and everything reads "unpriced".
+        self.assertEqual(snapshot["models"], {})
+        priced = cowork_pricing.price_usage(
+            {"input_tokens": 1000}, "claude-opus-5", snapshot=snapshot)
+        self.assertEqual(priced["state"], "unpriced")
+        self.assertIsNone(priced["cost"])
+        self.assertNotEqual(priced["cost"], 0)
+        # Provenance travels with every cost field.
+        self.assertEqual(priced["pricing_snapshot_id"], "empty")
+        self.assertIn("pricing_schema_version", priced)
+
+    def test_provider_counters_are_not_renamed_away(self):
+        normalized = cowork_pricing.normalize_usage({
+            "input_tokens": 10, "cache_creation_input_tokens": 20,
+            "cache_read_input_tokens": 30})
+        self.assertEqual(normalized["axes"]["cache_write"], 20)
+        self.assertEqual(normalized["axes"]["cached_input"], 30)
+        # The provider's own field names survive alongside the canonical axes.
+        self.assertIn("cache_creation_input_tokens", normalized["native"])
+        # `total_tokens` is a sum of the others; counting it would double
+        # every figure it appears in.
+        self.assertEqual(
+            cowork_pricing.normalize_usage({"total_tokens": 99})["unmapped"],
+            [])
+
+    def test_the_input_remainder_is_named_not_closed(self):
+        record = self._build("c1-turn-lifecycle")
+        sources = record["input_sources"]
+        self.assertIn("unattributed_input_tokens", sources)
+        # Bytes and tokens are separate axes and are never converted.
+        self.assertIn("measured_bytes", sources)
+        self.assertIn("provider_token_axes", sources)
+
+    def test_legacy_sessions_report_incompleteness_not_zeros(self):
+        record = self._build("c1-turn-lifecycle")
+        fields = {entry["field"] for entry in record["incomplete"]}
+        self.assertTrue(fields)
+        for entry in record["incomplete"]:
+            # Every gap names itself AND why, so "missing" never reads as 0.
+            self.assertTrue(entry["reason"])
+
+    def test_the_completion_account_lives_in_the_record(self):
+        record = self._build("c1-turn-lifecycle")
+        self.assertIsInstance(record["completion"], list)
+        self.assertTrue(record["completion"])
+        for entry in record["completion"]:
+            self.assertIn(entry["state"], cowork_measure.COMPLETION_STATES)
+        # An item with no evidence is still_open regardless of belief, and
+        # evidence is resolved against the RECORD rather than taken on trust —
+        # otherwise the account is just a second place to assert things.
+        account = cowork_measure.completion_account(
+            {"a": 1}, seeds=[
+                {"item": "x"},
+                {"item": "y", "evidence": ["record.a"]},
+                {"item": "z", "state": "delivered",
+                 "evidence": ["record.a", "record.nope"]},
+                {"item": "w", "state": "delivered",
+                 "evidence": ["record.nope"]}])
+        self.assertEqual(account[0]["state"], "still_open")
+        self.assertEqual(account[1]["state"], "delivered")
+        # Half its evidence resolves: partially delivered, and the gap named.
+        self.assertEqual(account[2]["state"], "partially_delivered")
+        self.assertEqual(account[2]["unresolved_evidence"], ["record.nope"])
+        # Claims delivered, resolves nothing: still_open, whatever it says.
+        self.assertEqual(account[3]["state"], "still_open")
+
+    def test_presence_alone_never_certifies_completion(self):
+        # Finding 5, the root cause: an empty object whose own state is
+        # `unknown` was resolving as delivered.
+        record = {"milestones": {"events": [], "state": "unknown"},
+                  "findings": {"total": 3},
+                  "verification": [{"label": "C1 work-record suite",
+                                    "ok": True},
+                                   {"label": "flaky check", "ok": False}]}
+        cases = [
+            ({"item": "a", "state": "delivered",
+              "evidence": ["record.milestones"]}, "still_open"),
+            ({"item": "b", "state": "delivered",
+              "evidence": ["record.findings"]}, "delivered"),
+            ({"item": "c", "state": "delivered",
+              "evidence": ["C1 work-record suite"]}, "delivered"),
+            ({"item": "d", "state": "delivered",
+              "evidence": ["flaky check"]}, "still_open"),
+            ({"item": "e", "state": "delivered",
+              "evidence": ["never ran"]}, "still_open"),
+        ]
+        for seed, expected in cases:
+            state, _resolved, _unresolved = (
+                cowork_measure.resolve_completion_state(seed, record))
+            self.assertEqual(state, expected, seed["item"])
+
+    def test_an_empty_or_unknown_field_is_not_evidence(self):
+        record = {"a": {}, "b": [], "c": "", "d": None, "e": False,
+                  "f": {"state": "unknown"}, "g": {"state": "ok", "x": 1},
+                  "h": 0}
+        for field in ("a", "b", "c", "d", "e", "f"):
+            self.assertFalse(
+                cowork_measure._evidence_is_substantive("record.%s" % field,
+                                                        record), field)
+        self.assertTrue(
+            cowork_measure._evidence_is_substantive("record.g", record))
+
+    def test_the_inline_script_fingerprint_survives_ingestion(self):
+        # The digest is computed from the RAW command and PERSISTED. Deriving
+        # it later from `command_identity` is too late — sanitization has
+        # already replaced the script with a placeholder, so an attempt could
+        # never match its own claim.
+        raw_a = '.venv/bin/python -c "print(123)"'
+        raw_b = '.venv/bin/python -c "print(456)"'
+        self.assertNotEqual(cowork_ingest.command_fingerprint(raw_a),
+                            cowork_ingest.command_fingerprint(raw_b))
+        self.assertNotEqual(
+            cowork_ingest.command_fingerprint(raw_a),
+            cowork_ingest.command_fingerprint(
+                cowork_ingest.sanitize_command(raw_a)))
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "S-fp.jsonl")
+            records = []
+            for index, raw in ((1, raw_a), (2, raw_b)):
+                records.append({
+                    "type": "assistant", "sessionId": "S-fp",
+                    "timestamp": "2026-07-28T10:0%d:00Z" % index,
+                    "message": {"usage": {"input_tokens": 1},
+                                "content": [{"type": "tool_use",
+                                             "id": "t%d" % index,
+                                             "name": "Bash",
+                                             "input": {"command": raw}}]}})
+                records.append({
+                    "type": "user", "sessionId": "S-fp",
+                    "timestamp": "2026-07-28T10:0%d:01Z" % index,
+                    "message": {"content": [
+                        {"type": "tool_result", "tool_use_id": "t%d" % index,
+                         "is_error": False,
+                         "content": [{"type": "text",
+                                      "text": "Ran 3 tests\nOK\nExit code 0"}]}]}})
+            with open(log, "w") as fh:
+                for rec in records:
+                    fh.write(json.dumps(rec) + "\n")
+            result = cowork_ingest.ingest_claude(log)
+            prints = {a["tool_call_id"]: a.get("command_fingerprint")
+                      for a in result.tool_activity}
+            self.assertEqual(prints["t1"],
+                             cowork_ingest.command_fingerprint(raw_a))
+            self.assertNotEqual(prints["t1"], prints["t2"])
+            # ...and the claim for script A joins attempt t1, not t2.
+            attempts = [dict(a) for a in result.tool_activity]
+            claims, joined = cowork_measure.join_claims_and_attempts(
+                [{"label": "a", "command": raw_a, "ok": True}], attempts)
+            self.assertEqual(claims[0]["claim_state"], "corroborated")
+            by_call = {a["tool_call_id"]: a.get("claim_state")
+                       for a in joined}
+            self.assertEqual(by_call["t1"], "corroborated")
+            self.assertEqual(by_call["t2"], "unclaimed")
+
+    def test_a_required_command_that_was_not_recorded_is_wrong(self):
+        # Requiring `actual` to be truthy meant the easiest way to pass the
+        # exact-command gate was to record no command at all.
+        required = {"full suite": "pytest -q"}
+        state, _m, why = cowork._adjudicate_readiness(
+            [{"label": "full suite", "ok": True, "source_manifest": "m1"}],
+            "m1", required)
+        self.assertEqual(state, "unverified")
+        self.assertIn("different command", why)
+
+    def test_sampled_selection_follows_the_durable_round(self):
+        # Deciding from the in-loop counter restarted 1/3/5 after every resume.
+        with tempfile.TemporaryDirectory() as d:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = d
+            self.addCleanup(self._restore_root, prior)
+            picked = []
+            for _ in range(4):
+                durable = state_store.next_phase_round("S", "building", "b")
+                picked.append(
+                    cowork_eval.decide("sampled", durable)["selected"])
+            # 1,2,3,4 -> selected, skipped, selected, skipped. Deciding from a
+            # counter that restarts would have selected round 1 twice.
+            self.assertEqual(picked, [True, False, True, False])
+
+    def test_a_resumed_round_gets_a_distinct_durable_identity(self):
+        # Content-addressing fixed the frozen BYTES; this fixes the round
+        # IDENTITY. `review_rounds` restarts at 0 on resume, so the queue,
+        # ledger, cost joins and final-round supersession all keyed on a
+        # colliding (phase, round) and merged two different rounds.
+        with tempfile.TemporaryDirectory() as d:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = d
+            self.addCleanup(self._restore_root, prior)
+            first = state_store.next_phase_round("S", "building", "builder")
+            second = state_store.next_phase_round("S", "building", "builder")
+            # ...the process dies and a fresh _role_loop starts at 0 again.
+            third = state_store.next_phase_round("S", "building", "builder")
+            self.assertEqual([first, second, third], [1, 2, 3])
+            # Reading must NOT advance it: two records from one round would
+            # otherwise carry different identities.
+            self.assertEqual(
+                state_store.current_phase_round("S", "building", "builder"), 3)
+            self.assertEqual(
+                state_store.current_phase_round("S", "building", "builder"), 3)
+            # Seats and phases are counted independently.
+            self.assertEqual(
+                state_store.next_phase_round("S", "building", "reviewer"), 1)
+            self.assertEqual(
+                state_store.next_phase_round("S", "planning", "builder"), 1)
+
+    def test_ambiguous_fingerprints_are_refused_not_guessed(self):
+        # Two different inline-script commands used to collapse to `python -c`,
+        # so one assertion could corroborate a different one that never ran.
+        a = '.venv/bin/python -c "import json;assert 1"'
+        b = '.venv/bin/python -c "import re;assert 2"'
+        self.assertNotEqual(cowork_ingest.command_fingerprint(a),
+                            cowork_ingest.command_fingerprint(b))
+        # And when two claims genuinely DO share a fingerprint, neither is
+        # corroborated by the other's attempt.
+        attempts = [{"id": "V-0001", "command_identity": "pytest <arg>",
+                     "adjudication": "pass"}]
+        claims, _ = cowork_measure.join_claims_and_attempts(
+            [{"label": "one", "command": "pytest tests/alpha", "ok": True},
+             {"label": "two", "command": "pytest tests/beta", "ok": True}],
+            attempts)
+        for claim in claims:
+            self.assertEqual(claim["claim_state"], "ambiguous")
+            self.assertIn("Refused rather than guessed", claim["claim_reason"])
+
+    def test_a_piped_producer_status_is_not_read_as_a_pass(self):
+        # `pytest | tail` exits 0 when pytest fails, because the shell reports
+        # the LAST stage. Annotating that as PIPED while still counting the
+        # pass annotated the problem instead of preventing it.
+        block = {"type": "tool_result", "is_error": False,
+                 "content": [{"type": "text", "text": "FAILED (failures=3)"}]}
+        piped = cowork_ingest._claude_finish(
+            {"pipeline": True, "intent": "verify", "is_verification": True},
+            block, None, "2026-07-28T10:00:00Z")
+        self.assertIsNone(piped["exit_status"])
+        self.assertEqual(piped["adjudication"], "unknown")
+        # An unpiped run with the same output still reads its status.
+        direct = cowork_ingest._claude_finish(
+            {"pipeline": False, "intent": "verify", "is_verification": True},
+            block, None, "2026-07-28T10:00:00Z")
+        self.assertEqual(direct["exit_status"], 0)
+
+    def test_frozen_revisions_are_content_addressed_across_a_resume(self):
+        # `review_rounds` restarts at 0 in every fresh _role_loop, so naming a
+        # revision by phase/round/role alone made the first post-resume round
+        # reuse the PRE-resume `-r1-` bytes as its current evidence.
+        with tempfile.TemporaryDirectory() as d:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = d
+            self.addCleanup(self._restore_root, prior)
+            source = os.path.join(d, "verdict.json")
+            with open(source, "w") as fh:
+                json.dump({"verdict": "revise", "round": 1}, fh)
+            first = cowork._freeze_round_evidence("S", source, "building", 1,
+                                                  "builder")
+            # ...the session is resumed and round numbering restarts at 1.
+            with open(source, "w") as fh:
+                json.dump({"verdict": "approve", "round": "post-resume"}, fh)
+            second = cowork._freeze_round_evidence("S", source, "building", 1,
+                                                   "builder")
+            self.assertNotEqual(first, second)
+            with open(second) as fh:
+                self.assertIn("post-resume", fh.read())
+            with open(first) as fh:
+                self.assertNotIn("post-resume", fh.read())
+            # Re-freezing identical bytes is a no-op, so a seal stays true.
+            self.assertEqual(
+                cowork._freeze_round_evidence("S", source, "building", 1,
+                                              "builder"), second)
+
+    def test_the_chain_rotates_on_a_skipped_round(self):
+        # Under `sampled`, round 2 is not scored — but it is still the round
+        # immediately before round 3, and returning early left round 3 holding
+        # round 1 as its "prior feedback".
+        with tempfile.TemporaryDirectory() as d:
+            prior_root = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = d
+            self.addCleanup(self._restore_root, prior_root)
+            verdict = os.path.join(d, "verdict.json")
+            seen = []
+            for index in (1, 2, 3):
+                with open(verdict, "w") as fh:
+                    json.dump({"verdict": "revise", "round": index}, fh)
+                rotated = cowork._rotate_evidence_chain(
+                    "S", "builder", verdict, None, "building", index)
+                seen.append(rotated["prior"].get("round"))
+            # Round 3's prior is round 2, not round 1.
+            self.assertEqual(seen, [None, 1, 2])
+
+    def test_the_source_clock_fails_closed(self):
+        """An unreadable clock is not permission to promote."""
+        fresh = {"id": "V-1", "pipeline": False, "adjudication": "pass",
+                 "started_at": "2099-01-01T00:00:00Z"}
+        claim = {"label": "a", "claim_state": "corroborated",
+                 "corroborating_attempts": [fresh]}
+        for clock, needle in (
+                (None, "no source clock"),
+                (cowork_measure.SourceClock(state="paths_unavailable"),
+                 "paths_unavailable"),
+                (cowork_measure.SourceClock(state="no_sources"), "no_sources"),
+                (cowork_measure.SourceClock(state="unreadable"), "unreadable"),
+        ):
+            why = cowork_measure.blocks_readiness(claim, "m1",
+                                                  newest_mtime=clock)
+            self.assertIsNotNone(why, needle)
+            self.assertIn(needle, why)
+
+    def test_a_deleted_source_is_a_change_the_clock_must_notice(self):
+        # A deletion leaves no mtime behind, so skipping unreadable paths made
+        # it the one mutation an mtime maximum cannot see.
+        with tempfile.TemporaryDirectory() as d:
+            keep = os.path.join(d, "kept.py")
+            with open(keep, "w") as fh:
+                fh.write("x")
+            ok = cowork_measure.newest_source_mtime(d, ["kept.py"])
+            self.assertEqual(ok.state, "ok")
+            self.assertTrue(ok.usable)
+            self.assertEqual(ok.counted, 1)
+            gone = cowork_measure.newest_source_mtime(
+                d, ["kept.py", "deleted.py"])
+            self.assertEqual(gone.state, "missing_sources")
+            self.assertFalse(gone.usable)
+            self.assertIn("deleted.py", gone.missing)
+            # ...and a claim cannot promote against it.
+            claim = {"label": "a", "claim_state": "corroborated",
+                     "corroborating_attempts": [
+                         {"id": "V-1", "pipeline": False,
+                          "adjudication": "pass",
+                          "started_at": "2099-01-01T00:00:00Z"}]}
+            self.assertIn("missing_sources",
+                          cowork_measure.blocks_readiness(claim, "m1", gone))
+        # No paths at all is not "nothing changed" either.
+        self.assertEqual(
+            cowork_measure.newest_source_mtime(".", None).state,
+            "paths_unavailable")
+        self.assertEqual(
+            cowork_measure.newest_source_mtime(".", []).state, "no_sources")
+
+    def test_an_observed_digest_beats_clock_inference(self):
+        # The strongest provenance is cowork's own observation of which tree an
+        # attempt ran against; where it exists the gate uses it outright.
+        clock = cowork_measure.SourceClock(2_000_000_000.0)
+        stale_time = {"id": "V-1", "pipeline": False, "adjudication": "pass",
+                      "started_at": "1999-01-01T00:00:00Z",
+                      "observed_source_digest": "m1"}
+        claim = {"label": "a", "claim_state": "corroborated",
+                 "corroborating_attempts": [stale_time]}
+        # Observed against the promoted tree: promotes despite the old clock.
+        self.assertIsNone(cowork_measure.blocks_readiness(claim, "m1", clock))
+        # Observed against a DIFFERENT tree: refused, and says so.
+        other = {"label": "a", "claim_state": "corroborated",
+                 "corroborating_attempts": [
+                     dict(stale_time, observed_source_digest="other")]}
+        why = cowork_measure.blocks_readiness(other, "m1", clock)
+        self.assertIn("different tree", why)
+
+    def test_evidence_pending_is_not_evidence_absent(self):
+        # A controller flushes asynchronously, so a command that ran seconds
+        # ago can be briefly invisible. Calling that "no evidence" is
+        # indistinguishable from "it never ran" and invites re-running work
+        # that already succeeded. Neither promotes; they say different things.
+        claims, _ = cowork_measure.join_claims_and_attempts(
+            [{"label": "a", "command": "pytest tests/", "ok": True,
+              "ran_at_seconds": 1.0}], [], log_lag_seconds=5.0)
+        self.assertEqual(claims[0]["evidence_state"], "evidence_pending")
+        self.assertIn("PENDING", claims[0]["claim_reason"])
+        # Beyond the grace window it is genuinely absent.
+        claims, _ = cowork_measure.join_claims_and_attempts(
+            [{"label": "a", "command": "pytest tests/", "ok": True,
+              "ran_at_seconds": 1.0}], [],
+            log_lag_seconds=cowork_measure.LOG_FLUSH_GRACE_SECONDS + 1)
+        self.assertEqual(claims[0]["evidence_state"], "evidence_absent")
+        # Neither promotes.
+        for state in ("evidence_pending", "evidence_absent"):
+            self.assertIsNotNone(cowork_measure.blocks_readiness(
+                {"label": "a", "claim_state": "self_reported",
+                 "evidence_state": state}, "m1",
+                cowork_measure.SourceClock(1.0)))
+
+    def test_only_a_fresh_unpiped_corroborated_run_promotes(self):
+        """Nothing weaker than positive corroboration promotes readiness.
+
+        Old failures stay on the record — that is what "a failure is never
+        erased" requires — but they are not the evidence a promotion runs on.
+        """
+        # `started_at` AFTER the sources last changed is what makes a run
+        # fresh. A manifest supplied by the claim proves nothing about it.
+        fresh = {"id": "V-1", "pipeline": False, "adjudication": "pass",
+                 "started_at": "2099-01-01T00:00:00Z"}
+        # A clock BETWEEN the stale and fresh timestamps, so the two cases are
+        # genuinely discriminated (epoch 2e9 is 2033).
+        recent = 2_000_000_000.0
+        supports = {"label": "a", "ok": True, "source_manifest": "m1",
+                    "claim_state": "corroborated",
+                    "corroborating_attempts": [fresh]}
+        self.assertIsNone(cowork_measure.blocks_readiness(
+            supports, "m1", newest_mtime=recent))
+        rejected = [
+            # No evidence at all is the weakest case, not a tolerated one.
+            ({"claim_state": "self_reported"}, "no controller-log attempt"),
+            ({"claim_state": "ambiguous"}, "attributed to it specifically"),
+            ({"claim_state": "contradicted",
+              "contradiction_kind": "latest_run_disagrees"}, "does not "
+             "corroborate"),
+            # A piped run's status is the pipeline's, so it certifies nothing.
+            ({"claim_state": "corroborated",
+              "corroborating_attempts": [dict(fresh, pipeline=True)]},
+             "piped"),
+            ({"claim_state": "corroborated",
+              "corroborating_attempts": []}, "no attributable attempt"),
+            # A run that STARTED BEFORE the sources last changed did not run
+            # against the tree being promoted, whatever it claims.
+            ({"claim_state": "corroborated",
+              "corroborating_attempts": [dict(
+                  fresh, started_at="1999-01-01T00:00:00Z")]},
+             "before the sources last changed"),
+            # An attempt with no start time cannot be placed at all, which is
+            # a reason to refuse it rather than assume it is current.
+            ({"claim_state": "corroborated",
+              "corroborating_attempts": [{"id": "V-1", "pipeline": False,
+                                          "adjudication": "pass"}]},
+             "no start time"),
+        ]
+        for claim, needle in rejected:
+            why = cowork_measure.blocks_readiness(
+                dict(claim, label="a"), "m1", newest_mtime=recent)
+            self.assertIsNotNone(why, needle)
+            self.assertIn(needle, why, needle)
+        req = {"a": None}
+        self.assertEqual(
+            cowork._adjudicate_readiness(
+                [dict(supports)], "m1", req)[0], "verified")
+        self.assertEqual(
+            cowork._adjudicate_readiness(
+                [{"label": "a", "ok": True, "source_manifest": "m1",
+                  "claim_state": "self_reported"}], "m1", req)[0],
+            "unverified")
+
+    def test_the_latest_run_is_the_newest_one_not_the_last_listed(self):
+        """`observations_for` concatenates attempts ROLE BY ROLE, so the last
+        element of the matched list was the last attempt of the last role — not
+        the newest. A command run by two roles reported an old failure as its
+        most recent run while a newer passing run sat earlier in the list."""
+        attempts = [
+            # Newest, but listed first (it came from the earlier role).
+            {"id": "V-2", "command_identity": "pytest <arg>",
+             "command_fingerprint": "pytest", "adjudication": "pass",
+             "started_at": "2026-07-29T18:00:00Z"},
+            {"id": "V-1", "command_identity": "pytest <arg>",
+             "command_fingerprint": "pytest", "adjudication": "fail",
+             "started_at": "2026-07-29T09:00:00Z"},
+        ]
+        claims, _ = cowork_measure.join_claims_and_attempts(
+            [{"label": "a", "command": "pytest tests/", "ok": True}], attempts)
+        self.assertEqual(claims[0]["claim_state"], "corroborated")
+        # The older failure is still on the record, not erased.
+        self.assertIn("fail", claims[0]["log_adjudications"])
+
+    def test_a_relabelled_command_does_not_satisfy_the_inventory(self):
+        # A matching label SET proves only that the names line up; without
+        # checking the command a role could satisfy the inventory by
+        # relabelling something cheaper.
+        required = {"full suite": "pytest -q"}
+        state, _m, why = cowork._adjudicate_readiness(
+            [{"label": "full suite", "ok": True, "source_manifest": "m1",
+              "command": "echo ok"}], "m1", required)
+        self.assertEqual(state, "unverified")
+        self.assertIn("different command", why)
+        self.assertEqual(cowork._adjudicate_readiness(
+            [{"label": "full suite", "ok": True, "source_manifest": "m1",
+              "command": "pytest -q", "claim_state": "corroborated", "corroborating_attempts": [{"id": "V-1", "pipeline": False, "adjudication": "pass",
+                     "started_at": "2099-01-01T00:00:00Z"}]}], "m1", required)[0],
+            "verified")
+
+    def test_readiness_requires_the_plans_whole_inventory(self):
+        required = {"full suite": None, "preflight": None, "lint": None}
+        def _ok(label):
+            return {"label": label, "ok": True, "source_manifest": "m1",
+                    "claim_state": "corroborated", "corroborating_attempts": [{"id": "V-1", "pipeline": False, "adjudication": "pass",
+                     "started_at": "2099-01-01T00:00:00Z"}]}
+
+        green = [_ok("full suite"), _ok("preflight")]
+        state, _m, why = cowork._adjudicate_readiness(green, "m1", required)
+        self.assertEqual(state, "unverified")
+        self.assertIn("lint", why)
+        # With the whole inventory green on the promoted manifest: verified.
+        green.append(_ok("lint"))
+        self.assertEqual(
+            cowork._adjudicate_readiness(green, "m1", required)[0], "verified")
+
+    def test_readiness_fails_closed_on_every_ambiguity(self):
+        req = {"a": None}
+        cases = [
+            ([], "m1", "no verification entries"),
+            ([{"label": "a", "ok": False, "source_manifest": "m1"}], "m1",
+             "verification failed"),
+            # An entry describing no known tree used to be ignored entirely if
+            # some other entry carried a manifest.
+            ([{"label": "a", "ok": True},
+              {"label": "b", "ok": True, "source_manifest": "m1"}], "m1",
+             "no source_manifest"),
+            ([{"label": "a", "ok": True, "source_manifest": "m1"},
+              {"label": "b", "ok": True, "source_manifest": "m2"}], "m1",
+             "spans 2 source manifests"),
+            ([{"label": "a", "ok": True, "source_manifest": "m1",
+               "expected_test_count": 900, "observed_test_count": 5}], "m1",
+             "expected 900"),
+            # The log SAYS OTHERWISE: blocking.
+            ([{"label": "a", "ok": True, "source_manifest": "m1",
+               "claim_state": "contradicted",
+               "contradiction_kind": "latest_run_disagrees"}], "m1",
+             "does not corroborate"),
+            # An unattributable join is refused too: if two claims share a
+            # fingerprint, neither can be corroborated by the other's attempt.
+            ([{"label": "a", "ok": True, "source_manifest": "m1",
+               "claim_state": "ambiguous"}], "m1",
+             "attributed to it specifically"),
+            ([{"label": "a", "ok": True, "source_manifest": "m1"}], None,
+             "could not be hashed"),
+            ([{"label": "a", "ok": True, "source_manifest": "m1"}], "m2",
+             "tree moved"),
+        ]
+        for entries, claimed, needle in cases:
+            state, _m, why = cowork._adjudicate_readiness(entries, claimed, req)
+            self.assertEqual(state, "unverified", needle)
+            self.assertIn(needle, why or "", needle)
+
+    def test_tool_activity_groups_by_cowork_turn_not_per_call(self):
+        # Grouping by the controller's request id gave ~one bucket per call,
+        # because a controller opens a new request per tool result.
+        class _Result:
+            state = "ok"
+            mutations = []
+            tool_activity = [
+                {"intent": "verify", "started_at": "2026-07-28T10:00:05Z",
+                 "command_identity": "pytest"},
+                {"intent": "read", "started_at": "2026-07-28T10:00:07Z",
+                 "command_identity": "cat"},
+                {"intent": "verify", "started_at": "2026-07-28T10:00:09Z",
+                 "command_identity": "pytest"},
+                {"intent": "read", "started_at": "2026-07-28T11:00:00Z",
+                 "command_identity": "ls"},
+            ]
+
+        work = {"W1": {"started_at": "2026-07-28T10:00:00Z",
+                       "ended_at": "2026-07-28T10:00:30Z", "role": "builder"}}
+        activity = cowork_measure.tool_activity({"builder": _Result()}, work)
+        bucket = activity["builder"]
+        self.assertEqual(bucket["calls"], 4)
+        self.assertEqual(bucket["by_turn"]["W1"]["calls"], 3)
+        self.assertEqual(bucket["busiest_turn_calls"], 3)
+        # A call outside every window says so rather than inventing a turn.
+        self.assertEqual(bucket["by_turn"]["(unattributed)"]["calls"], 1)
+
+    def test_marginal_cost_actually_varies_by_disposition(self):
+        # The previous version computed cost*(count/total)/count, which reduces
+        # to cost/total — every disposition got an identical figure, so a
+        # per-disposition function could not vary by disposition at all.
+        work = {
+            # An EXPENSIVE round that produced one confirmed finding...
+            "W1": {"work_class": "review", "phase": "building", "round": 1,
+                   "duration_ms": 90000, "usage": {"input_tokens": 9000}},
+            # ...and a CHEAP round that produced one withdrawn finding.
+            "W2": {"work_class": "review", "phase": "building", "round": 2,
+                   "duration_ms": 1000, "usage": {"input_tokens": 100}},
+        }
+        records = [
+            {"id": "F-0001", "kind": "finding", "state": "open",
+             "disposition": "confirmed", "phase": "building", "round": 1},
+            {"id": "F-0002", "kind": "finding", "state": "open",
+             "disposition": "confirmed", "phase": "building", "round": 1},
+            {"id": "F-0003", "kind": "finding", "state": "withdrawn",
+             "phase": "building", "round": 2},
+        ]
+        out = cowork_measure.marginal_cost_per_finding(work, records)
+        per = out["per_disposition"]
+        confirmed = per["confirmed"]["usage"]["input_tokens"]
+        withdrawn = per["withdrawn"]["usage"]["input_tokens"]
+        # The expensive round's findings cost more. Under the old arithmetic
+        # these two were necessarily equal.
+        self.assertNotEqual(confirmed, withdrawn)
+        self.assertGreater(confirmed, withdrawn)
+        self.assertEqual(confirmed, 4500.0)   # 9000 split over 2 findings
+        self.assertEqual(withdrawn, 100.0)
+        # A disposition with no findings is unknown, never 0.
+        self.assertEqual(per["duplicate"]["usage"], cowork_measure.UNKNOWN)
+
+    def test_findings_from_uncosted_rounds_are_reported_unlinked(self):
+        records = [{"id": "F-0001", "kind": "finding", "state": "open",
+                    "disposition": "confirmed", "phase": "building",
+                    "round": 9}]
+        out = cowork_measure.marginal_cost_per_finding({}, records)
+        bucket = out["per_disposition"]["confirmed"]
+        self.assertEqual(bucket["usage"], cowork_measure.UNKNOWN)
+        self.assertEqual(bucket["unlinked_findings"], 1)
+
+    def test_the_wrapped_log_form_joins_to_the_bare_claim(self):
+        # THE defect: the log records what actually ran (redirection, pipe),
+        # the status records the bare command, and exact-identity matching
+        # could never join them — so a claim whose evidence was right there
+        # came back `self_reported`.
+        attempts = [{"id": "V-0001",
+                     "command_identity": cowork_ingest.sanitize_command(
+                         ".venv/bin/python -m unittest suite 2>&1 | tail -3"),
+                     "adjudication": "pass"}]
+        claims, _ = cowork_measure.join_claims_and_attempts(
+            [{"label": "full suite", "ok": True,
+              "command": ".venv/bin/python -m unittest suite"}], attempts)
+        self.assertEqual(claims[0]["claim_state"], "corroborated")
+        # An env prefix is not the program either.
+        self.assertEqual(
+            cowork_ingest.command_fingerprint("FOO=1 pytest tests/"),
+            cowork_ingest.command_fingerprint("pytest tests/"))
+        # ...but a genuinely different command still does NOT join.
+        self.assertNotEqual(
+            cowork_ingest.command_fingerprint("pytest tests/a"),
+            cowork_ingest.command_fingerprint("ruff check ."))
+
+    def test_builder_claims_are_joined_to_the_log(self):
+        attempts = [{"id": "V-0001", "command_identity": "pytest <arg>",
+                     "adjudication": "fail"},
+                    {"id": "V-0002", "command_identity": "ruff check <arg>",
+                     "adjudication": "pass"}]
+        claims, attempts = cowork_measure.join_claims_and_attempts([
+            {"label": "tests", "command": "pytest tests/", "ok": True},
+            {"label": "lint", "command": "ruff check .", "ok": True},
+            {"label": "typecheck", "command": "mypy src/", "ok": True},
+        ], attempts)
+        by_label = {c["label"]: c for c in claims}
+        # Claimed green, the log says it failed: CONTRADICTED, both retained.
+        self.assertEqual(by_label["tests"]["claim_state"], "contradicted")
+        self.assertTrue(by_label["tests"]["ok"])
+        self.assertIn("fail", by_label["tests"]["log_adjudications"])
+        self.assertEqual(by_label["lint"]["claim_state"], "corroborated")
+        # No attempt ran it: labelled, not rejected.
+        self.assertEqual(by_label["typecheck"]["claim_state"], "self_reported")
+
+    def test_a_fresh_join_clears_stale_unconfirmable_diagnostics(self):
+        command = "pytest tests/"
+        stale = {
+            "label": "tests",
+            "command": command,
+            "ok": True,
+            "claim_state": "contradicted",
+            "claim_reason": "The claim is UNCONFIRMED.",
+            "contradiction_kind": "unconfirmable",
+            "evidence_state": "evidence_present",
+            "log_adjudications": ["unknown"],
+            "log_attempt_ids": ["V-old"],
+            "corroborating_attempts": [{"id": "V-old"}],
+            "contradicting_attempts": [{"id": "V-old"}],
+        }
+        attempt = {
+            "id": "V-new",
+            "command_fingerprint": cowork_ingest.command_fingerprint(command),
+            "adjudication": "pass",
+            "exit_status": 0,
+            "started_at": "2026-07-29T20:00:00Z",
+        }
+        claims, _ = cowork_measure.join_claims_and_attempts(
+            [stale], [attempt])
+        refreshed = claims[0]
+        self.assertEqual(refreshed["claim_state"], "corroborated")
+        self.assertEqual(refreshed["log_adjudications"], ["pass"])
+        self.assertEqual(refreshed["log_attempt_ids"], ["V-new"])
+        self.assertEqual(
+            [a["id"] for a in refreshed["corroborating_attempts"]],
+            ["V-new"])
+        for field in ("claim_reason", "contradiction_kind",
+                      "contradicting_attempts"):
+            self.assertNotIn(field, refreshed)
+
+    def test_a_claims_expectation_reaches_its_attempt(self):
+        attempts = [{"id": "V-0001", "command_identity": "pytest <arg>",
+                     "adjudication": "pass", "exit_status": 0,
+                     "executed_count": 5}]
+        claims, attempts = cowork_measure.join_claims_and_attempts([
+            {"label": "tests", "command": "pytest tests/", "ok": True,
+             "purpose": "the suite stays green", "expected_test_count": 900,
+             "source_manifest": "abc123"}], attempts)
+        attempt = attempts[0]
+        # Ingestion cannot know why a command ran or what it had to prove; the
+        # builder declares that, and it is re-adjudicated against the log fact.
+        self.assertEqual(attempt["purpose"], "the suite stays green")
+        # Recorded as CLAIMED, never copied onto the attempt as if the log
+        # had observed it — that copy was the laundering.
+        self.assertEqual(attempt["claimed_source_manifest"], "abc123")
+        self.assertNotIn("source_manifest", attempt)
+        self.assertEqual(attempt["expected_test_count"], 900)
+        self.assertEqual(attempt["adjudication"], "fail")   # 5 < 900
+        # ORDER: claim truth is derived AFTER the expectation is applied, so a
+        # claim cannot stay `corroborated` while its own attempt fails.
+        self.assertEqual(claims[0]["claim_state"], "contradicted")
+        self.assertEqual(attempt["claim_state"], "contradicted")
+
+    def test_readiness_requires_every_check_green_on_one_manifest(self):
+        claims = cowork_measure.readiness_claims([
+            {"event": "role.readiness", "claimed_manifest": "a",
+             "verified_manifest": "a", "state": "verified"},
+            {"event": "role.readiness", "claimed_manifest": "a",
+             "verified_manifest": "b", "state": "unverified"}])
+        self.assertEqual(claims["unverified"], 1)
+
+    def test_the_source_manifest_covers_untracked_files(self):
+        # `git ls-files` alone was blind to every module this build ADDED,
+        # because a new file is untracked until someone commits it.
+        paths = cowork._source_paths_for_manifest()
+        self.assertTrue(paths)
+        for added in ("scripts/cowork_measure.py", "scripts/cowork_ingest.py",
+                      "scripts/cowork_eval.py", "roles/evaluator.md"):
+            self.assertIn(added, paths)
+
+    def test_milestones_and_readiness_are_recorded(self):
+        milestones = cowork_measure.build_milestones([
+            {"event": "role.milestone", "milestone_phase": "editing",
+             "ts": "2026-07-28T10:00:00Z", "role": "builder"},
+            {"event": "role.milestone", "milestone_phase": "verification",
+             "ts": "2026-07-28T10:05:00Z", "role": "builder"},
+            {"event": "role.milestone", "milestone_phase": "repair",
+             "ts": "2026-07-28T10:07:00Z", "role": "builder"}])
+        self.assertEqual([e["phase"] for e in milestones["events"]],
+                         ["editing", "verification", "repair"])
+        self.assertEqual(milestones["state"], "ok")
+        self.assertEqual(cowork_measure.build_milestones([])["state"],
+                         cowork_measure.UNKNOWN)
+        # Readiness claimed against a tree that moved since verification is
+        # recorded as unverified — not refused, but never counted as clean.
+        readiness = cowork_measure.readiness_claims([
+            {"event": "role.readiness", "role": "builder",
+             "claimed_manifest": "abc", "verified_manifest": "abc"},
+            {"event": "role.readiness", "role": "builder",
+             "claimed_manifest": "def", "verified_manifest": "abc"},
+            {"event": "role.readiness", "role": "builder",
+             "claimed_manifest": "abc", "verified_manifest": None}])
+        self.assertEqual([c["state"] for c in readiness["claims"]],
+                         ["verified", "unverified", "unverified"])
+        self.assertEqual(readiness["unverified"], 2)
