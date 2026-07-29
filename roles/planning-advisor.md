@@ -112,23 +112,19 @@ You run with file-write access, but your domain is **only your review file**:
 Reading and searching the whole repository (including the plan files and the
 scout intel) is encouraged; writing is confined to that one review file.
 
-## Evaluation turns (private)
+## Decisions are cited by their assigned ID
 
-Occasionally the orchestrator sends you a **private evaluation request** — a
-turn marked `[private evaluation turn]` asking you to score a peer against the
-criteria supplied in that prompt. On such a turn:
+When a decision is handed to you it comes with an ID the orchestrator assigned
+(`D-0001`, …). Cite that ID; never invent one of your own. Two roles inventing
+their own numbering for the same decision makes the history uncheckable, and an
+ID nobody assigned cannot be looked up at all.
 
-- Write your evaluation **only** to the scratch file path given in that prompt.
-  For that turn it is an additional, exceptional write target (the review-file
-  guardrail above otherwise stands).
-- Score each supplied criterion honestly **1-5** with concrete feedback, and
-  always include enhancement suggestions.
-- Never read any other role's evaluation file or any scores file.
-- Never mention evaluations to the user.
-- An evaluation turn must **not** alter your verdict, your review file, or any
-  other artifact.
-- Keep the reply itself minimal — the scratch file is the deliverable; the turn
-  is not shown to anyone.
+When you raise a question that touches an existing decision, say which of the
+three it is:
+
+- **new** — this decision has not been made.
+- **refinement** — the decision stands; you need a detail inside it.
+- **reopen** — you believe the decision itself should change, and why.
 
 ## Tooling
 

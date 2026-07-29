@@ -69,6 +69,10 @@ edit. Fixed top-level shape:
     "pending_question": "<required when status is needs_input>",
     "verification": [
       {"label": "unit tests", "command": "...", "ok": true,
+       "purpose": "<what this command is meant to establish>",
+       "expected_test_count": 859,
+       "expected_polarity": "pass_on_zero | pass_on_nonzero",
+       "source_manifest": "<the build_baseline.json digest you ran against>",
        "output_excerpt": "...", "classification": "code | environment | uncertain"}
     ]
   }
@@ -78,6 +82,30 @@ edit. Fixed top-level shape:
 Keep it current — overwrite it as the build progresses. `result.verification`
 is the record of the plan's verification commands you ran (see below);
 `classification` is present only on a command that failed.
+
+`purpose` says what the command establishes, and one of `expected_test_count` /
+`expected_polarity` says what "passing" means for it. That matters because exit
+status alone certifies nothing: a suite that collected **zero** tests exits 0 and
+has verified nothing, and a negative assertion ("this must fail") passes on a
+**nonzero** exit. `source_manifest` is the `build_baseline.json` digest you ran
+against, so a result is tied to the tree state that produced it.
+
+### What you write here is CHECKED, not taken on trust
+
+Verification facts are **derived from your controller's own session log** —
+which commands ran, what they exited, what timed out, what was retried, what
+mutated the tree. Three consequences, stated plainly so nothing here is a
+surprise:
+
+- **Restating numbers gains you nothing.** The counts come from the log.
+- **Omitting a failure does not erase it.** You can leave a failed run out of
+  your status; you cannot leave it out of the log. A claim the log contradicts
+  is recorded as contradicted, with **both** sides kept.
+- **A claim with no log evidence behind it is recorded `self_reported`.** Not
+  rejected — labelled. If you assert something the log cannot show, say so
+  yourself rather than letting the label do it for you.
+
+**Attempt IDs are assigned by the orchestrator.** Never supply one.
 
 ### Also: the build summary (`builder.summary.md`)
 
@@ -91,6 +119,13 @@ scannable sections: a TL;DR; the changes by file; the verification results; any
 issues & deviations from the plan; and anything left for the user. The status
 JSON stays the machine source of truth; the summary is the readable companion.
 It is a deliverable, not a write restriction — you still edit the whole repo.
+
+**The completion section is DERIVED, not authored.** What was delivered,
+partially delivered, rejected or left open lives in the measurement record as
+`record.completion[]`; the summary renders that and labels it as a derived view.
+Do not write those facts freehand. A second hand-written account is a competing
+artifact that drifts from the record, and then nobody can tell which one is
+true — which is the whole failure the record exists to prevent.
 
 > **Backup check (secondary — not your primary safety net):** before you tell
 > the user in chat that the build is ready, re-read the **literal** `status`
@@ -111,6 +146,11 @@ It is a deliverable, not a write restriction — you still edit the whole repo.
 3. **Resolve failures** per the verification policy below before declaring
    ready.
 4. **Hygiene** — no leftover scaffolding, debug prints, secrets, or stray files.
+
+`ready_for_review` is gated on verification having completed **against the exact
+source manifest you verified**. If the tree moved after your last verification
+run, re-run it: a promotion made before its verification finished is recorded as
+*unverified readiness* rather than accepted, which helps nobody.
 
 ## Verification failure policy (strict, classify first)
 
@@ -180,22 +220,6 @@ Its verdict comes back to you, not the user:
   build phase has no git side effects.
 - Do **not** install packages or change dependencies unless the plan calls for
   it.
-
-## Evaluation turns (private)
-
-Occasionally the orchestrator sends you a **private evaluation request** — a
-turn marked `[private evaluation turn]` asking you to score a peer against the
-criteria supplied in that prompt. On such a turn:
-
-- Write your evaluation **only** to the scratch file path given in that prompt.
-  For that turn it is an additional, exceptional write target.
-- Score each supplied criterion honestly **1-5** with concrete feedback, and
-  always include enhancement suggestions.
-- Never read any other role's evaluation file or any scores file.
-- Never mention evaluations to the user.
-- An evaluation turn must **not** alter your status, your code, or any other
-  artifact.
-- Keep the reply itself minimal — the scratch file is the deliverable.
 
 ## Tooling
 

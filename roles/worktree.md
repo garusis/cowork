@@ -82,3 +82,15 @@ artifact accurately, and only claim `ready` once the worktree truly exists.
   when it is not, write it in normal prose. This NEVER changes the status
   artifact format — the required JSON is unchanged. Do not invoke /caveman or
   change any global level.
+
+## The build baseline
+
+When the building phase starts, cowork records what the build began from as a
+**per-file content manifest**, `build_baseline.json` — every tracked file with
+its SHA-256 and size — alongside the human-readable `build_baseline.txt` (the
+HEAD sha and a dirty flag).
+
+The manifest is what build and review metrics are measured against, not HEAD.
+A session that starts from a dirty worktree has no commit describing its
+starting point, so measuring the delta against HEAD would attribute whatever was
+already uncommitted to the builder.

@@ -305,8 +305,9 @@ echo "the brief" | ./cowork --team scout --context-file -
 - `--no-session` — do not read or write the session store.
 - `--switch-controller ROLE=CONTROLLER` — update one current-phase role in an
   existing saved session to `claude`, `codex`, or `opencode`, then continue
-  that session. A switch resets the role's model/effort pins (they are
-  controller-specific). Examples:
+  that session. **Repeatable**: every switch in one invocation is applied as a
+  single all-or-nothing update. A switch resets the role's model/effort pins
+  (they are controller-specific). Examples:
 
   ```bash
   ./cowork --switch-controller planner=codex
@@ -320,6 +321,12 @@ echo "the brief" | ./cowork --team scout --context-file -
   interactively. `--switch-controller` requires saved team/config state and
   cannot be combined with `--team`, `--config`, `--new`, `--no-session`,
   `--check`, or `--report`.
+- `--allow-controllers LIST` — restrict a saved session to the named controllers
+  (`--allow-controllers claude,codex`), or lift an existing restriction with
+  `--allow-controllers all`. Combines with `--switch-controller`; the policy
+  change and every role move are validated and persisted together before
+  anything resumes. Same conflict rules as `--switch-controller`. See
+  [Controller policy](#controller-policy).
 - `--worktree [NAME]` / `--wt [NAME]` — before scouting, spin up a small agent
   that creates a git **worktree** for the launch repo and runs the rest of the
   session inside it. The agent follows the repo's documented worktree
@@ -435,9 +442,15 @@ progress, cowork can switch that role to the other controller and keep the
 session moving. The cowork phase, artifacts, shared context, review baselines,
 epochs, and working tree stay in place. The provider conversation itself starts
 fresh because Claude and Codex do not expose a shared hidden-chat migration path;
-cowork seeds the new controller with an explicit handoff packet containing the
-current phase, role, shared context, relevant artifact paths and contents, and
-the failed pending turn when there was one.
+cowork seeds the new controller with an explicit handoff packet.
+
+That packet is **file-only**. Only content-free routing facts travel inline — the
+phase, the role, the from/to controllers, and a normalized reason/source code
+when one exists. Everything with a body is carried **by file path**, for the
+switched role to read from disk itself: the shared session context, the relevant
+session artifacts, any free-form recovery/diagnostic text, and the failed pending
+turn when there was one. No artifact bodies, context text, or turn contents are
+pasted into the packet.
 
 The switch option appears at these recovery points:
 
@@ -463,6 +476,78 @@ V1 is manual only. There is no automatic rate-limit failover, no migration of
 hidden Claude/Codex conversation history, and no guarantee that switching back
 later resumes the exact old provider session id; the saved role entry records one
 active controller/id pair at a time.
+
+### Controller policy
+
+A session can declare **which controllers it is allowed to use at all**. The
+allowed set is saved with the session. A session with **no** policy is
+**unrestricted** and behaves exactly as every session saved before this feature
+existed — nothing changes until you set one.
+
+```bash
+# restrict this session, and move both current-phase roles in the same command
+./cowork --allow-controllers claude,codex \
+         --switch-controller builder=codex \
+         --switch-controller build-reviewer=claude
+
+# lift the restriction again
+./cowork --allow-controllers all
+```
+
+`--switch-controller` is **repeatable**, and `--allow-controllers all` removes
+the restriction entirely (the session file goes back to its pre-feature shape).
+
+**A switch without `--allow-controllers` never changes the allowed set.** It is
+still checked *against* it — moving a role to a controller the session forbids is
+rejected — but the saved allowed list is left byte-for-byte as it was. The mirror
+also holds: a policy change never reassigns a role on its own.
+
+The interactive equivalent is **"Change this session's controllers"**, the third
+entry in the resume-or-new menu. It lets you pick the allowed set and remap the
+current phase's roles, ending in one confirmation. It goes through the same code
+path as the flags, so the same request produces the same saved session either
+way — including the case where you confirm without touching the pre-checked
+boxes, which leaves the policy untouched exactly like the plain switch command.
+
+**Ordering and the all-or-nothing guarantee.** cowork validates the whole
+proposal first — the allowed set, every role move, and whether the current phase
+would still be compliant — then checks that the target controllers are installed
+and working (only ever checking controllers that will be permitted once the
+command finishes), then persists the policy and every role move as one
+**single write**. The whole update completes **before anything resumes**: no role is
+dispatched until that one write has landed. If any part of the proposal is wrong
+you get one clear message, a non-zero exit, and a session file that is
+untouched — the update is **all-or-nothing**.
+
+**Current phase vs. the rest.** Roles in the **current phase** must comply in the
+same command — a role left on a now-forbidden controller is a hard error telling
+you to add the matching `--switch-controller`. Roles from finished phases are
+only reported as a **warning**, left exactly as they are, and blocked if they are
+ever reached.
+
+From then on every attempt to start a controller consults the policy first, for
+leads, paired reviewers, resumes, recovery relaunches and the `--worktree` agent
+alike. A blocked attempt never starts the process — not even a probe or an
+opencode agent-file write — and prints which role wanted which controller and
+what the session allows. Under `--headless` it exits cleanly instead of waiting
+for a human.
+
+**Recovery gates** stop offering a vague "alternate controller" on a session that
+carries a policy and list the specific controllers it still permits. When the
+policy leaves **no eligible controller**, the switch option disappears and the
+reason is stated; retry and end remain.
+
+**If a saved policy is unreadable** — a bad hand-edit, a half-written file —
+cowork stops before starting anything rather than treating a damaged restriction
+as no restriction. It names the session file and the two repairs: re-run with
+`--allow-controllers` (which replaces the policy outright and continues), or
+remove the `controller_policy` field from the session file by hand. Read-only
+commands (`--check`, `--report`) keep working throughout.
+
+Every policy change, rejected update, unreadable policy and blocked dispatch is
+recorded in the [orchestration trace](#orchestration-trace) as
+`controller.policy.change`, `controller.policy.rejected`,
+`controller.policy.invalid` and `controller.dispatch.blocked`.
 
 ### Orchestration trace
 
@@ -508,6 +593,165 @@ evaluatee tool+model (per-criterion averages), evaluation cost per evaluator
 tool+model (shared turns deduped), average score by verdict, and — from the
 trace — total turns + token usage per role/tool/model. Entries written before
 schema 2 still aggregate; they simply fold into `(unknown)` identity buckets.
+
+## Measurement
+
+Cowork can tell you how many tokens a session burned. The measurement layer
+tells you what that money bought — and, where it genuinely cannot know, says so
+instead of printing zero.
+
+### One authoritative record; the report is its rendering
+
+`measurement.json` in the session directory is the authority. Everything else
+derives from it:
+
+- `cowork --report` prints a rendering of the record.
+- `cowork --report --json` prints the record itself.
+- `builder.summary.md`'s completion section is a labelled derived view of
+  `record.completion[]` — there is deliberately no second hand-written account
+  to drift from it.
+
+**Building and printing are separate jobs.** The record is built from the raw
+sources (trace, scores, identities, ledger, controller logs) at known moments —
+every phase transition, session end, and session start — and is authoritative
+once written. The printer only ever loads and prints it; it performs no
+arithmetic, and passing it a file path raises rather than being loaded.
+
+A **third, separate step** hashes the raw sources and warns you above the report
+when they have moved on since the record was built. It produces no number and
+never feeds the printer, which is what lets "the report computes nothing" stay
+literally true while a stale record still warns you. A stale record still renders
+the RECORD's values under that banner — reporting stale-but-authoritative numbers
+with a warning is honest; silently recomputing them is not.
+
+`cowork --report --rebuild` refreshes the record on demand. A report never
+rebuilds implicitly.
+
+### Where the money went
+
+Cost splits into **exclusive classes** — productive, review, evaluation,
+verification, recovery, probe, in-flight, failed, cancelled — that reconcile
+against the turns' own reported usage, with any leftover named explicitly rather
+than hidden inside a total.
+
+Every controller turn, probe and evaluation carries a stable `work_id` joining
+its start to its end, plus its class, duration and a canonical identity. So an
+in-flight, failed or cancelled turn is recorded as what it is instead of
+vanishing, and a turn still running reports its duration as `unknown` rather than
+as 0.
+
+**A resumed Codex turn reports what that turn cost**, not the thread's running
+total. Codex's counters are cumulative, so a resumed turn re-reported every
+earlier turn's tokens; cowork differences them into the turn's own share and
+keeps the provider's raw counters untouched alongside as `usage_native`. If the
+cumulative reading ever moves backwards there is no honest per-turn figure, and
+the turn is marked `incomparable` rather than clamped to something plausible.
+
+### Evidence comes from the controllers' logs
+
+Cowork does not run the agents' commands, so it takes tool and verification facts
+from Claude's and Codex's own session logs rather than from agent prose. An agent
+that omits a failure cannot omit it from the log.
+
+The reader is **strictly read-only** — every ingested file's content digest is
+taken before and after the read and recorded, so the property is evidence rather
+than a promise — and **fallible**: a log that is missing, unreadable, truncated
+or in an unrecognised format yields `unknown`, never a guess and never a broken
+run. A run with every controller log deleted mid-flight still completes.
+
+What this buys you:
+
+- A test run that executed **zero tests** fails its check even though it exited
+  0. Exit status alone certifies nothing.
+- A red run **stays red** after a later green one. The later run is a different
+  attempt; it does not close the earlier one.
+- A run that **timed out** is `unresolved` — terminal, and never closed by a
+  later pass, so "re-run until it passes" cannot launder a hang into a pass.
+- A claim an agent made with nothing in the log behind it is labelled
+  `self_reported`; a claim the log contradicts keeps **both** sides.
+
+Extraction is content-free: commands are reduced to a sanitized identity (the
+program and its option-shaped arguments), outputs to counters and flags.
+
+### The ledgers
+
+Findings, decisions, human amendments, escaped defects and verification attempts
+all get their IDs from **one writer**, `cowork_ledger`. No agent-supplied id is
+ever accepted, and the record builder never writes — so printing a report ten
+times leaves `ledger.jsonl` byte-identical.
+
+The ledger is **append-only**. A later record may add or supersede; it may never
+rewrite or delete. A withdrawn finding survives as withdrawn, because retracting
+a false finding is good work and erasing it would make it indistinguishable from
+never having looked.
+
+Verification attempts arrive by **reconciliation**: ingestion emits id-free
+observations keyed on `(controller_session_id, tool_call_id)`, and reconciliation
+mints an id for each key it has not seen. Replaying the same log appends nothing
+the second time.
+
+### Scoring stays out of the way
+
+Evaluation runs in **isolated sessions** that have never touched the work and can
+only read the files they were given, on the same controller and model as the seat
+they occupy (collapsing them onto one controller would break comparability with
+sessions already recorded).
+
+It is also **deferred**. The moment a reviewer's verdict is written and
+validated, cowork seals an evidence envelope, drops it in a durable queue, and
+hands the fix straight back — the round never waits for scoring. The queue drains
+at phase end, at session end, and at the next start for anything a crash left
+pending. Before a score counts, the seal is re-checked: evidence that changed
+while the entry sat in the queue is marked `unverifiable` rather than re-hashed
+to whatever the file says now.
+
+Sealing **after** the verdict exists is also the structural fix for evidence
+binding: a digest can no longer be taken before the evidence it describes.
+
+`--evaluation-policy` takes `all_rounds` (the default), `final_round`, `sampled`
+or `off`, and the overhead of the choice is reported as its own cost class, so
+the choice can be made from data.
+
+### Missing data reads as missing
+
+These are real values, not absences, and none of them is ever coerced to 0 or
+ranked:
+
+| value | means |
+| --- | --- |
+| `unknown` | no source for this figure |
+| `incomparable` | the provider's counters cannot yield an honest per-turn figure |
+| `not_applicable` | the criterion cannot apply here (round-1 responsiveness has no prior feedback) |
+| `insufficient_evidence` | the evaluator could not judge from what it was given |
+| `self_reported` | an agent claimed it; the log does not show it |
+| `unverifiable` | the evidence changed, or a cited record never existed |
+| `unpriced` | no price for this model in the pricing snapshot |
+
+`not_applicable` and `insufficient_evidence` are first-class scores. A criterion
+that does not parse is recorded as `insufficient_evidence` rather than dropped —
+dropping it shrank the denominator, so the criteria an evaluator *could* judge
+looked like the whole picture.
+
+**Pricing ships as a schema with an empty snapshot.** Real prices baked into a
+repository are stale by construction, so by default every model resolves to
+`unpriced` and nothing claims to be money. Every cost field carries the schema
+version and snapshot id that produced it.
+
+### Time
+
+Productive, review, evaluation, verification, recovery and **time spent waiting
+on you** are shown separately. The waiting figure comes from timing every prompt
+that actually blocks on a human — all six of them, from the team menu to the
+approval gates — and never from guessing at gaps between events. A gap is equally
+an ingestion stall, a controller hang or a suspended process; it is not evidence
+of a person.
+
+### Old sessions
+
+Sessions recorded before this layer existed still report. They say plainly which
+records they predate: turn ids are synthesized (and labelled as such), user-wait
+is `unknown` rather than inferred, and every gap is listed in `record.incomplete[]`
+with its reason.
 
 ### Context revisions
 
@@ -627,25 +871,25 @@ saved and resumed on every pass and across cowork resumes, and it participates i
 [context revisions](#context-revisions) — a resumed reviewer that hasn't seen the
 latest `--context` gets it as an explicit update block on its next pass.
 
-### The review gate (Approve & finish / Ask a question / Request changes / Stop)
+### The review gate (Ask a question / Request changes / Approve & finish / Stop)
 
 Every interactive review gate spells out the consequence of each choice **as a
 label**, before you pick it, so nothing is a surprise. The approve wording is
 phase- and team-aware: the word **finish** appears only when approval actually
 ends the run.
 
-When the scout marks its intel — or the planner its plan — `ready_for_review`,
-the gate gives you these choices:
+**Approve is never the highlighted choice**, and nothing approves by omission —
+see [Gates ignore input typed before they were
+ready](#gates-ignore-input-typed-before-they-were-ready) below.
 
-- **Approve** — accept the work. With a downstream role on the team the label
-  previews the transition (**continue to planning** at the scout gate when a
-  planner is on the team, **continue to building** at the planner gate when a
-  builder is on the team); otherwise it reads **Approve & finish** and names the
-  deliverable (intel or plan).
-- **Ask a question** — put a plain question to the role. It answers
-  conversationally in chat and **leaves the artifact exactly as it is** (the
-  label reads "the intel/plan stays as-is"): no edit, no status flip, and —
-  because nothing changed on disk — no re-review (the
+When the scout marks its intel — or the planner its plan — `ready_for_review`,
+the gate gives you these choices, in this order:
+
+- **Ask a question** — the highlighted choice, because it changes nothing. Put a
+  plain question to the role. It answers conversationally in chat and **leaves
+  the artifact exactly as it is** (the label reads "the intel/plan stays
+  as-is"): no edit, no status flip, and — because nothing changed on disk — no
+  re-review (the
   [hash-gate](#reviewer-skip-on-unchanged-artifacts-hash-gate) skips the paired
   reviewer). You land right back at the same gate, so you can ask as many
   questions as you like for free before approving or requesting changes. If a
@@ -653,13 +897,26 @@ the gate gives you these choices:
   reopen — and then a re-review is correct.
 - **Request changes** — the role revises and you'll be asked for feedback; the
   label names the resuming role ("the scout/planner/builder revises").
-- **Stop** — a non-default choice that exits the phase cleanly **without
-  approving and without requesting changes** (see the Stop wording below).
+- **Approve** — accept the work. With a downstream role on the team the label
+  previews the transition (**continue to planning** at the scout gate when a
+  planner is on the team, **continue to building** at the planner gate when a
+  builder is on the team); otherwise it reads **Approve & finish** and names the
+  deliverable (intel or plan).
+- **Stop** — the last choice; exits the phase cleanly **without approving and
+  without requesting changes** (see the Stop wording below).
 
-The **builder** gate is a 3-way select on a TTY. **Approve & finish** previews
-finishing so you can review your working tree; **Request changes** has the
-builder revise from your feedback; **Stop** exits cleanly. It has no "Ask a
-question" choice.
+The **builder** gate is a 3-way select on a TTY, in the order **Request
+changes** / **Approve & finish** / **Stop**: Request changes (the highlighted
+choice) has the builder revise from your feedback; Approve & finish previews
+finishing so you can review your working tree; Stop exits cleanly. It has no
+"Ask a question" choice. On the preview-less compatibility path the gate is a
+plain **Approve & finish?** confirm, which now defaults to **No**, so pressing
+Return alone never approves.
+
+**Feedback is never a sign-off.** If you pick Request changes and then submit
+nothing — a blank line, whitespace only, a cancelled editor, or end-of-input —
+you land back at the gate rather than finishing, exactly like a blank question
+has always behaved. The only way to approve is to choose approve.
 
 When the reviewer's round cap is reached without approval, the **dissent** gate
 offers four choices, with continued iteration as the safe default.
@@ -685,6 +942,50 @@ iterating".
 Off a TTY (scripted/non-interactive runs) the historical contract is unchanged
 and there is no Stop choice: a blank line finishes, any other text requests
 changes. The question path is scoped to the scout and planner gates only.
+
+### Gates ignore input typed before they were ready
+
+A role turn can run for minutes, and anything you type while it runs goes
+nowhere: it is **discarded**, always. A gate becomes active only once it has
+finished drawing, and only what you type *after* that can select anything.
+
+**Whenever cowork sees that input waiting**, the gate shows a short notice
+telling you input was ignored and should be entered again. The notice carries no
+trace of what you typed — **at most a count** of how many characters arrived.
+cowork never reads that input, never keeps it, never records it in the trace,
+and never replays it into a later prompt.
+
+Even that count is best-effort: cowork asks the operating system how many bytes
+are waiting rather than looking at them, and on a terminal that cannot answer
+the question the notice simply appears without a number. Nothing else changes —
+the input is discarded either way. The same applies to the private trace record,
+which carries the gate name and the count when there is one, and no count at all
+when there isn't.
+
+What your **terminal** does with it is a separate matter. While a role turn is
+running there is no cowork editor attached, so the terminal echoes your
+keystrokes itself and they stay on screen. Seeing your text sitting there does
+not mean cowork received it — it didn't, and it never will. Type it again at the
+gate.
+
+The discarding is absolute; the notice is best-effort. cowork checks the input
+queue and then clears it, and those two steps cannot be made one operation, so a
+keystroke landing in the sliver between them is **still discarded and still
+cannot select anything** — it just goes unmentioned. cowork never warns
+speculatively either, so a notice you do see always refers to input that really
+was queued.
+
+Two cases deliberately fail safe rather than proceeding. If cowork cannot clear
+the leftover input at all — the terminal's own queue, the editor library's
+replay buffer, or the open widget's key buffers — it says so and **refuses to
+run the gate**, because it can no longer tell old keystrokes from new ones, and
+the phase ends without approving. The same happens if input keeps arriving
+through several re-opens. The session stays resumable in both cases.
+
+There is no environment variable and no flag that turns any of this off.
+
+Pasting into an **open** answer box is unaffected: a multi-line paste still
+lands whole as text and still needs an explicit Enter.
 
 ### Reviewer skip on unchanged artifacts (hash-gate)
 
@@ -853,12 +1154,13 @@ Each turn, cowork streams the reply, then reads the intel `status`:
   `reviewed: approved`, `reviewed: changes requested`, or
   `reviewed: needs user input` marker; see
   [The scout-reviewer role](#the-scout-reviewer-role)), then cowork shows the
-  [review gate](#the-review-gate-approve--finish--ask-a-question--request-changes--stop)
-  (**Approve & finish / Ask a question / Request changes / Stop**): approve
+  [review gate](#the-review-gate-ask-a-question--request-changes--approve--finish--stop)
+  (**Ask a question / Request changes / Approve & finish / Stop**): approve
   ends the session; a question is answered in chat for free (no intel edit, no
   re-review); requesting changes sends another turn so you keep refining; and
-  Stop exits without approving. Off a terminal the historical blank=finish /
-  text=revise contract is unchanged.
+  Stop exits without approving. Approve is never the highlighted choice and
+  blank feedback re-opens the gate rather than finishing. Off a terminal the
+  historical blank=finish / text=revise contract is unchanged.
 
 **Input.** On a terminal each turn is a prompt_toolkit multiline editor: real line
 editing (arrow keys, word-jump, paste, history) and multiline answers. A dim hint
@@ -888,7 +1190,10 @@ piped/scripted runs fall back to plain text and `readline`.
 |   |-- planner.md              # planner role spec (dual plan artifacts + hand-back contract)
 |   |-- planning-advisor.md     # planning-advisor role spec (plan critique + verdict schema)
 |   |-- builder.md              # builder role spec (executes the plan + verification policy + hand-back)
-|   `-- build-reviewer.md       # build-reviewer role spec (working-tree diff critique + verdict schema)
+|   |-- build-reviewer.md       # build-reviewer role spec (working-tree diff critique + verdict schema)
+|   `-- evaluator.md            # isolated evaluator role spec (scores from a sealed evidence envelope only)
+|-- pricing
+|   `-- snapshot.json           # pricing snapshot (ships EMPTY: everything resolves to `unpriced`)
 `-- scripts
     |-- cowork.py               # entry flow (questionary menus + args path) + phase loop + role orchestration
     |-- cowork_bridge.py        # flag assembly, stream-json framing, codex resume, probe
@@ -896,6 +1201,13 @@ piped/scripted runs fall back to plain text and `readline`.
     |-- cowork_preflight.py     # Python-version + pip-package + controller PATH checks
     |-- cowork_trace.py         # private JSONL orchestration trace writer
     |-- cowork_state.py         # .cowork/session.json store (config, phase, session ids, context revisions, verdicts)
+    |-- cowork_measure.py       # builds the AUTHORITATIVE measurement record; the only reader of raw sources
+    |-- cowork_report.py        # PURE renderer of that record (computes nothing; refuses a raw source)
+    |-- cowork_ingest.py        # read-only, fallible ingestion of the controllers' own session logs
+    |-- cowork_ledger.py        # the sole writer of ledger.jsonl and sole minter of stable IDs
+    |-- cowork_eval.py          # evaluation policy, sealed envelopes, the durable queue, isolation
+    |-- cowork_pricing.py       # versioned normalization + pricing schema and snapshot loader
+    |-- fixtures/measurement/   # the five criterion fixture sessions + fake controller logs
     `-- test_cowork.py          # unit + live integration tests
 ```
 
