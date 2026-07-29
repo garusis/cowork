@@ -1,0 +1,7 @@
+{"payload": {"cli_version": "0.0.0-fixture", "cwd": "/fixture", "id": "T-c3", "session_id": "T-c3"}, "timestamp": "2026-07-28T12:10:00Z", "type": "session_meta"}
+{"payload": {"turn_id": "turn-1", "type": "task_started"}, "timestamp": "2026-07-28T12:10:01Z", "type": "event_msg"}
+{"payload": {"call_id": "cx_red", "input": "{\"cmd\":\"python -m unittest suite\"}", "name": "exec", "type": "custom_tool_call"}, "timestamp": "2026-07-28T12:10:02Z", "type": "response_item"}
+{"payload": {"call_id": "cx_red", "output": [{"text": "Script failed\nWall time 7.0 seconds\nOutput:\nRan 12 tests\nFAILED (failures=2)", "type": "input_text"}], "type": "custom_tool_call_output"}, "timestamp": "2026-07-28T12:10:09Z", "type": "response_item"}
+{"payload": {"call_id": "cx_zero", "input": "{\"cmd\":\"pytest tests/empty\"}", "name": "exec", "type": "custom_tool_call"}, "timestamp": "2026-07-28T12:10:10Z", "type": "response_item"}
+{"payload": {"call_id": "cx_zero", "output": [{"text": "Script completed\nWall time 1.0 seconds\nOutput:\ncollected 0 items", "type": "input_text"}], "type": "custom_tool_call_output"}, "timestamp": "2026-07-28T12:10:12Z", "type": "response_item"}
+{"timestamp": "2026-07-28T12:20:99Z", "type": "event_ms

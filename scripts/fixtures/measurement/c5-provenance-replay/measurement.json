@@ -1,0 +1,104 @@
+{
+  "built_at": "2026-07-28T14:30:00Z",
+  "built_from": {
+    "trace": {
+      "bytes": 0,
+      "lines": 4,
+      "sha256": "stale-on-purpose",
+      "state": "ok"
+    }
+  },
+  "completion": [
+    {
+      "evidence": [
+        "record.cost.by_class"
+      ],
+      "item": "measurement foundation",
+      "reason": null,
+      "state": "delivered"
+    }
+  ],
+  "cost": {
+    "by_class": {
+      "productive": {
+        "duration_ms": 70000,
+        "duration_unknown_turns": 0,
+        "turns": 7,
+        "usage": {
+          "input_tokens": 700
+        }
+      }
+    },
+    "classified_total": {
+      "input_tokens": 700
+    },
+    "incomparable": {
+      "turns": 0,
+      "work_ids": []
+    },
+    "reconciled": true,
+    "turn_total": {
+      "input_tokens": 700
+    },
+    "turns_with_native_counters": 7,
+    "unclassified": {
+      "turns": 0,
+      "work_ids": []
+    },
+    "unreconciled": {}
+  },
+  "duration": {
+    "by_class": {
+      "productive_ms": 70000,
+      "turns_with_unknown_duration": 0,
+      "user_wait_ms": 0
+    },
+    "user_wait_spans": [],
+    "user_wait_unresolved": []
+  },
+  "enhancements": {},
+  "evaluation_queue": {
+    "pending": 0,
+    "pending_entries": []
+  },
+  "findings": {
+    "by_severity": {},
+    "confirmed": 0,
+    "open": 0,
+    "superseded": 0,
+    "total": 0,
+    "withdrawn": 0
+  },
+  "identities": {},
+  "incomplete": [],
+  "ingestion": {},
+  "input_sources": {
+    "attributed_input_tokens": 700,
+    "incomparable_turns": 0,
+    "measured_bytes": {},
+    "measured_bytes_total": 0,
+    "note": "fixture",
+    "provider_token_axes": {},
+    "unattributed_input_tokens": 0
+  },
+  "ledger": {},
+  "orphan_ends": [],
+  "pricing": {
+    "by_model": {},
+    "captured_at": null,
+    "note": "fixture",
+    "priced_turns": 0,
+    "schema_version": 1,
+    "snapshot_id": "empty",
+    "unpriced_turns": 7
+  },
+  "replay": [],
+  "schema_version": 1,
+  "score_cohorts": {},
+  "session": "c5-provenance-replay",
+  "trace_summary": {
+    "turn_count": 7
+  },
+  "verification_attempts": [],
+  "work": {}
+}

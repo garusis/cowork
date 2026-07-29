@@ -1,0 +1,9 @@
+{"payload": {"cli_version": "0.0.0-fixture", "cwd": "/fixture", "id": "T-c3", "session_id": "T-c3"}, "timestamp": "2026-07-28T12:10:00Z", "type": "session_meta"}
+{"payload": {"turn_id": "turn-1", "type": "task_started"}, "timestamp": "2026-07-28T12:10:01Z", "type": "event_msg"}
+{"payload": {"call_id": "cx_red", "input": "{\"cmd\":\"python -m unittest suite\"}", "name": "exec", "type": "custom_tool_call"}, "timestamp": "2026-07-28T12:10:02Z", "type": "response_item"}
+{"payload": {"call_id": "cx_red", "output": [{"text": "Script failed\nWall time 7.0 seconds\nOutput:\nRan 12 tests\nFAILED (failures=2)", "type": "input_text"}], "type": "custom_tool_call_output"}, "timestamp": "2026-07-28T12:10:09Z", "type": "response_item"}
+{"payload": {"call_id": "cx_zero", "input": "{\"cmd\":\"pytest tests/empty\"}", "name": "exec", "type": "custom_tool_call"}, "timestamp": "2026-07-28T12:10:10Z", "type": "response_item"}
+{"payload": {"call_id": "cx_zero", "output": [{"text": "Script completed\nWall time 1.0 seconds\nOutput:\ncollected 0 items", "type": "input_text"}], "type": "custom_tool_call_output"}, "timestamp": "2026-07-28T12:10:12Z", "type": "response_item"}
+{"payload": {"call_id": "cx_patch", "changes": {"/fixture/a.py": {"type": "modify"}}, "success": true, "turn_id": "turn-1", "type": "patch_apply_end"}, "timestamp": "2026-07-28T12:10:13Z", "type": "event_msg"}
+{"payload": {"info": {"last_token_usage": {"input_tokens": 400, "output_tokens": 60}, "total_token_usage": {"input_tokens": 400, "output_tokens": 60}}, "type": "token_count"}, "timestamp": "2026-07-28T12:10:20Z", "type": "event_msg"}
+{"payload": {"turn_id": "turn-1", "type": "task_complete"}, "timestamp": "2026-07-28T12:10:21Z", "type": "event_msg"}

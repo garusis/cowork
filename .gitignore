@@ -4,3 +4,13 @@
 .venv
 .worktrees
 .opencode
+
+# Measurement fixtures: the INPUTS are checked in, the records they produce are
+# not. A committed record could go stale and mask a real change in the builder —
+# the exact failure the c5-provenance-replay fixture exists to detect. Its
+# record is the one deliberate exception (it must disagree with its own trace).
+scripts/fixtures/measurement/*/measurement.json
+!scripts/fixtures/measurement/c5-provenance-replay/measurement.json
+scripts/fixtures/measurement/c1-turn-lifecycle/ledger.jsonl
+scripts/fixtures/measurement/c3-controller-log/ledger.jsonl
+scripts/fixtures/measurement/c4-*/ledger.jsonl

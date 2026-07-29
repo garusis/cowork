@@ -1,0 +1,12 @@
+{
+  "build-reviewer": {
+    "model": "gpt-5.6-sol",
+    "session_id": "T-r",
+    "tool": "codex"
+  },
+  "builder": {
+    "model": "claude-opus-5",
+    "session_id": "S-b",
+    "tool": "claude"
+  }
+}

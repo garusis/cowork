@@ -1,0 +1,92 @@
+{
+  "evaluations": [
+    {
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "both findings were real",
+          "name": "accuracy of findings",
+          "score": 4
+        }
+      ],
+      "evaluatee": "build-reviewer",
+      "evaluatee_model": "gpt-5.6-sol",
+      "evaluatee_tool": "codex",
+      "evaluator": "builder",
+      "phase": "building",
+      "reviewed_verdict": "revise",
+      "round": 1,
+      "timestamp": "2026-07-28T11:03:00Z"
+    },
+    {
+      "citation_failure": true,
+      "citations": {
+        "invented": [
+          "F-0099"
+        ],
+        "valid": [],
+        "withdrawn": []
+      },
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "cites a round that never existed",
+          "name": "accuracy of findings",
+          "score": 5
+        }
+      ],
+      "evaluatee": "build-reviewer",
+      "evaluatee_model": "gpt-5.6-sol",
+      "evaluatee_tool": "codex",
+      "evaluator": "builder",
+      "phase": "building",
+      "round": 9,
+      "timestamp": "2026-07-28T11:03:10Z",
+      "verification_state": "changed"
+    },
+    {
+      "citation_failure": true,
+      "citations": {
+        "invented": [],
+        "valid": [],
+        "withdrawn": [
+          "F-0002"
+        ]
+      },
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "counts a withdrawn finding as real",
+          "name": "accuracy of findings",
+          "score": 5
+        }
+      ],
+      "evaluatee": "build-reviewer",
+      "evaluatee_model": "gpt-5.6-sol",
+      "evaluatee_tool": "codex",
+      "evaluator": "builder",
+      "phase": "building",
+      "round": 2,
+      "timestamp": "2026-07-28T11:03:20Z",
+      "verification_state": "changed"
+    },
+    {
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "round 1: no prior feedback to respond to",
+          "name": "responsiveness to feedback",
+          "score": "not_applicable"
+        }
+      ],
+      "evaluatee": "builder",
+      "evaluatee_model": "claude-opus-5",
+      "evaluatee_tool": "claude",
+      "evaluator": "build-reviewer",
+      "phase": "building",
+      "reviewed_verdict": "revise",
+      "round": 1,
+      "timestamp": "2026-07-28T11:03:30Z"
+    }
+  ]
+}

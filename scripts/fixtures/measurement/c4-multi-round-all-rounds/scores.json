@@ -1,0 +1,96 @@
+{
+  "evaluations": [
+    {
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "ok",
+          "name": "accuracy of findings",
+          "score": 4
+        },
+        {
+          "feedback": "round 1 has no prior feedback",
+          "name": "responsiveness to feedback",
+          "score": "not_applicable"
+        }
+      ],
+      "evaluatee": "build-reviewer",
+      "evaluatee_model": "claude-opus-5",
+      "evaluatee_tool": "claude",
+      "evaluator": "builder",
+      "phase": "building",
+      "reviewed_verdict": "revise",
+      "round": 1,
+      "timestamp": "2026-07-28T13:31:00Z"
+    },
+    {
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "ok",
+          "name": "accuracy of findings",
+          "score": 4
+        },
+        {
+          "feedback": "addressed",
+          "name": "responsiveness to feedback",
+          "score": 4
+        }
+      ],
+      "evaluatee": "build-reviewer",
+      "evaluatee_model": "claude-opus-5",
+      "evaluatee_tool": "claude",
+      "evaluator": "builder",
+      "phase": "building",
+      "reviewed_verdict": "revise",
+      "round": 2,
+      "timestamp": "2026-07-28T13:32:00Z"
+    },
+    {
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "ok",
+          "name": "accuracy of findings",
+          "score": 4
+        },
+        {
+          "feedback": "addressed",
+          "name": "responsiveness to feedback",
+          "score": 4
+        }
+      ],
+      "evaluatee": "build-reviewer",
+      "evaluatee_model": "claude-opus-5",
+      "evaluatee_tool": "claude",
+      "evaluator": "builder",
+      "phase": "building",
+      "reviewed_verdict": "revise",
+      "round": 3,
+      "timestamp": "2026-07-28T13:33:00Z"
+    },
+    {
+      "context": "review-round",
+      "criteria": [
+        {
+          "feedback": "ok",
+          "name": "accuracy of findings",
+          "score": 4
+        },
+        {
+          "feedback": "addressed",
+          "name": "responsiveness to feedback",
+          "score": 4
+        }
+      ],
+      "evaluatee": "build-reviewer",
+      "evaluatee_model": "claude-opus-5",
+      "evaluatee_tool": "claude",
+      "evaluator": "builder",
+      "phase": "building",
+      "reviewed_verdict": "revise",
+      "round": 4,
+      "timestamp": "2026-07-28T13:34:00Z"
+    }
+  ]
+}

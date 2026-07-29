@@ -1,0 +1,7 @@
+{
+  "builder": {
+    "model": "claude-opus-5",
+    "session_id": "S-p",
+    "tool": "claude"
+  }
+}
