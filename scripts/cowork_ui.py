@@ -16,9 +16,22 @@ installed. `cowork --check` verifies them for interactive use.
 Python 3.9+.
 """
 
+import array
+import errno
+import fcntl
 import os
+# NOT `import select`: this module defines a public `select()` gate helper,
+# which would shadow the stdlib module and break the readability fallback.
+import select as select_mod
 import sys
+import termios
 import threading
+
+# cowork_trace imports nothing of ours, so this cannot cycle. Used only for the
+# user-wait instrumentation seam (P15): with no active trace it is a no-op, so
+# an injected/non-interactive prompt emits nothing.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cowork_trace as trace_store  # noqa: E402
 
 # ANSI foreground colors, used only when color is enabled (a real terminal).
 RESET = "\033[0m"
@@ -651,6 +664,482 @@ def banner(io_out, text, kind="info", enabled=None):
 
 
 # --------------------------------------------------------------------------- #
+# Gate input activation (the UX-011 approval-integrity boundary).              #
+#                                                                              #
+# A consequential gate must consume only input produced AFTER it has finished  #
+# painting. Two independent channels feed a freshly opened gate stale bytes:   #
+#                                                                              #
+#   1. the kernel tty input queue — while a role turn runs there is no         #
+#      prompt_toolkit application attached, so anything typed sits in the fd's  #
+#      queue and the next application reads it as ordinary key presses; and     #
+#   2. prompt_toolkit's PROCESS-GLOBAL typeahead buffer                        #
+#      (prompt_toolkit/input/typeahead.py `_buffer`, keyed by                  #
+#      input.typeahead_hash() == "fd-<fileno>", i.e. the same key for every    #
+#      application on stdin). Application.run_async() stores every unprocessed  #
+#      key press at exit and feeds it into the NEXT application — before that  #
+#      application's first render. That is the mechanism behind the recorded    #
+#      incident: the tail of a multi-line answer, left unprocessed when the     #
+#      answer editor exited, replayed into a review menu minutes later.        #
+#                                                                              #
+# So the boundary is TWO drains around one activation: `begin_gate` clears both #
+# channels before the widget's application starts (the typeahead replay happens #
+# before the first paint, so a render hook cannot catch it), and               #
+# `arm_activation` drains the fd again on the first `after_render` (keys read  #
+# from the fd can only be read by the event loop's reader callback, which       #
+# cannot run until that first synchronous redraw returns, so a render hook IS   #
+# the right place for them). Neither drain alone is sufficient.                #
+#                                                                              #
+# Contract:                                                                    #
+#   * DISCARD is absolute. Every pre-activation byte is dropped and can never  #
+#     select anything.                                                         #
+#   * NOTICE is observation-bound. Sampling the queue (FIONREAD/select) and     #
+#     flushing it (tcflush) cannot be one atomic operation, so a byte landing  #
+#     in the microseconds between them is still discarded but was never seen,  #
+#     and is not reported. cowork never warns speculatively, so a notice        #
+#     always refers to input that really was queued.                           #
+#   * FAIL CLOSED. If the queue cannot be cleared the stale bytes are still    #
+#     there, so the gate is NOT run: the wrapper returns DRAIN_FAILED and each  #
+#     reader maps it to its own safe, non-approving outcome.                   #
+#   * There is NO environment variable and NO flag that disables any of this.  #
+# --------------------------------------------------------------------------- #
+
+# Clamp on any reported count. Never user-facing policy — just a bound so a
+# runaway paste cannot put an unbounded number in a notice or a trace record.
+GATE_DISCARD_CAP = 999
+
+# tcflush attempts within a single drain before it is called a failure.
+GATE_DRAIN_RETRIES = 3
+
+# How many times ONE gate may be re-opened after a post-render discard before it
+# fails closed. The re-open loop is driven by external input, so a stuck key or a
+# continuous paste could otherwise re-open the gate forever. Exhausting this is
+# NOT a drain failure — the boundary worked every time — so it reports its own
+# `reopen_limit` reason while taking the same safe, non-approving exit.
+GATE_REOPEN_LIMIT = 3
+
+# Returned from a widget's application when the first-render drain found queued
+# input: the wrapper prints the notice and re-opens the gate. Private to this
+# module's wrapper loop; it never escapes to a caller.
+STALE = object()
+
+
+class _DrainFailed:
+    """The value the gate wrappers return when the input boundary could not be
+    established. `__bool__` RAISES so an unmapped call site fails loudly instead
+    of evaluating truthy and approving — a plain object() would have been truthy
+    at `if ui.confirm(...)`. It also has no `.strip()`, so the free-form feedback
+    sites raise AttributeError rather than mis-branching."""
+
+    __slots__ = ()
+
+    def __bool__(self):
+        raise TypeError(
+            "gate input boundary failed; caller must map ui.DRAIN_FAILED")
+
+    def __repr__(self):
+        return "<ui.DRAIN_FAILED>"
+
+
+DRAIN_FAILED = _DrainFailed()
+
+_gate_epoch_lock = threading.Lock()
+_gate_epoch = 0
+
+
+def _next_gate_epoch():
+    """A monotonically increasing id for one gate opening, so a trace reader can
+    tell two drains of the same gate apart."""
+    global _gate_epoch
+    with _gate_epoch_lock:
+        _gate_epoch += 1
+        return _gate_epoch
+
+
+def _clamp_count(n):
+    if n is None:
+        return None
+    return min(int(n), GATE_DISCARD_CAP)
+
+
+def _gate_fd(stream):
+    """The file descriptor of `stream` when it is a REAL terminal, else None.
+
+    A FakeTTY (a StringIO claiming isatty()) has no usable fileno, so every
+    existing test path and every piped/scripted path yields None and the whole
+    boundary no-ops."""
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        return None
+    try:
+        return fd if os.isatty(fd) else None
+    except (OSError, ValueError):
+        return None
+
+
+class DrainResult:
+    """Outcome of one attempt to clear the terminal input queue.
+
+    `ok` is True ONLY when tcflush actually returned. On False the stale bytes
+    are STILL QUEUED and the caller must not proceed as if they were gone."""
+
+    __slots__ = ("ok", "pending", "count", "errno_name")
+
+    def __init__(self, ok, pending=False, count=None, errno_name=None):
+        self.ok = ok
+        self.pending = pending
+        self.count = count
+        self.errno_name = errno_name
+
+
+def _pending_input(fd):
+    """(pending, count) for the terminal input queue, WITHOUT reading a byte.
+
+    FIONREAD reports the exact pending byte count without transferring anything
+    into the process. When it is unavailable the fallback is select(), which
+    answers only 'is something readable' — hence (True, None). There is
+    deliberately NO os.read anywhere on this path: reading the bytes even to
+    measure them would materialize discarded content in Python."""
+    if fd is None:
+        return (False, 0)
+    try:
+        buf = array.array("i", [0])
+        fcntl.ioctl(fd, termios.FIONREAD, buf, True)
+        n = int(buf[0])
+        return (n > 0, n)
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        readable, _w, _x = select_mod.select([fd], [], [], 0)
+        return (bool(readable), None)
+    except (OSError, ValueError):
+        return (False, None)
+
+
+def _errno_name(exc):
+    """The symbolic errno ('ENOTTY', …) of an OSError — never a message, which
+    could carry user data."""
+    return errno.errorcode.get(getattr(exc, "errno", None))
+
+
+def _drop_terminal_input(fd):
+    """Sample and then discard the terminal input queue. The bytes are dropped
+    in the kernel by tcflush(TCIFLUSH) and never enter this process."""
+    if fd is None:
+        return DrainResult(True, False, 0, None)
+    pending, count = _pending_input(fd)
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except OSError as exc:
+        # The queue was NOT cleared. Report the failure rather than swallowing
+        # it — the caller fails closed.
+        return DrainResult(False, pending, count, _errno_name(exc))
+    return DrainResult(True, pending, count, None)
+
+
+def _drop_typeahead():
+    """Clear prompt_toolkit's process-global typeahead bucket for the session's
+    input. Returns (ok, count) with a clamped character count.
+
+    Unlike the terminal queue, prompt_toolkit has ALREADY materialized these key
+    presses before cowork is involved, so they cannot be dropped without being
+    touched. The guarantee here is narrower and explicit: they are cleared
+    without ever being logged, displayed, replayed or otherwise exposed, and
+    only a capped length escapes as metadata.
+
+    FAILS CLOSED. `ok` is False only when a bucket that EXISTS could not be
+    emptied — that leaves replayable key presses armed for the next application,
+    which is the exact incident mechanism, so the caller must not treat the
+    boundary as established. Two cases are NOT failures because there is nothing
+    to clear: prompt_toolkit not being importable, and a session that has not
+    resolved an input yet (the bucket is keyed by input.typeahead_hash(), so it
+    can only be non-empty once an Application has run)."""
+    try:
+        from prompt_toolkit.application.current import get_app_session
+        from prompt_toolkit.input import typeahead as pt_typeahead
+    except ImportError:
+        return (True, 0)
+    # Read the session's input WITHOUT creating one: asking for one would
+    # needlessly construct a terminal input object at the very first gate.
+    try:
+        session = get_app_session()
+    except Exception:
+        return (False, 0)
+    if getattr(session, "_input", None) is None:
+        return (True, 0)
+    try:
+        inp = session.input
+        presses = pt_typeahead.get_typeahead(inp)   # returns AND resets
+        count = 0
+        for press in presses:
+            count += len(getattr(press, "data", "") or "")
+        pt_typeahead.clear_typeahead(inp)
+        del presses
+    except Exception:
+        # The bucket exists and could not be emptied. Do NOT swallow this: its
+        # contents would be replayed into the next application before it draws.
+        return (False, 0)
+    return (True, _clamp_count(count))
+
+
+class Activation:
+    """The record of one gate opening. `begin_gate` and `arm_activation` only
+    INSPECT and MUTATE this — they render nothing and call no callback, so the
+    ui wrapper stays the single reporting layer."""
+
+    __slots__ = ("gate", "epoch", "pending", "count", "safe", "errno_name",
+                 "typeahead_cleared", "active", "reason")
+
+    def __init__(self, gate=None, epoch=0):
+        self.gate = gate
+        self.epoch = epoch
+        self.pending = False
+        self.count = 0
+        self.safe = True
+        self.errno_name = None
+        self.typeahead_cleared = False
+        self.active = False
+        # Which stale-input channel could not be cleared, when safe is False:
+        # 'tcflush' (the terminal queue), 'typeahead' (prompt_toolkit's
+        # cross-application replay bucket) or 'key_queue' (the live
+        # application's own buffers). None while the boundary holds.
+        self.reason = None
+
+
+def begin_gate(io_in, io_out, gate=None):
+    """Drain both stale-input channels BEFORE a gate's widget opens.
+
+    The typeahead buffer must be cleared here, not from a render hook:
+    Application.run_async() feeds it into the key processor before the first
+    redraw, so by first render the key has already been processed and the
+    highlighted choice already accepted.
+
+    Off a real terminal this is a no-op (safe, nothing pending)."""
+    act = Activation(gate=gate, epoch=_next_gate_epoch())
+    fd = _gate_fd(io_in)
+    if fd is None:
+        return act
+    result = DrainResult(False)
+    for _ in range(GATE_DRAIN_RETRIES):
+        result = _drop_terminal_input(fd)
+        if result.ok:
+            break
+    if not result.ok:
+        # Fail closed. Still try the typeahead bucket — it is an independent
+        # stale channel and clearing it is strictly better than not — but leave
+        # pending/count empty so nothing downstream can report a discard that
+        # did not happen.
+        cleared, _count = _drop_typeahead()
+        act.safe = False
+        act.reason = "tcflush"
+        act.errno_name = result.errno_name
+        act.typeahead_cleared = cleared
+        return act
+    cleared, typeahead = _drop_typeahead()
+    if not cleared:
+        # The terminal queue is clean but prompt_toolkit's replay bucket is not,
+        # and its contents are fed to the next application BEFORE it draws — the
+        # exact incident mechanism. Fail closed rather than open a gate that can
+        # be driven by keys we could not drop.
+        act.safe = False
+        act.reason = "typeahead"
+        act.typeahead_cleared = False
+        return act
+    act.pending = bool(result.pending or typeahead)
+    if result.count is None:
+        act.count = None                      # FIONREAD unavailable
+    else:
+        act.count = _clamp_count(result.count + typeahead)
+    return act
+
+
+def arm_activation(app, activation, fd):
+    """Install a ONE-SHOT drain on `app`'s first render.
+
+    after_render fires at the end of the first _redraw(), which happens before
+    the event loop can run its fd reader — so anything this finds arrived while
+    the gate was drawing. It records the outcome on the SAME Activation and
+    exits the application with STALE so the wrapper can report once and re-open
+    a live gate. One-shot, so later redraws (cursor moves, typing) never drain
+    and a genuine in-box paste is never over-discarded."""
+    if app is None or fd is None:
+        return
+    try:
+        after_render = app.after_render
+    except AttributeError:
+        return                                # stub session in a test
+    state = {"fired": False}
+
+    def _on_first_render(_sender=None):
+        if state["fired"]:
+            return                            # the render_as_done redraw
+        state["fired"] = True
+        result = DrainResult(True, False, 0, None)
+        for _ in range(GATE_DRAIN_RETRIES):
+            result = _drop_terminal_input(fd)
+            if result.ok:
+                break
+        # Drop the live application's OWN queues too, without inspecting them.
+        # (These are the running app's buffers, deliberately NOT what the
+        # typeahead_cleared flag reports.)
+        #
+        # A MISSING attribute is tolerated — stub sessions in tests have no
+        # key_processor or input, and there is then nothing to drop. A present
+        # one that RAISES is a boundary failure and fails closed: those buffers
+        # can hold keys read before activation, so leaving them is exactly the
+        # hazard this drain exists to remove.
+        queues_ok = True
+        processor = getattr(app, "key_processor", None)
+        if processor is not None:
+            try:
+                processor.empty_queue()
+            except Exception:
+                queues_ok = False
+        app_input = getattr(app, "input", None)
+        if app_input is not None and hasattr(app_input, "flush_keys"):
+            try:
+                app_input.flush_keys()
+            except Exception:
+                queues_ok = False
+        activation.active = True
+        stale = False
+        if not result.ok:
+            activation.safe = False
+            activation.reason = "tcflush"
+            activation.errno_name = result.errno_name
+            activation.typeahead_cleared = False
+            stale = True
+        elif not queues_ok:
+            activation.safe = False
+            activation.reason = "key_queue"
+            activation.typeahead_cleared = False
+            stale = True
+        elif result.pending:
+            activation.pending = True
+            activation.count = _clamp_count(result.count)
+            stale = True
+        if stale:
+            try:
+                app.exit(STALE)
+            except Exception:                 # pragma: no cover - not running
+                pass
+
+    after_render += _on_first_render
+
+
+def _notice(io_out, text):
+    """Notices are plain writes, never Rich: they must survive verbatim into a
+    captured pty transcript and into the non-color path."""
+    if io_out is None:
+        return
+    try:
+        io_out.write("\n" + text + "\n")
+        io_out.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def discard_notice(io_out, count=None):
+    """Content-free heads-up that queued input was thrown away. Only a clamped
+    count is ever rendered — never any payload text."""
+    if count is None:
+        detail = "Input typed before this gate was ready"
+    else:
+        shown = ("%d+" % GATE_DISCARD_CAP if count >= GATE_DISCARD_CAP
+                 else str(count))
+        detail = "Input typed before this gate was ready (%s characters)" % shown
+    _notice(io_out, detail + " was ignored — please enter it again.")
+
+
+def drain_failed_notice(io_out):
+    """One wording for every channel that can fail (the terminal queue,
+    prompt_toolkit's replay bucket, the live application's own buffers): what
+    matters to the user is identical in all three — leftover input could not be
+    cleared, so old and new keystrokes can no longer be told apart."""
+    _notice(io_out,
+            "cowork could not clear input left over from before this gate, so "
+            "it cannot tell keystrokes typed before this gate from keystrokes "
+            "typed now. This gate will not be run.")
+
+
+def gate_abandoned_notice(io_out):
+    _notice(io_out,
+            "Input kept arriving before this gate was ready, so the gate was "
+            "not run and this phase is ending without approving.")
+
+
+def _protected(io_in, io_out, ask_fn=None):
+    """Whether a wrapper call is a protected gate: an injected ask_fn or a
+    missing/non-terminal stream keeps today's behavior byte-identical."""
+    if ask_fn is not None:
+        return False
+    if io_in is None or io_out is None:
+        return False
+    return is_tty(io_in) and is_tty(io_out)
+
+
+def _run_gate(io_in, io_out, gate, on_discard, on_drain_fail, build):
+    """THE wrapper loop, shared verbatim by confirm / select / prompt_user.
+
+    `build()` returns (application, run) for ONE attempt — a fresh widget every
+    time, so exactly one after_render handler exists per attempt and handlers
+    can never accumulate on a reused application object.
+
+    This is the ONLY layer that renders a notice or invokes a callback, and it
+    does so exactly once per gate open."""
+    fd = _gate_fd(io_in)
+    reopens = 0
+    while True:
+        act = begin_gate(io_in, io_out, gate=gate)
+        if not act.safe:
+            drain_failed_notice(io_out)
+            if on_drain_fail is not None:
+                on_drain_fail(gate=act.gate, epoch=act.epoch,
+                              phase="pre_render", reason=act.reason,
+                              errno_name=act.errno_name,
+                              typeahead_cleared=act.typeahead_cleared,
+                              reopens=None)
+            return DRAIN_FAILED
+        if act.pending:
+            discard_notice(io_out, act.count)
+            if on_discard is not None:
+                on_discard(gate=act.gate, epoch=act.epoch, phase="pre_render",
+                           count=act.count)
+        app, run = build()
+        arm_activation(app, act, fd)
+        result = run()
+        if result is not STALE:
+            return result
+        if not act.safe:
+            # A channel could not be cleared while the gate was drawing.
+            drain_failed_notice(io_out)
+            if on_drain_fail is not None:
+                on_drain_fail(gate=act.gate, epoch=act.epoch,
+                              phase="post_render", reason=act.reason,
+                              errno_name=act.errno_name,
+                              typeahead_cleared=act.typeahead_cleared,
+                              reopens=None)
+            return DRAIN_FAILED
+        reopens += 1
+        if reopens >= GATE_REOPEN_LIMIT:
+            # Check the limit BEFORE any reporting, so exactly one notice and
+            # one event fire for this final attempt.
+            gate_abandoned_notice(io_out)
+            if on_drain_fail is not None:
+                on_drain_fail(gate=act.gate, epoch=act.epoch,
+                              phase="post_render", reason="reopen_limit",
+                              errno_name=None, typeahead_cleared=None,
+                              reopens=GATE_REOPEN_LIMIT)
+            return DRAIN_FAILED
+        discard_notice(io_out, act.count)
+        if on_discard is not None:
+            on_discard(gate=act.gate, epoch=act.epoch, phase="post_render",
+                       count=act.count)
+        # Loop back to the TOP: every re-open is a full gate open — drain, a
+        # new Activation, a fresh widget, exactly one handler.
+
+
+# --------------------------------------------------------------------------- #
 # Conversation input (prompt_toolkit).                                         #
 # --------------------------------------------------------------------------- #
 
@@ -695,7 +1184,8 @@ def _default_prompt_session():
     return PromptSession()
 
 
-def prompt_user(io_in, io_out, header=None, session_factory=None):
+def prompt_user(io_in, io_out, header=None, session_factory=None, gate=None,
+                on_discard=None, on_drain_fail=None):
     """Unified conversation input.
 
     On a real terminal: a prompt_toolkit multiline editor — Enter submits,
@@ -704,15 +1194,39 @@ def prompt_user(io_in, io_out, header=None, session_factory=None):
 
     Returns the entered text (possibly '' for a blank line); EOF when input is
     exhausted / Ctrl-D (end of conversation); or CANCEL when the editor was
-    dismissed. Ctrl-C propagates (the loop treats it as an abort)."""
+    dismissed. Ctrl-C propagates (the loop treats it as an abort).
+
+    PROTECTION IS OPT-IN AND KEYED ON `gate`. Only a call that names a
+    consequential gate runs the activation boundary; stale input is then
+    discarded before and at first render, `on_discard`/`on_drain_fail` report
+    it, and DRAIN_FAILED is returned when a stale-input channel could not be
+    cleared. With `gate=None` — the ordinary context and turn prompts — the
+    behavior is exactly what it has always been: no drain, no notice, no loop,
+    and NEVER DRAIN_FAILED. That matters because those callers consume the
+    result as text (`reply.strip()`), so a sentinel they never asked for would
+    raise instead of re-prompting.
+
+    `build_key_bindings` is deliberately untouched, so prompt_toolkit's default
+    bracketed-paste handler keeps inserting a framed paste whole once the editor
+    is open and activated."""
+    with trace_store.user_wait("prompt_user") as _span:
+        return _prompt_user_inner(io_in, io_out, header, session_factory, gate,
+                                  on_discard, on_drain_fail, _span)
+
+
+def _prompt_user_inner(io_in, io_out, header, session_factory, gate,
+                       on_discard, on_drain_fail, span):
+    """`prompt_user`'s body, wrapped by the user-wait span (P15). `span` carries
+    the termination outcome so a dismissed or EOF'd prompt closes its span with
+    the truth rather than defaulting to `answered`."""
     if not (is_tty(io_in) and is_tty(io_out)):
         line = io_in.readline()
         if line == "":
+            span.outcome = "eof"
             return EOF  # no trailing newline => genuine end of input
         return line.rstrip("\n")  # a blank line is "\n" => "" (re-prompt, not EOF)
     from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.styles import Style
-    session = (session_factory or _default_prompt_session)()
     # Build a clear, multi-line prompt: the question, a dim key hint, then the
     # input marker — all visible right at the cursor (no reliance on a toolbar).
     head = colorize(header, CYAN, True) if header else ""
@@ -723,18 +1237,40 @@ def prompt_user(io_in, io_out, header=None, session_factory=None):
     # 'noreverse' so it's invisible margin, not a dark status bar.
     pad_style = Style.from_dict({"bottom-toolbar": "noreverse",
                                  "bottom-toolbar.text": "noreverse"})
-    try:
-        text = session.prompt(
-            message,
-            multiline=True,
-            key_bindings=build_key_bindings(),
-            prompt_continuation=lambda width, line_number, soft: "  ",
-            bottom_toolbar=lambda: " ",
-            style=pad_style,
-        )
-    except EOFError:          # Ctrl-D on an empty buffer
-        return EOF
-    # KeyboardInterrupt (Ctrl-C) intentionally propagates -> loop aborts cleanly.
+
+    def _open():
+        """One editor attempt: (application, run). A FRESH PromptSession every
+        time, so a re-opened gate is armed exactly once."""
+        session = (session_factory or _default_prompt_session)()
+
+        def _run():
+            try:
+                return session.prompt(
+                    message,
+                    multiline=True,
+                    key_bindings=build_key_bindings(),
+                    prompt_continuation=lambda width, line_number, soft: "  ",
+                    bottom_toolbar=lambda: " ",
+                    style=pad_style,
+                )
+            except EOFError:  # Ctrl-D on an empty buffer
+                return EOF
+            # KeyboardInterrupt (Ctrl-C) intentionally propagates -> abort.
+
+        return getattr(session, "app", None), _run
+
+    if gate is None:
+        # Legacy path, byte-identical to before the boundary existed: the
+        # ordinary context and turn prompts are not gates, have no caller that
+        # maps DRAIN_FAILED, and must never be handed one.
+        _app, run = _open()
+        text = run()
+    else:
+        text = _run_gate(io_in, io_out, gate, on_discard, on_drain_fail, _open)
+        if text is DRAIN_FAILED:
+            return text
+    if text is EOF or text is CANCEL:
+        return text
     return (text or "").rstrip("\n")
 
 
@@ -770,24 +1306,98 @@ def format_relative_time(epoch, now):
     return "%dy ago" % max(1, years)
 
 
-def confirm(prompt, ask_fn=None):
+def confirm(prompt, ask_fn=None, default=True, io_in=None, io_out=None,
+            gate=None, on_discard=None, on_drain_fail=None):
     """Yes/No gate. On a TTY: questionary.confirm. `ask_fn` is injectable for tests
-    and returns a bool (or None, treated as False)."""
-    if ask_fn is None:
+    and returns a bool (or None, treated as False). `default` is the accept-on-
+    Return answer and stays True so every existing caller is unchanged; the
+    review gate passes default=False so a stray Return can never approve.
+
+    Passing real terminal `io_in`/`io_out` opts the call into the activation
+    boundary and can return DRAIN_FAILED, which the caller MUST map. With an
+    injected `ask_fn` or a non-terminal stream the behavior is exactly what it
+    has always been — no drain, no notice, no loop."""
+    with trace_store.user_wait("confirm") as span:
+        if not _protected(io_in, io_out, ask_fn):
+            if ask_fn is None:
+                import questionary
+                ask_fn = lambda: questionary.confirm(
+                    prompt, default=default).ask()
+            raw = ask_fn()
+            if raw is None:
+                span.outcome = "cancelled"
+            return bool(raw)
         import questionary
-        ask_fn = lambda: questionary.confirm(prompt, default=True).ask()
-    return bool(ask_fn())
+
+        def _open():
+            question = questionary.confirm(prompt, default=default)
+            return question.application, question.ask
+
+        answer = _run_gate(io_in, io_out, gate, on_discard, on_drain_fail,
+                           _open)
+        if answer is DRAIN_FAILED:
+            span.outcome = "drain_failed"
+            return answer
+        if answer is None:
+            span.outcome = "cancelled"
+        return bool(answer)
 
 
-def select(prompt, choices, ask_fn=None):
+def select(prompt, choices, ask_fn=None, io_in=None, io_out=None, gate=None,
+           on_discard=None, on_drain_fail=None):
     """Single-choice gate. `choices` is a list of (key, label) pairs; the first
-    choice is the highlighted default. On a TTY: questionary.select. `ask_fn` is
-    injectable for tests and returns a key. Returns the chosen key, or None when
-    the prompt was dismissed (callers pick their own safe fallback)."""
+    choice is the highlighted default (questionary points at the first
+    non-disabled choice when no `default` is given — verified against
+    questionary 2.1.1's InquirerControl._init_choices). On a TTY:
+    questionary.select. `ask_fn` is injectable for tests and returns a key.
+    Returns the chosen key, or None when the prompt was dismissed (callers pick
+    their own safe fallback).
+
+    Passing real terminal `io_in`/`io_out` opts the call into the activation
+    boundary and can return DRAIN_FAILED, which the caller MUST map. With an
+    injected `ask_fn` or a non-terminal stream the behavior is unchanged."""
+    with trace_store.user_wait("select") as span:
+        if not _protected(io_in, io_out, ask_fn):
+            if ask_fn is None:
+                import questionary
+                ask_fn = lambda: questionary.select(
+                    prompt,
+                    choices=[questionary.Choice(label, value=key)
+                             for key, label in choices]).ask()
+            picked = ask_fn()
+            if picked is None:
+                span.outcome = "cancelled"
+            return picked
+        import questionary
+
+        def _open():
+            question = questionary.select(
+                prompt,
+                choices=[questionary.Choice(label, value=key)
+                         for key, label in choices])
+            return question.application, question.ask
+
+        picked = _run_gate(io_in, io_out, gate, on_discard, on_drain_fail,
+                           _open)
+        if picked is DRAIN_FAILED:
+            span.outcome = "drain_failed"
+        elif picked is None:
+            span.outcome = "cancelled"
+        return picked
+
+
+def multiselect(prompt, choices, selected=(), ask_fn=None):
+    """Multi-choice gate (mirrors `select`). `choices` is a list of (key, label)
+    pairs; `selected` is the set of keys pre-checked when the prompt opens. On a
+    TTY: questionary.checkbox. `ask_fn` is injectable for tests and returns the
+    list of chosen keys. Returns that list, or None when the prompt was
+    dismissed (callers pick their own safe fallback — never an empty set)."""
     if ask_fn is None:
         import questionary
-        ask_fn = lambda: questionary.select(
+        checked = set(selected or ())
+        ask_fn = lambda: questionary.checkbox(
             prompt,
-            choices=[questionary.Choice(label, value=key)
+            choices=[questionary.Choice(label, value=key,
+                                        checked=key in checked)
                      for key, label in choices]).ask()
     return ask_fn()
