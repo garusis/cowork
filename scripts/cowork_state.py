@@ -25,8 +25,22 @@ Schema (version 1):
                   "last_context_revision_seen": 3}
         # or:    {"controller": "codex",    "id": "<thread_id>", ...}
         # or:    {"controller": "opencode", "id": "<ses_...>", ...}
-      }
+      },
+      # OPTIONAL session controller policy. ABSENT = unrestricted, which is how
+      # every session saved before this field existed loads and runs. Removing a
+      # restriction DELETES the key, so a lifted session is byte-equivalent in
+      # shape to a pre-feature session.
+      "controller_policy": {"allowed": ["claude", "codex"],
+                            "updated": 1750000000.0,
+                            "source": "cli"}
     }
+
+A PRESENT-BUT-INVALID `controller_policy` is a HARD ERROR, never an implicit
+"unrestricted": reading a damaged restriction as "no restriction" would start
+exactly the provider the policy existed to forbid. `read_controller_policy`
+therefore returns a TAGGED result and there is deliberately no reader that
+collapses `invalid` to None; the run stops until an explicit
+`--allow-controllers` replaces the policy wholesale.
 
 The context invariant: explicit context (`--context`/prompted goal) is persisted
 as the CURRENT session context, with a monotonically increasing revision. Any
@@ -38,15 +52,33 @@ of being discarded.
 Python 3.9+, stdlib only.
 """
 
+import datetime
 import glob
 import hashlib
 import json
 import os
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import cowork_policy as policy  # noqa: E402
 
 VERSION = 1
 DIR_NAME = ".cowork"
 FILE_NAME = "session.json"
+
+# Evaluation policy (D2): how much of a run gets scored. `all_rounds` is the
+# default; the others are the levers for turning measurement overhead down.
+# Whatever the value, the overhead is reported separately so the choice is
+# informed rather than blind.
+EVALUATION_POLICIES = ("all_rounds", "final_round", "sampled", "off")
+DEFAULT_EVALUATION_POLICY = "all_rounds"
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z")
 
 
 def session_dir(cwd=None):
@@ -485,14 +517,21 @@ def identities_path_for(session_uuid):
     return os.path.join(session_assets_dir(session_uuid), "identities.json")
 
 
-def upsert_role_identity(path, role, identity):
+def upsert_role_identity(path, role, identity, work_id=None):
     """Merge one role's identity dict into the registry at `path`.
 
     Only non-None values are written, and known values are never overwritten
     by None (a later turn that could not observe the model must not erase an
     earlier observation). A no-change merge skips the write. Tolerant: any
     OSError/ValueError yields False — identity is observational and must never
-    break a turn."""
+    break a turn.
+
+    The latest-wins map is kept as-is for existing readers, and an IMMUTABLE
+    OBSERVATION is additionally appended under `observations[]` (CV-002). The
+    map alone cannot say what a given turn ran with: a role that switches model
+    mid-session would have the later model read back onto its earlier turns. A
+    turn's identity is therefore read from its own observation, keyed by
+    `work_id`, and observations are never rewritten."""
     if not (path and role and isinstance(identity, dict)):
         return False
     fresh = {k: v for k, v in identity.items() if v is not None}
@@ -509,8 +548,22 @@ def upsert_role_identity(path, role, identity):
         current = data.get(role) if isinstance(data.get(role), dict) else {}
         merged = dict(current)
         merged.update(fresh)
-        if merged == current:
+        observations = data.get("observations")
+        if not isinstance(observations, list):
+            observations = []
+        observation = dict(fresh)
+        observation["role"] = role
+        observation["observed_at"] = _utc_now()
+        if work_id:
+            observation["work_id"] = work_id
+        already = bool(work_id) and any(
+            isinstance(o, dict) and o.get("work_id") == work_id
+            and o.get("role") == role for o in observations)
+        if merged == current and (already or not work_id):
             return True
+        if not already:
+            observations.append(observation)
+            data["observations"] = observations
         data[role] = merged
         dirname = os.path.dirname(path)
         if dirname:
@@ -537,15 +590,289 @@ def read_role_identities(path):
     return data if isinstance(data, dict) else {}
 
 
+def evaluation_queue_path_for(session_uuid):
+    """Path of the durable evaluation queue (P12). Scoring is sealed and
+    enqueued the instant a verdict is valid and drained at phase end, so no
+    round ever waits for it; the queue lives on disk so a session killed
+    mid-phase leaves its rounds queued rather than lost."""
+    return os.path.join(session_assets_dir(session_uuid),
+                        "evaluation_queue.jsonl")
+
+
+def next_phase_round(session_uuid, phase, seat):
+    """A MONOTONIC round identity for one (phase, seat), persisted.
+
+    `review_rounds` restarts at 0 in every fresh `_role_loop`, so after a resume
+    the new round reused the pre-resume round's `(phase, round)` key. Everything
+    that joins on that key — the evaluation queue, ledger findings, marginal-cost
+    round grouping, the ordering check, final-round supersession — then merged
+    two genuinely different rounds, and the evidence chain could report the
+    current round and its prior as the same one.
+
+    The in-loop counter still drives the conversation; THIS is the durable
+    identity the joins use. Tolerant: if it cannot be persisted the caller falls
+    back to the in-loop counter, which is no worse than before.
+    """
+    if not session_uuid:
+        return None
+    path = os.path.join(session_assets_dir(session_uuid), "round_epochs.json")
+    key = "%s|%s" % (phase or "phase", seat or "role")
+    try:
+        try:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            data = {}
+        nxt = int(data.get(key) or 0) + 1
+        data[key] = nxt
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+        return nxt
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def current_phase_round(session_uuid, phase, seat, default=None):
+    """The durable round identity WITHOUT minting a new one.
+
+    `next_phase_round` increments; a caller that merely needs to label something
+    with the round already in progress must not advance the counter, or two
+    records from one round would carry different identities.
+    """
+    if not session_uuid:
+        return default
+    path = os.path.join(session_assets_dir(session_uuid), "round_epochs.json")
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+        value = (data or {}).get("%s|%s" % (phase or "phase", seat or "role"))
+        return int(value) if value else default
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def evidence_chain_path_for(session_uuid):
+    """Where the prior round's frozen evidence pointers are persisted.
+
+    The chain used to live in an in-memory closure, so a resume lost it and the
+    round after a restart sealed no prior evidence at all — silently reverting
+    to the behaviour P6 exists to prevent. On disk it survives the process.
+    """
+    return os.path.join(session_assets_dir(session_uuid),
+                        "evidence_chain.json")
+
+
+def read_evidence_chain(session_uuid, seat):
+    """The prior round's frozen pointers for one seat, or {}."""
+    data = None
+    try:
+        with open(evidence_chain_path_for(session_uuid), "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    entry = data.get(seat)
+    return entry if isinstance(entry, dict) else {}
+
+
+def write_evidence_chain(session_uuid, seat, entry):
+    """Record this round's frozen pointers as the next round's prior. Tolerant:
+    a write failure loses the chain for one round rather than the run."""
+    path = evidence_chain_path_for(session_uuid)
+    try:
+        try:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            data = {}
+        data[seat] = entry
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def ledger_path_for(session_uuid):
+    """Path of the append-only ledger of everything cowork assigns an id to:
+    findings, decisions, human amendments, escaped defects and verification
+    attempts. Written only by cowork_ledger (P3)."""
+    return os.path.join(session_assets_dir(session_uuid), "ledger.jsonl")
+
+
+def measurement_path_for(session_uuid):
+    """Path of the authoritative measurement record (D3). The text report is a
+    rendering of this file, never a recomputation of the raw sources."""
+    return os.path.join(session_assets_dir(session_uuid), "measurement.json")
+
+
+def build_manifest_path_for(session_uuid):
+    """Path of the per-file build baseline manifest (`build_baseline.json`).
+
+    Distinct from the prose `build_baseline.txt`, which records the HEAD sha and
+    dirty flag for a human. Build and review metrics are computed against THIS
+    manifest, because a session that starts from a dirty tree has no commit
+    describing what the build actually started from."""
+    return os.path.join(session_assets_dir(session_uuid),
+                        "build_baseline.json")
+
+
+def get_evaluation_policy(state):
+    """The saved evaluation policy, defaulting to `all_rounds`. Unlike the
+    controller policy an unreadable value is NOT a hard error: this setting
+    governs measurement, and measurement must never break a run — an
+    unrecognised value falls back to the default."""
+    value = (state or {}).get("evaluation_policy")
+    return value if value in EVALUATION_POLICIES else DEFAULT_EVALUATION_POLICY
+
+
+def save_evaluation_policy(path, value, prior=None):
+    """Persist the evaluation policy. Returns the new state. Raises ValueError
+    on an unknown value, so a typo at the CLI is refused rather than silently
+    turning scoring off."""
+    if value not in EVALUATION_POLICIES:
+        raise ValueError(
+            "unknown evaluation policy %r (expected one of: %s)"
+            % (value, ", ".join(EVALUATION_POLICIES)))
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    state.setdefault("sessions", state.get("sessions") or {})
+    state["evaluation_policy"] = value
+    save(path, state)
+    return state
+
+
+def build_manifest(root, paths):
+    """Hash each path under `root` into a per-file manifest entry.
+
+    Returns `{"root", "generated_at", "files": [{path, sha256, bytes}, ...]}`.
+    A path that cannot be read is recorded with `sha256: None` and
+    `state: "unreadable"` rather than dropped — a file the build cannot see is
+    a fact about the baseline, not an absence."""
+    files = []
+    for rel in sorted(set(paths or ())):
+        full = os.path.join(root, rel) if root else rel
+        entry = {"path": rel}
+        try:
+            with open(full, "rb") as fh:
+                raw = fh.read()
+            entry["sha256"] = hashlib.sha256(raw).hexdigest()
+            entry["bytes"] = len(raw)
+            entry["state"] = "ok"
+        except OSError:
+            entry["sha256"] = None
+            entry["bytes"] = None
+            entry["state"] = "unreadable"
+        files.append(entry)
+    return {"root": root, "generated_at": _utc_now(), "files": files}
+
+
+def write_build_manifest(path, manifest):
+    """Persist a build manifest. Tolerant: a write failure yields False and
+    leaves the run alone — the manifest feeds measurement, not the build."""
+    if not (path and isinstance(manifest, dict)):
+        return False
+    try:
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def read_build_manifest(path):
+    """The manifest as a dict, or None when missing/malformed."""
+    if not path:
+        return None
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def manifest_digest(manifest):
+    """A single stable digest over a manifest's file entries, used as the
+    `source_manifest` stamp on a verification attempt (P17). Order-independent:
+    computed over the sorted (path, sha256) pairs, so the digest identifies the
+    tree state rather than the order it happened to be hashed in."""
+    if not isinstance(manifest, dict):
+        return None
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return None
+    pairs = sorted(
+        "%s:%s" % (f.get("path"), f.get("sha256"))
+        for f in files if isinstance(f, dict))
+    return hashlib.sha256("\n".join(pairs).encode("utf-8")).hexdigest()
+
+
+# Scores that are honest about not being numbers. They are real values, not
+# missing ones: `not_applicable` means the criterion cannot apply to this round
+# (round-1 responsiveness has no prior feedback to respond to), and
+# `insufficient_evidence` means the evaluator could not judge from what it was
+# given. Neither is ranked and neither is averaged.
+NON_NUMERIC_SCORES = ("not_applicable", "insufficient_evidence")
+
+
+def normalize_score(value):
+    """Normalize one criterion score: an int clamped to 1-5, one of the honest
+    non-numeric values, or `insufficient_evidence` when it parses as neither."""
+    if isinstance(value, str) and value.strip() in NON_NUMERIC_SCORES:
+        return value.strip()
+    try:
+        return max(1, min(5, int(value)))
+    except (TypeError, ValueError):
+        return "insufficient_evidence"
+
+
+def is_numeric_score(value):
+    """True only for a score that may be averaged or ranked."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def read_eval(path):
     """Return the normalized list of evaluation dicts from a scratch file, or
     [] when the file is missing, unreadable, or malformed (mirrors
     `read_review`'s tolerance — an eval turn that wrote nothing usable is
     skipped, never an error).
 
-    Normalization: each criterion needs a non-empty `name` and an int-coercible
-    `score` (clamped to 1-5); `feedback` and `enhancement_suggestions` are
-    stringified. Entries with no parseable criteria are dropped."""
+    Normalization: each criterion needs a non-empty `name` and a score that is
+    either int-coercible (clamped to 1-5) or one of the honest non-numeric
+    values `not_applicable` / `insufficient_evidence`; `feedback` and
+    `enhancement_suggestions` are stringified. Entries with no parseable
+    criteria are dropped.
+
+    A criterion whose score parses as neither is recorded as
+    `insufficient_evidence` rather than DROPPED (CV-019). Dropping it silently
+    shrank the denominator, so an evaluator that could not judge a criterion
+    made the remaining scores look like the whole picture; the criterion now
+    survives as unscoreable and is excluded from averages explicitly."""
     if not path:
         return []
     try:
@@ -569,13 +896,9 @@ def read_eval(path):
             name = str(crit.get("name") or "").strip()
             if not name:
                 continue
-            try:
-                score = int(crit.get("score"))
-            except (TypeError, ValueError):
-                continue
             criteria.append({
                 "name": name,
-                "score": max(1, min(5, score)),
+                "score": normalize_score(crit.get("score")),
                 "feedback": str(crit.get("feedback") or ""),
             })
         if not criteria:
@@ -836,8 +1159,26 @@ def switch_role_controller(path, role, target_controller, prior=None,
     active provider id for that role, preserve non-id bookkeeping fields on the
     role session entry, and record a small pending handoff marker that the next
     fresh launch can consume.
+
+    Signature and observable effect are unchanged: this is `_apply_role_switch`
+    (the pure in-memory step, shared with the multi-role transition below) plus
+    exactly one save. It touches ONLY the role's own entries — never any
+    session-level field such as `controller_policy`.
     """
-    state = dict(prior or load(path) or {})
+    state = _apply_role_switch(
+        dict(prior or load(path) or {}), role, target_controller,
+        reason=reason, source=source, created=created,
+        pending_turn=pending_turn)
+    save(path, state)
+    return state
+
+
+def _apply_role_switch(state, role, target_controller, reason=None,
+                       source=None, created=None, pending_turn=None):
+    """The in-memory half of a controller switch: return the updated state with
+    `role` moved to `target_controller`. Performs NO save, so the multi-role
+    transition can apply several of these and persist once."""
+    state = dict(state or {})
     state.setdefault("team", state.get("team") or [])
     config = dict(state.get("config") or {})
     role_cfg = dict(config.get(role) or {})
@@ -872,6 +1213,118 @@ def switch_role_controller(path, role, target_controller, prior=None,
         switch_entry["pending_turn"] = pt
     pending[role] = switch_entry
     state["pending_switches"] = pending
+    return state
+
+
+# --------------------------------------------------------------------------- #
+# Session controller policy.                                                   #
+#                                                                              #
+# The allowed-controller set for this session. ABSENT = unrestricted (every     #
+# pre-feature session); PRESENT-BUT-INVALID = a hard error, never an implicit   #
+# "unrestricted". See the module docstring and cowork_policy.                   #
+# --------------------------------------------------------------------------- #
+
+POLICY_KEY = "controller_policy"
+
+
+class InvalidControllerPolicy(ValueError):
+    """A saved `controller_policy` that cannot be read. Carries the raw value so
+    the caller can report what it found without guessing what it meant."""
+
+    def __init__(self, raw, reason=None):
+        self.raw = raw
+        self.reason = reason or "controller_policy is not a readable allowed set"
+        super().__init__(self.reason)
+
+
+def read_controller_policy(state):
+    """Return a TAGGED read of the saved policy:
+
+        ("unrestricted", None)              — the key is absent
+        ("allowed", ("claude", "codex"))    — a valid restricted set
+        ("invalid", <raw value>)            — present but unreadable
+
+    A policy is INVALID when the key is present and any of: the value is not a
+    dict; `allowed` is missing, is not a list, or is empty; any element is not a
+    known controller name.
+
+    There is deliberately NO reader that collapses `invalid` to `unrestricted` —
+    that downgrade is exactly the fail-open behaviour this feature exists to
+    prevent."""
+    if not isinstance(state, dict) or POLICY_KEY not in state:
+        return ("unrestricted", None)
+    raw = state.get(POLICY_KEY)
+    if not isinstance(raw, dict):
+        return ("invalid", raw)
+    allowed = raw.get("allowed")
+    if not isinstance(allowed, list) or not allowed:
+        return ("invalid", raw)
+    for item in allowed:
+        if not isinstance(item, str) or item not in policy.CONTROLLERS:
+            return ("invalid", raw)
+    return ("allowed", policy.normalize(allowed))
+
+
+def get_allowed_controllers(state):
+    """The allowed tuple, or None when unrestricted. Raises
+    InvalidControllerPolicy on an unreadable policy — so a caller that ignores
+    the tagged form still cannot fail open."""
+    kind, value = read_controller_policy(state)
+    if kind == "invalid":
+        raise InvalidControllerPolicy(value)
+    return value if kind == "allowed" else None
+
+
+def apply_controller_transition(path, mappings, allowed=None, set_policy=False,
+                                prior=None, source=None, reason=None,
+                                created=None, pending_turns=None):
+    """Apply an allowed-set change and any number of role remappings as ONE
+    state transition: every mutation happens in memory and is persisted by
+    EXACTLY ONE `save`.
+
+    `set_policy` DEFAULTS TO FALSE, so the failure mode of forgetting it is
+    "preserve the saved policy", never "delete it":
+
+      - set_policy=False -> the `controller_policy` key is not read, written or
+        removed; its serialized value is byte-identical across the transition.
+      - set_policy=True, allowed=None -> the key is REMOVED (the restriction is
+        lifted, leaving the file byte-equivalent in shape to a pre-feature one).
+      - set_policy=True, allowed=<iterable> -> the key is written with the
+        normalized set. This form is also the repair path for an INVALID saved
+        policy: it replaces the value wholesale without ever reading it.
+
+    Raises ValueError BEFORE any mutation when a mapping names a role that is
+    not in the saved config. Returns the new state."""
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    state.setdefault("sessions", state.get("sessions") or {})
+
+    pairs = [(role, target) for role, target in (mappings or [])]
+    saved_config = state.get("config") or {}
+    for role, _target in pairs:
+        if role not in saved_config:
+            raise ValueError(
+                "cannot switch %r: role is not in the saved session config."
+                % role)
+    if set_policy and allowed is not None:
+        # Normalize (and reject an empty/unknown set) before touching anything.
+        allowed = policy.normalize(allowed)
+
+    stamp = created if created is not None else time.time()
+    for role, target in pairs:
+        state = _apply_role_switch(
+            state, role, target, reason=reason, source=source, created=stamp,
+            pending_turn=(pending_turns or {}).get(role))
+    if set_policy:
+        if allowed is None:
+            state.pop(POLICY_KEY, None)
+        else:
+            state[POLICY_KEY] = {
+                "allowed": list(allowed),
+                "updated": stamp,
+                "source": source or "cli",
+            }
     save(path, state)
     return state
 

@@ -38,8 +38,15 @@ preserving the existing degrade-never-raise behavior.
 Pure stdlib.
 """
 
+import datetime
 import hashlib
 import os
+import uuid
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z")
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +313,13 @@ def _descriptor_entries(artifacts):
             "bytes": len(raw_bytes),
             "sha256": hashlib.sha256(raw_bytes).hexdigest(),
             "present": present,
+            # A missing file still gets a digest here, because the prompt line
+            # renders one — but it is the digest of NOTHING, and without this
+            # flag it is indistinguishable from a real empty file's. That
+            # ambiguity is how a missing artifact came to be treated as content
+            # (CV-008). Consumers check this flag; the sealed envelope below
+            # refuses to record the digest at all.
+            "empty_or_missing": (not present) or len(raw_bytes) == 0,
         })
     return entries
 
@@ -950,7 +964,11 @@ EDGES = {
     # route 12 (peer evaluation evidence — verdict + consumed upstream)
     "eval->reviewer_verdict": {
         "from_role": "orchestrator", "to_role": "evaluator", "kind": "eval",
-        "sources": ["verdict", "reviewed"], "required": ["verdict"],
+        # `upstream` carries the PRIOR round's frozen verdict (P6). Without it
+        # in the allowed set the sealed chain could be assembled and then not
+        # delivered, so "responsiveness to feedback" would have nothing to be
+        # responsive to and would score not_applicable forever.
+        "sources": ["verdict", "reviewed", "upstream"], "required": ["verdict"],
         "facts": (), "render": _render_eval_verdict,
     },
     "eval->upstream": {
@@ -1124,3 +1142,128 @@ def render_handoff(edge_id, *, artifacts=None, facts=None, ctx=None):
                         edge_ids=edge_ids, delivery="path",
                         embedded=_embedded_map(entries),
                         descriptors=descriptors)
+
+
+# --------------------------------------------------------------------------- #
+# Sealed evidence envelopes (P4/P6 — the CV-008 fix).                         #
+#                                                                             #
+# CV-008's root cause is an ORDERING one, not a hashing one: `render_handoff`  #
+# hashes each artifact when the prompt BLOCK is built, and the evaluation      #
+# block was built before the reviewer had written its verdict. A file that did #
+# not exist yet therefore contributed the empty-file digest as if it were      #
+# content, and a file about to be rewritten contributed the PREVIOUS round's.  #
+# Either way a score was bound to evidence the evaluator never saw.            #
+#                                                                             #
+# Sealing after the artifact is written AND validated removes the defect       #
+# structurally rather than patching a call order that could drift back.        #
+# --------------------------------------------------------------------------- #
+
+
+class EvidenceEnvelope:
+    """An immutable statement of what evidence existed, and with what content,
+    at the moment a claim about it was made.
+
+    Sealing is not the same as reading: an artifact that is missing or that
+    fails validation is recorded as `present=False` / `validated=False` and is
+    given NO digest. The empty-file digest is never substituted, because that is
+    exactly the substitution that made a missing file look like content.
+    """
+
+    def __init__(self, envelope_id, sealed_at, artifacts, context=None):
+        self.envelope_id = envelope_id
+        self.sealed_at = sealed_at
+        self.artifacts = artifacts
+        self.context = context or {}
+
+    def as_dict(self):
+        return {
+            "envelope_id": self.envelope_id,
+            "sealed_at": self.sealed_at,
+            "artifacts": self.artifacts,
+            "context": self.context,
+        }
+
+    @property
+    def complete(self):
+        """True only when every sealed artifact was present AND validated."""
+        return all(a.get("present") and a.get("validated")
+                   for a in self.artifacts) if self.artifacts else False
+
+    def digests(self):
+        return {a["path"]: a.get("sha256") for a in self.artifacts}
+
+
+def seal_envelope(artifacts, validate=None, context=None, envelope_id=None,
+                  sealed_at=None):
+    """Seal the evidence for one claim, AFTER the caller has written it.
+
+    `artifacts` is an iterable of `{path, label?, role?}` dicts. `validate` is
+    an optional `validate(path, raw) -> bool` the caller supplies to say whether
+    the file it just wrote is actually usable (a verdict file that parses, say)
+    — an artifact that exists but is unusable is not evidence, and is sealed as
+    such rather than silently counted.
+
+    Never raises: an unreadable artifact seals as absent.
+    """
+    sealed = []
+    for art in artifacts or []:
+        if isinstance(art, str):
+            art = {"path": art}
+        if not isinstance(art, dict) or not art.get("path"):
+            continue
+        path = art["path"]
+        raw = _read_raw(path)
+        present = raw is not None
+        validated = False
+        if present:
+            if validate is None:
+                validated = True
+            else:
+                try:
+                    validated = bool(validate(path, raw))
+                except Exception:  # noqa: BLE001 - a validator never breaks a seal
+                    validated = False
+        sealed.append({
+            "path": path,
+            "label": art.get("label") or os.path.basename(path),
+            "role": art.get("role"),
+            "present": present,
+            "validated": validated,
+            # NO digest for an artifact that is absent or invalid. `None` says
+            # "there was nothing to hash"; the empty-file digest would say
+            # "there was content, and it was empty" — a different, false claim.
+            "sha256": (hashlib.sha256(raw).hexdigest()
+                       if present and validated else None),
+            "bytes": len(raw) if present else None,
+        })
+    return EvidenceEnvelope(
+        envelope_id=envelope_id or str(uuid.uuid4()),
+        sealed_at=sealed_at or _utc_now(),
+        artifacts=sealed, context=context)
+
+
+def verify_envelope(envelope):
+    """Re-read a sealed envelope's artifacts and compare against the seal.
+
+    Returns `{"state": "ok"|"changed"|"unknown", "changed": [<path>, ...]}`.
+
+    Called at aggregation time, which is what makes deferred scoring safe: an
+    artifact that changed between sealing and scoring marks its score
+    `unverifiable` rather than being re-hashed to whatever it says now. Re-
+    hashing would make every score verifiable by construction and prove
+    nothing.
+    """
+    if isinstance(envelope, dict):
+        envelope = EvidenceEnvelope(
+            envelope.get("envelope_id"), envelope.get("sealed_at"),
+            envelope.get("artifacts") or [], envelope.get("context"))
+    if not isinstance(envelope, EvidenceEnvelope) or not envelope.artifacts:
+        return {"state": "unknown", "changed": [],
+                "detail": "no sealed artifacts to verify"}
+    changed = []
+    for art in envelope.artifacts:
+        raw = _read_raw(art.get("path"))
+        now = hashlib.sha256(raw).hexdigest() if raw is not None else None
+        if now != art.get("sha256"):
+            changed.append(art.get("path"))
+    return {"state": "changed" if changed else "ok", "changed": changed}

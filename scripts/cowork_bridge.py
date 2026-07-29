@@ -35,6 +35,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cowork_ui as ui  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_probe_cache as probe_cache  # noqa: E402
+# The session controller policy. Every entry point below that creates a process
+# or writes provider-specific setup calls `policy.guard(...)` as its FIRST
+# statement, so a disallowed controller can never be started — not even for a
+# probe or an agent-file write — regardless of which call site was used.
+import cowork_policy as policy  # noqa: E402
 # Re-exported so existing callers/tests keep using bridge.USER_LABEL /
 # bridge.speaker_label; the canonical definitions live in cowork_ui.
 from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
@@ -287,6 +292,7 @@ def ensure_opencode_agent(role_prompt_file, speaker, mode, yolo,
     """Write `.opencode/agents/cowork-<speaker>.md` under base_dir (default cwd)
     and return the agent name. Overwrites any previous file so the prompt and
     permissions always reflect the current role config."""
+    policy.guard("opencode", role=speaker, kind="setup")
     base_dir = base_dir or os.getcwd()
     agent_name = OPENCODE_AGENT_PREFIX + speaker
     agent_dir = os.path.join(base_dir, OPENCODE_AGENT_SUBDIR)
@@ -314,6 +320,7 @@ def build_opencode_command(agent_name, prompt_text, mode, yolo, model=None,
     (provider-specific reasoning effort). Yolo implement runs get `--auto`;
     everything else relies on the generated agent's permission block (see
     `opencode_permission_lines`)."""
+    policy.guard("opencode", kind="setup")
     cmd = ["opencode", "run", "--format", "json", "--agent", agent_name]
     if model:
         cmd += ["--model", model]
@@ -615,6 +622,7 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     key is stored. A version-resolution failure forces always-live (never
     cached). `version_fn`/`cache_path` are injectable for tests.
     """
+    policy.guard("claude", role=role, kind="probe")
     command = build_claude_command(role_prompt_file, mode, yolo,
                                    extra_writable_dir=extra_writable_dir)
     cache_key = None
@@ -632,12 +640,24 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                             role_prompt_file=role_prompt_file)
             return True, None
     stdin_text = encode_user_message("ping")
+    # The probe is its own unit of work (P1): a probe's cost is real and is
+    # classified `probe` rather than folded into the role turn that follows it.
+    probe_work_id = trace_store.new_work_id()
+    probe_started = time.monotonic()
+
+    def _probe_elapsed_ms():
+        return int((time.monotonic() - probe_started) * 1000)
+
+    def _probe_work(**kw):
+        return trace_store.work_meta(probe_work_id, "probe", **kw)
+
     if trace:
         data = trace_store.command_meta(command)
         data.update(trace_store.prompt_meta(stdin_text, prefix="stdin"))
         trace.event("controller.probe.start", controller="claude", role=role,
                     prompt_kind="probe", mode=mode, yolo=yolo, cwd=os.getcwd(),
-                    role_prompt_file=role_prompt_file, **data)
+                    role_prompt_file=role_prompt_file,
+                    **dict(data, **_probe_work()))
     try:
         events = spawn(command, stdin_text)
         seen_ok = False
@@ -666,13 +686,17 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
             if trace:
                 trace.event("controller.probe.end", controller="claude",
                             role=role, prompt_kind="probe", result="ok",
-                            usage=probe_usage)
+                            usage=probe_usage, usage_native=probe_usage,
+                            **_probe_work(
+                                usage_scope="turn_native",
+                                duration_ms=_probe_elapsed_ms()))
             return True, None
     except Exception as exc:  # noqa: BLE001 - surface any spawn failure as an alert
         if trace:
             trace.event("controller.probe.end", controller="claude", role=role,
                         prompt_kind="probe", result="error",
-                        error_type=type(exc).__name__)
+                        error_type=type(exc).__name__,
+                        **_probe_work(duration_ms=_probe_elapsed_ms()))
         return False, (
             "Could not probe `claude` stream-json input (%s).\n"
             "    Confirm `claude` is installed and supports "
@@ -680,7 +704,8 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         )
     if trace:
         trace.event("controller.probe.end", controller="claude", role=role,
-                    prompt_kind="probe", result="unsupported")
+                    prompt_kind="probe", result="unsupported",
+                    **_probe_work(duration_ms=_probe_elapsed_ms()))
     return False, (
         "`claude` did not accept the cowork stream-json stdin message shape.\n"
         "    The stdin schema is undocumented (anthropics/claude-code #24594); "
@@ -737,6 +762,7 @@ class ClaudeSession:
                  session_id=None, resume_id=None, on_session_id=None,
                  region_factory=None, trace=None, extra_writable_dir=None,
                  internal=False, model=None, effort=None):
+        policy.guard("claude", role=speaker, kind="dispatch")
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.controller = "claude"
@@ -814,17 +840,71 @@ class ClaudeSession:
         `meta` is an optional per-turn accounting dict (#1/D11) merged into the
         controller.turn.start event (prompt_kind, role, controller, phase,
         fresh/resume, round, artifact descriptors, context_revision). It is
-        content-free metadata only — Trace.event drops any None field."""
+        content-free metadata only — Trace.event drops any None field.
+
+        The turn is also one immutable unit of work (P1): a `work_id` is minted
+        here and echoed on EVERY end path, so an in-flight, failed or cancelled
+        turn is joinable to its start rather than invisible (CV-005)."""
+        meta = dict(meta or {})
+        work_id = trace_store.new_work_id()
+        self.last_work_id = work_id
+        work_class = meta.get("work_class") or "productive"
+        turn_started = time.monotonic()
+        try:
+            return self._send_turn(text, meta, work_id, work_class,
+                                   turn_started)
+        except KeyboardInterrupt:
+            # Cancellation is its own terminal class (C1), not a flavour of
+            # failure: elapsed is computed BEFORE re-raising so the turn keeps
+            # its duration instead of losing it (P14).
+            if self.trace:
+                self.trace.event(
+                    "controller.turn.end", controller="claude",
+                    role=self.speaker, result="cancelled",
+                    model=self.live_model or self.model,
+                    **trace_store.work_meta(
+                        work_id, "cancelled", usage_scope="turn_native",
+                        identity=self._identity(),
+                        duration_ms=int(
+                            (time.monotonic() - turn_started) * 1000)))
+            raise
+
+    def _identity(self):
+        """The canonical identity block stamped on this session's work (P1)."""
+        return trace_store.identity_meta(
+            controller="claude", provider="anthropic",
+            model=self.live_model or self.model,
+            model_source=("live_event" if self.live_model
+                          else ("config_pinned" if self.model else "unknown")),
+            controller_session_id=self.session_id)
+
+    def _send_turn(self, text, meta, work_id, work_class, turn_started):
         if self.trace:
             fields = {"controller": "claude", "role": self.speaker}
             fields.update(trace_store.prompt_meta(text))
-            if meta:
-                fields.update({k: v for k, v in meta.items() if v is not None})
+            fields.update({k: v for k, v in meta.items() if v is not None})
+            fields.update(trace_store.work_meta(
+                work_id, work_class, usage_scope="turn_native",
+                identity=self._identity()))
             self.trace.event("controller.turn.start", **fields)
-        turn_started = time.monotonic()
 
         def _elapsed_ms():
             return int((time.monotonic() - turn_started) * 1000)
+
+        def _end(**kw):
+            """Emit controller.turn.end with the work stamps always present.
+
+            duration_ms is computed by the caller BEFORE this returns, so no end
+            path can emit without one (P14)."""
+            if not self.trace:
+                return
+            end_class = kw.pop("work_class", None) or work_class
+            fields = {"controller": "claude", "role": self.speaker}
+            fields.update(kw)
+            fields.update(trace_store.work_meta(
+                work_id, end_class, usage_scope="turn_native",
+                identity=self._identity()))
+            self.trace.event("controller.turn.end", **fields)
 
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
@@ -973,13 +1053,11 @@ class ClaudeSession:
                 if parsed.get("is_error") or controller_error is not None:
                     error_type = ((controller_error or {}).get("error_type")
                                   or parsed.get("subtype") or "controller_error")
-                    if self.trace:
-                        self.trace.event(
-                            "controller.turn.end", controller="claude",
-                            role=self.speaker, result="error",
-                            subtype=parsed.get("subtype"),
-                            error_type=error_type,
-                            model=self.live_model or self.model, duration_ms=_elapsed_ms())
+                    _end(result="error", work_class="failed",
+                         subtype=parsed.get("subtype"),
+                         error_type=error_type,
+                         model=self.live_model or self.model,
+                         duration_ms=_elapsed_ms())
                     if controller_error is None:
                         self.io_out.write(
                             ui.colorize("[error] " + (parsed.get("text") or ""),
@@ -990,14 +1068,17 @@ class ClaudeSession:
                         error_type=error_type,
                         session_id=sid or self.session_id,
                         model=self.live_model or self.model, duration_ms=_elapsed_ms())
-                elif self.trace:
-                    self.trace.event("controller.turn.end", controller="claude",
-                                     role=self.speaker,
-                                     result="denied" if denied else "ok",
-                                     subtype=parsed.get("subtype"),
-                                     usage=parsed.get("usage"),
-                                     model=self.live_model or self.model,
-                                     duration_ms=_elapsed_ms())
+                else:
+                    _end(result="denied" if denied else "ok",
+                         subtype=parsed.get("subtype"),
+                         usage=parsed.get("usage"),
+                         # Claude reports usage per turn already: preserved
+                         # verbatim so cache_creation_input_tokens and
+                         # cache_read_input_tokens are never renamed away when
+                         # reconciled against Codex's differently-named fields.
+                         usage_native=parsed.get("usage"),
+                         model=self.live_model or self.model,
+                         duration_ms=_elapsed_ms())
                 self.io_out.flush()
                 if denied:
                     return turn_result(
@@ -1016,12 +1097,13 @@ class ClaudeSession:
             spinner.stop()
         if region is not None:
             region.__exit__(None, None, None)
-        if self.trace:
-            self.trace.event("controller.turn.end", controller="claude",
-                             role=self.speaker, result="error",
-                             error_type="eof")
+        # The loop-exhausted / EOF path: `_elapsed_ms()` was already in scope
+        # here and simply unused, so this end emitted no duration at all (P14).
+        _end(result="error", work_class="failed", error_type="eof",
+             model=self.live_model or self.model, duration_ms=_elapsed_ms())
         return turn_result(False, "error", error_type="eof",
-                           session_id=self.session_id)
+                           session_id=self.session_id,
+                           duration_ms=_elapsed_ms())
 
     def close(self):
         try:
@@ -1029,6 +1111,42 @@ class ClaudeSession:
         except Exception:  # noqa: BLE001
             pass
         _terminate(self.proc)
+
+
+def _resumed_usage_baseline(thread_id):
+    """The thread's cumulative token totals BEFORE this process resumed it.
+
+    Read from Codex's own rollout, which is the only place the prior total
+    exists — this process did not run those turns. Returns None when the
+    rollout cannot be located or read, which the caller reports as an honest
+    `incomparable` first turn rather than as a fabricated baseline.
+
+    Strictly read-only and never raises: a baseline that cannot be established
+    degrades the measurement, never the run.
+    """
+    try:
+        import cowork_ingest as ingest_logs
+        path = ingest_logs.locate_codex_log(thread_id)
+        if not path:
+            return None
+        result = ingest_logs.ingest_codex(path)
+        if not result.ok:
+            return None
+        # The LAST cross-check total on the thread is its state at resume time.
+        for turn in reversed(result.turns):
+            totals = turn.get("usage_cross_check")
+            if isinstance(totals, dict) and totals:
+                running = {}
+                for entry in result.turns:
+                    usage = entry.get("usage")
+                    if isinstance(usage, dict):
+                        for field, value in usage.items():
+                            if isinstance(value, int):
+                                running[field] = running.get(field, 0) + value
+                return running or None
+        return None
+    except Exception:  # noqa: BLE001 - a baseline never breaks a run
+        return None
 
 
 class CodexSession:
@@ -1039,6 +1157,7 @@ class CodexSession:
                  resume_thread_id=None, on_thread_id=None, trace=None,
                  extra_writable_dir=None, internal=False, model=None,
                  effort=None):
+        policy.guard("codex", role=speaker, kind="dispatch")
         self.mode = mode
         self.yolo = yolo
         self.model = model
@@ -1065,6 +1184,75 @@ class CodexSession:
         self._notified = False
         self._resuming_first = resume_thread_id is not None
         self._started = False
+        # Codex reports the THREAD's running totals, not the turn's (C1). A
+        # resumed turn therefore reports every prior turn's tokens again unless
+        # the cumulative reading is differenced. `_cumulative_usage` holds the
+        # previous reading; `usage_native` always keeps the provider's own
+        # counters verbatim beside the derived per-turn `usage`.
+        # A RESUMED session has a baseline it did not observe: the thread
+        # already carries every earlier turn's tokens, and the first cumulative
+        # reading of this process is NOT this turn's cost. Seeding it from the
+        # rollout is what makes a resumed turn report its own share; when the
+        # rollout cannot be read there is no honest baseline, and the first
+        # resumed turn says `incomparable` rather than reporting the whole
+        # thread as though this turn had spent it.
+        self._cumulative_usage = None
+        self._baseline_state = "fresh"
+        if resume_thread_id:
+            seeded = _resumed_usage_baseline(resume_thread_id)
+            self._cumulative_usage = seeded
+            self._baseline_state = "seeded" if seeded else "unseeded"
+            if trace:
+                trace.event("controller.resume.baseline", controller="codex",
+                            role=speaker, thread_id=resume_thread_id,
+                            state=self._baseline_state)
+        self.last_work_id = None
+
+    def _identity(self):
+        """The canonical identity block stamped on this session's work (P1)."""
+        return trace_store.identity_meta(
+            controller="codex", provider="openai",
+            model=self.live_model or self.model,
+            model_source=("live_event" if self.live_model
+                          else ("config_pinned" if self.model else "unknown")),
+            controller_session_id=self.thread_id)
+
+    def _turn_usage(self, cumulative):
+        """Convert Codex's cumulative thread counters into THIS turn's usage.
+
+        Returns `(usage, usage_scope)`. A field that would go negative means the
+        counters are not a monotonic cumulative series for this thread, so no
+        honest per-turn figure exists: the turn is marked `incomparable` and
+        `usage` is None. Never a clamped or fabricated number.
+        """
+        if not isinstance(cumulative, dict):
+            return None, "unknown"
+        previous = self._cumulative_usage
+        if not isinstance(previous, dict):
+            self._cumulative_usage = dict(cumulative)
+            if self._baseline_state == "unseeded":
+                # A resumed thread whose prior total could not be read. The
+                # running total here includes turns this process never ran, so
+                # reporting it as this turn's cost is exactly the cumulative
+                # defect. There is no honest figure, and saying so is the only
+                # correct answer.
+                self._baseline_state = "fresh"
+                return None, "incomparable"
+            # A genuinely fresh thread: the running total IS this turn's.
+            return dict(cumulative), "turn_delta"
+        delta = {}
+        for field, value in cumulative.items():
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            before = previous.get(field)
+            before = before if isinstance(before, int) and not isinstance(
+                before, bool) else 0
+            if value - before < 0:
+                self._cumulative_usage = dict(cumulative)
+                return None, "incomparable"
+            delta[field] = value - before
+        self._cumulative_usage = dict(cumulative)
+        return delta, "turn_delta"
 
     def _run(self, command):
         proc = subprocess.Popen(
@@ -1124,6 +1312,10 @@ class CodexSession:
         return events
 
     def send(self, text, meta=None):
+        meta = dict(meta or {})
+        work_id = trace_store.new_work_id()
+        self.last_work_id = work_id
+        work_class = meta.get("work_class") or "productive"
         if not self._started and not self._resuming_first:
             command = build_codex_command(
                 text, self.mode, self.yolo,
@@ -1135,9 +1327,18 @@ class CodexSession:
                 self.io_out.write("[error] no codex thread id; cannot continue\n")
                 self.io_out.flush()
                 if self.trace:
-                    self.trace.event("controller.turn.end", controller="codex",
-                                     role=self.speaker, result="error",
-                                     error_type="missing_thread_id")
+                    # This path used to emit a `controller.turn.end` whose
+                    # matching start is never emitted (the start comes further
+                    # down, after the command is built) — an orphan end that no
+                    # work_id could join. It is a REJECTED turn: it carries its
+                    # own work_id and never pretends a turn began (P14).
+                    self.trace.event(
+                        "controller.turn.rejected", controller="codex",
+                        role=self.speaker, result="error",
+                        error_type="missing_thread_id",
+                        **trace_store.work_meta(
+                            work_id, "failed", usage_scope="unknown",
+                            identity=self._identity(), duration_ms=0))
                 return turn_result(False, "error",
                                    error_type="missing_thread_id")
             command = build_codex_resume_command(
@@ -1156,19 +1357,44 @@ class CodexSession:
             fields.update(trace_store.command_meta(command, prompt_text=text))
             # Per-turn accounting (#1/D11): caller-supplied meta merges in last,
             # but never overrides the authoritative fresh/resume computed here.
-            if meta:
-                fields.update({k: v for k, v in meta.items()
-                               if v is not None and k not in ("fresh", "resume")})
+            fields.update({k: v for k, v in meta.items()
+                           if v is not None and k not in ("fresh", "resume")})
+            fields.update(trace_store.work_meta(
+                work_id, work_class, usage_scope="turn_delta",
+                identity=self._identity()))
             self.trace.event("controller.turn.start", **fields)
         turn_started = time.monotonic()
         try:
             events = self._run(command)
-        except Exception as exc:  # noqa: BLE001
+        except KeyboardInterrupt:
+            # Cancellation is its own terminal class, and computing elapsed
+            # before re-raising is what keeps its duration (C1, P14).
             if self.trace:
-                self.trace.event("controller.turn.end", controller="codex",
-                                 role=self.speaker, result="error",
-                                 error_type=type(exc).__name__)
-            return turn_result(False, "error", error_type=type(exc).__name__)
+                self.trace.event(
+                    "controller.turn.end", controller="codex",
+                    role=self.speaker, result="cancelled",
+                    thread_id=self.thread_id,
+                    **trace_store.work_meta(
+                        work_id, "cancelled", usage_scope="unknown",
+                        identity=self._identity(),
+                        duration_ms=int(
+                            (time.monotonic() - turn_started) * 1000)))
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # duration_ms is computed HERE rather than below the except block,
+            # which is why this end used to emit without one (P14).
+            failed_ms = int((time.monotonic() - turn_started) * 1000)
+            if self.trace:
+                self.trace.event(
+                    "controller.turn.end", controller="codex",
+                    role=self.speaker, result="error",
+                    error_type=type(exc).__name__,
+                    thread_id=self.thread_id,
+                    **trace_store.work_meta(
+                        work_id, "failed", usage_scope="unknown",
+                        identity=self._identity(), duration_ms=failed_ms))
+            return turn_result(False, "error", error_type=type(exc).__name__,
+                               duration_ms=failed_ms)
         duration_ms = int((time.monotonic() - turn_started) * 1000)
         tid = capture_thread_id(events)
         if tid and not self.thread_id:
@@ -1202,15 +1428,26 @@ class CodexSession:
         # Older codex CLIs never name the live model in events; fall back to
         # the config-pinned model so the stamp is still meaningful.
         model = self.live_model or self.model
+        # THE CUMULATIVE-CODEX FIX (C1): `usage` off turn.completed is the
+        # THREAD's running total, so a resumed turn re-reports every earlier
+        # turn's tokens. Difference it into this turn's own share, and keep the
+        # provider's raw counters verbatim beside it as `usage_native` — the
+        # derived figure never overwrites the source it came from.
+        turn_usage, usage_scope = self._turn_usage(usage)
+        end_class = work_class if result == "ok" else (
+            "failed" if result == "error" else work_class)
         if self.trace:
             self.trace.event("controller.turn.end", controller="codex",
                              role=self.speaker, result=result,
                              thread_id=self.thread_id, event_count=len(events),
-                             usage=usage, model=model,
-                             duration_ms=duration_ms)
+                             usage=turn_usage, usage_native=usage, model=model,
+                             **trace_store.work_meta(
+                                 work_id, end_class, usage_scope=usage_scope,
+                                 identity=self._identity(),
+                                 duration_ms=duration_ms))
         return turn_result(
             result == "ok", result, denied=(result == "denied"),
-            thread_id=self.thread_id, usage=usage, model=model,
+            thread_id=self.thread_id, usage=turn_usage, model=model,
             duration_ms=duration_ms)
 
     def close(self):
@@ -1231,6 +1468,9 @@ class OpencodeSession:
                  resume_session_id=None, on_session_id=None, trace=None,
                  extra_writable_dir=None, internal=False, model=None,
                  effort=None, agent_base_dir=None):
+        # BEFORE ensure_opencode_agent below: a blocked opencode dispatch must
+        # not leave a generated agent file behind.
+        policy.guard("opencode", role=speaker, kind="dispatch")
         self.mode = mode
         self.yolo = yolo
         self.model = model
