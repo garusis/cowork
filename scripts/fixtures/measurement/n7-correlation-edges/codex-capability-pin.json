@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.145.0",
+  "protocol_schema_digest": "7de759175387b022c6b4106695d65f371cc6229921edce06fc1513e0151cd646",
+  "protocol_schema_digest_scope": "codex-0.145.0 generated ServerRequest method census recorded by the approved plan",
+  "experimentalFeature_multi_agent": {
+    "default": {
+      "defaultEnabled": true,
+      "enabled": true,
+      "name": "multi_agent",
+      "stage": "stable"
+    },
+    "disabled_flag": {
+      "defaultEnabled": true,
+      "enabled": false,
+      "name": "multi_agent",
+      "stage": "stable"
+    }
+  },
+  "raw_instruction_keyword_counts": {
+    "default": {
+      "followup_task": 2,
+      "send_message": 4,
+      "spawn_agent": 3,
+      "sub-agent": 7,
+      "subagent": 2
+    },
+    "disabled_flag": {
+      "followup_task": 2,
+      "send_message": 4,
+      "spawn_agent": 3,
+      "sub-agent": 7,
+      "subagent": 2
+    }
+  },
+  "tools_inventory_observable": false,
+  "pre_child_server_request": false
+}

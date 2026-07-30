@@ -1,0 +1,5 @@
+{"type":"system","subtype":"subagent_start","agent_id":"a1","parent_tool_use_id":"t1"}
+{"type":"system","subtype":"subagent_start","agent_id":"a2","parent_tool_use_id":"t2"}
+{"type":"system","subtype":"subagent_stop","agent_id":"a1","parent_tool_use_id":"t1","event_id":"s1"}
+{"type":"system","subtype":"subagent_stop","agent_id":"a1","parent_tool_use_id":"t1","event_id":"s1"}
+{"type":"assistant","parent_tool_use_id":"ungoverned","message":{"usage":{"input_tokens":1},"content":[]}}

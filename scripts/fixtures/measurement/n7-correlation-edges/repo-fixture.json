@@ -1,0 +1,1 @@
+{"initial":{"tracked.txt":"before\n","deleted.txt":"remove\n"},"writes":{"tracked.txt":"concurrent update\n","new.txt":"created\n"},"deletes":["deleted.txt"],"expected":{"added":["new.txt"],"modified":["tracked.txt"],"deleted":["deleted.txt"]}}

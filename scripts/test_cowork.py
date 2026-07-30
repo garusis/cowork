@@ -20,6 +20,8 @@ import os
 from pathlib import Path
 import select as select_mod
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,12 @@ import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_ui as ui  # noqa: E402
 import cowork_policy as policy  # noqa: E402
+import cowork_action_policy as action_policy  # noqa: E402
+import cowork_action_guard as action_guard  # noqa: E402
+import cowork_guard_broker as guard_broker  # noqa: E402
+import cowork_delta as delta_store  # noqa: E402
+import cowork_measure as measure  # noqa: E402
+import cowork_report as report  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
 # that exercise the real libraries skip when they are absent — same pattern as the
@@ -50,6 +58,55 @@ try:
     HAS_UI_DEPS = True
 except ImportError:
     HAS_UI_DEPS = False
+
+
+_NESTED_FIXTURES = os.path.join(
+    _HERE, "fixtures", "measurement")
+
+
+def _nested_fixture_events(name):
+    path = os.path.join(_NESTED_FIXTURES, name, "raw-events.jsonl")
+    with open(path) as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def _materialize_nested_fixture_repo(name, root):
+    """Build one fixture's real git state and return its boundary delta."""
+    with open(os.path.join(
+            _NESTED_FIXTURES, name, "repo-fixture.json")) as fh:
+        fixture = json.load(fh)
+    repo = os.path.join(root, "repo")
+    os.mkdir(repo)
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", repo] + list(args), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=True)
+
+    git("init")
+    git("config", "user.email", "fixture@example.invalid")
+    git("config", "user.name", "Fixture")
+    for relative, content in fixture["initial"].items():
+        path = os.path.join(repo, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Path(path).write_text(content)
+    git("add", ".")
+    git("commit", "-m", "fixture")
+    scope = action_policy.OwnedScope(repo_roots=(repo,))
+    before = delta_store.snapshot(scope)
+    for relative, content in fixture["writes"].items():
+        path = os.path.join(repo, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Path(path).write_text(content)
+    for relative in fixture["deletes"]:
+        os.unlink(os.path.join(repo, relative))
+    result = delta_store.diff(before, delta_store.snapshot(scope))
+    expected = {
+        key: sorted(os.path.realpath(os.path.join(repo, relative))
+                    for relative in fixture["expected"][key])
+        for key in ("added", "modified", "deleted")
+    }
+    return result, expected
 
 
 class FlagAssemblyTest(unittest.TestCase):
@@ -1866,6 +1923,41 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(events[0]["status"], "needs_input")
         self.assertIn("ts", events[0])
 
+    def test_ordinary_trace_append_does_not_scan_or_fsync_prior_lines(self):
+        import unittest.mock as mock
+        path = self._tmp()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            for index in range(2000):
+                fh.write(json.dumps({"event_id": str(index)}) + "\n")
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        with mock.patch.object(
+                guard_broker.json, "loads",
+                side_effect=AssertionError("ordinary trace scanned history")):
+            trace.event("constant.work")
+        self.assertEqual(self._events(path)[-1]["event"], "constant.work")
+
+    def test_concurrent_ordinary_trace_appends_remain_valid_json_lines(self):
+        path = self._tmp()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        barrier = threading.Barrier(32)
+
+        def emit(index):
+            barrier.wait()
+            trace.event("concurrent", writer=index)
+
+        threads = [
+            threading.Thread(target=emit, args=(index,))
+            for index in range(32)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        events = self._events(path)
+        self.assertEqual(len(events), 32)
+        self.assertEqual(
+            {event["writer"] for event in events}, set(range(32)))
+
     def test_command_meta_redacts_prompt_but_keeps_hash_and_length(self):
         secret = "please do not duplicate this prompt"
         meta = trace_store.command_meta(["codex", "exec", secret],
@@ -2814,7 +2906,7 @@ class ScoutReviewerRegistrationTest(unittest.TestCase):
         self.assertNotIn("revisor", cowork.ROLES)  # reserved slot dropped
         self.assertEqual(
             cowork.DEFAULTS["scout-reviewer"],
-            {"controller": "codex", "model": None, "effort": None,
+            {"controller": "claude", "model": None, "effort": None,
              "yolo": True, "mode": "implement"})
 
     def test_role_prompt_file_exists(self):
@@ -3774,6 +3866,10 @@ class ControllerSwitchLoopTest(unittest.TestCase):
         status_path = self._path()
         review_path = status_path + ".review"
         config = cowork.default_config(["planner", cowork.PLANNING_ADVISOR])
+        # Exercise a persisted pre-migration Codex reviewer: the shipped
+        # default is now Claude, but existing sessions still need the switch
+        # gate when their saved Codex binary is unavailable.
+        config[cowork.PLANNING_ADVISOR]["controller"] = "codex"
         calls = {"runner": [], "checks": 0, "switches": []}
 
         class LeadSession:
@@ -4056,7 +4152,8 @@ class ReviewerSessionFlowTest(unittest.TestCase):
             if on_session and resume_id is None:
                 on_session(config["scout"]["controller"], "scout-1")
             if on_reviewer_session and reviewer_resume_id is None:
-                on_reviewer_session("codex", "rev-1")
+                on_reviewer_session(
+                    config["scout-reviewer"]["controller"], "rev-1")
             if on_reviewer_context_ack:
                 on_reviewer_context_ack()  # reviewer ran successfully
             return 0
@@ -4073,7 +4170,7 @@ class ReviewerSessionFlowTest(unittest.TestCase):
         saved = state_store.load(spath)
         self.assertEqual(state_store.get_context(saved), "the original goal")
         self.assertEqual(
-            state_store.get_role_session(saved, "scout-reviewer", "codex"),
+            state_store.get_role_session(saved, "scout-reviewer", "claude"),
             "rev-1")
 
         # Run 2: resume (team set so it's non-interactive; no --context => empty).
@@ -4158,7 +4255,7 @@ class RunReviewerOnceTest(unittest.TestCase):
             json.dump({"status": "ready_for_review", "result": {}}, fh)
         return intel, review
 
-    def test_codex_reviewer_writes_and_is_read_back_via_quiet_sink(self):
+    def test_default_reviewer_writes_and_is_read_back_via_quiet_sink(self):
         intel, review = self._paths()
         seen = {}
 
@@ -4183,13 +4280,16 @@ class RunReviewerOnceTest(unittest.TestCase):
             session_factory=factory)
         self.assertEqual(verdict["verdict"], "needs_user")
         self.assertEqual(verdict["user_question"], "scope?")
-        self.assertEqual(seen["controller"], "codex")     # default controller
+        self.assertEqual(seen["controller"], "claude")    # governed default
         self.assertTrue(seen["closed"])
         # single-voice: the reviewer's io_out is a quiet sink, not a real terminal.
         self.assertFalse(ui.is_tty(seen["io_out"]))
         self.assertIsInstance(seen["io_out"], cowork._QuietSink)
-        # reviewer prompt carries the shared context + intel, not the scout brief.
-        self.assertIn("the goal", seen["prompt"])
+        # Claude reviewers receive shared context by authoritative file path,
+        # never pasted inline, plus the intel artifact path.
+        self.assertNotIn("the goal", seen["prompt"])
+        self.assertIn("shared session context", seen["prompt"])
+        self.assertIn("scout intel JSON", seen["prompt"])
         self.assertNotIn("do NOT produce a plan", seen["prompt"])
 
     def test_stale_verdict_cleared_before_each_pass(self):
@@ -5105,7 +5205,7 @@ class PlanningAdvisorRegistrationTest(unittest.TestCase):
         # inherits the old advisor defaults
         self.assertEqual(
             cowork.DEFAULTS["planning-advisor"],
-            {"controller": "codex", "model": None, "effort": None,
+            {"controller": "claude", "model": None, "effort": None,
              "yolo": True, "mode": "implement"})
 
     def test_role_prompt_files_exist(self):
@@ -7411,7 +7511,7 @@ class BuildReviewerRegistrationTest(unittest.TestCase):
         self.assertNotIn("revisor", cowork.DEFAULTS)
         self.assertEqual(
             cowork.DEFAULTS["build-reviewer"],
-            {"controller": "codex", "model": None, "effort": None,
+            {"controller": "claude", "model": None, "effort": None,
              "yolo": True, "mode": "implement"})
         self.assertEqual(
             cowork.DEFAULTS["builder"],
@@ -10037,6 +10137,41 @@ class PromptAccountingTest(unittest.TestCase):
         # Best-effort usage rides controller.turn.end.
         end = [e for e in events if e["event"] == "controller.turn.end"][0]
         self.assertEqual(end["usage"], {"input_tokens": 9})
+        self.assertEqual(end["provider_usage_total"], {"input_tokens": 9})
+        self.assertEqual(end["usage_basis"], "parent_counter_ambiguous")
+
+    def test_claude_turn_separates_direct_usage_from_provider_total(self):
+        import unittest.mock as mock
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 7, "output_tokens": 2},
+                },
+            }),
+            json.dumps({
+                "type": "result", "subtype": "success", "session_id": "S1",
+                "usage": {"input_tokens": 11, "output_tokens": 3},
+            }),
+        ]
+        with mock.patch.object(
+                bridge.subprocess, "Popen",
+                return_value=_ClaudeProc(lines)):
+            session = bridge.ClaudeSession(
+                "roles/scout.md", "plan", True, io_out=io.StringIO(),
+                speaker="scout", session_id="S1", trace=trace)
+            session.send("hi")
+        end = [event for event in self._events(path)
+               if event["event"] == "controller.turn.end"][0]
+        self.assertEqual(
+            end["usage"], {"input_tokens": 7, "output_tokens": 2})
+        self.assertEqual(
+            end["provider_usage_total"],
+            {"input_tokens": 11, "output_tokens": 3})
+        self.assertEqual(end["usage_basis"], "parent_message_sum")
 
     def test_probe_events_carry_prompt_kind_and_usage(self):
         # #1: probe start/end carry prompt_kind='probe'; end carries best-effort
@@ -11366,7 +11501,7 @@ class HeadlessReviewerResumeTest(unittest.TestCase):
             spath, team, cowork.default_config(team), prior=state)
         # a saved scout-reviewer session id makes it a RESUMED reviewer
         state_store.save_role_session(
-            spath, "scout-reviewer", "codex", "rev-1", prior=state)
+            spath, "scout-reviewer", "claude", "rev-1", prior=state)
         seen = {}
 
         def fake_scout(config, context, selected,
@@ -23722,3 +23857,1978 @@ class OwnedVerificationArtifactSelfValidationTests(unittest.TestCase):
             verification.validate_argv_safety(entries, checkout_stub)
         finally:
             shutil.rmtree(checkout_stub, ignore_errors=True)
+
+
+class ActionPolicyDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.scope = action_policy.OwnedScope(
+            repo_roots=(self.tmp.name,),
+            role_temp_dir=os.path.join(self.tmp.name, ".tmp"))
+
+    def test_read_allowed_and_unknown_denied(self):
+        read = action_policy.classify_action("Read", {"file_path": "/etc/hosts"})
+        self.assertTrue(action_policy.decide(read, self.scope)["allow"])
+        unknown = action_policy.classify_action("mcp__x__write", {"path": "x"})
+        self.assertEqual(action_policy.decide(unknown, self.scope)["reason"],
+                         "unknown_tool_class")
+
+
+class BashProofPolicyTests(unittest.TestCase):
+    def test_bypass_shapes_deny_and_inert_commands_pass(self):
+        denied = ("cp a b", "install a b", "sed -i s/a/b/ x", "tee x",
+                  "python3 -c 'open(\"x\",\"w\")'", "./script.sh",
+                  "echo $(pwd)", "find . -exec rm {} ;",
+                  "git status & rm -rf /tmp/victim",
+                  "git status\nrm -rf /tmp/victim",
+                  "git status\r\nrm -rf /tmp/victim",
+                  "touch $HOME/escaped",
+                  "git status || rm -rf /tmp/victim",
+                  "git status; rm -rf /tmp/victim",
+                  "git diff --output=/tmp/leak.txt",
+                  "git diff -O/tmp/order.txt",
+                  "find . -fprint /tmp/leak.txt",
+                  "find . -fls /tmp/leak.txt",
+                  "python3 -m unittest writes_test.py")
+        for command in denied:
+            with self.subTest(command=command):
+                action = action_policy.classify_action(
+                    "Bash", {"command": command}, cwd="/tmp")
+                if action["class"] in ("write", "delete"):
+                    scope = action_policy.OwnedScope(repo_roots=("/private/no",))
+                    self.assertFalse(action_policy.decide(action, scope)["allow"])
+                else:
+                    self.assertFalse(action["resolution_complete"])
+        for command in (
+                "git status", "ls", "rg needle", "ls -la",
+                "grep -rn needle .", "head -20 file.txt",
+                "tail -50 log.txt", "rg -ln needle",
+                "git log --oneline -10"):
+            with self.subTest(command=command):
+                self.assertEqual(action_policy.classify_action(
+                    "Bash", {"command": command})["class"], "read")
+
+    def test_unittest_module_with_write_code_is_never_classified_read(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "written.txt")
+            module = os.path.join(root, "test_writes.py")
+            Path(module).write_text(
+                "from pathlib import Path\n"
+                "Path(%r).write_text('unsafe')\n" % target)
+            action = action_policy.classify_action(
+                "Bash", {"command": "python3 -m unittest test_writes.py"},
+                cwd=root)
+            self.assertEqual(action["class"], "unknown")
+            self.assertEqual(action["reason"], "shell_unprovable")
+            self.assertFalse(os.path.exists(target))
+
+
+class KernelWriteBoundaryTests(unittest.TestCase):
+    def test_real_profile_allows_owned_and_denies_outside_effects(self):
+        with tempfile.TemporaryDirectory() as root:
+            owned = os.path.join(root, "owned")
+            outside = os.path.join(root, "outside")
+            os.mkdir(owned)
+            os.mkdir(outside)
+            link = os.path.join(root, "owned-link")
+            os.symlink(owned, link)
+            scope = action_policy.OwnedScope(repo_roots=(link,))
+            probe = bridge.kernel_write_boundary(scope)
+            if not probe["available"]:
+                for mode in ("plan", "implement"):
+                    self.assertFalse(action_policy.capability_decision(
+                        "claude", mode, "governed",
+                        "pre_execution_record", False)["allow"])
+                return
+
+            def run_python(source):
+                wrapped = bridge.kernel_write_boundary(
+                    scope, [sys.executable, "-c", source])
+                return subprocess.run(
+                    wrapped["argv"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+
+            inside = os.path.join(owned, "inside.txt")
+            self.assertEqual(run_python(
+                "open(%r, 'w').write('ok')" % inside).returncode, 0)
+            self.assertTrue(os.path.exists(inside))
+
+            outside_file = os.path.join(outside, "outside.txt")
+            self.assertNotEqual(run_python(
+                "open(%r, 'w').write('bad')" % outside_file).returncode, 0)
+            self.assertFalse(os.path.exists(outside_file))
+
+            victim = os.path.join(outside, "victim.txt")
+            Path(victim).write_text("keep")
+            self.assertNotEqual(run_python(
+                "import os; os.unlink(%r)" % victim).returncode, 0)
+            self.assertTrue(os.path.exists(victim))
+
+            device = bridge.kernel_write_boundary(
+                scope, ["/bin/sh", "-c", "echo ok >/dev/null"])
+            self.assertEqual(subprocess.run(device["argv"]).returncode, 0)
+
+    def test_linux_preflight_truthfully_reports_no_governed_controller(self):
+        ok, alerts = preflight.preflight(
+            {"builder": {"controller": "claude"}},
+            which=lambda _name: "/usr/bin/fake", interactive=False,
+            platform="linux")
+        self.assertFalse(ok)
+        self.assertTrue(any(
+            "no controller will be launched" in alert.lower()
+            and "credentials/state" in alert for alert in alerts))
+
+
+class ControllerCapabilityMatrixTests(unittest.TestCase):
+    def test_claude_role_requires_delegation_to_be_disabled(self):
+        governed = action_policy.capability_decision(
+            "claude", "implement", "governed", "pre_execution_record", True)
+        self.assertFalse(governed["allow"])
+        self.assertEqual(
+            governed["missing_capability"], "child_agent_correlation")
+        disabled = action_policy.capability_decision(
+            "claude", "implement", "enforceably_disabled",
+            "pre_execution_record", True)
+        self.assertTrue(disabled["allow"])
+        for controller in ("codex", "opencode"):
+            with self.subTest(controller=controller):
+                self.assertFalse(action_policy.capability_decision(
+                    controller, "implement", "unknown", "none", False)["allow"])
+
+    def test_action_adapter_handles_parent_and_stamped_historical_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            assets = os.path.join(root, "assets")
+            os.mkdir(repo)
+            os.mkdir(assets)
+            scope = action_policy.OwnedScope(
+                repo_roots=(repo,), session_assets_dir=assets)
+            paths = {
+                "actions": os.path.join(root, "actions.jsonl"),
+                "children": os.path.join(root, "children.jsonl"),
+                "trace": os.path.join(root, "trace.jsonl"),
+            }
+            parent = {
+                "controller": "claude",
+                "controller_source": "config_pinned",
+                "model": "sonnet", "model_source": "config_pinned",
+                "effort": "high", "effort_source": "config_pinned",
+            }
+            broker = guard_broker.GuardBroker(
+                os.path.join(root, "guard.sock"), "token", scope,
+                paths["actions"], paths["children"], paths["trace"], parent)
+            cases = (
+                (os.path.join(repo, "owned.txt"), "allow"),
+                (os.path.join(assets, "other-role.json"), "deny"),
+                (os.path.join(root, "unowned.txt"), "deny"),
+            )
+            for acting in ("parent", "child"):
+                for index, (target, expected) in enumerate(cases):
+                    with self.subTest(acting=acting, target=target):
+                        response = broker.handle({
+                            "guard_attempt_id": "%s-%d" % (acting, index),
+                            "token": "token",
+                            "payload": {
+                                "tool_name": "Write",
+                                "tool_input": {"file_path": target},
+                                "cwd": repo, "work_id": acting,
+                                "parent_work_id": "parent",
+                            }})
+                        self.assertEqual(
+                            response["hookSpecificOutput"]
+                            ["permissionDecision"], expected)
+
+    def test_refused_rows_launch_zero_processes(self):
+        launches = []
+        for controller in ("codex", "opencode"):
+            for mode in ("plan", "implement"):
+                decision = action_policy.capability_decision(
+                    controller, mode, "unknown", "none", False)
+                if decision["allow"]:
+                    launches.append((controller, mode))
+                self.assertEqual(
+                    decision["missing_capability"],
+                    "pre_child_delegation_decision")
+        self.assertEqual(launches, [])
+
+    def test_refused_adapters_record_reason_before_zero_launch(self):
+        class RecordingTrace:
+            def __init__(self):
+                self.events = []
+
+            def event(self, name, **fields):
+                self.events.append(dict(fields, event=name))
+
+        previous = bridge.set_nested_guard_active(True)
+        try:
+            for controller, constructor in (
+                    ("codex", lambda trace: bridge.CodexSession(
+                        "plan", False, trace=trace)),
+                    ("opencode", lambda trace: bridge.OpencodeSession(
+                        "roles/scout.md", "plan", False, trace=trace))):
+                with self.subTest(controller=controller):
+                    trace = RecordingTrace()
+                    with self.assertRaisesRegex(
+                            RuntimeError, "pre-child delegation decision"):
+                        constructor(trace)
+                    self.assertEqual(trace.events, [{
+                        "event": "controller.dispatch.refused",
+                        "controller": controller,
+                        "role": "scout",
+                        "missing_capability":
+                            "pre_child_delegation_decision",
+                    }])
+        finally:
+            bridge.set_nested_guard_active(previous)
+
+
+class NestedChildGovernanceTests(unittest.TestCase):
+    PARENT = {
+        "controller": "claude", "controller_source": "config_pinned",
+        "model": "sonnet", "model_source": "config_pinned",
+        "effort": "high", "effort_source": "config_pinned",
+    }
+
+    def test_pin_preserves_input_and_mismatch_denies(self):
+        decision = action_policy.decide_child(
+            {"prompt": "keep", "subagent_type": "Explore"},
+            self.PARENT, ("claude",))
+        self.assertTrue(decision["allow"])
+        self.assertEqual(decision["updated_input"]["prompt"], "keep")
+        self.assertEqual(decision["updated_input"]["model"], "sonnet")
+        self.assertNotIn("effort", decision["updated_input"])
+        self.assertNotIn("controller", decision["updated_input"])
+        denied = action_policy.decide_child(
+            {"model": "other"}, self.PARENT, ("claude",))
+        self.assertEqual(denied["reason"],
+                         "child_identity_override_attempted")
+
+    def test_every_identity_and_pin_failure_is_fail_closed(self):
+        cases = (
+            ({"controller": "codex"}, self.PARENT, ("claude",), True,
+             "child_controller_not_permitted"),
+            ({"effort": "low"}, self.PARENT, ("claude",), True,
+             "child_identity_override_attempted"),
+            ({}, dict(self.PARENT, model_source="unknown"), ("claude",),
+             True, "parent_identity_unresolved"),
+            ({}, self.PARENT, ("claude",), False,
+             "child_pin_not_enforceable"),
+        )
+        for requested, parent, allowed, pin, reason in cases:
+            with self.subTest(reason=reason):
+                decision = action_policy.decide_child(
+                    requested, parent, allowed, pin_capability=pin)
+                self.assertFalse(decision["allow"])
+                self.assertEqual(decision["reason"], reason)
+
+    def test_broker_mints_stable_id_before_every_child_refusal(self):
+        with tempfile.TemporaryDirectory() as root:
+            scope = action_policy.OwnedScope(repo_roots=(root,))
+            broker = guard_broker.GuardBroker(
+                os.path.join(root, "guard.sock"), "token", scope,
+                os.path.join(root, "actions.jsonl"),
+                os.path.join(root, "children.jsonl"),
+                os.path.join(root, "trace.jsonl"), self.PARENT)
+            for attempt, model, reason in (
+                    ("correlation-block", None,
+                     "child_agent_correlation_unavailable"),
+                    ("identity-block", "other",
+                     "child_identity_override_attempted")):
+                payload = {"subagent_type": "Explore", "prompt": "keep"}
+                if model:
+                    payload["model"] = model
+                response = broker.handle({
+                    "guard_attempt_id": attempt, "token": "token",
+                    "payload": {"tool_name": "Agent",
+                                "tool_use_id": "tool-" + attempt,
+                                "parent_work_id": "parent",
+                                "tool_input": payload}})
+                self.assertEqual(response["hookSpecificOutput"]
+                                 ["permissionDecision"], "deny")
+                self.assertIn(
+                    reason,
+                    response["hookSpecificOutput"]
+                    ["permissionDecisionReason"])
+                self.assertTrue(response["child_work_id"])
+            with open(os.path.join(root, "children.jsonl")) as fh:
+                rows = [json.loads(line) for line in fh]
+            self.assertEqual({row["guard_attempt_id"] for row in rows},
+                             {"correlation-block", "identity-block"})
+
+    def test_delegated_prompt_is_absent_from_every_durable_ledger(self):
+        secret = "DISTINCTIVE-CHILD-PROMPT-DO-NOT-PERSIST"
+        with tempfile.TemporaryDirectory() as root:
+            paths = {
+                key: os.path.join(root, key + ".jsonl")
+                for key in ("actions", "children", "trace")}
+            broker = guard_broker.GuardBroker(
+                os.path.join(root, "guard.sock"), "token",
+                action_policy.OwnedScope(repo_roots=(root,)),
+                paths["actions"], paths["children"], paths["trace"],
+                self.PARENT)
+            broker.handle({
+                "guard_attempt_id": "secret-attempt", "token": "token",
+                "payload": {
+                    "tool_name": "Agent", "tool_use_id": "tool-secret",
+                    "parent_work_id": "parent",
+                    "tool_input": {
+                        "prompt": secret + " with more task content",
+                        "description": secret,
+                        "subagent_type": "Explore",
+                        "model": "sonnet",
+                    }}})
+            combined = ""
+            for path in paths.values():
+                if os.path.exists(path):
+                    combined += Path(path).read_text()
+            self.assertNotIn(secret, combined)
+            with open(paths["children"]) as fh:
+                row = json.loads(fh.readline())
+            self.assertEqual(row["requested_identity"], {"model": "sonnet"})
+            self.assertRegex(row["requested_input_digest"], r"^[0-9a-f]{64}$")
+            self.assertGreater(row["requested_input_bytes"], 0)
+
+
+class ChildCorrelationTests(unittest.TestCase):
+    def test_blocked_and_open_children_stay_distinct(self):
+        rows = [
+            {"work_id": "a", "parent_work_id": "p", "state": "blocked",
+             "reason": "child_identity_mismatch"},
+            {"work_id": "b", "parent_work_id": "p", "state": "started"},
+        ]
+        work = measure.child_work_from_ledger(rows)
+        self.assertEqual(work["a"]["work_kind"], "child_attempt")
+        self.assertEqual(work["b"]["duration_ms"], "unknown")
+
+    def test_n7_raw_stream_drives_concurrency_duplicate_and_ambiguity(self):
+        parsed = [bridge.parse_claude_event(event) for event in
+                  _nested_fixture_events("n7-correlation-edges")]
+        starts = [event for event in parsed
+                  if event.get("kind") == "child_start"]
+        stops = [event for event in parsed
+                 if event.get("kind") == "child_end"]
+        usage = [event for event in parsed
+                 if event.get("kind") == "child_usage"]
+        self.assertEqual({event["tool_use_id"] for event in starts},
+                         {"t1", "t2"})
+        self.assertEqual([event["event_id"] for event in stops],
+                         ["s1", "s1"])
+        self.assertEqual(usage[0]["parent_tool_use_id"], "ungoverned")
+        with open(os.path.join(
+                _NESTED_FIXTURES, "n7-correlation-edges",
+                "hook-payloads.json")) as fh:
+            payloads = json.load(fh)
+        with tempfile.TemporaryDirectory() as root:
+            broker = guard_broker.GuardBroker(
+                os.path.join(root, "guard.sock"), "token",
+                action_policy.OwnedScope(repo_roots=(root,)),
+                os.path.join(root, "actions.jsonl"),
+                os.path.join(root, "children.jsonl"),
+                os.path.join(root, "trace.jsonl"),
+                NestedChildGovernanceTests.PARENT)
+            decisions = []
+            for index, payload in enumerate(payloads):
+                response = broker.handle({
+                    "guard_attempt_id": "n7-%d" % index,
+                    "token": "token", "payload": payload})
+                decisions.append(response["hookSpecificOutput"]
+                                 ["permissionDecision"])
+            self.assertEqual(decisions, ["deny", "deny", "deny"])
+            self.assertIsNone(broker.work_id_for_tool("t1"))
+            # This is the documented SubagentStart shape: common fields plus
+            # agent_id/agent_type, with no Agent tool_use_id.
+            start_response = broker.handle({
+                "guard_attempt_id": "n7-agent", "token": "token",
+                "payload": {"hook_event_name": "SubagentStart",
+                            "session_id": "session", "cwd": root,
+                            "transcript_path": "/tmp/transcript.jsonl",
+                            "agent_id": "a1",
+                            "agent_type": "Explore"}})
+            self.assertFalse(start_response["continue"])
+            self.assertEqual(
+                start_response["stopReason"],
+                "child_agent_correlation_unavailable")
+            nested = broker.handle({
+                "guard_attempt_id": "n7-nested-read", "token": "token",
+                "payload": {"hook_event_name": "PreToolUse",
+                            "tool_name": "Read",
+                            "tool_use_id": "nested-tool",
+                            "tool_input": {"file_path": "/etc/hosts"},
+                            "agent_id": "a1", "agent_type": "Explore"}})
+            self.assertEqual(
+                nested["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn(
+                "child_agent_correlation_unavailable",
+                nested["hookSpecificOutput"]["permissionDecisionReason"])
+            with open(os.path.join(root, "children.jsonl")) as fh:
+                child_rows = [json.loads(line) for line in fh]
+            rebuilt = measure.child_work_from_ledger(child_rows)
+            self.assertTrue(rebuilt)
+            self.assertTrue(all(
+                item["work_state"] == "blocked"
+                for item in rebuilt.values()))
+            with open(os.path.join(root, "trace.jsonl")) as fh:
+                trace_rows = [json.loads(line) for line in fh]
+            self.assertTrue(any(
+                row.get("event") == "child.ungoverned"
+                and row.get("reason")
+                == "child_agent_correlation_unavailable"
+                for row in trace_rows))
+
+
+class ActionBoundaryPolicyTests(unittest.TestCase):
+    def test_declared_output_and_session_asset_boundary(self):
+        with tempfile.TemporaryDirectory() as root:
+            assets = os.path.join(root, "assets")
+            output = os.path.join(assets, "mine.json")
+            scope = action_policy.OwnedScope(
+                repo_roots=(os.path.join(root, "repo"),),
+                declared_outputs=(output,), session_assets_dir=assets)
+            own = {"class": "write", "targets": [output],
+                   "resolution_complete": True}
+            other = {"class": "write",
+                     "targets": [os.path.join(assets, "other.json")],
+                     "resolution_complete": True}
+            self.assertTrue(action_policy.decide(own, scope)["allow"])
+            self.assertEqual(action_policy.decide(other, scope)["reason"],
+                             "session_asset_not_declared_output")
+
+    def test_direct_and_child_boundary_table_is_sanitized(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            assets = os.path.join(root, "assets")
+            sibling = os.path.join(root, "sibling")
+            for path in (repo, assets, sibling):
+                os.mkdir(path)
+            output = os.path.join(assets, "mine.json")
+            controller_state = os.path.join(assets, "controller-state")
+            private_temp = os.path.join(assets, "role-temp")
+            os.mkdir(controller_state)
+            os.mkdir(private_temp)
+            scope = action_policy.OwnedScope(
+                repo_roots=(repo,), declared_outputs=(output,),
+                role_temp_dir=private_temp,
+                controller_state_dir=controller_state,
+                session_assets_dir=assets,
+                sibling_worktrees=(sibling,))
+            created = os.path.join(private_temp, "created.txt")
+            Path(created).write_text("x")
+            clean = os.path.join(repo, "clean-tracked.txt")
+            cases = (
+                ({"class": "write", "targets": [output],
+                  "resolution_complete": True}, True, "owned_target"),
+                ({"class": "write", "targets": [
+                    os.path.join(controller_state, "cache")],
+                  "resolution_complete": True}, True, "owned_target"),
+                ({"class": "write", "targets": [
+                    os.path.join(private_temp, "scratch")],
+                  "resolution_complete": True}, True, "owned_target"),
+                ({"class": "delete", "targets": [created],
+                  "resolution_complete": True}, True, "owned_target"),
+                ({"class": "delete", "targets": [clean],
+                  "resolution_complete": True}, True, "owned_target"),
+                (action_policy.classify_action(
+                    "Bash", {"command": "rm -f /tmp/*.py"}, cwd=repo),
+                 False, "shell_unprovable"),
+                ({"class": "write", "targets": [
+                    os.path.join(sibling, "x")],
+                  "resolution_complete": True}, False, "sibling_worktree"),
+                ({"class": "write", "targets": [
+                    os.path.join(assets, "other.json")],
+                  "resolution_complete": True}, False,
+                 "session_asset_not_declared_output"),
+                ({"class": "delete", "targets": [
+                    os.path.join(repo, "unowned-delete")],
+                  "resolution_complete": True}, False,
+                 "delete_not_recoverable"),
+                ({"class": "read", "targets": ["/etc/hosts"],
+                  "resolution_complete": True}, True, "read_only"),
+            )
+            for actor in ("parent", "child"):
+                for index, (action, allowed, reason) in enumerate(cases):
+                    with self.subTest(actor=actor, index=index):
+                        decision = action_policy.decide(
+                            action, scope, created_paths=(created,),
+                            clean_tracked_paths=(clean,))
+                        self.assertEqual(decision["allow"], allowed)
+                        self.assertEqual(decision["reason"], reason)
+                        record = action_policy.sanitize(
+                            decision, action, work_id=actor,
+                            parent_work_id="parent",
+                            guard_attempt_id="%s-%d" % (actor, index))
+                        encoded = json.dumps(record)
+                        self.assertNotIn(root, encoded)
+                        self.assertNotIn("rm -f", encoded)
+
+
+class NestedGuardSettingsAssemblyTests(unittest.TestCase):
+    def test_live_probe_uses_guard_env_settings_kernel_and_no_delegation(self):
+        import unittest.mock as mock
+
+        class Broker:
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        broker_instance = Broker()
+        scope = action_policy.OwnedScope()
+        runtime = {
+            "settings_path": "/guard/settings.json",
+            "delegation_allowed": False,
+            "scope": scope,
+            "env": {
+                "CLAUDE_CONFIG_DIR": "/guard/controller",
+                "TMPDIR": "/guard/tmp",
+            },
+            "broker": broker_instance,
+        }
+        seen = {}
+
+        def spawn(command, _stdin):
+            seen["command"] = command
+            return [{"type": "result", "result": "ok"}]
+
+        class RecordingTrace:
+            session_uuid = "probe-guard"
+
+            def event(self, *_args, **_kwargs):
+                pass
+
+        previous = bridge.set_nested_guard_active(True)
+        self.addCleanup(bridge.set_nested_guard_active, previous)
+        with mock.patch.object(
+                bridge, "_guard_runtime", return_value=runtime) as guarded, \
+                mock.patch.object(
+                    bridge, "kernel_write_boundary",
+                    side_effect=lambda _scope, argv=None: {
+                        "available": True, "platform": "darwin",
+                        "argv": ["sandbox-exec"] + list(argv or ())}):
+            ok, alert = bridge.probe_claude_stream_json(
+                spawn, trace=RecordingTrace(),
+                extra_writable_dir="/session/assets")
+        self.assertTrue(ok)
+        self.assertIsNone(alert)
+        command = seen["command"]
+        self.assertEqual(command[0], "sandbox-exec")
+        self.assertIn("CLAUDE_CONFIG_DIR=/guard/controller", command)
+        self.assertIn("--settings", command)
+        self.assertIn("/guard/settings.json", command)
+        self.assertIn("Agent", command)
+        self.assertIn("Task", command)
+        self.assertTrue(broker_instance.stopped)
+        self.assertEqual(guarded.call_args.kwargs["declared_outputs"], ())
+        self.assertFalse(guarded.call_args.kwargs["repo_writable"])
+
+    def test_probe_repo_mutation_denies_and_records_probe_work_id(self):
+        import unittest.mock as mock
+        if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
+            self.skipTest("governed Claude runtime is supported on macOS")
+
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            sessions = os.path.join(root, "sessions")
+            os.mkdir(repo)
+            os.mkdir(sessions)
+            subprocess.run(
+                ["git", "-C", repo, "init"], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            session_uuid = "probe-readonly"
+            prior_sessions = os.environ.get("COWORK_SESSIONS_ROOT")
+            prior_cwd = os.getcwd()
+            os.environ["COWORK_SESSIONS_ROOT"] = sessions
+            os.chdir(repo)
+            try:
+                assets = state_store.session_assets_dir(session_uuid)
+                os.makedirs(assets)
+                trace = trace_store.Trace(
+                    trace_store.trace_path_for(session_uuid),
+                    session_uuid=session_uuid)
+                target = os.path.join(repo, "probe-must-not-write.txt")
+                observed = {}
+                actual_guard = bridge._guard_runtime
+
+                def capture_guard(*args, **kwargs):
+                    runtime = actual_guard(*args, **kwargs)
+                    observed["runtime"] = runtime
+                    return runtime
+
+                def spawn(_command, _stdin):
+                    context_path = state_store.guard_context_path_for(
+                        session_uuid, "scout")
+                    with open(context_path) as fh:
+                        context = json.load(fh)
+                    payload = action_guard.enrich_payload({
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Write",
+                        "tool_use_id": "probe-write",
+                        "tool_input": {"file_path": target},
+                        "cwd": repo,
+                    }, context)
+                    observed["probe_work_id"] = payload.get("work_id")
+                    response = action_guard.forward(
+                        payload, context["socket_path"], context["token"],
+                        attempt_id="probe-write-attempt")
+                    observed["decision"] = (
+                        response["hookSpecificOutput"]
+                        ["permissionDecision"])
+                    if observed["decision"] == "allow":
+                        Path(target).write_text("forged")
+                    return [{"type": "result", "subtype": "success",
+                             "usage": {"input_tokens": 1,
+                                       "output_tokens": 1}}]
+
+                previous = bridge.set_nested_guard_active(True)
+                try:
+                    with mock.patch.object(
+                            bridge, "_guard_runtime",
+                            side_effect=capture_guard):
+                        ok, alert = bridge.probe_claude_stream_json(
+                            spawn, trace=trace, role="scout",
+                            extra_writable_dir=assets)
+                finally:
+                    bridge.set_nested_guard_active(previous)
+                self.assertTrue(ok)
+                self.assertIsNone(alert)
+                self.assertEqual(observed["decision"], "deny")
+                self.assertFalse(os.path.exists(target))
+                scope = observed["runtime"]["scope"]
+                self.assertEqual(scope.repo_roots, ())
+                with open(state_store.actions_path_for(session_uuid)) as fh:
+                    records = [json.loads(line) for line in fh]
+                row = next(record for record in records
+                           if record.get("guard_attempt_id")
+                           == "probe-write-attempt")
+                self.assertEqual(row["work_id"],
+                                 observed["probe_work_id"])
+                with open(trace_store.trace_path_for(session_uuid)) as fh:
+                    events = [json.loads(line) for line in fh]
+                probe_start = next(
+                    event for event in events
+                    if event.get("event") == "controller.probe.start")
+                self.assertEqual(
+                    probe_start["work_id"], observed["probe_work_id"])
+                denied = bridge.kernel_write_boundary(
+                    scope, [sys.executable, "-c",
+                            "open(%r, 'w').write('forged')" % target])
+                self.assertNotEqual(
+                    subprocess.run(
+                        denied["argv"], stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE).returncode,
+                    0)
+                self.assertFalse(os.path.exists(target))
+            finally:
+                os.chdir(prior_cwd)
+                if prior_sessions is None:
+                    os.environ.pop("COWORK_SESSIONS_ROOT", None)
+                else:
+                    os.environ["COWORK_SESSIONS_ROOT"] = prior_sessions
+
+    def test_registered_siblings_reach_policy_and_kernel_boundaries(self):
+        import unittest.mock as mock
+
+        def completed(stdout):
+            return subprocess.CompletedProcess([], 0, stdout=stdout)
+
+        with mock.patch.object(
+                bridge.subprocess, "run",
+                side_effect=[
+                    completed("/repo/main\n"),
+                    completed("worktree /repo/main\n\n"
+                              "worktree /repo/main/.worktrees/other\n")]):
+            active, siblings = bridge._git_worktree_scope("/repo/main")
+        self.assertEqual(active, "/repo/main")
+        self.assertEqual(siblings, ("/repo/main/.worktrees/other",))
+        scope = action_policy.OwnedScope(
+            repo_roots=(active,), sibling_worktrees=siblings)
+        decision = action_policy.decide({
+            "class": "write",
+            "targets": ["/repo/main/.worktrees/other/stolen.txt"],
+            "resolution_complete": True,
+        }, scope)
+        self.assertEqual(decision["reason"], "sibling_worktree")
+        boundary = bridge.kernel_write_boundary(scope, ["true"])
+        if boundary["available"] and boundary["platform"] == "darwin":
+            self.assertIn(
+                '(deny file-write* (subpath '
+                '"/repo/main/.worktrees/other"))',
+                boundary["profile"])
+        elif boundary["available"]:
+            self.assertIn("--ro-bind", boundary["argv"])
+
+    def test_runtime_disables_delegation_even_with_concrete_parent_pins(self):
+        import unittest.mock as mock
+
+        class RecordingTrace:
+            session_uuid = "correlation-runtime"
+
+            def __init__(self):
+                self.events = []
+
+            def event(self, name, **fields):
+                self.events.append(dict(fields, event=name))
+
+        class FakeBroker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def serve_forever(self):
+                pass
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as root:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = root
+            self.addCleanup(
+                lambda: os.environ.pop("COWORK_SESSIONS_ROOT", None)
+                if prior is None else os.environ.__setitem__(
+                    "COWORK_SESSIONS_ROOT", prior))
+            assets = state_store.session_assets_dir("correlation-runtime")
+            os.makedirs(assets)
+            trace = RecordingTrace()
+            real_exists = os.path.exists
+            with mock.patch.object(
+                    bridge, "kernel_write_boundary",
+                    return_value={"available": True, "platform": "darwin"}), \
+                    mock.patch.object(
+                        bridge.guard_broker, "GuardBroker", FakeBroker), \
+                    mock.patch.object(bridge.threading, "Thread", FakeThread), \
+                    mock.patch.object(bridge.os.path, "exists",
+                                      side_effect=lambda path: (
+                                          True if str(path).endswith(".sock")
+                                          else real_exists(path))):
+                runtime = bridge._guard_runtime(
+                    trace, "builder", assets, "sonnet", "high", True)
+            self.assertFalse(runtime["delegation_allowed"])
+            self.assertEqual(
+                trace.events[-1]["delegation_reason"],
+                "child_agent_correlation_unavailable")
+
+    def test_pretool_hook_is_catch_all_and_command_is_wired(self):
+        doc = bridge.guard_settings_document("/tmp/guard.py")
+        pre = doc["hooks"]["PreToolUse"][0]
+        self.assertNotIn("matcher", pre)
+        self.assertIn("PostToolUse", doc["hooks"])
+        self.assertIn("SubagentStart", doc["hooks"])
+        cmd = bridge.build_claude_command(
+            "roles/scout.md", "plan", False,
+            guard_settings_path="/tmp/settings.json",
+            delegation_allowed=False)
+        self.assertIn("--settings", cmd)
+        self.assertIn("Agent", cmd)
+        self.assertIn("Task", cmd)
+
+    def test_every_role_and_mode_gets_a_catch_all_settings_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            for role in cowork.ROLES:
+                for mode in ("plan", "implement"):
+                    path = os.path.join(root, "%s-%s.json" % (role, mode))
+                    bridge.write_guard_settings(
+                        path, "/tmp/guard.py",
+                        context_path="/tmp/context.json")
+                    with open(path) as fh:
+                        doc = json.load(fh)
+                    self.assertNotIn("matcher",
+                                     doc["hooks"]["PreToolUse"][0])
+
+
+class NestedPersistenceRebuildTests(unittest.TestCase):
+    def test_replayed_child_rows_are_idempotent(self):
+        rows = [{"work_id": "c", "state": "started"},
+                {"work_id": "c", "state": "ended", "duration_ms": 4,
+                 "delta": {"state": "complete", "added": []}}]
+        self.assertEqual(measure.child_work_from_ledger(rows),
+                         measure.child_work_from_ledger(rows))
+
+    def test_n1_n2_n3_n6_raw_fixtures_rebuild_stably(self):
+        for name in ("n1-child-lifecycle", "n2-legacy-direct-only",
+                     "n3-unsupported-child-telemetry",
+                     "n6-readonly-child"):
+            with self.subTest(name=name):
+                raw = _nested_fixture_events(name)
+                first = [bridge.parse_claude_event(event) for event in raw]
+                second = [bridge.parse_claude_event(event) for event in raw]
+                self.assertEqual(first, second)
+        n1 = [bridge.parse_claude_event(event) for event in
+              _nested_fixture_events("n1-child-lifecycle")]
+        self.assertEqual(n1[0]["kind"], "child_usage")
+        n2 = [bridge.parse_claude_event(event) for event in
+              _nested_fixture_events("n2-legacy-direct-only")]
+        self.assertEqual(n2[0]["kind"], "assistant")
+        n3 = [bridge.parse_codex_event(event) for event in
+              _nested_fixture_events("n3-unsupported-child-telemetry")]
+        self.assertEqual(n3[0]["kind"], "turn_completed")
+        n6 = [bridge.parse_claude_event(event) for event in
+              _nested_fixture_events("n6-readonly-child")]
+        self.assertEqual(n6[0]["parent_tool_use_id"], "tool-readonly-1")
+
+    def test_n1_blocked_attempt_survives_broker_resume(self):
+        with open(os.path.join(
+                _NESTED_FIXTURES, "n1-child-lifecycle",
+                "hook-payload.json")) as fh:
+            payload = json.load(fh)
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            os.mkdir(repo)
+            subprocess.run(
+                ["git", "-C", repo, "init"], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=True)
+            target = os.path.join(repo, "child.txt")
+            actions = os.path.join(root, "actions.jsonl")
+            children = os.path.join(root, "children.jsonl")
+            trace = os.path.join(root, "trace.jsonl")
+            scope = action_policy.OwnedScope(repo_roots=(repo,))
+            parent = NestedChildGovernanceTests.PARENT
+            first = guard_broker.GuardBroker(
+                os.path.join(root, "first.sock"), "first-token", scope,
+                actions, children, trace, parent)
+            response = first.handle({
+                "guard_attempt_id": "n1-start", "token": "first-token",
+                "payload": dict(payload, parent_work_id="parent")})
+            child_id = response["child_work_id"]
+            self.assertEqual(
+                response["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn(
+                "child_agent_correlation_unavailable",
+                response["hookSpecificOutput"]["permissionDecisionReason"])
+
+            resumed = guard_broker.GuardBroker(
+                os.path.join(root, "resumed.sock"), "resumed-token", scope,
+                actions, children, trace, parent)
+            self.assertIsNone(resumed.work_id_for_tool("tool-child-1"))
+            self.assertFalse(os.path.exists(target))
+            with open(children) as fh:
+                rows = [json.loads(line) for line in fh]
+            rebuilt = measure.child_work_from_ledger(rows)
+            self.assertEqual(rebuilt[child_id]["work_state"], "blocked")
+            self.assertEqual(
+                rebuilt[child_id]["reason"],
+                "child_agent_correlation_unavailable")
+
+
+class NestedCostReconciliationTests(unittest.TestCase):
+    def test_additive_and_inclusive_axes_do_not_double_count(self):
+        work = {
+            "p": {"usage": {"input_tokens": 10},
+                  "usage_basis": "parent_direct"},
+            "c": {"work_kind": "child", "usage": {"input_tokens": 4}},
+        }
+        additive = measure.reconcile_nested(
+            work, {"input_tokens": 14})
+        self.assertEqual(additive["totals"]["input_tokens"], 14)
+        self.assertEqual(additive["basis"]["input_tokens"],
+                         "parent_direct_plus_children")
+        inclusive_work = {
+            "p": {"usage": {"input_tokens": 10},
+                  "usage_basis": "parent_inclusive"},
+            "c": {"work_kind": "child", "usage": {"input_tokens": 4}},
+        }
+        inclusive = measure.reconcile_nested(
+            inclusive_work, {"input_tokens": 10})
+        self.assertEqual(inclusive["totals"]["input_tokens"], 10)
+        self.assertEqual(inclusive["basis"]["input_tokens"],
+                         "parent_inclusive")
+
+    def test_n1_n4_n5_raw_usage_reconciles_without_replay_double_count(self):
+        n1 = [bridge.parse_claude_event(event) for event in
+              _nested_fixture_events("n1-child-lifecycle")]
+        n5 = [bridge.parse_claude_event(event) for event in
+              _nested_fixture_events("n5-nondelegating-baseline")]
+        child_usage = n1[0]["usage"]
+        parent_usage = n5[0]["usage"]
+        work = {
+            "parent": {"usage": parent_usage,
+                       "usage_basis": "parent_direct"},
+            "child": {"work_kind": "child", "usage": child_usage},
+        }
+        additive_total = {
+            key: parent_usage.get(key, 0) + child_usage.get(key, 0)
+            for key in set(parent_usage) | set(child_usage)}
+        reconciled = measure.reconcile_nested(work, additive_total)
+        self.assertTrue(reconciled["comparable"])
+        self.assertTrue(all(value == "parent_direct_plus_children"
+                            for value in reconciled["basis"].values()))
+
+        n4_raw = _nested_fixture_events("n4-inclusive-parent")
+        unique = {}
+        for event in n4_raw:
+            parsed = bridge.parse_claude_event(event)
+            key = (parsed.get("parent_tool_use_id"),
+                   parsed.get("event_id"),
+                   json.dumps(parsed.get("usage"), sort_keys=True))
+            unique.setdefault(key, parsed)
+        # The fixture contains one replay; a stable key collapses it.
+        self.assertLess(len(unique), len(n4_raw))
+        broker = object.__new__(guard_broker.GuardBroker)
+        broker._child_usage = {}
+        broker._seen_child_usage = set()
+        for event in n4_raw:
+            parsed = bridge.parse_claude_event(event)
+            if parsed.get("kind") == "child_usage":
+                broker.record_child_usage(
+                    "child", parsed.get("usage"),
+                    event_id=parsed.get("event_id"),
+                    replayed=parsed.get("replayed"))
+        self.assertEqual(
+            broker._child_usage["child"],
+            {"input_tokens": 4, "output_tokens": 2})
+
+    def test_build_record_reconciles_provider_basis_end_to_end(self):
+        cases = (
+            ("n1-additive", "n1-child-lifecycle", False, True,
+             "parent_direct_plus_children"),
+            ("n4-inclusive", "n4-inclusive-parent", False, True,
+             "parent_inclusive"),
+            ("n5-direct", "n5-nondelegating-baseline", False, True,
+             "parent_direct_plus_children"),
+            ("n4-missing-provider", "n4-inclusive-parent", True, False,
+             "unknown"),
+        )
+        with tempfile.TemporaryDirectory() as root:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = root
+            self.addCleanup(
+                lambda: os.environ.pop("COWORK_SESSIONS_ROOT", None)
+                if prior is None else os.environ.__setitem__(
+                    "COWORK_SESSIONS_ROOT", prior))
+            for (name, fixture, omit_provider, comparable,
+                 expected_basis) in cases:
+                with self.subTest(name=name):
+                    parsed = [
+                        bridge.parse_claude_event(event)
+                        for event in _nested_fixture_events(fixture)]
+                    parent_usage = {}
+                    child_usage = {}
+                    provider = None
+                    for event in parsed:
+                        usage = event.get("usage")
+                        if not isinstance(usage, dict):
+                            continue
+                        if event.get("kind") == "assistant":
+                            for axis, value in usage.items():
+                                parent_usage[axis] = (
+                                    parent_usage.get(axis, 0) + value)
+                        elif (event.get("kind") == "child_usage"
+                              and not event.get("replayed")):
+                            for axis, value in usage.items():
+                                child_usage[axis] = (
+                                    child_usage.get(axis, 0) + value)
+                        elif event.get("kind") == "result":
+                            provider = usage
+                    if omit_provider:
+                        provider = None
+                    assets = state_store.session_assets_dir(name)
+                    os.makedirs(assets)
+                    trace_path = trace_store.trace_path_for(name)
+                    events = [
+                        {"event": "nested.guard.ready", "event_id": "guard",
+                         "ts": "2026-01-01T00:00:00Z"},
+                        {"event": "controller.turn.start", "event_id": "s",
+                         "ts": "2026-01-01T00:00:00Z", "work_id": "parent",
+                         "work_class": "productive"},
+                        {"event": "controller.turn.end", "event_id": "e",
+                         "ts": "2026-01-01T00:00:01Z", "work_id": "parent",
+                         "work_class": "productive", "duration_ms": 1000,
+                         "usage": parent_usage,
+                         "usage_basis": "parent_message_sum",
+                         "provider_usage_total": provider},
+                    ]
+                    with open(trace_path, "w") as fh:
+                        for event in events:
+                            fh.write(json.dumps(event) + "\n")
+                    if child_usage:
+                        with open(state_store.children_path_for(name), "w") as fh:
+                            fh.write(json.dumps({
+                                "guard_attempt_id": "child-start",
+                                "work_id": "child", "parent_work_id": "parent",
+                                "state": "started",
+                                "ts": "2026-01-01T00:00:00Z",
+                                "effective_identity": {
+                                    "controller": "claude",
+                                    "model": "sonnet",
+                                    "model_source": "config_pinned",
+                                    "effort": "high",
+                                    "effort_source": "config_pinned"},
+                                "effective_policy": "child_identity_pinned",
+                                "agent_id": "agent-1",
+                            }) + "\n")
+                            end_row = {
+                                "guard_attempt_id": "child-end",
+                                "work_id": "child", "state": "ended",
+                                "ts": "2026-01-01T00:00:01Z",
+                                "duration_ms": 1000, "usage": child_usage,
+                                "usage_scope": "child_native_sum",
+                                "delta": {"state": "complete", "added": [],
+                                          "modified": [], "deleted": []},
+                                "terminal_source": "agent_tool_result",
+                            }
+                            fh.write(json.dumps(end_row) + "\n")
+                            if name == "n4-inclusive":
+                                fh.write(json.dumps(end_row) + "\n")
+                    record = measure.build_record(name, ingest_results={})
+                    self.assertEqual(
+                        record["nested"]["comparable"], comparable)
+                    self.assertEqual(
+                        record["nested"]["basis"]["input_tokens"],
+                        expected_basis)
+                    rendered = report.render_report(record)
+                    self.assertIn("reason:", rendered)
+                    self.assertIn("provider totals:", rendered)
+
+
+class GuardBrokerPrivilegeTests(unittest.TestCase):
+    def test_real_platform_peer_uid_credentials_are_checked(self):
+        broker = object.__new__(guard_broker.GuardBroker)
+        left, right = socket.socketpair()
+
+        class ObservedConnection:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+                self.calls = []
+
+            def getsockopt(self, level, option, length):
+                self.calls.append((level, option, length))
+                return self.wrapped.getsockopt(level, option, length)
+
+        observed = ObservedConnection(left)
+        try:
+            supported = (hasattr(socket, "SO_PEERCRED")
+                         or hasattr(socket, "LOCAL_PEERCRED"))
+            self.assertEqual(broker._peer_allowed(observed), supported)
+            self.assertEqual(len(observed.calls), 1 if supported else 0)
+            if sys.platform == "darwin":
+                self.assertTrue(hasattr(socket, "LOCAL_PEERCRED"))
+                self.assertEqual(
+                    observed.calls[0][1], socket.LOCAL_PEERCRED)
+
+                class ForeignDarwinPeer:
+                    def getsockopt(self, _level, _option, _length):
+                        return struct.pack(
+                            "=II", 0, os.getuid() + 1) + b"\0" * 64
+
+                self.assertFalse(
+                    broker._peer_allowed(ForeignDarwinPeer()))
+        finally:
+            left.close()
+            right.close()
+
+    def test_broker_is_only_jsonl_writer_and_dedupes(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "actions.jsonl")
+            record = {"guard_attempt_id": "a", "reason": "denied"}
+            self.assertTrue(guard_broker.append_once(path, record))
+            self.assertFalse(guard_broker.append_once(path, record))
+            with open(path) as fh:
+                self.assertEqual(len(fh.readlines()), 1)
+
+    def test_kernel_refuses_audit_writes_while_broker_writes_and_token_rotates(self):
+        with tempfile.TemporaryDirectory() as root:
+            owned = os.path.join(root, "owned")
+            audit = os.path.join(root, "audit")
+            os.mkdir(owned)
+            os.mkdir(audit)
+            scope = action_policy.OwnedScope(repo_roots=(owned,))
+            boundary = bridge.kernel_write_boundary(scope)
+            if boundary["available"]:
+                for name in ("trace.jsonl", "actions.jsonl", "children.jsonl"):
+                    target = os.path.join(audit, name)
+                    wrapped = bridge.kernel_write_boundary(
+                        scope, [sys.executable, "-c",
+                                "open(%r, 'w').write('forged')" % target])
+                    self.assertNotEqual(
+                        subprocess.run(wrapped["argv"]).returncode, 0)
+                    self.assertFalse(os.path.exists(target))
+
+            actions = os.path.join(audit, "actions.jsonl")
+            children = os.path.join(audit, "children.jsonl")
+            trace = os.path.join(audit, "trace.jsonl")
+            parent = {
+                "controller": "claude",
+                "controller_source": "config_pinned",
+                "model": "sonnet", "model_source": "config_pinned",
+                "effort": "high", "effort_source": "config_pinned",
+            }
+            old = guard_broker.GuardBroker(
+                os.path.join(root, "old.sock"), "old-token", scope,
+                actions, children, trace, parent)
+            allowed = old.handle({
+                "guard_attempt_id": "broker-write", "token": "old-token",
+                "payload": {"tool_name": "Write",
+                            "tool_input": {
+                                "file_path": os.path.join(owned, "ok")},
+                            "cwd": owned}})
+            self.assertEqual(allowed["hookSpecificOutput"]
+                             ["permissionDecision"], "allow")
+            self.assertTrue(os.path.exists(actions))
+
+            resumed = guard_broker.GuardBroker(
+                os.path.join(root, "new.sock"), "new-token", scope,
+                actions, children, trace, parent)
+            stale = resumed.handle({
+                "guard_attempt_id": "stale-token", "token": "old-token",
+                "payload": {"tool_name": "Read", "tool_input": {}}})
+            self.assertEqual(stale["hookSpecificOutput"]
+                             ["permissionDecision"], "deny")
+
+    def test_concurrent_authorized_writers_append_valid_json_exactly_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "trace.jsonl")
+            trace = trace_store.Trace(path, session_uuid="session")
+            barrier = threading.Barrier(24)
+
+            def broker_writer(index):
+                barrier.wait()
+                guard_broker.append_once(path, {
+                    "event": "action.policy.decision",
+                    "event_id": "broker-%d" % index,
+                    "guard_attempt_id": "shared-attempt",
+                })
+
+            def supervisor_writer(index):
+                barrier.wait()
+                trace.event(
+                    "guard.broker.unavailable",
+                    guard_attempt_id="shared-attempt", writer=index)
+
+            threads = [
+                threading.Thread(target=broker_writer, args=(index,))
+                for index in range(12)
+            ] + [
+                threading.Thread(target=supervisor_writer, args=(index,))
+                for index in range(12)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            with open(path) as fh:
+                records = [json.loads(line) for line in fh if line.strip()]
+            matching = [
+                record for record in records
+                if record.get("guard_attempt_id") == "shared-attempt"]
+            self.assertEqual(len(matching), 1)
+
+
+class ChildArtifactDeltaTests(unittest.TestCase):
+    def test_content_diff_reports_add_modify_delete_and_revert(self):
+        before = {"state": "complete",
+                  "entries": {"/a": "1", "/b": "2"}}
+        after = {"state": "complete",
+                 "entries": {"/a": "3", "/c": "4"}}
+        result = delta_store.diff(before, after)
+        self.assertEqual(result["added"], ["/c"])
+        self.assertEqual(result["modified"], ["/a"])
+        self.assertEqual(result["deleted"], ["/b"])
+        self.assertEqual(delta_store.diff(before, before)["modified"], [])
+
+    def test_real_git_and_declared_output_deltas_attribution_and_bounds(self):
+        # n6 is the read-only-child fixture whose boundary delta must be empty.
+        self.assertTrue(_nested_fixture_events("n6-readonly-child"))
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            outputs = os.path.join(root, "outputs")
+            os.mkdir(repo)
+            os.mkdir(outputs)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", repo] + list(args),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+            git("init")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "user.name", "Fixture")
+            Path(os.path.join(repo, "modified.txt")).write_text("before")
+            Path(os.path.join(repo, "deleted.txt")).write_text("before")
+            git("add", ".")
+            git("commit", "-m", "fixture")
+
+            external = os.path.join(outputs, "artifact.json")
+            scope = action_policy.OwnedScope(
+                repo_roots=(repo,), declared_outputs=(external,))
+            before = delta_store.snapshot(scope)
+            Path(os.path.join(repo, "modified.txt")).write_text("after")
+            os.unlink(os.path.join(repo, "deleted.txt"))
+            Path(os.path.join(repo, "untracked.txt")).write_text("new")
+            Path(external).write_text("{}")
+            after = delta_store.snapshot(scope)
+            result = delta_store.diff(before, after)
+            self.assertIn(os.path.realpath(external), result["added"])
+            self.assertIn(os.path.realpath(
+                os.path.join(repo, "untracked.txt")), result["added"])
+            self.assertIn(os.path.realpath(
+                os.path.join(repo, "modified.txt")), result["modified"])
+            self.assertIn(os.path.realpath(
+                os.path.join(repo, "deleted.txt")), result["deleted"])
+
+            reverted_before = delta_store.snapshot(scope)
+            target = os.path.join(repo, "modified.txt")
+            original = Path(target).read_text()
+            Path(target).write_text("temporary")
+            Path(target).write_text(original)
+            self.assertEqual(
+                delta_store.diff(reverted_before,
+                                 delta_store.snapshot(scope))["modified"], [])
+
+            child_path = os.path.realpath(target)
+            contested_path = os.path.realpath(external)
+            unknown_path = os.path.realpath(
+                os.path.join(repo, "untracked.txt"))
+            attributed = delta_store.attribute({
+                "child": {"added": [], "modified": [child_path],
+                          "deleted": []},
+                "parent": {"added": [contested_path, unknown_path],
+                           "modified": [], "deleted": []},
+            }, {
+                child_path: ["child"],
+                contested_path: ["child", "parent"],
+            })
+            self.assertEqual(attributed[child_path]["attribution"], "credited")
+            self.assertEqual(attributed[contested_path]["attribution"],
+                             "contested")
+            self.assertEqual(attributed[unknown_path], {
+                "work_ids": [], "attribution": "unattributed"})
+
+            partial = delta_store.snapshot(scope, max_paths=2)
+            self.assertEqual(partial["state"], "partial")
+            self.assertLessEqual(len(partial["entries"]), 2)
+            self.assertEqual(delta_store.diff(None, after)["state"], "unknown")
+
+    def test_every_nested_fixture_materializes_real_git_boundaries(self):
+        for name in (
+                "n1-child-lifecycle", "n2-legacy-direct-only",
+                "n3-unsupported-child-telemetry", "n4-inclusive-parent",
+                "n5-nondelegating-baseline", "n6-readonly-child",
+                "n7-correlation-edges"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                result, expected = _materialize_nested_fixture_repo(name, root)
+                self.assertEqual(result["state"], "complete")
+                for key in ("added", "modified", "deleted"):
+                    self.assertEqual(result[key], expected[key])
+
+    def test_snapshot_cap_holds_across_multiple_roots_and_outputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            repos = []
+            for index in range(2):
+                repo = os.path.join(root, "repo-%d" % index)
+                os.mkdir(repo)
+                subprocess.run(
+                    ["git", "-C", repo, "init"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=True)
+                Path(os.path.join(repo, "file.txt")).write_text("x")
+                repos.append(repo)
+            output_a = os.path.join(root, "output-a")
+            output_b = os.path.join(root, "output-b")
+            os.mkdir(output_a)
+            os.mkdir(output_b)
+            Path(os.path.join(output_a, "a.txt")).write_text("a")
+            Path(os.path.join(output_b, "b.txt")).write_text("b")
+            scope = action_policy.OwnedScope(
+                repo_roots=tuple(repos),
+                declared_outputs=(output_a, output_b))
+            result = delta_store.snapshot(scope, max_paths=2)
+            self.assertEqual(result["state"], "partial")
+            self.assertLessEqual(len(result["entries"]), 2)
+
+    def test_historical_broker_evidence_builds_attribution_after_resume(self):
+        with tempfile.TemporaryDirectory() as root:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = root
+            self.addCleanup(
+                lambda: os.environ.pop("COWORK_SESSIONS_ROOT", None)
+                if prior is None else os.environ.__setitem__(
+                    "COWORK_SESSIONS_ROOT", prior))
+            session = "artifact-runtime"
+            assets = state_store.session_assets_dir(session)
+            repo = os.path.join(root, "repo")
+            os.makedirs(assets)
+            os.mkdir(repo)
+            subprocess.run(["git", "-C", repo, "init"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           check=True)
+            subprocess.run(["git", "-C", repo, "config", "user.email",
+                            "fixture@example.invalid"], check=True)
+            subprocess.run(["git", "-C", repo, "config", "user.name",
+                            "Fixture"], check=True)
+            for name in ("child.txt", "contested.txt", "unknown.txt",
+                         "reverted.txt"):
+                Path(os.path.join(repo, name)).write_text("before")
+            subprocess.run(["git", "-C", repo, "add", "."], check=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m", "fixture"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           check=True)
+            external = os.path.join(assets, "declared.json")
+            scope = action_policy.OwnedScope(
+                repo_roots=(repo,), declared_outputs=(external,),
+                session_assets_dir=assets)
+            trace = trace_store.Trace(
+                trace_store.trace_path_for(session), session_uuid=session)
+            trace.event("nested.guard.ready")
+            parent = NestedChildGovernanceTests.PARENT
+            child_id = "historical-child"
+            guard_broker.append_once(
+                state_store.children_path_for(session), {
+                    "guard_attempt_id": "historical-start",
+                    "work_id": child_id, "parent_work_id": "parent",
+                    "tool_use_id": "tool-child", "state": "started",
+                    "ts": "2026-01-01T00:00:00Z",
+                    "before_snapshot": delta_store.snapshot(scope),
+                    "effective_identity": {
+                        "controller": "claude",
+                        "model": "sonnet",
+                        "model_source": "config_pinned",
+                        "effort": "high",
+                        "effort_source": "config_pinned",
+                    },
+                    "effective_policy": "child_identity_pinned",
+                })
+            broker = guard_broker.GuardBroker(
+                os.path.join(assets, "guard.sock"), "token", scope,
+                state_store.actions_path_for(session),
+                state_store.children_path_for(session),
+                trace_store.trace_path_for(session), parent)
+            targets = {
+                "child": os.path.join(repo, "child.txt"),
+                "parent": os.path.join(repo, "parent.txt"),
+                "contested": os.path.join(repo, "contested.txt"),
+                "unknown": os.path.join(repo, "unknown.txt"),
+                "reverted": os.path.join(repo, "reverted.txt"),
+                "external": external,
+            }
+            Path(targets["parent"]).write_text("before")
+            subprocess.run(["git", "-C", repo, "add", "parent.txt"],
+                           check=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m",
+                            "parent fixture"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, check=True)
+            for key in ("child", "parent", "contested", "unknown",
+                        "external"):
+                Path(targets[key]).write_text("after")
+            Path(targets["reverted"]).write_text("temporary")
+            Path(targets["reverted"]).write_text("before")
+
+            def post(attempt, target, work_id=None, agent_id=None):
+                broker.handle({
+                    "guard_attempt_id": attempt, "token": "token",
+                    "payload": {
+                        "hook_event_name": "PostToolUse",
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": target},
+                        "cwd": repo, "work_id": work_id,
+                        "agent_id": agent_id, "parent_work_id": "parent",
+                    }})
+
+            # Historical records may already carry an acting work_id. Current
+            # live Claude delegation is refused because its documented hooks
+            # cannot create this mapping from agent_id.
+            post("child-evidence", targets["child"], work_id=child_id)
+            post("parent-evidence", targets["parent"], work_id="parent")
+            post("contest-child", targets["contested"], work_id=child_id)
+            post("contest-parent", targets["contested"], work_id="parent")
+            post("external-child", external, work_id=child_id)
+
+            resumed = guard_broker.GuardBroker(
+                os.path.join(assets, "guard-resumed.sock"), "rotated", scope,
+                state_store.actions_path_for(session),
+                state_store.children_path_for(session),
+                trace_store.trace_path_for(session), parent)
+            self.assertEqual(
+                resumed.work_id_for_tool("tool-child"), child_id)
+            resumed.finalize_child(
+                child_id, agent_id="agent-1",
+                terminal_source="agent_tool_result")
+            record = measure.build_record(session, ingest_results={})
+            attribution = record["nested"]["artifact_attribution"]
+            child = record["work"][child_id]
+            self.assertEqual(child["agent_id"], "agent-1")
+            self.assertEqual(child["effective_policy"],
+                             "child_identity_pinned")
+            self.assertEqual(child["terminal_source"], "agent_tool_result")
+            self.assertIsInstance(child["duration_ms"], int)
+            self.assertEqual(child["tool_count"], 3)
+            self.assertEqual(
+                attribution[os.path.realpath(targets["child"])]
+                ["attribution"], "credited")
+            self.assertEqual(
+                attribution[os.path.realpath(targets["parent"])],
+                {"work_ids": ["parent"], "attribution": "credited"})
+            self.assertEqual(
+                attribution[os.path.realpath(targets["contested"])]
+                ["attribution"], "contested")
+            self.assertEqual(
+                attribution[os.path.realpath(targets["unknown"])]
+                ["attribution"], "unattributed")
+            self.assertEqual(
+                attribution[os.path.realpath(external)]["attribution"],
+                "credited")
+            self.assertNotIn(os.path.realpath(targets["reverted"]),
+                             attribution)
+            contributions = record["contribution"]
+            self.assertIn({
+                "work_id": child_id, "mode": "produced",
+                "artifact_path": os.path.realpath(targets["child"]),
+                "evidence": ["artifact_delta"],
+            }, contributions)
+            self.assertIn({
+                "work_id": "parent", "mode": "produced",
+                "artifact_path": os.path.realpath(targets["parent"]),
+                "evidence": ["artifact_delta"],
+            }, contributions)
+            self.assertTrue(any(
+                item.get("work_id") == "parent"
+                and item.get("child_work_id") == child_id
+                and item.get("mode") == "coordinated"
+                and item.get("artifact_path") is None
+                for item in contributions))
+            self.assertFalse(any(
+                item.get("work_id") == "parent"
+                and item.get("mode") == "produced"
+                and item.get("artifact_path")
+                == os.path.realpath(targets["child"])
+                for item in contributions))
+            rendered = report.render_report(record)
+            self.assertIn("identity_sources=model:config_pinned", rendered)
+            self.assertIn("policy=child_identity_pinned", rendered)
+            self.assertIn("agent=agent-1 tools=3", rendered)
+            self.assertIn("terminal=agent_tool_result", rendered)
+            self.assertIn("mode=coordinated", rendered)
+            self.assertIn("mode=unattributed", rendered)
+
+
+class ControllerStateIsolationTests(unittest.TestCase):
+    def test_guard_socket_path_is_bounded_under_deep_session_roots(self):
+        with tempfile.TemporaryDirectory() as root:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = os.path.join(
+                root, *("very-long-session-root-segment" for _ in range(8)))
+            try:
+                first = state_store.guard_socket_path_for(
+                    "session", "evaluator", "nonce-a")
+                second = state_store.guard_socket_path_for(
+                    "session", "evaluator", "nonce-b")
+            finally:
+                if prior is None:
+                    os.environ.pop("COWORK_SESSIONS_ROOT", None)
+                else:
+                    os.environ["COWORK_SESSIONS_ROOT"] = prior
+            self.assertLess(len(first.encode()), 100)
+            self.assertEqual(os.path.dirname(first), "/tmp")
+            self.assertNotEqual(first, second)
+
+    def test_legacy_resume_is_migrated_into_private_project_layout(self):
+        with tempfile.TemporaryDirectory() as root:
+            legacy = os.path.join(root, "legacy-projects")
+            private = os.path.join(root, "private")
+            source = os.path.join(legacy, "-repo", "legacy-id.jsonl")
+            os.makedirs(os.path.dirname(source))
+            Path(source).write_text('{"type":"user"}\n')
+            target = bridge.migrate_legacy_claude_resume(
+                private, "legacy-id", legacy_root=legacy)
+            self.assertEqual(
+                target,
+                os.path.join(private, "projects", "-repo",
+                             "legacy-id.jsonl"))
+            self.assertEqual(Path(target).read_text(), '{"type":"user"}\n')
+            Path(source).write_text("changed\n")
+            self.assertEqual(
+                bridge.migrate_legacy_claude_resume(
+                    private, "legacy-id", legacy_root=legacy),
+                target)
+            self.assertEqual(Path(target).read_text(), '{"type":"user"}\n')
+
+    def test_identity_registry_records_guarded_controller_state_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            class Session:
+                speaker = "builder"
+                controller = "claude"
+                model = "sonnet"
+                live_model = None
+                session_id = "session-id"
+                thread_id = None
+                extra_writable_dir = root
+                controller_state_dir = os.path.join(
+                    root, "controller-state", "builder")
+
+            cowork._record_role_identity(Session(), {})
+            identities = state_store.read_role_identities(
+                os.path.join(root, "identities.json"))
+            self.assertEqual(
+                identities["builder"]["controller_state_dir"],
+                Session.controller_state_dir)
+
+    def test_guarded_claude_evaluator_gets_assets_and_exact_scratch_output(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as root:
+            scratch = os.path.join(root, "eval.builder.json")
+            seen = {}
+
+            class Trace:
+                session_uuid = "eval-session"
+
+                def event(self, *_args, **_kwargs):
+                    pass
+
+            class Broker:
+                def stop(self):
+                    pass
+
+            class Thread:
+                def is_alive(self):
+                    return True
+
+            class Proc:
+                stdin = io.StringIO()
+
+                def __init__(self):
+                    self.stdout = iter([
+                        json.dumps({
+                            "type": "result", "subtype": "success",
+                            "session_id": "eval-provider-session",
+                            "usage": {"input_tokens": 1,
+                                      "output_tokens": 1},
+                        }) + "\n"])
+
+            def fake_guard(
+                    trace, role, assets_dir, model, effort,
+                    delegation_allowed, declared_outputs=None,
+                    resume_id=None, repo_writable=True):
+                seen.update({
+                    "role": role, "assets_dir": assets_dir,
+                    "declared_outputs": declared_outputs,
+                    "repo_writable": repo_writable,
+                })
+                context_path = os.path.join(root, "context.json")
+                Path(context_path).write_text("{}\n")
+                scope = action_policy.OwnedScope(
+                    repo_roots=((os.getcwd(),) if repo_writable else ()),
+                    declared_outputs=declared_outputs,
+                    session_assets_dir=assets_dir,
+                    controller_state_dir=os.path.join(
+                        assets_dir, "controller-state", role))
+                return {
+                    "settings_path": os.path.join(root, "settings.json"),
+                    "delegation_allowed": False, "scope": scope,
+                    "env": dict(os.environ), "broker": Broker(),
+                    "thread": Thread(),
+                    "context_path": context_path,
+                }
+
+            previous = bridge.set_nested_guard_active(True)
+            self.addCleanup(bridge.set_nested_guard_active, previous)
+            with mock.patch.object(
+                    bridge, "_guard_runtime", side_effect=fake_guard), \
+                    mock.patch.object(
+                        bridge, "kernel_write_boundary",
+                        side_effect=lambda _scope, argv=None: {
+                            "available": True, "platform": "darwin",
+                            "argv": list(argv or ())}), \
+                    mock.patch.object(bridge.subprocess, "Popen",
+                                      return_value=Proc()):
+                session = cowork._isolated_evaluator_session(
+                    {"scratch_path": scratch},
+                    {"tool": "claude", "model": "sonnet"},
+                    trace=Trace(), io_out=io.StringIO())
+            self.assertIsInstance(session, bridge.ClaudeSession)
+            self.assertTrue(session.send(
+                "score the sealed evidence",
+                meta={"work_class": "evaluation"})["ok"])
+            self.assertEqual(seen["assets_dir"], root)
+            self.assertEqual(seen["declared_outputs"], (scratch,))
+            self.assertFalse(seen["repo_writable"])
+            self.assertTrue(session._guard_runtime["scope"].is_declared_output(
+                scratch))
+            self.assertFalse(session._guard_runtime["scope"].owns(
+                os.path.join(root, "trace.jsonl")))
+
+    def test_evaluator_policy_and_kernel_deny_repo_and_unrelated_assets(self):
+        import unittest.mock as mock
+        if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
+            self.skipTest("governed Claude runtime is supported on macOS")
+
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            sessions = os.path.join(root, "sessions")
+            os.mkdir(repo)
+            os.mkdir(sessions)
+            subprocess.run(
+                ["git", "-C", repo, "init"], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            session_uuid = "eval-readonly"
+            prior_sessions = os.environ.get("COWORK_SESSIONS_ROOT")
+            prior_cwd = os.getcwd()
+            os.environ["COWORK_SESSIONS_ROOT"] = sessions
+            os.chdir(repo)
+            try:
+                assets = state_store.session_assets_dir(session_uuid)
+                os.makedirs(assets)
+                scratch = os.path.join(assets, "eval.builder.json")
+                unrelated = os.path.join(assets, "unrelated.json")
+                repo_target = os.path.join(repo, "evaluator-forgery.txt")
+                ledger = state_store.actions_path_for(session_uuid)
+                trace = trace_store.Trace(
+                    trace_store.trace_path_for(session_uuid),
+                    session_uuid=session_uuid)
+
+                class Proc:
+                    stdin = io.StringIO()
+
+                    def __init__(self):
+                        self.stdout = iter([
+                            json.dumps({
+                                "type": "result", "subtype": "success",
+                                "session_id": "eval-provider-session",
+                                "usage": {"input_tokens": 1,
+                                          "output_tokens": 1},
+                            }) + "\n"])
+
+                previous = bridge.set_nested_guard_active(True)
+                try:
+                    # Patch only the controller process seam. The helper is
+                    # pinned separately because subprocess.run itself uses
+                    # Popen as a context manager for Git discovery.
+                    with mock.patch.object(
+                            bridge, "_git_worktree_scope",
+                            return_value=(repo, ())), \
+                            mock.patch.object(
+                                bridge.subprocess, "Popen",
+                                return_value=Proc()):
+                        session = cowork._isolated_evaluator_session(
+                            {"scratch_path": scratch},
+                            {"tool": "claude", "model": "sonnet"},
+                            trace=trace, io_out=io.StringIO())
+                    result = session.send(
+                        "score the sealed evidence",
+                        meta={"work_class": "evaluation"})
+                finally:
+                    bridge.set_nested_guard_active(previous)
+                self.assertTrue(result["ok"])
+                scope = session._guard_runtime["scope"]
+                self.assertEqual(scope.repo_roots, ())
+
+                def write_decision(path):
+                    return action_policy.decide({
+                        "class": "write", "targets": [path],
+                        "resolution_complete": True,
+                    }, scope)
+
+                self.assertTrue(write_decision(scratch)["allow"])
+                for target in (repo_target, unrelated, ledger):
+                    with self.subTest(target=target):
+                        self.assertFalse(write_decision(target)["allow"])
+
+                allowed = bridge.kernel_write_boundary(
+                    scope, [sys.executable, "-c",
+                            "open(%r, 'w').write('score')" % scratch])
+                self.assertEqual(
+                    subprocess.run(
+                        allowed["argv"], stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE).returncode,
+                    0)
+                self.assertEqual(Path(scratch).read_text(), "score")
+                for target in (repo_target, unrelated, ledger):
+                    denied = bridge.kernel_write_boundary(
+                        scope, [sys.executable, "-c",
+                                "open(%r, 'w').write('forged')" % target])
+                    self.assertNotEqual(
+                        subprocess.run(
+                            denied["argv"], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE).returncode,
+                        0)
+                    self.assertFalse(os.path.exists(target))
+                session._guard_runtime["broker"].stop()
+            finally:
+                os.chdir(prior_cwd)
+                if prior_sessions is None:
+                    os.environ.pop("COWORK_SESSIONS_ROOT", None)
+                else:
+                    os.environ["COWORK_SESSIONS_ROOT"] = prior_sessions
+
+    def test_controller_state_is_stable_writable_but_audit_is_not(self):
+        with tempfile.TemporaryDirectory() as root:
+            state_dir = os.path.join(root, "controller")
+            audit = os.path.join(root, "trace.jsonl")
+            os.mkdir(state_dir)
+            scope = action_policy.OwnedScope(controller_state_dir=state_dir)
+            self.assertTrue(scope.owns(os.path.join(state_dir, "cache")))
+            self.assertFalse(scope.owns(audit))
+            self.assertEqual(
+                state_store.controller_state_dir_for("session", "builder"),
+                state_store.controller_state_dir_for("session", "builder"))
+            boundary = bridge.kernel_write_boundary(scope)
+            if boundary["available"]:
+                state_file = os.path.join(state_dir, "resume-state")
+                allowed = bridge.kernel_write_boundary(
+                    scope, [sys.executable, "-c",
+                            "open(%r, 'w').write('state')" % state_file])
+                denied = bridge.kernel_write_boundary(
+                    scope, [sys.executable, "-c",
+                            "open(%r, 'w').write('forged')" % audit])
+                self.assertEqual(
+                    subprocess.run(allowed["argv"]).returncode, 0)
+                self.assertNotEqual(
+                    subprocess.run(denied["argv"]).returncode, 0)
+
+    def test_fake_controller_fresh_and_resume_use_private_layout(self):
+        with tempfile.TemporaryDirectory() as root:
+            state_dir = os.path.join(root, "controller")
+            temp_dir = os.path.join(root, "temp")
+            os.mkdir(state_dir)
+            os.mkdir(temp_dir)
+            scope = action_policy.OwnedScope(
+                controller_state_dir=state_dir, role_temp_dir=temp_dir)
+            boundary = bridge.kernel_write_boundary(scope)
+            if not boundary["available"]:
+                self.assertFalse(action_policy.capability_decision(
+                    "claude", "implement", "governed",
+                    "pre_execution_record", False)["allow"])
+                return
+            source = (
+                "import os,sys;"
+                "state,temp,phase=sys.argv[1:];"
+                "paths=[os.path.join(state,'config.json'),"
+                "os.path.join(state,'session.id'),"
+                "os.path.join(state,'transcript.jsonl'),"
+                "os.path.join(state,'cache.bin'),"
+                "os.path.join(temp,'turn.tmp')];"
+                "assert phase=='fresh' or "
+                "open(paths[1]).read()=='session-1';"
+                "[open(p,'a').write(phase+'\\n') for p in paths];"
+                "open(paths[1],'w').write('session-1')")
+            fresh = bridge.kernel_write_boundary(
+                scope, [sys.executable, "-c", source,
+                        state_dir, temp_dir, "fresh"])
+            resume = bridge.kernel_write_boundary(
+                scope, [sys.executable, "-c", source,
+                        state_dir, temp_dir, "resume"])
+            self.assertEqual(
+                subprocess.run(fresh["argv"], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE).returncode, 0)
+            self.assertEqual(
+                subprocess.run(resume["argv"], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE).returncode, 0)
+            self.assertEqual(
+                Path(os.path.join(state_dir, "session.id")).read_text(),
+                "session-1")
+
+
+class GuardBrokerFailureRecordTests(unittest.TestCase):
+    def test_hook_enrichment_never_mislabels_documented_nested_payload(self):
+        context = {"current_parent_work_id": "parent-work"}
+        direct = action_guard.enrich_payload(
+            {"hook_event_name": "PreToolUse", "tool_name": "Read"},
+            context)
+        self.assertEqual(direct["work_id"], "parent-work")
+        self.assertEqual(direct["parent_work_id"], "parent-work")
+        nested = action_guard.enrich_payload({
+            "hook_event_name": "PreToolUse", "tool_name": "Read",
+            "agent_id": "agent-1", "agent_type": "Explore",
+        }, context)
+        self.assertNotIn("work_id", nested)
+        self.assertEqual(nested["parent_work_id"], "parent-work")
+
+    def test_missing_socket_denies_with_stable_attempt_id(self):
+        result = action_guard.forward(
+            {}, "/definitely/missing/cowork.sock", "token", timeout=0.01,
+            attempt_id="attempt-1")
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("attempt-1", output["permissionDecisionReason"])
+
+    def test_all_failure_channels_deny_and_reconcile_exactly_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            scope = action_policy.OwnedScope(
+                repo_roots=(os.path.join(root, "owned"),))
+            os.mkdir(scope.repo_roots[0])
+            actions = os.path.join(root, "actions.jsonl")
+            children = os.path.join(root, "children.jsonl")
+            trace = os.path.join(root, "trace.jsonl")
+            parent = {
+                "controller": "claude",
+                "controller_source": "config_pinned",
+                "model": "sonnet", "model_source": "config_pinned",
+                "effort": "high", "effort_source": "config_pinned",
+            }
+            broker = guard_broker.GuardBroker(
+                os.path.join(root, "guard.sock"), "token", scope,
+                actions, children, trace, parent)
+            for attempt_id, token, peer in (
+                    ("stale", "wrong", True),
+                    ("foreign", "token", False)):
+                response = broker.handle({
+                    "guard_attempt_id": attempt_id, "token": token,
+                    "payload": {"tool_name": "Read", "tool_input": {}}},
+                    peer_allowed=peer)
+                self.assertEqual(response["hookSpecificOutput"]
+                                 ["permissionDecision"], "deny")
+
+            oversize = action_guard.forward(
+                {"blob": "x" * 2048}, "/missing", "token",
+                max_bytes=128, attempt_id="oversize")
+            self.assertEqual(oversize["hookSpecificOutput"]
+                             ["permissionDecision"], "deny")
+
+            server_path = os.path.join(root, "timeout.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(server_path)
+            server.listen(1)
+
+            def accept_without_reply():
+                conn, _ = server.accept()
+                time.sleep(0.05)
+                conn.close()
+                server.close()
+
+            thread = threading.Thread(target=accept_without_reply)
+            thread.start()
+            timeout = action_guard.forward(
+                {}, server_path, "token", timeout=0.01,
+                attempt_id="timeout")
+            thread.join()
+            self.assertEqual(timeout["hookSpecificOutput"]
+                             ["permissionDecision"], "deny")
+
+            crashed = action_guard.forward(
+                {}, os.path.join(root, "crashed.sock"), "token",
+                attempt_id="crashed")
+            self.assertEqual(crashed["hookSpecificOutput"]
+                             ["permissionDecision"], "deny")
+
+            with open(actions) as fh:
+                broker_records = [json.loads(line) for line in fh]
+            events = [
+                {"event": "action.policy.denied_offline",
+                 "guard_attempt_id": "stale"},
+                {"event": "guard.broker.unavailable",
+                 "guard_attempt_id": "stale"},
+                {"event": "action.policy.denied_offline",
+                 "guard_attempt_id": "oversize"},
+                {"event": "action.policy.denied_offline",
+                 "guard_attempt_id": "timeout"},
+                {"event": "action.policy.denied_offline",
+                 "guard_attempt_id": "crashed"},
+            ]
+            first = measure.reconcile_guard_records(broker_records, events)
+            second = measure.reconcile_guard_records(broker_records, events)
+            self.assertEqual(first, second)
+            self.assertEqual(
+                len(first),
+                len({record["guard_attempt_id"] for record in first}))
+            by_id = {record["guard_attempt_id"]: record for record in first}
+            self.assertEqual(by_id["stale"]["evidence_channel"], "broker")
+            self.assertEqual(by_id["oversize"]["evidence_channel"], "stream")
+
+
+class UnknownToolClassTests(unittest.TestCase):
+    def test_local_plugin_and_mcp_unknowns_all_deny(self):
+        for name in ("RenamedWrite", "plugin_tool", "mcp__server__mutate"):
+            with self.subTest(name=name):
+                action = action_policy.classify_action(name, {"path": "x"})
+                self.assertEqual(action["reason"], "unknown_tool_class")
+
+    def test_catch_all_still_allows_evidenced_builtin_reads(self):
+        doc = bridge.guard_settings_document("/tmp/guard.py")
+        self.assertNotIn("matcher", doc["hooks"]["PreToolUse"][0])
+        for name in ("Read", "Glob", "Grep"):
+            action = action_policy.classify_action(name, {"path": "/x"})
+            self.assertEqual(action["class"], "read")
+            self.assertTrue(action_policy.decide(
+                action, action_policy.OwnedScope())["allow"])
+
+
+class CapabilityAllowlistTests(unittest.TestCase):
+    def test_schema_pin_allows_read_and_drift_denies(self):
+        schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+        digest = hashlib.sha256(json.dumps(
+            schema, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        allow = action_policy.load_capability_allowlist([{
+            "tool": "Lookup", "schema_digest": digest,
+            "classification": "read_only", "evidence": "fixture-1",
+        }])
+        self.assertEqual(action_policy.classify_action(
+            "Lookup", {}, installed_schema=schema,
+            capability_allowlist=allow)["class"], "read")
+        self.assertEqual(action_policy.classify_action(
+            "Lookup", {}, installed_schema={"changed": True},
+            capability_allowlist=allow)["reason"], "tool_schema_drift")
+
+    def test_invalid_pins_mutation_claims_and_incomplete_adapters_deny(self):
+        invalid = (
+            [{"tool": "Lookup", "classification": "read_only",
+              "evidence": "fixture"}],
+            [{"tool": "Write", "schema_digest": "x",
+              "classification": "read_only", "evidence": "fixture"}],
+            [{"tool": "Lookup", "schema_digest": "x",
+              "classification": "mutation", "evidence": "fixture"}],
+        )
+        for entries in invalid:
+            with self.subTest(entries=entries):
+                with self.assertRaises(ValueError):
+                    action_policy.load_capability_allowlist(entries)
+        allow = {"Lookup": {"schema_digest": "x"}}
+        self.assertEqual(action_policy.classify_action(
+            "Lookup", {}, installed_schema=None,
+            capability_allowlist=allow)["reason"], "tool_unpinnable")
+        incomplete = {"class": "write", "targets": [],
+                      "resolution_complete": False,
+                      "reason": "target_unresolved"}
+        self.assertEqual(action_policy.decide(
+            incomplete, action_policy.OwnedScope())["reason"],
+            "target_unresolved")
+
+
+class ZeroChildDelegationTests(unittest.TestCase):
+    def test_non_delegating_claude_disallows_both_tool_names(self):
+        command = bridge.build_claude_command(
+            "roles/scout.md", "plan", False, delegation_allowed=False)
+        self.assertIn("Agent", command)
+        self.assertIn("Task", command)
+        self.assertFalse(action_policy.capability_decision(
+            "codex", "plan", "unknown", "none", False)["allow"])
+        events = [bridge.parse_claude_event(event) for event in
+                  _nested_fixture_events("n5-nondelegating-baseline")]
+        self.assertFalse(any(event.get("parent_tool_use_id")
+                             for event in events))
+        self.assertEqual(measure.child_work_from_ledger([]), {})
+
+    def test_codex_capability_evidence_pin_forces_revisit_on_drift(self):
+        path = os.path.join(
+            _NESTED_FIXTURES, "n7-correlation-edges",
+            "codex-capability-pin.json")
+        with open(path) as fh:
+            pin = json.load(fh)
+        self.assertEqual(pin["cli_version"], "0.145.0")
+        self.assertRegex(pin["protocol_schema_digest"], r"^[0-9a-f]{64}$")
+        self.assertIn("generated ServerRequest",
+                      pin["protocol_schema_digest_scope"])
+        self.assertTrue(pin["experimentalFeature_multi_agent"]
+                        ["default"]["enabled"])
+        self.assertFalse(pin["experimentalFeature_multi_agent"]
+                         ["disabled_flag"]["enabled"])
+        self.assertEqual(
+            pin["raw_instruction_keyword_counts"]["default"],
+            pin["raw_instruction_keyword_counts"]["disabled_flag"])
+        self.assertGreater(
+            pin["raw_instruction_keyword_counts"]["disabled_flag"]
+            ["spawn_agent"], 0)
+        self.assertFalse(pin["tools_inventory_observable"])
+        self.assertFalse(pin["pre_child_server_request"])
+
+
+class NestedDocsTests(unittest.TestCase):
+    def test_docs_name_governance_boundary_and_exact_once_cost(self):
+        with open(os.path.join(os.path.dirname(_HERE), "README.md")) as fh:
+            text = fh.read()
+        self.assertIn("Nested-agent governance and accounting", text)
+        self.assertIn("exact-once", text)
+        self.assertIn("operating-system sandbox", text)
+        self.assertIn("child_agent_correlation_unavailable", text)

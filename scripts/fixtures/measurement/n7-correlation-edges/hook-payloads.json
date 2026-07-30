@@ -1,0 +1,5 @@
+[
+  {"tool_name":"Agent","tool_use_id":"t1","parent_work_id":"parent","tool_input":{"subagent_type":"Explore","prompt":"first"}},
+  {"tool_name":"Agent","tool_use_id":"t2","parent_work_id":"parent","tool_input":{"subagent_type":"Explore","prompt":"second"}},
+  {"tool_name":"Agent","tool_use_id":"t3","parent_work_id":"parent","tool_input":{"subagent_type":"Explore","prompt":"blocked","model":"other"}}
+]
