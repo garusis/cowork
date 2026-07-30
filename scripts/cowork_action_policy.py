@@ -118,8 +118,18 @@ CONTROLLER_CAPABILITY_MATRIX = {
         "mutation_gate": "pre_execution_record",
         "kernel_boundary": "required",
     },
-    ("opencode", "plan"): {"refused": "pre_child_delegation_decision"},
-    ("opencode", "implement"): {"refused": "pre_child_delegation_decision"},
+    ("opencode", "plan"): {
+        "delegation": "proven_absent",
+        "child_correlation": "unavailable",
+        "mutation_gate": "controller_permissions",
+        "kernel_boundary": "not_required",
+    },
+    ("opencode", "implement"): {
+        "delegation": "proven_absent",
+        "child_correlation": "unavailable",
+        "mutation_gate": "controller_permissions",
+        "kernel_boundary": "not_required",
+    },
 }
 
 
@@ -252,7 +262,7 @@ def capability_decision(controller, mode, delegation="unknown",
         return {"allow": False, "reason": "delegation_capability_unknown"}
     if not mutation_ok:
         return {"allow": False, "reason": "mutation_gate_missing"}
-    if not kernel_boundary:
+    if row.get("kernel_boundary") == "required" and not kernel_boundary:
         return {"allow": False, "reason": "kernel_boundary_missing"}
     return {"allow": True, "reason": "capabilities_governed",
             "controller": controller, "mode": mode}

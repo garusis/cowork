@@ -1309,17 +1309,21 @@ disallows `Agent` and legacy `Task`; Codex starts with `multi_agent` disabled
 through two independent config pins. The broker independently denies an
 `Agent`/`Task` attempt if either removal is bypassed. A nested hook carrying an
 unmatched `agent_id` is recorded as
-`child_agent_correlation_unavailable`. OpenCode is refused before process
-launch because its transport cannot prove a pre-child decision or hard-remove
-delegation.
+`child_agent_correlation_unavailable`. OpenCode has no child-correlation hook,
+so Cowork instead hard-removes its native Task tool in the generated role agent
+before process launch, using both the current `permission.task: deny` control
+and the compatible `tools.task: false` control. OpenCode documents that a
+denied task target is removed from the model's tool description.
 
-**Linux limitation:** normal governed Cowork roles currently have no supported
-controller on Linux. The safe authenticated-profile/bootstrap path is currently
-implemented only for macOS for Claude and Codex; OpenCode lacks the required
-delegation boundary. Preflight reports this before role dispatch. The presence
-of a bubblewrap profile generator does not constitute Linux controller support.
+**Linux limitation:** the authenticated private-profile and kernel-boundary
+path is currently implemented only for macOS Claude and Codex roles. OpenCode
+can run non-delegating through its controller-native permissions, but it does
+not provide the same per-action broker receipts or operating-system write
+boundary. Reports preserve that capability difference rather than treating the
+controllers as equivalent. The presence of a bubblewrap profile generator does
+not constitute Linux support for the private-profile path.
 
-Every supported local tool call reaches an orchestrator-owned broker. Built-in
+Every Claude/Codex local tool call reaches an orchestrator-owned broker. Built-in
 mutation adapters must resolve all targets; Bash is proof-based and rejects
 unresolved globs, substitutions, inline interpreters, invoked scripts, unknown
 verbs, and incomplete redirects. Unknown local, plugin, and MCP tools are

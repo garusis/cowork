@@ -358,10 +358,13 @@ class OpencodeBridgeTest(unittest.TestCase):
     """opencode agent-file generation, command assembly, and event parsing."""
 
     def test_permission_lines_per_mode(self):
-        # yolo implement -> no block (--auto rides on the command instead).
+        # Yolo still hard-removes native delegation; --auto applies to the
+        # remaining tools only.
         self.assertEqual(
-            bridge.opencode_permission_lines("implement", True), [])
+            bridge.opencode_permission_lines("implement", True),
+            ["permission:", "  task: deny"])
         plan = bridge.opencode_permission_lines("plan", True)
+        self.assertIn("  task: deny", plan)
         self.assertIn("  edit: deny", plan)
         self.assertIn("  bash: ask", plan)  # ask auto-rejects headless
         safe = bridge.opencode_permission_lines("implement", False,
@@ -379,11 +382,12 @@ class OpencodeBridgeTest(unittest.TestCase):
         self.assertTrue(md.startswith("---\n"))
         self.assertIn("description: cowork scout role", md)
         self.assertIn("mode: primary", md)
+        self.assertIn("tools:\n  task: false", md)
         self.assertIn("edit: deny", md)
         self.assertTrue(md.rstrip().endswith("ROLE PROMPT"))
         yolo_md = bridge.opencode_agent_markdown(
             "R", "implement", True, description="d")
-        self.assertNotIn("permission:", yolo_md)
+        self.assertIn("permission:\n  task: deny", yolo_md)
 
     def test_ensure_opencode_agent_writes_and_regenerates(self):
         import tempfile
@@ -24116,25 +24120,22 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
                             response["hookSpecificOutput"]
                             ["permissionDecision"], expected)
 
-    def test_refused_rows_launch_zero_processes(self):
-        launches = []
-        for controller in ("opencode",):
-            for mode in ("plan", "implement"):
-                decision = action_policy.capability_decision(
-                    controller, mode, "unknown", "none", False)
-                if decision["allow"]:
-                    launches.append((controller, mode))
-                self.assertEqual(
-                    decision["missing_capability"],
-                    "pre_child_delegation_decision")
-        self.assertEqual(launches, [])
+    def test_opencode_runs_only_with_delegation_proven_absent(self):
+        for mode in ("plan", "implement"):
+            unknown = action_policy.capability_decision(
+                "opencode", mode, "unknown", "controller_permissions", False)
+            self.assertFalse(unknown["allow"])
+            decision = action_policy.capability_decision(
+                "opencode", mode, "proven_absent",
+                "controller_permissions", False)
+            self.assertTrue(decision["allow"])
         for mode in ("plan", "implement"):
             decision = action_policy.capability_decision(
                 "codex", mode, "enforceably_disabled",
                 "pre_execution_record", True)
             self.assertTrue(decision["allow"])
 
-    def test_refused_adapters_record_reason_before_zero_launch(self):
+    def test_guarded_opencode_hard_removes_task_before_launch(self):
         class RecordingTrace:
             def __init__(self):
                 self.events = []
@@ -24144,17 +24145,26 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
 
         previous = bridge.set_nested_guard_active(True)
         try:
-            trace = RecordingTrace()
-            with self.assertRaisesRegex(
-                    RuntimeError, "pre-child delegation decision"):
-                bridge.OpencodeSession(
-                    "roles/scout.md", "plan", False, trace=trace)
-            self.assertEqual(trace.events, [{
-                "event": "controller.dispatch.refused",
+            with tempfile.TemporaryDirectory() as base:
+                trace = RecordingTrace()
+                session = bridge.OpencodeSession(
+                    "roles/scout.md", "plan", False, trace=trace,
+                    agent_base_dir=base)
+                agent_path = os.path.join(
+                    base, ".opencode", "agents",
+                    session.agent_name + ".md")
+                with open(agent_path) as fh:
+                    content = fh.read()
+            self.assertIn("permission:\n  task: deny", content)
+            self.assertIn("tools:\n  task: false", content)
+            self.assertIn({
                 "controller": "opencode",
                 "role": "scout",
-                "missing_capability": "pre_child_delegation_decision",
-            }])
+                "delegation": "proven_absent",
+                "delegation_reason": "task_permission_denied",
+                "kernel_boundary": "controller_permissions",
+                "event": "nested.guard.ready",
+            }, trace.events)
         finally:
             bridge.set_nested_guard_active(previous)
 

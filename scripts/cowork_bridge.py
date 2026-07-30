@@ -664,12 +664,16 @@ def opencode_permission_lines(mode, yolo, external_dir=False):
     - implement + no-yolo -> edit allow + bash ask (mirrors claude acceptEdits:
       edits land, other commands are denied). `external_directory: allow` is
       added when the role needs to write session artifacts outside cwd.
-    - implement + yolo -> no permission block; the run gets `--auto` instead
-      (auto-approve everything not explicitly denied).
+    - every mode -> task deny. OpenCode removes denied task targets from the
+      model's tool description, so native child delegation is absent before
+      the first model turn.
+    - implement + yolo -> only the task deny remains; the run gets `--auto`
+      (auto-approve everything else).
     """
     if mode == "implement" and yolo:
-        return []
+        return ["permission:", "  task: deny"]
     lines = ["permission:",
+             "  task: deny",
              "  edit: %s" % ("deny" if mode == "plan" else "allow"),
              "  bash: ask",
              "  webfetch: allow"]
@@ -681,7 +685,10 @@ def opencode_permission_lines(mode, yolo, external_dir=False):
 def opencode_agent_markdown(role_prompt_text, mode, yolo, description,
                             external_dir=False):
     """Agent-file markdown: YAML frontmatter + the role prompt as the body."""
-    lines = ["---", "description: %s" % description, "mode: primary"]
+    lines = ["---", "description: %s" % description, "mode: primary",
+             # Defense in depth across OpenCode versions: `tools` is the
+             # deprecated boolean form while `permission` below is current.
+             "tools:", "  task: false"]
     lines += opencode_permission_lines(mode, yolo, external_dir=external_dir)
     lines.append("---")
     return "\n".join(lines) + "\n" + role_prompt_text.strip() + "\n"
@@ -2095,18 +2102,7 @@ class OpencodeSession:
                  resume_session_id=None, on_session_id=None, trace=None,
                  extra_writable_dir=None, internal=False, model=None,
                  effort=None, agent_base_dir=None):
-        # BEFORE ensure_opencode_agent below: a blocked opencode dispatch must
-        # not leave a generated agent file behind.
         policy.guard("opencode", role=speaker, kind="dispatch")
-        if nested_guard_active():
-            if trace:
-                trace.event(
-                    "controller.dispatch.refused", controller="opencode",
-                    role=speaker,
-                    missing_capability="pre_child_delegation_decision")
-            raise RuntimeError(
-                "controller_capability_missing: "
-                "opencode has no pre-child delegation decision")
         self.mode = mode
         self.yolo = yolo
         self.model = model
@@ -2127,6 +2123,12 @@ class OpencodeSession:
         self.agent_name = ensure_opencode_agent(
             role_prompt_file, speaker, mode, yolo, base_dir=agent_base_dir,
             external_dir=bool(extra_writable_dir))
+        if nested_guard_active() and self.trace:
+            self.trace.event(
+                "nested.guard.ready", controller="opencode", role=speaker,
+                delegation="proven_absent",
+                delegation_reason="task_permission_denied",
+                kernel_boundary="controller_permissions")
         if self.trace:
             # The agent file is a SYSTEM prompt (mirrors ClaudeSession's
             # role.prompt.bytes accounting, delivery-tagged for the report).
