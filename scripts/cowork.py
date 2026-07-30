@@ -49,6 +49,7 @@ import cowork_policy as policy  # noqa: E402
 import cowork_measure as measure  # noqa: E402
 import cowork_ingest as ingest  # noqa: E402
 import cowork_ledger as ledger  # noqa: E402
+import cowork_verification as verification  # noqa: E402
 import cowork_eval as evaluation  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2546,6 +2547,57 @@ def _required_verification_labels(session_uuid):
         return None
 
 
+def _raw_plan_verification(session_uuid):
+    """The approved plan's raw `result.verification` array, or None when the
+    plan artifact is absent/unreadable. The sole read of that array for the
+    owned-transaction path below — everything downstream goes through
+    `cowork_verification.normalize_inventory`, never a hand-rolled label-only
+    reading of the plan."""
+    try:
+        directory = state_store.session_assets_dir(session_uuid)
+        plan = measure._read_json(os.path.join(directory,
+                                               "planner.plan.json"))
+        entries = ((plan or {}).get("result") or {}).get("verification")
+        return entries if isinstance(entries, list) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _declared_plan_schema(session_uuid):
+    """The plan's OWN `result.verification_schema` field, or None when the
+    plan never set one. Read separately from `_raw_plan_verification` (the
+    entries array) so `normalize_inventory` can compare what the PLAN
+    declared against the SHAPE of its entries — an entry-level field can
+    never upgrade or downgrade what the plan itself declared."""
+    try:
+        directory = state_store.session_assets_dir(session_uuid)
+        plan = measure._read_json(os.path.join(directory,
+                                               "planner.plan.json"))
+        return ((plan or {}).get("result") or {}).get("verification_schema")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _plan_inventory(session_uuid):
+    """Normalize the approved plan's verification array via
+    `cowork_verification.normalize_inventory`, preserving label/command/
+    execution_mode/kind and any measurement metadata (schema-2), or applying
+    the explicit schema-1 legacy normalization (label/command only plans).
+
+    Returns `(schema, entries, final_suite_label)`, or `(None, None, None)`
+    when the plan carries no verification array at all or the array fails
+    validation — the caller decides how to treat that (an empty/invalid
+    inventory is reported, never silently treated as "nothing required")."""
+    raw = _raw_plan_verification(session_uuid)
+    if not raw:
+        return None, None, None
+    try:
+        return verification.normalize_inventory(
+            raw, declared_schema=_declared_plan_schema(session_uuid))
+    except verification.InventoryError:
+        return None, None, None
+
+
 def _adjudicate_readiness(entries, claimed, required=None):
     """Decide whether a promotion is verified. Returns `(state, manifest, why)`.
 
@@ -2655,19 +2707,31 @@ def _adjudicate_readiness(entries, claimed, required=None):
 def unverified_readiness_text(reason):
     """What the user sees when a promotion is handed back unverified."""
     return ("Readiness was claimed before it was verified, so the work was "
-            "reopened rather than reviewed.\n%s\nThe role has been asked to "
-            "re-run its verification against the tree it is promoting."
+            "reopened rather than reviewed.\n%s\nThe cause has been named so "
+            "it can be repaired; a new owned verification transaction "
+            "decides the next promotion, not a rerun of this one."
             % (reason or "The verified tree and the promoted tree differ."))
 
 
 # The hand-back body is a STATIC template with one normalized reason code
 # substituted in; the reason comes from a closed set computed by
-# `_record_readiness`, never from role output, so nothing free-form rides here.
+# `_record_readiness`/`_record_readiness_from_transaction`, never from role
+# output, so nothing free-form rides here. THE SOLE CALLER (`_role_loop`) is
+# always the owned-transaction builder path (see `_run_owned_verification_
+# transaction` at the one call site) — so this text must never tell a role
+# to "re-run" anything: an owned transaction is never re-run to manufacture
+# evidence, and repeating this exact wording for a non-owned reason (an
+# invalid/missing plan inventory) would be equally wrong, since the fix
+# there is a plan repair, not a rerun either.
 UNVERIFIED_READINESS_HANDBACK = (
     "Your `ready_for_review` was not accepted: %s\n\n"
-    "Re-run the plan's verification commands against the tree as it stands "
-    "now, record each result with its `source_manifest`, and set "
-    "`ready_for_review` again once every check is green against one manifest.")
+    "Do not re-run any verification command to try to produce evidence — "
+    "an owned transaction is never replayed to manufacture a result, and "
+    "the named cause above (or the plan's approved verification inventory, "
+    "if that is what's actually wrong) is what needs repairing. Fix the "
+    "underlying cause, leave the tree stable, and set `ready_for_review` "
+    "again once you believe it's fixed: submitting again starts a new "
+    "owned verification transaction against the tree as it then stands.")
 
 
 def unverified_readiness_handback_text(reason=None):
@@ -2734,6 +2798,178 @@ def _record_readiness(session_uuid, role, status_path, round_index, trace):
         # gate may never be.
         return {"state": "unverified", "event_id": None,
                 "reason": "the readiness gate could not be evaluated"}
+
+
+# The reason NAMED to the builder when an owned transaction invalidates
+# readiness: the underlying reason (from `_owned_transaction_reason` below)
+# plus a pointer to exactly which owned run produced the evidence. This is
+# text substituted INTO `_unverified_readiness_delivery`'s existing static
+# template — the closed hand-back boundary this session already has — never a
+# second delivery path of its own (see TransportChokePointTests).
+OWNED_TRANSACTION_REASON_SUFFIX = (
+    "%s (owned verification transaction %s, verdict %s; see "
+    "verification/transactions/%s/result.json under the session's assets "
+    "for the exact attempt(s) that did not pass)")
+
+
+def _owned_transaction_reason_text(result, reason):
+    transaction_id = result.get("transaction_id")
+    return OWNED_TRANSACTION_REASON_SUFFIX % (
+        reason or "the owned verification transaction did not certify "
+        "this candidate", transaction_id, result.get("verdict"),
+        transaction_id)
+
+
+def _owned_transaction_reason(result):
+    """A short, closed-vocabulary reason string for a red/unverified
+    `TransactionResult`, naming the first attempt (if any) that did not pass
+    or the structural cause (mutation, worker identity) otherwise. Static and
+    derived entirely from the result dict — never from role-authored prose."""
+    if not isinstance(result, dict):
+        return "the transaction produced no result"
+    if not result.get("worker_identity_verified"):
+        return ("the verification worker's self-reported source did not "
+                "match the immutable snapshot, so nothing it ran can be "
+                "trusted")
+    mutation = result.get("mutation")
+    if mutation:
+        changed = mutation.get("changed_paths") or []
+        return ("source or the git index moved during verification (%s)"
+                % (", ".join(changed[:4]) or mutation.get("reason")
+                   or "unspecified change"))
+    for attempt in result.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        if attempt.get("evidence_state") not in (
+                None, verification.EVIDENCE_PRESENT):
+            return ("%s: evidence %s"
+                    % (attempt.get("label"), attempt.get("evidence_state")))
+        if attempt.get("timed_out"):
+            return "%s timed out" % attempt.get("label")
+        if attempt.get("exit_code") not in (0, None):
+            return ("%s exited %s" % (attempt.get("label"),
+                                       attempt.get("exit_code")))
+    return "the transaction did not reach a green verdict"
+
+
+def _run_owned_verification_transaction(session_uuid, role, round_index,
+                                        trace, repo=None,
+                                        run_transaction_fn=None):
+    """Synchronously submit ONE owned verification transaction for the
+    approved plan's inventory, at the builder's ready-for-review transition.
+
+    This is the orchestrator gate itself (P: "builder readiness becomes an
+    orchestrator gate instead of an agent verification claim"): the builder
+    never runs verification commands inside its own controller turn for this
+    check, and its prose cannot override the result. Returns
+    `(TransactionResult_or_None, reason_or_None)` — a `None` result with a
+    reason means the transaction could not even be attempted (missing/invalid
+    plan inventory, no session), which is itself an unverified outcome for
+    the caller to hand back exactly like a red transaction.
+    """
+    run_transaction_fn = run_transaction_fn or verification.run_transaction
+    if not session_uuid or not trace:
+        # No session identity (or no trace to attach the transaction event
+        # to) means the gate cannot even be evaluated at all — mirrors
+        # `_record_readiness`'s own best-effort bypass (`if not (trace and
+        # session_uuid): return`) for scout/planner, so a caller that has not
+        # wired session tracking is not blocked at every builder promotion.
+        return None, None
+    raw = _raw_plan_verification(session_uuid)
+    if not raw:
+        return None, "the approved plan carries no verification inventory"
+    declared_schema = _declared_plan_schema(session_uuid)
+    try:
+        verification.normalize_inventory(raw, declared_schema=declared_schema)
+    except verification.InventoryError as exc:
+        return None, "the approved plan's verification inventory is " \
+            "invalid (%s): %s" % (exc.code, exc)
+    repo = repo or os.getcwd()
+    try:
+        result = run_transaction_fn(repo, session_uuid, raw)
+    except verification.InventoryError as exc:
+        return None, "the approved plan's verification inventory is " \
+            "invalid (%s): %s" % (exc.code, exc)
+    if trace:
+        trace.event(
+            "verification.transaction", role=role, round=round_index,
+            transaction_id=result.get("transaction_id"),
+            request_key=result.get("request_key"),
+            verdict=result.get("verdict"),
+            final_suite_binding=result.get("final_suite_binding"),
+            reused_lock_result=bool(result.get("reused_lock_result")))
+    return result, None
+
+
+def _record_readiness_from_transaction(session_uuid, role, round_index,
+                                       trace, result, missing_reason=None,
+                                       repo=None):
+    """Emit the builder's `role.readiness` event directly from an owned
+    `TransactionResult` — the manifest/index the transaction itself captured
+    and verified against, never a controller-log rejoin. This is what
+    replaces `_record_readiness`'s controller-log-derived truth for owned
+    commands; scout/planner promotion (which has no candidate build or
+    verification inventory) is unaffected and keeps using `_record_readiness`.
+
+    `result is None` with `missing_reason is None` means the gate itself
+    could not be evaluated at all (no session identity / no trace) —
+    mirroring `_record_readiness`'s own best-effort bypass, this does NOT
+    invalidate the promotion (a gate that cannot run must not fabricate a
+    failure any more than it may fabricate a pass). `result is None` WITH a
+    `missing_reason` means the gate DID run and found the plan's inventory
+    missing/invalid — that is a genuine unverified outcome.
+
+    A GREEN verdict alone is never sufficient for `state="verified"`: the
+    candidate as it stands RIGHT NOW (at promotion time) must be IDENTICAL
+    to the exact candidate the transaction's snapshot verified — otherwise
+    a green result for an earlier tree state would silently certify a
+    later, unverified edit. Both digests are computed by `verification.
+    current_candidate_identity`/`build_snapshot`'s ONE canonical algorithm
+    (never `cowork_state.manifest_digest`, a different scheme that would
+    disagree with the transaction's own digest even when nothing moved) and
+    compared for EXACT equality.
+    """
+    if result is None and missing_reason is None:
+        return None
+    if result is None:
+        reason = missing_reason
+        event_id = trace.event(
+            "role.readiness", role=role, round=round_index,
+            claimed_manifest=None, verified_manifest=None,
+            state="unverified", reason=reason) if trace else None
+        return {"state": "unverified", "reason": reason,
+                "event_id": event_id, "claimed_manifest": None,
+                "verified_manifest": None, "transaction_id": None}
+    verdict = result.get("verdict")
+    snapshot = result.get("snapshot") or {}
+    verified_manifest = snapshot.get("manifest_digest")
+    verified_index = snapshot.get("index_digest")
+    claimed, claimed_index = verification.current_candidate_identity(
+        repo or os.getcwd())
+    if verdict == verification.VERDICT_GREEN:
+        if (claimed is not None and claimed == verified_manifest
+                and claimed_index is not None
+                and claimed_index == verified_index):
+            state, reason = "verified", None
+        else:
+            state = "unverified"
+            reason = ("the candidate has moved since the owned "
+                     "verification transaction verified it (manifest/index "
+                     "no longer match the reviewed snapshot); a green "
+                     "verdict for a DIFFERENT tree state does not certify "
+                     "this one")
+    else:
+        state = "unverified"
+        reason = _owned_transaction_reason(result)
+    event_id = trace.event(
+        "role.readiness", role=role, round=round_index,
+        claimed_manifest=claimed, verified_manifest=verified_manifest,
+        state=state, reason=reason,
+        transaction_id=result.get("transaction_id"),
+        verdict=verdict) if trace else None
+    return {"state": state, "reason": reason, "event_id": event_id,
+            "claimed_manifest": claimed, "verified_manifest": verified_manifest,
+            "transaction_id": result.get("transaction_id"), "verdict": verdict}
 
 
 def record_milestone(trace, role, milestone_phase, round_index=None):
@@ -5743,28 +5979,51 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 # (D10) — never an implicit hand-back.
                 status = "needs_input"
             if status == "ready_for_review":
-                # The builder finished editing and is claiming its work is
-                # verified: that transition is the `verification` milestone.
-                record_milestone(trace, role, "verification", review_rounds)
-                # READINESS IS A GATE, NOT A NOTE. Recording `unverified` and
-                # then proceeding anyway left the criterion — "readiness is
-                # never claimed before it is true" — unenforced: the claim was
-                # observed to be false and accepted regardless. An unverified
-                # promotion is now INVALIDATED and handed back with the reason,
-                # exactly like any other reopened work, so the role re-verifies
-                # against the tree it is actually promoting.
-                readiness = _record_readiness(session_uuid, role, status_path,
-                                              review_rounds, trace)
-                if readiness and readiness.get("state") == "unverified":
-                    state_store.invalidate_ready_status(status_path)
-                    pending = _unverified_readiness_delivery(
-                        readiness.get("reason"))
-                    pending_reopens_work = True
-                    pending_reopen_reason = "unverified_readiness"
-                    pending_reopen_event_id = readiness.get("event_id")
-                    ui.banner(io_out, unverified_readiness_text(
-                        readiness.get("reason") or ""), "warn")
-                    continue
+                if role == "builder":
+                    # The builder finished editing and is claiming its work is
+                    # verified: that transition is the `verification`
+                    # milestone. Scout and planner promotion happen before a
+                    # candidate build or verification inventory exists.
+                    record_milestone(trace, role, "verification", review_rounds)
+                    # READINESS IS AN ORCHESTRATOR-OWNED GATE, NOT A SELF-
+                    # REPORTED CLAIM. Cowork itself submits and runs the
+                    # approved plan's verification inventory as one owned,
+                    # hermetic, manifest-bound transaction here — synchronously,
+                    # before the build-reviewer ever runs — rather than
+                    # trusting whatever the builder ran inside its own
+                    # controller turn. A red/unverified transaction invalidates
+                    # readiness through the SAME hand-back mechanism as any
+                    # other unverified promotion; a green one records verified
+                    # readiness against the transaction's OWN captured
+                    # manifest/index, never a controller-log rejoin.
+                    txn_result, txn_missing_reason = (
+                        _run_owned_verification_transaction(
+                            session_uuid, role, review_rounds, trace))
+                    readiness = _record_readiness_from_transaction(
+                        session_uuid, role, review_rounds, trace, txn_result,
+                        missing_reason=txn_missing_reason)
+                    if readiness and readiness.get("state") == "unverified":
+                        state_store.invalidate_ready_status(status_path)
+                        # SAME wrap-and-hand-back mechanism as any other
+                        # unverified promotion — `_unverified_readiness_
+                        # delivery` is the one closed-set boundary wrapper for
+                        # this text (enforced by
+                        # TransportChokePointTests). A transaction-backed
+                        # reason is expanded to name the transaction id
+                        # BEFORE crossing that boundary, never by adding a
+                        # second delivery path.
+                        handback_reason = readiness.get("reason")
+                        if txn_result is not None:
+                            handback_reason = _owned_transaction_reason_text(
+                                txn_result, handback_reason)
+                        pending = _unverified_readiness_delivery(
+                            handback_reason)
+                        pending_reopens_work = True
+                        pending_reopen_reason = "unverified_readiness"
+                        pending_reopen_event_id = readiness.get("event_id")
+                        ui.banner(io_out, unverified_readiness_text(
+                            readiness.get("reason") or ""), "warn")
+                        continue
                 dissent = ""
                 dissent_verdict = None
                 # Hash-gate (scout + planner): when the lead's reviewed artifact

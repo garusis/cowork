@@ -77,6 +77,16 @@ def _fmt_ms(value):
     return "%.1f s" % (value / 1000.0)
 
 
+def _secs_to_ms(seconds):
+    """Convert a float seconds figure (as owned-transaction wall times are
+    recorded) to the `int` milliseconds `_fmt_ms` expects, or None when
+    `seconds` is not a plain number. A pure formatting-boundary conversion,
+    not a recomputation of anything the record does not already state."""
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+        return None
+    return int(seconds * 1000)
+
+
 def _fmt_bytes(n):
     if not isinstance(n, int) or isinstance(n, bool):
         return UNKNOWN
@@ -194,6 +204,7 @@ def render_report(record):
     lines.extend(_section_duration(record))
     lines.extend(_section_input(record))
     lines.extend(_section_verification(record))
+    lines.extend(_section_owned_verification(record))
     lines.extend(_section_claims(record))
     lines.extend(_section_findings(record))
     lines.extend(_section_marginal(record))
@@ -405,6 +416,96 @@ def _section_verification(record):
         if detail:
             lines.append("           %s" % "; ".join(detail))
     lines.extend(_attempt_rollups(record))
+    lines.append("")
+    return lines
+
+
+def _section_owned_verification(record):
+    """Owned verification transaction evidence (`owned_verification.*`) —
+    the orchestrator's own hermetic, manifest-bound run of the plan's
+    approved inventory, when one exists for this session. Distinct from the
+    section above (`verification`/`verification_attempts`), which is always
+    the controller-log-derived view; a session with an owned transaction
+    carries BOTH, and this section is what makes clear which one the
+    builder-readiness gate actually decided on. Tolerant of a legacy session
+    that has none — every lookup below is a plain `_at` with a default, so a
+    record built before this field existed renders the same "no owned
+    transaction" note rather than failing.
+    """
+    lines = ["Owned verification transaction "
+             "(orchestrator-run, manifest-bound)", "-" * 56]
+    latest = _at(record, "owned_verification.latest", None)
+    if not isinstance(latest, dict):
+        lines.extend(["  (no owned verification transaction for this "
+                      "session — controller-log-derived verification above "
+                      "is the only evidence)", ""])
+        return lines
+    cost = _at(record, "owned_verification.cost", {}) or {}
+    lines.append("  transaction %s  verdict=%s  final_suite=%s (%s)"
+                 % (_fmt(latest.get("transaction_id")),
+                    _fmt(latest.get("verdict")),
+                    _fmt(latest.get("final_suite_label")),
+                    _fmt(latest.get("final_suite_binding"))))
+    lines.append("  work_items=%s  attempts=%s (initial=%s focused=%s)  "
+                 "subprocess_wall_time=%s"
+                 % (_fmt(cost.get("work_items")),
+                    _fmt(cost.get("attempt_count")),
+                    _fmt(cost.get("initial_attempt_count")),
+                    _fmt(cost.get("focused_attempt_count")),
+                    _fmt_ms(_secs_to_ms(cost.get("subprocess_wall_time_s")))))
+    lines.append("  worker_identity_verified=%s  reused_lock_result=%s  "
+                 "mutation_detected=%s"
+                 % (_fmt(cost.get("worker_identity_verified")),
+                    _fmt(cost.get("reused_lock_result")),
+                    _fmt(cost.get("mutation_detected"))))
+    if cost.get("mutation_detected"):
+        mutation = cost.get("mutation") or {}
+        lines.append("    MUTATION during verification: %s (changed: %s)"
+                     % (_fmt(mutation.get("reason")),
+                        ", ".join(mutation.get("changed_paths") or [])[:200]
+                        or "(none listed)"))
+    if cost.get("evidence_unresolved_count") or cost.get(
+            "evidence_absent_count"):
+        lines.append("  evidence retry/expiry: %s unresolved, %s absent "
+                     "(bounded poll exhausted, never re-launched)"
+                     % (_fmt(cost.get("evidence_unresolved_count")),
+                        _fmt(cost.get("evidence_absent_count"))))
+    snapshot = cost.get("snapshot") or {}
+    if snapshot:
+        lines.append("  snapshot manifest=%s index=%s"
+                     % (str(snapshot.get("manifest_digest"))[:12],
+                        str(snapshot.get("index_digest"))[:12]))
+    for attempt in latest.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        lines.append(
+            "    %-20s kind=%-16s exit=%-5s evidence=%-10s wall=%s"
+            % (_fmt(attempt.get("label")), _fmt(attempt.get("kind")),
+               _fmt(attempt.get("exit_code")),
+               _fmt(attempt.get("evidence_state")),
+               _fmt_ms(_secs_to_ms(attempt.get("wall_time_s")))))
+    focused = _at(record, "owned_verification.focused_attribution", [])
+    if isinstance(focused, list) and focused:
+        lines.append("")
+        lines.append("  Focused-check attribution (reviewer-triggered only "
+                     "— never the initial baseline/preflight/final_suite):")
+        for item in focused:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "    %-20s finding=%-10s reuse=%-10s marginal_cost=%s"
+                % (_fmt(item.get("label")),
+                   _fmt(item.get("triggering_finding")),
+                   _fmt(item.get("reuse_decision")),
+                   _fmt(item.get("marginal_cost"))))
+            if item.get("invalidation_reason"):
+                lines.append("      invalidated because: %s"
+                             % item.get("invalidation_reason"))
+    transaction_count = _at(record, "owned_verification.transaction_count", 0)
+    if isinstance(transaction_count, int) and transaction_count > 1:
+        lines.append("")
+        lines.append("  %s owned transaction(s) recorded this session "
+                     "(showing the latest above)." % _fmt(transaction_count))
     lines.append("")
     return lines
 

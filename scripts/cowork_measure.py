@@ -40,6 +40,7 @@ Python 3.9+, stdlib only.
 """
 
 import datetime
+import glob
 import hashlib
 import json
 import os
@@ -52,6 +53,7 @@ import cowork_ledger as ledger  # noqa: E402
 import cowork_pricing as pricing  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
+import cowork_verification as verification  # noqa: E402
 
 SCHEMA_VERSION = 1
 
@@ -1007,6 +1009,165 @@ def enhancement_digest(scores):
 
 
 # --------------------------------------------------------------------------- #
+# Owned verification transactions: authoritative when present, legacy        #
+# controller-log-derived attempts remain the fallback for sessions with none. #
+# --------------------------------------------------------------------------- #
+
+
+def _owned_transaction_result_paths(session_uuid):
+    """Every `result.json` an owned transaction wrote for this session, oldest
+    first (by `finished_at`, falling back to path sort when that is absent).
+    Discovery is a directory glob (mirroring `cowork_state`'s own approach)
+    rather than an index file, since a transaction's home directory is fully
+    deterministic from `(session_uuid, transaction_id)` alone."""
+    root = state_store.verification_root_for(session_uuid)
+    pattern = os.path.join(root, "transactions", "*", "result.json")
+    try:
+        paths = sorted(glob.glob(pattern))
+    except OSError:
+        return []
+    def _key(path):
+        doc = _read_json(path) or {}
+        return doc.get("finished_at") or ""
+    return sorted(paths, key=_key)
+
+
+def owned_transactions_for(session_uuid):
+    """Every owned `TransactionResult` persisted for this session, oldest
+    first. `[]` when the session has none (a legacy session, or one that
+    never reached the builder-readiness gate) — the caller's fallback to the
+    controller-log-derived path is unconditional on this being empty."""
+    if not session_uuid:
+        return []
+    out = []
+    for path in _owned_transaction_result_paths(session_uuid):
+        doc = _read_json(path)
+        if isinstance(doc, dict):
+            out.append(doc)
+    return out
+
+
+def latest_owned_transaction(session_uuid):
+    """The most recently finished owned transaction for this session, or
+    None. This is what a builder-readiness gate's decision was actually based
+    on — later transactions (e.g. a subsequent green run after a red one)
+    supersede earlier ones for "what does verification say about this
+    session" purposes, while `owned_transactions_for` keeps every one for
+    cost/attribution accounting."""
+    transactions = owned_transactions_for(session_uuid)
+    return transactions[-1] if transactions else None
+
+
+# `kind`s that are the INITIAL inventory (baseline/preflight/final_suite, plus
+# the whole-plan legacy_required bucket) — never misclassified as a
+# reviewer-triggered focused check just because they happen to carry
+# measurement metadata. Only `kind=focused` uses the focused-check contract
+# (invalidation_reason/reuse_decision/triggering_finding/marginal_cost).
+_INITIAL_INVENTORY_KINDS = (
+    verification.KIND_BASELINE, verification.KIND_PREFLIGHT,
+    verification.KIND_FINAL_SUITE, verification.KIND_LEGACY_REQUIRED)
+
+
+def owned_transaction_cost_summary(result):
+    """Subprocess duration/resource cost for one owned transaction, kept
+    STRICTLY SEPARATE from model-inference cost (`cost.by_class` above): this
+    is wall-clock time the worker's spawned commands spent, not anything a
+    controller billed tokens for. One transaction — however many commands its
+    inventory names after deduplication — counts as exactly ONE orchestration
+    work item, per the plan's "19 command identities, one work item, one
+    final suite" invariant.
+
+    Returns a dict with `work_items=1`, per-kind counts, total/attempt wall
+    time, final-suite identity/binding, mutation/cleanup outcome, and
+    evidence retry/expiry counts. `None` when `result` is not a usable
+    TransactionResult.
+    """
+    if not isinstance(result, dict):
+        return None
+    attempts = result.get("attempts") or []
+    focused = []
+    initial = []
+    total_wall_s = 0.0
+    evidence_unresolved = 0
+    evidence_absent = 0
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        wall = attempt.get("wall_time_s")
+        if isinstance(wall, (int, float)):
+            total_wall_s += wall
+        state = attempt.get("evidence_state")
+        if state == verification.EVIDENCE_UNRESOLVED:
+            evidence_unresolved += 1
+        elif state == verification.EVIDENCE_ABSENT:
+            evidence_absent += 1
+        kind = attempt.get("kind")
+        if kind == verification.KIND_FOCUSED:
+            focused.append(attempt)
+        elif kind in _INITIAL_INVENTORY_KINDS or kind is None:
+            initial.append(attempt)
+        else:
+            initial.append(attempt)
+    mutation = result.get("mutation")
+    return {
+        "transaction_id": result.get("transaction_id"),
+        "request_key": result.get("request_key"),
+        "verdict": result.get("verdict"),
+        "work_items": 1,
+        "attempt_count": len(attempts),
+        "initial_attempt_count": len(initial),
+        "focused_attempt_count": len(focused),
+        "final_suite_label": result.get("final_suite_label"),
+        "final_suite_binding": result.get("final_suite_binding"),
+        "subprocess_wall_time_s": total_wall_s,
+        "mutation_detected": mutation is not None,
+        "mutation": mutation,
+        "worker_identity_verified": bool(
+            result.get("worker_identity_verified")),
+        "reused_lock_result": bool(result.get("reused_lock_result")),
+        "evidence_unresolved_count": evidence_unresolved,
+        "evidence_absent_count": evidence_absent,
+        "snapshot": result.get("snapshot"),
+        "created_at": result.get("created_at"),
+        "finished_at": result.get("finished_at"),
+    }
+
+
+def owned_focused_check_attribution(result):
+    """Focused-check (`kind=focused`) value attribution for one owned
+    transaction: invalidation reason, reuse decision, triggering finding, and
+    marginal cost per attempt — carried straight from the plan's inventory
+    metadata onto the corresponding attempt, so a focused check's cost can be
+    tied to the reviewer finding that triggered it WITHOUT double counting it
+    against the initial baseline/preflight/final_suite inventory (which never
+    populates these fields; see `_INITIAL_INVENTORY_KINDS`).
+
+    Returns a list of `{label, invalidation_reason, reuse_decision,
+    triggering_finding, marginal_cost, exit_code, wall_time_s}` dicts, one per
+    `kind=focused` attempt. `[]` when `result` carries no focused attempts
+    (an initial-only inventory, or a legacy/schema-1 transaction whose kind is
+    always `legacy_required`)."""
+    if not isinstance(result, dict):
+        return []
+    out = []
+    for attempt in result.get("attempts") or []:
+        if not isinstance(attempt, dict) or attempt.get("kind") != \
+                verification.KIND_FOCUSED:
+            continue
+        out.append({
+            "label": attempt.get("label"),
+            "invalidation_reason": attempt.get("invalidation_reason"),
+            "reuse_decision": attempt.get("reuse_decision"),
+            "triggering_finding": attempt.get("triggering_finding"),
+            "marginal_cost": attempt.get("marginal_cost"),
+            "exit_code": attempt.get("exit_code"),
+            "evidence_state": attempt.get("evidence_state"),
+            "wall_time_s": attempt.get("wall_time_s"),
+        })
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Building the record.                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -1071,7 +1232,41 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
                 "reason": "controller log %s" % getattr(result, "state",
                                                         UNKNOWN)})
 
-    attempts = ledger.active_attempts(ledger_records)
+    # CLEAN-CHECKOUT REPRODUCIBILITY. `ledger.jsonl` is intentionally
+    # gitignored for the checked-in fixtures (it is derived, mutable state,
+    # not source truth) — a read-only checkout or one where the ignored file
+    # was simply never generated must still reproduce the identical attempts
+    # a persisted reconciliation would have. When the ledger already holds
+    # attempt records, THOSE are used unchanged (the normal, writable-session
+    # path is untouched). Only when it holds none do we materialize PURELY IN
+    # MEMORY from the same tracked controller-log observations, via
+    # `cowork_ledger.materialize_attempts` — never writing the ignored file
+    # ourselves, and using the identical identity rules `reconcile_attempts`
+    # would have applied.
+    # OWNED transaction attempts are EXCLUDED here, not merely disjoint-by-
+    # key: `record["owned_verification"]` (below) reads the authoritative
+    # `result.json` for the same data directly, and is the tree that owns
+    # it — showing the SAME command under BOTH `verification_attempts` and
+    # `owned_verification` would represent one owned command twice, even
+    # though the two trees can never disagree with each other about a
+    # single command's outcome (`owned_verification` wins for anything
+    # owned; this field stays legacy-controller-log-derived only, exactly
+    # as its own comment below already promises).
+    attempts = [a for a in ledger.active_attempts(ledger_records)
+               if not (isinstance(a, dict) and a.get("owned"))]
+    if not attempts:
+        try:
+            # `verification_only=True` (the default) matches exactly what the
+            # normal writable-session path feeds `reconcile_attempts` (see
+            # cowork.py's own `observations_for(results)` calls) — the whole
+            # point of this fallback is to reproduce the identical attempts a
+            # persisted reconciliation would have produced, not a wider set.
+            observations = ingest.observations_for(ingest_results)
+        except Exception:  # noqa: BLE001
+            observations = []
+        if observations:
+            attempts = ledger.materialize_attempts(ledger_records,
+                                                    observations)
     if not attempts:
         incomplete.append({
             "field": "record.verification_attempts",
@@ -1098,6 +1293,24 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
     except Exception:  # noqa: BLE001
         queue_pending = []
 
+    # OWNED TRANSACTION EVIDENCE, when present, is authoritative: it is what
+    # the builder-readiness gate itself decided on, not a rejoin of controller
+    # logs after the fact. `latest_owned_transaction` is None for a legacy
+    # session (no transaction ever ran) or one that never reached the
+    # builder-readiness gate — the controller-log-derived `verification`/
+    # `verification_attempts` above are computed UNCONDITIONALLY either way,
+    # so a legacy session's report is unaffected by any of this.
+    owned_transactions = owned_transactions_for(session_uuid)
+    owned_txn = owned_transactions[-1] if owned_transactions else None
+    owned_cost = owned_transaction_cost_summary(owned_txn)
+    owned_focused = owned_focused_check_attribution(owned_txn)
+    if owned_txn is None:
+        incomplete.append({
+            "field": "record.owned_verification",
+            "reason": "no owned verification transaction was found for "
+                      "this session; verification evidence above is "
+                      "derived from controller logs (legacy path)"})
+
     record = {
         "schema_version": SCHEMA_VERSION,
         "session": session_uuid,
@@ -1119,6 +1332,19 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
         "verification_attempts": attempts,
         "verification": claims,
         "verification_summary": verification_claim_summary(claims),
+        # Owned-transaction verification (authoritative when present; see the
+        # note above `owned_txn`). Kept as a SEPARATE tree from
+        # `verification`/`verification_attempts` rather than merged into
+        # them, so a legacy session's controller-log-derived fields are never
+        # perturbed by this being absent, and so subprocess wall time here is
+        # never confused with the model-inference cost in `cost.by_class`.
+        "owned_verification": {
+            "transactions": owned_transactions,
+            "transaction_count": len(owned_transactions),
+            "latest": owned_txn,
+            "cost": owned_cost,
+            "focused_attribution": owned_focused,
+        },
         "tool_activity": tool_activity(ingest_results, work),
         "environment_recurrences": environment_recurrences(attempts),
         "findings": finding_lifecycle(ledger_records),

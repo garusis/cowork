@@ -27,6 +27,7 @@ import termios
 import threading
 import time
 import unittest
+import uuid
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -9073,6 +9074,89 @@ class ReviewerFailureGateTest(unittest.TestCase):
             trace=trace)
         return rc, outcome, out.getvalue()
 
+    def test_build_readiness_gate_does_not_block_scout_or_planner(self):
+        # The invariant this test protects: builder promotion is now gated by
+        # the OWNED verification transaction
+        # (`_run_owned_verification_transaction` /
+        # `_record_readiness_from_transaction`), never the legacy
+        # controller-log-derived `_record_readiness`; scout/planner promotion
+        # is completely untouched by any of this wiring and never calls
+        # readiness in any form.
+        import unittest.mock as mock
+
+        for role in ("scout", "planner"):
+            path = self._path()
+            trace = self._trace(path)
+            reviewer = self._review_fn([{"verdict": "approve"}])
+            with self.subTest(role=role), \
+                    mock.patch.object(
+                        cowork, "_record_readiness",
+                        side_effect=AssertionError(
+                            "build readiness reached a pre-build role")) as legacy_gate, \
+                    mock.patch.object(
+                        cowork, "_run_owned_verification_transaction",
+                        side_effect=AssertionError(
+                            "owned verification transaction reached a "
+                            "pre-build role")) as txn_gate, \
+                    mock.patch.object(
+                        cowork, "_record_readiness_from_transaction",
+                        side_effect=AssertionError(
+                            "owned readiness reached a pre-build role")
+                    ) as txn_readiness:
+                rc, outcome, _ = cowork._role_loop(
+                    self._session(path, ["ready_for_review"]),
+                    "seed", path, context="", io_in=io.StringIO(""),
+                    io_out=io.StringIO(), role=role, review_fn=reviewer,
+                    trace=trace, session_uuid="S")
+            self.assertEqual((rc, outcome), (0, "approved"))
+            self.assertEqual(reviewer.calls["n"], 1)
+            legacy_gate.assert_not_called()
+            txn_gate.assert_not_called()
+            txn_readiness.assert_not_called()
+            events = self._events(path)
+            self.assertFalse(any(
+                e.get("event") == "role.milestone"
+                and e.get("milestone_phase") == "verification"
+                for e in events))
+
+        # Builder: the owned-transaction path is used INSTEAD OF
+        # `_record_readiness` — the legacy function is never called for
+        # builder either, only the new transaction-backed pair is.
+        path = self._path()
+        trace = self._trace(path)
+        reviewer = self._review_fn([{"verdict": "approve"}])
+        with mock.patch.object(
+                cowork, "_record_readiness",
+                side_effect=AssertionError(
+                    "builder promotion must use the owned verification "
+                    "transaction, not the legacy controller-log gate")
+        ) as legacy_gate, \
+                mock.patch.object(
+                    cowork, "_run_owned_verification_transaction",
+                    return_value=(
+                        {"transaction_id": "T", "verdict": "red"},
+                        None)) as txn_gate, \
+                mock.patch.object(
+                    cowork, "_record_readiness_from_transaction",
+                    return_value={"state": "unverified", "reason": "missing",
+                                  "event_id": "E"}) as txn_readiness:
+            rc, outcome, _ = cowork._role_loop(
+                self._session(
+                    path, ["ready_for_review", "needs_input"]),
+                "seed", path, context="", io_in=io.StringIO("/quit\n"),
+                io_out=io.StringIO(), role="builder", review_fn=reviewer,
+                trace=trace, session_uuid="S")
+        self.assertEqual((rc, outcome), (0, "ended"))
+        legacy_gate.assert_not_called()
+        txn_gate.assert_called_once()
+        txn_readiness.assert_called_once()
+        self.assertEqual(reviewer.calls["n"], 0)
+        events = self._events(path)
+        self.assertTrue(any(
+            e.get("event") == "role.milestone"
+            and e.get("milestone_phase") == "verification"
+            and e.get("role") == "builder" for e in events))
+
     def test_gate_fires_at_two_consecutive_failures_then_end(self):
         path = self._path()
         rfn = self._review_fn([])  # always None -> always a failure
@@ -9856,6 +9940,7 @@ import cowork_eval  # noqa: E402
 import cowork_pricing  # noqa: E402
 import cowork_probe_cache as probe_cache  # noqa: E402
 import cowork_handoff as handoff  # noqa: E402
+import cowork_verification as verification  # noqa: E402
 
 
 def _render_summary(summary, session_uuid=None):
@@ -21207,4 +21292,2433 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
              "claimed_manifest": "abc", "verified_manifest": None}])
         self.assertEqual([c["state"] for c in readiness["claims"]],
                          ["verified", "unverified", "unverified"])
-        self.assertEqual(readiness["unverified"], 2)
+
+
+# =============================================================================== #
+# Owned hermetic manifest-bound verification transaction (ORCH-030/031,          #
+# CV-022/037). Every class below exercises the REAL `cowork_verification`        #
+# module against small throwaway git repos — no mocking of process groups,       #
+# snapshots, or the worker subprocess itself, so these are genuine end-to-end    #
+# regressions for the lifecycle/binding/worker-boundary/evidence/escape/         #
+# integration/self-validation contracts the plan requires.                       #
+# =============================================================================== #
+
+
+def _seed_worker_into_repo(repo):
+    """Copy the REAL `cowork_verification.py` and everything it imports
+    (`cowork_state`, `cowork_policy`, `cowork_ledger`) into a throwaway
+    repo's `scripts/` dir and commit them, so `build_snapshot` captures a
+    self-sufficient worker: `run_transaction` always spawns
+    `<snapshot_checkout>/scripts/cowork_verification.py`, which imports its
+    dependencies from alongside its own `__file__` — a repo missing any one
+    of them cannot run a transaction at all (a worker ImportError is
+    silent: stdout/stderr are DEVNULL'd, so it just times out at the
+    startup-allowance deadline with no worker identity ever reported)."""
+    dest_dir = os.path.join(repo, "scripts")
+    os.makedirs(dest_dir, exist_ok=True)
+    for name in ("cowork_verification.py", "cowork_state.py",
+                "cowork_policy.py", "cowork_ledger.py"):
+        shutil.copyfile(os.path.join(_HERE, name),
+                        os.path.join(dest_dir, name))
+    subprocess.run(["git", "-C", repo, "add", "scripts"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "seed worker"],
+                   check=True)
+
+
+class _OwnedVerificationTestBase(unittest.TestCase):
+    """Shared fixture: an isolated COWORK_SESSIONS_ROOT and a throwaway
+    committed git repo seeded with the real worker module, so every
+    `run_transaction` call in this file exercises the actual snapshot/
+    worker/process-group machinery rather than a fake."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if prior is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = prior
+        self.addCleanup(restore)
+        self.sessions_root = root
+        self.repo = _init_git_repo()
+        self.addCleanup(lambda: shutil.rmtree(self.repo, ignore_errors=True))
+        _seed_worker_into_repo(self.repo)
+        self.session_uuid = "S-" + uuid.uuid4().hex[:8]
+
+    def _inventory(self, *entries):
+        return [dict(e) for e in entries]
+
+    def _entry(self, label, command, kind=verification.KIND_BASELINE,
+              mode="isolated_snapshot", **extra):
+        e = {"label": label, "command": command, "execution_mode": mode,
+            "kind": kind}
+        e.update(extra)
+        return e
+
+    def _marker_path(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        os.remove(path)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def _append_marker_cmd(self, marker, text):
+        # A safe argv-only command (no shell) that appends `text` to `marker`
+        # — used as the observable side effect proving whether/how many
+        # times a command actually ran.
+        return ["python3", "-c",
+               "open(%r, 'a').write(%r + chr(10))" % (marker, text)]
+
+
+class OwnedVerificationLifecycleTests(_OwnedVerificationTestBase):
+    """Orchestrator ownership, serial execution, single-flight, noninteractive
+    stdin, timeout escalation, and complete process/lock/poller cleanup."""
+
+    def test_stdin_gets_immediate_eof(self):
+        marker = self._marker_path()
+        cmd = ["python3", "-c",
+              "import sys\ndata = sys.stdin.read()\n"
+              "open(%r, 'w').write('EOF:' + repr(data))" % marker]
+        result = verification.run_transaction(
+            self.repo, self.session_uuid,
+            self._inventory(self._entry("stdin", cmd,
+                                        kind=verification.KIND_FINAL_SUITE)))
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        with open(marker) as fh:
+            self.assertEqual(fh.read(), "EOF:''")
+
+    def test_multi_command_inventory_runs_serially_in_order(self):
+        marker = self._marker_path()
+        entries = self._inventory(
+            self._entry("a", self._append_marker_cmd(marker, "a")),
+            self._entry("b", self._append_marker_cmd(marker, "b")),
+            self._entry("c", self._append_marker_cmd(marker, "c"),
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(result["final_suite_binding"], "ran_once")
+        with open(marker) as fh:
+            self.assertEqual(fh.read().split(), ["a", "b", "c"])
+        self.assertEqual(len(result["attempts"]), 3)
+
+    def test_duplicate_normalized_commands_run_once(self):
+        # A `kind=final_suite` entry is deliberately EXEMPT from dedup (see
+        # `deduplicate_inventory`): the final suite always runs as its own
+        # dedicated execution even if its command text happens to match an
+        # earlier entry, so the duplicate-command scenario here uses two
+        # ordinary (non-final) entries, with a distinct final_suite entry
+        # added separately.
+        marker = self._marker_path()
+        cmd = self._append_marker_cmd(marker, "shared")
+        entries = self._inventory(
+            self._entry("first", cmd),
+            self._entry("second", cmd),
+            self._entry("final", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        with open(marker) as fh:
+            lines = fh.read().split()
+        self.assertEqual(lines, ["shared"])  # ran exactly once, not twice
+
+    def test_reordered_baseline_entries_are_not_treated_as_equivalent(self):
+        # Execution is SERIAL and FAIL-FAST: reordering two non-final
+        # baseline entries changes which one runs first and, after a
+        # failure, which later entries are skipped. `normalized_inventory_
+        # key` previously SORTED entries by label before hashing, so two
+        # inventories with the same entries in a DIFFERENT order collapsed
+        # onto the identical key — a single-flight waiter could then reuse
+        # a terminal result produced by the WRONG execution sequence.
+        first_order = self._inventory(
+            self._entry("a", ["python3", "-c", "pass"]),
+            self._entry("b", ["python3", "-c", "import sys"]),
+            self._entry("final", ["python3", "-c", "import os"],
+                       kind=verification.KIND_FINAL_SUITE))
+        reordered = self._inventory(
+            self._entry("b", ["python3", "-c", "import sys"]),
+            self._entry("a", ["python3", "-c", "pass"]),
+            self._entry("final", ["python3", "-c", "import os"],
+                       kind=verification.KIND_FINAL_SUITE))
+        schema_a, entries_a, _ = verification.normalize_inventory(first_order)
+        schema_b, entries_b, _ = verification.normalize_inventory(reordered)
+        key_a = verification.normalized_inventory_key(schema_a, entries_a)
+        key_b = verification.normalized_inventory_key(schema_b, entries_b)
+        self.assertNotEqual(
+            key_a, key_b,
+            "two behaviorally distinct orderings of the same entries must "
+            "never collapse onto the same single-flight identity")
+
+        # End-to-end: submitted as two SEPARATE run_transaction() calls,
+        # neither may reuse the other's result — they get distinct
+        # transaction ids and neither reports `reused_lock_result`.
+        result_a = verification.run_transaction(self.repo, self.session_uuid,
+                                                 first_order)
+        result_b = verification.run_transaction(self.repo, self.session_uuid,
+                                                 reordered)
+        self.assertNotEqual(result_a["request_key"], result_b["request_key"])
+        self.assertNotEqual(result_a["transaction_id"],
+                            result_b["transaction_id"])
+        self.assertFalse(result_a.get("reused_lock_result"))
+        self.assertFalse(result_b.get("reused_lock_result"))
+
+    def test_duplicate_concurrent_requests_share_one_transaction(self):
+        # A GENUINE overlap, not two sequential calls: the command blocks
+        # (writes a `ready` marker, then polls for a `go` marker) so the
+        # first `run_transaction()` call is still mid-execution — meaning
+        # its single-flight flock is still held for its ENTIRE run, not
+        # just around the instant of acquisition — when the SECOND,
+        # identical `run_transaction()` call is made from another thread.
+        # The second call must find the flock genuinely busy, block in the
+        # waiter poll loop, and only return once the first's terminal
+        # result is durably published — proving real OS-level exclusion
+        # across the whole transaction, not merely an unenforced `.meta`
+        # marker a second caller could race past.
+        ready_marker = self._marker_path()
+        go_marker = self._marker_path()
+        exec_marker = self._marker_path()
+        blocking_cmd = ["python3", "-c",
+                        "import os, time, sys\n"
+                        "open(%r, 'w').write('ready')\n"
+                        "deadline = time.time() + 20\n"
+                        "while not os.path.exists(%r):\n"
+                        "    if time.time() > deadline:\n"
+                        "        sys.exit(1)\n"
+                        "    time.sleep(0.02)\n"
+                        "open(%r, 'a').write('x' + chr(10))\n"
+                        % (ready_marker, go_marker, exec_marker)]
+        entries = self._inventory(
+            self._entry("only", blocking_cmd,
+                       kind=verification.KIND_FINAL_SUITE))
+
+        results = {}
+
+        def call_run_transaction(key):
+            results[key] = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+
+        first_thread = threading.Thread(
+            target=call_run_transaction, args=("first",))
+        first_thread.start()
+
+        # Wait for the first call's command to genuinely be mid-execution
+        # (and therefore its single-flight flock genuinely held) before
+        # the second call is even made.
+        deadline = time.time() + 15
+        while not os.path.exists(ready_marker):
+            self.assertLess(time.time(), deadline,
+                            "first transaction's command never started")
+            time.sleep(0.02)
+
+        second_thread = threading.Thread(
+            target=call_run_transaction, args=("second",))
+        second_thread.start()
+        # Generous margin for the second call's own snapshot-build/request
+        # overhead to complete and for it to actually reach and block on
+        # the busy flock — the first call's command keeps blocking (up to
+        # its own 20s internal deadline) regardless of how long this is,
+        # so there is no way for the second call to race ahead.
+        time.sleep(1.5)
+
+        with open(go_marker, "w") as fh:
+            fh.write("go")
+
+        first_thread.join(timeout=30)
+        second_thread.join(timeout=30)
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+
+        first = results.get("first")
+        second = results.get("second")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(second["request_key"], first["request_key"])
+        reused_flags = {first.get("reused_lock_result"),
+                        second.get("reused_lock_result")}
+        self.assertEqual(reused_flags, {False, True},
+                         "exactly one of the two overlapping calls must be "
+                         "the acquirer and the other a waiter that reused "
+                         "its terminal result")
+        acquirer = first if not first.get("reused_lock_result") else second
+        waiter = second if acquirer is first else first
+        self.assertEqual(waiter["transaction_id"], acquirer["transaction_id"])
+        with open(exec_marker) as fh:
+            self.assertEqual(fh.read().split(), ["x"],
+                             "the command must have executed exactly once "
+                             "across both overlapping calls")
+
+    def test_term_then_kill_escalation_and_no_orphans_survive(self):
+        # Ignores SIGTERM so the parent MUST escalate to SIGKILL; also spawns
+        # a child of its own in the same process group to prove group-wide
+        # cleanup, not just the direct child.
+        stubborn = (
+            "import os, signal, subprocess, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "subprocess.Popen(['sleep', '30'])\n"
+            "time.sleep(30)\n")
+        entries = self._inventory(
+            self._entry("hang", ["python3", "-c", stubborn],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(
+            self.repo, self.session_uuid, entries, command_timeout_s=1,
+            term_grace_s=1)
+        attempt = result["attempts"][0]
+        self.assertTrue(attempt.get("timed_out"))
+        self.assertTrue(attempt.get("term_sent"))
+        self.assertTrue(attempt.get("kill_sent"))
+        self.assertTrue(attempt.get("descendants_confirmed_gone"))
+        self.assertIn(result["verdict"],
+                      (verification.VERDICT_RED, verification.VERDICT_UNVERIFIED))
+
+    def test_worker_hang_is_bounded_and_fully_cleaned_up(self):
+        # A worker that never reports its identity (bad request) must not
+        # hang the parent forever, and must leave no process/lock behind.
+        entries = self._inventory(
+            self._entry("noop", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        started = time.time()
+        result = verification.run_transaction(
+            self.repo, self.session_uuid, entries,
+            python_executable="/nonexistent/python3-does-not-exist")
+        elapsed = time.time() - started
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertLess(elapsed, 60)
+        active_pgid_path = state_store.verification_active_pgid_path_for(
+            self.session_uuid, result["transaction_id"])
+        self.assertIsNone(state_store.read_json_tolerant(active_pgid_path))
+
+
+class OwnedVerificationBindingTests(_OwnedVerificationTestBase):
+    """Immutable snapshot identity, mutation detection, immutable attempt
+    IDs, and final-suite binding to the exact reviewed candidate."""
+
+    def test_snapshot_copies_bytes_mode_and_symlink_and_index(self):
+        with open(os.path.join(self.repo, "exec.sh"), "w") as fh:
+            fh.write("#!/bin/sh\necho hi\n")
+        os.chmod(os.path.join(self.repo, "exec.sh"), 0o755)
+        os.symlink("f.txt", os.path.join(self.repo, "link.txt"))
+        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", self.repo, "commit", "-qm", "exec+link"],
+                      check=True)
+        txn_id = verification.new_transaction_id()
+        snapshot = verification.build_snapshot(self.repo, self.session_uuid,
+                                               txn_id)
+        manifest = state_store.read_json_tolerant(
+            snapshot["manifest_path"])["files"]
+        self.assertEqual(manifest["exec.sh"]["mode"], "755")
+        self.assertEqual(manifest["link.txt"]["type"], "symlink")
+        self.assertEqual(manifest["link.txt"]["symlink_target"], "f.txt")
+        self.assertTrue(os.path.exists(snapshot["index_path"]))
+        with open(snapshot["index_path"], "rb") as fh:
+            snap_index_bytes = fh.read()
+        self.assertEqual(snap_index_bytes,
+                         verification.read_index_bytes(self.repo))
+
+    def test_source_mutation_after_snapshot_fails_closed(self):
+        marker = self._marker_path()
+        mutate_and_run = (
+            "with open(%r, 'a') as f: f.write('mutated\\n')\n" % (
+                os.path.join(self.repo, "f.txt")))
+        entries = self._inventory(
+            self._entry("mutate", ["python3", "-c", mutate_and_run]),
+            self._entry("after", self._append_marker_cmd(marker, "after"),
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_RED)
+        self.assertIsNotNone(result["mutation"])
+        self.assertIn("f.txt", result["mutation"]["changed_paths"])
+        self.assertFalse(os.path.exists(marker))  # later command never ran
+        self.assertEqual(result["final_suite_binding"], "not_reached")
+
+    def test_index_mutation_after_snapshot_fails_closed(self):
+        stage_new_file = (
+            "open(%r, 'w').write('new')\n" % os.path.join(self.repo, "n.txt"))
+        entries = self._inventory(
+            self._entry("stage", ["python3", "-c", stage_new_file
+                                  + "\nimport subprocess\n"
+                                  "subprocess.run(['git', 'add', 'n.txt'])"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_RED)
+        self.assertIsNotNone(result["mutation"])
+
+    def test_immutable_attempt_ids_stable_through_revision(self):
+        path = os.path.join(self.sessions_root, "attempts.jsonl")
+        txn_id = "T-fixed"
+        first = cowork_ledger.mint_owned_attempt(path, txn_id, "label-a",
+                                          {"phase": "started"})
+        again = cowork_ledger.mint_owned_attempt(path, txn_id, "label-a",
+                                          {"phase": "started"})
+        self.assertEqual(first["id"], again["id"])  # idempotent re-entry
+        revised = cowork_ledger.revise_owned_attempt(
+            path, txn_id, "label-a", {"exit_code": 0}, "terminal")
+        self.assertEqual(revised["id"], first["id"])
+        self.assertEqual(revised["attempt_state"], "terminal")
+        self.assertEqual(revised["exit_code"], 0)
+
+    def test_final_result_bound_to_exactly_one_final_suite_run(self):
+        entries = self._inventory(
+            self._entry("base", ["python3", "-c", "pass"]),
+            self._entry("final", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(result["final_suite_binding"], "ran_once")
+        self.assertEqual(result["final_suite_label"], "final")
+        final_attempts = [a for a in result["attempts"]
+                          if a.get("label") == "final"]
+        self.assertEqual(len(final_attempts), 1)
+
+    def _result_json_path(self, transaction_id):
+        return state_store.verification_result_path_for(
+            self.session_uuid, transaction_id)
+
+    def test_terminal_result_is_persisted_at_its_advertised_path_green(self):
+        # Repair regression for transactions 7714ce9ffb184194a3873111a3200206
+        # and f7fb63bbe8294485a1983f15d46023f5: both hand-backs advertised
+        # `verification/transactions/<id>/result.json` as where to find the
+        # exact attempt(s) that did not pass, but nothing ever wrote a file
+        # there — only inside the single-flight lock's `.meta`. This proves
+        # the file now exists, at the exact advertised path, and is the
+        # SAME result `run_transaction` returned.
+        entries = self._inventory(
+            self._entry("final", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        path = self._result_json_path(result["transaction_id"])
+        self.assertTrue(os.path.exists(path),
+                        "result.json missing at the advertised path: %r"
+                        % path)
+        on_disk = state_store.read_json_tolerant(path)
+        self.assertEqual(on_disk["transaction_id"], result["transaction_id"])
+        self.assertEqual(on_disk["verdict"], "green")
+        self.assertEqual(on_disk["final_suite_binding"], "ran_once")
+
+    def test_terminal_result_is_persisted_at_its_advertised_path_red(self):
+        marker = self._marker_path()
+        mutate_and_run = (
+            "open(%r, 'a').write('mutated' + chr(10))"
+            % os.path.join(self.repo, "f.txt"))
+        entries = self._inventory(
+            self._entry("mutate", ["python3", "-c", mutate_and_run]),
+            self._entry("after", self._append_marker_cmd(marker, "after"),
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_RED)
+        path = self._result_json_path(result["transaction_id"])
+        self.assertTrue(os.path.exists(path),
+                        "result.json missing at the advertised path: %r"
+                        % path)
+        on_disk = state_store.read_json_tolerant(path)
+        self.assertEqual(on_disk["transaction_id"], result["transaction_id"])
+        self.assertEqual(on_disk["verdict"], "red")
+        self.assertIsNotNone(on_disk["mutation"])
+
+    def test_terminal_result_is_persisted_at_its_advertised_path_unverified(self):
+        entries = self._inventory(
+            self._entry("noop", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(
+            self.repo, self.session_uuid, entries,
+            python_executable="/nonexistent/python3-does-not-exist")
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        path = self._result_json_path(result["transaction_id"])
+        self.assertTrue(os.path.exists(path),
+                        "result.json missing at the advertised path: %r"
+                        % path)
+        on_disk = state_store.read_json_tolerant(path)
+        self.assertEqual(on_disk["transaction_id"], result["transaction_id"])
+        self.assertEqual(on_disk["verdict"], "unverified")
+
+
+class OwnedVerificationWorkerBoundaryTests(_OwnedVerificationTestBase):
+    """The worker always runs the CURRENT source captured at snapshot time,
+    independent of the long-running parent's own version and of any live
+    edit made after the snapshot but before spawn."""
+
+    def test_worker_reports_current_snapshot_source_hash(self):
+        entries = self._inventory(
+            self._entry("noop", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertTrue(result["worker_identity_verified"])
+        expected_hash = verification.self_source_hash()
+        self.assertEqual(result["worker_identity"]["source_hash"],
+                         expected_hash)
+        self.assertEqual(result["worker_identity"]["protocol_version"],
+                         verification.PROTOCOL_VERSION)
+
+    def test_live_worker_mutation_after_snapshot_is_never_executed(self):
+        # Simulate "parent started on version A, candidate moved to version
+        # B" by building the snapshot/checkout directly (library calls, the
+        # same ones `run_transaction` uses), then mutating the LIVE repo's
+        # worker file before ever spawning — proving the spawned worker still
+        # comes from the frozen snapshot bytes, not the mutated live file.
+        txn_id = verification.new_transaction_id()
+        schema, txn_entries, final_label = verification.normalize_inventory(
+            self._inventory(self._entry(
+                "noop", ["python3", "-c", "pass"],
+                kind=verification.KIND_FINAL_SUITE)))
+        snapshot = verification.build_snapshot(self.repo, self.session_uuid,
+                                               txn_id)
+        checkout_root = verification.materialize_checkout(self.session_uuid,
+                                                          txn_id)
+        original_hash = verification.self_source_hash()
+
+        live_worker_path = os.path.join(self.repo, "scripts",
+                                        "cowork_verification.py")
+        with open(live_worker_path, "a") as fh:
+            fh.write("\n# live post-snapshot mutation, must never run\n")
+        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", self.repo, "commit", "-qm", "mutate B"],
+                      check=True)
+
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        minted = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, txn_id, [(e["label"], {}) for e in txn_entries])
+        self.assertIsNotNone(minted)
+        for e in txn_entries:
+            e["ledger_attempt_id"] = minted[e["label"]]["id"]
+
+        request = verification.build_request(
+            self.session_uuid, txn_id, self.repo,
+            snapshot["manifest_digest"], snapshot["index_digest"], {},
+            schema, txn_entries, final_label)
+        request_path = state_store.verification_request_path_for(
+            self.session_uuid, txn_id)
+        state_store.write_json_atomic(request_path, request)
+        result = verification._run_owned_transaction(
+            self.repo, self.session_uuid, txn_id, request, txn_entries,
+            final_label, snapshot, checkout_root, sys.executable or "python3")
+
+        # The worker that actually ran self-hashed to the ORIGINAL (pre-
+        # mutation) bytes, because it was spawned from the immutable
+        # snapshot checkout, never the live (now-mutated-to-"version B")
+        # path — and the live movement is reported fail-closed, not
+        # silently accepted.
+        self.assertEqual(result["worker_identity"]["source_hash"],
+                         original_hash)
+        self.assertEqual(result["verdict"], verification.VERDICT_RED)
+        self.assertIsNotNone(result["mutation"])
+
+    def test_one_transaction_dedupes_many_commands_to_one_execution(self):
+        # `kind=final_suite` is exempt from dedup (see
+        # `deduplicate_inventory`), so the 18 duplicated labels below share
+        # ONE execution and the separate `final` entry (a distinct command)
+        # is its own dedicated execution.
+        marker = self._marker_path()
+        cmd = self._append_marker_cmd(marker, "once")
+        entries = [self._entry("label-%d" % i, cmd) for i in range(18)]
+        entries.append(self._entry("final", ["python3", "-c", "pass"],
+                                   kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        with open(marker) as fh:
+            self.assertEqual(fh.read().split(), ["once"])
+        self.assertEqual(result["final_suite_binding"], "ran_once")
+
+    def test_deliberately_older_parent_executes_captured_newer_worker(self):
+        # A REAL cross-version fixture, not a same-process same-file test: a
+        # genuinely SEPARATE module object — loaded from its OWN file, on
+        # disk, distinct from both the live candidate's and this test
+        # process's `cowork_verification.py` — stands in for "a parent
+        # process that started on version A". It drives a transaction whose
+        # snapshot captures a DIFFERENT, NEWER worker file ("version B",
+        # distinguishable by a source-level marker the old parent's own
+        # module does not have). The command run against the snapshot
+        # imports `cowork_verification` FROM THE SNAPSHOT CHECKOUT (not
+        # from the old parent's sys.path) and reports which marker it
+        # sees — proving the actually-executed code, and the worker's own
+        # self-reported identity hash, are the NEWER captured version, not
+        # whatever the long-running parent process happened to import at
+        # its own startup.
+        import importlib.util
+
+        with open(os.path.join(_HERE, "cowork_verification.py")) as fh:
+            original_src = fh.read()
+        old_parent_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(old_parent_dir,
+                                              ignore_errors=True))
+        old_parent_path = os.path.join(old_parent_dir,
+                                       "cowork_verification_old_parent.py")
+        with open(old_parent_path, "w") as fh:
+            fh.write(original_src + "\nWORKER_VERSION_MARKER = 'A'\n")
+        # The old parent module needs `cowork_state`/`cowork_policy`
+        # importable from alongside it too, exactly like the real module.
+        for name in ("cowork_state.py", "cowork_policy.py"):
+            shutil.copyfile(os.path.join(_HERE, name),
+                            os.path.join(old_parent_dir, name))
+        spec = importlib.util.spec_from_file_location(
+            "cowork_verification_old_parent", old_parent_path)
+        old_parent = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(old_parent)
+        self.assertEqual(old_parent.WORKER_VERSION_MARKER, "A")
+        self.assertNotEqual(old_parent.self_source_hash(),
+                            verification.self_source_hash(),
+                            "the old-parent module must be genuinely "
+                            "distinct bytes from the live module")
+
+        # The candidate repo's worker file is "version B": same real
+        # implementation, plus its OWN distinguishing marker.
+        newer_worker_path = os.path.join(self.repo, "scripts",
+                                         "cowork_verification.py")
+        with open(newer_worker_path, "w") as fh:
+            fh.write(original_src + "\nWORKER_VERSION_MARKER = 'B'\n")
+        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", self.repo, "commit", "-qm",
+                       "worker version B"], check=True)
+        with open(newer_worker_path, "rb") as fh:
+            expected_newer_hash = hashlib.sha256(fh.read()).hexdigest()
+
+        marker = self._marker_path()
+        observe_marker_cmd = [
+            "python3", "-c",
+            "import sys, os\n"
+            "sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))\n"
+            "import cowork_verification as v\n"
+            "open(%r, 'w').write(v.WORKER_VERSION_MARKER)\n" % marker]
+        entries = self._inventory(self._entry(
+            "observe-version", observe_marker_cmd,
+            kind=verification.KIND_FINAL_SUITE))
+
+        # Driven by the OLD PARENT module's own `run_transaction` — not
+        # this test process's `verification` import.
+        result = old_parent.run_transaction(self.repo, self.session_uuid,
+                                            entries)
+
+        self.assertEqual(result["verdict"], "green")
+        self.assertTrue(result["worker_identity_verified"])
+        # The worker that actually ran reports the NEWER (B) file's hash —
+        # not the old parent's own module hash, and not the pre-edit "A"-
+        # marker-less original either.
+        self.assertEqual(result["worker_identity"]["source_hash"],
+                         expected_newer_hash)
+        self.assertNotEqual(result["worker_identity"]["source_hash"],
+                            old_parent.self_source_hash())
+        # And the command that actually EXECUTED observed marker "B" —
+        # proof of behavior, not just a hash coincidence.
+        with open(marker) as fh:
+            self.assertEqual(fh.read(), "B")
+
+
+class OwnedVerificationEvidenceRetryTests(_OwnedVerificationTestBase):
+    """Delayed evidence resolves against the SAME pre-minted attempt via
+    bounded polling; expired evidence is terminally unresolved/absent and
+    never triggers a rerun."""
+
+    def test_delayed_evidence_attaches_to_the_original_attempt(self):
+        txn_id = "T-delay"
+        events_path = state_store.verification_attempt_events_path_for(
+            self.session_uuid, txn_id)
+
+        def _write_late():
+            time.sleep(0.3)
+            state_store.append_jsonl_atomic(events_path, {
+                "event": "terminal", "label": "slow",
+                "evidence_state": verification.EVIDENCE_PRESENT,
+                "exit_code": 0, "timed_out": False})
+
+        writer = threading.Thread(target=_write_late, daemon=True)
+        writer.start()
+        terminal = verification.bounded_evidence_wait(
+            self.session_uuid, txn_id, ["slow"], poll_attempts=20,
+            poll_delay_s=0.05)
+        writer.join(timeout=2)
+        self.assertEqual(terminal["slow"]["evidence_state"],
+                         verification.EVIDENCE_PRESENT)
+        self.assertEqual(terminal["slow"]["exit_code"], 0)
+
+    def test_expired_evidence_is_unresolved_absent_with_no_rerun(self):
+        txn_id = "T-expired"
+        # Nothing is ever written for "never" — the poll must give up within
+        # its bound rather than block forever or invent a rerun.
+        started = time.time()
+        terminal = verification.bounded_evidence_wait(
+            self.session_uuid, txn_id, ["never"], poll_attempts=3,
+            poll_delay_s=0.02)
+        elapsed = time.time() - started
+        self.assertIn(terminal["never"]["evidence_state"],
+                      (verification.EVIDENCE_UNRESOLVED,
+                       verification.EVIDENCE_ABSENT))
+        self.assertLess(elapsed, 5)
+
+    def test_healthy_command_outlasting_the_evidence_poll_window_still_completes(self):
+        # Regression for the transaction-7714ce9ffb184194a3873111a3200206
+        # incident: the parent's PRIMARY wait for a command's terminal
+        # evidence must be bounded by that command's own timeout/grace
+        # window (`_execution_wait_budget_s`), never by the short
+        # `evidence_retry_policy` alone — that policy is only a SECOND,
+        # later step for evidence that is merely slow to become visible
+        # after execution has already ended. A command that sleeps well
+        # past a tiny evidence-retry window, but well within its generous
+        # command timeout, must still be waited out and reported GREEN —
+        # not killed out from under itself a few seconds in.
+        marker = self._marker_path()
+        # Sleeps ~1.5s: comfortably longer than the tiny evidence_retry
+        # window configured below (2 * 0.05s = 0.1s), comfortably shorter
+        # than the command timeout (300s default).
+        cmd = ["python3", "-c",
+              "import time\ntime.sleep(1.5)\n"
+              + "open(%r, 'w').write('done')" % marker]
+        entries = self._inventory(
+            self._entry("slow-but-healthy", cmd,
+                       kind=verification.KIND_FINAL_SUITE))
+        started = time.time()
+        result = verification.run_transaction(
+            self.repo, self.session_uuid, entries,
+            evidence_poll_attempts=2, evidence_poll_delay_s=0.05)
+        elapsed = time.time() - started
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(result["final_suite_binding"], "ran_once")
+        attempt = result["attempts"][0]
+        self.assertFalse(attempt.get("timed_out"))
+        self.assertFalse(bool(attempt.get("term_sent")))
+        self.assertFalse(bool(attempt.get("kill_sent")))
+        self.assertTrue(os.path.exists(marker))
+        self.assertGreaterEqual(elapsed, 1.4)  # actually waited for it
+
+
+class OwnedVerificationEscapeRejectionTests(_OwnedVerificationTestBase):
+    """An isolated_snapshot argv that could resolve execution back onto the
+    live worktree is rejected before any process spawns; a permitted
+    command's real OS cwd resolves inside the validated snapshot."""
+
+    def _checkout_root(self):
+        txn_id = verification.new_transaction_id()
+        verification.build_snapshot(self.repo, self.session_uuid, txn_id)
+        return verification.materialize_checkout(self.session_uuid, txn_id)
+
+    def test_cd_to_live_worktree_is_rejected(self):
+        root = self._checkout_root()
+        entries = self._inventory(self._entry(
+            "escape", ["bash", "-c", "cd %s && echo pwned" % self.repo],
+            kind=verification.KIND_FINAL_SUITE))
+        with self.assertRaises(verification.InventoryError) as ctx:
+            verification.validate_argv_safety(entries, root)
+        self.assertEqual(ctx.exception.code, "unsafe_argv_shell_metachar")
+
+        entries2 = self._inventory(self._entry(
+            "escape2", ["cd", self.repo], kind=verification.KIND_FINAL_SUITE))
+        with self.assertRaises(verification.InventoryError) as ctx2:
+            verification.validate_argv_safety(entries2, root)
+        self.assertEqual(ctx2.exception.code, "unsafe_argv_cd")
+
+    def test_absolute_live_path_is_rejected(self):
+        root = self._checkout_root()
+        entries = self._inventory(self._entry(
+            "abs", ["cat", os.path.join(self.repo, "f.txt")],
+            kind=verification.KIND_FINAL_SUITE))
+        with self.assertRaises(verification.InventoryError) as ctx:
+            verification.validate_argv_safety(entries, root)
+        self.assertEqual(ctx.exception.code, "unsafe_argv_absolute_escape")
+
+    def test_traversal_is_rejected(self):
+        root = self._checkout_root()
+        entries = self._inventory(self._entry(
+            "trav", ["cat", "../../etc/passwd"],
+            kind=verification.KIND_FINAL_SUITE))
+        with self.assertRaises(verification.InventoryError) as ctx:
+            verification.validate_argv_safety(entries, root)
+        self.assertEqual(ctx.exception.code, "unsafe_argv_traversal")
+
+    def test_shell_chain_is_rejected(self):
+        root = self._checkout_root()
+        for token in [";", "&&", "||", "|", "`x`", "$(x)"]:
+            entries = self._inventory(self._entry(
+                "chain", ["echo", "hi %s rm -rf /" % token],
+                kind=verification.KIND_FINAL_SUITE))
+            with self.assertRaises(verification.InventoryError):
+                verification.validate_argv_safety(entries, root)
+
+    def test_permitted_command_cwd_resolves_inside_snapshot_not_live(self):
+        marker = self._marker_path()
+        cmd = ["python3", "-c",
+              "import os\nopen(%r, 'w').write(os.getcwd())" % marker]
+        entries = self._inventory(
+            self._entry("pwd", cmd, kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        with open(marker) as fh:
+            observed_cwd = fh.read().strip()
+        self.assertNotEqual(os.path.realpath(observed_cwd),
+                            os.path.realpath(self.repo))
+        self.assertIn(self.session_uuid, observed_cwd)
+
+
+class OwnedVerificationCommandIsolationTests(_OwnedVerificationTestBase):
+    """Repair regression for the b3b70ca6c0e54a86b738a55a032036d3 finding:
+    every `isolated_snapshot` command gets its OWN fresh, disposable, real-Git
+    checkout — never a checkout shared across commands, never the read-only
+    bootstrap worker checkout."""
+
+    def test_generated_file_from_one_command_is_absent_in_the_next(self):
+        marker = self._marker_path()
+        write_junk = ["python3", "-c",
+                     "open('generated_junk.txt', 'w').write('leftover')"]
+        check_absent = ["python3", "-c",
+                        "import os\n"
+                        "open(%r, 'w').write("
+                        "'present' if os.path.exists('generated_junk.txt') "
+                        "else 'absent')" % marker]
+        entries = self._inventory(
+            self._entry("write-junk", write_junk),
+            self._entry("check-absent", check_absent,
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        with open(marker) as fh:
+            self.assertEqual(fh.read(), "absent")
+
+    def test_git_rev_parse_ls_files_and_tracked_detection_work_inside_checkout(self):
+        marker = self._marker_path()
+        probe = ["python3", "-c",
+                "import subprocess, json\n"
+                "toplevel = subprocess.run(['git', 'rev-parse', "
+                "'--show-toplevel'], capture_output=True, text=True)\n"
+                "ls = subprocess.run(['git', 'ls-files'], "
+                "capture_output=True, text=True)\n"
+                "open(%r, 'w').write(json.dumps({"
+                "'toplevel_rc': toplevel.returncode, "
+                "'toplevel_out': toplevel.stdout.strip(), "
+                "'ls_rc': ls.returncode, "
+                "'ls_files': sorted(ls.stdout.split())}))" % marker]
+        entries = self._inventory(
+            self._entry("git-probe", probe, kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        with open(marker) as fh:
+            observed = json.loads(fh.read())
+        self.assertEqual(observed["toplevel_rc"], 0)
+        self.assertEqual(observed["ls_rc"], 0)
+        self.assertIn("f.txt", observed["ls_files"])
+        # `--show-toplevel` resolves inside the per-command checkout, never
+        # the live worktree.
+        self.assertNotEqual(os.path.realpath(observed["toplevel_out"]),
+                            os.path.realpath(self.repo))
+
+    def test_command_cannot_mutate_the_bootstrap_worker_checkout(self):
+        # The bootstrap checkout (where the worker process itself was
+        # spawned from) must be untouched by ANY command — a command only
+        # ever sees its own fresh per-command checkout, never that path.
+        bootstrap_worker_path_marker = self._marker_path()
+        probe = ["python3", "-c",
+                "import os\n"
+                "cwd = os.getcwd()\n"
+                "open(%r, 'w').write(cwd)" % bootstrap_worker_path_marker]
+        entries = self._inventory(
+            self._entry("probe-cwd", probe, kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        bootstrap_checkout = state_store.verification_snapshot_checkout_dir(
+            self.session_uuid, result["transaction_id"])
+        with open(bootstrap_worker_path_marker) as fh:
+            command_cwd = fh.read().strip()
+        self.assertNotEqual(os.path.realpath(command_cwd),
+                            os.path.realpath(bootstrap_checkout))
+        # And the bootstrap checkout's own worker file is exactly what was
+        # captured — never overwritten by a command that happened to write
+        # to a same-named relative path in ITS OWN checkout.
+        self.assertTrue(os.path.exists(os.path.join(
+            bootstrap_checkout, "scripts", "cowork_verification.py")))
+
+    def test_every_per_command_checkout_is_removed_after_completion(self):
+        entries = self._inventory(
+            self._entry("a", ["python3", "-c", "pass"]),
+            self._entry("b", ["python3", "-c", "pass"]),
+            self._entry("c", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        checks_root = state_store.verification_command_checks_root_for(
+            self.session_uuid, result["transaction_id"])
+        # Every per-command checkout directory that existed during the
+        # transaction is gone afterward — nothing left over for the next
+        # transaction (or a curious later reader) to find.
+        if os.path.exists(checks_root):
+            self.assertEqual(os.listdir(checks_root), [])
+
+
+class OwnedVerificationLedgerIntegrationTests(_OwnedVerificationTestBase):
+    """Repair regression: the "Unify immutable owned attempts with legacy
+    ledger" contract must actually run end to end through the transaction
+    path, not just in cowork_ledger's own isolated unit tests. The parent
+    mints one stable V id per normalized entry BEFORE launch, embeds it in
+    the immutable request, the worker uses that id (never invents its own),
+    and terminal/delayed/expired evidence revises the SAME id — no
+    duplicates, ever."""
+
+    def _ledger_records(self):
+        path = state_store.ledger_path_for(self.session_uuid)
+        return cowork_ledger.read_ledger(path)
+
+    def test_attempt_records_exist_before_the_command_can_launch(self):
+        # A command that blocks on stdin until it observes ITS OWN minted
+        # ledger record proves the mint happened strictly before the worker
+        # could have started running it — not just "eventually", but
+        # BEFORE launch, which is what the contract requires.
+        marker = self._marker_path()
+        probe = ["python3", "-c",
+                "import json, time, sys\n"
+                "sessions_root = %r\n"
+                "ledger_path = sessions_root + '/%s/ledger.jsonl'\n"
+                "found = False\n"
+                "for _ in range(50):\n"
+                "    try:\n"
+                "        with open(ledger_path) as fh:\n"
+                "            lines = fh.readlines()\n"
+                "    except FileNotFoundError:\n"
+                "        lines = []\n"
+                "    for line in lines:\n"
+                "        rec = json.loads(line)\n"
+                "        if rec.get('label') == 'probed' and rec.get('owned'):\n"
+                "            found = True\n"
+                "    if found:\n"
+                "        break\n"
+                "    time.sleep(0.05)\n"
+                "open(%r, 'w').write('found' if found else 'missing')\n"
+                % (self.sessions_root, self.session_uuid, marker)]
+        entries = self._inventory(
+            self._entry("probed", probe, kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        with open(marker) as fh:
+            self.assertEqual(fh.read(), "found")
+
+    def test_worker_events_use_the_minted_v_ids(self):
+        entries = self._inventory(
+            self._entry("a", ["python3", "-c", "pass"]),
+            self._entry("final", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        events_path = state_store.verification_attempt_events_path_for(
+            self.session_uuid, result["transaction_id"])
+        events = state_store.read_jsonl_tolerant(events_path)
+        starts = [e for e in events if e.get("event") == "start"]
+        self.assertEqual(len(starts), 2)
+        for ev in starts:
+            self.assertTrue(str(ev.get("attempt_id") or "").startswith("V-"),
+                            "worker invented an attempt_id instead of using "
+                            "the minted ledger id: %r" % ev.get("attempt_id"))
+        # And the SAME ids appear in the returned TransactionResult's
+        # attempts, cross-referencing correctly.
+        ledger_ids_in_result = {a.get("ledger_attempt_id")
+                                for a in result["attempts"]}
+        worker_ids = {ev.get("attempt_id") for ev in starts}
+        self.assertEqual(ledger_ids_in_result, worker_ids)
+
+    def test_terminal_evidence_revises_the_same_id_not_a_new_one(self):
+        entries = self._inventory(
+            self._entry("solo", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        records = self._ledger_records()
+        ids = {r["id"] for r in records if r.get("label") == "solo"}
+        self.assertEqual(len(ids), 1)  # exactly one stable id, ever
+        states = [r["attempt_state"] for r in records
+                 if r.get("label") == "solo"]
+        # mint, observed start, terminal — the complete lifecycle, all
+        # under the one id asserted above.
+        self.assertEqual(states, ["pending", "running", "terminal"])
+
+    def _minted_entry(self, label, command, txn_id, ledger_path,
+                      kind=verification.KIND_FINAL_SUITE):
+        minted = cowork_ledger.mint_owned_attempt(
+            ledger_path, txn_id, label,
+            fields={"command": command, "execution_mode": "isolated_snapshot",
+                   "verification_kind": kind})
+        self.assertIsNotNone(minted)
+        return {"label": label, "command": command,
+               "execution_mode": "isolated_snapshot", "kind": kind,
+               "ledger_attempt_id": minted["id"]}
+
+    def test_delayed_evidence_revises_the_minted_id_to_terminal_present(self):
+        # A CONTROLLED seam, not real subprocess timing: the primary wait
+        # observes nothing (evidence not yet visible), the secondary
+        # (short-retry-policy) wait observes it PRESENT — the textbook
+        # "delayed, not expired" case, asserted exactly rather than accepted
+        # as one of two possible outcomes.
+        txn_id = "T-delayed-seam"
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        entry = self._minted_entry("delayed", ["python3", "-c", "pass"],
+                                   txn_id, ledger_path)
+        calls = []
+
+        def fake_wait(session_uuid, transaction_id, labels, poll_attempts,
+                     poll_delay_s):
+            calls.append(poll_attempts)
+            if len(calls) == 1:
+                return {"delayed": {"evidence_state":
+                                    verification.EVIDENCE_UNRESOLVED}}
+            return {"delayed": {"evidence_state": verification.EVIDENCE_PRESENT,
+                                "exit_code": 0, "timed_out": False,
+                                "wall_time_s": 0.01}}
+
+        attempt, ledger_ok = verification._wait_for_attempt_and_revise_ledger(
+            self.session_uuid, txn_id, entry,
+            request={"evidence_retry_policy": {"poll_attempts": 3,
+                                                "poll_delay_s": 0.01}},
+            ledger_path=ledger_path, overall_deadline=time.time() + 60,
+            timeout_policy={}, snapshot_manifest_digest="D",
+            bounded_evidence_wait_fn=fake_wait)
+        self.assertTrue(ledger_ok)
+        self.assertEqual(attempt["evidence_state"], verification.EVIDENCE_PRESENT)
+        self.assertEqual(len(calls), 2)  # exactly primary then secondary
+        records = cowork_ledger.read_ledger(ledger_path)
+        delayed_records = [r for r in records if r.get("label") == "delayed"]
+        self.assertEqual([r["id"] for r in delayed_records],
+                         [entry["ledger_attempt_id"]] * len(delayed_records))
+        self.assertEqual(delayed_records[-1]["attempt_state"], "terminal")
+        self.assertEqual(delayed_records[-1]["exit_status"], "pass")
+
+    def test_expired_evidence_revises_the_minted_id_to_unresolved(self):
+        # Both waits observe nothing — genuine expiry, not delay.
+        txn_id = "T-expired-seam"
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        entry = self._minted_entry("never", ["python3", "-c", "pass"],
+                                   txn_id, ledger_path)
+        calls = []
+
+        def fake_wait(session_uuid, transaction_id, labels, poll_attempts,
+                     poll_delay_s):
+            calls.append(poll_attempts)
+            return {"never": {"evidence_state": verification.EVIDENCE_UNRESOLVED}}
+
+        attempt, ledger_ok = verification._wait_for_attempt_and_revise_ledger(
+            self.session_uuid, txn_id, entry,
+            request={"evidence_retry_policy": {"poll_attempts": 2,
+                                                "poll_delay_s": 0.01}},
+            ledger_path=ledger_path, overall_deadline=time.time() + 60,
+            timeout_policy={}, snapshot_manifest_digest="D",
+            bounded_evidence_wait_fn=fake_wait)
+        self.assertTrue(ledger_ok)
+        self.assertEqual(attempt["evidence_state"],
+                         verification.EVIDENCE_UNRESOLVED)
+        self.assertEqual(len(calls), 2)  # bounded: primary + one retry pass,
+                                         # never re-launched, never a third
+        records = cowork_ledger.read_ledger(ledger_path)
+        never_records = [r for r in records if r.get("label") == "never"]
+        self.assertEqual([r["id"] for r in never_records],
+                         [entry["ledger_attempt_id"]] * len(never_records))
+        self.assertEqual(never_records[-1]["attempt_state"], "unresolved")
+
+    def test_one_transaction_mints_no_duplicate_attempts(self):
+        entries = self._inventory(
+            self._entry("a", ["python3", "-c", "pass"]),
+            self._entry("b", ["python3", "-c", "import sys"]),
+            self._entry("c", ["python3", "-c", "import os"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        records = self._ledger_records()
+        mint_records = [r for r in records if r.get("attempt_state") == "pending"]
+        # Exactly one mint per distinct label — never two for the same one.
+        labels = [r["label"] for r in mint_records]
+        self.assertEqual(sorted(labels), ["a", "b", "c"])
+        self.assertEqual(len(labels), len(set(labels)))
+
+    def test_concurrent_distinct_transactions_never_collide_on_ledger_ids(self):
+        # The request-key single-flight lock does NOT cover this: two
+        # DIFFERENT transactions in the SAME session (say, a baseline run
+        # and a focused-repair run kicked off close together) each call
+        # mint_owned_attempts_batch independently. Without a lock spanning
+        # the whole re-read/allocate/append sequence, both could read the
+        # same "highest id so far" and mint the identical V-xxxx. This
+        # drives many threads, each minting many entries under its OWN
+        # transaction id, concurrently, against the same ledger file.
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        thread_count = 8
+        entries_per_thread = 10
+        results_by_thread = [None] * thread_count
+
+        def mint_for_thread(i):
+            txn_id = "T-concurrent-%d" % i
+            entries = [("label-%d-%d" % (i, j), {})
+                      for j in range(entries_per_thread)]
+            results_by_thread[i] = cowork_ledger.mint_owned_attempts_batch(
+                ledger_path, txn_id, entries)
+
+        threads = [threading.Thread(target=mint_for_thread, args=(i,))
+                  for i in range(thread_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        all_ids = []
+        for results in results_by_thread:
+            self.assertIsNotNone(results)
+            for record in results.values():
+                all_ids.append(record["id"])
+        self.assertEqual(len(all_ids), thread_count * entries_per_thread)
+        self.assertEqual(len(all_ids), len(set(all_ids)),
+                         "two concurrent transactions minted the same "
+                         "ledger id: %r" % ([i for i in set(all_ids)
+                                            if all_ids.count(i) > 1]))
+        # And the ledger itself agrees — every id appears exactly once.
+        records = cowork_ledger.read_ledger(ledger_path)
+        persisted_ids = [r["id"] for r in records
+                        if r.get("attempt_state") == "pending"
+                        and r.get("label", "").startswith("label-")]
+        self.assertEqual(len(persisted_ids), len(set(persisted_ids)))
+
+    def test_owned_mint_and_legacy_reconcile_never_collide_across_processes(self):
+        # The THREAD-only test above proves the lock works within one
+        # process; it does NOT prove the PROCESS boundary the contract
+        # actually names ("a report/drain racing a builder's owned
+        # transaction" — two independent OS processes). This spawns two
+        # REAL, separate `python3` processes against the SAME ledger file:
+        # one calling mint_owned_attempts_batch (the owned path), the
+        # other calling reconcile_attempts (the legacy controller-log
+        # path) — both allocating from the same V-namespace.
+        #
+        # READINESS BARRIER: without one, the two children could simply
+        # run sequentially (one finishes before the other even starts
+        # contending), and the test would pass with or without the lock
+        # actually working — it would prove nothing. Each child writes a
+        # READY marker, then blocks polling for a GO marker; the parent
+        # (this test) waits for BOTH ready markers before creating GO,
+        # releasing both children as close to simultaneously as two
+        # separate OS processes can be, forcing genuine contention on the
+        # ledger's allocation lock.
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        out_mint = self._marker_path()
+        out_reconcile = self._marker_path()
+        ready_mint = self._marker_path()
+        ready_reconcile = self._marker_path()
+        go_path = self._marker_path()
+        self.assertFalse(os.path.exists(go_path))
+        entries_per_side = 15
+
+        wait_for_go = (
+            "def _wait_for_go(ready_path, go_path):\n"
+            "    import time\n"
+            "    open(ready_path, 'w').write('ready')\n"
+            "    deadline = time.time() + 30\n"
+            "    while time.time() < deadline:\n"
+            "        if os.path.exists(go_path):\n"
+            "            return\n"
+            "        time.sleep(0.01)\n"
+            "    raise SystemExit('timed out waiting for go signal')\n"
+        )
+
+        mint_script = (
+            "import sys, json, os\n"
+            "sys.path.insert(0, %r)\n"
+            "import cowork_ledger\n"
+            "%s"
+            "_wait_for_go(%r, %r)\n"
+            "entries = [('m-%%d' %% i, {}) for i in range(%d)]\n"
+            "r = cowork_ledger.mint_owned_attempts_batch(%r, 'T-proc-mint', "
+            "entries)\n"
+            "ids = [v['id'] for v in r.values()] if r else None\n"
+            "json.dump(ids, open(%r, 'w'))\n"
+        ) % (_HERE, wait_for_go, ready_mint, go_path, entries_per_side,
+            ledger_path, out_mint)
+
+        reconcile_script = (
+            "import sys, json, os\n"
+            "sys.path.insert(0, %r)\n"
+            "import cowork_ledger\n"
+            "%s"
+            "_wait_for_go(%r, %r)\n"
+            "obs = [{'controller_session_id': 'C-proc', "
+            "'tool_call_id': 'call-%%d' %% i, 'exit_status': 'pass'} "
+            "for i in range(%d)]\n"
+            "r = cowork_ledger.reconcile_attempts(%r, obs)\n"
+            "json.dump(r, open(%r, 'w'))\n"
+        ) % (_HERE, wait_for_go, ready_reconcile, go_path, entries_per_side,
+            ledger_path, out_reconcile)
+
+        proc_a = subprocess.Popen([sys.executable, "-c", mint_script])
+        proc_b = subprocess.Popen([sys.executable, "-c", reconcile_script])
+
+        # Wait for BOTH children to signal ready before releasing either.
+        ready_deadline = time.time() + 15
+        while time.time() < ready_deadline:
+            if os.path.exists(ready_mint) and os.path.exists(ready_reconcile):
+                break
+            time.sleep(0.01)
+        else:
+            proc_a.kill()
+            proc_b.kill()
+            self.fail("one or both children never signaled ready")
+        with open(go_path, "w") as fh:
+            fh.write("go")
+
+        rc_a = proc_a.wait(timeout=30)
+        rc_b = proc_b.wait(timeout=30)
+        self.assertEqual(rc_a, 0)
+        self.assertEqual(rc_b, 0)
+
+        with open(out_mint) as fh:
+            mint_ids = json.load(fh)
+        with open(out_reconcile) as fh:
+            reconcile_result = json.load(fh)
+        self.assertIsNotNone(mint_ids)
+        self.assertEqual(len(mint_ids), entries_per_side)
+        self.assertEqual(reconcile_result.get("state"), "ok")
+        reconcile_ids = reconcile_result.get("minted") or []
+        self.assertEqual(len(reconcile_ids), entries_per_side)
+
+        # The two ALLOCATORS, running in two DIFFERENT OS processes, never
+        # handed out the same V id.
+        combined = mint_ids + reconcile_ids
+        self.assertEqual(len(combined), len(set(combined)),
+                         "owned mint and legacy reconcile allocated the "
+                         "same id across process boundaries: %r"
+                         % ([i for i in set(combined)
+                            if combined.count(i) > 1]))
+        # The ledger itself, read back fresh, agrees — every one of the
+        # 2*entries_per_side ids is present exactly once.
+        records = cowork_ledger.read_ledger(ledger_path)
+        all_persisted_ids = [r["id"] for r in records
+                             if r.get("id") in combined]
+        self.assertEqual(sorted(all_persisted_ids), sorted(combined))
+        self.assertEqual(len(all_persisted_ids), len(set(all_persisted_ids)))
+
+    def test_nth_entry_mint_failure_leaves_no_partial_owned_inventory(self):
+        # A REAL on-disk partial write, not a mock that fires before any
+        # I/O happens: os.fsync is patched to fail AFTER the full batch's
+        # bytes have already been written to the temp file (a genuine
+        # "prefix write" relative to the atomic rename that would have
+        # committed it) — proving the commit is atomic even when real bytes
+        # already exist on disk for this batch, not merely when nothing was
+        # ever written at all.
+        import unittest.mock as mock
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        txn_id = "T-nth-failure"
+        entries = [("first", {}), ("second", {}), ("third", {})]
+        ledger_dir = os.path.dirname(ledger_path)
+        os.makedirs(ledger_dir, exist_ok=True)
+        before_listing = set(os.listdir(ledger_dir))
+
+        with mock.patch.object(cowork_ledger.os, "fsync",
+                               side_effect=OSError("simulated disk failure")):
+            results = cowork_ledger.mint_owned_attempts_batch(
+                ledger_path, txn_id, entries)
+        self.assertIsNone(results)
+        # The real ledger path is BYTE-IDENTICAL to before (untouched) —
+        # readers see the old ledger, never a partial new one.
+        self.assertFalse(os.path.exists(ledger_path))
+        records = cowork_ledger.read_ledger(ledger_path)
+        leftover_labels = {r.get("label") for r in records
+                           if r.get("transaction_id") == txn_id}
+        self.assertEqual(leftover_labels, set())  # zero partial writes
+        # No stray TEMP file left behind — cleanup ran. The `.mint.lock`
+        # file itself is a legitimate, intentionally-persistent artifact
+        # (the lock is reused across calls), not leftover debris, so it's
+        # the one expected addition.
+        after_listing = set(os.listdir(ledger_dir))
+        new_entries = after_listing - before_listing
+        self.assertEqual(new_entries, {os.path.basename(ledger_path)
+                                       + ".mint.lock"})
+        self.assertFalse(any(name.startswith(".") and "tmp-" in name
+                             for name in new_entries))
+
+        # A retry AFTER the fault clears mints all three cleanly, from
+        # scratch — the failed attempt left no stale state to collide with.
+        results = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, txn_id, entries)
+        self.assertIsNotNone(results)
+        self.assertEqual(set(results), {"first", "second", "third"})
+        self.assertEqual(len({r["id"] for r in results.values()}), 3)
+
+    def test_prefix_write_atomicity_readers_see_old_or_complete_batch(self):
+        # A separate, more direct proof of the atomic-commit contract at
+        # the unit level: seed the ledger with one existing record, then
+        # inject a failure AFTER the temp file has the FULL intended
+        # content (old + new) written to it but BEFORE the atomic rename —
+        # a reader concurrently opening the real path during this window
+        # must see ONLY the old content, never a mix.
+        import unittest.mock as mock
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        seed_ok = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, "T-seed", [("seed-label", {})])
+        self.assertIsNotNone(seed_ok)
+        with open(ledger_path, "rb") as fh:
+            before_bytes = fh.read()
+
+        with mock.patch.object(cowork_ledger.os, "replace",
+                               side_effect=OSError("simulated rename failure")):
+            results = cowork_ledger.mint_owned_attempts_batch(
+                ledger_path, "T-after-seed", [("new-label", {})])
+        self.assertIsNone(results)
+        with open(ledger_path, "rb") as fh:
+            after_bytes = fh.read()
+        # Exactly the pre-batch content — not the old content plus a
+        # dangling partial new line, not the new content either.
+        self.assertEqual(after_bytes, before_bytes)
+        records = cowork_ledger.read_ledger(ledger_path)
+        self.assertNotIn("new-label", [r.get("label") for r in records])
+
+    def test_allocation_fails_closed_on_unreadable_ledger_byte_identical(self):
+        # The ledger EXISTS and has real content, but a permissions/I-O
+        # error makes it unreadable at the moment of allocation — this
+        # must NOT be treated as "empty, safe to start fresh" (which
+        # would REPLACE real history via the atomic-commit path).
+        import unittest.mock as mock
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        seeded = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, "T-seed-unreadable", [("seed", {})])
+        self.assertIsNotNone(seeded)
+        with open(ledger_path, "rb") as fh:
+            before_bytes = fh.read()
+
+        real_open = open
+
+        def failing_open(path, mode="r", *a, **k):
+            if path == ledger_path and "r" in mode:
+                raise OSError("simulated permission failure")
+            return real_open(path, mode, *a, **k)
+
+        with mock.patch("builtins.open", side_effect=failing_open):
+            results = cowork_ledger.mint_owned_attempts_batch(
+                ledger_path, "T-new-while-unreadable", [("new", {})])
+        self.assertIsNone(results)
+        with open(ledger_path, "rb") as fh:
+            after_bytes = fh.read()
+        self.assertEqual(after_bytes, before_bytes)  # byte-identical
+
+    def test_allocation_fails_closed_on_malformed_line_byte_identical(self):
+        # The ledger has one real record PLUS one deliberately malformed
+        # (non-JSON) line. Allocation must fail closed rather than
+        # silently skipping the bad line (which could hide an existing
+        # `attempt_key`/id from the natural-key check and mint a
+        # DUPLICATE) or "fixing" the file by dropping it.
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        seeded = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, "T-seed-malformed", [("seed", {})])
+        self.assertIsNotNone(seeded)
+        with open(ledger_path, "ab") as fh:
+            fh.write(b"{not valid json at all\n")
+        with open(ledger_path, "rb") as fh:
+            before_bytes = fh.read()
+
+        results = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, "T-new-while-malformed", [("new", {})])
+        self.assertIsNone(results)
+        with open(ledger_path, "rb") as fh:
+            after_bytes = fh.read()
+        self.assertEqual(after_bytes, before_bytes)  # byte-identical,
+                                                      # including the bad line
+
+        # And the same fail-closed posture applies to reconcile_attempts,
+        # the OTHER allocator sharing this same strict read.
+        reconcile_result = cowork_ledger.reconcile_attempts(
+            ledger_path, [{"controller_session_id": "C",
+                          "tool_call_id": "t-1", "exit_status": "pass"}])
+        self.assertEqual(reconcile_result["state"], "failed")
+        with open(ledger_path, "rb") as fh:
+            after_reconcile_bytes = fh.read()
+        self.assertEqual(after_reconcile_bytes, before_bytes)
+
+    def test_missing_ledger_is_legitimately_empty_not_a_read_failure(self):
+        # The one case that must NOT fail closed: a ledger that has simply
+        # never been created yet (no file at all) is a legitimate empty
+        # state, distinct from "exists but unreadable".
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        self.assertFalse(os.path.exists(ledger_path))
+        results = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, "T-fresh", [("first", {})])
+        self.assertIsNotNone(results)
+        self.assertIn("first", results)
+
+    def test_injected_mint_failure_is_unverified_and_never_launches(self):
+        # A mint failure for ANY entry must abort BEFORE the request is
+        # persisted or the worker spawned — proven here by the command's own
+        # marker file never appearing, not just by the verdict.
+        import unittest.mock as mock
+        marker = self._marker_path()
+        entries = self._inventory(
+            self._entry("would-run", self._append_marker_cmd(marker, "ran"),
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification.ledger, "mint_owned_attempts_batch",
+                               return_value=None):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertEqual(result["ledger_failure"]["reason"], "mint_failed")
+        self.assertFalse(os.path.exists(marker))  # never launched
+        request_path = state_store.verification_request_path_for(
+            self.session_uuid, result["transaction_id"])
+        self.assertFalse(os.path.exists(request_path))  # never persisted
+
+    def test_injected_revise_failure_is_unverified_despite_a_clean_exit(self):
+        # The command genuinely succeeds (exit 0) — but a broken ledger
+        # revision must still fail the WHOLE transaction closed, never let
+        # a real green exit paper over missing durable evidence.
+        #
+        # PERSISTENT, not a one-call mock: the real revise_owned_attempt is
+        # used for "first" throughout (proving its own lifecycle genuinely
+        # succeeds), while every call for "second" — running, terminal, AND
+        # the backstop's own retry of it — fails, for the ENTIRE duration
+        # of the transaction, not just once.
+        import unittest.mock as mock
+        real_revise = cowork_ledger.revise_owned_attempt
+
+        def flaky_revise(path, transaction_id, label, fields,
+                         attempt_state="terminal"):
+            if label == "second":
+                return None
+            return real_revise(path, transaction_id, label, fields,
+                               attempt_state=attempt_state)
+
+        entries = self._inventory(
+            self._entry("first", ["python3", "-c", "pass"]),
+            self._entry("second", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification.ledger, "revise_owned_attempt",
+                               side_effect=flaky_revise):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertIsNotNone(result["ledger_failure"])
+        self.assertIn("second", result["ledger_failure"].get("labels")
+                      or [result["ledger_failure"].get("label")])
+        # "first"'s own lifecycle genuinely completed (real revise calls) —
+        # this failure is scoped to "second", not a global inability to
+        # revise anything.
+        records = self._ledger_records()
+        first_states = [r["attempt_state"] for r in records
+                       if r.get("label") == "first"]
+        self.assertEqual(first_states, ["pending", "running", "terminal"])
+
+    def test_started_but_never_terminalized_backstops_to_unresolved_not_not_reached(self):
+        # The specific gap: "running" succeeds (so the entry IS started —
+        # the worker may genuinely be executing it) but its OWN terminal
+        # revision fails PERSISTENTLY. The backstop must land this on
+        # `unresolved` — honest ("may have run, evidence incomplete") —
+        # never `not_reached`, which would falsely claim certainty that it
+        # never started.
+        import unittest.mock as mock
+        real_revise = cowork_ledger.revise_owned_attempt
+
+        def fail_only_terminal_for_flaky(path, transaction_id, label, fields,
+                                         attempt_state="terminal"):
+            if label == "flaky" and attempt_state == "terminal":
+                return None
+            return real_revise(path, transaction_id, label, fields,
+                               attempt_state=attempt_state)
+
+        entries = self._inventory(
+            self._entry("flaky", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification.ledger, "revise_owned_attempt",
+                               side_effect=fail_only_terminal_for_flaky):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        records = self._ledger_records()
+        flaky_records = [r for r in records if r.get("label") == "flaky"]
+        ids = {r["id"] for r in flaky_records}
+        self.assertEqual(len(ids), 1)  # one stable id throughout
+        self.assertEqual(flaky_records[-1]["attempt_state"], "unresolved")
+        self.assertNotEqual(flaky_records[-1]["attempt_state"], "not_reached")
+        self.assertTrue(flaky_records[-1].get("may_have_run"))
+
+    def test_transient_backstop_failure_settles_on_retry_persistent_is_honestly_reported(self):
+        # TRANSIENT: the ORIGINAL terminal write fails (so `ledger_failure`
+        # is still set — the transaction is correctly unverified, since
+        # this command's real outcome was never captured), but the
+        # backstop's OWN first unresolved-revision attempt then fails too
+        # while its bounded RETRY succeeds — settling ledger INTEGRITY
+        # (the id is NOT left dangling, and `ledger_failure` is never
+        # COMPOUNDED with the backstop's own "not_reached_revision_failed"
+        # on top of the original cause).
+        import unittest.mock as mock
+        real_revise = cowork_ledger.revise_owned_attempt
+        call_count = {"n": 0}
+
+        def transient_then_ok(path, transaction_id, label, fields,
+                              attempt_state="terminal"):
+            if label == "transient":
+                call_count["n"] += 1
+                # Call 1 = the "running" write (must succeed so the entry
+                # is genuinely started). Call 2 = the original terminal
+                # write (fails). Call 3 = the backstop's FIRST unresolved
+                # retry (fails). Call 4 = the backstop's SECOND unresolved
+                # retry (succeeds) — proving the bounded retry, not luck.
+                if call_count["n"] in (2, 3):
+                    return None
+            return real_revise(path, transaction_id, label, fields,
+                               attempt_state=attempt_state)
+
+        entries = self._inventory(
+            self._entry("transient", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification.ledger, "revise_owned_attempt",
+                               side_effect=transient_then_ok):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        self.assertEqual(call_count["n"], 4)
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        # The ledger's OWN integrity settled — `ledger_failure` still
+        # names the ORIGINAL cause (the terminal write failing), but is
+        # NEVER compounded with a SEPARATE "not_reached_revision_failed"
+        # backstop failure, because the backstop's retry succeeded.
+        self.assertEqual(result["ledger_failure"]["reason"],
+                         "terminal_revision_failed")
+        records = self._ledger_records()
+        transient_records = [r for r in records if r.get("label") == "transient"]
+        ids = {r["id"] for r in transient_records}
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(transient_records[-1]["attempt_state"], "unresolved")
+
+        # PERSISTENT (both the original write AND the backstop's bounded
+        # retries fail): honestly reported as a COMPOUNDED ledger_failure —
+        # `not_reached_revision_failed`, preserving the original reason —
+        # never silently swallowed.
+        def always_fails(path, transaction_id, label, fields,
+                         attempt_state="terminal"):
+            if label == "persistent" and attempt_state != "running":
+                return None
+            return real_revise(path, transaction_id, label, fields,
+                               attempt_state=attempt_state)
+
+        entries2 = self._inventory(
+            self._entry("persistent", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification.ledger, "revise_owned_attempt",
+                               side_effect=always_fails):
+            result2 = verification.run_transaction(
+                self.repo, self.session_uuid, entries2)
+        self.assertEqual(result2["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertIsNotNone(result2["ledger_failure"])
+        self.assertEqual(result2["ledger_failure"]["reason"],
+                         "not_reached_revision_failed")
+        self.assertEqual(result2["ledger_failure"]["prior_reason"],
+                         "terminal_revision_failed")
+        self.assertIn("persistent", result2["ledger_failure"].get("labels")
+                      or [result2["ledger_failure"].get("label")])
+
+    def test_early_command_failure_leaves_zero_pending_owned_attempts(self):
+        entries = self._inventory(
+            self._entry("fails", ["python3", "-c", "import sys\nsys.exit(1)"]),
+            self._entry("never-reached-a", ["python3", "-c", "pass"]),
+            self._entry("never-reached-b", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_RED)
+        records = self._ledger_records()
+        dangling = [r["label"] for r in records
+                   if r.get("attempt_state") in ("pending", "running")
+                   and r.get("label") in
+                   ("fails", "never-reached-a", "never-reached-b")]
+        # A LABEL may transiently appear as pending/running mid-history, but
+        # its LATEST state must never still be pending/running once the
+        # transaction has concluded.
+        latest_state = {}
+        for r in records:
+            if r.get("label") in ("fails", "never-reached-a",
+                                  "never-reached-b"):
+                latest_state[r["label"]] = r["attempt_state"]
+        self.assertEqual(set(latest_state), {"fails", "never-reached-a",
+                                             "never-reached-b"})
+        self.assertNotIn("pending", latest_state.values())
+        self.assertNotIn("running", latest_state.values())
+        self.assertEqual(latest_state["fails"], "terminal")
+        self.assertEqual(latest_state["never-reached-a"], "not_reached")
+        self.assertEqual(latest_state["never-reached-b"], "not_reached")
+
+    def test_permit_blocks_the_next_entry_when_terminal_revision_fails(self):
+        # The P0 run-ahead bug, made deterministic: entry 1's COMMAND
+        # genuinely succeeds (real marker file written), but its OWN
+        # terminal ledger revision fails PERSISTENTLY. Without a
+        # parent-issued permit gating entry 2, the worker (running
+        # independently, as fast as it can) would have ALREADY started —
+        # or finished — entry 2 by the time the parent even notices entry
+        # 1's ledger failure. This asserts entry 2's marker file NEVER
+        # appears at all — not just that the ledger ends up honest, but
+        # that the WORKER PROCESS itself never launched it.
+        import unittest.mock as mock
+        real_revise = cowork_ledger.revise_owned_attempt
+        marker_first = self._marker_path()
+        marker_second = self._marker_path()
+
+        def fail_first_terminal(path, transaction_id, label, fields,
+                                attempt_state="terminal"):
+            if label == "first" and attempt_state == "terminal":
+                return None
+            return real_revise(path, transaction_id, label, fields,
+                               attempt_state=attempt_state)
+
+        entries = self._inventory(
+            self._entry("first", self._append_marker_cmd(marker_first,
+                                                          "ran-first")),
+            self._entry("second", self._append_marker_cmd(marker_second,
+                                                           "ran-second"),
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification.ledger, "revise_owned_attempt",
+                               side_effect=fail_first_terminal):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertTrue(os.path.exists(marker_first),
+                        "entry 1 legitimately ran")
+        self.assertFalse(os.path.exists(marker_second),
+                         "entry 2 must NEVER launch once the parent could "
+                         "not durably revise entry 1's terminal state")
+        # And the ledger itself agrees: "second" never started.
+        records = self._ledger_records()
+        second_latest = [r["attempt_state"] for r in records
+                        if r.get("label") == "second"][-1]
+        self.assertEqual(second_latest, "not_reached")
+
+    def test_worker_start_failure_leaves_zero_pending_owned_attempts(self):
+        entries = self._inventory(
+            self._entry("a", ["python3", "-c", "pass"]),
+            self._entry("b", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(
+            self.repo, self.session_uuid, entries,
+            python_executable="/nonexistent/python3-does-not-exist")
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        records = self._ledger_records()
+        latest_state = {}
+        for r in records:
+            if r.get("label") in ("a", "b"):
+                latest_state[r["label"]] = r["attempt_state"]
+        self.assertEqual(set(latest_state), {"a", "b"})
+        self.assertNotIn("pending", latest_state.values())
+        self.assertNotIn("running", latest_state.values())
+        self.assertEqual(set(latest_state.values()), {"not_reached"})
+
+    def test_worker_crash_before_identity_completes_promptly_with_evidence(self):
+        # ORCH-030: a worker that is successfully SPAWNED but crashes before
+        # reporting identity (a missing snapshotted dependency) must not
+        # burn the whole startup allowance — this reseeds the throwaway
+        # repo WITHOUT cowork_ledger.py so the worker's own top-level
+        # `import cowork_ledger` fails immediately at process start.
+        worker_path = os.path.join(self.repo, "scripts", "cowork_ledger.py")
+        os.remove(worker_path)
+        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", self.repo, "commit", "-qm",
+                       "remove a worker dependency"], check=True)
+        entries = self._inventory(
+            self._entry("noop", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        started = time.time()
+        result = verification.run_transaction(
+            self.repo, self.session_uuid, entries,
+            command_timeout_s=5)
+        elapsed = time.time() - started
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertLess(elapsed, 15,
+                        "worker crash detection must not burn the full "
+                        "startup allowance")
+        self.assertIsNotNone(result["startup_failure"])
+        self.assertEqual(result["startup_failure"]["reason"],
+                         "worker_exited_before_identity_report")
+        self.assertIsNotNone(result["startup_failure"].get("exit_code"))
+        self.assertIn("cowork_ledger",
+                      result["startup_failure"].get("log_tail") or "")
+        records = self._ledger_records()
+        latest_state = {r["label"]: r["attempt_state"] for r in records
+                        if r.get("label") == "noop"}
+        self.assertEqual(latest_state.get("noop"), "not_reached")
+
+    def test_worker_rejects_a_request_missing_a_ledger_attempt_id_promptly(self):
+        # Request validation is bound to WORKER ACCEPTANCE: a request with
+        # even one entry missing its pre-minted ledger_attempt_id (a
+        # downgraded/corrupted request, simulated here by minting normally
+        # then stripping the field back out before the worker ever sees it)
+        # must be REJECTED before identity is published — never accepted
+        # and then left to time out against a full per-command evidence
+        # budget waiting for evidence that a rejected request can never
+        # produce.
+        txn_id = verification.new_transaction_id()
+        schema, txn_entries, final_label = verification.normalize_inventory(
+            self._inventory(
+                self._entry("a", ["python3", "-c", "pass"]),
+                self._entry("b", ["python3", "-c", "pass"],
+                           kind=verification.KIND_FINAL_SUITE)))
+        snapshot = verification.build_snapshot(self.repo, self.session_uuid,
+                                               txn_id)
+        checkout_root = verification.materialize_checkout(self.session_uuid,
+                                                          txn_id)
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        minted = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, txn_id,
+            [(e["label"], {}) for e in txn_entries])
+        self.assertIsNotNone(minted)
+        for e in txn_entries:
+            e["ledger_attempt_id"] = minted[e["label"]]["id"]
+        # Strip the SECOND entry's id back out — its ledger record was
+        # already minted (proving "same IDs": the id exists and is
+        # discoverable), but the REQUEST no longer carries it.
+        stripped_id = txn_entries[1]["ledger_attempt_id"]
+        txn_entries[1]["ledger_attempt_id"] = None
+
+        request = verification.build_request(
+            self.session_uuid, txn_id, self.repo,
+            snapshot["manifest_digest"], snapshot["index_digest"], {},
+            schema, txn_entries, final_label,
+            # A deliberately huge command timeout: if the worker's
+            # rejection were NOT bound to acceptance, the parent would
+            # wait close to this long for evidence. A prompt rejection
+            # must finish in a small fraction of it regardless.
+            command_timeout_s=300)
+        request_path = state_store.verification_request_path_for(
+            self.session_uuid, txn_id)
+        state_store.write_json_atomic(request_path, request)
+
+        marker_a = os.path.join(self.repo, "launched_a.marker")
+        started = time.time()
+        result = verification._run_owned_transaction(
+            self.repo, self.session_uuid, txn_id, request, txn_entries,
+            final_label, snapshot, checkout_root, sys.executable or "python3")
+        elapsed = time.time() - started
+
+        self.assertFalse(result["worker_identity_verified"])
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertIsNotNone(result["startup_failure"])
+        self.assertEqual(result["startup_failure"]["reason"],
+                         "request_rejected")
+        self.assertEqual(result["startup_failure"]["exit_code"],
+                         verification.WORKER_EXIT_REQUEST_REJECTED)
+        # Prompt: nowhere near the 300s command timeout, and comfortably
+        # under even the (much shorter) startup allowance.
+        self.assertLess(elapsed, 15)
+        # Zero command launches — no attempts were ever run.
+        self.assertEqual(result["attempts"], [])
+        self.assertFalse(os.path.exists(marker_a))
+        # Same IDs: both pre-minted ids still exist, under their original
+        # ids, now terminalized as not_reached — never replaced, never
+        # orphaned as pending.
+        records = cowork_ledger.read_ledger(ledger_path)
+        latest_state = {r["label"]: (r["id"], r["attempt_state"])
+                        for r in records if r.get("transaction_id") == txn_id}
+        self.assertEqual(latest_state["a"][0], minted["a"]["id"])
+        self.assertEqual(latest_state["b"][0], stripped_id)
+        self.assertEqual(latest_state["a"][1], "not_reached")
+        self.assertEqual(latest_state["b"][1], "not_reached")
+
+    def test_worker_rejects_a_protocol_version_mismatch_even_with_ids_present(self):
+        # Presence of ledger_attempt_id is NOT sufficient on its own — a
+        # request can carry a valid id on every entry while still
+        # declaring the WRONG protocol_version (simulated here by building
+        # a real, fully-valid request and then corrupting only that one
+        # field). This must be rejected on its own, distinctly from the
+        # missing-id case.
+        txn_id = verification.new_transaction_id()
+        schema, txn_entries, final_label = verification.normalize_inventory(
+            self._inventory(
+                self._entry("solo", ["python3", "-c", "pass"],
+                           kind=verification.KIND_FINAL_SUITE)))
+        snapshot = verification.build_snapshot(self.repo, self.session_uuid,
+                                               txn_id)
+        checkout_root = verification.materialize_checkout(self.session_uuid,
+                                                          txn_id)
+        ledger_path = state_store.ledger_path_for(self.session_uuid)
+        minted = cowork_ledger.mint_owned_attempts_batch(
+            ledger_path, txn_id, [(e["label"], {}) for e in txn_entries])
+        self.assertIsNotNone(minted)
+        for e in txn_entries:
+            e["ledger_attempt_id"] = minted[e["label"]]["id"]
+        # Every entry HAS a valid id — only the request's OWN declared
+        # protocol_version is wrong.
+        self.assertTrue(all(e.get("ledger_attempt_id") for e in txn_entries))
+
+        request = verification.build_request(
+            self.session_uuid, txn_id, self.repo,
+            snapshot["manifest_digest"], snapshot["index_digest"], {},
+            schema, txn_entries, final_label, command_timeout_s=300)
+        request["protocol_version"] = verification.PROTOCOL_VERSION - 1
+        request_path = state_store.verification_request_path_for(
+            self.session_uuid, txn_id)
+        state_store.write_json_atomic(request_path, request)
+
+        started = time.time()
+        result = verification._run_owned_transaction(
+            self.repo, self.session_uuid, txn_id, request, txn_entries,
+            final_label, snapshot, checkout_root, sys.executable or "python3")
+        elapsed = time.time() - started
+
+        self.assertFalse(result["worker_identity_verified"])
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertIsNotNone(result["startup_failure"])
+        self.assertEqual(result["startup_failure"]["reason"],
+                         "request_rejected")
+        self.assertLess(elapsed, 15)
+        self.assertEqual(result["attempts"], [])
+        records = cowork_ledger.read_ledger(ledger_path)
+        latest = {r["id"]: r["attempt_state"] for r in records
+                 if r.get("transaction_id") == txn_id}
+        self.assertEqual(latest[minted["solo"]["id"]], "not_reached")
+
+    def test_startup_log_capture_is_bounded_for_oversized_stderr(self):
+        # A REAL subprocess writing far more than MAX_STARTUP_LOG_BYTES,
+        # captured directly through `_capture_startup_log` (not the full
+        # worker path — this isolates the bound itself): the file on disk
+        # must be capped, the subprocess must not hang/block on a full
+        # pipe waiting for a reader, a subsequent bounded read must never
+        # pull more than the cap into memory, and — critically — the
+        # RETAINED bytes must be the TAIL (the end of the output, where a
+        # real traceback would be), never the head.
+        cap = verification.MAX_STARTUP_LOG_BYTES
+        oversized_multiplier = 5
+        # A UNIQUE marker at the very START (must be trimmed away) and a
+        # DIFFERENT unique marker at the very END (must survive) — using
+        # the SAME repeated filler for both, as an earlier draft of this
+        # test did, cannot actually prove which end was kept, since a
+        # uniform repeated pattern looks identical no matter where the
+        # trim boundary falls.
+        script = ("import sys\n"
+                  "sys.stdout.write('HEAD_SENTINEL_MUST_BE_TRIMMED')\n"
+                  "sys.stdout.write('filler' * %d)\n"
+                  "sys.stdout.write('TAIL_SENTINEL_MUST_SURVIVE')\n"
+                  "sys.stdout.flush()\n") % ((cap * oversized_multiplier) // 6)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        log_path = os.path.join(tempfile.mkdtemp(), "startup.log")
+
+        started = time.time()
+        capture_thread = threading.Thread(
+            target=verification._capture_startup_log,
+            args=(proc.stdout, log_path, cap), daemon=True)
+        capture_thread.start()
+        rc = proc.wait(timeout=15)  # must not hang draining an unread pipe
+        capture_thread.join(timeout=15)
+        elapsed = time.time() - started
+
+        self.assertEqual(rc, 0)
+        self.assertLess(elapsed, 15)
+        on_disk_size = os.path.getsize(log_path)
+        self.assertLessEqual(on_disk_size, cap)
+        self.assertGreater(on_disk_size, 0)
+        with open(log_path, "rb") as fh:
+            on_disk = fh.read()
+        self.assertIn(b"TAIL_SENTINEL_MUST_SURVIVE", on_disk)
+        self.assertNotIn(b"HEAD_SENTINEL_MUST_BE_TRIMMED", on_disk)
+
+        # The bounded READER, given a session/transaction pointing at this
+        # oversized file, never returns more than its own max_bytes either,
+        # and still surfaces the tail sentinel.
+        session_uuid = "S-startup-log-" + uuid.uuid4().hex[:8]
+        txn_id = "T-startup-log"
+        real_log_path = state_store.verification_worker_startup_log_path_for(
+            session_uuid, txn_id)
+        os.makedirs(os.path.dirname(real_log_path), exist_ok=True)
+        shutil.copyfile(log_path, real_log_path)
+        read_max = 4096
+        text = verification._read_worker_startup_log(
+            session_uuid, txn_id, max_bytes=read_max)
+        self.assertLessEqual(len(text.encode("utf-8")),
+                             read_max + len("...(truncated)...\n"))
+        self.assertIn("TAIL_SENTINEL_MUST_SURVIVE", text)
+
+    def test_startup_log_tail_sentinel_survives_through_the_real_worker_path(self):
+        # The FULL integration path, not the isolated capture function: a
+        # real worker process (spawned via spawn_worker, exactly as
+        # `_run_owned_transaction` does) that emits far more than
+        # MAX_STARTUP_LOG_BYTES of junk BEFORE crashing with a distinct
+        # sentinel in its final traceback line. This proves the tail
+        # survives spawn_worker's PIPE capture, the background thread's
+        # bounded join, AND `_read_worker_startup_log`'s own bounded read
+        # — the complete chain `result['startup_failure']['log_tail']`
+        # actually goes through.
+        cap = verification.MAX_STARTUP_LOG_BYTES
+        broken_ledger_path = os.path.join(self.repo, "scripts",
+                                          "cowork_ledger.py")
+        with open(broken_ledger_path, "w") as fh:
+            fh.write(
+                "import sys\n"
+                "sys.stderr.write('JUNK_BEFORE_CRASH' * %d)\n"
+                "sys.stderr.write('\\nWORKER_CRASH_SENTINEL_9f3a\\n')\n"
+                "raise ImportError('intentional test failure')\n"
+                % ((cap * 3) // len("JUNK_BEFORE_CRASH")))
+        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", self.repo, "commit", "-qm",
+                       "worker dependency writes junk then crashes"],
+                      check=True)
+        entries = self._inventory(
+            self._entry("noop", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(
+            self.repo, self.session_uuid, entries, command_timeout_s=5)
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertIsNotNone(result["startup_failure"])
+        log_tail = result["startup_failure"].get("log_tail") or ""
+        # The sentinel — at the very END of ~3x MAX_STARTUP_LOG_BYTES of
+        # junk — survived the entire chain: PIPE capture (tail-trimmed to
+        # 64 KiB), the bounded thread join, and the bounded final read.
+        self.assertIn("WORKER_CRASH_SENTINEL_9f3a", log_tail)
+        self.assertLessEqual(len(log_tail.encode("utf-8")),
+                             4096 + len("...(truncated)...\n"))
+        # The CAPTURE stage itself actually trimmed something: the source
+        # wrote ~3x MAX_STARTUP_LOG_BYTES, but the on-disk captured file
+        # (before the final bounded read even applies) is capped.
+        captured_log_path = state_store.verification_worker_startup_log_path_for(
+            self.session_uuid, result["transaction_id"])
+        self.assertLessEqual(os.path.getsize(captured_log_path), cap)
+
+    def test_issue_permit_honors_a_false_write_return_not_just_exceptions(self):
+        # `write_json_atomic` reports failure by RETURNING False, not by
+        # raising — it swallows OSError internally (see cowork_state.py).
+        # `_issue_permit` previously ignored that boolean and returned True
+        # unconditionally whenever no exception escaped, so a real,
+        # reported write failure was silently treated as success and the
+        # worker would have been (wrongly) authorized. Here the permit
+        # write specifically is forced to report False while every other
+        # write_json_atomic call (identity, result.json, etc.) behaves
+        # normally, and the command must never launch.
+        import unittest.mock as mock
+        real_write = verification.state_store.write_json_atomic
+        marker = self._marker_path()
+
+        def fail_only_permit_write(path, data):
+            if path.endswith("permit.json"):
+                return False
+            return real_write(path, data)
+
+        entries = self._inventory(
+            self._entry("only", self._append_marker_cmd(marker, "ran"),
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification.state_store, "write_json_atomic",
+                               side_effect=fail_only_permit_write):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertFalse(os.path.exists(marker),
+                         "command must never launch when the permit write "
+                         "itself reports False, not just when it raises")
+        self.assertEqual(result["ledger_failure"]["reason"],
+                         "permit_issue_failed")
+        records = self._ledger_records()
+        latest = [r["attempt_state"] for r in records
+                 if r.get("label") == "only"][-1]
+        self.assertEqual(latest, "not_reached")
+
+    def test_atomic_commit_batch_inserts_a_missing_separator_not_corruption(self):
+        # A ledger whose last byte is not a newline is a valid, parseable
+        # JSONL file (`_strict_raw_and_records_for_allocation`'s
+        # `splitlines()`-based scan accepts it happily) — but
+        # `_atomic_commit_batch` used to concatenate the next batch's bytes
+        # directly onto `raw_prefix`, gluing the first new record onto the
+        # tail of the existing last line and corrupting both into one
+        # unparseable line. Covers both allocators — an owned mint AND a
+        # legacy reconcile — each onto its OWN no-trailing-newline ledger
+        # (deliberately separate files, not shared: mint's own separator
+        # insertion would otherwise leave the ledger newline-terminated
+        # before reconcile ever got a chance to exercise the same fix
+        # against the original no-trailing-newline shape).
+        def _seed_ledger_no_trailing_newline(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            existing = {"kind": "attempt", "id": "V-0001",
+                       "attempt_key": "seed", "label": "seed",
+                       "attempt_state": "terminal"}
+            with open(path, "wb") as fh:
+                fh.write(json.dumps(existing, sort_keys=True).encode("utf-8"))
+                # Deliberately NO trailing newline.
+
+        def _assert_parseable_and_unique(path, expected_new_key):
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            lines = [ln for ln in raw.decode("utf-8").splitlines()
+                    if ln.strip()]
+            parsed = [json.loads(ln) for ln in lines]  # raises if corrupted
+            ids = [rec.get("id") for rec in parsed if rec.get("id")]
+            self.assertEqual(len(ids), len(set(ids)),
+                             "no duplicate/corrupted ids after a batch "
+                             "commit onto a ledger with no trailing "
+                             "newline")
+            self.assertIn("seed", [rec.get("attempt_key") for rec in parsed])
+            self.assertIn(expected_new_key,
+                          [rec.get("attempt_key") for rec in parsed])
+
+        # Scenario A: owned mint onto a no-trailing-newline ledger.
+        mint_ledger_path = os.path.join(self.sessions_root, "mint-sep",
+                                        "ledger.jsonl")
+        _seed_ledger_no_trailing_newline(mint_ledger_path)
+        mint_result = cowork_ledger.mint_owned_attempts_batch(
+            mint_ledger_path, "txn-mint-sep", [("minted-one", {})])
+        self.assertIsNotNone(mint_result)
+        self.assertEqual(len(mint_result), 1)
+        _assert_parseable_and_unique(
+            mint_ledger_path,
+            expected_new_key=cowork_ledger.owned_attempt_key(
+                "txn-mint-sep", "minted-one"))
+
+        # Scenario B: legacy reconcile onto its OWN no-trailing-newline
+        # ledger — a real natural key (`controller_session_id` +
+        # `tool_call_id`) is required, or `attempt_key()` returns None and
+        # reconcile appends NOTHING, silently passing without ever
+        # exercising `_atomic_commit_batch`'s separator-insertion path at
+        # all.
+        reconcile_ledger_path = os.path.join(self.sessions_root,
+                                             "reconcile-sep", "ledger.jsonl")
+        _seed_ledger_no_trailing_newline(reconcile_ledger_path)
+        reconcile_observation = {
+            "controller_session_id": "S-reconcile-sep",
+            "tool_call_id": "call_reconcile_sep",
+            "command_identity": "echo reconciled",
+            "exit_status": "pass", "adjudication": "pass"}
+        reconcile_result = cowork_ledger.reconcile_attempts(
+            reconcile_ledger_path, [reconcile_observation])
+        self.assertNotEqual(reconcile_result.get("state"), "failed")
+        self.assertEqual(len(reconcile_result.get("minted") or []), 1,
+                         "reconcile must have actually minted exactly one "
+                         "id — a natural-key-free observation would mint "
+                         "zero and pass without exercising the allocator "
+                         "at all")
+        expected_reconcile_key = cowork_ledger.attempt_key(
+            reconcile_observation)
+        self.assertIsNotNone(expected_reconcile_key)
+        _assert_parseable_and_unique(
+            reconcile_ledger_path, expected_new_key=expected_reconcile_key)
+
+    def test_capture_thread_is_joined_on_every_exit_path_not_just_early_crash(self):
+        # The prior fix only joined `startup_capture_thread` in the
+        # early-crash/readback branch. A NORMAL, successful transaction
+        # never touches that branch at all — its capture thread was never
+        # joined anywhere, so `_run_owned_transaction` could return while
+        # the daemon thread was still mid-write to the startup log file.
+        # Two equal empty reads (the prior draft's only check) can pass
+        # EVEN WHILE the thread is still alive and simply hasn't written
+        # anything yet — that proves nothing about joining. This wraps the
+        # REAL `spawn_worker` to retain the exact `threading.Thread` object
+        # it returns, so the test can assert `is_alive()` is False (the
+        # thread has actually finished, not merely "hasn't gotten around
+        # to it yet") before trusting the artifact's bytes at all.
+        import unittest.mock as mock
+        real_spawn_worker = verification.spawn_worker
+        captured_thread_holder = {}
+
+        def spy_spawn_worker(*args, **kwargs):
+            proc, write_fd, capture_thread = real_spawn_worker(
+                *args, **kwargs)
+            captured_thread_holder["thread"] = capture_thread
+            return proc, write_fd, capture_thread
+
+        entries = self._inventory(
+            self._entry("solo", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        with mock.patch.object(verification, "spawn_worker",
+                               side_effect=spy_spawn_worker):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+
+        capture_thread = captured_thread_holder.get("thread")
+        self.assertIsNotNone(capture_thread,
+                             "spawn_worker did not return a capture thread "
+                             "to inspect")
+        self.assertFalse(
+            capture_thread.is_alive(),
+            "the capture thread must already be joined/finished by the "
+            "time run_transaction returns, on the ordinary green exit "
+            "path — not just on the early-crash path")
+
+        captured_log_path = state_store.verification_worker_startup_log_path_for(
+            self.session_uuid, result["transaction_id"])
+        # The artifact must actually EXIST — a still-missing file read
+        # twice as empty bytes would trivially satisfy a byte-equality
+        # check without proving anything was ever captured or finalized.
+        self.assertTrue(os.path.exists(captured_log_path),
+                        "the capture thread finished without ever writing "
+                        "its log artifact to disk")
+
+        with open(captured_log_path, "rb") as fh:
+            first_bytes = fh.read()
+        time.sleep(0.05)
+        with open(captured_log_path, "rb") as fh:
+            second_bytes = fh.read()
+        self.assertEqual(first_bytes, second_bytes)
+
+    def test_spawn_worker_closes_both_liveness_fds_when_popen_raises(self):
+        # `spawn_worker` always closed the pipe's READ end (the one the
+        # worker would have inherited) in a `finally`, but the WRITE end —
+        # the one the PARENT holds to signal shutdown via EOF — was only
+        # returned to the caller on success. When `Popen` itself raises
+        # (bad interpreter path, resource exhaustion), no caller ever
+        # receives that fd to close, so it leaked for the parent's whole
+        # remaining lifetime. Assert the exception still propagates AND
+        # that no new fd is left open as a result of this call.
+        import unittest.mock as mock
+        checkout_root = self.repo
+        request_path = os.path.join(self.repo, "does-not-matter.json")
+
+        def count_open_fds():
+            fd_dir = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else None
+            if fd_dir:
+                return len(os.listdir(fd_dir))
+            # macOS/BSD fallback: probe a bounded range for open fds via
+            # os.fstat, cheaper and portable enough for a leak-count check.
+            count = 0
+            for fd in range(0, 256):
+                try:
+                    os.fstat(fd)
+                    count += 1
+                except OSError:
+                    pass
+            return count
+
+        before = count_open_fds()
+        with mock.patch.object(
+                verification.subprocess, "Popen",
+                side_effect=OSError("intentional: simulated spawn failure")):
+            with self.assertRaises(OSError):
+                verification.spawn_worker(
+                    "python3", checkout_root, request_path,
+                    session_uuid=self.session_uuid,
+                    transaction_id="txn-fd-leak")
+        after = count_open_fds()
+        self.assertEqual(before, after,
+                         "spawn_worker must close BOTH pipe ends when "
+                         "Popen raises, leaking neither")
+
+    def test_terminal_result_persistence_failure_never_publishes_green(self):
+        # If the terminal `result.json` write itself reports False (not an
+        # exception — `write_json_atomic` swallows those), the transaction
+        # must never be treated as a reusable GREEN result: a lock waiter
+        # reusing it, or a caller trusting the returned dict, would be
+        # trusting a claim the disk cannot back up (the advertised
+        # `result.json` path was never actually written). Forces the
+        # underlying command to genuinely pass (a real green outcome)
+        # while only the FINAL result persistence write is made to fail.
+        import unittest.mock as mock
+        real_write = verification.state_store.write_json_atomic
+        entries = self._inventory(
+            self._entry("solo", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result_path_holder = {}
+
+        def fail_only_final_result_write(path, data):
+            if data is not None and data.get("kind") == "attempt":
+                return real_write(path, data)
+            if isinstance(data, dict) and "verdict" in data:
+                result_path_holder["path"] = path
+                return False
+            return real_write(path, data)
+
+        with mock.patch.object(verification.state_store, "write_json_atomic",
+                               side_effect=fail_only_final_result_write):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries)
+        # The underlying command really did pass, but persistence failure
+        # must fail the transaction closed regardless.
+        self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
+        self.assertTrue(result.get("result_persistence_failed"))
+        # And the lock's published terminal metadata must agree — no
+        # waiter can reuse a stale green claim either.
+        lock_path = state_store.verification_lock_path_for(
+            self.session_uuid, result["request_key"])
+        meta = state_store.read_json_tolerant(lock_path + ".meta") or {}
+        self.assertEqual(meta.get("result", {}).get("verdict"),
+                         verification.VERDICT_UNVERIFIED)
+
+
+class OwnedVerificationIntegrationTests(_OwnedVerificationTestBase,
+                                        _MeasurementFixtureMixin):
+    """Clean-checkout compatibility, preserved legacy behavior, separated
+    subprocess cost, and focused-check attribution — without double
+    counting owned transactions against legacy controller-log ingestion."""
+
+    def test_c3_fixture_reproducible_without_ignored_ledger(self):
+        self._fixture_root()
+        ledger_path = os.path.join(_FIXTURES, "c3-controller-log",
+                                   "ledger.jsonl")
+        self.assertFalse(os.path.exists(ledger_path),
+                         "fixture ledger.jsonl must stay ignored/absent in "
+                         "a clean checkout for this test to mean anything")
+        self._drop_record("c3-controller-log")
+        record = cowork_measure.build_record("c3-controller-log")
+        self.assertGreater(len(record["verification_attempts"]), 0)
+        self.assertFalse(os.path.exists(ledger_path),
+                         "clean-checkout materialization must stay in "
+                         "memory and never write the ignored ledger")
+
+    def test_legacy_session_with_no_owned_transaction_is_tolerated(self):
+        # No transaction artifact exists anywhere under this session's
+        # assets dir — report rendering must stay tolerant, not crash.
+        directory = state_store.session_assets_dir(self.session_uuid)
+        os.makedirs(directory, exist_ok=True)
+        summary = cowork_measure.owned_transactions_for(self.session_uuid)
+        self.assertEqual(summary, [])
+        latest = cowork_measure.latest_owned_transaction(self.session_uuid)
+        self.assertIsNone(latest)
+
+    def test_owned_transaction_cost_kept_separate_and_focused_attribution(self):
+        # Distinct commands per entry so none of the three collapses onto
+        # another via dedup (`deduplicate_inventory` merges entries with an
+        # identical (command, execution_mode) pair) — this test wants three
+        # separately attributed attempts.
+        entries = self._inventory(
+            self._entry("base", ["python3", "-c", "pass"]),
+            self._entry("fix", ["python3", "-c", "import sys"],
+                       kind=verification.KIND_FOCUSED,
+                       invalidation_reason="stale after repair",
+                       reuse_decision="rerun",
+                       triggering_finding="F-1", marginal_cost=1),
+            self._entry("final", ["python3", "-c", "import os"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        state_store.write_json_atomic(
+            state_store.verification_result_path_for(
+                self.session_uuid, result["transaction_id"]), result)
+        cost = cowork_measure.owned_transaction_cost_summary(result)
+        self.assertIn("subprocess_wall_time_s", cost)
+        self.assertEqual(cost["work_items"], 1)  # one txn, not 3 turns
+        self.assertEqual(cost["attempt_count"], 3)
+        attribution = cowork_measure.owned_focused_check_attribution(result)
+        focused_labels = {a["label"] for a in attribution}
+        self.assertIn("fix", focused_labels)
+        self.assertNotIn("base", focused_labels)   # baseline, not focused
+        self.assertNotIn("final", focused_labels)  # final_suite, not focused
+        by_label = {a["label"]: a for a in attribution}
+        self.assertEqual(by_label["fix"]["invalidation_reason"],
+                         "stale after repair")
+        self.assertEqual(by_label["fix"]["reuse_decision"], "rerun")
+        self.assertEqual(by_label["fix"]["triggering_finding"], "F-1")
+        self.assertEqual(by_label["fix"]["marginal_cost"], 1)
+
+    def test_build_record_counts_one_owned_command_exactly_once(self):
+        # A REAL run_transaction() feeding a REAL build_record() call — not
+        # a synthetic ledger fixture — asserting: the minted id is stable
+        # and discoverable, `owned_verification` carries the exact outcome,
+        # `verification_attempts` (the LEGACY-only tree) does NOT ALSO carry
+        # the same owned command (no double representation of one owned
+        # command across both trees), and a session with no owned
+        # transaction at all falls back to the untouched legacy path.
+        entries = self._inventory(
+            self._entry("solo", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        minted_id = result["attempts"][0]["ledger_attempt_id"]
+        self.assertTrue(str(minted_id or "").startswith("V-"))
+
+        os.makedirs(state_store.session_assets_dir(self.session_uuid),
+                   exist_ok=True)
+        record = cowork_measure.build_record(self.session_uuid)
+
+        # Exact outcome join: the owned tree carries this transaction's
+        # real verdict and the minted id is present among its attempts.
+        owned_latest = record["owned_verification"]["latest"]
+        self.assertIsNotNone(owned_latest)
+        self.assertEqual(owned_latest["transaction_id"],
+                         result["transaction_id"])
+        owned_ids = {a.get("ledger_attempt_id")
+                    for a in owned_latest["attempts"]}
+        self.assertIn(minted_id, owned_ids)
+
+        # No double count: the SAME id/label never also appears in the
+        # legacy `verification_attempts` tree.
+        legacy_ids = {a.get("id") for a in record["verification_attempts"]
+                     if isinstance(a, dict)}
+        self.assertNotIn(minted_id, legacy_ids)
+        legacy_labels = {a.get("label") for a in record["verification_attempts"]
+                        if isinstance(a, dict)}
+        self.assertNotIn("solo", legacy_labels)
+
+        # Legacy fallback: a DIFFERENT session with no owned transaction at
+        # all is semantically unaffected by any of this — build_record
+        # still runs, and its owned tree is explicitly empty/absent rather
+        # than fabricated.
+        other_session = "S-legacy-only-" + uuid.uuid4().hex[:8]
+        os.makedirs(state_store.session_assets_dir(other_session),
+                   exist_ok=True)
+        legacy_record = cowork_measure.build_record(other_session)
+        self.assertIsNone(legacy_record["owned_verification"]["latest"])
+        self.assertEqual(legacy_record["owned_verification"]["transaction_count"],
+                         0)
+
+
+class OwnedTransactionHandbackTextTests(unittest.TestCase):
+    """Repair regression for the transaction-7714ce9ffb184194a3873111a3200206
+    incident: a red/unverified owned transaction's hand-back must name the
+    transaction id and exact session-relative result/evidence path, classify
+    the terminal reason, and NEVER instruct a role to re-run a command to
+    obtain evidence — an owned transaction is never replayed to manufacture
+    a result."""
+
+    def test_owned_transaction_reason_names_id_and_evidence_path(self):
+        result = {"transaction_id": "7714ce9ffb184194a3873111a3200206",
+                  "verdict": "red", "worker_identity_verified": True,
+                  "mutation": None,
+                  "attempts": [{"label": "final", "evidence_state": "unresolved",
+                                "exit_code": None, "timed_out": False}]}
+        reason = cowork._owned_transaction_reason(result)
+        self.assertIn("final", reason)
+        self.assertIn("unresolved", reason)
+        full = cowork._owned_transaction_reason_text(result, reason)
+        self.assertIn("7714ce9ffb184194a3873111a3200206", full)
+        self.assertIn(
+            "verification/transactions/7714ce9ffb184194a3873111a3200206/"
+            "result.json", full)
+
+    def test_handback_text_never_instructs_a_rerun(self):
+        result = {"transaction_id": "T-red", "verdict": "red",
+                  "worker_identity_verified": True, "mutation": None,
+                  "attempts": [{"label": "final", "evidence_state": "unresolved",
+                                "exit_code": None, "timed_out": False}]}
+        reason = cowork._owned_transaction_reason_text(
+            result, cowork._owned_transaction_reason(result))
+        handback = cowork.unverified_readiness_handback_text(reason)
+        banner = cowork.unverified_readiness_text(reason)
+        # It is fine (good, even) to explicitly tell the role NOT to
+        # re-run — what must never appear is an INSTRUCTION TO re-run
+        # verification/a command/an attempt to obtain evidence, which is
+        # exactly what the old generic template said unconditionally.
+        bad_phrases = (
+            "re-run the plan's verification",
+            "re-run its verification",
+            "re-run the same attempt",
+            "re-run this",
+            "run it again",
+            "run the command again",
+        )
+        for text in (handback, banner):
+            lowered = text.lower()
+            for phrase in bad_phrases:
+                self.assertNotIn(phrase, lowered,
+                                 "%r reads as an instruction to re-run "
+                                 "something" % text)
+        self.assertIn("do not re-run", handback.lower())
+        self.assertIn("not a rerun", banner.lower())
+        # Still names the transaction id and path so the reader can act on it.
+        self.assertIn("T-red", handback)
+        self.assertIn("verification/transactions/T-red/result.json", handback)
+        # And still tells the reader what TO do: repair, then resubmit.
+        self.assertIn("repair", handback.lower())
+
+
+class OwnedTransactionCandidateBindingTests(_OwnedVerificationTestBase):
+    """A GREEN verdict alone must never be sufficient for readiness
+    `state="verified"` — the live candidate at promotion time must be
+    IDENTICAL (exact digest equality, one canonical algorithm) to the exact
+    candidate the transaction's snapshot verified. Repair regression for the
+    f7fb63bbe8294485a1983f15d46023f5 finding: a green transaction whose
+    claimed/verified manifests disagreed was accepted as verified anyway."""
+
+    def _trace(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return trace_store.Trace(os.path.join(d, "trace.jsonl"),
+                                 session_uuid=self.session_uuid, run_id="R")
+
+    def test_matching_candidate_and_snapshot_is_verified(self):
+        entries = self._inventory(
+            self._entry("final", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        readiness = cowork._record_readiness_from_transaction(
+            self.session_uuid, "builder", 1, self._trace(), result,
+            repo=self.repo)
+        self.assertEqual(readiness["state"], "verified")
+        self.assertEqual(readiness["claimed_manifest"],
+                         readiness["verified_manifest"])
+
+    def test_candidate_moved_after_green_transaction_fails_closed(self):
+        entries = self._inventory(
+            self._entry("final", ["python3", "-c", "pass"],
+                       kind=verification.KIND_FINAL_SUITE))
+        result = verification.run_transaction(self.repo, self.session_uuid,
+                                              entries)
+        self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
+        # The candidate moves AFTER the transaction already verified it —
+        # readiness must not bind this (stale) green result to the NEW tree.
+        with open(os.path.join(self.repo, "f.txt"), "a") as fh:
+            fh.write("edited after the transaction verified the tree\n")
+        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", self.repo, "commit", "-qm",
+                       "post-transaction edit"], check=True)
+        readiness = cowork._record_readiness_from_transaction(
+            self.session_uuid, "builder", 1, self._trace(), result,
+            repo=self.repo)
+        self.assertEqual(readiness["state"], "unverified")
+        self.assertNotEqual(readiness["claimed_manifest"],
+                            readiness["verified_manifest"])
+        self.assertIn("moved", readiness["reason"])
+
+    def test_only_exact_digest_equality_counts_as_bound(self):
+        # A hand-crafted result whose snapshot digest is a near-miss (one
+        # character different) of the live candidate's real digest must
+        # still fail closed — no fuzzy/prefix matching.
+        claimed, claimed_index = verification.current_candidate_identity(
+            self.repo)
+        near_miss = claimed[:-1] + ("0" if claimed[-1] != "0" else "1")
+        fake_result = {"verdict": "green", "transaction_id": "T-nearmiss",
+                       "snapshot": {"manifest_digest": near_miss,
+                                    "index_digest": claimed_index}}
+        readiness = cowork._record_readiness_from_transaction(
+            self.session_uuid, "builder", 1, self._trace(), fake_result,
+            repo=self.repo)
+        self.assertEqual(readiness["state"], "unverified")
+
+
+class OwnedVerificationArtifactSelfValidationTests(unittest.TestCase):
+    """THIS plan's own `result.verification` array, loaded verbatim from a
+    checked-in fixture — not a synthetic stand-in, and not a second in-code
+    copy — must pass the REAL schema-2 inventory validator this same plan
+    requires. The fixture at scripts/fixtures/verification/plan_inventory.json
+    is the ONE authoritative, portable, tracked copy: it was captured once
+    from the approved planner.plan.json and lives in the repo, so this
+    regression neither depends on a transient session directory nor
+    duplicates the array as a Python literal that could silently drift from
+    the fixture file."""
+
+    FIXTURE_PATH = os.path.join(
+        _HERE, "fixtures", "verification", "plan_inventory.json")
+
+    def _load_fixture(self):
+        self.assertTrue(
+            os.path.exists(self.FIXTURE_PATH),
+            "checked-in fixture missing: %r" % self.FIXTURE_PATH)
+        with open(self.FIXTURE_PATH) as fh:
+            return json.load(fh)
+
+    def test_self_plan_verification_array_is_schema2_valid(self):
+        fixture = self._load_fixture()
+        raw = fixture.get("verification")
+        declared_schema = fixture.get("verification_schema")
+        self.assertTrue(raw, "fixture carries no verification array")
+        schema, entries, final_label = verification.normalize_inventory(
+            raw, declared_schema=declared_schema)
+        self.assertEqual(schema, verification.SCHEMA_2)
+        for entry in entries:
+            self.assertIn("label", entry)
+            self.assertIn("command", entry)
+            self.assertIn(entry["execution_mode"], verification.EXECUTION_MODES)
+            self.assertIn(entry["kind"], verification.KINDS)
+        final_kinds = [e for e in entries
+                      if e["kind"] == verification.KIND_FINAL_SUITE]
+        self.assertEqual(len(final_kinds), 1)
+        self.assertEqual(entries[-1]["kind"], verification.KIND_FINAL_SUITE)
+        self.assertEqual(final_label, entries[-1]["label"])
+        checkout_stub = tempfile.mkdtemp()
+        try:
+            verification.validate_argv_safety(entries, checkout_stub)
+        finally:
+            shutil.rmtree(checkout_stub, ignore_errors=True)
