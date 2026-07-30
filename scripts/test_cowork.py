@@ -24759,6 +24759,34 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
         elif boundary["available"]:
             self.assertIn("--ro-bind", boundary["argv"])
 
+    def test_parent_worktree_does_not_shadow_selected_nested_worktree(self):
+        with tempfile.TemporaryDirectory() as root:
+            active = os.path.join(root, ".worktrees", "selected")
+            os.makedirs(active)
+            target = os.path.join(active, "builder-write.txt")
+            scope = action_policy.OwnedScope(
+                repo_roots=(active,), sibling_worktrees=(root,))
+            decision = action_policy.decide({
+                "class": "write",
+                "targets": [target],
+                "resolution_complete": True,
+            }, scope)
+            self.assertEqual(decision["reason"], "owned_target")
+            boundary = bridge.kernel_write_boundary(
+                scope, [sys.executable, "-c",
+                        "open(%r, 'w').write('ok')" % target])
+            if not boundary["available"]:
+                self.skipTest("kernel write boundary is unavailable")
+            if boundary["platform"] == "darwin":
+                self.assertNotIn(
+                    '(deny file-write* (subpath "%s"))' % root,
+                    boundary["profile"])
+            completed = subprocess.run(
+                boundary["argv"], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(Path(target).read_text(), "ok")
+
     def test_runtime_disables_delegation_even_with_concrete_parent_pins(self):
         import unittest.mock as mock
 

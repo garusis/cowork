@@ -1337,7 +1337,10 @@ outputs, and its private temp/controller-state directories. Deletes require an
 exact owned and recoverable target. A generated operating-system sandbox
 independently enforces those same roots. Registered sibling worktrees are
 discovered before every Claude launch and explicitly denied in both the action
-policy and kernel profile, including siblings nested below `.worktrees/`.
+policy and kernel profile when they sit at or below a writable root. When the
+selected worktree itself lives below the main checkout's `.worktrees/`
+directory, that registered parent remains read-only under the default deny
+without shadowing the more-specific selected root.
 The trace, action ledger, and child ledger remain outside the controller's
 writable scope. Isolated evaluators receive only their exact scratch output;
 live compatibility probes use the same guard, private state, non-delegating

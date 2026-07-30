@@ -490,6 +490,13 @@ def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
     roots = tuple(os.path.realpath(p) for p in owned_scope.writable_roots)
     siblings = tuple(os.path.realpath(p)
                      for p in owned_scope.sibling_worktrees)
+    # Explicit sibling denies are needed only when a sibling is nested inside
+    # a writable root. An ancestor sibling (the main checkout when the selected
+    # worktree lives under `.worktrees/`) is already read-only under the
+    # default deny and must not override the selected nested root.
+    nested_siblings = tuple(
+        sibling for sibling in siblings
+        if any(action_policy._inside(sibling, root) for root in roots))
     protected = tuple(dict.fromkeys(
         os.path.abspath(os.path.expanduser(p))
         for p in protected_paths if p))
@@ -505,7 +512,7 @@ def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
             lines.append('(allow file-write* (subpath "%s"))' % quote(root))
         # Seatbelt deny rules override broader allows. This is essential when a
         # repository convention nests sibling worktrees below the active root.
-        for root in siblings:
+        for root in nested_siblings:
             lines.append('(deny file-write* (literal "%s"))' % quote(root))
             lines.append('(deny file-write* (subpath "%s"))' % quote(root))
         for path in protected:
@@ -522,7 +529,7 @@ def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
         wrapper = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/"]
         for root in roots:
             wrapper += ["--bind", root, root]
-        for root in siblings:
+        for root in nested_siblings:
             wrapper += ["--ro-bind", root, root]
         for path in protected:
             wrapper += ["--ro-bind", os.path.realpath(path),

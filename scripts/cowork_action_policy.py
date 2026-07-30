@@ -484,9 +484,21 @@ def decide(action, scope, created_paths=(), clean_tracked_paths=()):
         if not target:
             return {"allow": False, "reason": "target_unresolved"}
         target = _real(target)
-        if any(target == p or _inside(target, p)
-               for p in scope.sibling_worktrees):
-            return {"allow": False, "reason": "sibling_worktree"}
+        owned_by_repo = any(
+            target == root or _inside(target, root)
+            for root in scope.repo_roots)
+        for sibling in scope.sibling_worktrees:
+            if not (target == sibling or _inside(target, sibling)):
+                continue
+            sibling_inside_owned = any(
+                sibling == root or _inside(sibling, root)
+                for root in scope.repo_roots)
+            # A selected worktree may intentionally live below the main
+            # worktree. Its ancestor is registered as a sibling, but must not
+            # shadow the more-specific active root. Siblings at or below an
+            # owned root still override that broader writable scope.
+            if sibling_inside_owned or not owned_by_repo:
+                return {"allow": False, "reason": "sibling_worktree"}
         if (scope.session_assets_dir and _inside(
                 target, scope.session_assets_dir)
                 and not (scope.is_declared_output(target)
