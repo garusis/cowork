@@ -1275,6 +1275,8 @@ piped/scripted runs fall back to plain text and `readline`.
 `-- scripts
     |-- cowork.py               # entry flow (questionary menus + args path) + phase loop + role orchestration
     |-- cowork_bridge.py        # flag assembly, stream-json framing, codex resume, probe
+    |-- cowork_profiles.py      # private controller state + reference-only authentication reuse
+    |-- cowork_action_policy.py # controller capability matrix + content-free action decisions
     |-- cowork_ui.py            # shared UX layer: prompt_toolkit input, Rich markdown/panels, color
     |-- cowork_preflight.py     # Python-version + pip-package + controller PATH checks
     |-- cowork_trace.py         # private JSONL orchestration trace writer
@@ -1300,28 +1302,29 @@ Agent/Task dispatch is therefore refused and durably recorded. Historical
 child telemetry remains readable; it is not evidence that current delegation
 is enabled.
 
-The capability matrix fails closed. Claude is currently the only controller
-that can run a normal governed role on macOS because its catch-all tool hooks
-and kernel boundary can govern direct work. It runs non-delegating:
-`Agent` and legacy `Task` are explicitly disallowed, and the broker independently
-denies either tool if that removal is bypassed. A documented nested hook carrying
-an unmatched `agent_id` is denied as `child_agent_correlation_unavailable`.
-Codex and OpenCode roles are refused before process launch because their
-transports cannot prove a pre-child decision or hard-remove delegation.
+The capability matrix fails closed. Claude and Codex can run normal governed
+roles on macOS because both expose catch-all local-tool hooks and run inside
+the generated kernel boundary. Both run non-delegating. Claude explicitly
+disallows `Agent` and legacy `Task`; Codex starts with `multi_agent` disabled
+through two independent config pins. The broker independently denies an
+`Agent`/`Task` attempt if either removal is bypassed. A nested hook carrying an
+unmatched `agent_id` is recorded as
+`child_agent_correlation_unavailable`. OpenCode is refused before process
+launch because its transport cannot prove a pre-child decision or hard-remove
+delegation.
 
 **Linux limitation:** normal governed Cowork roles currently have no supported
-controller on Linux. Claude is refused because isolated credential/state
-provisioning is not implemented there; Codex and OpenCode are refused because
-they lack a pre-child delegation decision. Preflight reports this before role
-dispatch. The presence of a bubblewrap profile generator does not constitute
-Linux controller support.
+controller on Linux. The safe authenticated-profile/bootstrap path is currently
+implemented only for macOS for Claude and Codex; OpenCode lacks the required
+delegation boundary. Preflight reports this before role dispatch. The presence
+of a bubblewrap profile generator does not constitute Linux controller support.
 
-Every tool call reaches an orchestrator-owned broker. Built-in mutation
-adapters must resolve all targets; Bash is proof-based and rejects unresolved
-globs, substitutions, inline interpreters, invoked scripts, unknown verbs, and
-incomplete redirects. Unknown local, plugin, and MCP tools are denied.
-Allowlisted reads require a tested installed-schema digest, and schema drift
-denies. Durable decisions contain hashes and reason codes rather than raw
+Every supported local tool call reaches an orchestrator-owned broker. Built-in
+mutation adapters must resolve all targets; Bash is proof-based and rejects
+unresolved globs, substitutions, inline interpreters, invoked scripts, unknown
+verbs, and incomplete redirects. Unknown local, plugin, and MCP tools are
+denied. Allowlisted reads require a tested installed-schema digest, and schema
+drift denies. Durable decisions contain hashes and reason codes rather than raw
 commands, delegated prompts, or absolute paths. Child requests retain only
 controller/model/effort identity, a digest, and byte length.
 
@@ -1347,12 +1350,27 @@ the connecting UID using Darwin `LOCAL_PEERCRED` (or Linux `SO_PEERCRED` where
 available). A platform with neither mechanism fails closed. Inode-checked
 cleanup cannot unlink a newer broker's socket.
 
-Guarded Claude sessions keep transcripts in a stable per-role controller-state
-directory recorded in `identities.json`. On the first resume of a legacy
-session, Cowork copies its uniquely matching transcript from the default
-Claude projects tree into that private layout; ambiguous matches fail closed.
-Ordinary trace events use serialized constant-work JSONL appends, while guard
-attempt records retain the scan-and-fsync exact-once path.
+Guarded controller authentication is reference-only and checked inside the
+exact production boundary before every process can make a model turn. Claude
+keeps the existing authenticated profile for macOS Keychain lookup, excludes
+its user/project/local settings, and temporarily links only Cowork's
+preselected session id to a transcript in the role-private controller-state
+directory. The link is removed when the session closes; the private transcript
+remains resumable. Codex receives a private `CODEX_HOME` whose `auth.json` is a
+read-only symlink to the existing owner-only login file. Its Cowork-owned
+`hooks.json`, the auth link, and the auth target are protected from controller
+writes. Neither path copies tokens, setup credentials, or an entire controller
+profile. Missing, permissively readable, mismatched, or unauthenticated
+references fail before a model process starts. The trace records only the
+controller, a bounded authentication-method category, success, duration, and
+error type.
+
+Claude transcripts remain in a stable per-role controller-state directory
+recorded in `identities.json`. On the first resume of a legacy session, Cowork
+copies its uniquely matching transcript from the default Claude projects tree
+into that private layout; ambiguous matches fail closed. Ordinary trace events
+use serialized constant-work JSONL appends, while guard attempt records retain
+the scan-and-fsync exact-once path.
 
 Child deltas come from content snapshots at child boundaries, including tracked
 and untracked repository files and declared outputs outside the repository.
