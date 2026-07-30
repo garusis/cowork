@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cowork_ingest as ingest  # noqa: E402
 import cowork_ledger as ledger  # noqa: E402
+import cowork_delta as delta_store  # noqa: E402
 import cowork_pricing as pricing  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
@@ -84,6 +85,8 @@ def _source_paths(session_uuid):
         "ledger": state_store.ledger_path_for(session_uuid),
         "evaluation_queue": state_store.evaluation_queue_path_for(
             session_uuid),
+        "children": state_store.children_path_for(session_uuid),
+        "actions": state_store.actions_path_for(session_uuid),
     }
 
 
@@ -162,7 +165,9 @@ def build_work(events):
         if name not in ("controller.turn.start", "controller.turn.end",
                         "controller.probe.start", "controller.probe.end",
                         "controller.turn.rejected",
-                        "eval.turn.start", "eval.turn.end"):
+                        "eval.turn.start", "eval.turn.end",
+                        "child.work.start", "child.work.end",
+                        "child.dispatch.blocked"):
             continue
         work_id = event.get("work_id")
         is_start = name.endswith(".start")
@@ -195,6 +200,16 @@ def build_work(events):
         entry = work.setdefault(work_id, {
             "work_id": work_id, "work_id_source": "stamped"})
         _merge_work(entry, event, is_start)
+        if name.startswith("child."):
+            entry["parent_work_id"] = event.get("parent_work_id")
+            entry["work_kind"] = (
+                "child_attempt" if name == "child.dispatch.blocked"
+                else "child")
+            if name == "child.dispatch.blocked":
+                entry["work_state"] = "blocked"
+                entry["reason"] = event.get("reason")
+                entry["duration_ms"] = event.get("duration_ms", 0)
+                continue
         if name == "controller.turn.rejected":
             # A rejected turn never began: it has no start to join to, and
             # recording it as an end would leave an orphan in the record. It is
@@ -227,6 +242,235 @@ def build_work(events):
     return work, orphans
 
 
+def child_work_from_ledger(records):
+    """Build stable child/blocked-attempt work items from append-only records."""
+    work = {}
+    for record in records or ():
+        if not isinstance(record, dict) or not record.get("work_id"):
+            continue
+        work_id = record["work_id"]
+        item = work.setdefault(work_id, {
+            "work_id": work_id, "work_id_source": "stamped",
+            "work_kind": ("child_attempt"
+                          if record.get("state") == "blocked" else "child"),
+            "work_class": "productive",
+            "parent_work_id": record.get("parent_work_id"),
+            "identity": record.get("effective_identity"),
+            "requested_identity": record.get("requested_identity"),
+            "pinned_input_digest": record.get("pinned_input_digest"),
+            "tool_use_id": record.get("tool_use_id"),
+            "usage_scope": UNKNOWN,
+            "tools": [],
+        })
+        for field in ("agent_id", "agent_type", "effective_policy",
+                      "terminal_source"):
+            if record.get(field) is not None:
+                item[field] = record[field]
+        state = record.get("state")
+        if state == "blocked":
+            item.update({"work_state": "blocked", "work_class": "productive",
+                         "reason": record.get("reason"), "duration_ms": 0})
+        elif state == "started":
+            item.setdefault("work_state", "in_flight")
+            item.setdefault("started_at", record.get("ts"))
+        elif state == "ended":
+            item["work_state"] = "complete"
+            item["ended_at"] = record.get("ts")
+            item["duration_ms"] = record.get("duration_ms", UNKNOWN)
+            if record.get("usage") is not None:
+                item["usage"] = record["usage"]
+                item["usage_scope"] = (
+                    record.get("usage_scope") or "child_native_sum")
+            if record.get("delta") is not None:
+                item["delta"] = record["delta"]
+        elif state == "tool":
+            tool = {
+                "name": record.get("tool_name"),
+                "tool_use_id": record.get("tool_use_id"),
+                "ts": record.get("ts"),
+            }
+            if tool not in item["tools"]:
+                item["tools"].append(tool)
+        elif state == "terminal_precedence":
+            item["terminal_source"] = record.get("terminal_source")
+    for item in work.values():
+        item["tool_count"] = len(item.get("tools") or [])
+        if item.get("work_state") == "in_flight":
+            item["duration_ms"] = UNKNOWN
+    return work
+
+
+def reconcile_guard_records(action_records, events):
+    """One record per guard attempt: broker > supervisor > stream fallback."""
+    by_id = {}
+    for record in action_records or ():
+        attempt_id = record.get("guard_attempt_id")
+        if attempt_id:
+            item = dict(record)
+            item["evidence_channel"] = "broker"
+            by_id[attempt_id] = item
+    for event in events or ():
+        attempt_id = event.get("guard_attempt_id")
+        if not attempt_id or attempt_id in by_id:
+            continue
+        if event.get("event") == "guard.broker.unavailable":
+            item = dict(event)
+            item["evidence_channel"] = "supervisor"
+            by_id[attempt_id] = item
+        elif event.get("event") == "action.policy.denied_offline":
+            item = dict(event)
+            item["evidence_channel"] = "stream"
+            by_id[attempt_id] = item
+    return [by_id[key] for key in sorted(by_id)]
+
+
+def reconcile_artifact_attribution(work, action_records):
+    """Join content deltas to actor-specific PostToolUse path evidence."""
+    deltas = {}
+    for work_id, item in (work or {}).items():
+        if item.get("work_kind") == "child" and isinstance(
+                item.get("delta"), dict):
+            deltas[work_id] = item["delta"]
+    evidence = {}
+    for record in action_records or ():
+        if (record.get("evidence_kind") != "mutation_effect"
+                or not record.get("work_id")):
+            continue
+        for digest in record.get("path_digests") or ():
+            actors = evidence.setdefault(digest, [])
+            if record["work_id"] not in actors:
+                actors.append(record["work_id"])
+    return delta_store.attribute(deltas, evidence)
+
+
+def nested_contributions(work, artifact_attribution):
+    """Build evidence-linked production and coordination contributions."""
+    contributions = []
+    for path, attribution in sorted((artifact_attribution or {}).items()):
+        mode = attribution.get("attribution") or UNKNOWN
+        actors = attribution.get("work_ids") or ()
+        if not actors:
+            contributions.append({
+                "work_id": UNKNOWN, "mode": "unattributed",
+                "artifact_path": path, "evidence": ["artifact_delta"],
+            })
+            continue
+        for actor in actors:
+            contributions.append({
+                "work_id": actor,
+                "mode": "contested" if mode == "contested" else "produced",
+                "artifact_path": path, "evidence": ["artifact_delta"],
+            })
+    for item in (work or {}).values():
+        if item.get("work_kind") != "child" or not item.get("parent_work_id"):
+            continue
+        evidence = [value for value in (
+            item.get("tool_use_id"), item.get("pinned_input_digest"))
+            if value]
+        contributions.append({
+            "work_id": item["parent_work_id"],
+            "child_work_id": item.get("work_id"),
+            "mode": "coordinated",
+            "artifact_path": None,
+            "evidence": evidence or [UNKNOWN],
+        })
+    return contributions
+
+
+def reconcile_nested(work, provider_totals=None):
+    """Exact-once nested usage with explicit per-axis arithmetic basis."""
+    provider_totals = provider_totals if isinstance(provider_totals, dict) \
+        else {}
+    axes = set(provider_totals)
+    for item in work.values():
+        if isinstance(item.get("usage"), dict):
+            axes.update(item["usage"])
+    totals = {}
+    basis = {}
+    comparable = True
+    reasons = {}
+    if not axes:
+        comparable = False
+        reasons["overall"] = "provider total unavailable"
+    for axis in sorted(axes):
+        parent_direct = 0
+        child_sum = 0
+        known = True
+        parent_bases = set()
+        for item in work.values():
+            usage = item.get("usage")
+            if item.get("work_kind") == "child_attempt":
+                continue
+            if not isinstance(usage, dict) or not isinstance(
+                    usage.get(axis), int):
+                known = False
+                continue
+            if item.get("work_kind") == "child":
+                child_sum += usage[axis]
+            else:
+                parent_direct += usage[axis]
+                parent_bases.add(item.get("usage_basis"))
+        provider = provider_totals.get(axis)
+        additive = parent_direct + child_sum
+        additive_allowed = bool(parent_bases) and parent_bases.issubset(
+            {"parent_message_sum", "parent_direct"})
+        inclusive_allowed = bool(parent_bases) and parent_bases.issubset(
+            {"parent_message_sum", "parent_inclusive"})
+        additive_match = (
+            known and additive_allowed and isinstance(provider, int)
+            and provider == additive)
+        inclusive_match = (
+            known and inclusive_allowed and isinstance(provider, int)
+            and provider == parent_direct)
+        # With no child usage the two arithmetic expressions are identical.
+        # Prefer the direct/additive name unless the source explicitly says
+        # inclusive; the numeric result remains exact either way.
+        if additive_match and not (
+                inclusive_match and parent_bases == {"parent_inclusive"}):
+            totals[axis] = provider
+            basis[axis] = "parent_direct_plus_children"
+            reasons[axis] = "provider total equals direct parent plus children"
+        elif inclusive_match:
+            totals[axis] = provider
+            basis[axis] = "parent_inclusive"
+            reasons[axis] = "provider total equals evidenced inclusive parent"
+        else:
+            totals[axis] = UNKNOWN
+            basis[axis] = UNKNOWN
+            if provider is None:
+                reasons[axis] = "provider total unavailable"
+            elif not known:
+                reasons[axis] = "native usage incomplete"
+            else:
+                reasons[axis] = "provider arithmetic or parent basis ambiguous"
+            comparable = False
+    contributions = []
+    work_items = []
+    for item in work.values():
+        if item.get("work_kind") not in ("child", "child_attempt"):
+            continue
+        work_items.append(dict(item))
+        contributions.append({
+            "work_id": item.get("work_id"),
+            "parent_work_id": item.get("parent_work_id"),
+            "kind": item.get("work_kind"),
+            "usage": item.get("usage", UNKNOWN),
+            "delta": item.get("delta", UNKNOWN),
+            "artifact_attribution": item.get(
+                "artifact_attribution", UNKNOWN),
+            "evidence": [v for v in (item.get("tool_use_id"),
+                                     item.get("pinned_input_digest")) if v],
+        })
+    work_items.sort(key=lambda item: item.get("work_id") or "")
+    return {"totals": totals, "basis": basis,
+            "comparable": comparable,
+            "comparability_reason": reasons,
+            "provider_totals": provider_totals or UNKNOWN,
+            "contributions": contributions,
+            "contribution_count": len(contributions),
+            "work_items": work_items}
+
+
 def _merge_work(entry, event, is_start):
     if is_start:
         entry["started_at"] = event.get("ts")
@@ -246,6 +490,11 @@ def _merge_work(entry, event, is_start):
             entry["usage"] = event.get("usage")
         if event.get("usage_native") is not None:
             entry["usage_native"] = event.get("usage_native")
+        if event.get("provider_usage_total") is not None:
+            entry["provider_usage_total"] = event.get(
+                "provider_usage_total")
+        if event.get("usage_basis") is not None:
+            entry["usage_basis"] = event.get("usage_basis")
         # The END's class wins: a turn that started as `productive` and ended
         # cancelled IS cancelled. The purpose it was launched with does not
         # survive the way it actually finished.
@@ -1193,6 +1442,94 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
     ledger_records = ledger.read_ledger(paths["ledger"])
 
     work, orphans = build_work(events)
+    child_records = _read_jsonl(paths["children"])
+    action_records = _read_jsonl(paths["actions"])
+    for work_id, entry in child_work_from_ledger(child_records).items():
+        if work_id in work:
+            work[work_id].update({k: v for k, v in entry.items()
+                                  if v is not None})
+        else:
+            work[work_id] = entry
+    artifact_attribution = reconcile_artifact_attribution(
+        work, action_records)
+    for work_id, entry in work.items():
+        if entry.get("work_kind") not in ("child", "child_attempt"):
+            continue
+        entry["artifact_attribution"] = {
+            path: item for path, item in artifact_attribution.items()
+            if work_id in (item.get("work_ids") or ())
+        }
+    nested_governed = any(event.get("event") == "nested.guard.ready"
+                          for event in events)
+    if nested_governed:
+        provider_totals = {}
+        for entry in work.values():
+            if entry.get("work_kind") in ("child", "child_attempt"):
+                continue
+            provider = entry.get("provider_usage_total")
+            if not isinstance(provider, dict):
+                continue
+            for axis, value in provider.items():
+                if isinstance(value, int) and not isinstance(value, bool):
+                    provider_totals[axis] = provider_totals.get(axis, 0) + value
+        nested = reconcile_nested(work, provider_totals or None)
+        nested["artifact_attribution"] = artifact_attribution
+        nested["contributions"] = nested_contributions(
+            work, artifact_attribution)
+        nested["contribution_count"] = len(nested["contributions"])
+        if not nested.get("comparable"):
+            incomplete.append({
+                "field": "record.nested.totals",
+                "reason": "nested provider arithmetic is absent or ambiguous",
+            })
+        required_child_fields = (
+            "identity", "effective_policy", "duration_ms", "usage",
+            "tools", "tool_count", "work_state", "delta", "agent_id",
+            "started_at")
+        required_identity_fields = (
+            "controller", "model", "model_source", "effort",
+            "effort_source")
+        for work_id, entry in work.items():
+            if entry.get("work_kind") != "child":
+                continue
+            for field in required_child_fields:
+                value = entry.get(field, UNKNOWN)
+                if value in (None, UNKNOWN):
+                    incomplete.append({
+                        "field": "record.work[%s].%s" % (work_id, field),
+                        "reason": "child telemetry field unavailable",
+                    })
+            if entry.get("work_state") == "complete":
+                for field in ("ended_at", "terminal_source"):
+                    if entry.get(field, UNKNOWN) in (None, UNKNOWN):
+                        incomplete.append({
+                            "field": "record.work[%s].%s" % (work_id, field),
+                            "reason": "child terminal field unavailable",
+                        })
+            identity = entry.get("identity")
+            for field in required_identity_fields:
+                value = (identity.get(field, UNKNOWN)
+                         if isinstance(identity, dict) else UNKNOWN)
+                if value in (None, UNKNOWN):
+                    incomplete.append({
+                        "field": "record.work[%s].identity.%s"
+                                 % (work_id, field),
+                        "reason": "child identity source unavailable",
+                    })
+    else:
+        nested = {
+            "state": UNKNOWN, "totals": UNKNOWN, "basis": UNKNOWN,
+            "comparable": False, "contributions": UNKNOWN,
+            "contribution_count": UNKNOWN,
+            "comparability_reason": UNKNOWN,
+            "provider_totals": UNKNOWN,
+            "artifact_attribution": UNKNOWN,
+            "work_items": UNKNOWN,
+        }
+        incomplete.append({
+            "field": "record.nested",
+            "reason": "session predates governed child telemetry; nested "
+                      "work and all-in cost are unknown"})
     if any(entry.get("work_id_source") == "synthesized"
            for entry in work.values()):
         incomplete.append({
@@ -1322,6 +1659,10 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
         "work": work,
         "orphan_ends": orphans,
         "cost": costs,
+        "nested": nested,
+        "contribution": (nested.get("contributions", UNKNOWN)
+                         if isinstance(nested, dict) else UNKNOWN),
+        "guard_decisions": reconcile_guard_records(action_records, events),
         "duration": {"by_class": duration_by_class(work, wait_ms,
                                                    user_wait_spans=wait_spans),
                      "user_wait_spans": wait_spans,

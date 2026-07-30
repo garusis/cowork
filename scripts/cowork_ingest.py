@@ -154,6 +154,7 @@ class Result:
         self.tool_activity = fields.get("tool_activity") or []
         self.verification_attempts = fields.get("verification_attempts") or []
         self.mutations = fields.get("mutations") or []
+        self.child_turns = fields.get("child_turns")
         self.digest_before = fields.get("digest_before")
         self.digest_after = fields.get("digest_after")
         self.lines_read = fields.get("lines_read", 0)
@@ -184,6 +185,7 @@ class Result:
             "tool_activity": self.tool_activity,
             "verification_attempts": self.verification_attempts,
             "mutations": self.mutations,
+            "child_turns": self.child_turns,
             "digest_before": self.digest_before,
             "digest_after": self.digest_after,
             "read_only_verified": self.read_only_verified,
@@ -679,6 +681,7 @@ def ingest_claude(path):
     activity = []
     attempts = []
     mutations = []
+    child_turns = []
 
     for rec in records:
         rtype = rec.get("type")
@@ -687,7 +690,7 @@ def ingest_claude(path):
         if rtype == "assistant":
             usage = message.get("usage")
             if isinstance(usage, dict):
-                turns.append({
+                turn = {
                     "controller": "claude",
                     "controller_session_id": rec.get("sessionId"),
                     "timestamp": rec.get("timestamp"),
@@ -696,7 +699,16 @@ def ingest_claude(path):
                     "usage_scope": "turn_native",
                     "usage": _int_fields(usage),
                     "model": message.get("model"),
-                })
+                }
+                parent_tool_use_id = rec.get("parent_tool_use_id")
+                if parent_tool_use_id:
+                    turn.update({
+                        "parent_tool_use_id": parent_tool_use_id,
+                        "provenance": "transcript_fallback",
+                    })
+                    child_turns.append(turn)
+                else:
+                    turns.append(turn)
             for block in message.get("content") or []:
                 if not isinstance(block, dict):
                     continue
@@ -785,7 +797,8 @@ def ingest_claude(path):
 
     return Result("ok" if state == "ok" else state, path=path,
                   controller="claude", controller_session_id=session_id,
-                  turns=turns, tool_activity=activity,
+                  turns=turns, child_turns=child_turns,
+                  tool_activity=activity,
                   verification_attempts=attempts, mutations=mutations,
                   digest_before=digest_before, digest_after=_digest(path),
                   **stats)
@@ -1323,7 +1336,11 @@ def ingest_session(identities, cwd=None, claude_root=None, codex_root=None):
         session_id = identity.get("session_id") or identity.get("thread_id")
         try:
             if tool == "claude":
-                path = locate_claude_log(session_id, cwd=cwd, root=claude_root)
+                role_root = claude_root
+                state_dir = identity.get("controller_state_dir")
+                if role_root is None and state_dir:
+                    role_root = os.path.join(state_dir, "projects")
+                path = locate_claude_log(session_id, cwd=cwd, root=role_root)
                 out[role] = ingest_claude(path)
             elif tool == "codex":
                 path = locate_codex_log(session_id, root=codex_root)

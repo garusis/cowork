@@ -107,6 +107,15 @@ LINEAGE = (
     ("cost.unreconciled", "cost.unreconciled"),
     ("cost.incomparable_turns", "cost.incomparable.turns"),
     ("cost.unclassified_turns", "cost.unclassified.turns"),
+    ("nested.work", "nested.work_items"),
+    ("nested.totals", "nested.totals"),
+    ("nested.basis", "nested.basis"),
+    ("nested.comparable", "nested.comparable"),
+    ("nested.comparability_reason", "nested.comparability_reason"),
+    ("nested.provider_totals", "nested.provider_totals"),
+    ("nested.artifact_attribution", "nested.artifact_attribution"),
+    ("nested.contributions", "nested.contributions"),
+    ("nested.contribution_count", "nested.contribution_count"),
     ("duration.by_class", "duration.by_class"),
     ("duration.user_wait_ms", "duration.by_class.user_wait_ms"),
     ("duration.user_wait_span_count", "duration.user_wait_span_count"),
@@ -201,6 +210,8 @@ def render_report(record):
     lines.append("")
 
     lines.extend(_section_cost(record))
+    lines.extend(_section_nested_work(record))
+    lines.extend(_section_nested_cost(record))
     lines.extend(_section_duration(record))
     lines.extend(_section_input(record))
     lines.extend(_section_verification(record))
@@ -218,6 +229,74 @@ def render_report(record):
     lines.extend(_section_completion(record))
     lines.extend(_section_incomplete(record))
     return "\n".join(lines) + "\n"
+
+
+def _section_nested_work(record):
+    lines = ["Nested work", "-" * 56]
+    nested = _at(record, "nested.work_items", [])
+    if not isinstance(nested, list):
+        lines.extend(["  (nested work unknown for this record)", ""])
+        return lines
+    if not nested:
+        lines.extend(["  (no governed child work recorded)", ""])
+        return lines
+    for item in nested:
+        identity = item.get("identity") or {}
+        lines.append("  %s  %s  %s/%s" % (
+            _fmt(item.get("work_kind")), _fmt(item.get("work_state")),
+            _fmt(identity.get("controller")), _fmt(identity.get("model"))))
+        lines.append("      id=%s parent=%s duration=%s usage=%s" % (
+            _fmt(item.get("work_id")), _fmt(item.get("parent_work_id")),
+            _fmt(item.get("duration_ms")), _fmt(item.get("usage"))))
+        lines.append(
+            "      identity_sources=model:%s effort:%s policy=%s" % (
+                _fmt(identity.get("model_source")),
+                _fmt(identity.get("effort_source")),
+                _fmt(item.get("effective_policy"))))
+        lines.append("      agent=%s tools=%s terminal=%s" % (
+            _fmt(item.get("agent_id")), _fmt(item.get("tool_count")),
+            _fmt(item.get("terminal_source"))))
+        if item.get("reason"):
+            lines.append("      blocked: %s" % item["reason"])
+        if item.get("delta") is not None:
+            lines.append("      delta: %s" % _fmt(item["delta"]))
+        if item.get("artifact_attribution") is not None:
+            lines.append("      attribution: %s" %
+                         _fmt(item["artifact_attribution"]))
+    lines.append("")
+    return lines
+
+
+def _section_nested_cost(record):
+    nested = _at(record, "nested", {})
+    lines = ["Nested all-in cost", "-" * 56]
+    if not isinstance(nested, dict) or not nested:
+        lines.extend(["  (nested accounting unavailable)", ""])
+        return lines
+    lines.append("  comparable: %s" % _fmt(nested.get("comparable")))
+    lines.append("  totals: %s" % _fmt(nested.get("totals")))
+    lines.append("  basis: %s" % _fmt(nested.get("basis")))
+    lines.append("  reason: %s" %
+                 _fmt(nested.get("comparability_reason")))
+    lines.append("  provider totals: %s" %
+                 _fmt(nested.get("provider_totals")))
+    lines.append("  artifact attribution: %s" %
+                 _fmt(nested.get("artifact_attribution")))
+    lines.append("  contributions: %s" %
+                 _fmt(nested.get("contribution_count")))
+    contributions = nested.get("contributions")
+    if isinstance(contributions, list):
+        for item in contributions:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "    actor=%s mode=%s child=%s artifact=%s evidence=%s" % (
+                    _fmt(item.get("work_id")), _fmt(item.get("mode")),
+                    _fmt(item.get("child_work_id")),
+                    _fmt(item.get("artifact_path")),
+                    _fmt(item.get("evidence"))))
+    lines.append("")
+    return lines
 
 
 def _section_cost(record):
