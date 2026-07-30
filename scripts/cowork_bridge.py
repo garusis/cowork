@@ -26,9 +26,14 @@ Python 3.9+, stdlib only.
 
 import json
 import os
+import re
+import shutil
+import shlex
 import subprocess
 import sys
+import threading
 import time
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -40,15 +45,30 @@ import cowork_probe_cache as probe_cache  # noqa: E402
 # statement, so a disallowed controller can never be started — not even for a
 # probe or an agent-file write — regardless of which call site was used.
 import cowork_policy as policy  # noqa: E402
+import cowork_action_policy as action_policy  # noqa: E402
+import cowork_state as state_store  # noqa: E402
+import cowork_guard_broker as guard_broker  # noqa: E402
 # Re-exported so existing callers/tests keep using bridge.USER_LABEL /
 # bridge.speaker_label; the canonical definitions live in cowork_ui.
 from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
 
 DEFAULT_ROLE_PROMPT = "roles/scout.md"
+_NESTED_GUARD_ACTIVE = False
 
 # The spinner moved to cowork_ui (both bridges + the loop share it). Alias kept
 # for back-compat.
 _Spinner = ui.Spinner
+
+
+def set_nested_guard_active(value):
+    global _NESTED_GUARD_ACTIVE
+    prior = _NESTED_GUARD_ACTIVE
+    _NESTED_GUARD_ACTIVE = bool(value)
+    return prior
+
+
+def nested_guard_active():
+    return _NESTED_GUARD_ACTIVE
 
 
 def turn_result(ok=True, result="ok", **fields):
@@ -109,7 +129,8 @@ def codex_mode_flags(mode, yolo):
 
 def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
                          resume_id=None, extra_writable_dir=None,
-                         model=None, effort=None):
+                         model=None, effort=None, guard_settings_path=None,
+                         delegation_allowed=True):
     """Full argv for a persistent duplex claude scout process.
 
     Pass `session_id` to pin a known UUID on a fresh session (so it can be saved
@@ -143,6 +164,11 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         cmd += ["--model", model]
     if effort:
         cmd += ["--effort", effort]
+    if guard_settings_path:
+        cmd += ["--settings", guard_settings_path]
+    if not delegation_allowed:
+        # Both names are needed across the Agent/legacy Task CLI transition.
+        cmd += ["--disallowedTools", "Agent", "Task"]
     if extra_writable_dir:
         cmd += ["--add-dir", extra_writable_dir]
     if resume_id:
@@ -150,6 +176,261 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     elif session_id:
         cmd += ["--session-id", session_id]
     return cmd
+
+
+def guard_settings_document(guard_script, socket_path=None,
+                            context_path=None):
+    """Claude settings with catch-all interception and lifecycle hooks."""
+    command = [sys.executable, guard_script]
+    if context_path:
+        command += ["--context", context_path]
+    hook = {"type": "command",
+            "command": " ".join(shlex.quote(part) for part in command),
+            "timeout": 5}
+    # PreToolUse intentionally has no matcher: unknown/plugin/MCP tools must
+    # reach the broker too.
+    return {"hooks": {
+        "PreToolUse": [{"hooks": [hook]}],
+        "PostToolUse": [{"hooks": [hook]}],
+        "SubagentStart": [{"hooks": [hook]}],
+        "SubagentStop": [{"hooks": [hook]}],
+    }}
+
+
+def write_guard_settings(path, guard_script, socket_path=None,
+                         context_path=None):
+    doc = guard_settings_document(
+        guard_script, socket_path=socket_path, context_path=context_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def _declared_outputs_for_role(assets_dir, role):
+    names = {
+        "scout": ("scout.intel.json", "scout.intel.md"),
+        "scout-reviewer": ("scout-review.json",),
+        "planner": ("planner.plan.json", "planner.plan.md"),
+        "planning-advisor": ("planner-review.json",),
+        "builder": ("builder.status.json", "builder.summary.md"),
+        "build-reviewer": ("builder-review.json",),
+        "worktree": ("worktree.status.json",),
+    }.get(role)
+    if names is None:
+        # Evaluators write only their own role-named scratch artifact.
+        names = ("eval.%s.json" % role,)
+    return tuple(os.path.join(assets_dir, name) for name in names)
+
+
+def _git_worktree_scope(cwd):
+    """Return active root and its registered sibling worktrees, or fail closed."""
+    try:
+        top = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10)
+        if top.returncode != 0 or not top.stdout.strip():
+            raise RuntimeError("git_toplevel_unavailable")
+        active = os.path.realpath(top.stdout.strip())
+        listed = subprocess.run(
+            ["git", "-C", active, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=10)
+        if listed.returncode != 0:
+            raise RuntimeError("git_worktree_inventory_unavailable")
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise RuntimeError("git_worktree_inventory_unavailable") from exc
+    roots = []
+    for line in listed.stdout.splitlines():
+        if line.startswith("worktree "):
+            root = os.path.realpath(line[len("worktree "):].strip())
+            if root and root != active:
+                roots.append(root)
+    return active, tuple(dict.fromkeys(roots))
+
+
+def migrate_legacy_claude_resume(controller_state, resume_id,
+                                 legacy_root=None):
+    """Copy a pre-isolation Claude transcript into the private state root.
+
+    The relative project layout is preserved because Claude uses that layout
+    when resolving ``--resume``. Ambiguous legacy ids fail closed.
+    """
+    if not resume_id:
+        return None
+    projects = os.path.join(controller_state, "projects")
+    wanted = str(resume_id) + ".jsonl"
+    for base, _dirs, files in os.walk(projects):
+        if wanted in files:
+            return os.path.join(base, wanted)
+    legacy_projects = legacy_root or os.path.join(
+        os.path.expanduser("~"), ".claude", "projects")
+    matches = []
+    for base, _dirs, files in os.walk(legacy_projects):
+        if wanted in files:
+            matches.append(os.path.join(base, wanted))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError("legacy_resume_ambiguous")
+    relative = os.path.relpath(matches[0], legacy_projects)
+    target = os.path.join(projects, relative)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copy2(matches[0], target)
+    return target
+
+
+def _guard_runtime(trace, role, assets_dir, model, effort,
+                   delegation_allowed, declared_outputs=None, resume_id=None,
+                   repo_writable=True):
+    session_uuid = getattr(trace, "session_uuid", None)
+    if not (session_uuid and assets_dir):
+        raise RuntimeError("guard_context_unavailable")
+    if sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "controller_state_unavailable: isolated Claude credentials "
+            "were not provisioned")
+    guard_dir = state_store.guard_dir_for(session_uuid)
+    role_temp = os.path.join(guard_dir, "tmp", role)
+    controller_state = state_store.controller_state_dir_for(session_uuid, role)
+    os.makedirs(role_temp, exist_ok=True)
+    os.makedirs(controller_state, exist_ok=True)
+    active_root, sibling_worktrees = _git_worktree_scope(os.getcwd())
+    # Evaluators are intrinsically evidence readers. Keep this invariant at the
+    # boundary as well as at their production caller so a future call site
+    # cannot accidentally restore repository mutation authority.
+    if role == "evaluator":
+        repo_writable = False
+    if resume_id:
+        migrate_legacy_claude_resume(controller_state, resume_id)
+    scope = action_policy.OwnedScope(
+        repo_roots=((active_root,) if repo_writable else ()),
+        declared_outputs=(tuple(declared_outputs)
+                          if declared_outputs is not None
+                          else _declared_outputs_for_role(assets_dir, role)),
+        role_temp_dir=role_temp, controller_state_dir=controller_state,
+        session_assets_dir=assets_dir, sibling_worktrees=sibling_worktrees)
+    boundary = kernel_write_boundary(scope)
+    if not boundary["available"]:
+        raise RuntimeError(boundary["reason"])
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    socket_path = state_store.guard_socket_path_for(
+        session_uuid, role, token)
+    settings_path = state_store.guard_settings_path_for(session_uuid, role)
+    parent = {
+        "controller": "claude", "controller_source": "config_pinned",
+        "model": model, "model_source": (
+            "config_pinned" if model else "unknown"),
+        "effort": effort, "effort_source": (
+            "config_pinned" if effort else "unknown"),
+    }
+    capability_allowlist, _ = state_store.read_capability_allowlist(
+        session_uuid)
+    context_path = state_store.guard_context_path_for(session_uuid, role)
+    context_tmp = context_path + ".tmp"
+    with open(context_tmp, "w") as fh:
+        json.dump({
+            "role": role, "socket_path": socket_path, "token": token,
+            "parent_identity": parent,
+            "owned_roots": list(scope.writable_roots),
+        }, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(context_tmp, context_path)
+    write_guard_settings(
+        settings_path,
+        os.path.join(os.path.dirname(__file__), "cowork_action_guard.py"),
+        socket_path=socket_path, context_path=context_path)
+    broker = guard_broker.GuardBroker(
+        socket_path, token, scope, state_store.actions_path_for(session_uuid),
+        state_store.children_path_for(session_uuid),
+        trace_store.trace_path_for(session_uuid), parent,
+        capability_allowlist=capability_allowlist)
+    thread = threading.Thread(target=broker.serve_forever,
+                              name="cowork-guard-%s" % role, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2.0
+    while not os.path.exists(socket_path) and thread.is_alive():
+        if time.monotonic() >= deadline:
+            broker.stop()
+            raise RuntimeError("guard_broker_start_timeout")
+        time.sleep(0.01)
+    if not thread.is_alive():
+        raise RuntimeError("guard_broker_start_failed")
+    # Claude's documented SubagentStart payload exposes agent_id but no Agent
+    # tool_use_id.  There is therefore no concurrency-safe join from the
+    # pre-dispatch decision to nested hooks.  Keep the role usable, but remove
+    # Agent/Task from the controller and make the broker refuse any bypass.
+    can_delegate = False
+    trace.event("nested.guard.ready", role=role, controller="claude",
+                delegation="enforceably_disabled",
+                delegation_reason="child_agent_correlation_unavailable",
+                kernel_boundary=boundary.get("platform"))
+    env = dict(os.environ)
+    env.update({"CLAUDE_CONFIG_DIR": controller_state,
+                "TMPDIR": role_temp})
+    return {"scope": scope, "boundary": boundary, "broker": broker,
+            "thread": thread, "settings_path": settings_path, "env": env,
+            "context_path": context_path,
+            "delegation_allowed": can_delegate}
+
+
+def _stamp_guard_parent_work(runtime, work_id):
+    """Publish the current parent work id for raw hook payload enrichment."""
+    path = (runtime or {}).get("context_path")
+    if not path:
+        return
+    with open(path, "r") as fh:
+        context = json.load(fh)
+    context["current_parent_work_id"] = work_id
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(context, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def kernel_write_boundary(owned_scope, argv=None):
+    """Return a generated kernel-boundary description, or fail closed.
+
+    macOS seatbelt is emitted as an argv wrapper. Linux requires bubblewrap;
+    unsupported platforms return an unavailable result rather than silently
+    launching without a boundary.
+    """
+    roots = tuple(os.path.realpath(p) for p in owned_scope.writable_roots)
+    siblings = tuple(os.path.realpath(p)
+                     for p in owned_scope.sibling_worktrees)
+    if sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        def quote(value):
+            return value.replace("\\", "\\\\").replace('"', '\\"')
+        lines = ["(version 1)", "(allow default)", "(deny file-write*)",
+                 '(allow file-write* (literal "/dev/null"))',
+                 '(allow file-write* (literal "/dev/tty"))',
+                 '(allow file-write* (subpath "/dev/fd"))']
+        for root in roots:
+            lines.append('(allow file-write* (literal "%s"))' % quote(root))
+            lines.append('(allow file-write* (subpath "%s"))' % quote(root))
+        # Seatbelt deny rules override broader allows. This is essential when a
+        # repository convention nests sibling worktrees below the active root.
+        for root in siblings:
+            lines.append('(deny file-write* (literal "%s"))' % quote(root))
+            lines.append('(deny file-write* (subpath "%s"))' % quote(root))
+        profile = "\n".join(lines) + "\n"
+        wrapper = ["sandbox-exec", "-p", profile]
+        return {"available": True, "platform": "darwin",
+                "profile": profile,
+                "argv": wrapper + list(argv or ())}
+    if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        wrapper = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/"]
+        for root in roots:
+            wrapper += ["--bind", root, root]
+        for root in siblings:
+            wrapper += ["--ro-bind", root, root]
+        return {"available": True, "platform": "linux", "profile": None,
+                "argv": wrapper + list(argv or ())}
+    return {"available": False, "platform": sys.platform, "profile": None,
+            "argv": None, "reason": "kernel_boundary_unavailable"}
 
 
 def codex_model_args(model=None, effort=None):
@@ -399,6 +680,20 @@ def parse_claude_event(obj):
     etype = obj.get("type")
     if etype == "assistant":
         msg = obj.get("message", {}) or {}
+        parent_tool_use_id = obj.get("parent_tool_use_id")
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else None
+        if parent_tool_use_id:
+            tools = []
+            for part in msg.get("content", []) if isinstance(
+                    msg.get("content"), list) else []:
+                if isinstance(part, dict) and part.get("type") == "tool_use":
+                    tools.append({"name": part.get("name"),
+                                  "tool_use_id": part.get("id")})
+            return {"kind": "child_usage", "parent_tool_use_id":
+                    parent_tool_use_id, "usage": usage, "tools": tools,
+                    "text": _text_from_content(msg.get("content")),
+                    "event_id": obj.get("uuid") or obj.get("requestId"),
+                    "replayed": bool(obj.get("replayed"))}
         text = _text_from_content(msg.get("content"))
         # Claude CLI may wrap an API/authentication failure in a synthetic
         # assistant event and later emit a nominally successful zero-token
@@ -414,7 +709,10 @@ def parse_claude_event(obj):
                     _text_from_content(part.get("content"))
                 ):
                     return {"kind": "denied", "text": _text_from_content(part.get("content"))}
-        return {"kind": "assistant", "text": text}
+        parsed = {"kind": "assistant", "text": text}
+        if usage is not None:
+            parsed["usage"] = usage
+        return parsed
     if etype == "result":
         subtype = obj.get("subtype", "")
         is_error = "error" in (subtype or "")
@@ -429,6 +727,16 @@ def parse_claude_event(obj):
             "usage": _usage_from_result(obj),
         }
     if etype == "system":
+        if obj.get("subtype") in ("subagent_start", "subagent_started"):
+            return {"kind": "child_start", "agent_id": obj.get("agent_id"),
+                    "agent_type": obj.get("agent_type"),
+                    "tool_use_id": obj.get("tool_use_id")
+                    or obj.get("parent_tool_use_id")}
+        if obj.get("subtype") in ("subagent_stop", "subagent_stopped"):
+            return {"kind": "child_end", "agent_id": obj.get("agent_id"),
+                    "tool_use_id": obj.get("tool_use_id")
+                    or obj.get("parent_tool_use_id"),
+                    "event_id": obj.get("uuid") or obj.get("event_id")}
         if obj.get("subtype") == "api_error":
             error = obj.get("error") or {}
             text = (error.get("formatted") or error.get("message")
@@ -438,7 +746,7 @@ def parse_claude_event(obj):
         # The init system event names the live model (traceability: which
         # model actually served this session, not just which was requested).
         return {"kind": "system", "subtype": obj.get("subtype", ""),
-                "model": obj.get("model")}
+                "model": obj.get("model"), "tools": obj.get("tools")}
     if etype == "stream_event":
         event = obj.get("event") or {}
         delta = event.get("delta") or {}
@@ -603,15 +911,16 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                              role_prompt_file=DEFAULT_ROLE_PROMPT, trace=None,
                              role="scout", extra_writable_dir=None,
                              cache_enabled=False, version_fn=None,
-                             cache_path=None):
+                             cache_path=None, model=None, effort=None):
     """Send one minimal user message to claude and confirm an assistant/result
     event comes back.
 
     spawn(command, stdin_text) -> iterable of raw event dicts (json objects).
     Returns (ok, alert_or_None). On an unsupported shape, ok is False and alert
     explains the failure rather than proceeding on a guessed schema.
-    `extra_writable_dir` mirrors the live session's writable-root grant so the
-    pre-first-token probe runs with the same sandbox.
+    `extra_writable_dir` locates private session state. A live probe deliberately
+    receives a narrower write scope than the role it precedes: controller
+    state/temp only, with no repository or declared role outputs.
 
     #3 probe cache: when `cache_enabled` (the live launch call sites pass True;
     tests and existing callers default to False, keeping the always-live-probe
@@ -639,11 +948,33 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                             role=role, prompt_kind="probe", mode=mode, yolo=yolo,
                             role_prompt_file=role_prompt_file)
             return True, None
+    # The live probe is a distinct audited work item. Mint and publish its id
+    # before the process exists so every hook decision can join to it.
+    probe_work_id = trace_store.new_work_id()
+    probe_started = time.monotonic()
+    runtime = None
+    if nested_guard_active():
+        runtime = _guard_runtime(
+            trace, role, extra_writable_dir, model, effort, False,
+            declared_outputs=(), repo_writable=False)
+        _stamp_guard_parent_work(runtime, probe_work_id)
+        command = build_claude_command(
+            role_prompt_file, mode, yolo,
+            extra_writable_dir=extra_writable_dir, model=model, effort=effort,
+            guard_settings_path=runtime["settings_path"],
+            delegation_allowed=runtime["delegation_allowed"])
+        env_argv = [shutil.which("env") or "/usr/bin/env"]
+        env_argv += ["%s=%s" % (key, runtime["env"][key])
+                     for key in ("CLAUDE_CONFIG_DIR", "TMPDIR")]
+        boundary = kernel_write_boundary(
+            runtime["scope"], env_argv + command)
+        if not boundary["available"]:
+            runtime["broker"].stop()
+            raise RuntimeError(boundary["reason"])
+        command = boundary["argv"]
     stdin_text = encode_user_message("ping")
     # The probe is its own unit of work (P1): a probe's cost is real and is
     # classified `probe` rather than folded into the role turn that follows it.
-    probe_work_id = trace_store.new_work_id()
-    probe_started = time.monotonic()
 
     def _probe_elapsed_ms():
         return int((time.monotonic() - probe_started) * 1000)
@@ -702,6 +1033,9 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
             "    Confirm `claude` is installed and supports "
             "`--input-format stream-json`." % exc
         )
+    finally:
+        if runtime:
+            runtime["broker"].stop()
     if trace:
         trace.event("controller.probe.end", controller="claude", role=role,
                     prompt_kind="probe", result="unsupported",
@@ -761,7 +1095,10 @@ class ClaudeSession:
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
                  session_id=None, resume_id=None, on_session_id=None,
                  region_factory=None, trace=None, extra_writable_dir=None,
-                 internal=False, model=None, effort=None):
+                 internal=False, model=None, effort=None,
+                 guard_settings_path=None, delegation_allowed=True,
+                 owned_scope=None, controller_env=None,
+                 declared_outputs=None, repo_writable=True):
         policy.guard("claude", role=speaker, kind="dispatch")
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
@@ -779,6 +1116,16 @@ class ClaudeSession:
         self.role_prompt_file = role_prompt_file
         self.session_id = session_id
         self.resume_id = resume_id
+        self._guard_runtime = None
+        if nested_guard_active():
+            self._guard_runtime = _guard_runtime(
+                trace, speaker, extra_writable_dir, model, effort,
+                delegation_allowed, declared_outputs=declared_outputs,
+                resume_id=resume_id, repo_writable=repo_writable)
+            guard_settings_path = self._guard_runtime["settings_path"]
+            delegation_allowed = self._guard_runtime["delegation_allowed"]
+            owned_scope = self._guard_runtime["scope"]
+            controller_env = self._guard_runtime["env"]
         # The LIVE model, captured from the first system-init event that names
         # it (traceability: stamped on turn results and eval score entries).
         # Distinct from `self.model`, the config-pinned request (None = the
@@ -789,10 +1136,20 @@ class ClaudeSession:
         self._region_factory = region_factory or ui.StreamingMarkdown
         self._seen_session = False
         self.extra_writable_dir = extra_writable_dir
+        self.controller_state_dir = (
+            self._guard_runtime["scope"].controller_state_dir
+            if self._guard_runtime else None)
         command = build_claude_command(role_prompt_file, mode, yolo,
                                        session_id=session_id, resume_id=resume_id,
                                        extra_writable_dir=extra_writable_dir,
-                                       model=model, effort=effort)
+                                       model=model, effort=effort,
+                                       guard_settings_path=guard_settings_path,
+                                       delegation_allowed=delegation_allowed)
+        if owned_scope is not None:
+            boundary = kernel_write_boundary(owned_scope, command)
+            if not boundary["available"]:
+                raise RuntimeError(boundary["reason"])
+            command = boundary["argv"]
         if self.trace:
             self.trace.event(
                 "controller.spawn.start", controller="claude", role=speaker,
@@ -818,6 +1175,7 @@ class ClaudeSession:
             self.proc = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                env=controller_env,
             )
         except Exception as exc:  # noqa: BLE001
             if self.trace:
@@ -846,6 +1204,13 @@ class ClaudeSession:
         here and echoed on EVERY end path, so an in-flight, failed or cancelled
         turn is joinable to its start rather than invisible (CV-005)."""
         meta = dict(meta or {})
+        if (self._guard_runtime
+                and not self._guard_runtime["thread"].is_alive()):
+            if self.trace:
+                self.trace.event("guard.broker.unavailable",
+                                 role=self.speaker, result="denied")
+            return turn_result(False, "denied", denied=True,
+                               error_type="guard_unavailable")
         work_id = trace_store.new_work_id()
         self.last_work_id = work_id
         work_class = meta.get("work_class") or "productive"
@@ -876,9 +1241,13 @@ class ClaudeSession:
             model=self.live_model or self.model,
             model_source=("live_event" if self.live_model
                           else ("config_pinned" if self.model else "unknown")),
-            controller_session_id=self.session_id)
+            controller_session_id=self.session_id,
+            effort=self.effort,
+            effort_source=("config_pinned" if self.effort else "unknown"))
 
     def _send_turn(self, text, meta, work_id, work_class, turn_started):
+        if self._guard_runtime:
+            _stamp_guard_parent_work(self._guard_runtime, work_id)
         if self.trace:
             fields = {"controller": "claude", "role": self.speaker}
             fields.update(trace_store.prompt_meta(text))
@@ -912,6 +1281,7 @@ class ClaudeSession:
         any_text = False
         denied = False
         controller_error = None
+        parent_direct_usage = {}
         region = None
         idle = "%s working" % self.speaker
         status_active = False  # the region currently shows a tool-activity row
@@ -986,6 +1356,11 @@ class ClaudeSession:
                                      session_id=sid)
                 self.on_session_id(sid)
             kind = parsed["kind"]
+            if kind == "assistant" and isinstance(parsed.get("usage"), dict):
+                for axis, value in parsed["usage"].items():
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        parent_direct_usage[axis] = (
+                            parent_direct_usage.get(axis, 0) + value)
             if (kind == "system" and parsed.get("model")
                     and parsed["model"] != self.live_model):
                 self.live_model = parsed["model"]
@@ -993,6 +1368,47 @@ class ClaudeSession:
                     self.trace.event("controller.model", controller="claude",
                                      role=self.speaker,
                                      model=self.live_model)
+            if (kind == "system" and self._guard_runtime
+                    and isinstance(parsed.get("tools"), list)):
+                schemas = {}
+                for tool in parsed["tools"]:
+                    if not isinstance(tool, dict):
+                        continue
+                    name = tool.get("name")
+                    schema = tool.get("input_schema") or tool.get(
+                        "inputSchema")
+                    if name and isinstance(schema, dict):
+                        schemas[name] = schema
+                self._guard_runtime["broker"].installed_schemas.update(schemas)
+            if kind == "child_usage" and self._guard_runtime:
+                broker = self._guard_runtime["broker"]
+                child_work_id = broker.work_id_for_tool(
+                    parsed.get("parent_tool_use_id"))
+                if not child_work_id:
+                    if self.trace:
+                        self.trace.event(
+                            "child.ungoverned", role=self.speaker,
+                            parent_tool_use_id=parsed.get(
+                                "parent_tool_use_id"))
+                    _end(result="denied", work_class="failed",
+                         error_type="child_ungoverned",
+                         duration_ms=_elapsed_ms())
+                    return turn_result(
+                        False, "denied", denied=True,
+                        error_type="child_ungoverned",
+                        duration_ms=_elapsed_ms())
+                broker.record_child_usage(child_work_id,
+                                          parsed.get("usage"),
+                                          event_id=parsed.get("event_id"),
+                                          replayed=parsed.get("replayed"))
+            if kind == "child_end" and self._guard_runtime:
+                broker = self._guard_runtime["broker"]
+                child_work_id = broker.work_id_for_tool(
+                    parsed.get("tool_use_id"))
+                if child_work_id:
+                    broker.finalize_child(
+                        child_work_id, agent_id=parsed.get("agent_id"),
+                        terminal_source="subagent_stop")
             if kind == "partial" and parsed.get("text"):
                 _feed(parsed["text"])
                 any_text = True
@@ -1023,6 +1439,18 @@ class ClaudeSession:
                 if self.trace:
                     self.trace.event("controller.denied", controller="claude",
                                      role=self.speaker)
+                    match = re.search(
+                        r"guard_attempt_id=([A-Za-z0-9._:-]+)",
+                        parsed.get("text") or "")
+                    if match and self._guard_runtime:
+                        attempt_id = match.group(1)
+                        if not self._guard_runtime["broker"].has_attempt(
+                                attempt_id):
+                            self.trace.event(
+                                "action.policy.denied_offline",
+                                controller="claude", role=self.speaker,
+                                guard_attempt_id=attempt_id,
+                                reason="guard_unavailable")
                 self.io_out.write("\n" + ui.label(self.speaker, tty) + denial_message())
             elif kind == "error":
                 # Keep reading until the result event so the persistent stream
@@ -1069,9 +1497,14 @@ class ClaudeSession:
                         session_id=sid or self.session_id,
                         model=self.live_model or self.model, duration_ms=_elapsed_ms())
                 else:
+                    direct_usage = parent_direct_usage or parsed.get("usage")
                     _end(result="denied" if denied else "ok",
                          subtype=parsed.get("subtype"),
-                         usage=parsed.get("usage"),
+                         usage=direct_usage,
+                         usage_basis=("parent_message_sum"
+                                      if parent_direct_usage
+                                      else "parent_counter_ambiguous"),
+                         provider_usage_total=parsed.get("usage"),
                          # Claude reports usage per turn already: preserved
                          # verbatim so cache_creation_input_tokens and
                          # cache_read_input_tokens are never renamed away when
@@ -1111,6 +1544,8 @@ class ClaudeSession:
         except Exception:  # noqa: BLE001
             pass
         _terminate(self.proc)
+        if self._guard_runtime:
+            self._guard_runtime["broker"].stop()
 
 
 def _resumed_usage_baseline(thread_id):
@@ -1158,6 +1593,15 @@ class CodexSession:
                  extra_writable_dir=None, internal=False, model=None,
                  effort=None):
         policy.guard("codex", role=speaker, kind="dispatch")
+        if nested_guard_active():
+            if trace:
+                trace.event(
+                    "controller.dispatch.refused", controller="codex",
+                    role=speaker,
+                    missing_capability="pre_child_delegation_decision")
+            raise RuntimeError(
+                "controller_capability_missing: "
+                "codex has no pre-child delegation decision")
         self.mode = mode
         self.yolo = yolo
         self.model = model
@@ -1471,6 +1915,15 @@ class OpencodeSession:
         # BEFORE ensure_opencode_agent below: a blocked opencode dispatch must
         # not leave a generated agent file behind.
         policy.guard("opencode", role=speaker, kind="dispatch")
+        if nested_guard_active():
+            if trace:
+                trace.event(
+                    "controller.dispatch.refused", controller="opencode",
+                    role=speaker,
+                    missing_capability="pre_child_delegation_decision")
+            raise RuntimeError(
+                "controller_capability_missing: "
+                "opencode has no pre-child delegation decision")
         self.mode = mode
         self.yolo = yolo
         self.model = model

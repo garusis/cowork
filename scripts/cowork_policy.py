@@ -192,6 +192,16 @@ class DispatchBlocked(RuntimeError):
         return self._message()
 
 
+class ChildDispatchBlocked(RuntimeError):
+    """User-facing form of a pre-child fail-closed policy decision."""
+
+    def __init__(self, decision):
+        self.decision = dict(decision or {})
+        super().__init__(
+            "cowork: child dispatch blocked before launch (%s)"
+            % (self.decision.get("reason") or "unknown"))
+
+
 # --------------------------------------------------------------------------- #
 # The active-policy holder.                                                    #
 #                                                                              #
@@ -290,3 +300,15 @@ def guard(controller, role=None, kind="dispatch", phase=None, trace=None):
     raise DispatchBlocked(controller, role=role,
                           phase=phase if phase is not None else _ACTIVE["phase"],
                           allowed=allowed, kind=kind, invalid=invalid)
+
+
+def guard_child(requested_child, parent_effective, pin_capability=True):
+    """Return the child decision; the broker owns ids and durable emission."""
+    from cowork_action_policy import decide_child
+    allowed = active_allowed()
+    if _ACTIVE["mode"] == "invalid":
+        allowed = ()
+    elif allowed is None:
+        allowed = (parent_effective or {}).get("controller"),
+    return decide_child(requested_child, parent_effective, allowed,
+                        pin_capability=pin_capability)

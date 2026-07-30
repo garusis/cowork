@@ -16,6 +16,8 @@ import re
 import time
 import uuid
 
+from cowork_guard_broker import append_once
+
 
 # Work classes (P1). Exclusive: every unit of controller cost belongs to exactly
 # one of these. `in_flight`, `failed` and `cancelled` are terminal states of a
@@ -34,6 +36,13 @@ WORK_CLASSES = (
 USAGE_SCOPES = ("turn_native", "turn_delta", "incomparable", "unknown")
 
 MODEL_SOURCES = ("live_event", "config_pinned", "unknown")
+EFFORT_SOURCES = MODEL_SOURCES
+
+NESTED_EVENT_NAMES = (
+    "child.work.start", "child.work.end", "child.tool", "child.delta",
+    "action.policy.decision", "child.dispatch.blocked", "child.ungoverned",
+    "guard.broker.unavailable",
+)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -53,7 +62,7 @@ def strip_ansi(value):
 
 
 def work_meta(work_id, work_class, usage_scope=None, identity=None,
-              duration_ms=None):
+              duration_ms=None, parent_work_id=None, work_kind=None):
     """Build the stamped work-record fields shared by every emission site (P1).
 
     `duration_ms` is required on end events (P14) — an end event that omits it
@@ -68,11 +77,16 @@ def work_meta(work_id, work_class, usage_scope=None, identity=None,
         meta["identity"] = identity
     if duration_ms is not None:
         meta["duration_ms"] = duration_ms
+    if parent_work_id is not None:
+        meta["parent_work_id"] = parent_work_id
+    if work_kind is not None:
+        meta["work_kind"] = work_kind
     return meta
 
 
 def identity_meta(controller=None, provider=None, model=None,
-                  model_source=None, controller_session_id=None):
+                  model_source=None, controller_session_id=None,
+                  effort=None, effort_source=None):
     """The canonical identity block stamped on a unit of work.
 
     `model_source` says how the model was learned: `live_event` (the controller
@@ -85,6 +99,9 @@ def identity_meta(controller=None, provider=None, model=None,
         "provider": strip_ansi(provider),
         "model": strip_ansi(model),
         "model_source": source,
+        "effort": strip_ansi(effort),
+        "effort_source": (effort_source if effort_source in EFFORT_SOURCES
+                          else "unknown"),
         "controller_session_id": strip_ansi(controller_session_id),
     }
 
@@ -247,10 +264,14 @@ class Trace:
             obj["session_uuid"] = self.session_uuid
         obj.update({k: v for k, v in fields.items() if v is not None})
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "a") as fh:
-                json.dump(_json_safe(obj), fh, sort_keys=True)
-                fh.write("\n")
+            # Ordinary event ids are unique by construction. Scanning every
+            # prior line to rediscover that fact makes trace emission
+            # quadratic. Guard attempts retain durable exact-once semantics;
+            # ordinary diagnostics use serialized, constant-work appends.
+            guard_attempt_id = obj.get("guard_attempt_id")
+            append_once(
+                self.path, _json_safe(obj),
+                key="guard_attempt_id" if guard_attempt_id else None)
         except OSError:
             # Debug tracing must never break cowork.
             return event_id

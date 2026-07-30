@@ -517,6 +517,62 @@ def identities_path_for(session_uuid):
     return os.path.join(session_assets_dir(session_uuid), "identities.json")
 
 
+def children_path_for(session_uuid):
+    """Append-only child-attempt/provider-correlation ledger."""
+    return os.path.join(session_assets_dir(session_uuid), "children.jsonl")
+
+
+def actions_path_for(session_uuid):
+    """Append-only sanitized action-policy decisions."""
+    return os.path.join(session_assets_dir(session_uuid), "actions.jsonl")
+
+
+def capability_pins_path_for(session_uuid):
+    return os.path.join(session_assets_dir(session_uuid),
+                        "capability-pins.json")
+
+
+def read_capability_allowlist(session_uuid):
+    """Load and validate schema-pinned read-only capabilities, fail closed."""
+    try:
+        with open(capability_pins_path_for(session_uuid), "r") as fh:
+            raw = json.load(fh)
+        entries = raw.get("capabilities") if isinstance(raw, dict) else raw
+        from cowork_action_policy import load_capability_allowlist
+        return load_capability_allowlist(entries), None
+    except (OSError, ValueError, TypeError) as exc:
+        return {}, type(exc).__name__
+
+
+def guard_dir_for(session_uuid):
+    return os.path.join(session_assets_dir(session_uuid), "guard")
+
+
+def guard_context_path_for(session_uuid, role):
+    return os.path.join(guard_dir_for(session_uuid), "%s.context.json" % role)
+
+
+def guard_settings_path_for(session_uuid, role):
+    return os.path.join(guard_dir_for(session_uuid), "%s.settings.json" % role)
+
+
+def guard_socket_path_for(session_uuid, role, nonce):
+    """Short supervisor-owned AF_UNIX path, independent of session depth."""
+    seed = "\0".join((
+        os.path.realpath(session_assets_dir(session_uuid)),
+        str(role), str(nonce))).encode()
+    digest = hashlib.sha256(seed).hexdigest()[:32]
+    # macOS sockaddr_un paths are limited to roughly 104 bytes. /tmp keeps the
+    # transport bounded even when COWORK_SESSIONS_ROOT is deeply nested.
+    return os.path.join("/tmp", "cowork-guard-%s.sock" % digest)
+
+
+def controller_state_dir_for(session_uuid, role):
+    """Stable writable controller-private state root for one role."""
+    return os.path.join(session_assets_dir(session_uuid), "controller-state",
+                        role)
+
+
 def upsert_role_identity(path, role, identity, work_id=None):
     """Merge one role's identity dict into the registry at `path`.
 

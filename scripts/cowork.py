@@ -140,15 +140,15 @@ HANDBACK_PREPROCESSOR = {"planner": "scout", "builder": "planner"}
 DEFAULTS = {
     "scout": {"controller": "claude", "model": None, "effort": None,
               "yolo": True, "mode": "implement"},
-    SCOUT_REVIEWER: {"controller": "codex", "model": None, "effort": None,
+    SCOUT_REVIEWER: {"controller": "claude", "model": None, "effort": None,
                      "yolo": True, "mode": "implement"},
     "planner": {"controller": "claude", "model": None, "effort": None,
                 "yolo": True, "mode": "implement"},
-    PLANNING_ADVISOR: {"controller": "codex", "model": None, "effort": None,
+    PLANNING_ADVISOR: {"controller": "claude", "model": None, "effort": None,
                        "yolo": True, "mode": "implement"},
     "builder": {"controller": "claude", "model": None, "effort": None,
                 "yolo": True, "mode": "implement"},
-    BUILD_REVIEWER: {"controller": "codex", "model": None, "effort": None,
+    BUILD_REVIEWER: {"controller": "claude", "model": None, "effort": None,
                      "yolo": True, "mode": "implement"},
 }
 
@@ -1154,6 +1154,8 @@ def _record_role_identity(session, result=None):
                                or result.get("thread_id")
                                or getattr(session, "session_id", None)
                                or getattr(session, "thread_id", None)),
+                "controller_state_dir": getattr(
+                    session, "controller_state_dir", None),
             })
     except Exception:  # noqa: BLE001 - identity is observational only
         pass
@@ -3381,16 +3383,21 @@ def _isolated_evaluator_session(entry, identity, config=None, trace=None,
     controller = identity.get("tool")
     model = identity.get("model")
     effort = identity.get("effort")
+    scratch_path = entry.get("scratch_path")
+    assets_dir = os.path.dirname(scratch_path) if scratch_path else None
     if controller == "claude":
         return bridge.ClaudeSession(
             EVALUATOR_PROMPT_PATH, "plan", False,
             io_out=io_out or open(os.devnull, "w"), speaker="evaluator",
-            trace=trace, internal=True, model=model, effort=effort)
+            trace=trace, internal=True, model=model, effort=effort,
+            extra_writable_dir=assets_dir,
+            declared_outputs=((scratch_path,) if scratch_path else ()),
+            repo_writable=False)
     if controller == "codex":
         return bridge.CodexSession(
             "plan", False, io_out=io_out or open(os.devnull, "w"),
             speaker="evaluator", trace=trace, internal=True, model=model,
-            effort=effort)
+            effort=effort, extra_writable_dir=assets_dir)
     return None
 
 
@@ -8433,8 +8440,11 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 pending_switch_turns[r] = entry["pending_turn"]
 
     def check_controller_tool(controller):
-        return preflight.check_tools(
+        ok, alerts = preflight.check_tools(
             [controller], which=which if which is not None else shutil.which)
+        runtime_ok, runtime_alerts = preflight.check_governed_runtime(
+            [controller])
+        return ok and runtime_ok, alerts + runtime_alerts
 
     def reviewer_controller_check(role):
         if role not in config:
@@ -9766,7 +9776,13 @@ def main(argv=None):
             return preflight.main()
         if args.report:
             return run_report(args)
-        return run_flow(args)
+        # Runtime controller dispatches are governed from this point onward.
+        # Read-only --check/--report paths above never need a broker.
+        prior_guard = bridge.set_nested_guard_active(True)
+        try:
+            return run_flow(args)
+        finally:
+            bridge.set_nested_guard_active(prior_guard)
     except KeyboardInterrupt:
         # Clean exit on Ctrl-C instead of dumping a traceback. 130 = 128 + SIGINT.
         sys.stderr.write("\ncowork: interrupted.\n")

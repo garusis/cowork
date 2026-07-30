@@ -80,6 +80,27 @@ def check_tools(tools, which=shutil.which):
     return (len(alerts) == 0), alerts
 
 
+def check_governed_runtime(controllers, platform=sys.platform):
+    """Report controller rows that cannot run under the governance boundary."""
+    if not str(platform).startswith("linux"):
+        return True, []
+    controllers = list(controllers or ())
+    if not controllers:
+        return True, []
+    alerts = []
+    for controller in controllers:
+        if controller == "claude":
+            reason = (
+                "isolated Claude credentials/state provisioning is not "
+                "implemented")
+        else:
+            reason = "no pre-child delegation decision is available"
+        alerts.append(
+            "Controller %r is unavailable for governed Cowork roles on Linux: "
+            "%s. No controller will be launched." % (controller, reason))
+    return False, alerts
+
+
 # Backwards-compatible alias.
 check_controllers = check_tools
 
@@ -102,7 +123,8 @@ def check_python_packages(packages, find_spec=importlib.util.find_spec):
 
 
 def preflight(role_config, version_info=sys.version_info, which=shutil.which,
-              interactive=True, find_spec=importlib.util.find_spec):
+              interactive=True, find_spec=importlib.util.find_spec,
+              platform=sys.platform):
     """Run all preflight checks. Return (ok, [alerts]).
 
     The rich UX packages (rich/prompt_toolkit/questionary) are required only for
@@ -118,13 +140,16 @@ def preflight(role_config, version_info=sys.version_info, which=shutil.which,
     tools = list(required_controllers(role_config))
     tools_ok, tool_alerts = check_tools(tools, which=which)
     alerts.extend(tool_alerts)
+    runtime_ok, runtime_alerts = check_governed_runtime(
+        tools, platform=platform)
+    alerts.extend(runtime_alerts)
 
     pkg_ok = True
     if interactive:
         pkg_ok, pkg_alerts = check_python_packages(PY_PACKAGES, find_spec=find_spec)
         alerts.extend(pkg_alerts)
 
-    return (py_ok and tools_ok and pkg_ok), alerts
+    return (py_ok and tools_ok and runtime_ok and pkg_ok), alerts
 
 
 def main(argv=None):
