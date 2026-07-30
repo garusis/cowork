@@ -33,6 +33,7 @@ Python 3.9+, stdlib only.
 """
 
 import datetime
+import fcntl
 import json
 import os
 
@@ -105,12 +106,13 @@ def next_id(records, kind):
     return "%s-%04d" % (prefix, highest + 1)
 
 
-def _append(path, records):
-    """Append records to the ledger. Returns True on success.
-
-    All-or-nothing per call: the batch is serialized first, so a record that
-    cannot be encoded aborts the write instead of leaving a partial batch.
-    """
+def _append_locked(path, records):
+    """The raw append write — NO locking of its own. Callers that already
+    hold the session-ledger allocation lock (`reconcile_attempts`,
+    `mint_owned_attempts_batch`'s legacy-path callers) use this directly to
+    avoid the self-deadlock of a process trying to `flock` a file it is
+    already holding an exclusive lock on via a different fd. `_append`
+    (below) is the locking public entry point for every OTHER caller."""
     if not path or not records:
         return False
     try:
@@ -127,6 +129,53 @@ def _append(path, records):
     except OSError:
         return False
     return True
+
+
+def _with_ledger_lock(path, fn):
+    """Acquire the ONE session-ledger allocation lock (the same lock
+    `mint_owned_attempts_batch` and `reconcile_attempts` hold across their
+    own read/allocate/append sequences) and call `fn()` while holding it.
+    Every writer to this ledger file — not just the ones minting a V-id —
+    goes through this one lock, so a plain append (an ordinary finding,
+    decision, or revision) can never land in the narrow window between a
+    batch-mint's read and its atomic replace and be silently discarded by
+    it, and two independent allocators (an owned mint and a legacy
+    reconcile) can never race each other for the same next id."""
+    lock_path = _mint_lock_path(path)
+    try:
+        dirname = os.path.dirname(lock_path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        lock_fh = open(lock_path, "a+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            return fn()
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fh.close()
+
+
+def _append(path, records):
+    """Append records to the ledger, under the ledger's ONE allocation
+    lock. Returns True on success.
+
+    All-or-nothing per call: the batch is serialized first, so a record
+    that cannot be encoded aborts the write instead of leaving a partial
+    batch. This is the PUBLIC, locking entry point for the plain-append
+    write path — callers that already hold the lock themselves (inside
+    `_with_ledger_lock`) must call `_append_locked` directly instead, to
+    avoid `flock`-ing a file this process is already holding a lock on via
+    a different fd (a self-deadlock, not a wait)."""
+    if not path or not records:
+        return False
+    return _with_ledger_lock(path, lambda: _append_locked(path, records))
 
 
 def append_record(path, kind, fields=None, supersedes=None):
@@ -311,6 +360,17 @@ def reconcile_attempts(path, observations):
     Best-effort: any failure leaves the ledger untouched and is reported in the
     result, never half-written.
 
+    Runs its ENTIRE read/allocate/append sequence under the SAME session-
+    ledger allocation lock `mint_owned_attempts_batch` holds — this is what
+    makes `V-000n` a single, process-boundary-safe namespace shared by
+    BOTH allocators. Without this, an owned mint and a legacy reconcile
+    running concurrently in the same session (a report/drain racing a
+    builder's owned transaction) could each read the same "next number"
+    from a stale, unlocked snapshot and allocate the identical id — the
+    single-flight lock over a transaction's OWN request key does not
+    protect against this, since it only prevents one EQUIVALENT request
+    from double-running, not two DIFFERENT allocators from colliding.
+
     Returns `{"minted": [...], "superseded": [...], "unchanged": n,
               "state": "ok"|"failed"}`.
     """
@@ -318,8 +378,28 @@ def reconcile_attempts(path, observations):
     if not path:
         result["state"] = "failed"
         return result
+    outcome = _with_ledger_lock(path, lambda: _reconcile_attempts_locked(
+        path, observations, result))
+    if outcome is False:
+        return {"minted": [], "superseded": [], "unchanged": 0,
+               "state": "failed"}
+    return outcome
+
+
+def _reconcile_attempts_locked(path, observations, result):
+    """The body of `reconcile_attempts`, run while the caller already holds
+    the session-ledger lock. Returns the result dict, or False on failure
+    (the sentinel `reconcile_attempts` maps to its own failure shape)."""
     try:
-        existing = read_ledger(path)
+        try:
+            raw_prefix, existing = _strict_raw_and_records_for_allocation(
+                path)
+        except LedgerAllocationReadError:
+            # Same fail-closed posture as `mint_owned_attempts_batch`: an
+            # unreadable/malformed ledger is never silently treated as
+            # empty for an ALLOCATION decision.
+            return {"minted": [], "superseded": [], "unchanged": 0,
+                   "state": "failed"}
         by_key = {}
         canonical_id = {}
         for rec in existing:
@@ -375,7 +455,16 @@ def reconcile_attempts(path, observations):
             batch.append(record)
             result["superseded"].append(record["id"])
             by_key[key] = record
-        if batch and not _append(path, batch):
+        # `_atomic_commit_batch`, NOT the line-at-a-time `_append`/
+        # `_append_locked`: reconcile's own documented "any failure leaves
+        # the ledger untouched... never half-written" guarantee needs the
+        # SAME real atomicity `mint_owned_attempts_batch` uses — a plain
+        # append can leave a durable partial batch on a real I/O failure
+        # partway through. `raw_prefix` was read under this same lock,
+        # right before this batch was computed, so it is exactly what
+        # `path` still contains (no concurrent writer could have changed
+        # it — every writer goes through this one lock).
+        if batch and not _atomic_commit_batch(path, raw_prefix, batch):
             return {"minted": [], "superseded": [], "unchanged": 0,
                     "state": "failed"}
     except Exception as exc:  # noqa: BLE001 - reconciliation never breaks a run
@@ -393,6 +482,398 @@ _SIGNIFICANT = ("exit_status", "adjudication", "executed_count", "timed_out",
 
 def _same_attempt(prior, fields):
     return all(prior.get(k) == fields.get(k) for k in _SIGNIFICANT)
+
+
+# --------------------------------------------------------------------------- #
+# Owned verification transactions: orchestrator-owned mint/revise path.       #
+#                                                                              #
+# Unlike `reconcile_attempts` (which turns id-free, controller-log-DERIVED    #
+# observations into ledger records after the fact), an owned transaction's    #
+# attempt identity must exist BEFORE the command launches — the transaction   #
+# id and label are already known the instant the orchestrator decides to run  #
+# it. `mint_owned_attempt` allocates that stable V id up front;               #
+# `revise_owned_attempt` appends terminal facts under the SAME id as evidence #
+# arrives. Both use `owned_attempt_key`, a natural key derived from           #
+# (transaction_id, label) — disjoint by construction from                     #
+# `attempt_key`'s (controller_session_id, tool_call_id) key space, so an      #
+# owned attempt can never collide with, or be reconstructed by,               #
+# `reconcile_attempts`/`active_attempts`'s legacy controller-log path.        #
+# --------------------------------------------------------------------------- #
+
+
+def owned_attempt_key(transaction_id, label):
+    """The natural key of one owned-transaction attempt: `(transaction_id,
+    label)`. Distinct in shape from `attempt_key`'s controller-derived key so
+    the two identity spaces can never be confused by a reader that only looks
+    at the key string."""
+    if not transaction_id or not label:
+        return None
+    return "owned:%s:%s" % (transaction_id, label)
+
+
+def _mint_lock_path(path):
+    return path + ".mint.lock"
+
+
+class LedgerAllocationReadError(Exception):
+    """Raised by `_strict_raw_and_records_for_allocation` — the ledger
+    exists but cannot be trusted for an ALLOCATION decision (unreadable,
+    or contains a line that cannot be parsed). Callers must fail the WHOLE
+    mint/reconcile operation closed, never proceed as if the ledger were
+    simply empty or as if the bad line just weren't there."""
+
+
+def _strict_raw_and_records_for_allocation(path):
+    """The ledger's raw bytes AND parsed records, for an ALLOCATION
+    decision (minting or reconciling a `V-xxxx` id) — deliberately NOT the
+    same tolerance `read_ledger` uses for report-rendering, where a
+    best-effort partial view is the right tradeoff.
+
+    Distinguishes MISSING (the ledger has simply never been created yet —
+    legitimately empty: returns `(b"", [])`) from UNREADABLE (the file
+    exists but a permissions/I-O error prevents reading it) or MALFORMED
+    (any single line is not valid JSON) — either of the latter two RAISES
+    `LedgerAllocationReadError` instead of silently treating the ledger as
+    empty or silently skipping the bad line. `_read_raw_ledger_bytes`
+    (the prior implementation) returned `b""` for BOTH missing and
+    unreadable, and callers used `read_ledger`'s tolerant, line-skipping
+    scan for the natural-key/`next_id` check — either one could let an
+    allocator (a) commit a fresh batch as if the ledger's real, merely
+    temporarily-unreadable history had never existed (replacing it via
+    the atomic-commit path), or (b) allocate a DUPLICATE id for a key
+    that was actually already present, just hidden inside a line the
+    tolerant scan silently skipped.
+    """
+    if not path or not os.path.exists(path):
+        return b"", []
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise LedgerAllocationReadError(
+            "ledger exists but is unreadable: %s" % exc)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LedgerAllocationReadError(
+            "ledger contains undecodable bytes: %s" % exc)
+    records = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            records.append(json.loads(stripped))
+        except (ValueError, TypeError) as exc:
+            raise LedgerAllocationReadError(
+                "malformed ledger line %d: %s" % (lineno, exc))
+    return raw, records
+
+
+def _atomic_commit_batch(path, raw_prefix, batch):
+    """Commit `batch` (a list of new records) onto `raw_prefix` (the exact
+    existing ledger bytes) with REAL atomicity: build the complete new
+    ledger content in a temp file on the SAME directory (so the final
+    rename is on one filesystem) and `os.replace()` it onto `path` in one
+    step.
+
+    `_append`'s own line-at-a-time `open(path, "a")` loop does NOT give
+    this guarantee: a real I/O failure after writing N of M lines leaves a
+    durable, on-disk PARTIAL batch — some new records visible, others not.
+    `os.replace` is a single atomic rename on POSIX; a reader of `path` at
+    any point during this function's execution sees EITHER the complete
+    `raw_prefix` (nothing from this batch yet) or the complete
+    `raw_prefix + batch` (the whole batch, in one atomic step) — never
+    anything in between. If the process fails ANY time before the
+    `os.replace` call (including after real bytes have already been
+    written to the temp file — a genuine on-disk "prefix write"), `path`
+    itself is untouched, because nothing ever writes to `path` directly.
+
+    Returns True on success, False on any failure (temp file cleaned up
+    either way, never left renamed onto `path` unless fully committed).
+
+    `raw_prefix` is concatenated directly with the new batch's bytes, not
+    re-joined line by line — so a `raw_prefix` whose last byte is not a
+    newline (a valid, parseable JSONL file simply written without a final
+    trailing newline; `_strict_raw_and_records_for_allocation`'s
+    `splitlines()`-based scan accepts that shape happily) would otherwise
+    glue the first new record directly onto the tail of the existing last
+    line, corrupting BOTH into one unparseable line on disk. The separator
+    is inserted deliberately here, once, rather than trusting every
+    producer of `raw_prefix` to have already terminated it."""
+    if not batch:
+        return True
+    if raw_prefix and not raw_prefix.endswith(b"\n"):
+        raw_prefix = raw_prefix + b"\n"
+    try:
+        lines = b"".join(
+            (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8")
+            for rec in batch)
+    except (TypeError, ValueError):
+        return False
+    dirname = os.path.dirname(path) or "."
+    try:
+        os.makedirs(dirname, exist_ok=True)
+    except OSError:
+        return False
+    tmp_path = os.path.join(
+        dirname, ".%s.tmp-%d-%s" % (os.path.basename(path), os.getpid(),
+                                    _utc_now().replace(":", "")))
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(raw_prefix)
+            fh.write(lines)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def mint_owned_attempts_batch(path, transaction_id, entries):
+    """Allocate a stable V id for EVERY `(label, fields)` pair in `entries`,
+    ALL-OR-NOTHING, under one held session-ledger allocation lock.
+
+    This is the ONLY minting entry point for owned attempts — replacing an
+    earlier design that read the ledger, computed `next_id`, and appended
+    per entry with NO lock held across that sequence: two transactions in
+    the same session (two processes/threads calling this concurrently)
+    could both read the same "highest id so far" and mint the identical
+    V-xxxx for two different attempts, and a failure partway through a
+    multi-entry mint left the earlier entries durably minted while later
+    ones were not — exactly the "partial owned inventory" this exists to
+    rule out.
+
+    The lock (`fcntl.flock`, exclusive, held for the WHOLE re-read ->
+    natural-key-check -> allocate -> append sequence — never just around
+    the final write) makes two concurrent callers, however many entries
+    each requests, allocate from one strictly increasing, globally unique
+    id space. Existing records for a `(transaction_id, label)` already
+    minted are reused idempotently (safe to call again for the same
+    entries). ALL NEW records for THIS CALL are computed fully in memory
+    before a single `_append` — if anything about the batch is invalid (a
+    malformed entry, a natural-key collision, the append itself failing),
+    NOTHING from this call is written: not the entries validated before the
+    bad one, not any of them.
+
+    Returns `{label: record}` for every entry on success (both freshly
+    minted and idempotently reused), or `None` if the WHOLE batch failed —
+    the caller must treat `None` as "not one of these ids is durable yet",
+    never assume the first N succeeded.
+    """
+    if not path or not entries:
+        return None
+    lock_path = _mint_lock_path(path)
+    try:
+        dirname = os.path.dirname(lock_path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        lock_fh = open(lock_path, "a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                raw_prefix, existing = _strict_raw_and_records_for_allocation(
+                    path)
+            except LedgerAllocationReadError:
+                # FAIL CLOSED: an unreadable or malformed ledger is NEVER
+                # treated as empty. Minting on top of it (via the atomic
+                # replace below) could silently discard real history, or
+                # allocate a duplicate id for a key hidden in the bad data.
+                return None
+            by_key = {}
+            for rec in existing:
+                if rec.get("kind") == "attempt" and not rec.get("marker"):
+                    k = rec.get("attempt_key")
+                    if k:
+                        by_key[k] = rec
+            next_number = int(next_id(existing, "attempt").split("-")[1])
+
+            results = {}
+            batch = []
+            seen_keys_this_call = set()
+            for label, fields in entries:
+                key = owned_attempt_key(transaction_id, label)
+                if not key or key in seen_keys_this_call:
+                    # A malformed entry, or the SAME label twice in one
+                    # batch (a caller bug — never silently mint two ids for
+                    # one label), aborts the WHOLE batch. Nothing is
+                    # appended for this call at all.
+                    return None
+                seen_keys_this_call.add(key)
+                prior = by_key.get(key)
+                if prior is not None:
+                    results[label] = prior  # idempotent reuse
+                    continue
+                record = dict(fields or {})
+                record.update({
+                    "id": "V-%04d" % next_number,
+                    "kind": "attempt",
+                    "attempt_key": key,
+                    "transaction_id": transaction_id,
+                    "label": label,
+                    "recorded_at": _utc_now(),
+                    "state": "open",
+                    "attempt_state": "pending",
+                    "owned": True,
+                })
+                next_number += 1
+                batch.append(record)
+                by_key[key] = record
+                results[label] = record
+
+            if batch and not _atomic_commit_batch(path, raw_prefix, batch):
+                return None
+            return results
+        except Exception:  # noqa: BLE001 - the ledger never breaks a run
+            return None
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fh.close()
+
+
+def mint_owned_attempt(path, transaction_id, label, fields=None):
+    """Single-entry convenience wrapper over `mint_owned_attempts_batch` —
+    kept for callers that genuinely only ever mint one attempt at a time
+    (and for backward compatibility), but routed through the SAME locked
+    batch path so a lone mint can never race a concurrent batch mint in the
+    same session. Returns the minted (or idempotently reused) record, or
+    `None` on failure."""
+    results = mint_owned_attempts_batch(path, transaction_id,
+                                        [(label, fields)])
+    return (results or {}).get(label)
+
+
+def revise_owned_attempt(path, transaction_id, label, fields,
+                         attempt_state="terminal"):
+    """Append a revision under the SAME stable V id a prior
+    `mint_owned_attempt` call allocated for `(transaction_id, label)`.
+
+    FAILS CLOSED, deliberately, unlike the legacy `reconcile_attempts` path:
+    a missing prior mint is NOT filled in by minting one here. The owned
+    contract requires every attempt id to exist BEFORE its command can
+    launch (see `run_transaction`); a revision arriving with no matching
+    mint means that guarantee was violated somewhere upstream, and inventing
+    an id at revision time would silently launder that violation into a
+    normal-looking record instead of surfacing it. The caller (the parent,
+    in `cowork_verification.py`) is REQUIRED to treat a `None` return here
+    as invalidating the transaction, never as "nothing to revise."
+
+    Returns the appended record, or None when there was no prior mint to
+    revise, or on any other failure.
+    """
+    key = owned_attempt_key(transaction_id, label)
+    if not key:
+        return None
+    try:
+        existing = read_ledger(path)
+        canonical_id = None
+        for rec in existing:
+            if (rec.get("kind") == "attempt" and not rec.get("marker")
+                    and rec.get("attempt_key") == key):
+                canonical_id = rec.get("id")
+        if canonical_id is None:
+            return None
+        record = dict(fields or {})
+        record.update({
+            "id": canonical_id,
+            "kind": "attempt",
+            "attempt_key": key,
+            "transaction_id": transaction_id,
+            "label": label,
+            "recorded_at": _utc_now(),
+            "state": "open",
+            "attempt_state": attempt_state,
+            "owned": True,
+        })
+        if not _append(path, [record]):
+            return None
+        return record
+    except Exception:  # noqa: BLE001 - the ledger never breaks a run
+        return None
+
+
+def materialize_attempts(records, observations):
+    """PURE, in-memory materialization: combine existing ledger `records`
+    with a list of ingested `observations`, using the SAME identity rules as
+    the persistent `reconcile_attempts` path (natural key via `attempt_key`,
+    latest-non-superseded-wins), but performing no disk writes at all.
+
+    This exists so a read-only clean checkout (a fixture/session directory
+    whose ignored `ledger.jsonl` is absent or not writable) can still
+    reproduce the identical attempts/verdict a persisted reconciliation would
+    have produced, by materializing directly from tracked controller-log
+    inputs in memory.
+
+    Returns the list of active attempt records (same shape `active_attempts`
+    returns), as if `reconcile_attempts` had been called against `records`
+    with `observations` and then `active_attempts` had been read back —
+    without ever touching `path`.
+    """
+    by_key = {}
+    canonical_id = {}
+    for rec in records or []:
+        if rec.get("kind") != "attempt" or rec.get("marker"):
+            continue
+        key = rec.get("attempt_key")
+        if key:
+            by_key[key] = rec
+            canonical_id.setdefault(key, rec.get("id"))
+    next_number = int(next_id(list(records or []), "attempt").split("-")[1])
+    materialized = dict(by_key)
+    for observation in observations or []:
+        key = attempt_key(observation)
+        if not key:
+            continue
+        fields = {k: observation.get(k) for k in _ATTEMPT_FIELDS
+                  if observation.get(k) is not None}
+        prior = materialized.get(key)
+        if prior is None:
+            record = dict(fields)
+            record.update({
+                "id": "V-%04d" % next_number,
+                "kind": "attempt",
+                "attempt_key": key,
+                "recorded_at": _utc_now(),
+                "state": "open",
+                "attempt_state": "fresh",
+            })
+            next_number += 1
+            materialized[key] = record
+            canonical_id[key] = record["id"]
+            continue
+        if _same_attempt(prior, fields):
+            continue
+        if _terminal_attempt(prior):
+            continue
+        record = dict(fields)
+        record.update({
+            "id": canonical_id.get(key, prior.get("id")),
+            "kind": "attempt",
+            "attempt_key": key,
+            "recorded_at": _utc_now(),
+            "state": "open",
+            "attempt_state": "revised",
+            "revises_recorded_at": prior.get("recorded_at"),
+        })
+        materialized[key] = record
+    # Fold through the same collapse/latest-wins rule `active_attempts` uses,
+    # but starting from the in-memory materialized view rather than a second
+    # read of `path`.
+    return active_attempts(list(materialized.values()) + [
+        rec for rec in (records or [])
+        if rec.get("marker") or rec.get("kind") != "attempt"])
 
 
 # --------------------------------------------------------------------------- #

@@ -832,6 +832,310 @@ def manifest_digest(manifest):
     return hashlib.sha256("\n".join(pairs).encode("utf-8")).hexdigest()
 
 
+# --------------------------------------------------------------------------- #
+# Owned verification transactions (cowork_verification).                      #
+#                                                                              #
+# Every artifact below lives under the same per-session assets directory as   #
+# the rest of this file's paths (`session_assets_dir`), in a `verification/`  #
+# subtree keyed by transaction id. The layout exists so the parent, the       #
+# spawned worker, and a later `report`/`measure` reader can all find the same #
+# files by deterministic path alone — no index file to keep in sync, mirroring#
+# `discover_session_files`'s directory-glob approach above.                   #
+# --------------------------------------------------------------------------- #
+
+
+def verification_root_for(session_uuid):
+    """Root directory for all owned-verification-transaction artifacts of one
+    session: requests, snapshots, locks, and results. A directory, not a file,
+    so a transaction's several sidecar files (request/attempts/result) sit
+    together under one deterministic parent."""
+    return os.path.join(session_assets_dir(session_uuid), "verification")
+
+
+def verification_transaction_dir(session_uuid, transaction_id):
+    """Directory holding one transaction's request, attempt-event stream,
+    active-process-group state, and terminal result. `transaction_id` is
+    caller-minted (e.g. a uuid4 hex) and is the sole key — two transactions
+    never share a directory even if their content later turns out equal."""
+    return os.path.join(verification_root_for(session_uuid),
+                        "transactions", transaction_id)
+
+
+def verification_request_path_for(session_uuid, transaction_id):
+    """Path of the versioned JSON request cowork_verification.run_transaction
+    writes before spawning the worker: transaction id, request key, snapshot
+    identity, normalized configuration/inventory, and timeout/retry policy.
+    The worker is launched with this file's path as its sole positional
+    argument (see cowork_verification.py's `--worker` entry point)."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "request.json")
+
+
+def verification_worker_identity_path_for(session_uuid, transaction_id):
+    """Path of the worker's self-reported `{source_hash, protocol_version}`,
+    written before it runs any command so the parent can require equality with
+    the snapshot manifest entry for the worker's own file before trusting any
+    evidence that follows."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "worker_identity.json")
+
+
+def verification_worker_startup_log_path_for(session_uuid, transaction_id):
+    """Path of the worker process's raw stdout+stderr, captured from the
+    moment it is spawned. Normally near-empty (the worker deliberately
+    writes nothing but its identity report and attempt events elsewhere);
+    its only real job is to hold whatever a worker that crashes before
+    reporting identity (an ImportError traceback, for instance) printed on
+    its way out, so a startup failure produces a captured, structured
+    reason instead of the parent silently waiting out the full startup
+    allowance with no diagnostic evidence at all."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "worker_startup.log")
+
+
+def verification_attempt_events_path_for(session_uuid, transaction_id):
+    """Path of the append-only JSON-lines stream of per-command start/terminal
+    events the worker writes atomically and the parent tails/polls for bounded
+    evidence retry. One line per event; never rewritten, matching the
+    ledger's append-only convention."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "attempts.jsonl")
+
+
+def verification_active_pgid_path_for(session_uuid, transaction_id):
+    """Path of the atomically published `{pgid, label, started_at}` for the
+    command currently running, so a parent that must clean up a hung/crashed
+    worker knows which process group to TERM/KILL without guessing. Absent or
+    stale (no live pgid) once no command is active."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "active_pgid.json")
+
+
+def verification_permit_path_for(session_uuid, transaction_id):
+    """Path of the parent-issued per-entry PERMIT: `{index, ledger_attempt_id,
+    issued_at}` for the ONE entry the worker is currently authorized to
+    start. The worker must not begin entry N until this file names entry
+    N's exact (index, ledger_attempt_id); the parent writes it ONLY after
+    that entry's 'running' ledger revision has already durably succeeded,
+    and only issues the NEXT permit after entry N's terminal/unresolved
+    ledger revision has ALSO durably succeeded — closing the run-ahead gap
+    where the worker, running independently of the parent's own bookkeeping
+    pace, could start (or finish) a later entry before the parent had even
+    discovered an earlier one's ledger failure."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "permit.json")
+
+
+def verification_result_path_for(session_uuid, transaction_id):
+    """Path of the transaction's terminal, immutable `TransactionResult`
+    (green/red/unverified, per-command attempts, mutation report, final-suite
+    fact, evidence state). Written exactly once, atomically, at the end of
+    `run_transaction`."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "result.json")
+
+
+def verification_snapshot_root_for(session_uuid):
+    """Root of the content-addressed snapshot object store shared by every
+    transaction in a session: `objects/<sha256[:2]>/<sha256>` blobs plus one
+    manifest/index pair per transaction under `snapshots/<transaction_id>/`.
+    Sharing the object store across transactions is a pure size optimization
+    (identical file content across two nearby transactions is stored once);
+    each transaction's manifest still pins its own exact set of entries."""
+    return os.path.join(verification_root_for(session_uuid), "snapshot")
+
+
+def verification_snapshot_objects_dir(session_uuid):
+    """Directory of content-addressed blobs (`objects/<sha256[:2]>/<sha256>`)
+    copied out of the candidate tree. Sharded two-level by digest prefix so no
+    single directory accumulates every object the session ever snapshots."""
+    return os.path.join(verification_snapshot_root_for(session_uuid),
+                        "objects")
+
+
+def verification_snapshot_object_path(session_uuid, sha256):
+    """Path of one content-addressed object blob for `sha256`."""
+    return os.path.join(verification_snapshot_objects_dir(session_uuid),
+                        sha256[:2], sha256)
+
+
+def verification_snapshot_manifest_path_for(session_uuid, transaction_id):
+    """Path of one transaction's captured snapshot manifest: `path ->
+    {type, sha256, mode, symlink_target}` for every tracked/untracked-non-
+    ignored entry, plus the raw git-index digest recorded alongside it. The
+    authoritative identity a worker's isolated checkout is materialized from
+    and every mutation check is compared against."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "snapshot_manifest.json")
+
+
+def verification_snapshot_index_path_for(session_uuid, transaction_id):
+    """Path of the RAW git-index bytes captured for one transaction (not a
+    digest — the literal `.git/index` contents), so a worker's isolated
+    checkout can be materialized with `GIT_INDEX_FILE` pointed at an exact
+    copy without ever touching the live candidate's index."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "index.raw")
+
+
+def verification_snapshot_checkout_dir(session_uuid, transaction_id):
+    """Root of the materialized BOOTSTRAP checkout for one transaction: a
+    real directory tree (not content-addressed) built from the snapshot
+    manifest/objects, that the worker process is spawned from. NOT where
+    isolated_snapshot commands run — each command gets its own fresh
+    per-command checkout (`verification_command_checkout_dir`) so a command
+    can never mutate the bootstrap worker code that later commands (and the
+    worker's own re-exec, if any) depend on.
+
+    Excluded from the normal argv/cwd command-input path (no command's
+    cwd/argv/env is ever pointed here, and static argv validation rejects
+    any LITERAL escape attempt before launch) — this is NOT an access-
+    control boundary: a command's own inline logic could still discover or
+    construct this path at runtime, which static argv inspection cannot
+    see, so "inaccessible" would overclaim. NOT filesystem-enforced
+    read-only either, since a later cleanup pass must still be able to
+    remove it. Kept separate per transaction so a command in one
+    transaction can never observe another's checkout."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "checkout")
+
+
+def verification_command_checks_root_for(session_uuid, transaction_id):
+    """Parent directory of every per-command `isolated_snapshot` checkout for
+    one transaction. Not materialized itself — only used as the stable
+    boundary `validate_argv_safety` resolves escape checks against, since the
+    individual per-command subdirectories are created and destroyed one at a
+    time as the worker runs each command, not up front."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "checks")
+
+
+def verification_command_checkout_dir(session_uuid, transaction_id, index):
+    """Root of ONE command's fresh, writable, per-command checkout — a real
+    directory tree freshly materialized from the frozen snapshot
+    manifest/objects (never hard-linked, never reused from a previous
+    command), given functional local Git/index semantics of its own, used
+    for exactly one command, and removed immediately after that command's
+    terminal event is recorded. `index` is the command's position in the
+    deduplicated inventory (an int), not its label — avoids any label
+    sanitization while keeping directory names short, stable, and
+    collision-free within one transaction."""
+    return os.path.join(
+        verification_command_checks_root_for(session_uuid, transaction_id),
+        "%04d" % index)
+
+
+def verification_lock_path_for(session_uuid, request_key):
+    """Path of the kernel-level (`fcntl.flock`) single-flight lock file for one
+    normalized request key (hash of snapshot digest, index digest, normalized
+    configuration, and normalized inventory-including-execution-mode). Lives
+    at the session's verification root, not inside any one transaction's
+    directory, because the lock's purpose is to be found by a SECOND,
+    equivalent request before that request knows the first transaction's id."""
+    return os.path.join(verification_root_for(session_uuid),
+                        "locks", "%s.lock" % request_key)
+
+
+def write_json_atomic(path, data):
+    """Write `data` as JSON atomically (write-to-temp-then-`os.replace`),
+    creating parent directories as needed. The single shared atomic-write
+    primitive for verification-transaction artifacts; mirrors `save`'s and
+    `write_build_manifest`'s temp-then-rename pattern above so there is one
+    write style in this module, not a second bespoke one. Returns True on
+    success, False on any OSError/ValueError/TypeError (tolerant, matching
+    `write_build_manifest`)."""
+    if not path:
+        return False
+    try:
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = path + ".tmp.%d.%d" % (os.getpid(), int(time.time() * 1e6))
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def read_json_tolerant(path):
+    """Read one JSON object from `path`, or None if missing/unreadable/not a
+    JSON object. Tolerant by design (mirrors `read_build_manifest`/`load`
+    above): a transaction/result/lock reader must never raise on a file being
+    written concurrently by another process."""
+    if not path:
+        return None
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def append_jsonl_atomic(path, record):
+    """Append one JSON record as a line to `path`, creating it if needed.
+
+    Uses `os.open` with `O_APPEND` so concurrent appenders (the worker writing
+    its own attempt events) interleave whole lines rather than torn writes on
+    POSIX, matching cowork_ledger's append-only convention. Returns True on
+    success, False on any failure (tolerant: evidence write failures must
+    degrade to 'poll found nothing yet', never crash the worker or parent)."""
+    if not path:
+        return False
+    try:
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def read_jsonl_tolerant(path):
+    """Read every JSON-object line from `path`, oldest first. Tolerant: a
+    missing file yields [], and an unparseable/non-dict line is skipped rather
+    than raised — mirrors cowork_ledger.read_ledger's tolerance so a reader can
+    tail a file the worker is still appending to."""
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError:
+        return out
+    return out
+
+
 # Scores that are honest about not being numbers. They are real values, not
 # missing ones: `not_applicable` means the criterion cannot apply to this round
 # (round-1 responsiveness has no prior feedback to respond to), and

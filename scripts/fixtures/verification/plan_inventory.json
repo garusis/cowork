@@ -1,0 +1,118 @@
+{
+  "verification": [
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts.test_cowork.OwnedVerificationLifecycleTests",
+        "-v"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "baseline",
+      "label": "owned lifecycle, single-flight, and cleanup evidence",
+      "measures": "Asserts immediate stdin EOF; serial start/end timing; duplicate request and command execution counts; TERM then KILL event order; worker deadline/crash recovery; bounded waiter and stale-owner recovery; and absence of child, grandchild, worker, lock waiter, or poller after terminal cleanup."
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts.test_cowork.OwnedVerificationBindingTests",
+        "-v"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "baseline",
+      "label": "immutable snapshot, mutation, index, and final binding evidence",
+      "measures": "Asserts copied byte/type/mode/symlink/index identity; concurrent snapshot-race rejection before launch; immutable attempt IDs; source/index before and after digests and changed paths; fail-closed readiness; and exactly one final-suite result bound to the reviewed candidate."
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts.test_cowork.OwnedVerificationWorkerBoundaryTests",
+        "-v"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "baseline",
+      "label": "current-source worker and controller-independence evidence",
+      "measures": "Asserts a version-A parent launches captured version B from the immutable snapshot and matches its source hash/protocol version; mutation of the live worker path after capture is never executed and is reported fail-closed; one transaction handles 19 deduplicated commands with zero verification controller turns or evaluation drain and one final-suite execution."
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts.test_cowork.OwnedVerificationEvidenceRetryTests",
+        "-v"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "baseline",
+      "label": "same-attempt delayed and expired evidence",
+      "measures": "Asserts delayed and expired cases retain the original attempt ID and one command execution, record bounded retry events, terminate polling, and end respectively as evidence-present or explicitly unresolved/absent."
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts.test_cowork.OwnedVerificationEscapeRejectionTests",
+        "-v"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "baseline",
+      "label": "snapshot escape rejection",
+      "measures": "Asserts a `cd`/absolute-path/traversal/shell-chain argv aimed at the live worktree is rejected before launch, and a permitted command's actual OS-level cwd resolves inside the validated snapshot checkout, never the live worktree."
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts.test_cowork.OwnedVerificationIntegrationTests",
+        "-v"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "baseline",
+      "label": "clean-checkout compatibility and verification attribution",
+      "measures": "Asserts identical normalized fixture inputs and verdict without ignored/generated ledger state; preserved interactive, noninteractive, headless, resume, controller, readiness, measurement, and reporting outcomes; separate subprocess cost; and per-focused-check invalidation, reuse, reviewer-finding, and marginal-cost fields."
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts.test_cowork.OwnedVerificationArtifactSelfValidationTests",
+        "-v"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "baseline",
+      "label": "this plan's own verification inventory validates against the schema-2 validator",
+      "measures": "Loads this plan.json's result.verification array itself (not a synthetic fixture) and asserts the real inventory validator accepts it: every entry has label/command/execution_mode/kind, every command is a safe argv array with no cd/absolute-path/traversal/shell-metacharacter token, exactly one kind=final_suite entry exists, and it is last."
+    },
+    {
+      "command": [
+        "./cowork",
+        "--check"
+      ],
+      "execution_mode": "candidate_read_only",
+      "kind": "preflight",
+      "label": "CLI preflight",
+      "measures": "Confirms the existing CLI installation/configuration preflight remains green without mutating the candidate."
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts/test_cowork.py"
+      ],
+      "execution_mode": "isolated_snapshot",
+      "kind": "final_suite",
+      "label": "full unit suite including owned verification transaction regressions",
+      "measures": "Runs the complete repository regression envelope last and exactly once on the immutable reviewed snapshot, including the self-validation test above."
+    }
+  ],
+  "verification_schema": 2
+}
