@@ -46,6 +46,7 @@ import cowork_action_guard as action_guard  # noqa: E402
 import cowork_guard_broker as guard_broker  # noqa: E402
 import cowork_delta as delta_store  # noqa: E402
 import cowork_measure as measure  # noqa: E402
+import cowork_profiles as controller_profiles  # noqa: E402
 import cowork_report as report  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
@@ -146,6 +147,41 @@ class FlagAssemblyTest(unittest.TestCase):
         self.assertEqual(cmd[:4], ["codex", "exec", "--json", "--skip-git-repo-check"])
         self.assertIn("--sandbox", cmd)
         self.assertEqual(cmd[-1], "PROMPT")
+
+    def test_guarded_claude_uses_only_explicit_cowork_settings(self):
+        cmd = bridge.build_claude_command(
+            "roles/scout.md", "plan", False,
+            session_id="11111111-1111-4111-8111-111111111111",
+            guard_settings_path="/private/guard-settings.json",
+            delegation_allowed=False)
+        index = cmd.index("--setting-sources")
+        self.assertEqual(cmd[index + 1], "")
+        self.assertEqual(
+            cmd[cmd.index("--settings") + 1],
+            "/private/guard-settings.json")
+        self.assertIn("Agent", cmd)
+        self.assertIn("Task", cmd)
+        self.assertFalse(any(
+            str(part).startswith("CLAUDE_CONFIG_DIR=") for part in cmd))
+
+    def test_guarded_codex_fresh_and_resume_share_fail_closed_flags(self):
+        fresh = bridge.build_codex_command(
+            "PROMPT", "implement", False, guarded=True)
+        resume = bridge.build_codex_resume_command(
+            "thread-abc", "NEXT", "implement", False, guarded=True)
+        for command in (fresh, resume):
+            self.assertIn("--ignore-user-config", command)
+            self.assertIn("--ignore-rules", command)
+            self.assertIn("--dangerously-bypass-hook-trust", command)
+            self.assertIn("--strict-config", command)
+            disable = command.index("--disable")
+            self.assertEqual(command[disable + 1], "multi_agent")
+            self.assertIn("agents.enabled=false", self._c_values(command))
+            self.assertIn("project_doc_max_bytes=0", self._c_values(command))
+            self.assertTrue(any(
+                value.startswith("projects.")
+                and value.endswith('.trust_level="untrusted"')
+                for value in self._c_values(command)))
 
     def test_codex_resume_uses_explicit_id_never_last(self):
         cmd = bridge.build_codex_resume_command(
@@ -23874,6 +23910,19 @@ class ActionPolicyDecisionTests(unittest.TestCase):
         self.assertEqual(action_policy.decide(unknown, self.scope)["reason"],
                          "unknown_tool_class")
 
+    def test_controller_credentials_are_not_readable_through_tools(self):
+        secret = os.path.join(self.tmp.name, "controller", "auth.json")
+        scope = action_policy.OwnedScope(
+            repo_roots=(self.tmp.name,), protected_paths=(secret,))
+        secret_read = action_policy.classify_action(
+            "Read", {"file_path": secret})
+        self.assertEqual(
+            action_policy.decide(secret_read, scope),
+            {"allow": False, "reason": "protected_controller_state"})
+        ordinary_read = action_policy.classify_action(
+            "Read", {"file_path": os.path.join(self.tmp.name, "README.md")})
+        self.assertTrue(action_policy.decide(ordinary_read, scope)["allow"])
+
 
 class BashProofPolicyTests(unittest.TestCase):
     def test_bypass_shapes_deny_and_inert_commands_pass(self):
@@ -23925,6 +23974,34 @@ class BashProofPolicyTests(unittest.TestCase):
 
 
 class KernelWriteBoundaryTests(unittest.TestCase):
+    def test_protected_profile_files_override_writable_state_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "controller")
+            os.mkdir(state)
+            source = os.path.join(root, "global-auth.json")
+            Path(source).write_text("{}\n")
+            link = os.path.join(state, "auth.json")
+            os.symlink(source, link)
+            scope = action_policy.OwnedScope(controller_state_dir=state)
+            boundary = bridge.kernel_write_boundary(
+                scope, ["true"], protected_paths=(link, source))
+            if not boundary["available"]:
+                self.skipTest("kernel write boundary is unavailable")
+            if boundary["platform"] == "darwin":
+                self.assertIn(
+                    '(allow file-write* (subpath "%s"))'
+                    % os.path.realpath(state),
+                    boundary["profile"])
+                self.assertIn(
+                    '(deny file-write* (literal "%s"))' % link,
+                    boundary["profile"])
+                self.assertIn(
+                    '(deny file-write* (literal "%s"))' % source,
+                    boundary["profile"])
+            else:
+                self.assertGreaterEqual(
+                    boundary["argv"].count("--ro-bind"), 2)
+
     def test_real_profile_allows_owned_and_denies_outside_effects(self):
         with tempfile.TemporaryDirectory() as root:
             owned = os.path.join(root, "owned")
@@ -24041,7 +24118,7 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
 
     def test_refused_rows_launch_zero_processes(self):
         launches = []
-        for controller in ("codex", "opencode"):
+        for controller in ("opencode",):
             for mode in ("plan", "implement"):
                 decision = action_policy.capability_decision(
                     controller, mode, "unknown", "none", False)
@@ -24051,6 +24128,11 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
                     decision["missing_capability"],
                     "pre_child_delegation_decision")
         self.assertEqual(launches, [])
+        for mode in ("plan", "implement"):
+            decision = action_policy.capability_decision(
+                "codex", mode, "enforceably_disabled",
+                "pre_execution_record", True)
+            self.assertTrue(decision["allow"])
 
     def test_refused_adapters_record_reason_before_zero_launch(self):
         class RecordingTrace:
@@ -24062,23 +24144,17 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
 
         previous = bridge.set_nested_guard_active(True)
         try:
-            for controller, constructor in (
-                    ("codex", lambda trace: bridge.CodexSession(
-                        "plan", False, trace=trace)),
-                    ("opencode", lambda trace: bridge.OpencodeSession(
-                        "roles/scout.md", "plan", False, trace=trace))):
-                with self.subTest(controller=controller):
-                    trace = RecordingTrace()
-                    with self.assertRaisesRegex(
-                            RuntimeError, "pre-child delegation decision"):
-                        constructor(trace)
-                    self.assertEqual(trace.events, [{
-                        "event": "controller.dispatch.refused",
-                        "controller": controller,
-                        "role": "scout",
-                        "missing_capability":
-                            "pre_child_delegation_decision",
-                    }])
+            trace = RecordingTrace()
+            with self.assertRaisesRegex(
+                    RuntimeError, "pre-child delegation decision"):
+                bridge.OpencodeSession(
+                    "roles/scout.md", "plan", False, trace=trace)
+            self.assertEqual(trace.events, [{
+                "event": "controller.dispatch.refused",
+                "controller": "opencode",
+                "role": "scout",
+                "missing_capability": "pre_child_delegation_decision",
+            }])
         finally:
             bridge.set_nested_guard_active(previous)
 
@@ -24363,6 +24439,99 @@ class ActionBoundaryPolicyTests(unittest.TestCase):
 
 
 class NestedGuardSettingsAssemblyTests(unittest.TestCase):
+    def test_codex_runtime_loads_protected_cowork_hooks_and_broker(self):
+        import unittest.mock as mock
+
+        class RecordingTrace:
+            session_uuid = "codex-guard"
+
+            def __init__(self):
+                self.events = []
+
+            def event(self, name, **fields):
+                self.events.append(dict(fields, event=name))
+
+        class FakeBroker:
+            stopped = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def serve_forever(self):
+                pass
+
+            def stop(self):
+                self.stopped = True
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as root:
+            prior = os.environ.get("COWORK_SESSIONS_ROOT")
+            os.environ["COWORK_SESSIONS_ROOT"] = root
+            self.addCleanup(
+                lambda: os.environ.pop("COWORK_SESSIONS_ROOT", None)
+                if prior is None else os.environ.__setitem__(
+                    "COWORK_SESSIONS_ROOT", prior))
+            assets = state_store.session_assets_dir("codex-guard")
+            os.makedirs(assets)
+            trace = RecordingTrace()
+            real_exists = os.path.exists
+            with mock.patch.object(
+                    bridge, "_git_worktree_scope",
+                    return_value=(os.getcwd(), ())), \
+                    mock.patch.object(
+                        bridge.controller_profiles, "reference_codex_auth",
+                        return_value={
+                            "source_file": "/global/auth.json",
+                            "target_file": "/private/auth.json",
+                            "credential_copied": False,
+                            "protected_paths": (
+                                "/global/auth.json", "/private/auth.json"),
+                        }), \
+                    mock.patch.object(
+                        bridge, "kernel_write_boundary",
+                        return_value={
+                            "available": True, "platform": "darwin",
+                        }), \
+                    mock.patch.object(
+                        bridge.guard_broker, "GuardBroker", FakeBroker), \
+                    mock.patch.object(bridge.threading, "Thread", FakeThread), \
+                    mock.patch.object(
+                        bridge.os.path, "exists",
+                        side_effect=lambda path: (
+                            True if str(path).endswith(".sock")
+                            else real_exists(path))):
+                runtime = bridge._guard_runtime(
+                    trace, "builder", assets, "gpt-5.6-sol", "medium",
+                    False, controller="codex")
+            self.assertEqual(
+                os.path.realpath(runtime["settings_path"]),
+                os.path.join(
+                    runtime["scope"].controller_state_dir, "hooks.json"))
+            with open(runtime["settings_path"]) as fh:
+                hooks = json.load(fh)
+            self.assertIn("PreToolUse", hooks["hooks"])
+            self.assertIn(runtime["settings_path"],
+                          runtime["protected_paths"])
+            self.assertIn("/global/auth.json",
+                          runtime["protected_paths"])
+            self.assertTrue(
+                runtime["scope"].is_protected("/global/auth.json"))
+            self.assertFalse(runtime["delegation_allowed"])
+            self.assertEqual(
+                trace.events[-1]["delegation_reason"],
+                "multi_agent_feature_disabled")
+            bridge._close_guard_runtime(runtime)
+            self.assertTrue(runtime["broker"].stopped)
+
     def test_live_probe_uses_guard_env_settings_kernel_and_no_delegation(self):
         import unittest.mock as mock
 
@@ -24379,10 +24548,11 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
             "delegation_allowed": False,
             "scope": scope,
             "env": {
-                "CLAUDE_CONFIG_DIR": "/guard/controller",
                 "TMPDIR": "/guard/tmp",
             },
             "broker": broker_instance,
+            "profile": None,
+            "protected_paths": (),
         }
         seen = {}
 
@@ -24401,18 +24571,26 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
         with mock.patch.object(
                 bridge, "_guard_runtime", return_value=runtime) as guarded, \
                 mock.patch.object(
-                    bridge, "kernel_write_boundary",
-                    side_effect=lambda _scope, argv=None: {
+                bridge, "kernel_write_boundary",
+                    side_effect=lambda _scope, argv=None,
+                    protected_paths=(): {
                         "available": True, "platform": "darwin",
                         "argv": ["sandbox-exec"] + list(argv or ())}):
             ok, alert = bridge.probe_claude_stream_json(
                 spawn, trace=RecordingTrace(),
-                extra_writable_dir="/session/assets")
+                extra_writable_dir="/session/assets",
+                auth_run=lambda *args, **kwargs: subprocess.CompletedProcess(
+                    args[0], 0,
+                    stdout='{"loggedIn":true,"authMethod":"claude.ai"}',
+                    stderr=""))
         self.assertTrue(ok)
         self.assertIsNone(alert)
         command = seen["command"]
         self.assertEqual(command[0], "sandbox-exec")
-        self.assertIn("CLAUDE_CONFIG_DIR=/guard/controller", command)
+        self.assertFalse(any(
+            str(part).startswith("CLAUDE_CONFIG_DIR=") for part in command))
+        setting_sources = command.index("--setting-sources")
+        self.assertEqual(command[setting_sources + 1], "")
         self.assertIn("--settings", command)
         self.assertIn("/guard/settings.json", command)
         self.assertIn("Agent", command)
@@ -24483,10 +24661,24 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
                 try:
                     with mock.patch.object(
                             bridge, "_guard_runtime",
-                            side_effect=capture_guard):
+                            side_effect=capture_guard), \
+                            mock.patch.object(
+                                bridge.controller_profiles,
+                                "reference_claude_session",
+                                return_value={
+                                    "cleanup_kind": None,
+                                    "protected_paths": (),
+                                    "credential_copied": False,
+                                }):
                         ok, alert = bridge.probe_claude_stream_json(
                             spawn, trace=trace, role="scout",
-                            extra_writable_dir=assets)
+                            extra_writable_dir=assets,
+                            auth_run=lambda *args, **kwargs:
+                            subprocess.CompletedProcess(
+                                args[0], 0,
+                                stdout=('{"loggedIn":true,'
+                                        '"authMethod":"claude.ai"}'),
+                                stderr=""))
                 finally:
                     bridge.set_nested_guard_active(previous)
                 self.assertTrue(ok)
@@ -24601,6 +24793,14 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
                     bridge, "kernel_write_boundary",
                     return_value={"available": True, "platform": "darwin"}), \
                     mock.patch.object(
+                        bridge.controller_profiles,
+                        "reference_claude_session",
+                        return_value={
+                            "cleanup_kind": None,
+                            "protected_paths": (),
+                            "credential_copied": False,
+                        }), \
+                    mock.patch.object(
                         bridge.guard_broker, "GuardBroker", FakeBroker), \
                     mock.patch.object(bridge.threading, "Thread", FakeThread), \
                     mock.patch.object(bridge.os.path, "exists",
@@ -24608,7 +24808,8 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
                                           True if str(path).endswith(".sock")
                                           else real_exists(path))):
                 runtime = bridge._guard_runtime(
-                    trace, "builder", assets, "sonnet", "high", True)
+                    trace, "builder", assets, "sonnet", "high", True,
+                    controller_session_id=str(uuid.uuid4()))
             self.assertFalse(runtime["delegation_allowed"])
             self.assertEqual(
                 trace.events[-1]["delegation_reason"],
@@ -25305,6 +25506,341 @@ class ChildArtifactDeltaTests(unittest.TestCase):
             self.assertIn("mode=unattributed", rendered)
 
 
+class ControllerProfileBootstrapTests(unittest.TestCase):
+    def test_claude_fresh_and_resume_reference_private_transcript(self):
+        with tempfile.TemporaryDirectory() as root:
+            authenticated = os.path.join(root, "authenticated-claude")
+            private = os.path.join(root, "private-role")
+            cwd = os.path.join(root, "repo")
+            os.mkdir(cwd)
+            session_id = str(uuid.uuid4())
+            environ = {"CLAUDE_CONFIG_DIR": authenticated}
+
+            fresh = controller_profiles.reference_claude_session(
+                private, session_id, cwd, environ=environ)
+            self.assertTrue(os.path.islink(fresh["source_file"]))
+            self.assertFalse(os.path.exists(fresh["target_file"]))
+            self.assertEqual(
+                os.path.realpath(fresh["source_file"]),
+                os.path.realpath(fresh["target_file"]))
+            self.assertFalse(fresh["credential_copied"])
+
+            # Claude creates the transcript on its first real turn. Cowork
+            # retains that private source of truth after removing the bridge.
+            Path(fresh["target_file"]).write_text('{"type":"user"}\n')
+            self.assertTrue(
+                controller_profiles.cleanup_claude_session_reference(fresh))
+            self.assertFalse(os.path.lexists(fresh["source_file"]))
+            self.assertTrue(os.path.isfile(fresh["target_file"]))
+
+            resumed = controller_profiles.reference_claude_session(
+                private, session_id, cwd, environ=environ, resume=True)
+            self.assertTrue(os.path.islink(resumed["source_file"]))
+            self.assertEqual(
+                Path(resumed["source_file"]).read_text(),
+                '{"type":"user"}\n')
+            self.assertTrue(
+                controller_profiles.cleanup_claude_session_reference(resumed))
+
+    def test_claude_resume_and_collisions_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            authenticated = os.path.join(root, "authenticated-claude")
+            private = os.path.join(root, "private-role")
+            cwd = os.path.join(root, "repo")
+            os.mkdir(cwd)
+            environ = {"CLAUDE_CONFIG_DIR": authenticated}
+            missing_id = str(uuid.uuid4())
+            with self.assertRaisesRegex(
+                    controller_profiles.ProfileBootstrapError,
+                    "private_session_missing"):
+                controller_profiles.reference_claude_session(
+                    private, missing_id, cwd, environ=environ, resume=True)
+
+            collision_id = str(uuid.uuid4())
+            project_key = controller_profiles.claude_project_key(cwd)
+            private_file = os.path.join(
+                private, "projects", project_key, collision_id + ".jsonl")
+            os.makedirs(os.path.dirname(private_file), exist_ok=True)
+            Path(private_file).write_text("existing\n")
+            with self.assertRaisesRegex(
+                    controller_profiles.ProfileBootstrapError,
+                    "private_session_collision"):
+                controller_profiles.reference_claude_session(
+                    private, collision_id, cwd, environ=environ)
+
+    def test_registered_claude_reference_is_cleaned_during_exit_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            profile = controller_profiles.reference_claude_session(
+                os.path.join(root, "private"), str(uuid.uuid4()), root,
+                environ={
+                    "CLAUDE_CONFIG_DIR": os.path.join(root, "authenticated"),
+                })
+            self.assertTrue(os.path.islink(profile["source_file"]))
+            controller_profiles._cleanup_registered_claude_references()
+            self.assertFalse(os.path.lexists(profile["source_file"]))
+
+    def test_unhandled_interrupt_runs_claude_reference_exit_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            authenticated = os.path.join(root, "authenticated")
+            private = os.path.join(root, "private")
+            session_id = str(uuid.uuid4())
+            source = os.path.join(
+                authenticated, "projects",
+                controller_profiles.claude_project_key(root),
+                session_id + ".jsonl")
+            script = (
+                "import cowork_profiles as p\n"
+                "p.reference_claude_session(%r, %r, %r, "
+                "environ={'CLAUDE_CONFIG_DIR': %r})\n"
+                "raise KeyboardInterrupt()\n"
+            ) % (private, session_id, root, authenticated)
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=_HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(os.path.lexists(source))
+
+    def test_codex_private_home_references_but_never_copies_login(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "global", "auth.json")
+            private = os.path.join(root, "private")
+            os.makedirs(os.path.dirname(source))
+            Path(source).write_text('{"tokens":"SECRET-SENTINEL"}\n')
+            os.chmod(source, 0o600)
+            profile = controller_profiles.reference_codex_auth(
+                private, source_file=source)
+            self.assertTrue(os.path.islink(profile["target_file"]))
+            self.assertEqual(os.path.realpath(profile["target_file"]),
+                             os.path.realpath(source))
+            self.assertFalse(profile["credential_copied"])
+            self.assertEqual(
+                set(profile["protected_paths"]),
+                {profile["target_file"], profile["source_file"]})
+            self.assertEqual(
+                Path(profile["target_file"]).read_text(),
+                '{"tokens":"SECRET-SENTINEL"}\n')
+
+            os.unlink(profile["target_file"])
+            Path(profile["target_file"]).write_text(
+                '{"tokens":"COPIED-SECRET"}\n')
+            with self.assertRaisesRegex(
+                    controller_profiles.ProfileBootstrapError,
+                    "must_be_reference"):
+                controller_profiles.reference_codex_auth(
+                    private, source_file=source)
+
+    def test_codex_rejects_group_or_world_readable_login(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "auth.json")
+            Path(source).write_text("{}\n")
+            os.chmod(source, 0o644)
+            with self.assertRaisesRegex(
+                    controller_profiles.ProfileBootstrapError,
+                    "permissions"):
+                controller_profiles.reference_codex_auth(
+                    os.path.join(root, "private"), source_file=source)
+
+    def test_auth_status_parser_returns_only_bounded_metadata(self):
+        claude = controller_profiles.parse_auth_status(
+            "claude", 0,
+            '{"loggedIn":true,"authMethod":"SECRET-SENTINEL"}')
+        self.assertEqual(
+            claude, {"authenticated": True, "method": "other"})
+        codex = controller_profiles.parse_auth_status(
+            "codex", 0, "Logged in using ChatGPT")
+        self.assertEqual(
+            codex, {"authenticated": True, "method": "chatgpt"})
+
+    def test_exact_runtime_auth_trace_is_content_free(self):
+        import unittest.mock as mock
+
+        class RecordingTrace:
+            def __init__(self):
+                self.events = []
+
+            def event(self, name, **fields):
+                self.events.append(dict(fields, event=name))
+
+        runtime = {
+            "scope": action_policy.OwnedScope(),
+            "env": {"PROFILE_SENTINEL": "SECRET-ENV"},
+            "protected_paths": ("/global/auth.json",),
+        }
+        trace = RecordingTrace()
+        completed = subprocess.CompletedProcess(
+            [], 0,
+            stdout=('{"loggedIn":true,'
+                    '"authMethod":"SECRET-OUTPUT"}'),
+            stderr="")
+        with mock.patch.object(
+                bridge, "kernel_write_boundary",
+                return_value={
+                    "available": True,
+                    "platform": "darwin",
+                    "argv": ["claude", "auth", "status", "--json"],
+                }):
+            status = bridge._require_controller_auth(
+                runtime, "claude", trace, "scout",
+                run=lambda *args, **kwargs: completed)
+        self.assertEqual(status["method"], "other")
+        encoded = json.dumps(trace.events)
+        self.assertNotIn("SECRET-OUTPUT", encoded)
+        self.assertNotIn("SECRET-ENV", encoded)
+        self.assertNotIn("/global/auth.json", encoded)
+        self.assertEqual(trace.events[0]["authenticated"], True)
+        self.assertEqual(trace.events[0]["private_profile"], True)
+        self.assertEqual(trace.events[0]["credential_copied"], False)
+
+    def test_guarded_probe_cache_revalidates_auth_without_model_spawn(self):
+        import unittest.mock as mock
+
+        class Trace:
+            session_uuid = "cached-auth"
+
+            def __init__(self):
+                self.events = []
+
+            def event(self, name, **fields):
+                self.events.append(dict(fields, event=name))
+
+        runtime = {
+            "settings_path": "/guard/settings.json",
+            "delegation_allowed": False,
+            "scope": action_policy.OwnedScope(),
+            "env": {"TMPDIR": "/guard/tmp"},
+            "broker": None,
+            "profile": None,
+            "protected_paths": (),
+        }
+        calls = {"auth": 0, "spawn": 0}
+
+        def auth_run(*_args, **_kwargs):
+            calls["auth"] += 1
+            return subprocess.CompletedProcess(
+                [], 0,
+                stdout='{"loggedIn":true,"authMethod":"claude.ai"}',
+                stderr="")
+
+        def spawn(*_args, **_kwargs):
+            calls["spawn"] += 1
+            return []
+
+        previous = bridge.set_nested_guard_active(True)
+        self.addCleanup(bridge.set_nested_guard_active, previous)
+        trace = Trace()
+        with mock.patch.object(
+                bridge, "_guard_runtime", return_value=runtime), \
+                mock.patch.object(
+                    bridge, "kernel_write_boundary",
+                    return_value={
+                        "available": True, "platform": "darwin",
+                        "argv": ["claude", "auth", "status", "--json"],
+                    }), \
+                mock.patch.object(
+                    bridge.probe_cache, "resolve_claude_path",
+                    return_value="/usr/bin/claude"), \
+                mock.patch.object(
+                    bridge.probe_cache, "cache_hit", return_value=True):
+            ok, alert = bridge.probe_claude_stream_json(
+                spawn, trace=trace, role="scout",
+                extra_writable_dir="/session/assets",
+                cache_enabled=True, version_fn=lambda _path: "1.2.3",
+                auth_run=auth_run)
+        self.assertTrue(ok)
+        self.assertIsNone(alert)
+        self.assertEqual(calls, {"auth": 1, "spawn": 0})
+        cache_event = next(
+            event for event in trace.events
+            if event["event"] == "controller.probe.cache_hit")
+        self.assertTrue(cache_event["auth_revalidated"])
+
+    def test_codex_publishes_parent_work_before_guarded_turn(self):
+        import unittest.mock as mock
+
+        class FakeCodex(bridge.CodexSession):
+            def _run(self, _command):
+                return [
+                    {"type": "thread.started", "thread_id": "thread-1"},
+                    {"type": "turn.completed"},
+                ]
+
+        with tempfile.TemporaryDirectory() as root:
+            context_path = os.path.join(root, "context.json")
+            Path(context_path).write_text("{}\n")
+            session = FakeCodex(
+                "plan", False, io_out=io.StringIO())
+            session._guard_runtime = {
+                "context_path": context_path,
+                "scope": action_policy.OwnedScope(),
+                "protected_paths": (),
+                "broker": None,
+                "profile": None,
+            }
+            with mock.patch.object(
+                    bridge, "kernel_write_boundary",
+                    side_effect=lambda _scope, argv=None,
+                    protected_paths=(): {
+                        "available": True, "platform": "darwin",
+                        "argv": list(argv or ()),
+                    }):
+                result = session.send("guarded")
+            self.assertTrue(result["ok"])
+            with open(context_path) as fh:
+                context = json.load(fh)
+            self.assertEqual(
+                context["current_parent_work_id"], session.last_work_id)
+
+    def test_auth_failure_prevents_claude_and_codex_model_spawn(self):
+        import unittest.mock as mock
+
+        runtime = {
+            "settings_path": "/guard/settings.json",
+            "delegation_allowed": False,
+            "scope": action_policy.OwnedScope(),
+            "env": {"TMPDIR": "/guard/tmp"},
+            "broker": None,
+            "profile": None,
+            "protected_paths": (),
+        }
+        failed = subprocess.CompletedProcess(
+            [], 1, stdout='{"loggedIn":false}', stderr="logged out")
+
+        class Trace:
+            session_uuid = "auth-failure"
+
+            def event(self, *_args, **_kwargs):
+                pass
+
+        previous = bridge.set_nested_guard_active(True)
+        self.addCleanup(bridge.set_nested_guard_active, previous)
+        for controller in ("claude", "codex"):
+            with self.subTest(controller=controller), \
+                    mock.patch.object(
+                        bridge, "_guard_runtime", return_value=runtime), \
+                    mock.patch.object(
+                        bridge, "kernel_write_boundary",
+                        return_value={
+                            "available": True,
+                            "platform": "darwin",
+                            "argv": [controller, "auth-status"],
+                        }), \
+                    mock.patch.object(bridge.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(
+                        RuntimeError, "controller_auth_unavailable"):
+                    if controller == "claude":
+                        bridge.ClaudeSession(
+                            "roles/scout.md", "plan", False, trace=Trace(),
+                            extra_writable_dir="/session/assets",
+                            auth_run=lambda *args, **kwargs: failed)
+                    else:
+                        bridge.CodexSession(
+                            "plan", False, trace=Trace(),
+                            extra_writable_dir="/session/assets",
+                            auth_run=lambda *args, **kwargs: failed)
+                popen.assert_not_called()
+
+
 class ControllerStateIsolationTests(unittest.TestCase):
     def test_guard_socket_path_is_bounded_under_deep_session_roots(self):
         with tempfile.TemporaryDirectory() as root:
@@ -25401,7 +25937,7 @@ class ControllerStateIsolationTests(unittest.TestCase):
             def fake_guard(
                     trace, role, assets_dir, model, effort,
                     delegation_allowed, declared_outputs=None,
-                    resume_id=None, repo_writable=True):
+                    resume_id=None, repo_writable=True, **_kwargs):
                 seen.update({
                     "role": role, "assets_dir": assets_dir,
                     "declared_outputs": declared_outputs,
@@ -25421,6 +25957,8 @@ class ControllerStateIsolationTests(unittest.TestCase):
                     "env": dict(os.environ), "broker": Broker(),
                     "thread": Thread(),
                     "context_path": context_path,
+                    "profile": None,
+                    "protected_paths": (),
                 }
 
             previous = bridge.set_nested_guard_active(True)
@@ -25429,9 +25967,16 @@ class ControllerStateIsolationTests(unittest.TestCase):
                     bridge, "_guard_runtime", side_effect=fake_guard), \
                     mock.patch.object(
                         bridge, "kernel_write_boundary",
-                        side_effect=lambda _scope, argv=None: {
+                        side_effect=lambda _scope, argv=None,
+                        protected_paths=(): {
                             "available": True, "platform": "darwin",
                             "argv": list(argv or ())}), \
+                    mock.patch.object(
+                        bridge, "_require_controller_auth",
+                        return_value={
+                            "authenticated": True,
+                            "method": "claude.ai",
+                        }), \
                     mock.patch.object(bridge.subprocess, "Popen",
                                       return_value=Proc()):
                 session = cowork._isolated_evaluator_session(
@@ -25499,6 +26044,20 @@ class ControllerStateIsolationTests(unittest.TestCase):
                     with mock.patch.object(
                             bridge, "_git_worktree_scope",
                             return_value=(repo, ())), \
+                            mock.patch.object(
+                                bridge.controller_profiles,
+                                "reference_claude_session",
+                                return_value={
+                                    "cleanup_kind": None,
+                                    "protected_paths": (),
+                                    "credential_copied": False,
+                                }), \
+                            mock.patch.object(
+                                bridge, "_require_controller_auth",
+                                return_value={
+                                    "authenticated": True,
+                                    "method": "claude.ai",
+                                }), \
                             mock.patch.object(
                                 bridge.subprocess, "Popen",
                                 return_value=Proc()):
