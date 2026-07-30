@@ -112,22 +112,69 @@ your status channel. Fixed top-level shape:
 
 #### Verification commands
 
-Record `result.verification` as a list of `{label, command}` objects naming the
-concrete verification steps the build phase should run (tests, typecheck, lint,
-build) — the exact shell commands, anchored to the repo they run in (a repo's
-working dir or `git -C <root>`) when the plan spans more than one repo. It may be
-empty
-when none apply. The builder is contracted to run each of these during its
-self-audit and to block its own `ready_for_review` while any of them fails for a
-reason it introduced. Name commands that actually exist in this repo; do not
-invent a test runner that is not configured.
+Set `result.verification_schema: 2` and record `result.verification` as a list
+of schema-2 entries — the plan's own declared schema is authoritative and is
+checked against the entries' shape (`cowork_verification.normalize_inventory`
+rejects a mismatch: a plan that declares schema 2 but writes entries with no
+`execution_mode`/`kind`, or declares legacy/no schema but writes entries that
+carry those fields, is invalid). Verification no longer runs inside the
+builder's own conversational turn: the approved inventory below is what
+Cowork's owned verification transaction actually executes, serially, in a
+hermetic snapshot, outside the builder's controller turn — so name commands
+that actually exist in this repo and are safe to run unattended; do not invent
+a test runner that is not configured.
+
+Each entry is `{label, command, execution_mode, kind}` plus optional
+measurement metadata (`invalidation_reason`, `reuse_decision`,
+`triggering_finding`, `marginal_cost`, `measures`):
+
+- `command` is an **argv list**, never a shell string — no `cd`, no shell
+  metacharacters (`;`, `&&`, `||`, `|`, backticks, `$(...)`), no absolute path
+  outside the repo, no `..` traversal. The orchestrator alone sets the
+  subprocess's working directory (inside the isolated snapshot it builds); a
+  command that tries to `cd` or reference a live-worktree absolute path is
+  rejected before anything spawns.
+- `execution_mode` is `isolated_snapshot` for every test/build/lint command
+  (it runs against an immutable content-addressed copy of the approved
+  source, never the live candidate) or `candidate_read_only` for a read-only
+  preflight check that legitimately needs the live candidate (e.g. an install/
+  configuration check with no mutation risk).
+- `kind` is one of exactly four values: `baseline` (checks present from the
+  first approved inventory), `focused` (a repair-round check added after a
+  specific build-reviewer finding — carries `invalidation_reason`,
+  `reuse_decision`, `triggering_finding`, `marginal_cost`), `preflight` (the
+  one read-only CLI check, and the only entry allowed
+  `execution_mode: candidate_read_only`), or `final_suite` (**exactly one**,
+  and it must be the **last** entry) — the complete regression suite that is
+  the one accepted full-suite result for the reviewed candidate.
 
 ```json
+"verification_schema": 2,
 "verification": [
-  {"label": "unit tests", "command": "python3 -m pytest scripts/test_cowork.py"},
-  {"label": "preflight", "command": "cowork --check"}
+  {"label": "unit tests", "command": ["python3", "-m", "unittest", "scripts.test_cowork.SomeFocusedTests", "-v"],
+   "execution_mode": "isolated_snapshot", "kind": "baseline"},
+  {"label": "preflight", "command": ["./cowork", "--check"],
+   "execution_mode": "candidate_read_only", "kind": "preflight"},
+  {"label": "full unit suite", "command": ["python3", "-m", "unittest", "scripts/test_cowork.py"],
+   "execution_mode": "isolated_snapshot", "kind": "final_suite"}
 ]
 ```
+
+**Legacy compatibility.** A plan that omits `verification_schema` and writes
+plain `{label, command}` entries (a `command` string or argv, no
+`execution_mode`/`kind` anywhere) is accepted and normalized to schema 1:
+every entry runs `isolated_snapshot`, is classified `kind: legacy_required`,
+and the transaction reports its final-suite guarantee as `legacy_unknown`
+rather than inventing one — a legacy plan never said which entry (if any) was
+the complete suite, so the transaction does not pretend to know. Legacy
+plans keep their historical whole-inventory readiness comparison. Prefer
+schema 2 for every new plan; legacy normalization exists for already-approved
+plans resuming mid-build, not as an ongoing alternative.
+
+The builder selects only these planner-approved labels — it does not invent
+verification commands, and it does not run them inside its own controller
+turn; Cowork submits the whole approved inventory as one owned transaction at
+the builder's ready-for-review gate.
 
 Keep the file current — overwrite it as the plan sharpens.
 

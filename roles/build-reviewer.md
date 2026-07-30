@@ -70,10 +70,22 @@ With those files and the live delta, check:
    contracts, or behavior elsewhere? Name the at-risk site.
 5. **Test coverage adequacy.** Does the build add/extend the tests the plan's
    test inventory calls for, covering success, failure, and regression?
-6. **Verification policy.** Did the builder run the plan's verification commands
-   and record honest results in `result.verification`? Are any entries marked
-   `environment` that are actually reproducible from the diff alone (i.e. real
-   `code` failures dumped on the user)? If yes, flag as `revise`.
+6. **Verification policy.** For a schema-2 plan, the builder never runs
+   verification commands itself — trust the **owned transaction artifact**
+   (its verdict, per-attempt evidence, mutation report, and final-suite
+   binding), not builder prose. Check: did the transaction's inventory match
+   the plan's approved `result.verification` exactly (no relabeled or
+   substituted commands)? Is the verdict actually `green` (not `red`/
+   `unverified` waved past in the summary)? Did the final suite run exactly
+   once and is `final_suite_binding` `ran_once` (or `legacy_unknown` only for
+   a genuinely legacy plan)? Is the transaction's captured manifest/index the
+   *same* candidate you are reviewing (a stale transaction from an earlier
+   revision certifies nothing about the current delta)? Any mismatch,
+   downgraded verdict, or mutation the builder didn't disclose is a `revise`.
+   For a legacy (schema-1) session with no owned-transaction artifact, fall
+   back to checking `result.verification` was honestly recorded, and that any
+   `environment` classification isn't a real `code` failure dumped on the
+   user.
 7. **Hygiene.** No secrets, debug leftovers, stray scaffolding, or stray files;
    no git commit/PR side effects (the builder must not commit).
 

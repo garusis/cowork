@@ -647,11 +647,85 @@ keeps the provider's raw counters untouched alongside as `usage_native`. If the
 cumulative reading ever moves backwards there is no honest per-turn figure, and
 the turn is marked `incomparable` rather than clamped to something plausible.
 
+### Owned verification transaction
+
+At a builder's ready-for-review gate, Cowork itself — not the agent, and not
+inside the agent's own controller turn — runs the plan's approved verification
+inventory as **one owned, hermetic, manifest-bound transaction**:
+
+- **Immutable snapshot, one fresh checkout per command.** Before anything
+  runs, Cowork copies the candidate's tracked-plus-untracked-non-ignored
+  source bytes (with executable mode and symlink targets preserved) and the
+  raw Git index into a content-addressed object store, re-enumerating and
+  re-hashing before and after the copy so a concurrent edit during capture is
+  caught rather than silently copied half-and-half — objects are keyed by
+  hash and never overwritten in place, so the store itself is effectively
+  append-only. Every `execution_mode: isolated_snapshot` command then gets
+  its OWN fresh, disposable checkout materialized from that store — never a
+  checkout shared with any other command — with functional local Git
+  semantics of its own (the captured index written directly into it, so
+  `git ls-files`/`git rev-parse` work without ever touching the live
+  candidate), used for exactly one command, and removed immediately after
+  that command's terminal event is recorded, so one command's output can
+  never leak into the next. The one `execution_mode: candidate_read_only`
+  command (the CLI preflight) is the sole exception permitted to touch the
+  live candidate, and even then Cowork — never the plan or the command —
+  sets its working directory. A separate, per-transaction bootstrap checkout
+  is where the worker process itself is spawned from — excluded from the
+  normal command-input path (static argv validation rejects any literal
+  reference to it before launch), though this is isolation, not an access-
+  control guarantee: it doesn't stop a command's own inline logic from
+  discovering or constructing that path at runtime.
+- **Current-source worker, no restart.** A small worker process is spawned
+  from *inside the snapshot*, so it always runs the candidate's current code
+  even when the long-running parent process started from an older version. The
+  worker reports its own source hash and protocol version before running
+  anything; a mismatch makes the transaction `unverified` rather than trusted.
+  This is also what keeps a 19-command inventory from costing 19 conversational
+  turns: the whole inventory runs as one orchestration work item outside the
+  agent's context entirely.
+- **Owned process lifecycle.** Every command runs one at a time, stdin wired to
+  `/dev/null`, in its own process group. A hung or over-time command gets
+  `SIGTERM`, a bounded grace period, then `SIGKILL`, and Cowork verifies no
+  descendant survives before moving on. A worker that hangs or crashes is
+  bounded by an overall deadline and torn down the same way, including its
+  active command's process group — no orphaned process, and no orphaned
+  poller, in any of these paths.
+- **Fail-closed mutation detection.** Before and after every command, Cowork
+  re-diffs the live candidate's source manifest and Git index against the
+  values captured in the snapshot. Any movement stops the transaction
+  immediately, reports exactly which paths changed, certifies nothing, and
+  leaves the live tree untouched — there is no automatic rollback, because
+  overwriting a mutation could destroy the evidence or someone else's
+  concurrent work.
+- **Single-flight, not duplicated.** Concurrent or repeated requests for the
+  same snapshot digest, Git-index digest, configuration, and approved
+  inventory (execution mode included) share one transaction; a bounded waiter
+  reuses only a *terminal* result for that exact key, and a dead lock owner is
+  reclaimed rather than blocking the next attempt forever.
+- **One final suite, bound to the reviewed candidate.** The plan's inventory
+  names at most one `kind: final_suite` entry, always last; readiness requires
+  every approved command green, evidence present, the final suite run exactly
+  once, and the transaction's own captured manifest/index still matching what
+  was actually reviewed.
+- **Bounded evidence, never a silent rerun.** If a command's terminal result is
+  slow to land, Cowork polls the same pre-minted attempt for a bounded number
+  of attempts; past that bound the attempt is recorded `unresolved`/`absent`
+  and polling stops — delayed evidence is never resolved by launching a
+  replacement command.
+
+Legacy (schema-1) plans — `{label, command}` only, no `execution_mode`/`kind`
+— are still accepted: they run isolated, keep their historical
+whole-inventory readiness comparison, and report their final-suite guarantee
+as `legacy_unknown` rather than inventing one. See `roles/planner.md` for the
+schema-2 inventory format plans should write going forward.
+
 ### Evidence comes from the controllers' logs
 
-Cowork does not run the agents' commands, so it takes tool and verification facts
-from Claude's and Codex's own session logs rather than from agent prose. An agent
-that omits a failure cannot omit it from the log.
+For everything **outside** an owned verification transaction — tool use,
+non-owned sessions, and any legacy session with no transaction artifact —
+Cowork takes facts from Claude's and Codex's own session logs rather than from
+agent prose. An agent that omits a failure cannot omit it from the log.
 
 The reader is **strictly read-only** — every ingested file's content digest is
 taken before and after the read and recorded, so the property is evidence rather
@@ -685,10 +759,14 @@ rewrite or delete. A withdrawn finding survives as withdrawn, because retracting
 a false finding is good work and erasing it would make it indistinguishable from
 never having looked.
 
-Verification attempts arrive by **reconciliation**: ingestion emits id-free
-observations keyed on `(controller_session_id, tool_call_id)`, and reconciliation
-mints an id for each key it has not seen. Replaying the same log appends nothing
-the second time.
+Legacy verification attempts arrive by **reconciliation**: ingestion emits
+id-free observations keyed on `(controller_session_id, tool_call_id)`, and
+reconciliation mints an id for each key it has not seen. Replaying the same
+log appends nothing the second time. Owned-transaction attempts are minted
+directly — one stable id allocated *before* the command launches, revised in
+place as terminal evidence arrives — and never collide with or get
+reconstructed by legacy reconciliation, so the same command is never counted
+twice under two identities.
 
 ### Scoring stays out of the way
 

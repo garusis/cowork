@@ -92,10 +92,15 @@ against, so a result is tied to the tree state that produced it.
 
 ### What you write here is CHECKED, not taken on trust
 
-Verification facts are **derived from your controller's own session log** —
-which commands ran, what they exited, what timed out, what was retried, what
-mutated the tree. Three consequences, stated plainly so nothing here is a
-surprise:
+For a schema-2 plan, the AUTHORITATIVE verification evidence is the owned
+transaction record Cowork produces at your ready-for-review gate — its
+attempts, mutation report, and final-suite result, not anything you type into
+`result.verification` yourself. Your status JSON should reflect that
+transaction's outcome, not restate or reinterpret it. For a legacy (schema-1)
+plan running under old-session compatibility, verification facts are still
+**derived from your controller's own session log** — which commands ran, what
+they exited, what timed out, what was retried, what mutated the tree. Three
+consequences, stated plainly so nothing here is a surprise:
 
 - **Restating numbers gains you nothing.** The counts come from the log.
 - **Omitting a failure does not erase it.** You can leave a failed run out of
@@ -137,14 +142,24 @@ true — which is the whole failure the record exists to prevent.
 
 1. **Re-read the plan** (JSON + markdown) and walk every per-file change — is
    each one done, and is anything in the diff NOT called for by the plan?
-2. **Run each `result.verification` command** the plan named, anchored to the
-   repo the plan names it against — the plan's repo set is explicit, so run each
-   command in that repo's working dir or via `git -C <root>` (NOT a generic
-   "repo root"; a build may span more than one repo). Capture each into
-   `result.verification` as `{label, command, ok, output_excerpt}` (add
-   `classification` on failure).
+2. **Submit the plan's approved inventory as one owned verification
+   transaction** — you do not run these commands yourself, and never inside
+   your own controller turn. Marking `ready_for_review` triggers Cowork's
+   orchestrator-owned transaction: it builds an immutable hermetic snapshot of
+   your candidate, spawns a worker loaded from that snapshot, and runs the
+   plan's whole approved `result.verification` inventory serially, outside
+   this conversation. You may select which planner-approved labels matter for
+   a focused repair round after a reviewer finding (recording
+   `invalidation_reason`/`reuse_decision`/`triggering_finding`/`marginal_cost`
+   on those `kind: focused` entries) but you never invent a command the plan
+   did not approve, and you never execute verification commands yourself to
+   pre-check before submitting — the transaction is the check.
 3. **Resolve failures** per the verification policy below before declaring
-   ready.
+   ready. A red or unverified transaction hands you back a static,
+   evidence-path reason (the transaction id, what mutated, what failed, or
+   what evidence never arrived) through the normal reopened-work flow — fix
+   the underlying issue and let readiness resubmit the transaction; you never
+   get to argue past a failed transaction in prose.
 4. **Hygiene** — no leftover scaffolding, debug prints, secrets, or stray files.
 
 `ready_for_review` is gated on verification having completed **against the exact
