@@ -1358,10 +1358,13 @@ Guarded controller authentication is reference-only and checked inside the
 exact production boundary before every process can make a model turn. Claude
 keeps the existing authenticated profile for macOS Keychain lookup, excludes
 its user/project/local settings, and temporarily links only Cowork's
-preselected session id to a transcript in the role-private controller-state
-directory. The link is removed when the session closes; the private transcript
-remains resumable. Codex receives a private `CODEX_HOME` whose `auth.json` is a
-read-only symlink to the existing owner-only login file. Its Cowork-owned
+preselected session id to a transcript and `session-env` directory in the
+role-private controller-state directory. The links are removed when the session
+closes; the private state remains resumable. Controller-native `ToolSearch` is
+classified as read-only discovery; any tool it exposes is still intercepted
+and classified independently before use. Codex receives a private `CODEX_HOME`
+whose `auth.json` is a read-only symlink to the existing owner-only login file.
+Its Cowork-owned
 `hooks.json`, the auth link, and the auth target are protected from controller
 writes. Neither path copies tokens, setup credentials, or an entire controller
 profile. Missing, permissively readable, mismatched, or unauthenticated

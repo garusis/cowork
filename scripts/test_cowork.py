@@ -25533,6 +25533,11 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
             self.assertEqual(
                 os.path.realpath(fresh["source_file"]),
                 os.path.realpath(fresh["target_file"]))
+            self.assertTrue(os.path.islink(fresh["session_env_source"]))
+            self.assertTrue(os.path.isdir(fresh["session_env_target"]))
+            self.assertEqual(
+                os.path.realpath(fresh["session_env_source"]),
+                os.path.realpath(fresh["session_env_target"]))
             self.assertFalse(fresh["credential_copied"])
 
             # Claude creates the transcript on its first real turn. Cowork
@@ -25541,7 +25546,9 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
             self.assertTrue(
                 controller_profiles.cleanup_claude_session_reference(fresh))
             self.assertFalse(os.path.lexists(fresh["source_file"]))
+            self.assertFalse(os.path.lexists(fresh["session_env_source"]))
             self.assertTrue(os.path.isfile(fresh["target_file"]))
+            self.assertTrue(os.path.isdir(fresh["session_env_target"]))
 
             resumed = controller_profiles.reference_claude_session(
                 private, session_id, cwd, environ=environ, resume=True)
@@ -25551,6 +25558,53 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
                 '{"type":"user"}\n')
             self.assertTrue(
                 controller_profiles.cleanup_claude_session_reference(resumed))
+
+    def test_claude_session_env_collision_fails_before_transcript_link(self):
+        with tempfile.TemporaryDirectory() as root:
+            authenticated = os.path.join(root, "authenticated-claude")
+            private = os.path.join(root, "private-role")
+            session_id = str(uuid.uuid4())
+            source_env = os.path.join(
+                authenticated, "session-env", session_id)
+            os.makedirs(source_env)
+            with self.assertRaisesRegex(
+                    controller_profiles.ProfileBootstrapError,
+                    "session_env_reference_collision"):
+                controller_profiles.reference_claude_session(
+                    private, session_id, root,
+                    environ={"CLAUDE_CONFIG_DIR": authenticated})
+            source_file = os.path.join(
+                authenticated, "projects",
+                controller_profiles.claude_project_key(root),
+                session_id + ".jsonl")
+            self.assertFalse(os.path.lexists(source_file))
+
+    def test_claude_session_env_reference_is_writable_inside_boundary(self):
+        if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
+            self.skipTest("macOS kernel boundary is unavailable")
+        with tempfile.TemporaryDirectory() as root:
+            private = os.path.join(root, "private-role")
+            session_id = str(uuid.uuid4())
+            profile = controller_profiles.reference_claude_session(
+                private, session_id, root,
+                environ={
+                    "CLAUDE_CONFIG_DIR": os.path.join(root, "authenticated"),
+                })
+            boundary = bridge.kernel_write_boundary(
+                action_policy.OwnedScope(controller_state_dir=private),
+                [sys.executable, "-c",
+                 ("import os, pathlib, sys; "
+                  "os.makedirs(sys.argv[1], exist_ok=True); "
+                  "pathlib.Path(sys.argv[1], 'probe').write_text('ok')"),
+                 profile["session_env_source"]])
+            completed = subprocess.run(
+                boundary["argv"], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                Path(profile["session_env_target"], "probe").read_text(), "ok")
+            self.assertTrue(
+                controller_profiles.cleanup_claude_session_reference(profile))
 
     def test_claude_resume_and_collisions_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
@@ -25586,8 +25640,10 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
                     "CLAUDE_CONFIG_DIR": os.path.join(root, "authenticated"),
                 })
             self.assertTrue(os.path.islink(profile["source_file"]))
+            self.assertTrue(os.path.islink(profile["session_env_source"]))
             controller_profiles._cleanup_registered_claude_references()
             self.assertFalse(os.path.lexists(profile["source_file"]))
+            self.assertFalse(os.path.lexists(profile["session_env_source"]))
 
     def test_unhandled_interrupt_runs_claude_reference_exit_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
@@ -26307,7 +26363,7 @@ class UnknownToolClassTests(unittest.TestCase):
     def test_catch_all_still_allows_evidenced_builtin_reads(self):
         doc = bridge.guard_settings_document("/tmp/guard.py")
         self.assertNotIn("matcher", doc["hooks"]["PreToolUse"][0])
-        for name in ("Read", "Glob", "Grep"):
+        for name in ("Read", "Glob", "Grep", "ToolSearch"):
             action = action_policy.classify_action(name, {"path": "/x"})
             self.assertEqual(action["class"], "read")
             self.assertTrue(action_policy.decide(

@@ -16,7 +16,8 @@ import shlex
 
 KNOWN_IDENTITY_SOURCES = frozenset(("live_event", "config_pinned"))
 CHILD_TOOLS = frozenset(("Agent", "Task"))
-READ_TOOLS = frozenset(("Read", "Glob", "Grep", "WebFetch", "WebSearch"))
+READ_TOOLS = frozenset((
+    "Read", "Glob", "Grep", "ToolSearch", "WebFetch", "WebSearch"))
 MUTATION_TOOLS = frozenset(("Write", "Edit", "MultiEdit", "NotebookEdit"))
 INERT_COMMANDS = frozenset(("git", "ls", "rg", "grep", "find", "pwd",
                             "wc", "head", "tail"))

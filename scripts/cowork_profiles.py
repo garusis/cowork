@@ -45,7 +45,13 @@ def claude_project_key(cwd):
 
 def reference_claude_session(target_dir, session_id, cwd, environ=None,
                              home=None, resume=False):
-    """Route one authenticated-profile transcript into private role state."""
+    """Route one authenticated-profile session into private role state.
+
+    Claude writes both a project transcript and a ``session-env`` directory
+    under its authenticated configuration root. Reference both exact
+    session-id paths into role-private state so the kernel boundary never needs
+    to make the authenticated profile writable.
+    """
     try:
         canonical_id = str(uuid.UUID(str(session_id)))
     except (ValueError, TypeError, AttributeError):
@@ -60,27 +66,52 @@ def reference_claude_session(target_dir, session_id, cwd, environ=None,
     os.makedirs(private_dir, exist_ok=True)
     private_file = os.path.join(private_dir, canonical_id + ".jsonl")
     source_file = os.path.join(source_dir, canonical_id + ".jsonl")
+    source_env = os.path.join(config_dir, "session-env", canonical_id)
+    private_env = os.path.join(
+        os.path.abspath(os.path.expanduser(target_dir)),
+        "session-env", canonical_id)
 
     private_exists = os.path.isfile(private_file)
     if resume and not private_exists:
         raise ProfileBootstrapError("claude_private_session_missing")
     if not resume and os.path.lexists(private_file):
         raise ProfileBootstrapError("claude_private_session_collision")
-    if os.path.lexists(source_file):
-        if not os.path.islink(source_file):
-            raise ProfileBootstrapError("claude_session_reference_collision")
-        if os.path.realpath(source_file) != os.path.realpath(private_file):
-            raise ProfileBootstrapError("claude_session_reference_mismatch")
-        changed = False
-    else:
-        os.symlink(private_file, source_file)
-        changed = True
+    references = (
+        (source_file, private_file, "claude_session_reference"),
+        (source_env, private_env, "claude_session_env_reference"),
+    )
+    for source, target, error_prefix in references:
+        if not os.path.lexists(source):
+            continue
+        if not os.path.islink(source):
+            raise ProfileBootstrapError(error_prefix + "_collision")
+        if os.path.realpath(source) != os.path.realpath(target):
+            raise ProfileBootstrapError(error_prefix + "_mismatch")
+
+    os.makedirs(os.path.dirname(source_env), exist_ok=True)
+    os.makedirs(private_env, exist_ok=True)
+    created = []
+    try:
+        for source, target, _error_prefix in references:
+            if not os.path.lexists(source):
+                os.symlink(target, source)
+                created.append(source)
+    except OSError:
+        for source in reversed(created):
+            try:
+                os.unlink(source)
+            except OSError:
+                pass
+        raise
     with _CLAUDE_REFERENCE_LOCK:
-        _CLAUDE_REFERENCES[source_file] = private_file
+        for source, target, _error_prefix in references:
+            _CLAUDE_REFERENCES[source] = target
     return {
         "source_file": source_file,
         "target_file": private_file,
-        "changed": changed,
+        "session_env_source": source_env,
+        "session_env_target": private_env,
+        "changed": bool(created),
         "credential_copied": False,
         "cleanup_kind": "claude_session_reference",
         "protected_paths": (),
@@ -88,25 +119,32 @@ def reference_claude_session(target_dir, session_id, cwd, environ=None,
 
 
 def cleanup_claude_session_reference(profile):
-    """Remove only the exact symlink Cowork created; keep the private log."""
+    """Remove exact session symlinks; keep private transcript and env state."""
     if not isinstance(profile, dict):
         return False
-    source = profile.get("source_file")
-    target = profile.get("target_file")
     if profile.get("cleanup_kind") != "claude_session_reference":
         return False
-    try:
-        if (not os.path.islink(source)
-                or os.path.realpath(source) != os.path.realpath(target)):
-            return False
-        os.unlink(source)
-        return True
-    except OSError:
-        return False
-    finally:
-        with _CLAUDE_REFERENCE_LOCK:
-            if _CLAUDE_REFERENCES.get(source) == target:
-                _CLAUDE_REFERENCES.pop(source, None)
+    references = (
+        (profile.get("source_file"), profile.get("target_file")),
+        (profile.get("session_env_source"), profile.get("session_env_target")),
+    )
+    removed = False
+    for source, target in references:
+        if not source or not target:
+            continue
+        try:
+            if (not os.path.islink(source)
+                    or os.path.realpath(source) != os.path.realpath(target)):
+                continue
+            os.unlink(source)
+            removed = True
+        except OSError:
+            continue
+        finally:
+            with _CLAUDE_REFERENCE_LOCK:
+                if _CLAUDE_REFERENCES.get(source) == target:
+                    _CLAUDE_REFERENCES.pop(source, None)
+    return removed
 
 
 def _cleanup_registered_claude_references():
@@ -114,11 +152,16 @@ def _cleanup_registered_claude_references():
     with _CLAUDE_REFERENCE_LOCK:
         references = tuple(_CLAUDE_REFERENCES.items())
     for source, target in references:
-        cleanup_claude_session_reference({
-            "source_file": source,
-            "target_file": target,
-            "cleanup_kind": "claude_session_reference",
-        })
+        try:
+            if (os.path.islink(source)
+                    and os.path.realpath(source) == os.path.realpath(target)):
+                os.unlink(source)
+        except OSError:
+            pass
+        finally:
+            with _CLAUDE_REFERENCE_LOCK:
+                if _CLAUDE_REFERENCES.get(source) == target:
+                    _CLAUDE_REFERENCES.pop(source, None)
 
 
 atexit.register(_cleanup_registered_claude_references)
