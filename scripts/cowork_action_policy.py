@@ -106,8 +106,18 @@ CONTROLLER_CAPABILITY_MATRIX = {
         "mutation_gate": "pre_execution_record",
         "kernel_boundary": "required",
     },
-    ("codex", "plan"): {"refused": "pre_child_delegation_decision"},
-    ("codex", "implement"): {"refused": "pre_child_delegation_decision"},
+    ("codex", "plan"): {
+        "delegation": "enforceably_disabled",
+        "child_correlation": "unavailable",
+        "mutation_gate": "pre_execution_record",
+        "kernel_boundary": "required",
+    },
+    ("codex", "implement"): {
+        "delegation": "enforceably_disabled",
+        "child_correlation": "unavailable",
+        "mutation_gate": "pre_execution_record",
+        "kernel_boundary": "required",
+    },
     ("opencode", "plan"): {"refused": "pre_child_delegation_decision"},
     ("opencode", "implement"): {"refused": "pre_child_delegation_decision"},
 }
@@ -156,6 +166,7 @@ class OwnedScope:
     controller_state_dir: str = None
     session_assets_dir: str = None
     sibling_worktrees: tuple = field(default_factory=tuple)
+    protected_paths: tuple = field(default_factory=tuple)
 
     def __post_init__(self):
         object.__setattr__(self, "repo_roots",
@@ -164,6 +175,8 @@ class OwnedScope:
                            tuple(_real(p) for p in self.declared_outputs if p))
         object.__setattr__(self, "sibling_worktrees",
                            tuple(_real(p) for p in self.sibling_worktrees if p))
+        object.__setattr__(self, "protected_paths",
+                           tuple(_real(p) for p in self.protected_paths if p))
         for name in ("role_temp_dir", "controller_state_dir",
                      "session_assets_dir"):
             value = getattr(self, name)
@@ -190,6 +203,11 @@ class OwnedScope:
     def is_controller_state(self, path):
         return bool(self.controller_state_dir
                     and _inside(path, self.controller_state_dir))
+
+    def is_protected(self, path):
+        path = _real(path)
+        return any(path == protected or _inside(path, protected)
+                   for protected in self.protected_paths)
 
 
 def load_capability_allowlist(entries):
@@ -229,7 +247,7 @@ def capability_decision(controller, mode, delegation="unknown",
                 "missing_capability": "child_agent_correlation"}
     delegation_ok = delegation in ("governed", "enforceably_disabled",
                                    "proven_absent")
-    mutation_ok = mutation_gate == "pre_execution_record"
+    mutation_ok = mutation_gate == row.get("mutation_gate")
     if not delegation_ok:
         return {"allow": False, "reason": "delegation_capability_unknown"}
     if not mutation_ok:
@@ -406,7 +424,9 @@ def classify_action(tool_name, tool_input, cwd=None, installed_schema=None,
         return {"class": "child", "targets": [],
                 "resolution_complete": True, "input": tool_input}
     if tool_name in READ_TOOLS:
-        return {"class": "read", "targets": [],
+        raw = (tool_input.get("file_path") or tool_input.get("path"))
+        target = _resolve(raw, cwd) if raw else None
+        return {"class": "read", "targets": [target] if target else [],
                 "resolution_complete": True, "proof": "builtin_read"}
     if tool_name in ("Bash", "Shell", "exec_command"):
         return _bash_action(tool_input.get("command") or tool_input.get("cmd"),
@@ -437,14 +457,16 @@ def decide(action, scope, created_paths=(), clean_tracked_paths=()):
     """Apply ownership and recoverability rules to a classified action."""
     action = dict(action or {})
     kind = action.get("class")
+    targets = action.get("targets") or ()
     if kind == "read":
+        if any(target and scope.is_protected(target) for target in targets):
+            return {"allow": False, "reason": "protected_controller_state"}
         return {"allow": True, "reason": "read_only"}
     if kind in ("unknown", None) or not action.get("resolution_complete"):
         return {"allow": False,
                 "reason": action.get("reason") or "target_unresolved"}
     if kind == "child":
         return {"allow": False, "reason": "child_requires_identity_policy"}
-    targets = action.get("targets") or ()
     created = {_real(p) for p in created_paths}
     clean = {_real(p) for p in clean_tracked_paths}
     for target in targets:

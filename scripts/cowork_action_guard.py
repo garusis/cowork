@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude hook transport for the orchestrator-owned guard broker.
+"""Controller hook transport for the orchestrator-owned guard broker.
 
 The hook has no policy authority and writes no durable files.  Its sole minted
 value is the correlation id needed when the broker is unavailable.

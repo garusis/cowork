@@ -48,6 +48,7 @@ import cowork_policy as policy  # noqa: E402
 import cowork_action_policy as action_policy  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_guard_broker as guard_broker  # noqa: E402
+import cowork_profiles as controller_profiles  # noqa: E402
 # Re-exported so existing callers/tests keep using bridge.USER_LABEL /
 # bridge.speaker_label; the canonical definitions live in cowork_ui.
 from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
@@ -165,7 +166,11 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     if effort:
         cmd += ["--effort", effort]
     if guard_settings_path:
-        cmd += ["--settings", guard_settings_path]
+        # Keep the authenticated profile for Keychain lookup while excluding
+        # its user/project/local customizations. The explicit Cowork settings
+        # file below is still loaded and remains the only hook source.
+        cmd += ["--setting-sources", "",
+                "--settings", guard_settings_path]
     if not delegation_allowed:
         # Both names are needed across the Agent/legacy Task CLI transition.
         cmd += ["--disallowedTools", "Agent", "Task"]
@@ -284,43 +289,60 @@ def migrate_legacy_claude_resume(controller_state, resume_id,
 
 def _guard_runtime(trace, role, assets_dir, model, effort,
                    delegation_allowed, declared_outputs=None, resume_id=None,
-                   repo_writable=True):
+                   repo_writable=True, controller="claude",
+                   controller_session_id=None):
     session_uuid = getattr(trace, "session_uuid", None)
     if not (session_uuid and assets_dir):
         raise RuntimeError("guard_context_unavailable")
     if sys.platform.startswith("linux"):
         raise RuntimeError(
-            "controller_state_unavailable: isolated Claude credentials "
-            "were not provisioned")
+            "controller_state_unavailable: isolated %s credentials "
+            "were not provisioned" % controller)
+    if controller not in ("claude", "codex"):
+        raise RuntimeError("guard_controller_unsupported")
     guard_dir = state_store.guard_dir_for(session_uuid)
     role_temp = os.path.join(guard_dir, "tmp", role)
     controller_state = state_store.controller_state_dir_for(session_uuid, role)
     os.makedirs(role_temp, exist_ok=True)
     os.makedirs(controller_state, exist_ok=True)
+    profile = None
+    if controller == "codex":
+        profile = controller_profiles.reference_codex_auth(controller_state)
+    profile_protected = tuple((profile or {}).get("protected_paths") or ())
     active_root, sibling_worktrees = _git_worktree_scope(os.getcwd())
+    if controller == "claude":
+        if resume_id:
+            migrate_legacy_claude_resume(controller_state, resume_id)
     # Evaluators are intrinsically evidence readers. Keep this invariant at the
     # boundary as well as at their production caller so a future call site
     # cannot accidentally restore repository mutation authority.
     if role == "evaluator":
         repo_writable = False
-    if resume_id:
-        migrate_legacy_claude_resume(controller_state, resume_id)
     scope = action_policy.OwnedScope(
         repo_roots=((active_root,) if repo_writable else ()),
         declared_outputs=(tuple(declared_outputs)
                           if declared_outputs is not None
                           else _declared_outputs_for_role(assets_dir, role)),
         role_temp_dir=role_temp, controller_state_dir=controller_state,
-        session_assets_dir=assets_dir, sibling_worktrees=sibling_worktrees)
+        session_assets_dir=assets_dir, sibling_worktrees=sibling_worktrees,
+        protected_paths=profile_protected)
     boundary = kernel_write_boundary(scope)
     if not boundary["available"]:
+        controller_profiles.cleanup_claude_session_reference(profile)
         raise RuntimeError(boundary["reason"])
+    env = dict(os.environ)
+    env["TMPDIR"] = role_temp
+    if controller == "codex":
+        env["CODEX_HOME"] = controller_state
     token = uuid.uuid4().hex + uuid.uuid4().hex
     socket_path = state_store.guard_socket_path_for(
         session_uuid, role, token)
-    settings_path = state_store.guard_settings_path_for(session_uuid, role)
+    settings_path = (
+        os.path.join(controller_state, "hooks.json")
+        if controller == "codex"
+        else state_store.guard_settings_path_for(session_uuid, role))
     parent = {
-        "controller": "claude", "controller_source": "config_pinned",
+        "controller": controller, "controller_source": "config_pinned",
         "model": model, "model_source": (
             "config_pinned" if model else "unknown"),
         "effort": effort, "effort_source": (
@@ -354,26 +376,45 @@ def _guard_runtime(trace, role, assets_dir, model, effort,
     while not os.path.exists(socket_path) and thread.is_alive():
         if time.monotonic() >= deadline:
             broker.stop()
+            controller_profiles.cleanup_claude_session_reference(profile)
             raise RuntimeError("guard_broker_start_timeout")
         time.sleep(0.01)
     if not thread.is_alive():
+        controller_profiles.cleanup_claude_session_reference(profile)
         raise RuntimeError("guard_broker_start_failed")
-    # Claude's documented SubagentStart payload exposes agent_id but no Agent
-    # tool_use_id.  There is therefore no concurrency-safe join from the
-    # pre-dispatch decision to nested hooks.  Keep the role usable, but remove
-    # Agent/Task from the controller and make the broker refuse any bypass.
+    if controller == "claude":
+        try:
+            profile = controller_profiles.reference_claude_session(
+                controller_state, controller_session_id or resume_id,
+                os.getcwd(), resume=bool(resume_id))
+        except Exception:
+            broker.stop()
+            raise
+    # Neither supported controller exposes a concurrency-safe correlation from
+    # a pre-dispatch child decision to SubagentStart. Keep direct role work
+    # usable, hard-disable native delegation, and make the broker deny a bypass.
     can_delegate = False
-    trace.event("nested.guard.ready", role=role, controller="claude",
-                delegation="enforceably_disabled",
-                delegation_reason="child_agent_correlation_unavailable",
-                kernel_boundary=boundary.get("platform"))
-    env = dict(os.environ)
-    env.update({"CLAUDE_CONFIG_DIR": controller_state,
-                "TMPDIR": role_temp})
+    delegation_reason = (
+        "multi_agent_feature_disabled" if controller == "codex"
+        else "child_agent_correlation_unavailable")
+    try:
+        trace.event("nested.guard.ready", role=role, controller=controller,
+                    delegation="enforceably_disabled",
+                    delegation_reason=delegation_reason,
+                    kernel_boundary=boundary.get("platform"))
+    except Exception:
+        broker.stop()
+        controller_profiles.cleanup_claude_session_reference(profile)
+        raise
+    env["TMPDIR"] = role_temp
+    protected_paths = tuple(profile.get("protected_paths") or ())
+    if controller == "codex":
+        protected_paths += (settings_path,)
     return {"scope": scope, "boundary": boundary, "broker": broker,
             "thread": thread, "settings_path": settings_path, "env": env,
             "context_path": context_path,
-            "delegation_allowed": can_delegate}
+            "delegation_allowed": can_delegate, "profile": profile,
+            "protected_paths": protected_paths}
 
 
 def _stamp_guard_parent_work(runtime, work_id):
@@ -391,7 +432,55 @@ def _stamp_guard_parent_work(runtime, work_id):
     os.replace(tmp, path)
 
 
-def kernel_write_boundary(owned_scope, argv=None):
+def _require_controller_auth(runtime, controller, trace, role, run=None):
+    """Verify login inside the exact private profile before any model turn."""
+    runner = run or subprocess.run
+    command = controller_profiles.auth_command(controller)
+    boundary = kernel_write_boundary(
+        runtime["scope"], command,
+        protected_paths=runtime.get("protected_paths") or ())
+    if not boundary["available"]:
+        raise RuntimeError(boundary["reason"])
+    started = time.monotonic()
+    try:
+        completed = runner(
+            boundary["argv"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=runtime["env"], timeout=15, check=False)
+        status_output = completed.stdout
+        if controller == "codex":
+            status_output = (completed.stdout or "") + "\n" + (
+                completed.stderr or "")
+        status = controller_profiles.parse_auth_status(
+            controller, completed.returncode, status_output)
+        error_type = None
+    except Exception as exc:  # noqa: BLE001 - normalize to a safe preflight
+        status = {"authenticated": False, "method": None}
+        error_type = type(exc).__name__
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if trace:
+        trace.event(
+            "controller.auth.status", controller=controller, role=role,
+            authenticated=status["authenticated"], method=status.get("method"),
+            private_profile=True, credential_copied=False,
+            duration_ms=duration_ms, error_type=error_type)
+    if not status["authenticated"]:
+        raise RuntimeError(
+            "controller_auth_unavailable: %s private profile cannot reuse "
+            "the existing login" % controller)
+    return status
+
+
+def _close_guard_runtime(runtime):
+    if not runtime:
+        return
+    broker = runtime.get("broker")
+    if broker:
+        broker.stop()
+    controller_profiles.cleanup_claude_session_reference(
+        runtime.get("profile"))
+
+
+def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
     """Return a generated kernel-boundary description, or fail closed.
 
     macOS seatbelt is emitted as an argv wrapper. Linux requires bubblewrap;
@@ -401,6 +490,9 @@ def kernel_write_boundary(owned_scope, argv=None):
     roots = tuple(os.path.realpath(p) for p in owned_scope.writable_roots)
     siblings = tuple(os.path.realpath(p)
                      for p in owned_scope.sibling_worktrees)
+    protected = tuple(dict.fromkeys(
+        os.path.abspath(os.path.expanduser(p))
+        for p in protected_paths if p))
     if sys.platform == "darwin" and shutil.which("sandbox-exec"):
         def quote(value):
             return value.replace("\\", "\\\\").replace('"', '\\"')
@@ -416,6 +508,11 @@ def kernel_write_boundary(owned_scope, argv=None):
         for root in siblings:
             lines.append('(deny file-write* (literal "%s"))' % quote(root))
             lines.append('(deny file-write* (subpath "%s"))' % quote(root))
+        for path in protected:
+            lines.append('(deny file-write* (literal "%s"))' % quote(path))
+            real = os.path.realpath(path)
+            if real != path:
+                lines.append('(deny file-write* (literal "%s"))' % quote(real))
         profile = "\n".join(lines) + "\n"
         wrapper = ["sandbox-exec", "-p", profile]
         return {"available": True, "platform": "darwin",
@@ -427,6 +524,9 @@ def kernel_write_boundary(owned_scope, argv=None):
             wrapper += ["--bind", root, root]
         for root in siblings:
             wrapper += ["--ro-bind", root, root]
+        for path in protected:
+            wrapper += ["--ro-bind", os.path.realpath(path),
+                        os.path.realpath(path)]
         return {"available": True, "platform": "linux", "profile": None,
                 "argv": wrapper + list(argv or ())}
     return {"available": False, "platform": sys.platform, "profile": None,
@@ -448,8 +548,25 @@ def codex_model_args(model=None, effort=None):
     return args
 
 
+def codex_governance_args(guarded=False):
+    """Fail-closed Codex settings shared by fresh and resumed role turns."""
+    if not guarded:
+        return []
+    return [
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--dangerously-bypass-hook-trust",
+        "--disable", "multi_agent",
+        "-c", "agents.enabled=false",
+        "-c", "project_doc_max_bytes=0",
+        "-c", "projects.%s.trust_level=\"untrusted\"" % json.dumps(
+            os.path.abspath(os.getcwd())),
+        "--strict-config",
+    ]
+
+
 def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
-                        model=None, effort=None):
+                        model=None, effort=None, guarded=False):
     """argv for the first one-shot codex exec turn. The role spec is prepended
     into prompt_text by the caller (no AGENTS.md is written into the repo).
 
@@ -462,6 +579,7 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
     roles keep the same effective permissions as this fresh turn."""
     return (
         ["codex", "exec", "--json", "--skip-git-repo-check"]
+        + codex_governance_args(guarded)
         + codex_mode_flags(mode, yolo)
         + codex_model_args(model, effort)
         + (["--add-dir", extra_writable_dir] if extra_writable_dir else [])
@@ -502,7 +620,7 @@ def codex_resume_mode_args(mode, yolo, extra_writable_dir=None):
 
 def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
                                extra_writable_dir=None, model=None,
-                               effort=None):
+                               effort=None, guarded=False):
     """argv for a codex follow-up turn against an explicit thread id (never
     --last, which could grab a concurrent session in the same cwd).
 
@@ -516,6 +634,7 @@ def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
     final positional arg (never --last)."""
     return (
         ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+        + codex_governance_args(guarded)
         + codex_resume_mode_args(mode, yolo, extra_writable_dir)
         + codex_model_args(model, effort)
         + [thread_id, prompt_text]
@@ -911,7 +1030,8 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                              role_prompt_file=DEFAULT_ROLE_PROMPT, trace=None,
                              role="scout", extra_writable_dir=None,
                              cache_enabled=False, version_fn=None,
-                             cache_path=None, model=None, effort=None):
+                             cache_path=None, model=None, effort=None,
+                             auth_run=None):
     """Send one minimal user message to claude and confirm an assistant/result
     event comes back.
 
@@ -932,9 +1052,13 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     cached). `version_fn`/`cache_path` are injectable for tests.
     """
     policy.guard("claude", role=role, kind="probe")
+    probe_session_id = (
+        str(uuid.uuid4()) if nested_guard_active() else None)
     command = build_claude_command(role_prompt_file, mode, yolo,
-                                   extra_writable_dir=extra_writable_dir)
+                                   extra_writable_dir=extra_writable_dir,
+                                   session_id=probe_session_id)
     cache_key = None
+    cache_hit = False
     if cache_enabled:
         claude_path = probe_cache.resolve_claude_path(command)
         resolver = version_fn or probe_cache.claude_version
@@ -942,12 +1066,8 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         cache_key = probe_cache.probe_cache_key(
             claude_path, version, role_prompt_file, mode, yolo,
             bool(extra_writable_dir))
-        if cache_key and probe_cache.cache_hit(cache_key, path=cache_path):
-            if trace:
-                trace.event("controller.probe.cache_hit", controller="claude",
-                            role=role, prompt_kind="probe", mode=mode, yolo=yolo,
-                            role_prompt_file=role_prompt_file)
-            return True, None
+        cache_hit = bool(
+            cache_key and probe_cache.cache_hit(cache_key, path=cache_path))
     # The live probe is a distinct audited work item. Mint and publish its id
     # before the process exists so every hook decision can join to it.
     probe_work_id = trace_store.new_work_id()
@@ -956,22 +1076,49 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     if nested_guard_active():
         runtime = _guard_runtime(
             trace, role, extra_writable_dir, model, effort, False,
-            declared_outputs=(), repo_writable=False)
+            declared_outputs=(), repo_writable=False,
+            controller_session_id=probe_session_id)
+        try:
+            _require_controller_auth(
+                runtime, "claude", trace, role, run=auth_run)
+        except RuntimeError:
+            _close_guard_runtime(runtime)
+            return False, (
+                "Claude Code is logged in globally, but the guarded private "
+                "profile could not reuse that login. No model turn was "
+                "launched."
+            )
+        if cache_hit:
+            if trace:
+                trace.event("controller.probe.cache_hit", controller="claude",
+                            role=role, prompt_kind="probe", mode=mode, yolo=yolo,
+                            role_prompt_file=role_prompt_file,
+                            auth_revalidated=True)
+            _close_guard_runtime(runtime)
+            return True, None
         _stamp_guard_parent_work(runtime, probe_work_id)
         command = build_claude_command(
             role_prompt_file, mode, yolo,
             extra_writable_dir=extra_writable_dir, model=model, effort=effort,
             guard_settings_path=runtime["settings_path"],
-            delegation_allowed=runtime["delegation_allowed"])
+            delegation_allowed=runtime["delegation_allowed"],
+            session_id=probe_session_id)
         env_argv = [shutil.which("env") or "/usr/bin/env"]
         env_argv += ["%s=%s" % (key, runtime["env"][key])
-                     for key in ("CLAUDE_CONFIG_DIR", "TMPDIR")]
+                     for key in ("TMPDIR",)]
         boundary = kernel_write_boundary(
             runtime["scope"], env_argv + command)
         if not boundary["available"]:
-            runtime["broker"].stop()
+            _close_guard_runtime(runtime)
             raise RuntimeError(boundary["reason"])
         command = boundary["argv"]
+    elif cache_hit:
+        if trace:
+            trace.event("controller.probe.cache_hit", controller="claude",
+                        role=role, prompt_kind="probe", mode=mode, yolo=yolo,
+                        role_prompt_file=role_prompt_file,
+                        auth_revalidated=False)
+        return True, None
     stdin_text = encode_user_message("ping")
     # The probe is its own unit of work (P1): a probe's cost is real and is
     # classified `probe` rather than folded into the role turn that follows it.
@@ -1035,7 +1182,7 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         )
     finally:
         if runtime:
-            runtime["broker"].stop()
+            _close_guard_runtime(runtime)
     if trace:
         trace.event("controller.probe.end", controller="claude", role=role,
                     prompt_kind="probe", result="unsupported",
@@ -1098,7 +1245,7 @@ class ClaudeSession:
                  internal=False, model=None, effort=None,
                  guard_settings_path=None, delegation_allowed=True,
                  owned_scope=None, controller_env=None,
-                 declared_outputs=None, repo_writable=True):
+                 declared_outputs=None, repo_writable=True, auth_run=None):
         policy.guard("claude", role=speaker, kind="dispatch")
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
@@ -1114,6 +1261,8 @@ class ClaudeSession:
         self.model = model
         self.effort = effort
         self.role_prompt_file = role_prompt_file
+        if nested_guard_active() and not (session_id or resume_id):
+            session_id = str(uuid.uuid4())
         self.session_id = session_id
         self.resume_id = resume_id
         self._guard_runtime = None
@@ -1121,11 +1270,18 @@ class ClaudeSession:
             self._guard_runtime = _guard_runtime(
                 trace, speaker, extra_writable_dir, model, effort,
                 delegation_allowed, declared_outputs=declared_outputs,
-                resume_id=resume_id, repo_writable=repo_writable)
+                resume_id=resume_id, repo_writable=repo_writable,
+                controller_session_id=session_id or resume_id)
             guard_settings_path = self._guard_runtime["settings_path"]
             delegation_allowed = self._guard_runtime["delegation_allowed"]
             owned_scope = self._guard_runtime["scope"]
             controller_env = self._guard_runtime["env"]
+            try:
+                _require_controller_auth(
+                    self._guard_runtime, "claude", trace, speaker, run=auth_run)
+            except Exception:
+                _close_guard_runtime(self._guard_runtime)
+                raise
         # The LIVE model, captured from the first system-init event that names
         # it (traceability: stamped on turn results and eval score entries).
         # Distinct from `self.model`, the config-pinned request (None = the
@@ -1146,7 +1302,10 @@ class ClaudeSession:
                                        guard_settings_path=guard_settings_path,
                                        delegation_allowed=delegation_allowed)
         if owned_scope is not None:
-            boundary = kernel_write_boundary(owned_scope, command)
+            boundary = kernel_write_boundary(
+                owned_scope, command,
+                protected_paths=(self._guard_runtime or {}).get(
+                    "protected_paths") or ())
             if not boundary["available"]:
                 raise RuntimeError(boundary["reason"])
             command = boundary["argv"]
@@ -1545,7 +1704,7 @@ class ClaudeSession:
             pass
         _terminate(self.proc)
         if self._guard_runtime:
-            self._guard_runtime["broker"].stop()
+            _close_guard_runtime(self._guard_runtime)
 
 
 def _resumed_usage_baseline(thread_id):
@@ -1591,17 +1750,9 @@ class CodexSession:
     def __init__(self, mode, yolo, io_out=None, speaker="scout",
                  resume_thread_id=None, on_thread_id=None, trace=None,
                  extra_writable_dir=None, internal=False, model=None,
-                 effort=None):
+                 effort=None, declared_outputs=None, repo_writable=True,
+                 auth_run=None):
         policy.guard("codex", role=speaker, kind="dispatch")
-        if nested_guard_active():
-            if trace:
-                trace.event(
-                    "controller.dispatch.refused", controller="codex",
-                    role=speaker,
-                    missing_capability="pre_child_delegation_decision")
-            raise RuntimeError(
-                "controller_capability_missing: "
-                "codex has no pre-child delegation decision")
         self.mode = mode
         self.yolo = yolo
         self.model = model
@@ -1616,6 +1767,24 @@ class CodexSession:
         self.thread_id = resume_thread_id
         self.on_thread_id = on_thread_id
         self.trace = trace
+        self._guard_runtime = None
+        self._controller_env = None
+        if nested_guard_active():
+            self._guard_runtime = _guard_runtime(
+                trace, speaker, extra_writable_dir, model, effort, False,
+                declared_outputs=declared_outputs,
+                resume_id=resume_thread_id, repo_writable=repo_writable,
+                controller="codex")
+            self._controller_env = self._guard_runtime["env"]
+            try:
+                _require_controller_auth(
+                    self._guard_runtime, "codex", trace, speaker, run=auth_run)
+            except Exception:
+                _close_guard_runtime(self._guard_runtime)
+                raise
+        self.controller_state_dir = (
+            self._guard_runtime["scope"].controller_state_dir
+            if self._guard_runtime else None)
         # The LIVE model, captured best-effort from codex events that name it
         # (traceability: stamped on turn results and eval score entries).
         # Distinct from `self.model`, the config-pinned request (None = the
@@ -1702,6 +1871,7 @@ class CodexSession:
         proc = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True,
+            env=self._controller_env,
         )
         events = []
         tty = ui.is_tty(self.io_out)
@@ -1759,12 +1929,15 @@ class CodexSession:
         meta = dict(meta or {})
         work_id = trace_store.new_work_id()
         self.last_work_id = work_id
+        if self._guard_runtime:
+            _stamp_guard_parent_work(self._guard_runtime, work_id)
         work_class = meta.get("work_class") or "productive"
         if not self._started and not self._resuming_first:
             command = build_codex_command(
                 text, self.mode, self.yolo,
                 extra_writable_dir=self.extra_writable_dir,
-                model=self.model, effort=self.effort)
+                model=self.model, effort=self.effort,
+                guarded=bool(self._guard_runtime))
             fresh = True
         else:
             if not self.thread_id:
@@ -1788,9 +1961,18 @@ class CodexSession:
             command = build_codex_resume_command(
                 self.thread_id, text, self.mode, self.yolo,
                 extra_writable_dir=self.extra_writable_dir,
-                model=self.model, effort=self.effort)
+                model=self.model, effort=self.effort,
+                guarded=bool(self._guard_runtime))
             fresh = False
         self._started = True
+        if self._guard_runtime:
+            boundary = kernel_write_boundary(
+                self._guard_runtime["scope"], command,
+                protected_paths=self._guard_runtime.get(
+                    "protected_paths") or ())
+            if not boundary["available"]:
+                raise RuntimeError(boundary["reason"])
+            command = boundary["argv"]
         if self.trace:
             fields = {
                 "controller": "codex", "role": self.speaker,
@@ -1895,7 +2077,8 @@ class CodexSession:
             duration_ms=duration_ms)
 
     def close(self):
-        pass
+        if self._guard_runtime:
+            _close_guard_runtime(self._guard_runtime)
 
 
 class OpencodeSession:

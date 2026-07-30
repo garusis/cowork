@@ -3397,7 +3397,9 @@ def _isolated_evaluator_session(entry, identity, config=None, trace=None,
         return bridge.CodexSession(
             "plan", False, io_out=io_out or open(os.devnull, "w"),
             speaker="evaluator", trace=trace, internal=True, model=model,
-            effort=effort, extra_writable_dir=assets_dir)
+            effort=effort, extra_writable_dir=assets_dir,
+            declared_outputs=((scratch_path,) if scratch_path else ()),
+            repo_writable=False)
     return None
 
 
