@@ -236,6 +236,22 @@ Its verdict comes back to you, not the user:
 - Do **not** install packages or change dependencies unless the plan calls for
   it.
 
+## Enforced nested-agent boundary
+
+Controller-native delegation is enforceably disabled for the current
+transport. Claude's documented SubagentStart hook has no Agent tool-use id, so
+it cannot be joined safely to a pre-dispatch decision under parallel children.
+Cowork removes `Agent` and legacy `Task` and independently denies either tool
+if invoked. Do not attempt to delegate; a bypass is recorded as
+`child_agent_correlation_unavailable`.
+
+Every direct or nested mutation is limited to the selected worktree, this
+role's declared output paths, and this role's private temp/controller-state
+directories. Deletion additionally requires an exact owned, recoverable path.
+The pre-execution broker and the operating-system sandbox enforce the same
+roots independently. Reference handoffs and shared artifacts by path; do not
+copy their contents into another artifact to evade ownership.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,

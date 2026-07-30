@@ -1289,6 +1289,88 @@ piped/scripted runs fall back to plain text and `readline`.
     `-- test_cowork.py          # unit + live integration tests
 ```
 
+## Nested-agent governance and accounting
+
+Cowork decides controller-native child attempts before they start and gives
+every refused attempt a stable work id. The currently installed transports do
+not expose enough documented correlation to allow a child: Claude's Agent
+PreToolUse event has a tool-use id, but SubagentStart has only `agent_id` and
+`agent_type`, so parallel children cannot be joined deterministically. Every
+Agent/Task dispatch is therefore refused and durably recorded. Historical
+child telemetry remains readable; it is not evidence that current delegation
+is enabled.
+
+The capability matrix fails closed. Claude is currently the only controller
+that can run a normal governed role on macOS because its catch-all tool hooks
+and kernel boundary can govern direct work. It runs non-delegating:
+`Agent` and legacy `Task` are explicitly disallowed, and the broker independently
+denies either tool if that removal is bypassed. A documented nested hook carrying
+an unmatched `agent_id` is denied as `child_agent_correlation_unavailable`.
+Codex and OpenCode roles are refused before process launch because their
+transports cannot prove a pre-child decision or hard-remove delegation.
+
+**Linux limitation:** normal governed Cowork roles currently have no supported
+controller on Linux. Claude is refused because isolated credential/state
+provisioning is not implemented there; Codex and OpenCode are refused because
+they lack a pre-child delegation decision. Preflight reports this before role
+dispatch. The presence of a bubblewrap profile generator does not constitute
+Linux controller support.
+
+Every tool call reaches an orchestrator-owned broker. Built-in mutation
+adapters must resolve all targets; Bash is proof-based and rejects unresolved
+globs, substitutions, inline interpreters, invoked scripts, unknown verbs, and
+incomplete redirects. Unknown local, plugin, and MCP tools are denied.
+Allowlisted reads require a tested installed-schema digest, and schema drift
+denies. Durable decisions contain hashes and reason codes rather than raw
+commands, delegated prompts, or absolute paths. Child requests retain only
+controller/model/effort identity, a digest, and byte length.
+
+Writable scope is exactly the selected worktree, the acting role's declared
+outputs, and its private temp/controller-state directories. Deletes require an
+exact owned and recoverable target. A generated operating-system sandbox
+independently enforces those same roots. Registered sibling worktrees are
+discovered before every Claude launch and explicitly denied in both the action
+policy and kernel profile, including siblings nested below `.worktrees/`.
+The trace, action ledger, and child ledger remain outside the controller's
+writable scope. Isolated evaluators receive only their exact scratch output;
+live compatibility probes use the same guard, private state, non-delegating
+tool set, and kernel boundary as normal roles. Both are read-only with respect
+to the repository: evaluator scope adds only its exact scratch file, while a
+probe adds no role outputs at all. The probe work id is published to the hook
+context before its process launches, so any attempted action joins to the
+diagnostic work item. If discovery, the broker, or the kernel boundary is
+unavailable, the process is refused rather than silently downgraded.
+Broker sockets use a short nonce-derived `/tmp` pathname so deeply nested
+session roots cannot exceed the platform AF_UNIX limit; the random token still
+authenticates every request, permissions are owner-only, and the broker verifies
+the connecting UID using Darwin `LOCAL_PEERCRED` (or Linux `SO_PEERCRED` where
+available). A platform with neither mechanism fails closed. Inode-checked
+cleanup cannot unlink a newer broker's socket.
+
+Guarded Claude sessions keep transcripts in a stable per-role controller-state
+directory recorded in `identities.json`. On the first resume of a legacy
+session, Cowork copies its uniquely matching transcript from the default
+Claude projects tree into that private layout; ambiguous matches fail closed.
+Ordinary trace events use serialized constant-work JSONL appends, while guard
+attempt records retain the scan-and-fsync exact-once path.
+
+Child deltas come from content snapshots at child boundaries, including tracked
+and untracked repository files and declared outputs outside the repository.
+Reverted changes produce no delta. Actor evidence—not the enclosing snapshot
+window—decides credit: child-only and parent-only paths go to their actual
+actor, paths with evidence from multiple actors are contested, and changes
+without actor evidence remain explicitly unattributed. Descendant-attributed
+paths are therefore not inherited by an ancestor merely because its window
+also enclosed the mutation.
+
+Nested cost is exact-once per token axis. The measurement record states whether
+provider evidence proves the counter is parent-inclusive or proves
+parent-direct-plus-children arithmetic. It never infers an additive basis from
+complete-looking native components alone. Missing provider evidence, missing
+child telemetry, or irreconcilable counters remain `unknown` and make the
+comparison non-comparable; they are never guessed or coerced to zero. Legacy
+and direct-only sessions remain readable with nested facts marked unavailable.
+
 ## Development
 
 Run the fast unit suite (fakes only — no CLIs spawned, no API calls):

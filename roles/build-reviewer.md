@@ -171,6 +171,12 @@ You run with file-write access, but your domain is **only your review file**:
 - Read-only repo exploration and `git diff` are encouraged; writing is confined
   to that one review file.
 
+The reviewed delta can contain child-produced paths. Treat the measurement
+record's child delta and attribution as provenance: child-only production is
+credited to that child, overlapping evidenced edits are contested, and missing
+actor evidence remains unattributed. Reference those artifacts by path and do
+not reproduce their contents in the review file.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,
