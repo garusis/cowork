@@ -22,6 +22,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import errno
 import glob
 import hashlib
 import inspect
@@ -1130,9 +1131,16 @@ def _call_review_fn(review_fn, status_path, round_index, force_full_reread):
 
 
 def _record_role_identity(session, result=None):
-    """Upsert the session role's live identity — tool, model, provider session
-    id — into the per-session `identities.json` registry, so eval aggregation
-    can stamp the EVALUATEE's tool+model onto score entries.
+    """Upsert the session role's live identity — tool, model, effort, provider
+    session id — into the per-session `identities.json` registry, so eval
+    aggregation can stamp the EVALUATEE's tool+model onto score entries.
+
+    The effort recorded is the session's CONFIG-PINNED effort: no controller
+    reports a live effort, so the pinned value is the only honest source (it is
+    what the trace already calls `config_pinned`). A role left on the
+    controller's default records no effort at all, exactly as an unobserved
+    model is left blank rather than guessed, and downstream reads it as
+    unknown.
 
     Anchored on the session's `extra_writable_dir` (the session-assets dir for
     every real role/reviewer session). Only eval-relevant roles (ROLES) are
@@ -1150,6 +1158,7 @@ def _record_role_identity(session, result=None):
                 "model": (result.get("model")
                           or getattr(session, "live_model", None)
                           or getattr(session, "model", None)),
+                "effort": getattr(session, "effort", None),
                 "session_id": (result.get("session_id")
                                or result.get("thread_id")
                                or getattr(session, "session_id", None)
@@ -3192,7 +3201,8 @@ EVALUATOR_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "evaluator.md")
 
 
 def drain_evaluations(session_uuid, config=None, trace=None, io_out=None,
-                      session_factory=None, at=None, closed_phases=None):
+                      session_factory=None, at=None, closed_phases=None,
+                      effective_policy=None, mode="drain"):
     """Drain the durable evaluation queue through ISOLATED evaluator sessions.
 
     Called at every phase transition, at session end, and once at session start
@@ -3201,6 +3211,17 @@ def drain_evaluations(session_uuid, config=None, trace=None, io_out=None,
     scores: entries a previous process left pending are still on disk, with
     their ORIGINAL sealed digests.
 
+    THIS IS THE ONE SEAM EVERY DRAIN GOES THROUGH, which is why the effective
+    policy is resolved HERE rather than in per-phase branches: one check covers
+    startup, phase end, session end and recovery, and there is no fourth path
+    that can quietly keep spending under `off`. The policy that governs is the
+    one in force NOW, not the one stored on an entry when it was enqueued —
+    that is what makes turning evaluation off take effect on historical work.
+
+    `mode='preview'` is a read-only projection: it scores nothing and writes no
+    marker, and is what the foreground transition consults to decide whether a
+    drain is about to block the run.
+
     Each entry gets a FRESH session that has never touched the work, running
     `roles/evaluator.md` on the SAME controller and model as the seat it
     occupies (P5) — collapsing evaluations onto one controller would break
@@ -3208,34 +3229,189 @@ def drain_evaluations(session_uuid, config=None, trace=None, io_out=None,
 
     Every failure here degrades the measurement and never the run.
     """
+    if effective_policy is None:
+        effective_policy = state_store.DEFAULT_EVALUATION_POLICY
     queue_path = state_store.evaluation_queue_path_for(session_uuid)
+    # Every key the renderer and the gate read, present and zeroed: a missing
+    # queue is a quiet queue, not a blank screen.
     if not os.path.exists(queue_path):
-        return {"drained": 0, "failed": 0, "pending": 0, "state": "ok"}
-    if trace:
-        trace.event("eval.drain.start", session_uuid=session_uuid, at=at)
-
-    def _score(entry, verification):
-        return _score_queued_entry(entry, verification, session_uuid,
-                                   config=config, trace=trace, io_out=io_out,
-                                   session_factory=session_factory)
+        return evaluation.empty_summary(policy=effective_policy)
 
     # Only a phase the orchestrator has actually left is closed. A recovery
     # drain at session start knows of none, so its final-round candidates are
     # HELD rather than resolved — otherwise a crash mid-phase would score a
     # round that later turns out not to be the final one.
     closed = set(closed_phases or ())
+    phase_closed = (lambda phase: phase in closed) if closed else None
+
+    if mode == "preview":
+        return evaluation.preview(queue_path, phase_closed=phase_closed,
+                                  effective_policy=effective_policy)
+
+    if trace:
+        trace.event("eval.drain.start", session_uuid=session_uuid, at=at,
+                    policy=effective_policy)
+
+    def _score(entry, verification):
+        return _score_queued_entry(entry, verification, session_uuid,
+                                   config=config, trace=trace, io_out=io_out,
+                                   session_factory=session_factory)
+
+    def _on_transition(event):
+        if trace:
+            trace.event("eval.entry.lifecycle",
+                        entry_id=event.get("entry_id"),
+                        from_state=event.get("from_state"),
+                        to_state=event.get("to_state"),
+                        attempt=event.get("attempt"),
+                        limit=event.get("limit"),
+                        error_class=event.get("error_class"))
+
     summary = evaluation.drain(
-        queue_path, _score,
-        phase_closed=(lambda phase: phase in closed) if closed else None)
+        queue_path, _score, phase_closed=phase_closed,
+        effective_policy=effective_policy, on_transition=_on_transition)
     if trace:
         trace.event("eval.drain.end", session_uuid=session_uuid, at=at,
+                    policy=effective_policy,
                     drained=summary.get("drained"),
                     failed=summary.get("failed"),
                     unverifiable=summary.get("unverifiable"),
                     superseded=summary.get("superseded"),
                     held=summary.get("held"),
+                    terminal=summary.get("terminal"),
+                    retired=summary.get("retired"),
                     pending=summary.get("pending"))
     return summary
+
+
+def run_evaluation_transition(session_uuid, effective_policy, config=None,
+                              trace=None, io_in=None, io_out=None, at=None,
+                              closed_phases=None, headless=False, ask_fn=None,
+                              session_factory=None):
+    """The evaluation drain at one boundary, and its visible foreground state.
+
+    DELIBERATELY NOT INSIDE the best-effort measurement block that surrounds its
+    caller. Two reasons, both load-bearing: a blocking interactive prompt must
+    not sit inside a handler documented as "may never degrade the run", and its
+    exceptions must not be silently eaten by a swallow-all meant for
+    measurement.
+
+    A BLOCKING GATE OPENS ONLY WHEN THE DRAIN IS ACTUALLY GOING TO RUN WORK:
+    the policy is not `off` AND there is something scoreable or something
+    already terminal to retry. Everything else — `off`, an empty queue, a queue
+    with nothing left to do — stays exactly as quiet as it was, because a prompt
+    at a boundary that was never going to block is just noise. That is what
+    preserves deferred evaluation: an ordinary reviewer round never starts
+    waiting for scoring.
+
+    THE NON-BLOCKING BRANCH STILL DRAINS, and that is not an oversight. With
+    nothing scoreable this is pure reconciliation rather than scoring: it is
+    what records the policy-off holds, and what RETIRES superseded candidates.
+    Returning early would mean a boundary whose only work is a retire set never
+    retires anything — and session end is exactly such a boundary, since it
+    closes every phase. Those entries would be re-partitioned and re-counted at
+    every boundary forever, which is the lifecycle trap this exists to close.
+    """
+    def _drain(policy_value):
+        return drain_evaluations(
+            session_uuid, config=config, trace=trace, at=at,
+            closed_phases=closed_phases, effective_policy=policy_value,
+            session_factory=session_factory)
+
+    summary = drain_evaluations(
+        session_uuid, config=config, trace=trace, at=at,
+        closed_phases=closed_phases, effective_policy=effective_policy,
+        mode="preview")
+    blocking = (effective_policy != "off"
+                and (summary.get("scoreable", 0)
+                     or summary.get("terminal_existing", 0)))
+    if not blocking:
+        result = _drain(effective_policy)
+        if any(result.get(key) for key in
+               ("pending_running", "drained_total", "held", "terminal_total")):
+            ui.render_drain_state(io_out, effective_policy, result,
+                                  blocking=False)
+        return result
+    # A drain that WILL block gets a distinct visible state and bounded, safe
+    # control. Headless and non-TTY runs get identical bookkeeping and identical
+    # counts with NO prompt: they continue.
+    #
+    # THE NON-TTY RULE IS LOAD-BEARING, not a nicety. Off a real terminal there
+    # is nobody to answer, so opening the gate would hand the question to
+    # whatever happens to be on stdin — a scripted run, a pipe, or a test
+    # harness — and wait. A drain that used to be silent must not be able to
+    # stall a non-interactive run. An INJECTED `ask_fn` is the deliberate
+    # exception: that is a caller supplying the answer itself.
+    action = "continue"
+    interactive = (ui.is_real_terminal(io_in)
+                   and ui.is_real_terminal(io_out))
+    if not headless and (ask_fn is not None or interactive):
+        try:
+            action = ui.drain_gate(io_in, io_out, effective_policy, summary,
+                                   ask_fn=ask_fn)
+        except (KeyboardInterrupt, EOFError):
+            # Walking away is `end`: nothing scored, the queue preserved.
+            action = "end"
+        except Exception:  # noqa: BLE001
+            # A NAMED failure of the render/prompt only — never the blanket
+            # measurement swallow — falling back to the non-interactive
+            # behavior rather than losing the drain entirely.
+            if trace:
+                trace.event("eval.gate.error", at=at)
+            action = "continue"
+    if action == "end":
+        # Nothing scored, nothing marked, every entry preserved.
+        return summary
+    if action == "hold":
+        queue_path = state_store.evaluation_queue_path_for(session_uuid)
+        records = evaluation.read_queue(queue_path)
+        for entry in evaluation.pending_entries(queue_path):
+            entry_id = entry.get("entry_id")
+            evaluation.mark_held(
+                queue_path, entry_id, held_reason="user_hold",
+                fold=evaluation.read_entry_lifecycle(records, entry_id))
+        # Recount from the durable state WITHOUT scoring — a preview, not a
+        # drain, so holding cannot score the very work it just held.
+        held_summary = drain_evaluations(
+            session_uuid, config=config, trace=trace, at=at,
+            closed_phases=closed_phases, effective_policy=effective_policy,
+            mode="preview")
+        ui.render_drain_state(io_out, effective_policy, held_summary,
+                              blocking=False)
+        return held_summary
+    if action == "retry":
+        retry_terminal_evaluations(session_uuid)
+    result = _drain(effective_policy)
+    ui.render_drain_state(io_out, effective_policy, result, blocking=False)
+    return result
+
+
+def retry_terminal_evaluations(session_uuid):
+    """Explicitly reopen every terminal entry in the queue. Returns the count.
+
+    Terminal work is NEVER released by a policy change or by another drain
+    coming round again — only by this, a deliberate user action. The retry is
+    LINKED to what came before (`prior_attempt_ref` names the terminal marker it
+    reopened) rather than overwriting it, so the earlier attempts stay readable:
+    a retry that erased its own history would make the second failure look like
+    the first.
+    """
+    queue_path = state_store.evaluation_queue_path_for(session_uuid)
+    if not os.path.exists(queue_path):
+        return 0
+    records = evaluation.read_queue(queue_path)
+    reopened = 0
+    for entry_id in {rec.get("entry_id") for rec in records
+                     if rec.get("entry_id")}:
+        fold = evaluation.read_entry_lifecycle(records, entry_id)
+        if fold.get("state") not in ("terminal", "failed_permanent"):
+            continue
+        history = fold.get("transition_history") or []
+        if evaluation.mark_retried(queue_path, entry_id,
+                                   prior_attempt_ref=(history[-1]
+                                                      if history else None)):
+            reopened += 1
+    return reopened
 
 
 def _score_queued_entry(entry, verification, session_uuid, config=None,
@@ -3247,22 +3423,34 @@ def _score_queued_entry(entry, verification, session_uuid, config=None,
     `verification_state='changed'` so aggregation treats it as `unverifiable`
     and excludes it. Re-hashing the current file instead would make every score
     verifiable by construction and prove nothing.
+
+    RETURNS A CLASSIFIED OUTCOME, `{"ok": bool, "error_class": str|None}`, not
+    a bare bool. Every failure path used to collapse into one undifferentiated
+    `False`, which is why a retry could not be bounded: nothing on disk could
+    say whether trying again might ever help. The classes map to real paths —
+
+      malformed_entry   the entry cannot be run at all (no scratch/scores path,
+                        no controller in its identity snapshot, or no session).
+                        NO controller turn is ever started on these.
+      malformed_output  the evaluator ran but produced nothing aggregatable.
+      transient         a timeout or a dropped connection: worth one retry.
+      permanent         any other exception; a retry cannot change it.
     """
     scratch_path = entry.get("scratch_path")
     scores_path = entry.get("scores_path")
     if not (scratch_path and scores_path):
-        return False
+        return {"ok": False, "error_class": "malformed_entry"}
     seat = entry.get("evaluator_seat")
     identity = entry.get("identity_snapshot") or {}
     controller = identity.get("tool")
     if not controller:
         # Without the seat's controller there is no comparable evaluation to
-        # run. Left pending and reported as pending rather than run on a
-        # substitute controller, which would silently change what is compared.
+        # run. Reported as a malformed entry rather than run on a substitute
+        # controller, which would silently change what is compared.
         if trace:
             trace.event("eval.drain.skipped", entry_id=entry.get("entry_id"),
                         reason="unknown_controller", role=seat)
-        return False
+        return {"ok": False, "error_class": "malformed_entry"}
     _clear_eval_scratch(scratch_path, seat, trace=trace)
     # THE EVALUATOR MUST SEE WHAT WAS SEALED. Building this block from
     # `review_path` alone meant the sealed chain — the frozen current revision
@@ -3287,12 +3475,15 @@ def _score_queued_entry(entry, verification, session_uuid, config=None,
     prompt = assemble_eval_prompt(seat, scratch_path, specs)
     eval_turn_id = str(uuid.uuid4())
     session = None
+    # Taken BEFORE the factory call so a failed attempt can report the time it
+    # actually took. See the failure path below.
+    started_at = time.monotonic()
     try:
         factory = session_factory or _isolated_evaluator_session
         session = factory(entry, identity, config=config, trace=trace,
                           io_out=io_out)
         if session is None:
-            return False
+            return {"ok": False, "error_class": "malformed_entry"}
         if trace:
             trace.event("eval.turn.start", role="evaluator", seat=seat,
                         phase=entry.get("phase"), round=entry.get("round"),
@@ -3309,25 +3500,57 @@ def _score_queued_entry(entry, verification, session_uuid, config=None,
                                  eval_turn_id, len(specs),
                                  verdict={"verdict":
                                           entry.get("reviewed_verdict")})
-    except Exception:  # noqa: BLE001 - a failed evaluation never breaks the run
+    except Exception as exc:  # noqa: BLE001 - a failed eval never breaks the run
+        error_class = _eval_error_class(exc)
         if trace:
+            # A REAL DURATION, not a hardcoded zero. A failed attempt stays in
+            # the `failed` cost class — it is not productive work and must never
+            # count as an evaluation success — but it is now first-class,
+            # bounded and counted work, so reporting the time it consumed as 0
+            # would under-report what evaluation actually cost.
             trace.event("eval.turn.end", role="evaluator", result="error",
                         entry_id=entry.get("entry_id"),
-                        **trace_store.work_meta(eval_turn_id, "failed",
-                                                duration_ms=0))
-        return False
+                        error_class=error_class,
+                        **trace_store.work_meta(
+                            eval_turn_id, "failed",
+                            duration_ms=int(
+                                (time.monotonic() - started_at) * 1000)))
+        return {"ok": False, "error_class": error_class}
     finally:
         if session is not None:
             try:
                 session.close()
             except Exception:  # noqa: BLE001
                 pass
-    return _aggregate_eval(
+    aggregated = _aggregate_eval(
         scratch_path, scores_path, session_uuid, seat, entry.get("phase"),
         entry.get("round"),
         {s["evaluatee"]: _eval_spec_stamp(s) for s in specs}, trace=trace,
         verification=verification, envelope=entry.get("envelope"),
         eval_work_id=eval_turn_id)
+    # The evaluator ran and returned. Nothing aggregatable coming back means it
+    # produced missing or unparseable scores — a distinct thing from the run
+    # itself failing, and one a retry cannot fix.
+    if aggregated:
+        return {"ok": True, "error_class": None}
+    return {"ok": False, "error_class": "malformed_output"}
+
+
+# Exception types that mean "the environment blipped" rather than "this cannot
+# work". Only these earn a second attempt; everything else is permanent, so a
+# retry budget is never spent on a failure that will simply recur.
+_TRANSIENT_ERRNOS = frozenset(
+    code for code in (getattr(errno, "ECONNRESET", None),
+                      getattr(errno, "EPIPE", None)) if code is not None)
+
+
+def _eval_error_class(exc):
+    """Name the failure an evaluation attempt hit, for the retry budget."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return "transient"
+    if isinstance(exc, OSError) and exc.errno in _TRANSIENT_ERRNOS:
+        return "transient"
+    return "permanent"
 
 
 # How a sealed artifact's role maps onto the handoff transport's slots. The
@@ -9017,6 +9240,41 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             trace.event("context.ack", role=role, revision=current_rev,
                         context_revision=current_rev)
 
+    def _measurement_ingest(at):
+        """Ingest + reconcile. Best-effort: it may degrade the measurement and
+        never the run."""
+        try:
+            identities = state_store.read_role_identities(
+                state_store.identities_path_for(session_uuid))
+            results = ingest.ingest_session(identities, cwd=os.getcwd())
+            ledger.reconcile_attempts(
+                state_store.ledger_path_for(session_uuid),
+                ingest.observations_for(results))
+            return results
+        except Exception:  # noqa: BLE001 - measurement never breaks a run
+            trace.event("measurement.checkpoint.error", at=at)
+            return None
+
+    def _measurement_rebuild(at, results):
+        """Rebuild the record. Best-effort, exactly as before."""
+        try:
+            measure.build_and_write(session_uuid, cwd=os.getcwd(),
+                                    ingest_results=results)
+        except Exception:  # noqa: BLE001 - measurement never breaks a run
+            trace.event("measurement.checkpoint.error", at=at)
+
+    def evaluation_transition(at, closed_phases=None):
+        """This boundary's evaluation drain and its visible foreground state.
+
+        A thin binding of the run's context onto `run_evaluation_transition`,
+        which holds the actual behavior so it is reachable without standing up a
+        whole run.
+        """
+        return run_evaluation_transition(
+            session_uuid, evaluation_policy, config=config, trace=trace,
+            io_in=io_in, io_out=io_out, at=at, closed_phases=closed_phases,
+            headless=headless)
+
     def measurement_checkpoint(at, closed_phases=None):
         """The three measurement steps that run together at every boundary.
 
@@ -9026,22 +9284,15 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         the record current by construction during a live run, so an ordinary
         `--report` loads rather than rebuilds.
 
-        Entirely best-effort. Every step here degrades the measurement and none
-        of them may degrade the run.
+        The ingest and rebuild steps stay entirely best-effort: they degrade the
+        measurement and never the run. The evaluation transition in the middle
+        has its OWN error policy (see `evaluation_transition`) because it can
+        block on the user, and a blocking prompt inside a swallow-all handler is
+        how a gate fails invisibly.
         """
-        try:
-            identities = state_store.read_role_identities(
-                state_store.identities_path_for(session_uuid))
-            results = ingest.ingest_session(identities, cwd=os.getcwd())
-            ledger.reconcile_attempts(
-                state_store.ledger_path_for(session_uuid),
-                ingest.observations_for(results))
-            drain_evaluations(session_uuid, config=config, trace=trace, at=at,
-                              closed_phases=closed_phases)
-            measure.build_and_write(session_uuid, cwd=os.getcwd(),
-                                    ingest_results=results)
-        except Exception:  # noqa: BLE001 - measurement never breaks a run
-            trace.event("measurement.checkpoint.error", at=at)
+        results = _measurement_ingest(at)
+        evaluation_transition(at, closed_phases=closed_phases)
+        _measurement_rebuild(at, results)
 
     def set_phase(new_phase):
         if session_enabled:
