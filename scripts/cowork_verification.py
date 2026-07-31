@@ -1191,6 +1191,8 @@ def run_command_in_group(argv, cwd, timeout_s, term_grace_s,
     proc = subprocess.Popen(
         argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, start_new_session=True, env=env)
+    for stream in (proc.stdout, proc.stderr):
+        os.set_blocking(stream.fileno(), False)
     pgid = os.getpgid(proc.pid)
     if on_start:
         on_start(pgid)
@@ -1216,7 +1218,10 @@ def run_command_in_group(argv, cwd, timeout_s, term_grace_s,
             liveness_stopped = True
             break
         for key, _ in sel.select(timeout=min(0.25, max(0.0, remaining))):
-            chunk = key.fileobj.read(65536)
+            try:
+                chunk = os.read(key.fileobj.fileno(), 65536)
+            except BlockingIOError:
+                continue
             name = key.data
             if not chunk:
                 sel.unregister(key.fileobj)
@@ -1231,6 +1236,7 @@ def run_command_in_group(argv, cwd, timeout_s, term_grace_s,
                 truncated[name] = True
         if proc.poll() is not None and open_streams == 0:
             break
+    sel.close()
 
     if not timed_out and not liveness_stopped:
         try:
@@ -1267,19 +1273,30 @@ def run_command_in_group(argv, cwd, timeout_s, term_grace_s,
         pass
     exit_code = proc.returncode
 
-    # Drain anything still buffered in the OS pipes (non-blocking best
-    # effort) before declaring streams closed.
+    # Drain anything still buffered in the OS pipes without waiting for a
+    # detached descendant that inherited one of the write ends.
     for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
         try:
             if stream and not stream.closed:
-                rest = stream.read()
-                if rest and len(buffers[name]) < output_cap_bytes:
-                    room = output_cap_bytes - len(buffers[name])
-                    buffers[name].extend(rest[:room])
-                    if len(rest) > room:
+                while True:
+                    try:
+                        rest = os.read(stream.fileno(), 65536)
+                    except BlockingIOError:
+                        break
+                    if not rest:
+                        break
+                    if len(buffers[name]) < output_cap_bytes:
+                        room = output_cap_bytes - len(buffers[name])
+                        buffers[name].extend(rest[:room])
+                        if len(rest) > room:
+                            truncated[name] = True
+                    else:
                         truncated[name] = True
         except (OSError, ValueError):
             pass
+        finally:
+            if stream and not stream.closed:
+                stream.close()
 
     descendants_confirmed_gone = not _pgid_alive(pgid)
     ended = time.time()
