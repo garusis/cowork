@@ -565,6 +565,15 @@ would contain prompt bodies are replaced with `<prompt>`. The trace is intended
 for local debugging with the `cowork-debug` skill, not for terminal output or a
 shareable transcript.
 
+Evaluation drains record which policy governed them and what became of each
+entry: `eval.drain.start` and `eval.drain.end` both carry `policy=`, and
+`eval.drain.end` also carries the `terminal` and `retired` counts alongside the
+existing ones. Every entry state change emits `eval.entry.lifecycle`
+(`entry_id`, `from_state`, `to_state`, `attempt`, `limit`, `error_class`), so a
+retry budget can be reconstructed from the trace alone. A foreground drain screen
+that fails to render or prompt records `eval.gate.error` rather than failing
+silently.
+
 ### Evaluation traceability
 
 Every peer-evaluation entry in `scores.json` (schema 2) is stamped with full
@@ -639,6 +648,15 @@ its start to its end, plus its class, duration and a canonical identity. So an
 in-flight, failed or cancelled turn is recorded as what it is instead of
 vanishing, and a turn still running reports its duration as `unknown` rather than
 as 0.
+
+**Evaluation attempts stay in their own class**, away from productive phase
+work, and a **failed** attempt is booked to the `failed` class — it is not an
+evaluation success. What it is no longer is free: a failed evaluation attempt
+used to report a duration of exactly 0, which under-reported what scoring
+actually cost now that failed attempts are counted, bounded work. It reports the
+time it really took. Each queue entry also keeps its **final disposition** —
+held, terminal, retired or completed — along with how many attempts it used, so
+the report can show what was scored, what was held and what stopped trying.
 
 **A resumed Codex turn reports what that turn cost**, not the thread's running
 total. Codex's counters are cumulative, so a resumed turn re-reported every
@@ -778,10 +796,10 @@ sessions already recorded).
 It is also **deferred**. The moment a reviewer's verdict is written and
 validated, cowork seals an evidence envelope, drops it in a durable queue, and
 hands the fix straight back — the round never waits for scoring. The queue drains
-at phase end, at session end, and at the next start for anything a crash left
-pending. Before a score counts, the seal is re-checked: evidence that changed
-while the entry sat in the queue is marked `unverifiable` rather than re-hashed
-to whatever the file says now.
+at three boundaries: **session start** (for anything a crash left pending),
+**phase end**, and **session end**. Before a score counts, the seal is
+re-checked: evidence that changed while the entry sat in the queue is marked
+`unverifiable` rather than re-hashed to whatever the file says now.
 
 Sealing **after** the verdict exists is also the structural fix for evidence
 binding: a digest can no longer be taken before the evidence it describes.
@@ -789,6 +807,44 @@ binding: a digest can no longer be taken before the evidence it describes.
 `--evaluation-policy` takes `all_rounds` (the default), `final_round`, `sampled`
 or `off`, and the overhead of the choice is reported as its own cost class, so
 the choice can be made from data.
+
+**The policy governs when the queue is drained, not just when work is added to
+it.** The policy in force *now* is what applies, so switching a session to `off`
+takes effect on work queued before the switch: with `off`, an ordinary run or
+resume starts **zero** evaluator turns at every one of those three boundaries.
+Queued work is neither deleted nor called successful — it is **held**, durably
+and visibly, with the reason recorded on disk, and turning evaluation back on
+releases it. Holding is idempotent, so a session resumed ten times under `off`
+accumulates one hold, not ten.
+
+**When a drain is genuinely going to block the run, it says so.** You get a
+distinct screen naming the governing policy and four honest counts —
+pending/running, completed, held/skipped and terminal/failed — with four safe
+choices: **continue** the eligible work, **hold** it for later, **retry**
+eligible failed work, or **end** without scoring. Holding, ending, dismissing
+the prompt and walking away all leave every queue entry intact, and none of them
+records a success for work that did not succeed. Superseded work is reported
+inside held/skipped, never as completed — retiring a superseded candidate scores
+nothing. The screen never uses phase-approval wording, because evaluation-blocked
+time is not a phase you approved. Under `off`, with an empty queue, or with
+nothing left to do, there is no prompt at all — just a short status line, exactly
+as quiet as before. Headless runs — and any run that is not attached to a real
+terminal, such as a scripted or piped one — get identical bookkeeping and
+identical counts, and continue without prompting: there is nobody there to
+answer, and a drain that used to be silent must never be able to stall a
+non-interactive run.
+
+**Failures are classified and retries are bounded.** Every attempt is recorded
+*before* it runs, so a crash costs at most one attempt instead of looping
+forever. A transient failure gets a second attempt; missing or unparseable
+evaluator output, a permanent failure and an unusable entry each stop after the
+first — a retry cannot change any of those. Once the budget is spent the entry is
+**terminal**, and it stays terminal across a resume with its attempt count,
+failure class and history intact. Only an explicit **retry** reopens it, and that
+retry links back to the earlier attempts rather than overwriting them.
+
+Queue files written before any of this loads unchanged: entries with no lifecycle
+data read as pending with a fresh budget, and are never rewritten in place.
 
 ### Missing data reads as missing
 
@@ -809,6 +865,24 @@ ranked:
 that does not parse is recorded as `insufficient_evidence` rather than dropped —
 dropping it shrank the denominator, so the criteria an evaluator *could* judge
 looked like the whole picture.
+
+An evaluation queue entry ends up in exactly one of these states, and none of
+them is quietly reported as done:
+
+| state | means |
+| --- | --- |
+| `pending` | waiting to be scored |
+| `attempting` | an attempt was recorded but its outcome was not — an interrupted run |
+| `held` | held by policy (`off`) or by you; visible, durable, deliberately unscored |
+| `drained` | scored successfully — the only state that counts as completed |
+| `retired` | superseded by a later round; never scored, and **not** a failure |
+| `terminal` | its retry budget is spent; needs an explicit retry to reopen |
+| `retried` | you explicitly reopened a terminal entry; its earlier history is preserved |
+
+`unverifiable` above is unchanged by any of this and is still **not** a failure:
+such an entry drains successfully, costs no retry budget, and is simply excluded
+from the aggregates — it is reported beside the completed count rather than
+folded silently into it.
 
 **Pricing ships as a schema with an empty snapshot.** Real prices baked into a
 repository are stale by construction, so by default every model resolves to
