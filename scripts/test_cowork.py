@@ -49,6 +49,7 @@ import cowork_delta as delta_store  # noqa: E402
 import cowork_measure as measure  # noqa: E402
 import cowork_profiles as controller_profiles  # noqa: E402
 import cowork_report as report  # noqa: E402
+import cowork_eval as evaluation  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
 # that exercise the real libraries skip when they are absent — same pattern as the
@@ -26515,3 +26516,978 @@ class NestedDocsTests(unittest.TestCase):
         self.assertIn("exact-once", text)
         self.assertIn("operating-system sandbox", text)
         self.assertIn("child_agent_correlation_unavailable", text)
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation lifecycle and policy.                                             #
+#                                                                              #
+# Every test below is deterministic and provider-free: evaluator sessions are   #
+# replaced through the existing injectable `session_factory`, UI actions        #
+# through `ask_fn`, and no timestamp is ever asserted as an interval, because   #
+# the retry backoff is zero by design.                                         #
+# --------------------------------------------------------------------------- #
+
+
+class _EvalQueueFixture(unittest.TestCase):
+    """A temp session whose evaluation queue we can seed entry by entry."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._prior_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = self.tmp
+        self.addCleanup(self._restore_root)
+        self.session_uuid = "eval-lifecycle-test"
+        self.queue_path = state_store.evaluation_queue_path_for(
+            self.session_uuid)
+        os.makedirs(os.path.dirname(self.queue_path), exist_ok=True)
+        # A real reviewer verdict on disk. A queue entry always carries either a
+        # sealed envelope or a review path — the evaluator prompt is built from
+        # the evidence, and an entry with neither is not a runnable entry.
+        self.review_path = os.path.join(self.tmp, "reviewer-verdict.json")
+        with open(self.review_path, "w") as fh:
+            json.dump({"verdict": "approve", "findings": []}, fh)
+
+    def _restore_root(self):
+        if self._prior_root is None:
+            os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        else:
+            os.environ["COWORK_SESSIONS_ROOT"] = self._prior_root
+
+    def seed(self, entry_id, phase="building", round_index=1, candidate=False,
+             seat="builder", **extra):
+        entry = {
+            "entry_id": entry_id,
+            "phase": phase,
+            "round": round_index,
+            "evaluator_seat": seat,
+            "evaluatee": "reviewer",
+            "criteria": ["clarity"],
+            "scratch_path": os.path.join(self.tmp, "scratch.%s.json"
+                                         % entry_id),
+            "scores_path": os.path.join(self.tmp, "scores.json"),
+            "review_path": self.review_path,
+            "identity_snapshot": {"tool": "claude", "model": "m"},
+            "policy_decision": {"policy": "all_rounds", "selected": True},
+        }
+        if candidate:
+            entry["policy_decision"] = {
+                "policy": "final_round", "selected": True, "candidate": True,
+                "supersedes_earlier_candidates": True}
+        entry.update(extra)
+        self.assertTrue(evaluation.enqueue(self.queue_path, entry))
+        return entry
+
+    def fold(self, entry_id):
+        return evaluation.read_entry_lifecycle(
+            evaluation.read_queue(self.queue_path), entry_id)
+
+    def entry_ids_on_disk(self):
+        return {rec.get("entry_id")
+                for rec in evaluation.read_queue(self.queue_path)
+                if rec.get("entry_id")}
+
+    def markers(self, entry_id, state):
+        return [rec for rec in evaluation.read_queue(self.queue_path)
+                if rec.get("entry_id") == entry_id
+                and rec.get("state") == state]
+
+    def closed(self, *phases):
+        names = set(phases)
+        return lambda phase: phase in names
+
+    def never_scored(self, *_args, **_kwargs):
+        self.fail("a scorer ran when none should have")
+
+    def never_started(self, *_args, **_kwargs):
+        self.fail("an evaluator session started when none should have")
+
+    def never_asked(self, *_args, **_kwargs):
+        self.fail("a blocking gate opened when none should have")
+
+
+class EvalPolicyOffDrainTests(_EvalQueueFixture):
+    """Criterion 1: with policy `off`, no evaluator turn starts at ANY drain
+    boundary — and the work is still on disk afterwards, reported as held."""
+
+    def _drain_off(self, at):
+        return cowork.drain_evaluations(
+            self.session_uuid, at=at, effective_policy="off",
+            session_factory=self.never_started)
+
+    def _assert_all_held(self, summary, entry_ids):
+        self.assertEqual(summary["drained"], 0)
+        self.assertEqual(summary["held"], len(entry_ids))
+        self.assertEqual(self.entry_ids_on_disk() & set(entry_ids),
+                         set(entry_ids))
+        for entry_id in entry_ids:
+            fold = self.fold(entry_id)
+            self.assertEqual(fold["state"], "held")
+            self.assertEqual(fold["held_reason"], "policy_off")
+            self.assertEqual(self.markers(entry_id, "drained"), [])
+            self.assertEqual(self.markers(entry_id, "terminal"), [])
+
+    def test_eval_policy_off_drain_at_session_start(self):
+        ids = ["a", "b"]
+        for entry_id in ids:
+            self.seed(entry_id)
+        self._assert_all_held(self._drain_off("session.start"), ids)
+
+    def test_eval_policy_off_drain_at_phase_end(self):
+        ids = ["c"]
+        for entry_id in ids:
+            self.seed(entry_id)
+        summary = cowork.drain_evaluations(
+            self.session_uuid, at="phase.change:planning->building",
+            closed_phases=["planning"], effective_policy="off",
+            session_factory=self.never_started)
+        self._assert_all_held(summary, ids)
+
+    def test_eval_policy_off_drain_at_session_end(self):
+        ids = ["d", "e", "f"]
+        for entry_id in ids:
+            self.seed(entry_id)
+        summary = cowork.drain_evaluations(
+            self.session_uuid, at="session.end",
+            closed_phases=["building"], effective_policy="off",
+            session_factory=self.never_started)
+        self._assert_all_held(summary, ids)
+
+    def test_eval_policy_off_drain_on_resume_is_idempotent(self):
+        self.seed("g")
+        first = self._drain_off("session.start")
+        # A resume re-reads the same queue. The hold must not be re-appended.
+        second = self._drain_off("session.start")
+        self.assertEqual(first["held"], second["held"])
+        self.assertEqual(len(self.markers("g", "held")), 1)
+
+    def test_eval_policy_off_drain_writes_status_not_prompt(self):
+        self.seed("h")
+        out = io.StringIO()
+        cowork.run_evaluation_transition(
+            self.session_uuid, "off", io_out=out, at="session.start",
+            ask_fn=self.never_asked, session_factory=self.never_started)
+        rendered = out.getvalue()
+        self.assertIn("Evaluation drain", rendered)
+        self.assertIn("Governing policy: off", rendered)
+        self.assertIn("Held/skipped: 1", rendered)
+        self.assertEqual(self.fold("h")["state"], "held")
+
+    def test_eval_policy_off_drain_reports_deferred_retirement(self):
+        # A supersede-candidate in a CLOSED phase would be retired under an
+        # active policy. Under `off` retirement is deferred — but the entry is
+        # still counted, not dropped out of every bucket.
+        self.seed("old", candidate=True, round_index=1)
+        self.seed("new", candidate=True, round_index=2)
+        summary = cowork.drain_evaluations(
+            self.session_uuid, at="session.end", closed_phases=["building"],
+            effective_policy="off", session_factory=self.never_started)
+        self.assertEqual(summary["retire_pending"], 1)
+        self.assertEqual(summary["superseded_total"], 1)
+        self.assertEqual(self.markers("old", "retired"), [])
+        self.assertIn("old", self.entry_ids_on_disk())
+        # Held/skipped covers both the deferred retirement and the held entry.
+        self.assertEqual(summary["held"], 2)
+
+
+class EvalReenableTests(_EvalQueueFixture):
+    """Criterion 3: re-enabling releases eligible work exactly once; terminal
+    work waits for an explicit, linked retry."""
+
+    def test_eval_reenable_off_then_all_rounds_releases(self):
+        for entry_id in ("a", "b"):
+            self.seed(entry_id)
+        cowork.drain_evaluations(self.session_uuid, effective_policy="off",
+                                 session_factory=self.never_started)
+        dispatched = []
+
+        def score(entry, _verification):
+            dispatched.append(entry.get("entry_id"))
+            return {"ok": True, "error_class": None}
+
+        summary = evaluation.drain(self.queue_path, score,
+                                   verify_fn=lambda _e: {"state": "unknown"},
+                                   effective_policy="all_rounds")
+        self.assertEqual(sorted(dispatched), ["a", "b"])
+        self.assertEqual(summary["drained"], 2)
+        # Exactly once each: a second drain finds nothing left to dispatch.
+        evaluation.drain(self.queue_path, self.never_scored,
+                         verify_fn=lambda _e: {"state": "unknown"},
+                         effective_policy="all_rounds")
+
+    def test_eval_reenable_held_entry_is_still_pending(self):
+        self.seed("a")
+        cowork.drain_evaluations(self.session_uuid, effective_policy="off",
+                                 session_factory=self.never_started)
+        pending = [e.get("entry_id")
+                   for e in evaluation.pending_entries(self.queue_path)]
+        self.assertIn("a", pending)
+
+    def test_eval_reenable_terminal_and_retired_not_read_as_pending(self):
+        self.seed("term")
+        self.seed("ret")
+        evaluation.mark_terminal(self.queue_path, "term", "permanent", 1, 1)
+        evaluation.mark_retired(self.queue_path, "ret")
+        pending = [e.get("entry_id")
+                   for e in evaluation.pending_entries(self.queue_path)]
+        self.assertNotIn("term", pending)
+        self.assertNotIn("ret", pending)
+
+    def test_eval_reenable_explicit_retry_links_history(self):
+        self.seed("a")
+        evaluation.drain(self.queue_path,
+                         lambda *_a: {"ok": False, "error_class": "permanent"},
+                         verify_fn=lambda _e: {"state": "unknown"},
+                         effective_policy="all_rounds")
+        terminal = self.markers("a", "terminal")
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(cowork.retry_terminal_evaluations(self.session_uuid),
+                         1)
+        retried = self.markers("a", "retried")
+        self.assertEqual(len(retried), 1)
+        self.assertEqual(retried[0]["prior_attempt_ref"],
+                         terminal[0]["marker_id"])
+        # The earlier terminal record is still readable VERBATIM.
+        self.assertEqual(self.markers("a", "terminal")[0], terminal[0])
+        self.assertEqual(self.fold("a")["state"], "pending")
+        self.assertEqual(self.fold("a")["attempts"], 0)
+
+    def test_eval_reenable_final_round_candidate_still_held_after_flip(self):
+        # The phase stays OPEN across the policy flip, so the candidate hold
+        # must survive it: this is the composition case, not a policy hold.
+        self.seed("cand", candidate=True)
+        cowork.drain_evaluations(
+            self.session_uuid, effective_policy="off",
+            closed_phases=["planning"], session_factory=self.never_started)
+        evaluation.drain(self.queue_path, self.never_scored,
+                         verify_fn=lambda _e: {"state": "unknown"},
+                         phase_closed=self.closed("planning"),
+                         effective_policy="all_rounds")
+        self.assertIn("cand", [e.get("entry_id") for e
+                               in evaluation.pending_entries(self.queue_path)])
+        self.assertEqual(self.markers("cand", "drained"), [])
+
+    def test_eval_reenable_retire_only_boundary_still_retires(self):
+        # Retirement must actually happen at a session-end boundary, and must
+        # happen ONCE: an entry that read back as pending afterwards would be
+        # re-partitioned and re-counted at every boundary forever, which is the
+        # lifecycle trap this change exists to close.
+        #
+        # NOTE on the shape of this test: a retire set can only exist when at
+        # least two candidates are pending, and the surviving candidate is by
+        # definition scoreable — so "a boundary whose ONLY work is a retire
+        # set" is unreachable through _partition, and the transition here is
+        # correctly a blocking one. What is asserted is the durable outcome.
+        self.seed("old", candidate=True, round_index=1)
+        self.seed("new", candidate=True, round_index=2)
+        cowork.run_evaluation_transition(
+            self.session_uuid, "all_rounds", io_out=io.StringIO(),
+            at="session.end", closed_phases=["building"],
+            ask_fn=lambda: "continue",
+            session_factory=lambda *a, **k: None)
+        self.assertEqual(self.fold("old")["state"], "retired")
+        pending = [e.get("entry_id")
+                   for e in evaluation.pending_entries(self.queue_path)]
+        self.assertNotIn("old", pending)
+        # A second transition retires nothing again and leaves it retired.
+        cowork.run_evaluation_transition(
+            self.session_uuid, "all_rounds", io_out=io.StringIO(),
+            at="session.end", closed_phases=["building"],
+            ask_fn=lambda: "continue",
+            session_factory=lambda *a, **k: None)
+        self.assertEqual(len(self.markers("old", "retired")), 1)
+
+
+class EvalLifecycleTests(_EvalQueueFixture):
+    """Criterion 2: outcomes are classified, retries are bounded per class, and
+    terminal survives a resume."""
+
+    def _drain(self, score_fn, **kwargs):
+        return evaluation.drain(self.queue_path, score_fn,
+                                verify_fn=lambda _e: {"state": "unknown"},
+                                effective_policy="all_rounds", **kwargs)
+
+    def test_eval_lifecycle_failure_paths_classified(self):
+        # All four live paths through the REAL _score_queued_entry.
+        missing_paths = {"entry_id": "x"}
+        self.assertEqual(
+            cowork._score_queued_entry(missing_paths, {}, self.session_uuid),
+            {"ok": False, "error_class": "malformed_entry"})
+        no_tool = {"entry_id": "x", "scratch_path": "/tmp/a",
+                   "scores_path": "/tmp/b", "identity_snapshot": {}}
+        self.assertEqual(
+            cowork._score_queued_entry(no_tool, {}, self.session_uuid),
+            {"ok": False, "error_class": "malformed_entry"})
+        entry = self.seed("live")
+        self.assertEqual(
+            cowork._score_queued_entry(
+                entry, {}, self.session_uuid,
+                session_factory=lambda *a, **k: None),
+            {"ok": False, "error_class": "malformed_entry"})
+
+        class _Boom:
+            def send(self, *_a, **_k):
+                raise ConnectionError("dropped")
+
+            def close(self):
+                pass
+
+        outcome = cowork._score_queued_entry(
+            entry, {}, self.session_uuid,
+            session_factory=lambda *a, **k: _Boom())
+        self.assertFalse(outcome["ok"])
+        self.assertIn(outcome["error_class"], ("transient", "permanent"))
+
+    def test_eval_lifecycle_transient_retries_once_then_succeeds(self):
+        self.seed("a")
+        outcomes = [{"ok": False, "error_class": "transient"},
+                    {"ok": True, "error_class": None}]
+        self._drain(lambda *_a: outcomes[0])
+        self._drain(lambda *_a: outcomes[1])
+        self.assertEqual(len(self.markers("a", "attempt_started")), 2)
+        self.assertEqual(len(self.markers("a", "drained")), 1)
+        self.assertEqual(self.markers("a", "terminal"), [])
+
+    def test_eval_lifecycle_transient_stops_at_two(self):
+        self.seed("a")
+        transient = {"ok": False, "error_class": "transient"}
+        self._drain(lambda *_a: transient)
+        self._drain(lambda *_a: transient)
+        terminal = self.markers("a", "terminal")
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["error_class"], "transient")
+        self.assertEqual(terminal[0]["attempts"], 2)
+        self.assertEqual(terminal[0]["limit"], 2)
+        # A third drain must not call the scorer at all.
+        self._drain(self.never_scored)
+
+    def test_eval_lifecycle_malformed_output_terminal(self):
+        self.seed("a")
+        self._drain(lambda *_a: {"ok": False,
+                                 "error_class": "malformed_output"})
+        terminal = self.markers("a", "terminal")
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["error_class"], "malformed_output")
+        self.assertEqual(len(self.markers("a", "attempt_started")), 1)
+        self._drain(self.never_scored)
+
+    def test_eval_lifecycle_permanent_terminal(self):
+        self.seed("a")
+        self._drain(lambda *_a: {"ok": False, "error_class": "permanent"})
+        self.assertEqual(len(self.markers("a", "terminal")), 1)
+        self.assertEqual(len(self.markers("a", "attempt_started")), 1)
+        self._drain(self.never_scored)
+
+    def test_eval_lifecycle_malformed_entry_terminal_no_turn(self):
+        # A malformed entry must never start a controller turn.
+        self.seed("a", scratch_path=None, scores_path=None)
+        events = []
+
+        class _Trace:
+            def event(self, name, **fields):
+                events.append(name)
+
+        trace = _Trace()
+
+        def score(entry, verification):
+            return cowork._score_queued_entry(
+                entry, verification, self.session_uuid, trace=trace,
+                session_factory=self.never_started)
+
+        self._drain(score)
+        terminal = self.markers("a", "terminal")
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["error_class"], "malformed_entry")
+        self.assertNotIn("eval.turn.start", events)
+
+    def test_eval_lifecycle_unclassified_false_is_terminal(self):
+        # A legacy stub returning a bare False is bounded, not unbounded.
+        self.seed("a")
+        self._drain(lambda *_a: False)
+        terminal = self.markers("a", "terminal")
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["error_class"], "unclassified")
+        self.assertEqual(terminal[0]["limit"], 1)
+
+    def test_eval_lifecycle_terminal_stays_across_resume(self):
+        self.seed("a")
+        self._drain(lambda *_a: {"ok": False, "error_class": "permanent"})
+        before = self.fold("a")
+        # A fresh process re-reads the file and must see the same lifecycle.
+        after = evaluation.read_entry_lifecycle(
+            evaluation.read_queue(self.queue_path), "a")
+        for field in ("state", "error_class", "attempts", "limit",
+                      "eligible_at", "transition_history"):
+            self.assertEqual(before[field], after[field], field)
+        self.assertEqual(after["state"], "terminal")
+        self.assertTrue(after["transition_history"])
+        self._drain(self.never_scored)
+
+    def test_eval_lifecycle_crash_mid_score_is_bounded(self):
+        # An attempt marker with no outcome, already AT the ceiling: the next
+        # drain closes it rather than spending another attempt.
+        self.seed("a")
+        evaluation.mark_attempt_started(self.queue_path, "a", 1)
+        evaluation.mark_attempt_started(self.queue_path, "a", 2)
+        self._drain(self.never_scored)
+        self.assertEqual(len(self.markers("a", "terminal")), 1)
+
+    def test_eval_lifecycle_crash_gives_limit_one_class_a_second_attempt(self):
+        # DOCUMENTED CONSEQUENCE, pinned so it reads as intended behavior: a
+        # crash records no failure class, so the class is unknowable and only
+        # the ceiling binds — a limit-1 class gets one more real attempt.
+        self.seed("a")
+        evaluation.mark_attempt_started(self.queue_path, "a", 1)
+        calls = []
+        self._drain(lambda *_a: calls.append(1) or {
+            "ok": False, "error_class": "malformed_output"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.markers("a", "terminal")), 1)
+
+    def test_eval_lifecycle_unrecordable_attempt_is_not_spent(self):
+        # If the attempt marker cannot be WRITTEN, the attempt must not be RUN.
+        # Scoring anyway would charge for an attempt no later drain can see:
+        # the fold would still read zero attempts and score it again, forever.
+        # An unwritable queue must delay scoring, never charge for it.
+        self.seed("a")
+        calls = []
+        original = evaluation.mark_attempt_started
+        self.addCleanup(setattr, evaluation, "mark_attempt_started", original)
+        evaluation.mark_attempt_started = lambda *_a, **_k: False
+        summary = evaluation.drain(
+            self.queue_path, lambda *_a: calls.append(1) or True,
+            verify_fn=lambda _e: {"state": "unknown"},
+            effective_policy="all_rounds")
+        self.assertEqual(calls, [])
+        self.assertEqual(summary["pending"], 1)
+        self.assertEqual(summary["drained"], 0)
+        self.assertEqual(self.markers("a", "drained"), [])
+        self.assertEqual(self.markers("a", "terminal"), [])
+        # Still pending, with its budget intact, once the queue is writable.
+        evaluation.mark_attempt_started = original
+        self.assertIn("a", [e.get("entry_id") for e
+                            in evaluation.pending_entries(self.queue_path)])
+        self.assertEqual(self.fold("a")["attempts"], 0)
+
+    def test_eval_lifecycle_failed_attempt_records_duration(self):
+        entry = self.seed("a")
+        events = []
+
+        class _Trace:
+            def event(self, name, **fields):
+                events.append((name, fields))
+
+        class _Boom:
+            def send(self, *_a, **_k):
+                raise RuntimeError("nope")
+
+            def close(self):
+                pass
+
+        cowork._score_queued_entry(
+            entry, {}, self.session_uuid, trace=_Trace(),
+            session_factory=lambda *a, **k: _Boom())
+        ends = [fields for name, fields in events if name == "eval.turn.end"]
+        self.assertEqual(len(ends), 1)
+        self.assertIsInstance(ends[0].get("duration_ms"), int)
+        self.assertEqual(ends[0].get("error_class"), "permanent")
+
+
+class EvalForegroundTests(_EvalQueueFixture):
+    """Criterion 4: the drain state is distinct, truthful, and safe to leave."""
+
+    def _preview(self, policy="all_rounds", closed=None):
+        return evaluation.preview(
+            self.queue_path,
+            phase_closed=self.closed(*(closed or ())) if closed else None,
+            effective_policy=policy)
+
+    def test_eval_foreground_output_shows_policy_and_counts(self):
+        # An entry drained on a PREVIOUS pass, rendered from a preview that has
+        # scored nothing: the completed line must still report it.
+        self.seed("done")
+        evaluation.mark_drained(self.queue_path, "done")
+        self.seed("waiting")
+        self.seed("dead")
+        evaluation.mark_terminal(self.queue_path, "dead", "permanent", 1, 1)
+        self.seed("unver")
+        evaluation.mark_drained(self.queue_path, "unver", unverifiable=True)
+        summary = self._preview()
+        out = io.StringIO()
+        ui.render_drain_state(out, "all_rounds", summary, blocking=True)
+        rendered = out.getvalue()
+        self.assertIn("Governing policy: all_rounds", rendered)
+        self.assertIn("Pending/running: 1", rendered)
+        self.assertIn("Completed: 2 (1 unverifiable)", rendered)
+        self.assertIn("Terminal/failed: 1", rendered)
+        # The four buckets account for every entry in the queue.
+        total = (summary["pending_running"] + summary["drained_total"]
+                 + summary["held"] + summary["terminal_total"])
+        self.assertEqual(total, len(self.entry_ids_on_disk()))
+
+    def test_eval_foreground_superseded_as_held_not_completed(self):
+        self.seed("retired_one", candidate=True)
+        evaluation.mark_retired(self.queue_path, "retired_one")
+        summary = self._preview()
+        out = io.StringIO()
+        ui.render_drain_state(out, "all_rounds", summary, blocking=True)
+        rendered = out.getvalue()
+        self.assertIn("Held/skipped: 1 (1 superseded)", rendered)
+        self.assertIn("Completed: 0", rendered)
+        self.assertEqual(summary["superseded_total"], 1)
+        # The policy-off variant: deferred retirement, not yet retired.
+        self.seed("old", candidate=True, round_index=1)
+        self.seed("new", candidate=True, round_index=2)
+        deferred = evaluation.preview(
+            self.queue_path, phase_closed=self.closed("building"),
+            effective_policy="off")
+        self.assertEqual(deferred["retire_pending"], 1)
+        self.assertEqual(deferred["superseded_total"], 2)
+
+    def test_eval_foreground_no_phase_approval_wording(self):
+        self.seed("a")
+        out = io.StringIO()
+        ui.render_drain_state(out, "all_rounds", self._preview(),
+                              blocking=True)
+        rendered = out.getvalue().lower()
+        self.assertNotIn("approved", rendered)
+        self.assertNotIn("phase approved", rendered)
+
+    def test_eval_foreground_hold_and_end_preserve_queue(self):
+        for action in ("hold", "end"):
+            with self.subTest(action=action):
+                entry_id = "keep-%s" % action
+                self.seed(entry_id)
+                before = self.entry_ids_on_disk()
+                cowork.run_evaluation_transition(
+                    self.session_uuid, "all_rounds", io_out=io.StringIO(),
+                    ask_fn=lambda: action,
+                    session_factory=self.never_started)
+                self.assertEqual(self.entry_ids_on_disk(), before)
+                self.assertEqual(self.markers(entry_id, "drained"), [])
+
+    def test_eval_foreground_leave_preserves_queue(self):
+        # Walking away, in both of its shapes: an EOF and a dismissal.
+        def _eof():
+            raise EOFError
+
+        for ask in (_eof, lambda: None):
+            with self.subTest(ask=ask):
+                self.seed("walk")
+                before = self.entry_ids_on_disk()
+                cowork.run_evaluation_transition(
+                    self.session_uuid, "all_rounds", io_out=io.StringIO(),
+                    ask_fn=ask, session_factory=self.never_started)
+                self.assertEqual(self.entry_ids_on_disk(), before)
+                self.assertEqual(self.markers("walk", "drained"), [])
+
+    def test_eval_foreground_non_tty_never_prompts(self):
+        # Off a real terminal there is nobody to answer, so the gate must not
+        # open — it would hand the question to whatever is on stdin and wait.
+        # No ask_fn here on purpose: if this opened a gate it would block.
+        self.seed("a")
+        cowork.run_evaluation_transition(
+            self.session_uuid, "all_rounds", io_in=io.StringIO(),
+            io_out=io.StringIO(), session_factory=lambda *a, **k: None)
+        # It continued rather than prompting: the attempt was actually made.
+        self.assertEqual(len(self.markers("a", "attempt_started")), 1)
+
+    def test_eval_foreground_retry_action_dispatches_terminal_once(self):
+        self.seed("dead")
+        evaluation.mark_terminal(self.queue_path, "dead", "permanent", 1, 1)
+        # Count DISPATCHES (one isolated evaluator session per attempt), which
+        # is the thing "exactly once" is about.
+        dispatched = []
+
+        def factory(*_a, **_k):
+            dispatched.append(1)
+            return None
+
+        cowork.run_evaluation_transition(
+            self.session_uuid, "all_rounds", io_out=io.StringIO(),
+            ask_fn=lambda: "retry", session_factory=factory)
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(len(self.markers("dead", "retried")), 1)
+
+
+class EvalReportLegacyTests(_EvalQueueFixture):
+    """Criteria 5/6: dispositions reach the record and the report, and files
+    written before any of this still load."""
+
+    def test_eval_report_legacy_dispositions_separate_eval_costs(self):
+        self.seed("done")
+        evaluation.mark_drained(self.queue_path, "done")
+        self.seed("held")
+        evaluation.mark_held(self.queue_path, "held", held_reason="policy_off")
+        self.seed("dead")
+        evaluation.mark_terminal(self.queue_path, "dead", "permanent", 1, 1)
+        self.seed("gone")
+        evaluation.mark_retired(self.queue_path, "gone")
+        self.seed("waiting")
+        dispositions = evaluation.queue_dispositions(self.queue_path)
+        self.assertEqual(dispositions["by_state"],
+                         {"pending": 1, "held": 1, "attempting": 0,
+                          "terminal": 1, "retired": 1, "drained": 1})
+        record = {"evaluation_queue": {
+            "pending": 2, "pending_entries": ["held", "waiting"],
+            "by_state": dispositions["by_state"],
+            "entries": dispositions["entries"]}}
+        lineage = report.rendered_lineage(record)
+        for figure in ("queue.by_state.pending", "queue.by_state.held",
+                       "queue.by_state.terminal", "queue.by_state.retired",
+                       "queue.by_state.drained",
+                       "queue.by_state.attempting"):
+            self.assertTrue(lineage[figure]["resolved"], figure)
+        rendered = report.render_report(record)
+        self.assertIn("Evaluation queue dispositions", rendered)
+        # The pre-existing shape is untouched.
+        self.assertEqual(record["evaluation_queue"]["pending"], 2)
+
+    def test_eval_report_legacy_queue_without_lifecycle_loads(self):
+        # A pre-lifecycle queue: entries with no lifecycle fields, and old
+        # close-markers with no marker_id.
+        with open(self.queue_path, "a") as fh:
+            fh.write(json.dumps({"entry_id": "old", "state": "pending",
+                                 "phase": "building", "round": 1}) + "\n")
+            fh.write(json.dumps({"entry_id": "closed", "state": "pending",
+                                 "phase": "building", "round": 1}) + "\n")
+            fh.write(json.dumps({"entry_id": "closed",
+                                 "state": "drained"}) + "\n")
+            fh.write(json.dumps({"entry_id": "failed", "state": "pending",
+                                 "phase": "building", "round": 1}) + "\n")
+            fh.write(json.dumps({"entry_id": "failed",
+                                 "state": "failed_permanent"}) + "\n")
+        fold = self.fold("old")
+        self.assertEqual(fold["state"], "pending")
+        self.assertEqual(fold["attempts"], 0)
+        self.assertEqual(fold["limit"], evaluation.MAX_ATTEMPTS)
+        pending = [e.get("entry_id")
+                   for e in evaluation.pending_entries(self.queue_path)]
+        self.assertIn("old", pending)
+        self.assertNotIn("closed", pending)
+        self.assertNotIn("failed", pending)
+
+    def test_eval_report_legacy_session_loads_without_error(self):
+        path = os.path.join(self.tmp, "session.json")
+        state_store.save(path, {"team": ["builder"], "config": {},
+                                "sessions": {}})
+        loaded = state_store.load(path)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(state_store.get_evaluation_policy(loaded),
+                         state_store.DEFAULT_EVALUATION_POLICY)
+
+    def test_eval_report_legacy_minimal_entry_keeps_pending_on_false(self):
+        # BOTH SIDES OF THE BOUNDARY, in one drain.
+        #
+        # A pre-lifecycle record is little more than an id: there is nothing to
+        # build an evaluation from, so it can never start a controller turn and
+        # can never be charged for. It keeps its historical behavior — a failure
+        # leaves it pending and reported as pending — because naming a failure
+        # class for something that never ran, and then retiring it permanently
+        # on that guess, would be a fabrication.
+        #
+        # A well-formed current entry in the SAME queue must still be bounded:
+        # bare False is `unclassified`, limit 1, terminal after one attempt.
+        # That is the CV-039 fix and it must not be weakened to accommodate the
+        # legacy record.
+        self.assertTrue(evaluation.enqueue(self.queue_path, {"entry_id": "E1"}))
+        self.seed("shaped")
+        summary = evaluation.drain(
+            self.queue_path, lambda *_a: False,
+            verify_fn=lambda _e: {"state": "unknown"},
+            effective_policy="all_rounds")
+        self.assertEqual(summary["pending"], 1)
+        self.assertIn("E1", [e.get("entry_id") for e
+                             in evaluation.pending_entries(self.queue_path)])
+        self.assertEqual(self.markers("E1", "terminal"), [])
+        self.assertEqual(self.markers("E1", "attempt_started"), [])
+        self.assertEqual(self.fold("E1")["state"], "pending")
+        terminal = self.markers("shaped", "terminal")
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["error_class"], "unclassified")
+        self.assertEqual(terminal[0]["limit"], 1)
+
+    def test_eval_report_legacy_readable_queue_reports_ok_read_state(self):
+        # THE CASE THE OTHER TWO CANNOT REACH. The unreadable and missing tests
+        # both drive a queue with no readable entries, so the disposition loop
+        # never runs; only a NON-EMPTY readable queue can catch the read status
+        # being clobbered by a per-entry value inside that loop.
+        #
+        # The entries below deliberately end in several different lifecycle
+        # states, so a leak would surface as one of them ('drained', 'pending',
+        # 'terminal', …) appearing where the read status belongs.
+        self.seed("waiting")
+        self.seed("done")
+        evaluation.mark_drained(self.queue_path, "done")
+        self.seed("dead")
+        evaluation.mark_terminal(self.queue_path, "dead", "permanent", 1, 1)
+        dispositions = evaluation.queue_dispositions(self.queue_path)
+        self.assertEqual(dispositions["state"], evaluation.QUEUE_OK)
+        self.assertEqual(dispositions["state"], "ok")
+        # The per-entry states are still reported correctly alongside it.
+        self.assertEqual(dispositions["by_state"]["pending"], 1)
+        self.assertEqual(dispositions["by_state"]["drained"], 1)
+        self.assertEqual(dispositions["by_state"]["terminal"], 1)
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        self.assertEqual(record["evaluation_queue"]["read_state"], "ok")
+        # A readable queue is not an incomplete one.
+        fields = [item.get("field") for item in record.get("incomplete") or []]
+        self.assertNotIn("record.evaluation_queue.by_state", fields)
+
+    def test_eval_report_legacy_unreadable_queue_is_incomplete_not_zero(self):
+        # AN UNREADABLE QUEUE IS AN UNKNOWN, NOT AN EMPTY ONE.
+        #
+        # cowork_eval.read_queue deliberately swallows OSError and returns a
+        # list, which is right for a drain (an unreadable queue must never break
+        # the run) and wrong for a REPORT: the empty list is indistinguishable
+        # from a genuinely empty queue, so all-zero dispositions would be
+        # published as authoritative and the incomplete-data note would never be
+        # emitted. A read-status signal keeps the two apart.
+        #
+        # A directory at the queue path makes open() raise IsADirectoryError (an
+        # OSError) deterministically on every platform, without depending on
+        # permission semantics or on the test not running as root.
+        if os.path.isfile(self.queue_path):
+            os.remove(self.queue_path)
+        os.makedirs(self.queue_path, exist_ok=True)
+        self.assertEqual(
+            evaluation.read_queue_status(self.queue_path)["state"],
+            evaluation.QUEUE_UNREADABLE)
+        self.assertEqual(evaluation.queue_dispositions(self.queue_path)
+                         ["state"], evaluation.QUEUE_UNREADABLE)
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        queue = record["evaluation_queue"]
+        self.assertEqual(queue["read_state"], "unreadable")
+        # Not zero: every disposition reads as unknown.
+        for state in ("pending", "held", "attempting", "terminal", "retired",
+                      "drained"):
+            self.assertEqual(queue["by_state"][state], measure.UNKNOWN, state)
+        fields = [item.get("field") for item in record.get("incomplete") or []]
+        self.assertIn("record.evaluation_queue.by_state", fields)
+        self.assertIn("record.evaluation_queue.pending", fields)
+
+    def test_eval_report_legacy_missing_queue_is_a_known_zero(self):
+        # The other side of the distinction: an ABSENT queue really does hold
+        # nothing, so its zeros are true and must NOT be reported as unknown.
+        if os.path.isfile(self.queue_path):
+            os.remove(self.queue_path)
+        self.assertEqual(
+            evaluation.read_queue_status(self.queue_path)["state"],
+            evaluation.QUEUE_MISSING)
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        queue = record["evaluation_queue"]
+        self.assertEqual(queue["read_state"], "missing")
+        self.assertEqual(queue["by_state"]["pending"], 0)
+        for item in record.get("incomplete") or []:
+            if item.get("field") == "record.evaluation_queue.by_state":
+                self.assertIn("known zero", item.get("reason", ""))
+
+    def test_eval_report_legacy_bool_score_fn_still_supported(self):
+        self.seed("a")
+        summary = evaluation.drain(
+            self.queue_path, lambda *_a: True,
+            verify_fn=lambda _e: {"state": "unknown"},
+            effective_policy="all_rounds")
+        self.assertEqual(summary["drained"], 1)
+        self.assertEqual(self.fold("a")["state"], "drained")
+
+
+class EvaluatorEffortPropagationTests(unittest.TestCase):
+    """The seat's REASONING EFFORT must reach the evaluator that scores it.
+
+    Controller and model already travelled the whole chain; effort was dropped
+    at the very first link, so every isolated evaluator ran at the controller
+    default while the record said `unknown` — and two runs pinned to different
+    efforts were being compared as if they were the same run. These four tests
+    pin the chain end to end: recorded, queued, spawned, and (for records
+    written before the fix) still tolerated as unknown.
+    """
+
+    def _tmpdir(self):
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
+
+    def _session(self, directory, effort="medium", role="builder"):
+        """A minimal stand-in for a role session: only the attributes
+        `_record_role_identity` actually reads."""
+        class _FakeSession(object):
+            pass
+
+        session = _FakeSession()
+        session.speaker = role
+        session.extra_writable_dir = directory
+        session.controller = "claude"
+        session.model = "claude-opus-4-8"
+        session.effort = effort
+        session.session_id = "sess-1"
+        session.controller_state_dir = os.path.join(directory, "ctl")
+        return session
+
+    def _identities(self, directory):
+        return state_store.read_role_identities(
+            os.path.join(directory, "identities.json"))
+
+    def _stub_claude_session(self):
+        """Swap `bridge.ClaudeSession` for a constructor that only RECORDS what
+        it was built with. No CLI is spawned — the assertion is on the
+        construction arguments, which is where the effort either arrives or
+        does not."""
+        captured = {}
+
+        class _StubClaudeSession(object):
+            def __init__(self, *args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+        original = cowork.bridge.ClaudeSession
+        cowork.bridge.ClaudeSession = _StubClaudeSession
+        self.addCleanup(setattr, cowork.bridge, "ClaudeSession", original)
+        return captured, _StubClaudeSession
+
+    def test_effort_propagation_records_configured_effort(self):
+        # POSITIVE HALF: a pinned effort is durable in BOTH the latest-wins map
+        # and the appended immutable observation. The map alone cannot say what
+        # a given turn ran with, so the observation is asserted separately.
+        directory = self._tmpdir()
+        cowork._record_role_identity(
+            self._session(directory, effort="medium"),
+            {"model": "claude-opus-4-8", "session_id": "sess-1"})
+        data = self._identities(directory)
+        self.assertEqual(data["builder"]["effort"], "medium")
+        observations = [obs for obs in data.get("observations") or []
+                        if isinstance(obs, dict)
+                        and obs.get("role") == "builder"]
+        self.assertTrue(observations)
+        self.assertEqual(observations[-1].get("effort"), "medium")
+
+        # NEGATIVE HALF, in a SEPARATE FRESH DIRECTORY. Reusing the one above
+        # could prove nothing: `upsert_role_identity` merges only non-None
+        # values and never erases a known one, so the pinned 'medium' would
+        # still be there and the assertion would be vacuous. A role left on the
+        # controller default records no effort at all — absence stays absence
+        # rather than becoming a guessed value.
+        default_dir = self._tmpdir()
+        cowork._record_role_identity(
+            self._session(default_dir, effort=None), {})
+        default_data = self._identities(default_dir)
+        self.assertNotIn("effort", default_data["builder"])
+        self.assertEqual(default_data["builder"]["tool"], "claude")
+
+    def test_effort_propagation_survives_queue_snapshot(self):
+        # A queue entry is drained by a LATER PROCESS reading it off disk, so
+        # the effort has to survive the snapshot AND the round trip through the
+        # file — an in-memory assertion alone would not show that.
+        directory = self._tmpdir()
+        cowork._record_role_identity(
+            self._session(directory, effort="medium"), {})
+        snapshot = evaluation.evaluator_identity(
+            self._identities(directory), "builder")
+        self.assertEqual(snapshot["effort"], "medium")
+        self.assertEqual(snapshot["state"], "ok")
+
+        queue_path = os.path.join(directory, "evaluations.jsonl")
+        entry = {
+            "entry_id": "E1",
+            "session_uuid": "sess-uuid",
+            "evaluator_seat": "builder",
+            "evaluatee": "build-reviewer",
+            "scratch_path": os.path.join(directory, "eval-scratch.json"),
+            "scores_path": os.path.join(directory, "scores.jsonl"),
+            "identity_snapshot": snapshot,
+        }
+        self.assertTrue(evaluation.enqueue(queue_path, entry))
+        records = [rec for rec in evaluation.read_queue(queue_path)
+                   if rec.get("entry_id") == "E1"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0]["identity_snapshot"]["effort"], "medium")
+        self.assertEqual(records[0]["identity_snapshot"]["tool"], "claude")
+
+    def test_effort_propagation_reaches_isolated_evaluator_session(self):
+        directory = self._tmpdir()
+        captured, stub_cls = self._stub_claude_session()
+
+        # (a) DIRECT: the evaluator session is CONSTRUCTED with the snapshot's
+        # effort, not with the controller default.
+        entry = {"scratch_path": os.path.join(directory, "eval-scratch.json")}
+        session = cowork._isolated_evaluator_session(
+            entry, {"tool": "claude", "model": "m", "effort": "medium"},
+            io_out=io.StringIO())
+        self.assertIsInstance(session, stub_cls)
+        self.assertEqual(captured["kwargs"].get("effort"), "medium")
+        self.assertEqual(captured["kwargs"].get("model"), "m")
+
+        # (b) THROUGH THE DRAIN SEAM: the identity `_score_queued_entry` hands
+        # to the session factory is the entry's own snapshot, effort included.
+        # The factory returns None, so the entry is reported malformed and NO
+        # controller turn is ever started — the assertion is on what the
+        # factory RECEIVED.
+        received = []
+
+        def capture(entry_arg, identity_arg, config=None, trace=None,
+                    io_out=None):
+            received.append(identity_arg)
+            return None
+
+        # The evaluator prompt is assembled BEFORE the factory is called, and
+        # the handoff edge fails closed unless its required `verdict` slot is
+        # filled. A real verdict file on disk is what the production fallback
+        # at `_score_queued_entry` uses when an entry carries no sealed
+        # envelope, so the entry carries one here too.
+        review_path = os.path.join(directory, "reviewer.review.json")
+        with open(review_path, "w") as fh:
+            json.dump({"verdict": "approve", "findings": []}, fh)
+
+        # `criteria` is taken from the SAME expression the real enqueue site
+        # uses (cowork.py: `EVAL_CRITERIA.get((role, reviewer_role)) or []`),
+        # so the prompt prologue that runs before the factory — including
+        # `assemble_eval_prompt`, which is outside `_score_queued_entry`'s
+        # try block — is exercised on production-shaped data rather than on a
+        # hand-picked stand-in.
+        drain_entry = {
+            "entry_id": "E1",
+            "evaluator_seat": "builder",
+            "evaluatee": cowork.BUILD_REVIEWER,
+            "criteria": cowork.EVAL_CRITERIA.get(
+                ("builder", cowork.BUILD_REVIEWER)) or [],
+            "phase": "build",
+            "round": 1,
+            "review_path": review_path,
+            "scratch_path": os.path.join(directory, "eval-scratch.json"),
+            "scores_path": os.path.join(directory, "scores.jsonl"),
+            "identity_snapshot": {"tool": "claude", "model": "m",
+                                  "effort": "medium", "state": "ok"},
+        }
+        outcome = cowork._score_queued_entry(
+            drain_entry, None, "sess-uuid", io_out=io.StringIO(),
+            session_factory=capture)
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].get("effort"), "medium")
+
+    def test_effort_propagation_legacy_identity_reads_unknown(self):
+        # A record written BEFORE this change carries no effort. It must read
+        # as unknown — never as an invented default, and never as an error.
+        directory = self._tmpdir()
+        captured, stub_cls = self._stub_claude_session()
+        entry = {"scratch_path": os.path.join(directory, "eval-scratch.json")}
+
+        legacy = {"builder": {"tool": "claude", "model": "x"}}
+        snapshot = evaluation.evaluator_identity(legacy, "builder")
+        self.assertIsNone(snapshot["effort"])
+        self.assertEqual(snapshot["state"], "ok")
+        session = cowork._isolated_evaluator_session(
+            entry, snapshot, io_out=io.StringIO())
+        self.assertIsInstance(session, stub_cls)
+        self.assertIsNone(captured["kwargs"].get("effort"))
+        self.assertEqual(captured["kwargs"].get("model"), "x")
+
+        # The MISSING-ROLE branch returns no 'effort' key at all. Every
+        # consumer reads it with .get(), so it behaves as unknown too — and
+        # with no controller there is simply no session to build.
+        missing = evaluation.evaluator_identity({}, "builder")
+        self.assertIsNone(missing.get("effort"))
+        self.assertEqual(missing["state"], "unknown")
+        self.assertIsNone(cowork._isolated_evaluator_session(
+            entry, missing, io_out=io.StringIO()))

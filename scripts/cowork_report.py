@@ -149,6 +149,13 @@ LINEAGE = (
     ("readiness.total", "readiness.total"),
     ("readiness.unverified", "readiness.unverified"),
     ("queue.pending", "evaluation_queue.pending"),
+    ("queue.by_state.pending", "evaluation_queue.by_state.pending"),
+    ("queue.by_state.held", "evaluation_queue.by_state.held"),
+    ("queue.by_state.attempting", "evaluation_queue.by_state.attempting"),
+    ("queue.by_state.terminal", "evaluation_queue.by_state.terminal"),
+    ("queue.by_state.retired", "evaluation_queue.by_state.retired"),
+    ("queue.by_state.drained", "evaluation_queue.by_state.drained"),
+    ("queue.read_state", "evaluation_queue.read_state"),
     ("trace.turn_count", "trace_summary.turn_count"),
     ("trace.bytes_by_kind", "trace_summary.bytes_by_kind"),
     ("trace.artifact_bytes", "trace_summary.artifact_bytes"),
@@ -226,6 +233,7 @@ def render_report(record):
     lines.extend(_section_trace(record))
     lines.extend(_section_scores_legacy(record))
     lines.extend(_section_readiness(record))
+    lines.extend(_section_evaluation_queue(record))
     lines.extend(_section_completion(record))
     lines.extend(_section_incomplete(record))
     return "\n".join(lines) + "\n"
@@ -922,6 +930,44 @@ def _section_readiness(record):
                                 _fmt(claim.get("reason"))))
     else:
         lines.append("  readiness claims: (none recorded for this session)")
+    lines.append("")
+    return lines
+
+
+def _section_evaluation_queue(record):
+    """Each evaluation entry's FINAL DISPOSITION.
+
+    Every figure is a scalar looked up at a declared path — the renderer does
+    not count the members of `entries`, because a figure it derived is a figure
+    that can disagree with the record it claims to be rendering.
+
+    Held is deliberately not a failure and retired is deliberately not a
+    completion: both are states work can legitimately end a session in, and
+    collapsing either into "done" is what made a queue's real condition
+    impossible to read.
+    """
+    by_state = _at(record, "evaluation_queue.by_state", {})
+    lines = ["Evaluation queue dispositions", "-" * 56]
+    if not isinstance(by_state, dict) or not by_state:
+        lines.extend(["  (no evaluation queue recorded for this session)", ""])
+        return lines
+    read_state = _at(record, "evaluation_queue.read_state", None)
+    if read_state == "unreadable":
+        # The figures below are UNKNOWN, not zero. Saying so above them is what
+        # stops a reader taking an unreadable queue for an empty one.
+        lines.append("  The queue could not be read: these are UNKNOWN, not 0.")
+    elif read_state == "missing":
+        lines.append("  No queue file for this session — nothing was enqueued.")
+    for state, note in (("pending", "awaiting scoring"),
+                        ("attempting", "an attempt was recorded, no outcome"),
+                        ("held", "held by policy or by you; not scored"),
+                        ("drained", "scored successfully"),
+                        ("retired", "superseded; never scored, not a failure"),
+                        ("terminal", "budget spent; needs an explicit retry")):
+        lines.append("  %-11s %-4s %s"
+                     % (state, _fmt(_at(record,
+                                        "evaluation_queue.by_state." + state)),
+                        note))
     lines.append("")
     return lines
 

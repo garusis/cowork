@@ -61,6 +61,25 @@ def is_tty(stream):
     return bool(getattr(stream, "isatty", lambda: False)())
 
 
+def is_real_terminal(stream):
+    """True only for a stream backed by an ACTUAL terminal file descriptor.
+
+    Stricter than `is_tty`, deliberately. A FakeTTY test stream overrides
+    isatty() to return True so the rich rendering paths get exercised, which is
+    exactly right for rendering — and exactly wrong for deciding whether a
+    human can answer a blocking question. A gate that opens on a FakeTTY waits
+    on a terminal that does not exist.
+    """
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        return False
+    try:
+        return bool(os.isatty(fd))
+    except (OSError, ValueError):
+        return False
+
+
 def colorize(text, code, enabled):
     """Wrap text in an ANSI color when enabled; return it untouched otherwise."""
     if not enabled:
@@ -1066,6 +1085,93 @@ def gate_abandoned_notice(io_out):
     _notice(io_out,
             "Input kept arriving before this gate was ready, so the gate was "
             "not run and this phase is ending without approving.")
+
+
+def render_drain_state(io_out, policy, summary, blocking=False):
+    """The evaluation drain's own visible state.
+
+    Draining used to happen silently inside a phase transition, so time the run
+    spent waiting on scoring looked exactly like the previous phase having been
+    signed off. It is its own thing now, and it says so: the wording below never
+    contains any phase-approval phrasing.
+
+    EVERY FIGURE IS ONE PRECOMPUTED FIELD. There is no arithmetic here, and none
+    is allowed: `preview`/`drain` compute the buckets, and a renderer that
+    re-derived one could disagree with the durable state it claims to describe.
+
+    The four counts are whole-queue and mutually exclusive, and together they
+    account for every entry in the queue:
+
+      Pending/running   `pending_running`  — waiting, or being scored now
+      Completed         `drained_total`    — successfully scored, whole queue
+      Held/skipped      `held`             — held, deferred or retired
+      Terminal/failed   `terminal_total`   — finished failing; needs a retry
+
+    Completed is pinned to the WHOLE-QUEUE `drained_total`, never to the
+    per-drain `drained`: this screen is drawn from a preview, which by
+    definition has scored nothing, so the per-drain figure would read 0 on every
+    screen no matter how much work the queue had actually finished.
+
+    `unverifiable` and `superseded` are printed as BREAKDOWNS OF the line they
+    belong to, never as extra buckets. Superseded work sits inside held/skipped
+    precisely because retiring a superseded candidate is not completing it —
+    nothing was scored — and reporting it under Completed is the specific lie
+    this layout exists to prevent. An unverifiable entry did drain successfully,
+    so it is counted in Completed, but never silently: its own count is printed
+    beside it.
+
+    Plain writes only, so the block is byte-identical on and off a TTY and can
+    be asserted verbatim against a StringIO.
+    """
+    if io_out is None:
+        return
+    summary = summary or {}
+    completed = "Completed: %s" % summary.get("drained_total", 0)
+    if summary.get("unverifiable_total", 0):
+        completed += " (%s unverifiable)" % summary["unverifiable_total"]
+    held = "Held/skipped: %s" % summary.get("held", 0)
+    if summary.get("superseded_total", 0):
+        held += " (%s superseded)" % summary["superseded_total"]
+    lines = [
+        "Evaluation drain",
+        "Governing policy: %s" % (policy or "unknown"),
+        "Pending/running: %s" % summary.get("pending_running", 0),
+        completed,
+        held,
+        "Terminal/failed: %s" % summary.get("terminal_total", 0),
+    ]
+    if blocking:
+        lines.append("This drain is holding the run until you choose below.")
+    else:
+        lines.append("No evaluation work is running; the run continues.")
+    _notice(io_out, "\n".join(lines))
+
+
+def drain_gate(io_in, io_out, policy, summary, ask_fn=None):
+    """Render the drain state and ask what evaluation should do.
+
+    Four bounded, safe actions. NONE of them invents a success: holding, ending
+    and walking away all leave every durable entry exactly where it is, and none
+    of them writes a completion marker for work that did not complete.
+
+    `retry` is offered only when there is already-terminal work to retry —
+    `terminal_existing`, the retryable set, and NOT `terminal`, which counts
+    what became terminal during a drain that has not happened yet.
+
+    Dismissal and a failed input boundary both fall back to `end`, which is the
+    safe direction: the queue is preserved and nothing is scored.
+    """
+    render_drain_state(io_out, policy, summary, blocking=True)
+    choices = [("continue", "Continue eligible evaluation work"),
+               ("hold", "Hold remaining optional work")]
+    if (summary or {}).get("terminal_existing", 0):
+        choices.append(("retry", "Retry eligible failed work"))
+    choices.append(("end", "End without evaluating (queue preserved)"))
+    picked = select("What should evaluation do?", choices, ask_fn=ask_fn,
+                    io_in=io_in, io_out=io_out, gate="evaluation_drain")
+    if picked is DRAIN_FAILED or picked is None:
+        return "end"
+    return picked
 
 
 def _protected(io_in, io_out, ask_fn=None):
