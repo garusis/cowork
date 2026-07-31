@@ -4226,8 +4226,8 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
         pass
     if trace:
         trace.event("worktree.run.start", controller=controller,
-                    base_toplevel=base_toplevel, name=name, explicit=explicit,
-                    status_path=status_path)
+                    base_toplevel=base_toplevel, worktree_name=name,
+                    explicit=explicit, status_path=status_path)
     ui.banner(io_out, "worktree — creating a git worktree for this session\n"
               "name → %s\nbase → %s" % (name, base_toplevel), "start")
     io_out.flush()
