@@ -1624,11 +1624,54 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
                        % (len(unsupported), ", ".join(unsupported[:4])))})
 
     queue_pending = []
+    queue_dispositions = {
+        "by_state": {"pending": 0, "held": 0, "attempting": 0, "terminal": 0,
+                     "retired": 0, "drained": 0},
+        "entries": []}
+    # `unreadable` until a read actually says otherwise. The import or the call
+    # blowing up is itself a failure to read, and must not present as an empty
+    # queue.
+    queue_state = "unreadable"
     try:
         import cowork_eval as evaluation
         queue_pending = evaluation.pending_entries(paths["evaluation_queue"])
+        queue_dispositions = evaluation.queue_dispositions(
+            paths["evaluation_queue"])
+        queue_state = queue_dispositions.get("state") or "unreadable"
     except Exception:  # noqa: BLE001
         queue_pending = []
+    if queue_state == "unreadable":
+        # NEVER A SILENT ZERO FOR AN UNKNOWN. A by_state of all zeros because
+        # the file could not be read looks exactly like a queue with nothing in
+        # it, and those are completely different facts. The counts are replaced
+        # with UNKNOWN rather than published as authoritative.
+        queue_dispositions = {
+            "by_state": {key: UNKNOWN for key in
+                         ("pending", "held", "attempting", "terminal",
+                          "retired", "drained")},
+            "entries": []}
+        incomplete.append({
+            "field": "record.evaluation_queue.by_state",
+            "reason": "the evaluation queue exists but could not be read, so "
+                      "per-entry dispositions are UNKNOWN, not empty",
+            "path": paths["evaluation_queue"]})
+        # `pending` keeps its historical int shape (existing fixtures and the
+        # renderer depend on it), so its 0 is called out here instead: on an
+        # unreadable queue that 0 is a floor, not a count.
+        incomplete.append({
+            "field": "record.evaluation_queue.pending",
+            "reason": "the evaluation queue could not be read; the pending "
+                      "count is a floor derived from whatever was readable, "
+                      "not an authoritative total",
+            "path": paths["evaluation_queue"]})
+    elif queue_state == "missing":
+        # Genuinely nothing enqueued for this session. Distinct from the case
+        # above and NOT an unknown: zero here is the true figure.
+        incomplete.append({
+            "field": "record.evaluation_queue.by_state",
+            "reason": "no evaluation queue file exists for this session; the "
+                      "dispositions are empty because nothing was ever "
+                      "enqueued (this is a known zero, not an unknown)"})
 
     # OWNED TRANSACTION EVIDENCE, when present, is authoritative: it is what
     # the builder-readiness gate itself decided on, not a rejoin of controller
@@ -1697,9 +1740,18 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
         "ingestion": ingestion,
         "identities": identities,
         "pricing": _pricing_view(work),
+        # `pending` and `pending_entries` keep their exact existing shape and
+        # meaning — existing fixtures and the renderer depend on them. The
+        # dispositions are ADDITIVE: `by_state` ships as SCALARS because the
+        # report renderer may not count the members of a collection.
         "evaluation_queue": {
             "pending": len(queue_pending),
             "pending_entries": [e.get("entry_id") for e in queue_pending],
+            "by_state": queue_dispositions.get("by_state", {}),
+            "entries": queue_dispositions.get("entries", []),
+            # ok | missing | unreadable — so a reader can tell a true zero from
+            # a figure nobody was able to establish.
+            "read_state": queue_state,
         },
         "completion": [],
         # Milestones partition a builder turn's cost by what it was actually
