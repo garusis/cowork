@@ -500,9 +500,21 @@ def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
     protected = tuple(dict.fromkeys(
         os.path.abspath(os.path.expanduser(p))
         for p in protected_paths if p))
+    declared = tuple(os.path.realpath(p)
+                     for p in owned_scope.declared_outputs)
+    # Controllers create their own shell scratch under /tmp/claude-<uid>
+    # regardless of the TMPDIR redirect; without this grant every nested Bash
+    # call dies creating that directory before the command runs (ORCH-051).
+    scratch_base = "/tmp/claude-%d" % os.getuid()
+    scratch_bases = tuple(dict.fromkeys(
+        (scratch_base, os.path.realpath(scratch_base))))
     if sys.platform == "darwin" and shutil.which("sandbox-exec"):
         def quote(value):
             return value.replace("\\", "\\\\").replace('"', '\\"')
+
+        def regex_quote(value):
+            escaped = re.sub(r'([.^$+*?()\[\]{}|\\])', r'\\\1', value)
+            return escaped.replace('"', '\\"')
         lines = ["(version 1)", "(allow default)", "(deny file-write*)",
                  '(allow file-write* (literal "/dev/null"))',
                  '(allow file-write* (literal "/dev/tty"))',
@@ -510,6 +522,15 @@ def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
         for root in roots:
             lines.append('(allow file-write* (literal "%s"))' % quote(root))
             lines.append('(allow file-write* (subpath "%s"))' % quote(root))
+        for base in scratch_bases:
+            lines.append('(allow file-write* (subpath "%s"))' % quote(base))
+        # Controllers persist a declared output atomically through a
+        # `<path>.tmp.<rand>` sibling; a bare literal allow rejects that
+        # staging file, so cover the pattern beside every declared file
+        # (ORCH-051).
+        for path in declared:
+            lines.append('(allow file-write* (regex #"^%s\\.tmp\\."))'
+                         % regex_quote(path))
         # Seatbelt deny rules override broader allows. This is essential when a
         # repository convention nests sibling worktrees below the active root.
         for root in nested_siblings:

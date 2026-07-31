@@ -24037,6 +24037,44 @@ class KernelWriteBoundaryTests(unittest.TestCase):
                 self.assertGreaterEqual(
                     boundary["argv"].count("--ro-bind"), 2)
 
+    def test_declared_tmp_sibling_and_controller_scratch_are_writable(self):
+        with tempfile.TemporaryDirectory() as root:
+            assets = os.path.join(root, "assets")
+            os.mkdir(assets)
+            declared = os.path.join(assets, "scout.intel.json")
+            scope = action_policy.OwnedScope(declared_outputs=(declared,))
+            probe = bridge.kernel_write_boundary(scope)
+            if not probe["available"]:
+                self.skipTest("kernel write boundary is unavailable")
+            if probe["platform"] != "darwin":
+                self.skipTest("staging-sibling rules are darwin-only today")
+
+            def run_python(source):
+                wrapped = bridge.kernel_write_boundary(
+                    scope, [sys.executable, "-c", source])
+                return subprocess.run(
+                    wrapped["argv"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+
+            staging = declared + ".tmp.abc123"
+            self.assertEqual(run_python(
+                "open(%r, 'w').write('ok')" % staging).returncode, 0)
+            self.assertTrue(os.path.exists(staging))
+            undeclared = os.path.join(assets, "ledger.jsonl.tmp.abc123")
+            self.assertNotEqual(run_python(
+                "open(%r, 'w').write('bad')" % undeclared).returncode, 0)
+            self.assertFalse(os.path.exists(undeclared))
+            scratch = os.path.join(
+                "/tmp/claude-%d" % os.getuid(),
+                "cowork-test-%s" % uuid.uuid4().hex)
+            try:
+                self.assertEqual(run_python(
+                    "import os; os.makedirs(%r); "
+                    "open(os.path.join(%r, 'probe'), 'w').write('ok')"
+                    % (scratch, scratch)).returncode, 0)
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+
     def test_real_profile_allows_owned_and_denies_outside_effects(self):
         with tempfile.TemporaryDirectory() as root:
             owned = os.path.join(root, "owned")
