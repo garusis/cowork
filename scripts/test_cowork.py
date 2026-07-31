@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import select as select_mod
+import signal
 import shutil
 import socket
 import struct
@@ -21749,6 +21750,35 @@ class OwnedVerificationLifecycleTests(_OwnedVerificationTestBase):
         self.assertTrue(attempt.get("descendants_confirmed_gone"))
         self.assertIn(result["verdict"],
                       (verification.VERDICT_RED, verification.VERDICT_UNVERIFIED))
+
+    def test_detached_pipe_holder_cannot_defeat_command_timeout(self):
+        pid_path = os.path.join(self.repo, "detached-pipe-holder.pid")
+        holder = (
+            "import time\n"
+            "time.sleep(30)\n")
+        parent = (
+            "import os, subprocess, sys\n"
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', %r], start_new_session=True)\n"
+            "with open(%r, 'w') as fh: fh.write(str(child.pid))\n"
+            "sys.stderr.write('partial output')\n"
+            "sys.stderr.flush()\n" % (holder, pid_path))
+        started = time.time()
+        try:
+            attempt = verification.run_command_in_group(
+                ["python3", "-c", parent], cwd=self.repo, timeout_s=0.25,
+                term_grace_s=0.1, output_cap_bytes=1024)
+        finally:
+            if os.path.exists(pid_path):
+                with open(pid_path) as fh:
+                    child_pid = int(fh.read())
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.assertLess(time.time() - started, 2)
+        self.assertTrue(attempt["timed_out"])
+        self.assertIn("partial output", attempt["stderr"])
 
     def test_worker_hang_is_bounded_and_fully_cleaned_up(self):
         # A worker that never reports its identity (bad request) must not
