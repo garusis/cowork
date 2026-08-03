@@ -705,6 +705,9 @@ class OpencodeArtifactContractTest(unittest.TestCase):
 class OpencodeSessionTest(unittest.TestCase):
     """OpencodeSession turn behavior via a fake subprocess (no real CLI)."""
 
+    def setUp(self):
+        bridge._OPENCODE_GLOBAL_DELIVERY = False
+
     class FakeProc:
         def __init__(self, lines):
             self.stdout = iter(lines)
@@ -817,6 +820,201 @@ class OpencodeSessionTest(unittest.TestCase):
         empty, _ = run_with([])
         self.assertFalse(empty["ok"])
         self.assertEqual(empty.get("error_type"), "no_events")
+
+
+class OpencodeDeliveryFallbackTest(unittest.TestCase):
+    """ORCH-052: an `opencode run --agent` that dies pre-model because the
+    project-local agent file could not be loaded is retried exactly once via
+    the global config dir; ordinary provider errors never trigger this."""
+
+    DELIVERY_ERROR = json.dumps(
+        {"type": "error",
+         "error": {"name": "UnknownError",
+                   "data": {"message": "Unexpected server error"}}})
+    OK_LINES = [
+        json.dumps({"type": "text", "sessionID": "ses_F",
+                    "part": {"text": "rescued"}}),
+        json.dumps({"type": "step_finish", "sessionID": "ses_F",
+                    "part": {"reason": "stop",
+                             "tokens": {"input": 1, "output": 1}}}),
+    ]
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.config = tempfile.mkdtemp()
+        self._env = os.environ.get("OPENCODE_CONFIG_DIR")
+        os.environ["OPENCODE_CONFIG_DIR"] = self.config
+        bridge._OPENCODE_GLOBAL_DELIVERY = False
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("OPENCODE_CONFIG_DIR", None)
+        else:
+            os.environ["OPENCODE_CONFIG_DIR"] = self._env
+        bridge._OPENCODE_GLOBAL_DELIVERY = False
+
+    def _session(self, **kw):
+        rp = os.path.join(self.tmp, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("ROLE")
+        return bridge.OpencodeSession(rp, "implement", True,
+                                      agent_base_dir=self.tmp, **kw)
+
+    def _global_files(self):
+        import glob as globmod
+        return sorted(globmod.glob(
+            os.path.join(self.config, "agent", "*.md")))
+
+    def test_delivery_failure_falls_back_to_global_agent(self):
+        import unittest.mock as mock
+        cmds = []
+        snapshots = []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            files = self._global_files()
+            snapshots.append(
+                {f: open(f).read() for f in files})
+            if len(cmds) == 1:
+                return OpencodeSessionTest.FakeProc([self.DELIVERY_ERROR])
+            return OpencodeSessionTest.FakeProc(list(self.OK_LINES))
+
+        out = io.StringIO()
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=fake_popen):
+            s = self._session(io_out=out)
+            r = s.send("go")
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(cmds), 2)
+        self.assertEqual(r["session_id"], "ses_F")
+        # first attempt targeted the project-local agent, no global file yet.
+        self.assertEqual(cmds[0][cmds[0].index("--agent") + 1], "cowork-scout")
+        self.assertEqual(snapshots[0], {})
+        # retry targeted a session-scoped global agent whose content matches
+        # the project-local file byte for byte.
+        global_agent = cmds[1][cmds[1].index("--agent") + 1]
+        self.assertTrue(global_agent.startswith("cowork-scout-"))
+        local = open(os.path.join(
+            self.tmp, ".opencode", "agents", "cowork-scout.md")).read()
+        self.assertEqual(list(snapshots[1].values()), [local])
+        self.assertIn(global_agent + ".md",
+                      os.path.basename(list(snapshots[1])[0]))
+        # the global file is removed as soon as the run exits; sticky flag set.
+        self.assertEqual(self._global_files(), [])
+        self.assertTrue(bridge._OPENCODE_GLOBAL_DELIVERY)
+
+    def test_fallback_failure_reports_agent_delivery_failed(self):
+        import unittest.mock as mock
+        cmds = []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            return OpencodeSessionTest.FakeProc([self.DELIVERY_ERROR])
+
+        out = io.StringIO()
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=fake_popen):
+            s = self._session(io_out=out)
+            r = s.send("go")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r.get("error_type"), "agent_delivery_failed")
+        self.assertEqual(len(cmds), 2)  # one retry, never a loop
+        text = out.getvalue()
+        self.assertIn("cowork-scout.md", text)
+        self.assertIn(os.path.join(self.config, "agent"), text)
+        self.assertEqual(self._global_files(), [])
+        self.assertFalse(bridge._OPENCODE_GLOBAL_DELIVERY)
+
+    def test_ordinary_error_does_not_fallback(self):
+        import unittest.mock as mock
+        for lines in (
+            # different error text: ordinary provider error.
+            [json.dumps({"type": "error",
+                         "error": {"name": "APIError",
+                                   "data": {"message": "boom"}}})],
+            # delivery-shaped error AFTER real output: not a delivery failure.
+            [json.dumps({"type": "text", "sessionID": "ses_X",
+                         "part": {"text": "partial"}}),
+             self.DELIVERY_ERROR],
+        ):
+            cmds = []
+
+            def fake_popen(command, **kwargs):
+                cmds.append(command)
+                return OpencodeSessionTest.FakeProc(list(lines))
+
+            with mock.patch.object(bridge.subprocess, "Popen",
+                                   side_effect=fake_popen):
+                s = self._session(io_out=io.StringIO())
+                r = s.send("go")
+            self.assertFalse(r["ok"])
+            self.assertNotEqual(r.get("error_type"), "agent_delivery_failed")
+            self.assertEqual(len(cmds), 1)
+            self.assertEqual(self._global_files(), [])
+            self.assertFalse(bridge._OPENCODE_GLOBAL_DELIVERY)
+
+    def test_delivery_failure_ignores_failed_attempt_session_id(self):
+        import unittest.mock as mock
+        bad = json.dumps(
+            {"type": "error", "sessionID": "ses_BAD",
+             "error": {"name": "UnknownError",
+                       "data": {"message": "Unexpected server error"}}})
+        cmds = []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            if len(cmds) == 1:
+                return OpencodeSessionTest.FakeProc([bad])
+            return OpencodeSessionTest.FakeProc(list(self.OK_LINES))
+
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=fake_popen):
+            s = self._session(io_out=io.StringIO())
+            r = s.send("go")
+        self.assertTrue(r["ok"])
+        self.assertNotIn("--session", cmds[1])
+        self.assertEqual(r["session_id"], "ses_F")
+
+    def test_sticky_module_flag_skips_local_attempt(self):
+        import unittest.mock as mock
+        bridge._OPENCODE_GLOBAL_DELIVERY = True
+        cmds = []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            return OpencodeSessionTest.FakeProc(list(self.OK_LINES))
+
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=fake_popen):
+            s = self._session(io_out=io.StringIO())
+            r = s.send("go")
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(cmds), 1)
+        agent = cmds[0][cmds[0].index("--agent") + 1]
+        self.assertTrue(agent.startswith("cowork-scout-"))
+        # the project-local file is still written (overwrite-per-spawn
+        # contract unchanged) and the global copy leaves no residue.
+        self.assertTrue(os.path.exists(os.path.join(
+            self.tmp, ".opencode", "agents", "cowork-scout.md")))
+        self.assertEqual(self._global_files(), [])
+
+    def test_global_agent_dir_env_and_default(self):
+        self.assertEqual(bridge.opencode_global_agent_dir(),
+                         os.path.join(self.config, "agent"))
+        os.environ.pop("OPENCODE_CONFIG_DIR", None)
+        self.assertEqual(
+            bridge.opencode_global_agent_dir(),
+            os.path.join(os.path.expanduser("~"), ".config", "opencode",
+                         "agent"))
+
+    def test_write_opencode_global_agent(self):
+        name, path = bridge.write_opencode_global_agent(
+            "CONTENT\n", "planner", "abc12345")
+        self.assertEqual(name, "cowork-planner-abc12345")
+        self.assertEqual(
+            path, os.path.join(self.config, "agent", name + ".md"))
+        self.assertEqual(open(path).read(), "CONTENT\n")
 
 
 class StatusSpinnerTest(unittest.TestCase):

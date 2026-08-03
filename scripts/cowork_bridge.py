@@ -896,6 +896,68 @@ def ensure_opencode_agent(role_prompt_file, speaker, mode, yolo,
     return agent_name
 
 
+def opencode_global_agent_dir():
+    """Directory for fallback (global) agent delivery.
+
+    opencode 1.18.10 fails every run that resolves a PROJECT-LOCAL agent file
+    with a pre-model "Unexpected server error" (ORCH-052); the identical file
+    in the global config dir loads fine. `agent` (singular) is the empirically
+    verified segment on the affected version — the docs say `agents`, but the
+    fallback only ever fires on versions where singular is what works, and the
+    live test is the check if a future version changes the rules."""
+    base = os.environ.get("OPENCODE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".config", "opencode")
+    return os.path.join(base, "agent")
+
+
+def _remove_agent_file_quiet(path):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def write_opencode_global_agent(content, speaker, token):
+    """Write `content` as a session-scoped agent in the global config dir and
+    return `(agent_name, path)`. The `token` keeps concurrent cowork sessions
+    from colliding; the caller removes the file as soon as the run exits."""
+    agent_name = OPENCODE_AGENT_PREFIX + speaker + "-" + token
+    agent_dir = opencode_global_agent_dir()
+    os.makedirs(agent_dir, exist_ok=True)
+    path = os.path.join(agent_dir, agent_name + ".md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    return agent_name, path
+
+
+# Signature of the ORCH-052 agent-loading failure: the server dies before any
+# model turn, emitting only an error event with this name/message.
+_OPENCODE_DELIVERY_ERROR_MARKERS = ("unexpected server error", "unknownerror")
+
+
+def is_opencode_delivery_failure(parsed_events):
+    """True iff a run's parsed events match the agent-delivery failure shape:
+    at least one error event carrying the ORCH-052 marker text, and NO
+    substantive event (message, tool activity, denial, step_finish) — i.e. the
+    run died before any model turn, so a retry costs nothing. An error with
+    different text, or one that follows real output, is an ordinary provider
+    error and must NOT trigger delivery fallback."""
+    saw_marker = False
+    for parsed in parsed_events:
+        kind = parsed.get("kind")
+        if kind in ("message", "tool", "tool_done", "denied", "step_finish"):
+            return False
+        if kind == "error":
+            text = (parsed.get("text") or "").lower()
+            if any(m in text for m in _OPENCODE_DELIVERY_ERROR_MARKERS):
+                saw_marker = True
+            else:
+                return False
+    return saw_marker
+
+
 def build_opencode_command(agent_name, prompt_text, mode, yolo, model=None,
                            effort=None, resume_session_id=None):
     """argv for one `opencode run` turn (fresh or resumed).
@@ -2268,6 +2330,13 @@ class CodexSession:
             _close_guard_runtime(self._guard_runtime)
 
 
+# ORCH-052 sticky fallback: once one session's global-dir retry has SUCCEEDED,
+# every later OpencodeSession in this process skips the doomed local attempt
+# and delivers via the global dir directly. Set only on a successful retry so
+# a one-off transient server error can't lock the whole run into fallback.
+_OPENCODE_GLOBAL_DELIVERY = False
+
+
 class OpencodeSession:
     """Turn-based opencode bridge: one `opencode run --format json` per send(),
     resumed with `--session <ses_id>` once the first turn reveals the id.
@@ -2304,6 +2373,11 @@ class OpencodeSession:
             role_prompt_file, speaker, mode, yolo, base_dir=agent_base_dir,
             external_dir=bool(extra_writable_dir),
             assets_dir=extra_writable_dir)
+        self._local_agent_path = os.path.join(
+            agent_base_dir or os.getcwd(), OPENCODE_AGENT_SUBDIR,
+            self.agent_name + ".md")
+        self._fallback_token = uuid.uuid4().hex[:8]
+        self._use_global_agent = False
         if nested_guard_active() and self.trace:
             self.trace.event(
                 "nested.guard.ready", controller="opencode", role=speaker,
@@ -2374,7 +2448,32 @@ class OpencodeSession:
             raise
         return events
 
+    def _write_global_agent(self):
+        """Re-deliver the already-generated agent content via the global
+        config dir (same overwrite-per-spawn contract as the local file)."""
+        with open(self._local_agent_path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        return write_opencode_global_agent(
+            content, self.speaker, self._fallback_token)
+
+    def _agent_delivery_failed(self, turn_started):
+        duration_ms = int((time.monotonic() - turn_started) * 1000)
+        self.io_out.write(
+            "[error] opencode failed to load the cowork agent from %s and "
+            "from %s; opencode's agent loading appears broken (ORCH-052) — "
+            "no model turn was run\n"
+            % (self._local_agent_path, opencode_global_agent_dir()))
+        self.io_out.flush()
+        if self.trace:
+            self.trace.event("controller.turn.end", controller="opencode",
+                             role=self.speaker, result="error",
+                             error_type="agent_delivery_failed",
+                             duration_ms=duration_ms)
+        return turn_result(False, "error", error_type="agent_delivery_failed",
+                           session_id=self.session_id, duration_ms=duration_ms)
+
     def send(self, text, meta=None):
+        global _OPENCODE_GLOBAL_DELIVERY
         resume_id = None
         if self._started or self._resuming_first:
             if not self.session_id:
@@ -2390,8 +2489,13 @@ class OpencodeSession:
                                    error_type="missing_session_id")
             resume_id = self.session_id
         fresh = resume_id is None
+        agent_name = self.agent_name
+        global_path = None
+        if self._use_global_agent or _OPENCODE_GLOBAL_DELIVERY:
+            self._use_global_agent = True
+            agent_name, global_path = self._write_global_agent()
         command = build_opencode_command(
-            self.agent_name, text, self.mode, self.yolo, model=self.model,
+            agent_name, text, self.mode, self.yolo, model=self.model,
             effort=self.effort, resume_session_id=resume_id)
         self._started = True
         if self.trace:
@@ -2408,13 +2512,68 @@ class OpencodeSession:
             self.trace.event("controller.turn.start", **fields)
         turn_started = time.monotonic()
         try:
-            events = self._run(command)
+            try:
+                events = self._run(command)
+            finally:
+                _remove_agent_file_quiet(global_path)
         except Exception as exc:  # noqa: BLE001
             if self.trace:
                 self.trace.event("controller.turn.end", controller="opencode",
                                  role=self.speaker, result="error",
                                  error_type=type(exc).__name__)
             return turn_result(False, "error", error_type=type(exc).__name__)
+        parsed_events = [parse_opencode_event(obj) for obj in events]
+        fallback = False
+        if is_opencode_delivery_failure(parsed_events):
+            error_text = next((p.get("text") for p in parsed_events
+                               if p.get("kind") == "error"), None)
+            if self.trace:
+                self.trace.event(
+                    "opencode.agent_delivery.failed", controller="opencode",
+                    role=self.speaker, agent=agent_name,
+                    local_path=(None if global_path
+                                else self._local_agent_path),
+                    global_path=global_path, error_text=error_text,
+                    event_count=len(events))
+            if global_path is not None:
+                # Already on the fallback path — nothing further to try.
+                return self._agent_delivery_failed(turn_started)
+            # ORCH-052: the failed run died server-side before any model
+            # turn, so one retry delivered via the global config dir costs
+            # nothing. The failed attempt's error envelope may carry a
+            # sessionID; it is deliberately not adopted — the retry reuses
+            # the resume id computed at the top of this send().
+            agent_name, global_path = self._write_global_agent()
+            command = build_opencode_command(
+                agent_name, text, self.mode, self.yolo, model=self.model,
+                effort=self.effort, resume_session_id=resume_id)
+            try:
+                try:
+                    events = self._run(command)
+                except Exception as exc:  # noqa: BLE001
+                    if self.trace:
+                        self.trace.event(
+                            "controller.turn.end", controller="opencode",
+                            role=self.speaker, result="error",
+                            error_type=type(exc).__name__)
+                    return turn_result(False, "error",
+                                       error_type=type(exc).__name__)
+            finally:
+                _remove_agent_file_quiet(global_path)
+            parsed_events = [parse_opencode_event(obj) for obj in events]
+            retry_dead = (not events
+                          or is_opencode_delivery_failure(parsed_events))
+            if self.trace:
+                self.trace.event(
+                    "opencode.agent_delivery.fallback", controller="opencode",
+                    role=self.speaker, agent=agent_name,
+                    global_path=global_path,
+                    result="failed" if retry_dead else "ok")
+            if retry_dead:
+                return self._agent_delivery_failed(turn_started)
+            fallback = True
+            self._use_global_agent = True
+            _OPENCODE_GLOBAL_DELIVERY = True
         duration_ms = int((time.monotonic() - turn_started) * 1000)
         sid = capture_opencode_session_id(events)
         if sid and not self.session_id:
@@ -2426,7 +2585,6 @@ class OpencodeSession:
         if self.session_id and self.on_session_id and not self._notified:
             self._notified = True
             self.on_session_id(self.session_id)
-        parsed_events = [parse_opencode_event(obj) for obj in events]
         kinds = [p.get("kind") for p in parsed_events]
         result = ("error" if "error" in kinds
                   else "denied" if "denied" in kinds else "ok")
@@ -2442,7 +2600,8 @@ class OpencodeSession:
                              role=self.speaker, result=result,
                              session_id=self.session_id,
                              event_count=len(events), usage=usage,
-                             model=self.model, duration_ms=duration_ms)
+                             model=self.model, duration_ms=duration_ms,
+                             fallback=fallback)
         if result == "error" and not events:
             return turn_result(False, "error", error_type="no_events",
                                session_id=self.session_id,
