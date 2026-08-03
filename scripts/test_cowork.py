@@ -62,6 +62,14 @@ try:
 except ImportError:
     HAS_UI_DEPS = False
 
+# Structural frontmatter parsing (OpencodeBridgeTest) is PyYAML-gated the
+# same way — skip rather than fail when it is absent.
+try:
+    import yaml  # noqa: F401
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
 
 _NESTED_FIXTURES = os.path.join(
     _HERE, "fixtures", "measurement")
@@ -359,12 +367,23 @@ class ModelEffortFlagTest(unittest.TestCase):
 class OpencodeBridgeTest(unittest.TestCase):
     """opencode agent-file generation, command assembly, and event parsing."""
 
+    def _allow_keys(self, lines):
+        """The set of quoted-key texts on every `... : allow` line."""
+        keys = set()
+        for line in lines:
+            stripped = line.strip()
+            if stripped.endswith(": allow") and stripped != "webfetch: allow":
+                keys.add(stripped[:-len(": allow")])
+        return keys
+
     def test_permission_lines_per_mode(self):
         # Yolo still hard-removes native delegation; --auto applies to the
         # remaining tools only.
         self.assertEqual(
             bridge.opencode_permission_lines("implement", True),
             ["permission:", "  task: deny"])
+        # Plan mode with NO declared outputs stays the safe scalar deny
+        # (P12): the formatter is a total pure function that never raises.
         plan = bridge.opencode_permission_lines("plan", True)
         self.assertIn("  task: deny", plan)
         self.assertIn("  edit: deny", plan)
@@ -373,26 +392,147 @@ class OpencodeBridgeTest(unittest.TestCase):
                                                 external_dir=True)
         self.assertIn("  edit: allow", safe)
         self.assertIn("  external_directory: allow", safe)
-        # plan never grants the external dir (read-only stays read-only).
+        # plan mode with no declared outputs never grants the external dir
+        # either (read-only stays read-only).
         self.assertNotIn(
             "  external_directory: allow",
             bridge.opencode_permission_lines("plan", True, external_dir=True))
 
-    def test_agent_markdown_frontmatter_and_body(self):
+    def test_permission_lines_plan_mode_declared_outputs_map(self):
+        # Plan mode WITH declared outputs emits an ordered object map: the
+        # catch-all denies come first, then one allow per pattern form per
+        # declared output (P1, P2); external_directory gets the same
+        # deny-first shape, scoped to just the assets dir (P8) — never the
+        # flat `external_directory: allow`.
+        assets = os.path.join(tempfile.mkdtemp(), str(uuid.uuid4()))
+        os.makedirs(assets)
+        outputs = (os.path.join(assets, "planner.plan.json"),
+                  os.path.join(assets, "planner.plan.md"))
+        lines = bridge.opencode_permission_lines(
+            "plan", True, declared_outputs=outputs, assets_dir=assets)
+        self.assertIn("  task: deny", lines)
+        self.assertIn("  edit:", lines)
+        self.assertIn("  bash: ask", lines)
+        self.assertIn("  webfetch: allow", lines)
+        self.assertIn("  external_directory:", lines)
+        self.assertNotIn("  external_directory: allow", lines)
+
+        edit_section = lines[lines.index("  edit:"):lines.index("  bash: ask")]
+        deny_idx = [i for i, l in enumerate(edit_section)
+                   if l.strip().endswith(": deny")]
+        allow_idx = [i for i, l in enumerate(edit_section)
+                    if l.strip().endswith(": allow")]
+        self.assertEqual(len(deny_idx), 2)  # "*" and "**"
+        self.assertTrue(deny_idx)
+        self.assertTrue(allow_idx)
+        self.assertLess(max(deny_idx), min(allow_idx))  # denies precede allows
+
+        expected_edit = set()
+        for out in outputs:
+            expected_edit.update(bridge._opencode_path_patterns(out, assets))
+        self.assertEqual(
+            self._allow_keys(edit_section),
+            {bridge._opencode_yaml_key(p) for p in expected_edit})
+
+        ext_section = lines[lines.index("  external_directory:"):]
+        ext_deny_idx = [i for i, l in enumerate(ext_section)
+                        if l.strip().endswith(": deny")]
+        ext_allow_idx = [i for i, l in enumerate(ext_section)
+                         if l.strip().endswith(": allow")]
+        self.assertEqual(len(ext_deny_idx), 2)
+        self.assertLess(max(ext_deny_idx), min(ext_allow_idx))
+        self.assertEqual(
+            self._allow_keys(ext_section),
+            {bridge._opencode_yaml_key(p)
+             for p in bridge._opencode_dir_patterns(assets)})
+
+    def test_permission_lines_plan_mode_negative_matches(self):
+        # A repository path and a non-declared session asset match no allow
+        # key — the repository and other roles' artifacts stay read-only.
+        assets = os.path.join(tempfile.mkdtemp(), str(uuid.uuid4()))
+        os.makedirs(assets)
+        outputs = (os.path.join(assets, "scout-review.json"),)
+        lines = bridge.opencode_permission_lines(
+            "plan", True, declared_outputs=outputs, assets_dir=assets)
+        allow_keys = self._allow_keys(lines)
+
+        repo_path = os.path.join(_HERE, "cowork.py")
+        for pattern in bridge._opencode_path_patterns(repo_path, assets):
+            self.assertNotIn(bridge._opencode_yaml_key(pattern), allow_keys)
+
+        other_asset = os.path.join(assets, "planner.plan.json")
+        for pattern in bridge._opencode_path_patterns(other_asset, assets):
+            self.assertNotIn(bridge._opencode_yaml_key(pattern), allow_keys)
+
+    def test_agent_markdown_implement_frontmatter_golden(self):
+        # Nothing regresses for the configurations that already worked:
+        # implement+yolo and implement+no-yolo frontmatter stay byte-exact.
+        yolo_md = bridge.opencode_agent_markdown(
+            "R", "implement", True, description="d")
+        self.assertEqual(
+            yolo_md,
+            "---\ndescription: d\nmode: primary\ntools:\n  task: false\n"
+            "permission:\n  task: deny\n---\nR\n")
+        no_yolo_md = bridge.opencode_agent_markdown(
+            "R", "implement", False, description="d")
+        self.assertEqual(
+            no_yolo_md,
+            "---\ndescription: d\nmode: primary\ntools:\n  task: false\n"
+            "permission:\n  task: deny\n  edit: allow\n  bash: ask\n"
+            "  webfetch: allow\n---\nR\n")
+        no_yolo_ext_md = bridge.opencode_agent_markdown(
+            "R", "implement", False, description="d", external_dir=True)
+        self.assertEqual(
+            no_yolo_ext_md,
+            "---\ndescription: d\nmode: primary\ntools:\n  task: false\n"
+            "permission:\n  task: deny\n  edit: allow\n  bash: ask\n"
+            "  webfetch: allow\n  external_directory: allow\n---\nR\n")
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML not installed")
+    def test_plan_mode_frontmatter_parses_as_structural_deny_first_map(self):
+        assets = os.path.join(tempfile.mkdtemp(), str(uuid.uuid4()))
+        os.makedirs(assets)
+        outputs = (os.path.join(assets, "planner.plan.json"),
+                  os.path.join(assets, "planner.plan.md"))
         md = bridge.opencode_agent_markdown(
-            "ROLE PROMPT", "plan", True, description="cowork scout role")
+            "ROLE", "plan", True, description="d",
+            declared_outputs=outputs, assets_dir=assets)
+        self.assertTrue(md.startswith("---\n"))
+        fm_text, _, _ = md[len("---\n"):].partition("\n---\n")
+        doc = yaml.safe_load(fm_text)
+        edit = doc["permission"]["edit"]
+        self.assertIsInstance(edit, dict)
+        keys = list(edit.keys())
+        self.assertEqual(edit[keys[0]], "deny")
+        self.assertEqual(edit[keys[1]], "deny")
+        self.assertTrue(any(v == "allow" for v in list(edit.values())[2:]))
+        ext = doc["permission"]["external_directory"]
+        self.assertIsInstance(ext, dict)
+        ext_keys = list(ext.keys())
+        self.assertEqual(ext[ext_keys[0]], "deny")
+        self.assertEqual(ext[ext_keys[1]], "deny")
+
+    def test_agent_markdown_frontmatter_and_body(self):
+        assets = os.path.join(tempfile.mkdtemp(), str(uuid.uuid4()))
+        os.makedirs(assets)
+        outputs = (os.path.join(assets, "scout-review.json"),)
+        md = bridge.opencode_agent_markdown(
+            "ROLE PROMPT", "plan", True, description="cowork scout role",
+            declared_outputs=outputs, assets_dir=assets)
         self.assertTrue(md.startswith("---\n"))
         self.assertIn("description: cowork scout role", md)
         self.assertIn("mode: primary", md)
         self.assertIn("tools:\n  task: false", md)
-        self.assertIn("edit: deny", md)
+        self.assertIn("  edit:", md)
+        self.assertNotIn("edit: deny", md)  # no longer the blanket scalar
+        for pattern in bridge._opencode_path_patterns(outputs[0], assets):
+            self.assertIn(bridge._opencode_yaml_key(pattern), md)
         self.assertTrue(md.rstrip().endswith("ROLE PROMPT"))
         yolo_md = bridge.opencode_agent_markdown(
             "R", "implement", True, description="d")
         self.assertIn("permission:\n  task: deny", yolo_md)
 
     def test_ensure_opencode_agent_writes_and_regenerates(self):
-        import tempfile
         base = tempfile.mkdtemp()
         rp = os.path.join(base, "role.md")
         with open(rp, "w") as fh:
@@ -405,10 +545,19 @@ class OpencodeBridgeTest(unittest.TestCase):
             content = fh.read()
         self.assertIn("BE THE SCOUT", content)
         self.assertIn("edit: allow", content)
-        # A config change regenerates the file with the new permissions.
-        bridge.ensure_opencode_agent(rp, "scout", "plan", True, base_dir=base)
+        # A config change regenerates the file with the new permissions: plan
+        # mode now emits the per-file allow map (not the old blanket deny)
+        # once an assets dir carrying the role's declared outputs exists.
+        assets = tempfile.mkdtemp()
+        bridge.ensure_opencode_agent(rp, "scout", "plan", True, base_dir=base,
+                                     assets_dir=assets)
         with open(path) as fh:
-            self.assertIn("edit: deny", fh.read())
+            regenerated = fh.read()
+        self.assertNotIn("edit: allow", regenerated)
+        self.assertIn("  edit:", regenerated)
+        for out in bridge._declared_outputs_for_role(assets, "scout"):
+            for pattern in bridge._opencode_path_patterns(out, assets):
+                self.assertIn(bridge._opencode_yaml_key(pattern), regenerated)
 
     def test_build_opencode_command(self):
         cmd = bridge.build_opencode_command(
@@ -483,6 +632,74 @@ class OpencodeBridgeTest(unittest.TestCase):
         self.assertIsNone(bridge.opencode_usage([{"type": "text", "part": {}}]))
         self.assertIsNone(bridge.capture_opencode_session_id(
             [{"type": "text", "part": {}}]))
+
+
+class OpencodeArtifactContractTest(unittest.TestCase):
+    """Plan-mode setup-time refusal for an unexpressible artifact contract."""
+
+    def test_no_assets_dir_raises_before_any_subprocess_or_file(self):
+        import unittest.mock as mock
+        base = tempfile.mkdtemp()
+        rp = os.path.join(base, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("BE THE PLANNER")
+
+        def fail_popen(*a, **kw):
+            raise AssertionError("subprocess.Popen must not be called")
+
+        with mock.patch.object(
+                bridge.subprocess, "Popen", side_effect=fail_popen):
+            with self.assertRaises(
+                    bridge.OpencodeArtifactContractUnexpressible) as ctx:
+                bridge.ensure_opencode_agent(
+                    rp, "planner", "plan", True, base_dir=base)
+        msg = str(ctx.exception)
+        self.assertIn("planner", msg)
+        self.assertIn("opencode", msg)
+        self.assertIn("plan", msg)
+        self.assertIn("planner.plan.json", msg)
+        self.assertIn("planner.plan.md", msg)
+        path = os.path.join(base, ".opencode", "agents", "cowork-planner.md")
+        self.assertFalse(os.path.exists(path))
+
+    def test_outputs_outside_assets_dir_raises(self):
+        import unittest.mock as mock
+        base = tempfile.mkdtemp()
+        rp = os.path.join(base, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("BE THE PLANNER")
+        assets = tempfile.mkdtemp()
+        outside = tempfile.mkdtemp()
+        with mock.patch.object(
+                bridge, "_declared_outputs_for_role",
+                return_value=(os.path.join(outside, "planner.plan.json"),)):
+            with self.assertRaises(
+                    bridge.OpencodeArtifactContractUnexpressible):
+                bridge.ensure_opencode_agent(
+                    rp, "planner", "plan", True, base_dir=base,
+                    assets_dir=assets)
+        path = os.path.join(base, ".opencode", "agents", "cowork-planner.md")
+        self.assertFalse(os.path.exists(path))
+
+    def test_implement_mode_with_no_assets_dir_is_not_refused(self):
+        base = tempfile.mkdtemp()
+        rp = os.path.join(base, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("BE THE PLANNER")
+        name = bridge.ensure_opencode_agent(
+            rp, "planner", "implement", False, base_dir=base)
+        self.assertEqual(name, "cowork-planner")
+
+    def test_codex_and_claude_plan_paths_not_gated(self):
+        # Scoping is structural (P3): only the opencode path ever calls
+        # opencode_plan_declared_outputs / raises the new exception, so a
+        # Codex or Claude role can never be blocked by it.
+        import inspect
+        claude_src = inspect.getsource(bridge.ClaudeSession.__init__)
+        codex_src = inspect.getsource(bridge.CodexSession.__init__)
+        for src in (claude_src, codex_src):
+            self.assertNotIn("opencode_plan_declared_outputs", src)
+            self.assertNotIn("OpencodeArtifactContractUnexpressible", src)
 
 
 class OpencodeSessionTest(unittest.TestCase):
@@ -5080,6 +5297,7 @@ class ClaudeSessionTtyTest(unittest.TestCase):
 LIVE = os.environ.get("COWORK_LIVE") == "1"
 HAS_CLAUDE = shutil.which("claude") is not None
 HAS_CODEX = shutil.which("codex") is not None
+HAS_OPENCODE = shutil.which("opencode") is not None
 LIVE_TIMEOUT = int(os.environ.get("COWORK_LIVE_TIMEOUT", "240"))
 
 
@@ -5164,6 +5382,97 @@ class LiveCodexTest(unittest.TestCase):
             bridge.parse_codex_event(o).get("text", "")
             for o in objs2 if bridge.parse_codex_event(o)["kind"] == "message")
         self.assertIn("7", texts)
+
+
+# Gated on LIVE ONLY (never LIVE and HAS_OPENCODE, per P11): a class-level
+# HAS_OPENCODE gate would skip before the test body runs, printing no marker
+# line and making the opencode-absent arm below unreachable. HAS_OPENCODE is
+# consulted INSIDE the body instead, so every path — absent binary,
+# unreachable provider, timeout, or a real completed turn — prints exactly
+# one COWORK-LIVE-OPENCODE marker line before skipping or passing. A skipped
+# unittest exits 0, so without this a verification round could report green
+# with criterion 5 looking satisfied when nothing was actually checked.
+@unittest.skipUnless(LIVE, "set COWORK_LIVE=1 for live controller checks")
+class LiveOpencodeTest(unittest.TestCase):
+    """Verify the plan-mode permission map against the real installed
+    OpenCode (P9, P10, P11)."""
+
+    LIVE_MODEL = "opencode-go/glm-5.2"
+    LIVE_OPENCODE_TIMEOUT_S = 180
+
+    def _opencode_version(self):
+        if not HAS_OPENCODE:
+            return "absent"
+        try:
+            proc = subprocess.run(
+                ["opencode", "--version"], capture_output=True, text=True,
+                timeout=10)
+            return proc.stdout.strip() or proc.stderr.strip() or "unknown"
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+
+    def test_plan_mode_write_allowed_project_write_refused(self):
+        version = self._opencode_version()
+        if not HAS_OPENCODE:
+            print("COWORK-LIVE-OPENCODE: UNVERIFIED reason=opencode_absent "
+                 "opencode=absent")
+            raise unittest.SkipTest("opencode not on PATH")
+
+        # Own tmp project + assets dirs — never the harness's snapshot
+        # layout — so this check is self-contained.
+        project = tempfile.mkdtemp()
+        assets = tempfile.mkdtemp()
+        declared = os.path.join(assets, "eval.live-opencode.json")
+        sneak = os.path.join(project, "sneak.txt")
+        rp = os.path.join(project, "role.md")
+        with open(rp, "w") as fh:
+            fh.write(
+                "You are a test role with exactly two jobs, in order:\n"
+                "1. Write the exact text READY into a NEW file at: %s\n"
+                "2. Attempt to also write the exact text SNEAK into a NEW "
+                "file at: %s (do this even if you expect it to fail).\n"
+                "Then stop." % (declared, sneak))
+        try:
+            agent_name = bridge.ensure_opencode_agent(
+                rp, "live-opencode", "plan", True, base_dir=project,
+                assets_dir=assets)
+            cmd = bridge.build_opencode_command(
+                agent_name, "Follow your role instructions exactly, then "
+                "stop.", "plan", True, model=self.LIVE_MODEL)
+            proc = subprocess.run(
+                cmd, cwd=project, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True,
+                timeout=self.LIVE_OPENCODE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            print("COWORK-LIVE-OPENCODE: UNVERIFIED reason=timeout "
+                 "opencode=%s" % version)
+            raise unittest.SkipTest("opencode run timed out")
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("COWORK-LIVE-OPENCODE: UNVERIFIED reason=provider_"
+                 "unreachable opencode=%s" % version)
+            raise unittest.SkipTest("opencode run failed to start: %s" % exc)
+
+        if proc.returncode != 0:
+            low = (proc.stderr or "").lower()
+            if any(w in low for w in ("auth", "unauthoriz", "credential")):
+                reason = "auth"
+            elif "rate" in low and "limit" in low:
+                reason = "rate_limited"
+            else:
+                reason = "provider_unreachable"
+            print("COWORK-LIVE-OPENCODE: UNVERIFIED reason=%s opencode=%s"
+                 % (reason, version))
+            raise unittest.SkipTest(
+                "opencode run failed: %s" % (proc.stderr or "")[:300])
+
+        # Reachable and completed: this is now a real check, not a skip.
+        print("COWORK-LIVE-OPENCODE: VERIFIED opencode=%s" % version)
+        self.assertTrue(os.path.exists(declared),
+                        "declared plan-mode artifact was not written: %s"
+                        % declared)
+        self.assertFalse(os.path.exists(sneak),
+                         "project-directory write was NOT refused: %s"
+                         % sneak)
 
 
 class PhaseStateTest(unittest.TestCase):
@@ -24214,11 +24523,12 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
 
         previous = bridge.set_nested_guard_active(True)
         try:
-            with tempfile.TemporaryDirectory() as base:
+            with tempfile.TemporaryDirectory() as base, \
+                    tempfile.TemporaryDirectory() as assets:
                 trace = RecordingTrace()
                 session = bridge.OpencodeSession(
                     "roles/scout.md", "plan", False, trace=trace,
-                    agent_base_dir=base)
+                    agent_base_dir=base, extra_writable_dir=assets)
                 agent_path = os.path.join(
                     base, ".opencode", "agents",
                     session.agent_name + ".md")
