@@ -123,15 +123,38 @@ CONTROLLER_CAPABILITY_MATRIX = {
         "delegation": "proven_absent",
         "child_correlation": "unavailable",
         "mutation_gate": "controller_permissions",
-        "kernel_boundary": "not_required",
+        "kernel_boundary": "opportunistic",
     },
     ("opencode", "implement"): {
         "delegation": "proven_absent",
         "child_correlation": "unavailable",
         "mutation_gate": "controller_permissions",
-        "kernel_boundary": "not_required",
+        "kernel_boundary": "opportunistic",
     },
 }
+
+
+def readonly_bash_commands():
+    """Ordered read-only shell commands vetted by this module's own tables:
+    one `git <subcommand>` per SAFE_GIT_FLAGS entry, then the non-git inert
+    commands. This is the single source of truth for any controller-facing
+    read-only bash allowlist — never a hand-maintained copy."""
+    git_forms = tuple("git %s" % sub for sub in SAFE_GIT_FLAGS)
+    inert = tuple(sorted(INERT_COMMANDS - {"git"}))
+    return git_forms + inert
+
+
+def readonly_bash_glob_patterns():
+    """Ordered, de-duplicated glob patterns for `readonly_bash_commands()`:
+    the bare command and the command-with-arguments form. Callers pairing
+    this with a permission map MUST back it with a kernel write boundary —
+    glob prefix matching is injectable (`git status; <anything>` matches
+    `git status *`)."""
+    patterns = []
+    for command in readonly_bash_commands():
+        patterns.append(command)
+        patterns.append(command + " *")
+    return tuple(dict.fromkeys(patterns))
 
 
 def _real(path):

@@ -167,6 +167,22 @@ def _cleanup_registered_claude_references():
 atexit.register(_cleanup_registered_claude_references)
 
 
+def opencode_data_dir(environ=None, home=None):
+    """opencode's real runtime-state directory (`$XDG_DATA_HOME/opencode`,
+    default `~/.local/share/opencode`). It holds auth.json and the sqlite
+    session store (opencode.db + -wal/-shm), so it cannot be redirected or
+    symlinked per role the way codex auth is — the kernel write boundary
+    grants it as the controller-state root instead."""
+    environ = os.environ if environ is None else environ
+    configured = environ.get("XDG_DATA_HOME")
+    if configured:
+        base = os.path.abspath(os.path.expanduser(configured))
+    else:
+        home = os.path.expanduser("~") if home is None else home
+        base = os.path.join(os.path.abspath(home), ".local", "share")
+    return os.path.join(base, "opencode")
+
+
 def default_codex_auth_file(environ=None, home=None):
     environ = os.environ if environ is None else environ
     configured = environ.get("CODEX_HOME")

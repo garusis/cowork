@@ -298,8 +298,50 @@ def _guard_runtime(trace, role, assets_dir, model, effort,
         raise RuntimeError(
             "controller_state_unavailable: isolated %s credentials "
             "were not provisioned" % controller)
-    if controller not in ("claude", "codex"):
+    if controller not in ("claude", "codex", "opencode"):
         raise RuntimeError("guard_controller_unsupported")
+    if controller == "opencode":
+        # opencode has no PreToolUse hook transport, so there is no broker,
+        # guard settings, or context file to provision — the runtime is the
+        # kernel write boundary alone (ORCH-053: the seatbelt backstops the
+        # injectable bash glob allowlist in the agent frontmatter). Its
+        # controller state is the REAL data dir: auth.json and the sqlite
+        # session store live there and cannot be redirected or symlinked
+        # per role, so the boundary grants it instead.
+        guard_dir = state_store.guard_dir_for(session_uuid)
+        role_temp = os.path.join(guard_dir, "tmp", role)
+        os.makedirs(role_temp, exist_ok=True)
+        controller_state = controller_profiles.opencode_data_dir()
+        os.makedirs(controller_state, exist_ok=True)
+        active_root, sibling_worktrees = _git_worktree_scope(os.getcwd())
+        if role == "evaluator":
+            repo_writable = False
+        # The opencode CLI writes its own project bookkeeping
+        # (`.opencode/.gitignore`) at startup and dies if refused, so the
+        # cowork-generated `.opencode` dir stays writable even when the
+        # repository itself is read-only. It holds only generated agent
+        # files — never user code.
+        opencode_project_dir = os.path.join(os.getcwd(), ".opencode")
+        roots = ((active_root,) if repo_writable
+                 else (opencode_project_dir,))
+        scope = action_policy.OwnedScope(
+            repo_roots=roots,
+            declared_outputs=(tuple(declared_outputs)
+                              if declared_outputs is not None
+                              else _declared_outputs_for_role(
+                                  assets_dir, role)),
+            role_temp_dir=role_temp, controller_state_dir=controller_state,
+            session_assets_dir=assets_dir,
+            sibling_worktrees=sibling_worktrees, protected_paths=())
+        boundary = kernel_write_boundary(scope)
+        if not boundary["available"]:
+            raise RuntimeError(boundary["reason"])
+        env = dict(os.environ)
+        env["TMPDIR"] = role_temp
+        return {"scope": scope, "boundary": boundary, "broker": None,
+                "thread": None, "settings_path": None, "env": env,
+                "context_path": None, "delegation_allowed": False,
+                "profile": None, "protected_paths": ()}
     guard_dir = state_store.guard_dir_for(session_uuid)
     role_temp = os.path.join(guard_dir, "tmp", role)
     controller_state = state_store.controller_state_dir_for(session_uuid, role)
@@ -783,8 +825,24 @@ def opencode_plan_declared_outputs(speaker, assets_dir):
     return outputs
 
 
+def _opencode_bash_permission_lines():
+    """`bash:` pattern map allowing exactly the vetted read-only commands
+    (ORCH-053). Catch-all `ask` first (still a hard deny headless, but an
+    interactive run can approve), then one allow per pattern —
+    last-match-wins, same ordering discipline as the `edit:` map.
+
+    Glob prefix matching is injectable (`git status; rm -rf` matches
+    `"git status *"`), so this map is only ever emitted when the run is
+    wrapped in the kernel write boundary — the caller enforces that gate."""
+    lines = ["  bash:", "    %s: ask" % _opencode_yaml_key("*")]
+    for pattern in action_policy.readonly_bash_glob_patterns():
+        lines.append("    %s: allow" % _opencode_yaml_key(pattern))
+    return lines
+
+
 def opencode_permission_lines(mode, yolo, external_dir=False,
-                              declared_outputs=(), assets_dir=None):
+                              declared_outputs=(), assets_dir=None,
+                              bash_readonly=False):
     """Frontmatter `permission:` lines for (mode, yolo).
 
     opencode has no OS sandbox; permissions are the only guardrail, and in a
@@ -830,7 +888,9 @@ def opencode_permission_lines(mode, yolo, external_dir=False,
                     continue
                 seen.add(pattern)
                 lines.append("    %s: allow" % _opencode_yaml_key(pattern))
-        lines += ["  bash: ask", "  webfetch: allow",
+        lines += (_opencode_bash_permission_lines() if bash_readonly
+                  else ["  bash: ask"])
+        lines += ["  webfetch: allow",
                   "  external_directory:",
                   "    %s: deny" % _opencode_yaml_key("*"),
                   "    %s: deny" % _opencode_yaml_key("**")]
@@ -843,9 +903,10 @@ def opencode_permission_lines(mode, yolo, external_dir=False,
         return lines
     lines = ["permission:",
              "  task: deny",
-             "  edit: %s" % ("deny" if mode == "plan" else "allow"),
-             "  bash: ask",
-             "  webfetch: allow"]
+             "  edit: %s" % ("deny" if mode == "plan" else "allow")]
+    lines += (_opencode_bash_permission_lines() if bash_readonly
+              else ["  bash: ask"])
+    lines.append("  webfetch: allow")
     if mode != "plan" and external_dir:
         lines.append("  external_directory: allow")
     return lines
@@ -853,7 +914,7 @@ def opencode_permission_lines(mode, yolo, external_dir=False,
 
 def opencode_agent_markdown(role_prompt_text, mode, yolo, description,
                             external_dir=False, declared_outputs=(),
-                            assets_dir=None):
+                            assets_dir=None, bash_readonly=False):
     """Agent-file markdown: YAML frontmatter + the role prompt as the body."""
     lines = ["---", "description: %s" % description, "mode: primary",
              # Defense in depth across OpenCode versions: `tools` is the
@@ -861,13 +922,27 @@ def opencode_agent_markdown(role_prompt_text, mode, yolo, description,
              "tools:", "  task: false"]
     lines += opencode_permission_lines(
         mode, yolo, external_dir=external_dir,
-        declared_outputs=declared_outputs, assets_dir=assets_dir)
+        declared_outputs=declared_outputs, assets_dir=assets_dir,
+        bash_readonly=bash_readonly)
     lines.append("---")
-    return "\n".join(lines) + "\n" + role_prompt_text.strip() + "\n"
+    body = role_prompt_text.strip()
+    if bash_readonly:
+        # Steer the model away from burning a denial on a shell write: the
+        # allowlist covers read-only commands only, and a denied heredoc or
+        # redirect otherwise ends the turn as `denied`.
+        body += (
+            "\n\nShell access here is READ-ONLY: only pre-approved "
+            "inspection commands (git status/diff/log/show/ls-files/"
+            "rev-parse, ls, grep, rg, find, pwd, wc, head, tail) are "
+            "allowed. Never write files through the shell (no redirection, "
+            "heredocs, tee, or `cat >`); use the write/edit tools for every "
+            "file you produce.")
+    return "\n".join(lines) + "\n" + body + "\n"
 
 
 def ensure_opencode_agent(role_prompt_file, speaker, mode, yolo,
-                          base_dir=None, external_dir=False, assets_dir=None):
+                          base_dir=None, external_dir=False, assets_dir=None,
+                          bash_readonly=False):
     """Write `.opencode/agents/cowork-<speaker>.md` under base_dir (default cwd)
     and return the agent name. Overwrites any previous file so the prompt and
     permissions always reflect the current role config.
@@ -889,7 +964,7 @@ def ensure_opencode_agent(role_prompt_file, speaker, mode, yolo,
         role_text, mode, yolo,
         description="cowork %s role (generated; do not edit)" % speaker,
         external_dir=external_dir, declared_outputs=declared_outputs,
-        assets_dir=assets_dir)
+        assets_dir=assets_dir, bash_readonly=bash_readonly)
     path = os.path.join(agent_dir, agent_name + ".md")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
@@ -959,7 +1034,8 @@ def is_opencode_delivery_failure(parsed_events):
 
 
 def build_opencode_command(agent_name, prompt_text, mode, yolo, model=None,
-                           effort=None, resume_session_id=None):
+                           effort=None, resume_session_id=None,
+                           directory=None):
     """argv for one `opencode run` turn (fresh or resumed).
 
     `--format json` gives JSONL events on stdout; `--print-logs` is NOT passed
@@ -971,6 +1047,13 @@ def build_opencode_command(agent_name, prompt_text, mode, yolo, model=None,
     `opencode_permission_lines`)."""
     policy.guard("opencode", kind="setup")
     cmd = ["opencode", "run", "--format", "json", "--agent", agent_name]
+    if directory:
+        # opencode does not always resolve its project from the process cwd
+        # (observed 1.18.10: a run in a fresh tmp git repo executed its bash
+        # tool in the last-active project instead). `--dir` pins it, so the
+        # role's tools act on the same tree the kernel boundary was built
+        # around.
+        cmd += ["--dir", directory]
     if model:
         cmd += ["--model", model]
     if effort:
@@ -2369,21 +2452,40 @@ class OpencodeSession:
         self._notified = False
         self._resuming_first = resume_session_id is not None
         self._started = False
+        # ORCH-053: the read-only bash allowlist is glob-prefix-matched by
+        # opencode and therefore injectable, so it is only emitted when the
+        # run will actually be wrapped in the kernel write boundary. Off
+        # darwin (or without sandbox-exec) the frontmatter keeps `bash: ask`
+        # and no boundary is attempted — today's behavior.
+        guard_wrapped = (nested_guard_active()
+                         and sys.platform == "darwin"
+                         and bool(shutil.which("sandbox-exec")))
         self.agent_name = ensure_opencode_agent(
             role_prompt_file, speaker, mode, yolo, base_dir=agent_base_dir,
             external_dir=bool(extra_writable_dir),
-            assets_dir=extra_writable_dir)
+            assets_dir=extra_writable_dir, bash_readonly=guard_wrapped)
         self._local_agent_path = os.path.join(
             agent_base_dir or os.getcwd(), OPENCODE_AGENT_SUBDIR,
             self.agent_name + ".md")
         self._fallback_token = uuid.uuid4().hex[:8]
         self._use_global_agent = False
+        self._guard_runtime = None
+        self._controller_env = None
+        if guard_wrapped:
+            # Fails closed on darwin: no session context -> no launch,
+            # never an ungoverned run with the bash allowlist active.
+            self._guard_runtime = _guard_runtime(
+                trace, speaker, extra_writable_dir, model, effort, False,
+                resume_id=None, repo_writable=(mode == "implement"),
+                controller="opencode")
+            self._controller_env = self._guard_runtime["env"]
         if nested_guard_active() and self.trace:
             self.trace.event(
                 "nested.guard.ready", controller="opencode", role=speaker,
                 delegation="proven_absent",
                 delegation_reason="task_permission_denied",
-                kernel_boundary="controller_permissions")
+                kernel_boundary=("darwin" if self._guard_runtime
+                                 else "controller_permissions"))
         if self.trace:
             # The agent file is a SYSTEM prompt (mirrors ClaudeSession's
             # role.prompt.bytes accounting, delivery-tagged for the report).
@@ -2395,10 +2497,26 @@ class OpencodeSession:
                 self.trace.event("role.prompt.bytes", role=speaker,
                                  bytes=rp_bytes, delivery="opencode_agent")
 
+    def _wrap(self, command):
+        """Wrap an `opencode run` argv in the kernel write boundary when the
+        guard runtime is active; identity otherwise. Applied to every command
+        this session builds — including the ORCH-052 fallback rebuild — so
+        no opencode process ever runs unwrapped while the bash allowlist is
+        in its frontmatter."""
+        if not self._guard_runtime:
+            return command
+        boundary = kernel_write_boundary(
+            self._guard_runtime["scope"], command,
+            protected_paths=self._guard_runtime.get("protected_paths") or ())
+        if not boundary["available"]:
+            raise RuntimeError(boundary["reason"])
+        return boundary["argv"]
+
     def _run(self, command):
         proc = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True,
+            env=self._controller_env,
         )
         events = []
         tty = ui.is_tty(self.io_out)
@@ -2494,9 +2612,10 @@ class OpencodeSession:
         if self._use_global_agent or _OPENCODE_GLOBAL_DELIVERY:
             self._use_global_agent = True
             agent_name, global_path = self._write_global_agent()
-        command = build_opencode_command(
+        command = self._wrap(build_opencode_command(
             agent_name, text, self.mode, self.yolo, model=self.model,
-            effort=self.effort, resume_session_id=resume_id)
+            effort=self.effort, resume_session_id=resume_id,
+            directory=os.getcwd()))
         self._started = True
         if self.trace:
             fields = {
@@ -2544,9 +2663,10 @@ class OpencodeSession:
             # sessionID; it is deliberately not adopted — the retry reuses
             # the resume id computed at the top of this send().
             agent_name, global_path = self._write_global_agent()
-            command = build_opencode_command(
+            command = self._wrap(build_opencode_command(
                 agent_name, text, self.mode, self.yolo, model=self.model,
-                effort=self.effort, resume_session_id=resume_id)
+                effort=self.effort, resume_session_id=resume_id,
+                directory=os.getcwd()))
             try:
                 try:
                     events = self._run(command)
@@ -2612,4 +2732,5 @@ class OpencodeSession:
             duration_ms=duration_ms)
 
     def close(self):
-        pass
+        _close_guard_runtime(self._guard_runtime)
+        self._guard_runtime = None

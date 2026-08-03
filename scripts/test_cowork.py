@@ -1017,6 +1017,187 @@ class OpencodeDeliveryFallbackTest(unittest.TestCase):
         self.assertEqual(open(path).read(), "CONTENT\n")
 
 
+class OpencodeReadonlyBashTest(unittest.TestCase):
+    """ORCH-053: the read-only bash allowlist derives from the vetted
+    action-policy tables and is emitted only when explicitly requested."""
+
+    def test_readonly_bash_patterns_derive_from_policy_tables(self):
+        commands = action_policy.readonly_bash_commands()
+        expected = tuple(
+            "git %s" % sub for sub in action_policy.SAFE_GIT_FLAGS) + tuple(
+            sorted(action_policy.INERT_COMMANDS - {"git"}))
+        self.assertEqual(commands, expected)
+        patterns = action_policy.readonly_bash_glob_patterns()
+        for cmd in commands:
+            self.assertIn(cmd, patterns)
+            self.assertIn(cmd + " *", patterns)
+        self.assertEqual(len(patterns), 2 * len(commands))
+        # nothing from the mutating table may ever appear.
+        heads = {p.split(" ", 1)[0] for p in patterns}
+        self.assertFalse(heads & set(action_policy.MUTATING_COMMANDS))
+
+    def _bash_block(self, lines):
+        idx = lines.index("  bash:")
+        end = lines.index("  webfetch: allow")
+        return lines[idx + 1:end]
+
+    def test_permission_lines_bash_readonly_map_fallback_branch(self):
+        lines = bridge.opencode_permission_lines(
+            "plan", False, bash_readonly=True)
+        self.assertNotIn("  bash: ask", lines)
+        block = self._bash_block(lines)
+        self.assertEqual(
+            block[0], "    %s: ask" % bridge._opencode_yaml_key("*"))
+        self.assertEqual(
+            block[1:],
+            ["    %s: allow" % bridge._opencode_yaml_key(p)
+             for p in action_policy.readonly_bash_glob_patterns()])
+        self.assertIn('    "git status *": allow', block)
+
+    def test_permission_lines_bash_readonly_map_declared_outputs_branch(self):
+        import tempfile
+        assets = tempfile.mkdtemp()
+        out = os.path.join(assets, "scout.intel.json")
+        lines = bridge.opencode_permission_lines(
+            "plan", False, declared_outputs=(out,), assets_dir=assets,
+            bash_readonly=True)
+        self.assertNotIn("  bash: ask", lines)
+        block = self._bash_block(lines)
+        self.assertEqual(
+            block[0], "    %s: ask" % bridge._opencode_yaml_key("*"))
+        self.assertIn('    "git status *": allow', block)
+
+    def test_bash_readonly_off_and_yolo_implement_unchanged(self):
+        self.assertIn("  bash: ask",
+                      bridge.opencode_permission_lines("plan", False))
+        self.assertIn("  bash: ask",
+                      bridge.opencode_permission_lines("implement", False))
+        self.assertEqual(
+            bridge.opencode_permission_lines(
+                "implement", True, bash_readonly=True),
+            ["permission:", "  task: deny"])
+
+    def test_opencode_data_dir_honors_xdg(self):
+        self.assertEqual(
+            controller_profiles.opencode_data_dir(
+                environ={"XDG_DATA_HOME": "/x/data"}),
+            os.path.join("/x/data", "opencode"))
+        self.assertEqual(
+            controller_profiles.opencode_data_dir(environ={}, home="/h"),
+            os.path.join("/h", ".local", "share", "opencode"))
+
+    def test_capability_matrix_marks_opencode_opportunistic(self):
+        for mode in ("plan", "implement"):
+            row = action_policy.CONTROLLER_CAPABILITY_MATRIX[
+                ("opencode", mode)]
+            self.assertEqual(row["kernel_boundary"], "opportunistic")
+            self.assertEqual(row["mutation_gate"], "controller_permissions")
+
+    def test_build_command_pins_directory(self):
+        cmd = bridge.build_opencode_command(
+            "cowork-scout", "hi", "plan", False, directory="/w/tree")
+        self.assertEqual(cmd[cmd.index("--dir") + 1], "/w/tree")
+        self.assertNotIn(
+            "--dir", bridge.build_opencode_command(
+                "cowork-scout", "hi", "plan", False))
+
+    def test_bash_readonly_appends_shell_guidance_to_body(self):
+        md = bridge.opencode_agent_markdown(
+            "ROLE", "plan", False, description="d", bash_readonly=True)
+        self.assertIn("READ-ONLY", md)
+        self.assertIn("use the write/edit tools", md)
+        base = bridge.opencode_agent_markdown(
+            "ROLE", "plan", False, description="d")
+        self.assertNotIn("READ-ONLY", base)
+        self.assertTrue(base.endswith("ROLE\n"))
+
+
+class OpencodeSeatbeltWrapTest(unittest.TestCase):
+    """ORCH-053: a guarded OpencodeSession wraps every argv it builds in the
+    kernel write boundary — the fresh turn and the ORCH-052 fallback retry
+    alike — and passes the guard env to the child."""
+
+    DELIVERY_ERROR = OpencodeDeliveryFallbackTest.DELIVERY_ERROR
+    OK_LINES = OpencodeDeliveryFallbackTest.OK_LINES
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.config = tempfile.mkdtemp()
+        self._env = os.environ.get("OPENCODE_CONFIG_DIR")
+        os.environ["OPENCODE_CONFIG_DIR"] = self.config
+        bridge._OPENCODE_GLOBAL_DELIVERY = False
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("OPENCODE_CONFIG_DIR", None)
+        else:
+            os.environ["OPENCODE_CONFIG_DIR"] = self._env
+        bridge._OPENCODE_GLOBAL_DELIVERY = False
+
+    def _run_guarded(self, popen_side_effect):
+        import unittest.mock as mock
+        rp = os.path.join(self.tmp, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("ROLE")
+        scope = action_policy.OwnedScope(session_assets_dir=self.tmp)
+        runtime = {"scope": scope, "env": {"TMPDIR": self.tmp},
+                   "protected_paths": (), "broker": None, "profile": None}
+
+        def fake_boundary(owned_scope, argv=None, protected_paths=()):
+            return {"available": True, "platform": "darwin",
+                    "profile": "", "argv": ["sandbox-exec"] + list(argv)}
+
+        with mock.patch.object(bridge, "nested_guard_active",
+                               return_value=True), \
+                mock.patch.object(bridge.sys, "platform", "darwin"), \
+                mock.patch.object(bridge.shutil, "which",
+                                  return_value="/usr/bin/sandbox-exec"), \
+                mock.patch.object(bridge, "_guard_runtime",
+                                  return_value=runtime), \
+                mock.patch.object(bridge, "kernel_write_boundary",
+                                  side_effect=fake_boundary), \
+                mock.patch.object(bridge.subprocess, "Popen",
+                                  side_effect=popen_side_effect):
+            s = bridge.OpencodeSession(rp, "plan", False, io_out=io.StringIO(),
+                                       agent_base_dir=self.tmp,
+                                       extra_writable_dir=self.tmp)
+            return s.send("go")
+
+    def test_fresh_turn_wrapped_and_env_passed(self):
+        cmds, envs = [], []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            envs.append(kwargs.get("env"))
+            return OpencodeSessionTest.FakeProc(list(self.OK_LINES))
+
+        r = self._run_guarded(fake_popen)
+        self.assertTrue(r["ok"])
+        self.assertEqual(cmds[0][0], "sandbox-exec")
+        self.assertEqual(envs[0], {"TMPDIR": self.tmp})
+        # the bash allowlist rode along in the generated frontmatter.
+        agent = open(os.path.join(
+            self.tmp, ".opencode", "agents", "cowork-scout.md")).read()
+        self.assertIn('"git status *": allow', agent)
+        self.assertIn('"*": ask', agent)
+
+    def test_fallback_retry_also_wrapped(self):
+        cmds = []
+
+        def fake_popen(command, **kwargs):
+            cmds.append(command)
+            if len(cmds) == 1:
+                return OpencodeSessionTest.FakeProc([self.DELIVERY_ERROR])
+            return OpencodeSessionTest.FakeProc(list(self.OK_LINES))
+
+        r = self._run_guarded(fake_popen)
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(cmds), 2)
+        for cmd in cmds:
+            self.assertEqual(cmd[0], "sandbox-exec")
+
+
 class StatusSpinnerTest(unittest.TestCase):
     def test_returns_fn_value_and_runs_it(self):
         seen = {}
@@ -5671,6 +5852,84 @@ class LiveOpencodeTest(unittest.TestCase):
         self.assertFalse(os.path.exists(sneak),
                          "project-directory write was NOT refused: %s"
                          % sneak)
+
+    def test_plan_mode_readonly_bash_git_status_headless(self):
+        # ORCH-053 end to end through the production path: a seatbelt-wrapped
+        # plan-mode OpencodeSession whose frontmatter carries the read-only
+        # bash map runs `git status --porcelain` headless and persists the
+        # output into its declared artifact.
+        version = self._opencode_version()
+        if not HAS_OPENCODE:
+            print("COWORK-LIVE-OPENCODE-BASH: UNVERIFIED "
+                  "reason=opencode_absent opencode=absent")
+            raise unittest.SkipTest("opencode not on PATH")
+        if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
+            print("COWORK-LIVE-OPENCODE-BASH: UNVERIFIED reason=no_seatbelt "
+                  "opencode=%s" % version)
+            raise unittest.SkipTest(
+                "read-only bash requires the darwin seatbelt")
+
+        class RecordingTrace:
+            session_uuid = "live-opencode-bash-%s" % uuid.uuid4().hex[:8]
+
+            def event(self, name, **fields):
+                pass
+
+        project = tempfile.mkdtemp()
+        assets = tempfile.mkdtemp()
+        sessions_root = tempfile.mkdtemp()
+        subprocess.run(["git", "init", "-q", project], check=True,
+                       capture_output=True)
+        declared = os.path.join(assets, "eval.live-opencode.json")
+        rp = os.path.join(project, "role.md")
+        with open(rp, "w") as fh:
+            fh.write(
+                "You are a test role with exactly two jobs, in order:\n"
+                "1. Run the shell command `git status --porcelain` with the "
+                "bash tool.\n"
+                "2. Write that command's complete output verbatim into a NEW "
+                "file at: %s\n"
+                "Then stop." % declared)
+        previous_guard = bridge.set_nested_guard_active(True)
+        previous_cwd = os.getcwd()
+        previous_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = sessions_root
+        os.chdir(project)
+        try:
+            session = bridge.OpencodeSession(
+                rp, "plan", False, io_out=io.StringIO(),
+                speaker="live-opencode", trace=RecordingTrace(),
+                extra_writable_dir=assets, agent_base_dir=project,
+                model=self.LIVE_MODEL)
+            result = session.send(
+                "Follow your role instructions exactly, then stop.")
+            session.close()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            print("COWORK-LIVE-OPENCODE-BASH: UNVERIFIED "
+                  "reason=launch_failed opencode=%s" % version)
+            raise unittest.SkipTest("guarded launch failed: %s" % exc)
+        finally:
+            os.chdir(previous_cwd)
+            bridge.set_nested_guard_active(previous_guard)
+            if previous_root is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = previous_root
+
+        if not result["ok"]:
+            reason = result.get("error_type") or "provider_unreachable"
+            print("COWORK-LIVE-OPENCODE-BASH: UNVERIFIED reason=%s "
+                  "opencode=%s" % (reason, version))
+            raise unittest.SkipTest("live turn failed: %s" % reason)
+
+        print("COWORK-LIVE-OPENCODE-BASH: VERIFIED opencode=%s" % version)
+        self.assertTrue(os.path.exists(declared),
+                        "declared artifact was not written: %s" % declared)
+        with open(declared) as fh:
+            content = fh.read()
+        # Real `git status --porcelain` output in the fresh repo must list
+        # role.md as untracked — proof the bash call actually executed.
+        self.assertIn("role.md", content)
 
 
 class PhaseStateTest(unittest.TestCase):
@@ -24626,6 +24885,47 @@ class KernelWriteBoundaryTests(unittest.TestCase):
                 scope, ["/bin/sh", "-c", "echo ok >/dev/null"])
             self.assertEqual(subprocess.run(device["argv"]).returncode, 0)
 
+    def test_opencode_plan_scope_allows_state_and_denies_repo(self):
+        # ORCH-053: the scope shape `_guard_runtime` builds for a plan-mode
+        # opencode role — repo read-only, declared output and the controller
+        # data dir writable — enforced by the real seatbelt.
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            assets = os.path.join(root, "assets")
+            data_dir = os.path.join(root, "opencode-data")
+            for d in (repo, assets, data_dir):
+                os.mkdir(d)
+            declared = os.path.join(assets, "planner.plan.json")
+            scope = action_policy.OwnedScope(
+                repo_roots=(), declared_outputs=(declared,),
+                controller_state_dir=data_dir, session_assets_dir=assets)
+            probe = bridge.kernel_write_boundary(scope)
+            if not probe["available"]:
+                self.skipTest("kernel write boundary is unavailable")
+            if probe["platform"] != "darwin":
+                self.skipTest("real seatbelt execution is darwin-only")
+
+            def run_python(source):
+                wrapped = bridge.kernel_write_boundary(
+                    scope, [sys.executable, "-c", source])
+                return subprocess.run(
+                    wrapped["argv"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+
+            self.assertEqual(run_python(
+                "open(%r, 'w').write('ok')" % declared).returncode, 0)
+            db = os.path.join(data_dir, "opencode.db-wal")
+            self.assertEqual(run_python(
+                "open(%r, 'w').write('ok')" % db).returncode, 0)
+            repo_file = os.path.join(repo, "sneak.txt")
+            self.assertNotEqual(run_python(
+                "open(%r, 'w').write('bad')" % repo_file).returncode, 0)
+            self.assertFalse(os.path.exists(repo_file))
+            other_asset = os.path.join(assets, "builder.status.json")
+            self.assertNotEqual(run_python(
+                "open(%r, 'w').write('bad')" % other_asset).returncode, 0)
+            self.assertFalse(os.path.exists(other_asset))
+
     def test_linux_preflight_truthfully_reports_no_governed_controller(self):
         ok, alerts = preflight.preflight(
             {"builder": {"controller": "claude"}},
@@ -24712,17 +25012,26 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
             self.assertTrue(decision["allow"])
 
     def test_guarded_opencode_hard_removes_task_before_launch(self):
+        import unittest.mock as mock
+
         class RecordingTrace:
+            session_uuid = "test-guarded-opencode"
+
             def __init__(self):
                 self.events = []
 
             def event(self, name, **fields):
                 self.events.append(dict(fields, event=name))
 
+        seatbelt = (sys.platform == "darwin"
+                    and bool(shutil.which("sandbox-exec")))
         previous = bridge.set_nested_guard_active(True)
         try:
             with tempfile.TemporaryDirectory() as base, \
-                    tempfile.TemporaryDirectory() as assets:
+                    tempfile.TemporaryDirectory() as assets, \
+                    tempfile.TemporaryDirectory() as sessions_root, \
+                    mock.patch.dict(os.environ,
+                                    {"COWORK_SESSIONS_ROOT": sessions_root}):
                 trace = RecordingTrace()
                 session = bridge.OpencodeSession(
                     "roles/scout.md", "plan", False, trace=trace,
@@ -24732,6 +25041,7 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
                     session.agent_name + ".md")
                 with open(agent_path) as fh:
                     content = fh.read()
+                session.close()
             self.assertIn("permission:\n  task: deny", content)
             self.assertIn("tools:\n  task: false", content)
             self.assertIn({
@@ -24739,7 +25049,8 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
                 "role": "scout",
                 "delegation": "proven_absent",
                 "delegation_reason": "task_permission_denied",
-                "kernel_boundary": "controller_permissions",
+                "kernel_boundary": ("darwin" if seatbelt
+                                    else "controller_permissions"),
                 "event": "nested.guard.ready",
             }, trace.events)
         finally:
