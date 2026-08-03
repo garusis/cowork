@@ -4260,11 +4260,19 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
         if session_factory:
             session = session_factory("opencode")
         else:
-            session = bridge.OpencodeSession(
-                WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
-                io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
-                extra_writable_dir=extra_writable_dir,
-                model=wt_config.get("model"), effort=wt_config.get("effort"))
+            try:
+                session = bridge.OpencodeSession(
+                    WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
+                    io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
+                    extra_writable_dir=extra_writable_dir,
+                    model=wt_config.get("model"), effort=wt_config.get("effort"))
+            except policy.DispatchBlocked as exc:
+                if trace:
+                    trace.event("worktree.run.end", result="policy_blocked",
+                                controller=controller)
+                io_out.write(str(exc) + "\n")
+                io_out.flush()
+                return None
         first = brief  # role prompt rides in the generated agent file
     else:
         if session_factory:
@@ -4765,12 +4773,20 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         if session_factory:
             session = session_factory("opencode", review_io)
         else:
-            session = bridge.OpencodeSession(
-                prompt_path, cfg["mode"], cfg["yolo"], io_out=review_io,
-                speaker=reviewer_role, internal=surface,
-                resume_session_id=resume_id, on_session_id=cb, trace=trace,
-                extra_writable_dir=extra_writable_dir,
-                model=cfg.get("model"), effort=cfg.get("effort"))
+            try:
+                session = bridge.OpencodeSession(
+                    prompt_path, cfg["mode"], cfg["yolo"], io_out=review_io,
+                    speaker=reviewer_role, internal=surface,
+                    resume_session_id=resume_id, on_session_id=cb, trace=trace,
+                    extra_writable_dir=extra_writable_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
+            except policy.DispatchBlocked as exc:
+                if trace:
+                    trace.event("review.run.end", role=reviewer_role,
+                                result="policy_blocked",
+                                controller=cfg["controller"], phase=phase)
+                return _controller_failure_verdict(
+                    {"ok": False, "result": "policy_blocked"}, alert=str(exc))
         prompt = (brief + "\n\n" + ctx_block).strip()
     else:  # codex
         cb = (lambda i: on_session("codex", i)) if on_session else None

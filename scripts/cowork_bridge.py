@@ -680,18 +680,137 @@ OPENCODE_AGENT_PREFIX = "cowork-"
 OPENCODE_AGENT_SUBDIR = os.path.join(".opencode", "agents")
 
 
-def opencode_permission_lines(mode, yolo, external_dir=False):
+class OpencodeArtifactContractUnexpressible(policy.DispatchBlocked):
+    """Raised by `ensure_opencode_agent` BEFORE any agent file is written and
+    before any process exists, when a plan-mode OpenCode role's declared
+    outputs cannot be expressed as a permission grant (P4).
+
+    Subclasses `DispatchBlocked` so every existing pre-launch handler that
+    already renders a `DispatchBlocked` as a clean message (cowork.py:4210,
+    4635, 7159, ...) prints this refusal verbatim with no new handling. It is
+    defined only in this module, on the opencode path — the scoping is
+    structural, not conditional, so it can never fire for a Codex or Claude
+    role (P3)."""
+
+    def __init__(self, role, mode, artifacts):
+        self.mode = mode
+        self.artifacts = tuple(artifacts)
+        super().__init__("opencode", role=role, kind="setup")
+
+    def _message(self):
+        artifacts = ", ".join(self.artifacts) if self.artifacts else "none"
+        return (
+            "cowork: %s is configured for %s mode on opencode, but its "
+            "declared artifacts (%s) cannot be expressed as opencode "
+            "permissions — no opencode controller was launched."
+            % (self.role, self.mode, artifacts))
+
+
+def _opencode_path_patterns(path, assets_dir):
+    """Ordered, de-duplicated exact-file pattern forms for one absolute path
+    living directly under `assets_dir`.
+
+    Multiple forms are emitted because OpenCode's pattern normalization
+    (absolute vs cwd-relative vs `~`-expanded) could not be confirmed offline
+    against the compiled binary (F3): whichever form OpenCode normalizes a
+    write target to, one of these matches, so the write is allowed either
+    way. None of the three widens the grant beyond this one file — the
+    `**/...` form is scoped by the assets-dir basename (the session uuid), so
+    no ordinary repository path can match it."""
+    absolute = os.path.realpath(path)
+    patterns = [absolute]
+    home = os.path.expanduser("~")
+    if absolute == home or absolute.startswith(home + os.sep):
+        patterns.append("~" + absolute[len(home):])
+    patterns.append("**/%s/%s" % (
+        os.path.basename(os.path.normpath(assets_dir)),
+        os.path.basename(absolute)))
+    return tuple(dict.fromkeys(patterns))
+
+
+def _opencode_dir_patterns(assets_dir):
+    """Ordered, de-duplicated pattern forms granting exactly `assets_dir`
+    itself and everything under it (`<assets_dir>/**`), in the same
+    multi-form shape as `_opencode_path_patterns` (P8).
+
+    Scoped to this one session's assets directory only — never the flat
+    `external_directory: allow` — so a plan-mode role reads no filesystem
+    path outside the session's own folder."""
+    absolute = os.path.realpath(assets_dir)
+    basename = os.path.basename(absolute)
+    home = os.path.expanduser("~")
+    home_form = None
+    if absolute == home or absolute.startswith(home + os.sep):
+        home_form = "~" + absolute[len(home):]
+    patterns = [absolute]
+    if home_form:
+        patterns.append(home_form)
+    patterns.append("**/%s" % basename)
+    patterns.append(absolute + "/**")
+    if home_form:
+        patterns.append(home_form + "/**")
+    patterns.append("**/%s/**" % basename)
+    return tuple(dict.fromkeys(patterns))
+
+
+def _opencode_yaml_key(pattern):
+    """Render `pattern` as a double-quoted YAML mapping key so `/`, `*`, `~`
+    are read as literal text, never as YAML aliases or flow indicators.
+    JSON string syntax is valid YAML double-quoted-scalar syntax, so this
+    also handles escaping."""
+    return json.dumps(pattern)
+
+
+def opencode_plan_declared_outputs(speaker, assets_dir):
+    """Resolve `speaker`'s plan-mode declared-output paths under
+    `assets_dir`.
+
+    Raises `OpencodeArtifactContractUnexpressible` when no pattern set could
+    express the contract: no assets dir was supplied, the role has no
+    declared outputs, or a declared output does not live under the supplied
+    assets dir (P4). The refusal message names the artifact filenames even
+    with no assets dir, resolved from the role -> filename mapping alone."""
+    outputs = _declared_outputs_for_role(assets_dir, speaker) if assets_dir else ()
+    assets_real = os.path.realpath(assets_dir) if assets_dir else None
+    contained = bool(outputs) and assets_real is not None and all(
+        os.path.realpath(p) == assets_real
+        or os.path.realpath(p).startswith(assets_real + os.sep)
+        for p in outputs)
+    if not contained:
+        names = tuple(os.path.basename(p) for p in
+                      (outputs or _declared_outputs_for_role("", speaker)))
+        raise OpencodeArtifactContractUnexpressible(speaker, "plan", names)
+    return outputs
+
+
+def opencode_permission_lines(mode, yolo, external_dir=False,
+                              declared_outputs=(), assets_dir=None):
     """Frontmatter `permission:` lines for (mode, yolo).
 
     opencode has no OS sandbox; permissions are the only guardrail, and in a
     headless run (stdin is not a TTY) any rule that resolves to `ask` is
     auto-rejected by opencode — so `ask` acts as a hard deny here:
 
-    - plan -> edit deny + bash ask (read-only-ish; opencode cannot allow only
-      read-only shell commands the way codex's read-only sandbox can).
-    - implement + no-yolo -> edit allow + bash ask (mirrors claude acceptEdits:
-      edits land, other commands are denied). `external_directory: allow` is
-      added when the role needs to write session artifacts outside cwd.
+    - plan, WITH declared outputs -> an ordered `edit:` object map: catch-all
+      denies (`"*"`, `"**"`) first, then one allow key per pattern form per
+      declared output (P1, P2). OpenCode evaluates the map in order with the
+      last matching rule winning, so deny-first/allow-last is what yields
+      default-deny with narrow exceptions; `external_directory:` gets the
+      same deny-first shape, scoped to just the session assets directory
+      (P8) rather than the flat `external_directory: allow`, so a read-only
+      role gains no filesystem reach beyond its own session folder. `bash`
+      stays `ask`, which a headless run auto-rejects, so it is still a hard
+      deny in practice.
+    - plan, WITHOUT declared outputs -> today's scalar `edit: deny` (P12):
+      the formatter stays a total pure function and never raises: a caller
+      that reaches it without declared outputs gets the safest possible
+      output, not a broader one. (The pre-launch refusal for an
+      unexpressible contract lives one layer up, in
+      `opencode_plan_declared_outputs` / `ensure_opencode_agent`.)
+    - implement + no-yolo -> edit allow + bash ask (mirrors claude
+      acceptEdits: edits land, other commands are denied).
+      `external_directory: allow` is added when the role needs to write
+      session artifacts outside cwd.
     - every mode -> task deny. OpenCode removes denied task targets from the
       model's tool description, so native child delegation is absent before
       the first model turn.
@@ -700,6 +819,28 @@ def opencode_permission_lines(mode, yolo, external_dir=False):
     """
     if mode == "implement" and yolo:
         return ["permission:", "  task: deny"]
+    if mode == "plan" and declared_outputs:
+        lines = ["permission:", "  task: deny", "  edit:",
+                 "    %s: deny" % _opencode_yaml_key("*"),
+                 "    %s: deny" % _opencode_yaml_key("**")]
+        seen = set()
+        for output in declared_outputs:
+            for pattern in _opencode_path_patterns(output, assets_dir):
+                if pattern in seen:
+                    continue
+                seen.add(pattern)
+                lines.append("    %s: allow" % _opencode_yaml_key(pattern))
+        lines += ["  bash: ask", "  webfetch: allow",
+                  "  external_directory:",
+                  "    %s: deny" % _opencode_yaml_key("*"),
+                  "    %s: deny" % _opencode_yaml_key("**")]
+        seen = set()
+        for pattern in _opencode_dir_patterns(assets_dir):
+            if pattern in seen:
+                continue
+            seen.add(pattern)
+            lines.append("    %s: allow" % _opencode_yaml_key(pattern))
+        return lines
     lines = ["permission:",
              "  task: deny",
              "  edit: %s" % ("deny" if mode == "plan" else "allow"),
@@ -711,23 +852,33 @@ def opencode_permission_lines(mode, yolo, external_dir=False):
 
 
 def opencode_agent_markdown(role_prompt_text, mode, yolo, description,
-                            external_dir=False):
+                            external_dir=False, declared_outputs=(),
+                            assets_dir=None):
     """Agent-file markdown: YAML frontmatter + the role prompt as the body."""
     lines = ["---", "description: %s" % description, "mode: primary",
              # Defense in depth across OpenCode versions: `tools` is the
              # deprecated boolean form while `permission` below is current.
              "tools:", "  task: false"]
-    lines += opencode_permission_lines(mode, yolo, external_dir=external_dir)
+    lines += opencode_permission_lines(
+        mode, yolo, external_dir=external_dir,
+        declared_outputs=declared_outputs, assets_dir=assets_dir)
     lines.append("---")
     return "\n".join(lines) + "\n" + role_prompt_text.strip() + "\n"
 
 
 def ensure_opencode_agent(role_prompt_file, speaker, mode, yolo,
-                          base_dir=None, external_dir=False):
+                          base_dir=None, external_dir=False, assets_dir=None):
     """Write `.opencode/agents/cowork-<speaker>.md` under base_dir (default cwd)
     and return the agent name. Overwrites any previous file so the prompt and
-    permissions always reflect the current role config."""
+    permissions always reflect the current role config.
+
+    In plan mode, resolves the role's declared outputs against `assets_dir`
+    and raises `OpencodeArtifactContractUnexpressible` BEFORE writing
+    anything when that contract cannot be expressed as permissions (P3, P4)."""
     policy.guard("opencode", role=speaker, kind="setup")
+    declared_outputs = ()
+    if mode == "plan":
+        declared_outputs = opencode_plan_declared_outputs(speaker, assets_dir)
     base_dir = base_dir or os.getcwd()
     agent_name = OPENCODE_AGENT_PREFIX + speaker
     agent_dir = os.path.join(base_dir, OPENCODE_AGENT_SUBDIR)
@@ -737,7 +888,8 @@ def ensure_opencode_agent(role_prompt_file, speaker, mode, yolo,
     content = opencode_agent_markdown(
         role_text, mode, yolo,
         description="cowork %s role (generated; do not edit)" % speaker,
-        external_dir=external_dir)
+        external_dir=external_dir, declared_outputs=declared_outputs,
+        assets_dir=assets_dir)
     path = os.path.join(agent_dir, agent_name + ".md")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
@@ -2150,7 +2302,8 @@ class OpencodeSession:
         self._started = False
         self.agent_name = ensure_opencode_agent(
             role_prompt_file, speaker, mode, yolo, base_dir=agent_base_dir,
-            external_dir=bool(extra_writable_dir))
+            external_dir=bool(extra_writable_dir),
+            assets_dir=extra_writable_dir)
         if nested_guard_active() and self.trace:
             self.trace.event(
                 "nested.guard.ready", controller="opencode", role=speaker,
