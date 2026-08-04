@@ -151,6 +151,10 @@ class FlagAssemblyTest(unittest.TestCase):
         # interactive question tool is blocked (auto-"skipped" in headless -p)
         self.assertIn("--disallowedTools", cmd)
         self.assertIn("AskUserQuestion", cmd)
+        # ORCH-001: only the cowork-owned empty MCP config is ever loaded.
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertEqual(cmd[cmd.index("--mcp-config") + 1],
+                         bridge.CLAUDE_EMPTY_MCP_CONFIG_PATH)
 
     def test_build_codex_command(self):
         cmd = bridge.build_codex_command("PROMPT", "plan", True)
@@ -173,6 +177,11 @@ class FlagAssemblyTest(unittest.TestCase):
         self.assertIn("Task", cmd)
         self.assertFalse(any(
             str(part).startswith("CLAUDE_CONFIG_DIR=") for part in cmd))
+        # ORCH-001: the MCP-free flag pair is independent of the guard
+        # settings block and present on the guarded launch too.
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertEqual(cmd[cmd.index("--mcp-config") + 1],
+                         bridge.CLAUDE_EMPTY_MCP_CONFIG_PATH)
 
     def test_guarded_codex_fresh_and_resume_share_fail_closed_flags(self):
         fresh = bridge.build_codex_command(
@@ -188,6 +197,8 @@ class FlagAssemblyTest(unittest.TestCase):
             self.assertEqual(command[disable + 1], "multi_agent")
             self.assertIn("agents.enabled=false", self._c_values(command))
             self.assertIn("project_doc_max_bytes=0", self._c_values(command))
+            # ORCH-001: the fail-closed MCP override rides fresh AND resume.
+            self.assertIn("mcp_servers={}", self._c_values(command))
             self.assertTrue(any(
                 value.startswith("projects.")
                 and value.endswith('.trust_level="untrusted"')
@@ -367,6 +378,26 @@ class ModelEffortFlagTest(unittest.TestCase):
 class OpencodeBridgeTest(unittest.TestCase):
     """opencode agent-file generation, command assembly, and event parsing."""
 
+    # ORCH-001: the exact `tools:` block every cowork opencode agent file
+    # carries — the MCP catch-all deny first, then the native re-allows
+    # (last matching rule wins).
+    TOOLS_BLOCK = (
+        "tools:\n"
+        "  task: false\n"
+        '  "*_*": false\n'
+        "  read: true\n"
+        "  edit: true\n"
+        "  write: true\n"
+        "  bash: true\n"
+        "  grep: true\n"
+        "  glob: true\n"
+        "  list: true\n"
+        "  webfetch: true\n"
+        "  skill: true\n"
+        "  todowrite: true\n"
+        "  todoread: true\n"
+        "  apply_patch: true\n")
+
     def _allow_keys(self, lines):
         """The set of quoted-key texts on every `... : allow` line."""
         keys = set()
@@ -471,20 +502,20 @@ class OpencodeBridgeTest(unittest.TestCase):
             "R", "implement", True, description="d")
         self.assertEqual(
             yolo_md,
-            "---\ndescription: d\nmode: primary\ntools:\n  task: false\n"
+            "---\ndescription: d\nmode: primary\n" + self.TOOLS_BLOCK +
             "permission:\n  task: deny\n---\nR\n")
         no_yolo_md = bridge.opencode_agent_markdown(
             "R", "implement", False, description="d")
         self.assertEqual(
             no_yolo_md,
-            "---\ndescription: d\nmode: primary\ntools:\n  task: false\n"
+            "---\ndescription: d\nmode: primary\n" + self.TOOLS_BLOCK +
             "permission:\n  task: deny\n  edit: allow\n  bash: ask\n"
             "  webfetch: allow\n---\nR\n")
         no_yolo_ext_md = bridge.opencode_agent_markdown(
             "R", "implement", False, description="d", external_dir=True)
         self.assertEqual(
             no_yolo_ext_md,
-            "---\ndescription: d\nmode: primary\ntools:\n  task: false\n"
+            "---\ndescription: d\nmode: primary\n" + self.TOOLS_BLOCK +
             "permission:\n  task: deny\n  edit: allow\n  bash: ask\n"
             "  webfetch: allow\n  external_directory: allow\n---\nR\n")
 
@@ -511,6 +542,38 @@ class OpencodeBridgeTest(unittest.TestCase):
         ext_keys = list(ext.keys())
         self.assertEqual(ext[ext_keys[0]], "deny")
         self.assertEqual(ext[ext_keys[1]], "deny")
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML not installed")
+    def test_plan_mode_frontmatter_mcp_disabled(self):
+        # ORCH-001: the `tools:` map denies every MCP tool via the `"*_*"`
+        # catch-all (opencode names MCP tools `<server>_<tool>`) while the
+        # native tools cowork roles depend on stay explicitly re-allowed.
+        # Deny-first/allow-last: the last matching rule wins, so the denies
+        # must precede the re-allows.
+        assets = os.path.join(tempfile.mkdtemp(), str(uuid.uuid4()))
+        os.makedirs(assets)
+        outputs = (os.path.join(assets, "planner.plan.json"),
+                  os.path.join(assets, "planner.plan.md"))
+        md = bridge.opencode_agent_markdown(
+            "ROLE", "plan", True, description="d",
+            declared_outputs=outputs, assets_dir=assets)
+        fm_text, _, _ = md[len("---\n"):].partition("\n---\n")
+        doc = yaml.safe_load(fm_text)
+        tools = doc["tools"]
+        self.assertIs(tools["task"], False)
+        self.assertIs(tools["*_*"], False)  # MCP catch-all deny
+        # The catch-all is server-agnostic: no configured server name ever
+        # appears as a key (server names are unknowable at generation time).
+        self.assertNotIn("serena", tools)
+        # Native tools survive, explicitly re-allowed after the denies.
+        keys = list(tools.keys())
+        last_deny = max(keys.index(k) for k, v in tools.items() if v is False)
+        first_allow = min(keys.index(k) for k, v in tools.items() if v is True)
+        self.assertLess(last_deny, first_allow)
+        for native in ("read", "edit", "write", "bash", "grep", "glob",
+                       "list", "webfetch", "skill", "todowrite", "todoread",
+                       "apply_patch"):
+            self.assertIs(tools[native], True, native)
 
     def test_agent_markdown_frontmatter_and_body(self):
         assets = os.path.join(tempfile.mkdtemp(), str(uuid.uuid4()))
@@ -900,6 +963,10 @@ class OpencodeDeliveryFallbackTest(unittest.TestCase):
         self.assertEqual(list(snapshots[1].values()), [local])
         self.assertIn(global_agent + ".md",
                       os.path.basename(list(snapshots[1])[0]))
+        # ORCH-001: the global fallback copy inherits the MCP-disable tools
+        # block (it re-reads the local file byte for byte).
+        self.assertIn(OpencodeBridgeTest.TOOLS_BLOCK, local)
+        self.assertIn('"*_*": false', list(snapshots[1].values())[0])
         # the global file is removed as soon as the run exits; sticky flag set.
         self.assertEqual(self._global_files(), [])
         self.assertTrue(bridge._OPENCODE_GLOBAL_DELIVERY)
@@ -1015,6 +1082,215 @@ class OpencodeDeliveryFallbackTest(unittest.TestCase):
         self.assertEqual(
             path, os.path.join(self.config, "agent", name + ".md"))
         self.assertEqual(open(path).read(), "CONTENT\n")
+
+
+class McpFreeLaunchTests(unittest.TestCase):
+    """ORCH-001: every cowork role launches MCP-free on every controller —
+    claude, codex, opencode — fresh and resumed, guarded and unguarded."""
+
+    def _assert_claude_mcp_free(self, cmd):
+        i = cmd.index("--mcp-config")
+        self.assertEqual(cmd[i + 1], bridge.CLAUDE_EMPTY_MCP_CONFIG_PATH)
+        self.assertTrue(os.path.isabs(cmd[i + 1]))
+        self.assertEqual(cmd[i + 2], "--strict-mcp-config")
+
+    def test_claude_fresh_resume_and_probe_forms_carry_mcp_flags(self):
+        for mode in ("plan", "implement"):
+            for yolo in (True, False):
+                fresh = bridge.build_claude_command(
+                    "roles/scout.md", mode, yolo,
+                    session_id=str(uuid.uuid4()))
+                self._assert_claude_mcp_free(fresh)
+                resumed = bridge.build_claude_command(
+                    "roles/scout.md", mode, yolo,
+                    resume_id=str(uuid.uuid4()))
+                self._assert_claude_mcp_free(resumed)
+        # The probe's argument shapes: unguarded (no session/guard dir) and
+        # guarded (settings path + delegation lockdown).
+        probe_unguarded = bridge.build_claude_command(
+            "roles/scout.md", "plan", True,
+            extra_writable_dir=tempfile.mkdtemp())
+        self._assert_claude_mcp_free(probe_unguarded)
+        probe_guarded = bridge.build_claude_command(
+            "roles/scout.md", "plan", True,
+            guard_settings_path="/x/settings.json",
+            delegation_allowed=False, session_id=str(uuid.uuid4()))
+        self._assert_claude_mcp_free(probe_guarded)
+
+    def test_claude_empty_mcp_config_is_a_committed_empty_server_map(self):
+        # The static file the flag pair points at really is an empty,
+        # valid MCP config — no servers, ever.
+        self.assertTrue(os.path.isfile(bridge.CLAUDE_EMPTY_MCP_CONFIG_PATH))
+        with open(bridge.CLAUDE_EMPTY_MCP_CONFIG_PATH) as fh:
+            self.assertEqual(json.load(fh), {"mcpServers": {}})
+
+    def _assert_codex_mcp_free(self, cmd):
+        values = [cmd[i + 1] for i, part in enumerate(cmd)
+                  if part == "-c" and i + 1 < len(cmd)]
+        self.assertIn("mcp_servers={}", values)
+        # The user-config load is disabled exactly once — by governance args
+        # on the guarded path, by the MCP override helper on the unguarded
+        # one (see codex_mcp_override_args).
+        self.assertEqual(cmd.count("--ignore-user-config"), 1)
+
+    def test_codex_fresh_and_resume_carry_mcp_override(self):
+        for mode in ("plan", "implement"):
+            for yolo in (True, False):
+                for guarded in (False, True):
+                    fresh = bridge.build_codex_command(
+                        "PROMPT", mode, yolo, guarded=guarded)
+                    self._assert_codex_mcp_free(fresh)
+                    resumed = bridge.build_codex_resume_command(
+                        "T1", "PROMPT", mode, yolo, guarded=guarded)
+                    self._assert_codex_mcp_free(resumed)
+
+    def test_opencode_agent_markdown_carries_mcp_deny_all_modes(self):
+        block = OpencodeBridgeTest.TOOLS_BLOCK
+        for mode in ("plan", "implement"):
+            for yolo in (True, False):
+                md = bridge.opencode_agent_markdown(
+                    "R", mode, yolo, description="d")
+                self.assertIn(block, md)
+                # Deny-first: the MCP catch-all precedes every re-allow.
+                self.assertLess(md.index('"*_*": false'),
+                                md.index("  read: true"))
+
+    def test_opencode_project_local_agent_file_carries_mcp_deny(self):
+        base = tempfile.mkdtemp()
+        rp = os.path.join(base, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("ROLE")
+        name = bridge.ensure_opencode_agent(rp, "scout", "implement", True,
+                                            base_dir=base)
+        with open(os.path.join(base, ".opencode", "agents",
+                               name + ".md")) as fh:
+            content = fh.read()
+        self.assertIn(OpencodeBridgeTest.TOOLS_BLOCK, content)
+
+    def test_no_role_prompt_mentions_mcp(self):
+        # Requirement 4 as a regression test: no cowork role prompt mentions
+        # MCP (case-insensitively), so reintroduction fails the suite.
+        roles_dir = os.path.join(_HERE, os.pardir, "roles")
+        role_files = sorted(
+            os.path.join(roles_dir, f) for f in os.listdir(roles_dir)
+            if f.endswith(".md"))
+        self.assertEqual(len(role_files), 8)
+        for path in role_files:
+            with open(path) as fh:
+                self.assertNotIn("mcp", fh.read().lower(), path)
+
+
+class McpFreeTraceMarkerTests(unittest.TestCase):
+    """ORCH-001: every launch is auditable as MCP-free from the trace alone —
+    `controller.turn.start` (all three controllers) and `controller.probe.start`
+    (claude) carry `mcp_free=True` + the mechanism, and no event leaks MCP
+    server names, tool schemas, or credentials."""
+
+    def _tmp_trace(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, "trace.jsonl")
+
+    def _events(self, path):
+        with open(path, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _assert_marker(self, event, mechanism):
+        self.assertIs(event["mcp_free"], True)
+        self.assertEqual(event["mcp_mechanism"], mechanism)
+        # No MCP server names, tool schemas, or credentials anywhere in the
+        # event payload.
+        payload = json.dumps(event)
+        self.assertNotIn("mcp__", payload)
+        self.assertNotIn("mcpServers", payload)
+
+    def test_claude_probe_start_trace_carries_mcp_free_marker(self):
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+
+        def spawn(cmd, stdin):
+            return [{"type": "result", "subtype": "success"}]
+        ok, _ = bridge.probe_claude_stream_json(spawn, trace=trace)
+        self.assertTrue(ok)
+        start = [e for e in self._events(path)
+                 if e["event"] == "controller.probe.start"][0]
+        self._assert_marker(start, "claude_empty_mcp_config")
+
+    def test_claude_turn_start_trace_carries_mcp_free_marker(self):
+        import unittest.mock as mock
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        lines = [
+            json.dumps({"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}),
+            json.dumps({"type": "result", "subtype": "success",
+                        "session_id": "S1"}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_ClaudeProc(lines)):
+            session = bridge.ClaudeSession(
+                "roles/scout.md", "plan", True, io_out=io.StringIO(),
+                speaker="scout", trace=trace)
+            session.send("fresh turn", meta={"fresh": True})
+            session.send("resumed turn", meta={"fresh": False, "resume": True})
+        starts = [e for e in self._events(path)
+                  if e["event"] == "controller.turn.start"]
+        self.assertEqual(len(starts), 2)
+        self.assertTrue(starts[0]["fresh"])
+        self.assertTrue(starts[1]["resume"])
+        for event in starts:
+            self._assert_marker(event, "claude_empty_mcp_config")
+
+    def test_codex_turn_start_trace_carries_mcp_free_marker(self):
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+
+        class FakeCodex(bridge.CodexSession):
+            def _run(self, command):
+                return [{"type": "thread.started", "thread_id": "T1"}]
+
+        session = FakeCodex("implement", True, io_out=io.StringIO(),
+                            trace=trace)
+        session.send("fresh turn")
+        session.send("resumed turn")
+        starts = [e for e in self._events(path)
+                  if e["event"] == "controller.turn.start"]
+        self.assertEqual(len(starts), 2)
+        self.assertTrue(starts[0]["fresh"])
+        self.assertTrue(starts[1]["resume"])
+        for event in starts:
+            self._assert_marker(event, "codex_mcp_override")
+
+    def test_opencode_turn_start_trace_carries_mcp_free_marker(self):
+        import unittest.mock as mock
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        lines = [
+            json.dumps({"type": "text", "sessionID": "ses_M",
+                        "part": {"text": "hi"}}),
+            json.dumps({"type": "step_finish", "sessionID": "ses_M",
+                        "part": {"reason": "stop",
+                                 "tokens": {"input": 1, "output": 1}}}),
+        ]
+        tmp = tempfile.mkdtemp()
+        rp = os.path.join(tmp, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("ROLE")
+        with mock.patch.object(
+                bridge.subprocess, "Popen",
+                return_value=OpencodeSessionTest.FakeProc(lines)):
+            session = bridge.OpencodeSession(
+                rp, "implement", True, io_out=io.StringIO(),
+                agent_base_dir=tmp, trace=trace)
+            session.send("fresh turn")
+            session.send("resumed turn")
+        starts = [e for e in self._events(path)
+                  if e["event"] == "controller.turn.start"]
+        self.assertEqual(len(starts), 2)
+        self.assertTrue(starts[0]["fresh"])
+        self.assertTrue(starts[1]["resume"])
+        for event in starts:
+            self._assert_marker(event, "opencode_tools_deny")
 
 
 class OpencodeReadonlyBashTest(unittest.TestCase):
@@ -3439,6 +3715,9 @@ class SessionClassTest(unittest.TestCase):
         self.assertEqual(
             recorded["cmds"][1],
             ["codex", "exec", "resume", "--json", "--skip-git-repo-check",
+             # ORCH-001: the unguarded resume still carries the fail-closed
+             # MCP removal pair (see codex_mcp_override_args).
+             "--ignore-user-config", "-c", "mcp_servers={}",
              "--dangerously-bypass-approvals-and-sandbox", "T1", "second"])
         self.assertEqual(recorded["tid"], "T1")
 
@@ -13448,9 +13727,13 @@ class ModelFlagAssemblyTest(unittest.TestCase):
         self.assertEqual(cmd[i - 1], "-c")
         # resume rejects --model; the pin must ride -c only
         self.assertNotIn("--model", cmd)
-        # no pin -> no model config key at all (implement+yolo has no -c args)
-        self.assertNotIn("-c", bridge.build_codex_resume_command(
-            "T1", "p", "implement", True))
+        # no pin -> no model config key at all (the only `-c` on an unpinned
+        # implement+yolo resume is the ORCH-001 MCP override)
+        unpinned = bridge.build_codex_resume_command(
+            "T1", "p", "implement", True)
+        self.assertFalse(any(str(p).startswith("model=") for p in unpinned))
+        self.assertEqual(unpinned.count("-c"), 1)
+        self.assertIn("mcp_servers={}", unpinned)
 
 
 class ModelConfigTest(unittest.TestCase):
@@ -25044,6 +25327,10 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
                 session.close()
             self.assertIn("permission:\n  task: deny", content)
             self.assertIn("tools:\n  task: false", content)
+            # ORCH-001: the guarded opencode launch also carries the MCP
+            # catch-all deny plus the native re-allows.
+            self.assertIn('"*_*": false', content)
+            self.assertIn(OpencodeBridgeTest.TOOLS_BLOCK, content)
             self.assertIn({
                 "controller": "opencode",
                 "role": "scout",

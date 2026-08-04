@@ -56,6 +56,17 @@ from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
 DEFAULT_ROLE_PROMPT = "roles/scout.md"
 _NESTED_GUARD_ACTIVE = False
 
+# ORCH-001: cowork roles never inherit MCP servers. For claude this is a
+# cowork-owned static empty MCP config plus the `--mcp-config <path>
+# --strict-mcp-config` flag pair ("Only use MCP servers from --mcp-config,
+# ignoring all other MCP configurations" — verified against claude 2.1.220).
+# A committed static file (not a per-launch generated one) because the
+# unguarded probe has no session/guard directory to generate into, and a
+# stable `__file__`-relative path keeps golden argv assertions deterministic.
+CLAUDE_EMPTY_MCP_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data",
+    "claude_empty_mcp.json")
+
 # The spinner moved to cowork_ui (both bridges + the loop share it). Alias kept
 # for back-compat.
 _Spinner = ui.Spinner
@@ -160,6 +171,13 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         "ExitPlanMode",
         "--append-system-prompt-file",
         role_prompt_file,
+        # ORCH-001: load ONLY the cowork-owned empty MCP config — no
+        # user/project/plugin MCP server schema ever enters a role's context.
+        # Unconditional: the probe (guarded and unguarded) and every
+        # ClaudeSession fresh/resume launch all inherit it from here.
+        "--mcp-config",
+        CLAUDE_EMPTY_MCP_CONFIG_PATH,
+        "--strict-mcp-config",
     ] + claude_mode_flags(mode, yolo)
     if model:
         cmd += ["--model", model]
@@ -635,6 +653,33 @@ def codex_governance_args(guarded=False):
     ]
 
 
+def codex_mcp_override_args(guarded=False):
+    """Fail-closed MCP removal shared by fresh and resumed codex turns
+    (ORCH-001). Applied independent of `guarded` so the unguarded path is
+    covered too.
+
+    Mechanism verified live against codex-cli 0.145.0:
+    - `-c mcp_servers={}` alone deep-MERGES into the loaded config and is a
+      no-op (`codex mcp list -c 'mcp_servers={}'` still lists every configured
+      server); per-server `-c mcp_servers.<name>.enabled=false` overrides can
+      hard-fail config loading on real-world entries. Neither is a viable
+      removal mechanism on its own.
+    - `--ignore-user-config` ("Do not load `$CODEX_HOME/config.toml`; auth
+      still uses `CODEX_HOME`") removes every configured MCP server, because
+      config.toml is where codex MCP servers are defined.
+
+    Guarded turns already get `--ignore-user-config` (plus a private
+    CODEX_HOME) from `codex_governance_args`, so it is added here only on the
+    unguarded path. The explicit `-c mcp_servers={}` is kept on both paths as
+    the fail-closed marker of intent: with no user config loaded the effective
+    `mcp_servers` table is empty by construction, and if
+    `--ignore-user-config` semantics ever drift the override still applies."""
+    args = []
+    if not guarded:
+        args.append("--ignore-user-config")
+    return args + ["-c", "mcp_servers={}"]
+
+
 def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
                         model=None, effort=None, guarded=False):
     """argv for the first one-shot codex exec turn. The role spec is prepended
@@ -650,6 +695,7 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
     return (
         ["codex", "exec", "--json", "--skip-git-repo-check"]
         + codex_governance_args(guarded)
+        + codex_mcp_override_args(guarded)
         + codex_mode_flags(mode, yolo)
         + codex_model_args(model, effort)
         + (["--add-dir", extra_writable_dir] if extra_writable_dir else [])
@@ -705,6 +751,7 @@ def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
     return (
         ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
         + codex_governance_args(guarded)
+        + codex_mcp_override_args(guarded)
         + codex_resume_mode_args(mode, yolo, extra_writable_dir)
         + codex_model_args(model, effort)
         + [thread_id, prompt_text]
@@ -720,6 +767,33 @@ def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
 # frontmatter, so a config change must rewrite the file).
 OPENCODE_AGENT_PREFIX = "cowork-"
 OPENCODE_AGENT_SUBDIR = os.path.join(".opencode", "agents")
+
+# ORCH-001: MCP removal for opencode roles, in the legacy `tools:` map.
+# OpenCode names MCP tools `<server>_<tool>`, so the `"*_*"` catch-all denies
+# every MCP tool no matter which servers the user's config defines — server
+# names are not knowable at agent-generation time, and a name-based list would
+# silently miss servers added later. The explicit re-allows after it keep the
+# native tools cowork roles depend on (deny-first/allow-last; the last
+# matching rule wins, same discipline as `opencode_permission_lines`).
+# Live-verified on opencode 1.18.10: a probe MCP server's tool disappeared
+# from the model's tool set while native glob/read/bash kept working, and the
+# `permission:` map still dominates natives — a `tools: true` entry does NOT
+# re-open a permission `deny`, so per-mode permission behavior is unchanged.
+OPENCODE_MCP_DENY_TOOL_LINES = [
+    '  "*_*": false',
+    "  read: true",
+    "  edit: true",
+    "  write: true",
+    "  bash: true",
+    "  grep: true",
+    "  glob: true",
+    "  list: true",
+    "  webfetch: true",
+    "  skill: true",
+    "  todowrite: true",
+    "  todoread: true",
+    "  apply_patch: true",
+]
 
 
 class OpencodeArtifactContractUnexpressible(policy.DispatchBlocked):
@@ -920,6 +994,8 @@ def opencode_agent_markdown(role_prompt_text, mode, yolo, description,
              # Defense in depth across OpenCode versions: `tools` is the
              # deprecated boolean form while `permission` below is current.
              "tools:", "  task: false"]
+    # ORCH-001: strip every MCP tool (catch-all) while re-allowing natives.
+    lines += OPENCODE_MCP_DENY_TOOL_LINES
     lines += opencode_permission_lines(
         mode, yolo, external_dir=external_dir,
         declared_outputs=declared_outputs, assets_dir=assets_dir,
@@ -1467,6 +1543,7 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         trace.event("controller.probe.start", controller="claude", role=role,
                     prompt_kind="probe", mode=mode, yolo=yolo, cwd=os.getcwd(),
                     role_prompt_file=role_prompt_file,
+                    mcp_free=True, mcp_mechanism="claude_empty_mcp_config",
                     **dict(data, **_probe_work()))
     try:
         events = spawn(command, stdin_text)
@@ -1740,7 +1817,9 @@ class ClaudeSession:
         if self._guard_runtime:
             _stamp_guard_parent_work(self._guard_runtime, work_id)
         if self.trace:
-            fields = {"controller": "claude", "role": self.speaker}
+            fields = {"controller": "claude", "role": self.speaker,
+                      "mcp_free": True,
+                      "mcp_mechanism": "claude_empty_mcp_config"}
             fields.update(trace_store.prompt_meta(text))
             fields.update({k: v for k, v in meta.items() if v is not None})
             fields.update(trace_store.work_meta(
@@ -2311,6 +2390,7 @@ class CodexSession:
                 "fresh": fresh, "resume": not fresh, "mode": self.mode,
                 "yolo": self.yolo, "model": self.model, "effort": self.effort,
                 "cwd": os.getcwd(), "thread_id": self.thread_id,
+                "mcp_free": True, "mcp_mechanism": "codex_mcp_override",
             }
             fields.update(trace_store.command_meta(command, prompt_text=text))
             # Per-turn accounting (#1/D11): caller-supplied meta merges in last,
@@ -2623,6 +2703,7 @@ class OpencodeSession:
                 "fresh": fresh, "resume": not fresh, "mode": self.mode,
                 "yolo": self.yolo, "model": self.model, "effort": self.effort,
                 "cwd": os.getcwd(), "session_id": self.session_id,
+                "mcp_free": True, "mcp_mechanism": "opencode_tools_deny",
             }
             fields.update(trace_store.command_meta(command, prompt_text=text))
             if meta:
