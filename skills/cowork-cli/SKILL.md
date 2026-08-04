@@ -233,11 +233,39 @@ artifacts — not the terminal transcript. For deep session forensics use the
 (`git status`, `git diff`). cowork commits nothing; the edits are sitting there
 uncommitted.
 
-## Watching a live run
+## Supervising a live run
 
-Two watchers, because an event tail alone cannot see the two worst failure
-modes — **silence** (a 45-minute healthy builder turn and a dead run look
-identical) and **process death** (a killed run emits no event at all).
+**Passive monitoring is not supervision.** An agent driving cowork is the
+orchestrator: its job during the run is to catch bugs, wrong turns, harness
+issues, and model-quality signals in the work itself — not merely to notice
+that a phase ended. Event monitors and watchdogs are the crash net, never
+the primary loop.
+
+Run an **active review pass every ~5–10 minutes** while a phase is live:
+
+1. Read the new `run.log` narrative delta (the streamed role output) — is the
+   role on-plan? Is it misreading the task? Is it fighting the harness
+   (denied writes, missing files) rather than doing the work?
+2. Read the role's actual tool calls — for opencode roles query
+   `~/.local/share/opencode/opencode.db` (`part` table); for claude/codex
+   read their session logs. Tool errors surface here long before any trace
+   event.
+3. Check the working tree (`git status` / `git diff`) — are edits landing,
+   and do they look like the plan?
+4. File anything noteworthy (bug, friction, improvement) in the project's
+   issue tracker/backlog immediately — observations not written down are
+   lost when the session ends.
+
+A lead role's stream going quiet for 15+ minutes with near-zero process CPU
+is a stalled model turn: kill the controller child process — cowork detects
+the dead turn and redispatches the role onto its resumed session with
+history intact. Two stalls of the same model in one phase is a signal to
+step down the model/provider ladder rather than retry a third time.
+
+Alongside the active loop, keep two mechanical watchers, because an event
+tail alone cannot see the two worst failure modes — **silence** (a
+45-minute healthy builder turn and a dead run look identical) and **process
+death** (a killed run emits no event at all).
 
 1. **Event tail** on `trace.jsonl`. Filter for the full lifecycle set — the
    easy mistake is matching only happy-path events. Include at least:
