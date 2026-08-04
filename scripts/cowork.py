@@ -2359,7 +2359,9 @@ def _record_findings(session_uuid, verdict, discoverer, phase, round_index,
             evidence_sha256=finding.get("evidence_sha256"),
             discoverer=discoverer, round_index=round_index, phase=phase,
             disposition=finding.get("disposition"),
-            closure=finding.get("closure"))
+            closure=finding.get("closure"),
+            superseded_by_transaction=finding.get(
+                "superseded_by_transaction"))
         if record:
             out.append(record["id"])
     return out
@@ -2981,6 +2983,327 @@ def _record_readiness_from_transaction(session_uuid, role, round_index,
     return {"state": state, "reason": reason, "event_id": event_id,
             "claimed_manifest": claimed, "verified_manifest": verified_manifest,
             "transaction_id": result.get("transaction_id"), "verdict": verdict}
+
+
+# --------------------------------------------------------------------------- #
+# Owned-verification receipt: pointer, overlay, dispositions, supersession.    #
+# (ORCH-050 / CV-050 / UX-021 — the receipt the owned transaction already      #
+# writes is bound to the promotion here and rendered as ONE derived overlay on #
+# both gate surfaces; review dispositions ride `verification.disposition`      #
+# trace events + a reconciled sidecar; defeated verification challenges are    #
+# mechanically superseded so they can never by themselves reopen the builder.) #
+# --------------------------------------------------------------------------- #
+
+
+def _verification_contradiction(session_uuid, txn_result, readiness,
+                                status_path, summary_path=None):
+    """The D-0008 contradiction signal, computed ONCE at the builder
+    ready_for_review branch from STRUCTURED state — never prose parsing.
+
+    Fires only alongside a GREEN, currently-bound owned receipt, and only when:
+      (i)   builder.status.json `result.verification` asserts a pass/fail that
+            disagrees with the owned verdict (a stale red attempt, ok:null);
+      (ii)  builder.status.json `result.verification` is null/absent/incomplete
+            OR builder.summary.md is absent while the receipt binds (agent
+            verification prose missing in EITHER carrier); or
+      (iii) builder.status.json binds a manifest other than the receipt's.
+    """
+    if not (isinstance(txn_result, dict)
+            and txn_result.get("verdict") == verification.VERDICT_GREEN
+            and isinstance(readiness, dict)
+            and readiness.get("state") == "verified"):
+        return False
+    status = state_store.read_json_tolerant(status_path) or {}
+    entries = (status.get("result") or {}).get("verification")
+    if summary_path is None and isinstance(status_path, str) \
+            and status_path.endswith("builder.status.json"):
+        summary_path = (status_path[:-len("builder.status.json")]
+                        + "builder.summary.md")
+    summary_missing = bool(summary_path) and not os.path.exists(summary_path)
+    if not isinstance(entries, list) or not entries or summary_missing:
+        return True
+    manifest = (txn_result.get("snapshot") or {}).get("manifest_digest")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return True
+        if entry.get("ok") is not True:
+            # A green receipt with agent prose claiming anything but a pass
+            # (False, None, missing) is a disagreement (i) or incomplete (ii).
+            return True
+        source = entry.get("source_manifest")
+        if source and manifest and source != manifest:
+            return True
+    return False
+
+
+def _latest_verification_disposition(session_uuid, transaction_id):
+    """The latest sidecar disposition value for one transaction id, or None.
+    The sidecar is the reconciled read-through cache of the
+    `verification.disposition` trace events (D-0001); render surfaces read it
+    rather than replaying the trace."""
+    if not (session_uuid and transaction_id):
+        return None
+    entry = state_store.read_verification_dispositions(
+        session_uuid).get(transaction_id)
+    return (entry or {}).get("disposition")
+
+
+def _emit_verification_disposition(session_uuid, trace, transaction_id,
+                                   disposition, review_round=None,
+                                   reviewed_manifest_digest=None):
+    """Record ONE review disposition for an owned transaction (D-0001):
+    PRIMARY the `verification.disposition` trace event, PLUS the reconciled
+    sidecar entry written at the same moment, PLUS an in-place update of the
+    current-receipt pointer's own `disposition` field when the pointer names
+    this transaction (so a same-process render sees the new value without a
+    re-join, D-0002)."""
+    if not (session_uuid and transaction_id
+            and disposition in verification.DISPOSITIONS):
+        return
+    if trace:
+        trace.event("verification.disposition",
+                    transaction_id=transaction_id, disposition=disposition,
+                    review_round=review_round,
+                    reviewed_manifest_digest=reviewed_manifest_digest)
+    state_store.write_verification_disposition(session_uuid, {
+        "transaction_id": transaction_id, "disposition": disposition,
+        "review_round": review_round,
+        "reviewed_manifest_digest": reviewed_manifest_digest})
+    pointer = state_store.read_current_receipt_pointer(session_uuid)
+    if isinstance(pointer, dict) \
+            and pointer.get("transaction_id") == transaction_id \
+            and pointer.get("disposition") != disposition:
+        state_store.write_current_receipt_pointer(
+            session_uuid, dict(pointer, disposition=disposition))
+
+
+def _update_receipt_pointer_for_readiness(session_uuid, role, round_index,
+                                          trace, txn_result, readiness,
+                                          status_path, summary_path=None):
+    """Bind the promotion to its owned receipt (D-0002) at the builder
+    ready_for_review transition.
+
+    GREEN + bound: any prior pointer still `pending_review` for a DIFFERENT
+    transaction means that transaction's candidate was abandoned — it is
+    recorded `rejected` (D-0005) — then the new pointer is written carrying
+    every overlay field plus the ONCE-computed contradiction flag (D-0008).
+
+    RED/UNVERIFIED transaction: recorded `rejected` immediately (a red or
+    unverified transaction can never later be accepted). A GREEN transaction
+    whose candidate already moved is left untouched — single-flight reuse can
+    still bind it to a later, identical promotion.
+
+    RE-BINDING THE SAME transaction id (the single-flight reuse case, D-0006):
+    the candidate is genuinely up for review again, so a disposition recorded
+    in an EARLIER round is stale. Resetting only the pointer file would leave
+    the trace/sidecar — which every render-time join and the gate-acceptance
+    guard actually read (D-0001/D-0002) — holding the earlier round's value, so
+    the reset is emitted as a REAL `pending_review` disposition event rather
+    than patched into pointer.json alone.
+    """
+    if not (session_uuid and isinstance(txn_result, dict)
+            and isinstance(readiness, dict)):
+        return None
+    transaction_id = txn_result.get("transaction_id")
+    if not transaction_id:
+        return None
+    if readiness.get("state") != "verified":
+        if txn_result.get("verdict") != verification.VERDICT_GREEN:
+            _emit_verification_disposition(
+                session_uuid, trace, transaction_id,
+                verification.DISPOSITION_REJECTED,
+                reviewed_manifest_digest=(
+                    txn_result.get("snapshot") or {}).get("manifest_digest"))
+        return None
+    prior = state_store.read_current_receipt_pointer(session_uuid)
+    if isinstance(prior, dict) and prior.get("transaction_id") \
+            and prior.get("transaction_id") != transaction_id \
+            and (prior.get("disposition")
+                 or verification.DISPOSITION_PENDING_REVIEW) == \
+            verification.DISPOSITION_PENDING_REVIEW:
+        _emit_verification_disposition(
+            session_uuid, trace, prior["transaction_id"],
+            verification.DISPOSITION_REJECTED,
+            review_round=prior.get("review_round"),
+            reviewed_manifest_digest=prior.get("manifest_digest"))
+    pointer = {
+        "transaction_id": transaction_id,
+        "receipt_path": state_store.verification_result_path_for(
+            session_uuid, transaction_id),
+        "manifest_digest": (txn_result.get("snapshot") or {}).get(
+            "manifest_digest"),
+        "index_digest": (txn_result.get("snapshot") or {}).get("index_digest"),
+        "verdict": txn_result.get("verdict"),
+        "final_suite_label": txn_result.get("final_suite_label"),
+        "final_suite_binding": txn_result.get("final_suite_binding"),
+        "command_count": len(txn_result.get("attempts") or []),
+        "review_round": state_store.current_phase_round(
+            session_uuid, "building", role, default=round_index),
+        "disposition": verification.DISPOSITION_PENDING_REVIEW,
+        "contradiction": bool(_verification_contradiction(
+            session_uuid, txn_result, readiness, status_path,
+            summary_path=summary_path)),
+    }
+    state_store.write_current_receipt_pointer(session_uuid, pointer)
+    stale = _latest_verification_disposition(session_uuid, transaction_id)
+    if stale and stale != verification.DISPOSITION_PENDING_REVIEW:
+        # Emitted AFTER the pointer write, so the in-place pointer patch inside
+        # the emitter is a no-op and the trace + sidecar are what get corrected.
+        _emit_verification_disposition(
+            session_uuid, trace, transaction_id,
+            verification.DISPOSITION_PENDING_REVIEW,
+            review_round=pointer["review_round"],
+            reviewed_manifest_digest=pointer["manifest_digest"])
+    return pointer
+
+
+def verification_overlay(pointer, disposition=None):
+    """THE ONE overlay renderer (D-0003): a dict of content-free tokens derived
+    from the current-receipt pointer (which itself carries only owned state —
+    never a byte of agent prose). `disposition` is the render-time join onto
+    the latest disposition known for the transaction (D-0002); absent, the
+    pointer's own field is used. Returns None when there is no bound receipt."""
+    if not isinstance(pointer, dict) or not pointer.get("transaction_id"):
+        return None
+    return {
+        "txn_id": pointer.get("transaction_id"),
+        "manifest_digest": pointer.get("manifest_digest"),
+        "index_digest": pointer.get("index_digest"),
+        "verdict": pointer.get("verdict"),
+        "final_suite_label": pointer.get("final_suite_label"),
+        "final_suite_binding": pointer.get("final_suite_binding"),
+        "command_count": pointer.get("command_count"),
+        "disposition": (disposition or pointer.get("disposition")
+                        or verification.DISPOSITION_PENDING_REVIEW),
+        "contradiction": bool(pointer.get("contradiction")),
+    }
+
+
+def _current_verification_overlay(session_uuid):
+    """`(overlay, pointer)` for the CURRENT bound receipt, or `(None, None)`.
+    The disposition is joined at render time from the sidecar so a resumed
+    reviewer edge mid-loop shows the CURRENT value rather than hardcoding
+    `pending_review` (D-0002)."""
+    pointer = state_store.read_current_receipt_pointer(session_uuid)
+    if not isinstance(pointer, dict) or not pointer.get("transaction_id"):
+        return None, None
+    disposition = _latest_verification_disposition(
+        session_uuid, pointer["transaction_id"])
+    return verification_overlay(pointer, disposition=disposition), pointer
+
+
+def render_verification_overlay_block(overlay, receipt_path=None,
+                                      agent_status_path=None):
+    """The human-gate banner block (UX-021): the owned facts first, the
+    agent-authored verification prose named SEPARATELY as self-reported, and a
+    visible WARNING line when the contradiction flag is set. Empty string when
+    no overlay binds (the legacy no-transaction gate is unchanged)."""
+    if not overlay:
+        return ""
+    lines = ["", "Owned verification (orchestrator-derived):"]
+    lines.append("  transaction %s  verdict=%s  final_suite=%s (%s)"
+                 % (overlay.get("txn_id"), overlay.get("verdict"),
+                    overlay.get("final_suite_label"),
+                    overlay.get("final_suite_binding")))
+    lines.append("  manifest=%s  index=%s  commands=%s  disposition=%s"
+                 % (str(overlay.get("manifest_digest"))[:12],
+                    str(overlay.get("index_digest"))[:12],
+                    overlay.get("command_count"), overlay.get("disposition")))
+    if receipt_path:
+        lines.append("  receipt → %s" % receipt_path)
+    if agent_status_path:
+        lines.append("Agent-reported verification (self-reported prose — the "
+                     "owned receipt above is authoritative): see "
+                     "result.verification in %s" % agent_status_path)
+    if overlay.get("contradiction"):
+        lines.append("  WARNING: the builder's own verification prose is "
+                     "missing or disagrees with this receipt — trust the "
+                     "receipt, not the prose.")
+    return "\n".join(lines)
+
+
+def _classify_blocking_verification_challenges(verdict, pointer):
+    """D-0004 citation validation: classify a revise verdict's BLOCKING
+    corrective findings against the current-receipt pointer's owned state.
+
+    Returns `(blocking, defeated)`: every blocking finding, and the subset
+    that are DEFEATED verification challenges — either UNCITED (the
+    `verification_challenge` field carries no transaction id) or CONTRADICTED
+    (it cites a transaction id the owned receipt contradicts). A blocking
+    finding with no `verification_challenge` field is a NON-verification
+    finding; a challenge citing the bound receipt's own transaction id is
+    VALIDLY CITED — neither is defeated, and either keeps the full reopen
+    power of a normal revise."""
+    typed = verdict.get("corrective_findings") if isinstance(
+        verdict, dict) else None
+    findings = [f for f in (typed or []) if isinstance(f, dict)]
+    blocking = [f for f in findings if f.get("severity") == "blocking"]
+    defeated = []
+    for finding in blocking:
+        challenge = finding.get("verification_challenge")
+        if not isinstance(challenge, dict):
+            continue
+        cited = challenge.get("transaction_id")
+        if not cited or cited != (pointer or {}).get("transaction_id"):
+            defeated.append(finding)
+    return blocking, defeated
+
+
+def _verdict_with_superseded_challenges(verdict, defeated, pointer):
+    """A copy of the verdict in which each defeated verification challenge is
+    marked `closure=superseded` + `superseded_by_transaction` — the FINDING is
+    the thing superseded (it stays on the ledger, never erased); the bound
+    transaction SURVIVES as `pending_review` (D-0004)."""
+    defeated_ids = {id(f) for f in defeated}
+    typed = []
+    for finding in verdict.get("corrective_findings") or []:
+        if isinstance(finding, dict) and id(finding) in defeated_ids:
+            finding = dict(finding, closure="superseded",
+                           superseded_by_transaction=pointer.get(
+                               "transaction_id"))
+        typed.append(finding)
+    return dict(verdict, corrective_findings=typed)
+
+
+def _accepted_manifest_matches(pointer, repo=None):
+    """The A5/D-0005 equality check: the candidate being accepted RIGHT NOW
+    must be IDENTICAL to the candidate the transaction's snapshot verified —
+    computed with the ONE canonical algorithm (fail-closed: an unreadable git
+    state is not equal to anything)."""
+    claimed, claimed_index = verification.current_candidate_identity(
+        repo or os.getcwd())
+    return (claimed is not None
+            and claimed == (pointer or {}).get("manifest_digest")
+            and claimed_index is not None
+            and claimed_index == (pointer or {}).get("index_digest"))
+
+
+def _grant_gate_acceptance(session_uuid, trace):
+    """The D-0004/D-0005 gate-outcome grant at the building-phase user gate:
+    an explicit human approve OR a headless auto-approve accepts the bound
+    transaction — but ONLY while it is still `pending_review` (a reviewer that
+    already judged it, either way, is not second-guessed by the gate) and only
+    while the accepted candidate manifest still equals the receipt's captured
+    manifest. A manifest mismatch means the receipt's candidate was abandoned
+    before acceptance, which is `rejected`, never `accepted`."""
+    if not session_uuid:
+        return
+    pointer = state_store.read_current_receipt_pointer(session_uuid)
+    if not isinstance(pointer, dict) or not pointer.get("transaction_id"):
+        return
+    transaction_id = pointer["transaction_id"]
+    current = (_latest_verification_disposition(session_uuid, transaction_id)
+               or pointer.get("disposition")
+               or verification.DISPOSITION_PENDING_REVIEW)
+    if current != verification.DISPOSITION_PENDING_REVIEW:
+        return
+    disposition = (verification.DISPOSITION_ACCEPTED
+                   if _accepted_manifest_matches(pointer)
+                   else verification.DISPOSITION_REJECTED)
+    _emit_verification_disposition(
+        session_uuid, trace, transaction_id, disposition,
+        review_round=pointer.get("review_round"),
+        reviewed_manifest_digest=pointer.get("manifest_digest"))
 
 
 def record_milestone(trace, role, milestone_phase, round_index=None):
@@ -4434,7 +4757,8 @@ def _build_diff_recipe(repos=None, baseline_note=""):
 
 
 def _build_reviewer_artifacts(plan_json_path, plan_md_path, build_status_path,
-                              build_summary_path=None):
+                              build_summary_path=None,
+                              verification_receipt_path=None):
     arts = [
         {"label": "approved plan JSON (machine source of truth)",
          "path": plan_json_path, "kind": "json", "source": "plan_json"},
@@ -4447,6 +4771,13 @@ def _build_reviewer_artifacts(plan_json_path, plan_md_path, build_status_path,
         arts.append({"label": "builder markdown summary (the user's review "
                      "surface)", "path": build_summary_path, "kind": "markdown",
                      "source": "build_summary"})
+    if verification_receipt_path:
+        # ORCH-050: the owned transaction's terminal result.json reaches the
+        # reviewer by ABSOLUTE PATH as its own declared slot (optional, like
+        # build_summary — a legacy session has none).
+        arts.append({"label": "owned verification receipt (orchestrator-run "
+                     "transaction result)", "path": verification_receipt_path,
+                     "kind": "json", "source": "verification_receipt"})
     return arts
 
 
@@ -4454,7 +4785,9 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
                                     plan_md_path, build_status_path,
                                     baseline_note="", baseline_repos=None,
                                     build_summary_path=None, assets_dir=None,
-                                    context_revision=None):
+                                    context_revision=None,
+                                    verification_receipt_path=None,
+                                    verification_overlay=None):
     """The build-reviewer's situational context (route 7), delivered FILE-ONLY
     via the shared transport: the shared session context, BOTH plan artifacts,
     the builder's status JSON, the builder's markdown summary (when wired), and
@@ -4462,14 +4795,21 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
     is NOT embedded (a stale snapshot would mis-review): the build-reviewer
     captures it itself via the diff recipe (content-free static instructions).
     `baseline_repos` is the explicit selected repo-root list (each
-    ``{path, has_head}``) that drives the per-root capture recipe."""
+    ``{path, has_head}``) that drives the per-root capture recipe.
+    `verification_receipt_path` + `verification_overlay` carry the owned
+    verification receipt (ORCH-050): the receipt file by absolute path and the
+    derived owned-facts overlay as closed-schema edge facts."""
     artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
     artifacts.extend(_build_reviewer_artifacts(
-        plan_json_path, plan_md_path, build_status_path, build_summary_path))
+        plan_json_path, plan_md_path, build_status_path, build_summary_path,
+        verification_receipt_path=verification_receipt_path))
     artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
+    facts = {"team": list(selected or [])}
+    if verification_overlay:
+        facts.update(verification_overlay)
     return handoff.render_handoff(
         "builder->build-reviewer:review_ctx",
-        artifacts=artifacts, facts={"team": list(selected or [])},
+        artifacts=artifacts, facts=facts,
         ctx={"repos": list(baseline_repos or [])})
 
 
@@ -4494,27 +4834,36 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
                                            baseline_repos=None,
                                            build_summary_path=None,
                                            assets_dir=None,
-                                           context_revision=None):
+                                           context_revision=None,
+                                           verification_receipt_path=None,
+                                           verification_overlay=None):
     """Lighter context for a RESUMED build-reviewer session, delivered FILE-ONLY
     via the shared transport: only the updated artifacts are sent by PATH (plan,
     status, summary, build-baseline) — plus a context-update wake block
     referencing the persisted context FILE when the session context changed. The
-    full delta is still read live via the diff recipe; no body is inlined."""
+    full delta is still read live via the diff recipe; no body is inlined. The
+    owned verification receipt + overlay ride exactly as on the fresh edge
+    (ORCH-050), so a resumed reviewer never loses the receipt mid-loop."""
     artifacts = list(_build_reviewer_artifacts(
-        plan_json_path, plan_md_path, build_status_path, build_summary_path))
+        plan_json_path, plan_md_path, build_status_path, build_summary_path,
+        verification_receipt_path=verification_receipt_path))
     artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
     ctx = {"repos": list(baseline_repos or [])}
     if context_update:
         ctx["context_update_prefix"] = context_update_block(
             context_update, assets_dir, context_revision)
+    facts = {"team": []}
+    if verification_overlay:
+        facts.update(verification_overlay)
     return handoff.render_handoff(
         "builder->build-reviewer:review_resume",
-        artifacts=artifacts, facts={"team": []}, ctx=ctx)
+        artifacts=artifacts, facts=facts, ctx=ctx)
 
 
 def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                                baseline_repos=None, trace=None,
-                               extra_writable_dir=None, build_summary_path=None):
+                               extra_writable_dir=None, build_summary_path=None,
+                               session_uuid=None):
     """Build the real (non-test) reviewer runner for the building phase: a
     `run_reviewer_once` closure carrying the build-reviewer role, prompt, and
     the full-delta context assemblers. The reviewed artifact passed to the
@@ -4522,7 +4871,20 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
     the reviewer (`baseline_note` tells it which commit each repo's delta is
     measured from and whether a worktree started dirty; `baseline_repos` is the
     explicit selected repo-root list, each ``{path, has_head}``, that drives the
-    per-root capture recipe)."""
+    per-root capture recipe). When `session_uuid` is wired, each context
+    assembly looks up the CURRENT owned-receipt pointer from state at render
+    time (ORCH-050), so both the fresh and the resumed reviewer edge carry the
+    receipt file by absolute path plus the derived overlay facts with the
+    disposition current as of that render (D-0002)."""
+    def receipt_kwargs():
+        overlay, pointer = _current_verification_overlay(session_uuid)
+        return {
+            "verification_overlay": overlay,
+            "verification_receipt_path": (
+                pointer.get("receipt_path")
+                if isinstance(pointer, dict) else None),
+        }
+
     def runner(config, context, selected, build_status_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None, surface_io_out=None,
@@ -4544,8 +4906,9 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                 assemble_build_reviewer_context(
                     ctx, sel, plan_json_path, plan_md_path, p,
                     baseline_note=baseline_note, baseline_repos=baseline_repos,
-                    build_summary_path=build_summary_path, assets_dir=assets_dir,
-                    context_revision=context_revision),
+                    build_summary_path=build_summary_path,
+                    assets_dir=assets_dir, context_revision=context_revision,
+                    **receipt_kwargs()),
             resume_context_fn=lambda p, context_update=None, assets_dir=None,
                 context_revision=None:
                 assemble_build_reviewer_resume_context(
@@ -4553,7 +4916,8 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                     context_update=context_update, baseline_note=baseline_note,
                     baseline_repos=baseline_repos,
                     build_summary_path=build_summary_path,
-                    assets_dir=assets_dir, context_revision=context_revision))
+                    assets_dir=assets_dir, context_revision=context_revision,
+                    **receipt_kwargs()))
     # See make_planning_advisor_runner: marks a real surface-capable closure.
     runner._coplan_surface_capable = True
     return runner
@@ -4940,9 +5304,19 @@ def builder_needs_input_text():
     return "builder needs your input"
 
 
-def builder_review_text(build_status_path, enabled=False):
-    return "build ready for review — %s" % ui.render_path(
+def builder_review_text(build_status_path, enabled=False, overlay=None,
+                        receipt_path=None, agent_status_path=None):
+    """The building-phase human-gate banner line, plus — when an owned
+    verification receipt binds the current candidate (ORCH-050/UX-021) — the
+    derived overlay block: owned facts, the separately-labeled agent prose
+    pointer, and the contradiction warning. With no overlay the historical
+    one-line banner is returned byte-identically."""
+    text = "build ready for review — %s" % ui.render_path(
         build_status_path, enabled)
+    block = render_verification_overlay_block(
+        overlay, receipt_path=receipt_path,
+        agent_status_path=agent_status_path)
+    return text + block if block else text
 
 
 def builder_done_text(build_status_path, enabled=False):
@@ -5804,10 +6178,10 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
                phase=None, is_resume=False, seed_artifact_paths=None,
                on_first_send_accepted=None, headless=False,
-                review_allow_ask=True, gate_preview=None,
-                 require_pending_question=False, review_path=None,
-                 save_pending_turn_fn=None, clear_pending_turn_fn=None,
-                 spath=None, session_uuid=None):
+                 review_allow_ask=True, gate_preview=None,
+                  require_pending_question=False, review_path=None,
+                  save_pending_turn_fn=None, clear_pending_turn_fn=None,
+                  spath=None, session_uuid=None, build_summary_path=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -6250,6 +6624,16 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     readiness = _record_readiness_from_transaction(
                         session_uuid, role, review_rounds, trace, txn_result,
                         missing_reason=txn_missing_reason)
+                    # Bind this promotion to its owned receipt (D-0002): write
+                    # the current-receipt pointer carrying every overlay field
+                    # + the once-computed contradiction signal (D-0008) when the
+                    # transaction is green and bound; record a red/unverified
+                    # transaction `rejected`; abandon a prior still-pending
+                    # pointer whose candidate is being replaced (D-0005).
+                    _update_receipt_pointer_for_readiness(
+                        session_uuid, role, review_rounds, trace, txn_result,
+                        readiness, status_path,
+                        summary_path=build_summary_path)
                     if readiness and readiness.get("state") == "unverified":
                         state_store.invalidate_ready_status(status_path)
                         # SAME wrap-and-hand-back mechanism as any other
@@ -6463,7 +6847,47 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     reviewer_role=reviewer_role,
                                     gate="reviewer_needs_user",
                                     action="downgrade_revise")
+                        # ORCH-050 / CV-050 (D-0001/D-0004/D-0005): review
+                        # dispositions for the bound owned receipt, and the
+                        # mechanical supersession of defeated verification
+                        # challenges. Builder + a current receipt pointer only;
+                        # every other role and every no-receipt path behaves
+                        # exactly as before.
+                        receipt_pointer = (
+                            state_store.read_current_receipt_pointer(
+                                session_uuid)
+                            if role == "builder" and session_uuid else None)
+                        blocking_findings = []
+                        defeated_challenges = []
+                        if receipt_pointer and v == "revise":
+                            blocking_findings, defeated_challenges = (
+                                _classify_blocking_verification_challenges(
+                                    verdict, receipt_pointer))
+                        suppress_reopen_for_challenges = bool(
+                            blocking_findings) and len(
+                                defeated_challenges) == len(blocking_findings)
+                        disposition_round = (
+                            state_store.current_phase_round(
+                                session_uuid, phase, reviewer_role,
+                                default=review_rounds)
+                            if session_uuid else None)
                         if v == "approve":
+                            if receipt_pointer:
+                                # accepted ONLY when the candidate being
+                                # approved is still exactly the candidate the
+                                # receipt verified (A5/D-0005); otherwise the
+                                # receipt's candidate was abandoned (rejected).
+                                _emit_verification_disposition(
+                                    session_uuid, trace,
+                                    receipt_pointer["transaction_id"],
+                                    (verification.DISPOSITION_ACCEPTED
+                                     if _accepted_manifest_matches(
+                                         receipt_pointer)
+                                     else verification.DISPOSITION_REJECTED),
+                                    review_round=disposition_round,
+                                    reviewed_manifest_digest=(
+                                        receipt_pointer.get(
+                                            "manifest_digest")))
                             # Only an explicit approve reaches the user gate.
                             review_rounds = 0
                             # Seed the hash-gate baseline so the NEXT unchanged
@@ -6501,9 +6925,44 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     from_role=reviewer_role,
                                     to_role=role, kind="needs_user")
                             review_action = "continue"
+                        elif suppress_reopen_for_challenges:
+                            # D-0004 mechanical supersession: EVERY blocking
+                            # finding is an uncited-or-contradicted verification
+                            # challenge against a candidate the green owned
+                            # receipt certifies. The FINDINGS are superseded
+                            # (recorded, never erased); the transaction
+                            # SURVIVES as `pending_review` — NO builder reopen,
+                            # NO review.handoff — and the fall-through user-gate
+                            # outcome drives the final disposition (D-0005).
+                            _record_findings(
+                                session_uuid,
+                                _verdict_with_superseded_challenges(
+                                    verdict, defeated_challenges,
+                                    receipt_pointer),
+                                reviewer_role, phase, disposition_round,
+                                review_path)
+                            if trace:
+                                trace.event(
+                                    "verification.challenges_superseded",
+                                    role=reviewer_role, round=review_rounds,
+                                    transaction_id=receipt_pointer.get(
+                                        "transaction_id"),
+                                    superseded_count=len(defeated_challenges))
                         elif review_rounds < REVIEW_ROUND_CAP:
                             # A legitimate revise (reviewer wants changes): hand
-                            # back to the role for another pass.
+                            # back to the role for another pass. A VALID
+                            # blocking finding invalidates the green transaction
+                            # (D-0005): superseded_by_finding, NEVER accepted.
+                            if receipt_pointer and blocking_findings:
+                                _emit_verification_disposition(
+                                    session_uuid, trace,
+                                    receipt_pointer["transaction_id"],
+                                    verification
+                                    .DISPOSITION_SUPERSEDED_BY_FINDING,
+                                    review_round=disposition_round,
+                                    reviewed_manifest_digest=(
+                                        receipt_pointer.get(
+                                            "manifest_digest")))
                             pending = assemble_reviewer_handoff(
                                 "revise", verdict, artifact=artifact_noun,
                                 review_path=review_path)
@@ -6543,6 +7002,19 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         else:
                             # Round cap reached on a legitimate revise: fall
                             # through to the user with the dissent attached (D5).
+                            # The unresolved blocking finding still invalidates
+                            # the green transaction (D-0005): the gate cannot
+                            # later accept it.
+                            if receipt_pointer and blocking_findings:
+                                _emit_verification_disposition(
+                                    session_uuid, trace,
+                                    receipt_pointer["transaction_id"],
+                                    verification
+                                    .DISPOSITION_SUPERSEDED_BY_FINDING,
+                                    review_round=disposition_round,
+                                    reviewed_manifest_digest=(
+                                        receipt_pointer.get(
+                                            "manifest_digest")))
                             dissent = _dissent_suffix(verdict)
                             dissent_verdict = verdict
                             review_rounds = 0
@@ -6620,6 +7092,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     action="approve", gate="ready_for_review")
                         trace.event("gate.show", role=role, gate="done",
                                     path=status_path)
+                    # D-0004/D-0005 gate-outcome grant: an explicit human
+                    # approve (or the headless auto-approve above) accepts the
+                    # still-pending bound transaction while the candidate
+                    # manifest equals the receipt's; a reviewer judgment
+                    # already made is never second-guessed here.
+                    if role == "builder":
+                        _grant_gate_acceptance(session_uuid, trace)
                     ui.banner(io_out, done_text(
                         status_path, ui.is_tty(io_out)), "done")
                     outcome_kind = "approved"
@@ -7548,7 +8027,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     runner = reviewer_runner or make_build_reviewer_runner(
         plan_json_path, plan_md_path, baseline_note=baseline_note,
         baseline_repos=baseline_repos, trace=trace,
-        extra_writable_dir=sessions_dir, build_summary_path=build_summary_path)
+        extra_writable_dir=sessions_dir, build_summary_path=build_summary_path,
+        session_uuid=session_uuid)
     consumed = plan_consumed_upstream(plan_json_path, plan_md_path,
                                       building_epoch)
     review_fn = make_review_fn(
@@ -7600,12 +8080,23 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         if on_outcome:
             on_outcome(outcome, payload)
 
+    def _gate_review_text(_p, en=False):
+        # UX-021: the human gate renders the SAME derived overlay the reviewer
+        # surface carries — read fresh from the current-receipt pointer at
+        # banner time, with the agent-authored prose labeled separately and a
+        # visible warning when the contradiction flag is set.
+        overlay, pointer = _current_verification_overlay(session_uuid)
+        return builder_review_text(
+            build_surface_path or "", en, overlay=overlay,
+            receipt_path=(pointer.get("receipt_path")
+                          if isinstance(pointer, dict) else None),
+            agent_status_path=build_status_path)
+
     loop_kwargs = dict(
         role="builder", review_fn=review_fn, trace=trace,
         reviewer_role=BUILD_REVIEWER,
         needs_input_text=builder_needs_input_text,
-        review_text=lambda _p, en=False: builder_review_text(
-            build_surface_path or "", en),
+        review_text=_gate_review_text,
         done_text=lambda _p, en=False: builder_done_text(
             build_surface_path or "", en),
         artifact_noun="build",
@@ -7626,7 +8117,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         seed_artifact_paths=[plan_json_path, plan_md_path], headless=headless,
         gate_preview=gate_preview, require_pending_question=True,
         review_path=build_review_path, save_pending_turn_fn=save_pending_turn_fn,
-        clear_pending_turn_fn=clear_pending_turn_fn)
+        clear_pending_turn_fn=clear_pending_turn_fn,
+        build_summary_path=build_summary_path)
 
     if cfg["controller"] == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn

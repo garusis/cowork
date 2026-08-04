@@ -738,6 +738,56 @@ whole-inventory readiness comparison, and report their final-suite guarantee
 as `legacy_unknown` rather than inventing one. See `roles/planner.md` for the
 schema-2 inventory format plans should write going forward.
 
+#### The receipt downstream: overlays, dispositions, supersession, reuse
+
+The transaction's terminal result is a first-class **receipt**
+(`verification/transactions/<txn>/result.json`), and what decides things
+downstream is the receipt — never the builder's prose about verification:
+
+- **One derived overlay, both gates.** A verified promotion persists a
+  current-receipt pointer (transaction id, candidate manifest+index binding,
+  verdict, final-suite identity, command count, review round, disposition).
+  From it Cowork renders ONE overlay of content-free facts on two surfaces:
+  the build-reviewer's handoff (fresh and resumed edges, with the receipt
+  file delivered by absolute path alongside the other artifacts) and the
+  building-phase human approval gate (a compact banner block, with the
+  agent's own verification prose labeled separately as self-reported). A
+  structured **contradiction signal** — computed once, from owned state —
+  marks the overlay on both surfaces when the builder's verification prose is
+  missing or disagrees with the receipt. It is visible, never blocking.
+- **Four-state review disposition.** Every owned transaction carries
+  `pending_review` → `accepted` / `superseded_by_finding` / `rejected`, bound
+  to (transaction id, candidate manifest) and recorded as a
+  `verification.disposition` trace event (the trace is authoritative; a small
+  per-session sidecar is the reconciled read-through cache). `accepted`
+  requires an approving verdict — or an explicit gate approval — with the
+  accepted candidate manifest still equal to the transaction's captured
+  manifest; a valid later blocking finding supersedes the green transaction;
+  a red/unverified transaction or an abandoned candidate is `rejected`. The
+  measurement record joins the disposition onto each transaction; the report
+  lists every transaction with its disposition, prints **incurred**
+  verification cost (all transactions) separately from **accepted**
+  verification cost (accepted only), and completion value is granted only for
+  an `accepted` transaction. Legacy sessions with no owned transactions keep
+  the controller-log-derived completion path unchanged.
+- **Mechanical supersession of defeated verification challenges.** A reviewer
+  verification challenge against a candidate a green owned receipt certifies
+  must cite the receipt (`corrective_findings[*].verification_challenge:
+  {transaction_id, reason_code}`). A `revise` whose ONLY blocking findings
+  are challenges that are uncited — or contradicted by the owned receipt —
+  does NOT reopen the builder: the findings are recorded
+  `closure=superseded` + `superseded_by_transaction` (never erased), the
+  transaction survives as `pending_review`, and the user gate's outcome
+  drives its final disposition. Any non-verification blocking finding, or a
+  validly-cited challenge, reopens exactly as before.
+- **Reuse booked as avoided cost.** A correction that changes only
+  agent-authored artifacts (candidate manifest and Git index unchanged) hits
+  the existing single-flight reuse: no command re-runs, readiness stays bound
+  to the ORIGINAL transaction id, and the reuse is recorded from the
+  `verification.transaction` trace event's `reused_lock_result` flag as
+  **avoided cost** attributed to the reused transaction — with no second
+  incurred transaction.
+
 ### Evidence comes from the controllers' logs
 
 For everything **outside** an owned verification transaction — tool use,

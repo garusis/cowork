@@ -83,6 +83,26 @@
   },
   "ledger": {},
   "orphan_ends": [],
+  "owned_verification": {
+    "accepted_cost": {
+      "subprocess_wall_time_s": 0.0,
+      "work_items": 0
+    },
+    "avoided_cost": {
+      "reuse_count": 0,
+      "reused": [],
+      "subprocess_wall_time_s": 0.0
+    },
+    "cost": null,
+    "focused_attribution": [],
+    "incurred_cost": {
+      "subprocess_wall_time_s": 0.0,
+      "work_items": 0
+    },
+    "latest": null,
+    "transaction_count": 0,
+    "transactions": []
+  },
   "pricing": {
     "by_model": {},
     "captured_at": null,

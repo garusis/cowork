@@ -443,6 +443,30 @@ wj(f"{c5}/scores.json", {"evaluations": []})
 
 DISAGREEING_TURNS = 7      # the RECORD's value
 TRACE_TURNS = 2            # what a rebuild would produce
+
+
+def owned_verification_block():
+    """The additive ORCH-050 `owned_verification.*` fields for a pre-built
+    record that models NO owned transactions (the only pre-built fixture,
+    c5): every subfield the build side now always emits, at its empty/default
+    value — present so the record body names the current fields, with
+    contents that cannot change what the report renders for it. A fixture
+    that models owned transactions should be produced by running
+    `cowork_measure.build_record` over synthetic raw sources instead, so the
+    disposition join / cost rollups are computed by the real build side."""
+    return {
+        "transactions": [],
+        "transaction_count": 0,
+        "latest": None,
+        "cost": None,
+        "focused_attribution": [],
+        "incurred_cost": {"work_items": 0, "subprocess_wall_time_s": 0.0},
+        "accepted_cost": {"work_items": 0, "subprocess_wall_time_s": 0.0},
+        "avoided_cost": {"reuse_count": 0, "subprocess_wall_time_s": 0.0,
+                         "reused": []},
+    }
+
+
 wj(f"{c5}/measurement.json", {
     "schema_version": 1,
     "session": "c5-provenance-replay",
@@ -473,6 +497,9 @@ wj(f"{c5}/measurement.json", {
                  "open": 0, "by_severity": {}},
     "ledger": {}, "score_cohorts": {}, "enhancements": {}, "ingestion": {},
     "identities": {}, "replay": [],
+    # ORCH-050 additive fields: present at their empty/default values (this
+    # fixture models no owned transactions) — never a relaxed assertion.
+    "owned_verification": owned_verification_block(),
     "pricing": {"schema_version": 1, "snapshot_id": "empty",
                 "captured_at": None, "priced_turns": 0,
                 "unpriced_turns": DISAGREEING_TURNS, "by_model": {},

@@ -133,6 +133,9 @@ LINEAGE = (
     ("verification.commands", "verification"),
     ("verification.self_reported", "verification_summary.self_reported"),
     ("verification.contradicted", "verification_summary.contradicted"),
+    ("owned.incurred_cost", "owned_verification.incurred_cost"),
+    ("owned.accepted_cost", "owned_verification.accepted_cost"),
+    ("owned.avoided_cost", "owned_verification.avoided_cost"),
     ("tool_activity.by_role", "tool_activity"),
     ("verification.environment_recurrences", "environment_recurrences"),
     ("pricing.snapshot_id", "pricing.snapshot_id"),
@@ -588,11 +591,56 @@ def _section_owned_verification(record):
             if item.get("invalidation_reason"):
                 lines.append("      invalidated because: %s"
                              % item.get("invalidation_reason"))
+    # ORCH-050/CV-050: EVERY transaction with its review disposition, then the
+    # incurred-vs-accepted cost split — all figures read from the record.
+    transactions = _at(record, "owned_verification.transactions", [])
+    if isinstance(transactions, list) and transactions:
+        lines.append("")
+        lines.append("  Transactions (all, oldest first):")
+        for transaction in transactions:
+            if not isinstance(transaction, dict):
+                continue
+            line = ("    %-14s verdict=%-11s disposition=%s"
+                    % (str(transaction.get("transaction_id"))[:14],
+                       _fmt(transaction.get("verdict")),
+                       _fmt(transaction.get("disposition"))))
+            if transaction.get("review_round") is not None:
+                line += "  round=%s" % _fmt(transaction.get("review_round"))
+            reviewed = transaction.get("reviewed_manifest_digest")
+            if reviewed:
+                line += "  reviewed_manifest=%s" % str(reviewed)[:12]
+            lines.append(line)
+    incurred = _at(record, "owned_verification.incurred_cost", {}) or {}
+    accepted = _at(record, "owned_verification.accepted_cost", {}) or {}
+    lines.append("  incurred verification cost (ALL transactions): %s work "
+                 "item(s), subprocess wall %s"
+                 % (_fmt(incurred.get("work_items")),
+                    _fmt_ms(_secs_to_ms(
+                        incurred.get("subprocess_wall_time_s")))))
+    lines.append("  accepted verification cost (accepted dispositions only): "
+                 "%s work item(s), subprocess wall %s"
+                 % (_fmt(accepted.get("work_items")),
+                    _fmt_ms(_secs_to_ms(
+                        accepted.get("subprocess_wall_time_s")))))
+    avoided = _at(record, "owned_verification.avoided_cost", {}) or {}
+    if isinstance(avoided, dict) and avoided.get("reuse_count"):
+        reused_bits = []
+        for item in avoided.get("reused") or []:
+            if isinstance(item, dict):
+                reused_bits.append("%s x%s"
+                                   % (str(item.get("transaction_id"))[:12],
+                                      _fmt(item.get("reuse_count"))))
+        lines.append("  avoided cost via single-flight reuse: %s reuse(s), "
+                     "~subprocess wall %s avoided (reused: %s)"
+                     % (_fmt(avoided.get("reuse_count")),
+                        _fmt_ms(_secs_to_ms(
+                            avoided.get("subprocess_wall_time_s"))),
+                        ", ".join(reused_bits) or "(unattributed)"))
     transaction_count = _at(record, "owned_verification.transaction_count", 0)
     if isinstance(transaction_count, int) and transaction_count > 1:
         lines.append("")
         lines.append("  %s owned transaction(s) recorded this session "
-                     "(showing the latest above)." % _fmt(transaction_count))
+                     "(the latest is detailed above)." % _fmt(transaction_count))
     lines.append("")
     return lines
 

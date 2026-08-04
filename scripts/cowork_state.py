@@ -1103,6 +1103,95 @@ def verification_lock_path_for(session_uuid, request_key):
                         "locks", "%s.lock" % request_key)
 
 
+# --------------------------------------------------------------------------- #
+# Current-receipt pointer + review dispositions (ORCH-050 / CV-050 / UX-021). #
+#                                                                              #
+# The pointer binds a builder promotion to the OWNED transaction receipt the   #
+# gate used, so the reviewer surface and the human gate render one derived     #
+# overlay from owned state rather than from agent prose. The dispositions      #
+# sidecar is the read-through cache of the `verification.disposition` trace    #
+# events (the trace stays authoritative); both are orchestrator-written, never #
+# agent-writable.                                                              #
+# --------------------------------------------------------------------------- #
+
+
+def current_receipt_pointer_path_for(session_uuid):
+    """Path of the current-receipt pointer: the binding between the builder's
+    latest verified promotion and the owned transaction receipt the gate used
+    (transaction id, receipt path, manifest/index digests, verdict, final-suite
+    identity, command count, review round, disposition, contradiction flag).
+    One file per session — it always names the CURRENT bound candidate."""
+    return os.path.join(verification_root_for(session_uuid),
+                        "current_receipt.json")
+
+
+def write_current_receipt_pointer(session_uuid, pointer):
+    """Persist the current-receipt pointer atomically. Tolerant: a write
+    failure returns False and the surfaces simply render no overlay, matching
+    the legacy no-transaction path."""
+    if not session_uuid or not isinstance(pointer, dict):
+        return False
+    return write_json_atomic(current_receipt_pointer_path_for(session_uuid),
+                             pointer)
+
+
+def read_current_receipt_pointer(session_uuid):
+    """The current-receipt pointer as a dict, or None when absent/malformed
+    (fail-closed: no pointer, no overlay)."""
+    if not session_uuid:
+        return None
+    return read_json_tolerant(current_receipt_pointer_path_for(session_uuid))
+
+
+def verification_dispositions_path_for(session_uuid):
+    """Path of the review-disposition sidecar (D-0001): a small append-friendly
+    JSON document holding one entry per `verification.disposition` trace event,
+    keyed by transaction id on read. The trace is the single source of truth;
+    this file is a reconciled read-through cache so a resumed or `--report`-only
+    pass can render dispositions without replaying the whole trace."""
+    return os.path.join(verification_root_for(session_uuid),
+                        "dispositions.json")
+
+
+def write_verification_disposition(session_uuid, entry):
+    """Append one disposition entry (`{transaction_id, disposition,
+    review_round, reviewed_manifest_digest}`) to the sidecar, atomically.
+    `recorded_at` is stamped here when absent. Tolerant: returns False on any
+    failure rather than breaking the run."""
+    if not session_uuid or not isinstance(entry, dict) \
+            or not entry.get("transaction_id"):
+        return False
+    path = verification_dispositions_path_for(session_uuid)
+    data = read_json_tolerant(path)
+    if not isinstance(data, dict):
+        data = {}
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    record = dict(entry)
+    record.setdefault("recorded_at", _utc_now())
+    entries.append(record)
+    data["entries"] = entries
+    return write_json_atomic(path, data)
+
+
+def read_verification_dispositions(session_uuid):
+    """The LATEST disposition entry per transaction id, as
+    `{transaction_id: entry}`. Append order decides — a later entry for the
+    same transaction id supersedes the earlier one. Tolerant: `{}` when the
+    sidecar is missing or malformed."""
+    if not session_uuid:
+        return {}
+    data = read_json_tolerant(verification_dispositions_path_for(session_uuid))
+    entries = (data or {}).get("entries")
+    out = {}
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("transaction_id"):
+                out[entry["transaction_id"]] = entry
+    return out
+
+
 def write_json_atomic(path, data):
     """Write `data` as JSON atomically (write-to-temp-then-`os.replace`),
     creating parent directories as needed. The single shared atomic-write
