@@ -385,6 +385,7 @@ class OpencodeBridgeTest(unittest.TestCase):
         "tools:\n"
         "  task: false\n"
         '  "*_*": false\n'
+        "  external_directory: true\n"
         "  read: true\n"
         "  edit: true\n"
         "  write: true\n"
