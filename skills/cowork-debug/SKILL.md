@@ -17,8 +17,12 @@ Reconstruct what happened in a cowork run by joining four evidence sources:
    decisions.
 3. `~/.cowork/sessions/<session_uuid>/scout.intel.json` and
    `~/.cowork/sessions/<session_uuid>/scout-review.json` for
-   current/final artifacts.
-4. Claude/Codex local logs for role conversation and tool history.
+   current/final artifacts. Also useful in the same directory:
+   `identities.json` (per-role tool + resolved model + controller session id —
+   the fastest jump from a role to its controller log) and
+   `evaluation_queue.jsonl` (raw peer-evaluation lifecycle; malformed or
+   silently-failed evaluations are visible only here, not in `scores.json`).
+4. Claude/Codex/OpenCode local logs for role conversation and tool history.
 
 Do not rely on terminal transcripts. Do not mutate session artifacts while
 debugging. Terminal transcripts are useful as symptom reports only; verify them
@@ -38,6 +42,8 @@ against trace events, artifacts, and controller logs.
 3. Locate controller logs:
    - Claude session id: `~/.claude/projects/**/<session_id>.jsonl`
    - Codex thread id: `~/.codex/sessions/**/rollout-*<thread_id>.jsonl`
+   - OpenCode session id (`ses_…`): rows in
+     `~/.local/share/opencode/opencode.db` (sqlite)
 4. Build a timeline:
    - First use trace events for cowork decisions: status reads, gates, review
      rounds, invalidations, session saves, context acks, controller invocations.
@@ -132,6 +138,36 @@ Useful records:
 Codex may include reasoning or summaries. Treat summaries as lossy unless raw
 messages/tool events are unavailable.
 
+## Reading OpenCode Logs
+
+OpenCode has no per-session JSONL; everything lives in the sqlite database
+`~/.local/share/opencode/opencode.db`. Given a `ses_…` id from
+`.cowork/session.json` or `identities.json`:
+
+- `session` — one row per session (`id`, `time_created` in epoch ms).
+- `part` — the conversation: each row's `data` column is JSON. Filter with
+  `json_extract(data,'$.type')='tool'` for tool calls;
+  `$.tool` is the tool name, `$.state.status` is
+  `completed`/`error`, `$.state.input.filePath` the target, and
+  `$.state.error` carries the full denial text **including the resolved
+  permission rule list** — the ground truth for "why was this write/read
+  rejected".
+- `permission` — durable per-project permission approvals.
+- `message` / `session_message` — assistant/user message bodies.
+
+Example — every tool error in a role's session:
+
+```bash
+sqlite3 ~/.local/share/opencode/opencode.db \
+  "SELECT json_extract(data,'\$.tool'), json_extract(data,'\$.state.error')
+   FROM part WHERE session_id='ses_XXX'
+   AND json_extract(data,'\$.type')='tool'
+   AND json_extract(data,'\$.state.status')='error'"
+```
+
+The model's own prose about *why* something failed is narrative, not
+evidence — always confirm against `$.state.error` and the rule list.
+
 ## Common Diagnoses
 
 - Wrong `Approve & finish?` gate: check latest `status.read`; if it read
@@ -150,6 +186,18 @@ messages/tool events are unavailable.
 - Repeated terminal lines: compare UI render diagnostics with controller turns,
   artifacts, and controller logs. If only the transcript repeats, suspect Rich
   Live rendering/terminal redraw instead of role duplication.
+- Trace ends at `controller.turn.start` with no terminal event (no
+  `controller.turn.end`, no `run.end`): the cowork process was killed
+  externally (host-app/harness process-group reaping is the usual culprit),
+  not hung. Confirm with `ps`; recover by resuming the session — the active
+  role is redispatched onto its persisted state. Launch future runs detached
+  (double-fork + `setsid`; see the cowork-cli skill).
+- `stale_noop` / `stale_noop.unresolved` on a lead: the turn produced no
+  artifact-byte change. Before blaming the model, check the controller log
+  for **denied writes** (opencode: `part` rows with `$.state.status='error'`)
+  — a role whose canonical writes are blocked may have parked a complete
+  artifact in a fallback location such as
+  `~/.local/share/opencode/tool-output/`.
 
 ## Output Shape
 

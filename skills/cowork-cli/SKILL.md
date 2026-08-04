@@ -46,6 +46,32 @@ build-reviewer with no human gates. Leads never block (they record an
 assumption and proceed), reviewers review with what they have, each phase ends
 on reviewer consensus or the review-round cap.
 
+### Detached launch (agent harnesses that reap child processes)
+
+Many agent harnesses and host apps kill the process **group** of background
+shells when a tool call ends or the app cleans up — a plain `&` background
+run or even `nohup` dies mid-turn (the trace freezes at
+`controller.turn.start` with no terminal event). Launch cowork detached via
+double-fork + `setsid` so it survives:
+
+```python
+import os, subprocess, sys
+pid = os.fork()
+if pid > 0:
+    os.waitpid(pid, 0); sys.exit(0)
+os.setsid()
+if os.fork() > 0:
+    os._exit(0)
+os.chdir(WORKDIR)
+with open(LOGFILE, "ab") as log:
+    subprocess.Popen(["cowork", "--headless", "--context-file", "brief.md"],
+                     stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+os._exit(0)
+```
+
+A killed run is not lost: resuming redispatches the active phase's role onto
+its persisted state (see Resume below).
+
 ### Unattended, isolated in a git worktree (preferred when editing a repo)
 
 ```bash
@@ -108,6 +134,13 @@ cowork --session-file .cowork/session.<uuid>.json --headless --context "…"
 On resume without `--context`, cowork sends "Continue the session." and the
 current phase's role picks up where it left off.
 
+Resume-with-context is also the **supervisor recovery tool** for a wedged
+phase: after an external kill, or after fixing an environment/harness bug
+that blocked the active role, resume with a `--context` that states what was
+fixed and what the role should do next. The active phase's role is
+redispatched onto its persisted partial state (edits, artifacts) rather than
+restarting the phase.
+
 `--resume` opens an interactive picker — **needs a TTY, not for agents**. Target
 a specific session with `--session-file` instead.
 
@@ -126,6 +159,10 @@ scouting, `planner`/`planning-advisor` while planning, `builder`/`build-reviewer
 while building). A switch resets that role's model/effort pins. Repeatable
 switches apply as one all-or-nothing write. Cannot combine with `--team`,
 `--config`, `--new`, `--no-session`, `--check`, or `--report`.
+
+Known gap: `--allow-controllers` also cannot combine with a fresh
+`--config` team — to restrict controllers on a configured fresh run, enforce
+the restriction yourself at each switch decision instead of passing the flag.
 
 ## `--config` grammar
 
@@ -208,6 +245,16 @@ uncommitted.
 Mid-planning the planner can hand back to the scout, and mid-building the
 builder can hand back to the planner, with a handoff note. A killed run resumes
 into its persisted phase without re-running earlier roles.
+
+Trace events `stale_noop` / `stale_noop.unresolved` mean a lead's turn ended
+**without its artifact changing on disk**: cowork re-nudges once
+(`stale_noop`), and if the follow-up turn still changes nothing
+(`stale_noop.unresolved`) the headless run ends. Before blaming the model,
+check whether the role's writes are being **denied** — inspect the
+controller's own session log for write-tool errors (for opencode:
+`~/.local/share/opencode/opencode.db`). A role whose canonical writes are
+blocked may have delivered a complete artifact to a fallback location such as
+`~/.local/share/opencode/tool-output/`.
 
 ## Exit codes
 
