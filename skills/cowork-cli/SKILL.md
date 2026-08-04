@@ -278,6 +278,11 @@ add `--headless` (with context) or hand the session to the user.
   (`Agent`/`Task` dispatches are denied and recorded). Never invoke `cowork`
   from inside a cowork role.
 - **`cwd` decides where the session lands.** Run from the repo root you mean.
+- **`cwd` does NOT decide which code runs.** The `cowork` shim on PATH
+  executes its own checkout's `scripts/` (typically the main repo), even when
+  launched from a worktree. A cowork-code fix committed only on a worktree
+  branch never runs — land it on the shim's checkout (usually main) before
+  resuming a run that depends on it.
 - **Confinement is instruction-level plus a broker/kernel boundary, not a
   promise of a sandbox.** Writable scope is the selected worktree, the acting
   role's declared outputs, and its private state. On Linux, opencode roles do
