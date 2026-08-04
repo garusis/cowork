@@ -118,6 +118,22 @@ VERDICT_GREEN = "green"
 VERDICT_RED = "red"
 VERDICT_UNVERIFIED = "unverified"
 
+# Review dispositions for an owned transaction (ORCH-050 / CV-050). Bound to
+# (transaction_id, candidate manifest) by the orchestrator at the review
+# verdict / gate; carried by `verification.disposition` trace events and the
+# reconciled per-session sidecar. `pending_review` until a review round judges
+# the bound candidate; `accepted` only on an approving verdict (or an explicit
+# gate approval) with the accepted candidate manifest still equal to the
+# transaction's captured manifest; `superseded_by_finding` when a valid later
+# blocking finding invalidates the green transaction; `rejected` when the
+# transaction itself was red/unverified or its candidate was abandoned.
+DISPOSITION_PENDING_REVIEW = "pending_review"
+DISPOSITION_ACCEPTED = "accepted"
+DISPOSITION_SUPERSEDED_BY_FINDING = "superseded_by_finding"
+DISPOSITION_REJECTED = "rejected"
+DISPOSITIONS = (DISPOSITION_PENDING_REVIEW, DISPOSITION_ACCEPTED,
+                DISPOSITION_SUPERSEDED_BY_FINDING, DISPOSITION_REJECTED)
+
 # Worker exit code for a request the worker validated and REJECTED before
 # ever publishing identity (e.g. a protocol-2 request missing a required
 # `ledger_attempt_id`) — distinct from 2 (unreadable request) and a normal

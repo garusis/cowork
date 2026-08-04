@@ -102,6 +102,8 @@ SLOT_LABELS = {
     "build_status": "builder status JSON (status + verification log)",
     "build_summary": "builder markdown summary (the user's review surface)",
     "build_baseline": "build-baseline metadata (per-root start commit + dirty)",
+    "verification_receipt": "owned verification receipt (orchestrator-run "
+                            "transaction result)",
     "review": "reviewer verdict + findings (JSON)",
     "payload": "hand-back note",
     "artifacts": "session artifact",
@@ -529,6 +531,19 @@ _FACT_SCHEMAS = {
     "artifact_noun": _in(ARTIFACT_NOUNS),
     "reason_code": is_content_free_token,
     "source_code": is_content_free_token,
+    # ORCH-050 owned-verification overlay facts (derived tokens only — a hex
+    # id, digests, enum verdicts/bindings/dispositions, an integer count, a
+    # boolean flag; never a byte of agent prose).
+    "txn_id": is_content_free_token,
+    "manifest_digest": is_content_free_token,
+    "index_digest": is_content_free_token,
+    "verdict": _in({"green", "red", "unverified"}),
+    "final_suite_label": is_content_free_token,
+    "final_suite_binding": _in({"ran_once", "not_reached", "legacy_unknown"}),
+    "command_count": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "disposition": _in({"pending_review", "accepted", "superseded_by_finding",
+                        "rejected"}),
+    "contradiction": lambda v: isinstance(v, bool),
 }
 
 
@@ -716,30 +731,66 @@ def _render_advisor_ctx(descriptor_lines, facts, ctx):
 
 # ---- route 7: builder -> build-reviewer (artifacts by path; live diff) ----- #
 
+def _render_owned_verification_block(facts):
+    """The ORCH-050 owned-facts overlay block, rendered from the edge's
+    closed-schema fact tokens (derived from Cowork-owned records — never from
+    agent prose). Empty string when no owned receipt binds (legacy sessions
+    render exactly as before). A set `contradiction` flag renders the marked
+    CONTRADICTION line."""
+    if not facts.get("txn_id"):
+        return ""
+    lines = [
+        "Owned verification receipt (orchestrator-derived — the authoritative",
+        "verification fact base for this review; the builder's own verification",
+        "prose is secondary to it):",
+        "  transaction=%s  verdict=%s  final_suite=%s (%s)"
+        % (facts.get("txn_id"), facts.get("verdict"),
+           facts.get("final_suite_label"), facts.get("final_suite_binding")),
+        "  manifest=%s  index=%s  commands=%s"
+        % (str(facts.get("manifest_digest"))[:12],
+           str(facts.get("index_digest"))[:12], facts.get("command_count")),
+        "  disposition=%s" % facts.get("disposition"),
+        "  The receipt file itself (result.json) reaches you by absolute path",
+        "  among the artifacts above (the verification_receipt slot).",
+    ]
+    if facts.get("contradiction"):
+        lines.append(
+            "  CONTRADICTION: the builder's own verification prose is missing")
+        lines.append(
+            "  or disagrees with this receipt — trust the receipt, not the"
+            " prose.")
+    return "\n".join(lines)
+
+
 def _render_build_reviewer_ctx(descriptor_lines, facts, ctx):
     team = ", ".join(facts.get("team") or []) or "(unspecified)"
-    return (
+    parts = [
         "The files below are the current authoritative files on disk — the "
         "SAME shared session context the builder was given, both approved plan "
         "files, the builder's status JSON, the builder's markdown summary "
         "(when present), and the build-baseline metadata. Read them from disk."
-        "\n%s\n\n"
-        "Team on this session: %s\n\n"
-        "%s\n\n"
-        "%s"
-        % (descriptor_lines, team, FULL_REREAD_INSTRUCTION,
-           build_diff_recipe(ctx.get("repos"))))
+        "\n%s" % descriptor_lines,
+        "Team on this session: %s" % team,
+    ]
+    owned = _render_owned_verification_block(facts)
+    if owned:
+        parts.append(owned)
+    parts.extend([FULL_REREAD_INSTRUCTION, build_diff_recipe(ctx.get("repos"))])
+    return "\n\n".join(parts)
 
 
 def _render_build_reviewer_resume(descriptor_lines, facts, ctx):
-    body = (
-        "The builder has updated its work since your last review. Re-review the "
-        "current full working-tree delta against the plan and the builder's "
-        "current status. The current authoritative files are on disk:\n%s\n\n"
-        "%s\n\n"
-        "%s"
-        % (descriptor_lines, FULL_REREAD_INSTRUCTION,
-           build_diff_recipe(ctx.get("repos"))))
+    parts = [
+        "The builder has updated its work since your last review. Re-review "
+        "the current full working-tree delta against the plan and the "
+        "builder's current status. The current authoritative files are on "
+        "disk:\n%s" % descriptor_lines,
+    ]
+    owned = _render_owned_verification_block(facts)
+    if owned:
+        parts.append(owned)
+    parts.extend([FULL_REREAD_INSTRUCTION, build_diff_recipe(ctx.get("repos"))])
+    body = "\n\n".join(parts)
     prefix = ctx.get("context_update_prefix")
     return (prefix + "\n\n" + body) if prefix else body
 
@@ -908,23 +959,32 @@ EDGES = {
         "sources": ["plan_json", "plan_md"], "required": ["plan_json", "plan_md"],
         "facts": (), "render": _render_plan_updated,
     },
-    # route 7 (build_summary optional; build_status + build_baseline required)
+    # route 7 (build_summary + verification_receipt optional;
+    # build_status + build_baseline required). The ORCH-050 overlay facts are
+    # declared on BOTH edges; they ride only when an owned receipt binds.
     "builder->build-reviewer:review_ctx": {
         "from_role": "builder", "to_role": "build-reviewer",
         "kind": "review_ctx",
         "sources": ["context", "plan_json", "plan_md", "build_status",
-                    "build_summary", "build_baseline"],
+                    "build_summary", "build_baseline",
+                    "verification_receipt"],
         "required": ["context", "plan_json", "plan_md", "build_status",
                      "build_baseline"],
-        "facts": ("team",), "ctx_keys": ("repos",),
+        "facts": ("team", "txn_id", "manifest_digest", "index_digest",
+                  "verdict", "final_suite_label", "final_suite_binding",
+                  "command_count", "disposition", "contradiction"),
+        "ctx_keys": ("repos",),
         "render": _render_build_reviewer_ctx,
     },
     "builder->build-reviewer:review_resume": {
         "from_role": "builder", "to_role": "build-reviewer", "kind": "resume",
         "sources": ["plan_json", "plan_md", "build_status", "build_summary",
-                    "build_baseline"],
+                    "build_baseline", "verification_receipt"],
         "required": ["plan_json", "plan_md", "build_status", "build_baseline"],
-        "facts": ("team",), "ctx_keys": ("repos", "context_update_prefix"),
+        "facts": ("team", "txn_id", "manifest_digest", "index_digest",
+                  "verdict", "final_suite_label", "final_suite_binding",
+                  "command_count", "disposition", "contradiction"),
+        "ctx_keys": ("repos", "context_update_prefix"),
         "render": _render_build_reviewer_resume,
     },
     # route 9

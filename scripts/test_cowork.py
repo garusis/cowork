@@ -10313,6 +10313,20 @@ class ReviewerFailureGateTest(unittest.TestCase):
         path = self._path()
         trace = self._trace(path)
         reviewer = self._review_fn([{"verdict": "approve"}])
+        # The red transaction below is now durably recorded `rejected`
+        # (ORCH-050 dispositions): point the sessions root at a throwaway dir
+        # so the sidecar write lands in the fixture, not the real home dir.
+        _sessions_tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(_sessions_tmp, ignore_errors=True))
+        _prior_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = _sessions_tmp
+
+        def _restore_root():
+            if _prior_root is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = _prior_root
+        self.addCleanup(_restore_root)
         with mock.patch.object(
                 cowork, "_record_readiness",
                 side_effect=AssertionError(
@@ -14509,7 +14523,14 @@ class TransportChokePointTests(unittest.TestCase):
         vals = {"team": ["scout"], "role": "scout", "phase": "scouting",
                 "from_controller": "claude", "to_controller": "codex",
                 "artifact_noun": "intel", "reason_code": "reviewer_failure",
-                "source_code": "gate"}
+                "source_code": "gate",
+                # ORCH-050 owned-verification overlay facts (both
+                # builder->build-reviewer edges declare them).
+                "txn_id": "T-1", "manifest_digest": "ab" * 32,
+                "index_digest": "cd" * 32, "verdict": "green",
+                "final_suite_label": "full", "final_suite_binding": "ran_once",
+                "command_count": 1, "disposition": "pending_review",
+                "contradiction": False}
         return {k: vals[k] for k in spec["facts"]}
 
     def _edge_ctx(self, spec):
@@ -24978,6 +24999,687 @@ class OwnedVerificationArtifactSelfValidationTests(unittest.TestCase):
             verification.validate_argv_safety(entries, checkout_stub)
         finally:
             shutil.rmtree(checkout_stub, ignore_errors=True)
+
+
+class OwnedOverlayRenderTests(_OwnedVerificationTestBase):
+    """ORCH-050 criterion 1: ONE orchestrator-derived verification overlay
+    reaches BOTH gate surfaces — the build-reviewer handoff (fresh + resumed
+    edges, with the receipt file named by absolute path) and the
+    building-phase human approval gate. Every overlay field is derived from
+    the owned transaction result ON DISK, agent prose is labeled separately,
+    and the structured contradiction signal renders on both surfaces exactly
+    for the contradicting/missing-prose states."""
+
+    MANIFEST = "ab" * 32
+    INDEX = "cd" * 32
+
+    def _green_result(self):
+        txn_id = "T-green"
+        return txn_id, {
+            "transaction_id": txn_id,
+            "request_key": "k1",
+            "verdict": "green",
+            "final_suite_label": "full_unit_suite",
+            "final_suite_binding": "ran_once",
+            "attempts": [
+                {"label": "preflight", "kind": "preflight", "exit_code": 0,
+                 "evidence_state": "present", "wall_time_s": 0.5},
+                {"label": "full_unit_suite", "kind": "final_suite",
+                 "exit_code": 0, "evidence_state": "present",
+                 "wall_time_s": 2.5},
+            ],
+            "mutation": None,
+            "worker_identity_verified": True,
+            "reused_lock_result": False,
+            "snapshot": {"manifest_digest": self.MANIFEST,
+                         "index_digest": self.INDEX},
+            "created_at": "2026-08-01T00:00:00Z",
+            "finished_at": "2026-08-01T00:00:10Z",
+        }
+
+    def _persist_receipt(self, txn_id, result):
+        path = state_store.verification_result_path_for(
+            self.session_uuid, txn_id)
+        self.assertTrue(state_store.write_json_atomic(path, result))
+        return path
+
+    def _bind_pointer(self, result, status_body, summary_present):
+        assets = state_store.session_assets_dir(self.session_uuid)
+        os.makedirs(assets, exist_ok=True)
+        status_path = os.path.join(assets, "builder.status.json")
+        with open(status_path, "w") as fh:
+            json.dump(status_body, fh)
+        summary_path = os.path.join(assets, "builder.summary.md")
+        if summary_present:
+            with open(summary_path, "w") as fh:
+                fh.write("# build summary\n")
+        elif os.path.exists(summary_path):
+            os.remove(summary_path)
+        readiness = {"state": "verified",
+                     "transaction_id": result["transaction_id"]}
+        pointer = cowork._update_receipt_pointer_for_readiness(
+            self.session_uuid, "builder", 1, None, result, readiness,
+            status_path, summary_path=summary_path)
+        self.assertIsInstance(pointer, dict)
+        return pointer, status_path
+
+    def _surfaces(self, status_path, receipt_path):
+        overlay, _pointer = cowork._current_verification_overlay(
+            self.session_uuid)
+        self.assertIsInstance(overlay, dict)
+        assets = state_store.session_assets_dir(self.session_uuid)
+        pj = os.path.join(assets, "planner.plan.json")
+        pm = os.path.join(assets, "planner.plan.md")
+        with open(pj, "w") as fh:
+            fh.write("{}")
+        with open(pm, "w") as fh:
+            fh.write("# plan\n")
+        ctx = cowork.assemble_build_reviewer_context(
+            "goal", ["builder"], pj, pm, status_path,
+            verification_receipt_path=receipt_path,
+            verification_overlay=overlay)
+        resumed = cowork.assemble_build_reviewer_resume_context(
+            pj, pm, status_path,
+            verification_receipt_path=receipt_path,
+            verification_overlay=overlay)
+        banner = cowork.builder_review_text(
+            status_path, False, overlay=overlay, receipt_path=receipt_path,
+            agent_status_path=status_path)
+        return overlay, ctx, resumed, banner
+
+    def _assert_owned_fields(self, surface, txn_id):
+        self.assertIn(txn_id, surface)
+        self.assertIn("verdict=green", surface)
+        self.assertIn("full_unit_suite", surface)
+        self.assertIn("ran_once", surface)
+        self.assertIn(self.MANIFEST[:12], surface)
+        self.assertIn(self.INDEX[:12], surface)
+        self.assertIn("commands=2", surface)
+        self.assertIn("disposition=pending_review", surface)
+        # Builder prose never contaminates the owned-facts surface.
+        self.assertNotIn("T-DECOY", surface)
+
+    def _run_state(self, status_body, summary_present):
+        txn_id, result = self._green_result()
+        receipt_path = self._persist_receipt(txn_id, result)
+        pointer, status_path = self._bind_pointer(
+            result, status_body, summary_present)
+        overlay, ctx, resumed, banner = self._surfaces(
+            status_path, receipt_path)
+        for surface in (ctx, resumed, banner):
+            self._assert_owned_fields(surface, txn_id)
+        # The reviewer surface names the receipt's ABSOLUTE PATH as a declared
+        # artifact descriptor, on BOTH edges.
+        self.assertIn(receipt_path, ctx)
+        self.assertIn(receipt_path, resumed)
+        self.assertIn("verification_receipt", ctx)
+        return pointer, banner, ctx, resumed
+
+    def test_consistent_prose_renders_no_contradiction(self):
+        status_body = {"status": "ready_for_review", "result": {
+            "transaction_id": "T-DECOY", "verdict": "red",
+            "verification": [{"label": "full_unit_suite", "ok": True,
+                              "source_manifest": self.MANIFEST}]}}
+        pointer, banner, ctx, resumed = self._run_state(status_body, True)
+        self.assertFalse(pointer["contradiction"])
+        for surface in (ctx, resumed):
+            self.assertNotIn("CONTRADICTION", surface)
+        self.assertNotIn("WARNING", banner)
+
+    def test_null_ok_prose_renders_contradiction_on_both_surfaces(self):
+        status_body = {"status": "ready_for_review", "result": {
+            "verification": [{"label": "full_unit_suite", "ok": None,
+                              "source_manifest": self.MANIFEST}]}}
+        pointer, banner, ctx, resumed = self._run_state(status_body, True)
+        self.assertTrue(pointer["contradiction"])
+        for surface in (ctx, resumed):
+            self.assertIn("CONTRADICTION", surface)
+        self.assertIn("WARNING", banner)
+
+    def test_stale_red_prose_renders_contradiction_on_both_surfaces(self):
+        status_body = {"status": "ready_for_review", "result": {
+            "verification": [{"label": "full_unit_suite", "ok": False,
+                              "source_manifest": self.MANIFEST}]}}
+        pointer, banner, ctx, resumed = self._run_state(status_body, True)
+        self.assertTrue(pointer["contradiction"])
+        for surface in (ctx, resumed):
+            self.assertIn("CONTRADICTION", surface)
+        self.assertIn("WARNING", banner)
+
+    def test_absent_summary_renders_contradiction_on_both_surfaces(self):
+        status_body = {"status": "ready_for_review", "result": {
+            "verification": [{"label": "full_unit_suite", "ok": True,
+                              "source_manifest": self.MANIFEST}]}}
+        pointer, banner, ctx, resumed = self._run_state(status_body, False)
+        self.assertTrue(pointer["contradiction"])
+        for surface in (ctx, resumed):
+            self.assertIn("CONTRADICTION", surface)
+        self.assertIn("WARNING", banner)
+
+    def test_overlay_fields_derive_from_the_receipt_on_disk(self):
+        txn_id, result = self._green_result()
+        receipt_path = self._persist_receipt(txn_id, result)
+        status_body = {"status": "ready_for_review", "result": {
+            "verification": [{"label": "full_unit_suite", "ok": True,
+                              "source_manifest": self.MANIFEST}]}}
+        _pointer, status_path = self._bind_pointer(result, status_body, True)
+        overlay, _ = cowork._current_verification_overlay(self.session_uuid)
+        on_disk = state_store.read_json_tolerant(receipt_path)
+        self.assertEqual(overlay["txn_id"], on_disk["transaction_id"])
+        self.assertEqual(overlay["verdict"], on_disk["verdict"])
+        self.assertEqual(overlay["manifest_digest"],
+                         on_disk["snapshot"]["manifest_digest"])
+        self.assertEqual(overlay["index_digest"],
+                         on_disk["snapshot"]["index_digest"])
+        self.assertEqual(overlay["final_suite_label"],
+                         on_disk["final_suite_label"])
+        self.assertEqual(overlay["final_suite_binding"],
+                         on_disk["final_suite_binding"])
+        self.assertEqual(overlay["command_count"], len(on_disk["attempts"]))
+        self.assertEqual(overlay["disposition"], "pending_review")
+        # The receipt rides the SAME per-session assets dir the reviewer pass
+        # is granted as its writable root, so the reviewer's sandbox can read
+        # it in every controller configuration (P2).
+        assets = state_store.session_assets_dir(self.session_uuid)
+        self.assertEqual(os.path.commonpath([receipt_path, assets]), assets)
+
+
+class SupersessionReopenBlockTests(unittest.TestCase):
+    """ORCH-050 criterion 2 / D-0004: a reviewer `revise` whose ONLY blocking
+    findings are verification challenges that are uncited — or contradicted by
+    the owned receipt for the reviewed candidate — does NOT reopen the builder
+    and is recorded superseded; any non-verification blocking finding (or a
+    validly-cited challenge) reopens exactly as today."""
+
+    TXN_ID = "T-green"
+    MANIFEST = "ab" * 32
+    INDEX = "cd" * 32
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = self.root
+
+        def restore():
+            if prior is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = prior
+        self.addCleanup(restore)
+        self.session_uuid = "S-super"
+        self.status_path = os.path.join(self.root, "builder.status.json")
+        self.trace_path = trace_store.trace_path_for(self.session_uuid)
+        os.makedirs(os.path.dirname(self.trace_path), exist_ok=True)
+
+    def _session(self, statuses):
+        status_path = self.status_path
+
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                st = statuses.pop(0) if statuses else "ready_for_review"
+                with open(status_path, "w") as fh:
+                    json.dump({"status": st}, fh)
+
+            def close(self):
+                self.closed = True
+        return FakeSession()
+
+    def _events(self):
+        with open(self.trace_path) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _findings(self):
+        return cowork_ledger.read_ledger(
+            state_store.ledger_path_for(self.session_uuid))
+
+    def _fake_green(self):
+        return {"transaction_id": self.TXN_ID, "verdict": "green",
+                "final_suite_label": "full_unit_suite",
+                "final_suite_binding": "ran_once",
+                "attempts": [{"label": "full_unit_suite"}],
+                "snapshot": {"manifest_digest": self.MANIFEST,
+                             "index_digest": self.INDEX}}
+
+    def _drive(self, statuses, verdicts):
+        import unittest.mock as mock
+        sess = self._session(statuses)
+        trace = trace_store.Trace(
+            self.trace_path, session_uuid=self.session_uuid, run_id="R")
+        calls = {"n": 0}
+
+        def review_fn(_p, _round):
+            calls["n"] += 1
+            return verdicts.pop(0) if verdicts else None
+
+        with mock.patch.object(
+                cowork, "_run_owned_verification_transaction",
+                return_value=(self._fake_green(), None)), \
+                mock.patch.object(
+                    cowork, "_record_readiness_from_transaction",
+                    return_value={"state": "verified", "reason": None,
+                                  "event_id": "E",
+                                  "transaction_id": self.TXN_ID}), \
+                mock.patch.object(
+                    cowork.verification, "current_candidate_identity",
+                    return_value=(self.MANIFEST, self.INDEX)):
+            rc, outcome, _ = cowork._role_loop(
+                sess, "seed", self.status_path, context="",
+                io_in=io.StringIO(""), io_out=io.StringIO(),
+                role="builder", review_fn=review_fn, trace=trace,
+                reviewer_role=cowork.BUILD_REVIEWER, artifact_noun="build",
+                phase="building", session_uuid=self.session_uuid)
+        return rc, outcome, sess, calls
+
+    def _assert_suppressed(self, rc, outcome, sess, calls):
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(calls["n"], 1)
+        # NO builder reopen: the seed is the only send, and no revise handoff
+        # was ever assembled or recorded.
+        self.assertEqual(len(sess.sent), 1)
+        events = self._events()
+        self.assertFalse(any(e.get("event") == "review.handoff"
+                             for e in events))
+        self.assertFalse(any(
+            e.get("event") == "review.handoff.recorded"
+            and e.get("kind") == "revise" for e in events))
+        superseded = [e for e in events
+                      if e.get("event") == "verification.challenges_superseded"]
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(superseded[0].get("superseded_count"), 1)
+        self.assertEqual(superseded[0].get("transaction_id"), self.TXN_ID)
+        # The FINDING is durably recorded, superseded — never erased.
+        findings = [r for r in self._findings() if r.get("kind") == "finding"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].get("closure"), "superseded")
+        self.assertEqual(findings[0].get("superseded_by_transaction"),
+                         self.TXN_ID)
+        # The transaction SURVIVED as pending_review, and the fall-through
+        # user-gate approve then ACCEPTED it (D-0004/D-0005 gate grant).
+        dispositions = [e for e in events
+                        if e.get("event") == "verification.disposition"]
+        self.assertEqual([d.get("disposition") for d in dispositions],
+                         ["accepted"])
+        self.assertEqual(
+            state_store.read_verification_dispositions(
+                self.session_uuid)[self.TXN_ID]["disposition"], "accepted")
+
+    def test_uncited_verification_challenge_does_not_reopen(self):
+        verdicts = [{"verdict": "revise", "corrective_findings": [
+            {"summary": "the verification never actually ran",
+             "severity": "blocking",
+             "verification_challenge": {"reason_code": "no_evidence"}}]}]
+        rc, outcome, sess, calls = self._drive(["ready_for_review"], verdicts)
+        self._assert_suppressed(rc, outcome, sess, calls)
+
+    def test_contradicted_verification_challenge_does_not_reopen(self):
+        verdicts = [{"verdict": "revise", "corrective_findings": [
+            {"summary": "the green receipt is for a different tree",
+             "severity": "blocking",
+             "verification_challenge": {"transaction_id": "T-OTHER",
+                                        "reason_code": "stale_manifest"}}]}]
+        rc, outcome, sess, calls = self._drive(["ready_for_review"], verdicts)
+        self._assert_suppressed(rc, outcome, sess, calls)
+
+    def _assert_genuine_revise_reopened(self, rc, outcome, sess, calls):
+        self.assertEqual((rc, outcome), (0, "approved"))
+        # The builder WAS handed back for another pass: seed + revise handoff.
+        self.assertEqual(len(sess.sent), 2)
+        self.assertEqual(calls["n"], 1 + cowork.REVIEW_FAIL_CAP)
+        events = self._events()
+        self.assertTrue(any(
+            e.get("event") == "review.handoff.recorded"
+            and e.get("kind") == "revise" for e in events))
+        supersessions = [e for e in events
+                         if e.get("event") == "verification.disposition"
+                         and e.get("disposition") == "superseded_by_finding"]
+        self.assertEqual(len(supersessions), 1)
+        self.assertEqual(supersessions[0].get("transaction_id"), self.TXN_ID)
+        self.assertEqual(supersessions[0].get("reviewed_manifest_digest"),
+                         self.MANIFEST)
+        self.assertIsNotNone(supersessions[0].get("review_round"))
+        # A genuine revise is NEVER mechanically superseded.
+        self.assertFalse(any(
+            e.get("event") == "verification.challenges_superseded"
+            for e in events))
+
+    def test_non_verification_blocking_finding_reopens_as_today(self):
+        verdicts = [{"verdict": "revise", "corrective_findings": [
+            {"summary": "out-of-plan change in scripts/cowork.py",
+             "severity": "blocking"}]}]
+        rc, outcome, sess, calls = self._drive(
+            ["ready_for_review", "ready_for_review"], verdicts)
+        self._assert_genuine_revise_reopened(rc, outcome, sess, calls)
+
+    def test_validly_cited_challenge_reopens_as_today(self):
+        verdicts = [{"verdict": "revise", "corrective_findings": [
+            {"summary": "the receipt's verdict is misreported",
+             "severity": "blocking",
+             "verification_challenge": {"transaction_id": self.TXN_ID,
+                                        "reason_code": "wrong_verdict"}}]}]
+        rc, outcome, sess, calls = self._drive(
+            ["ready_for_review", "ready_for_review"], verdicts)
+        self._assert_genuine_revise_reopened(rc, outcome, sess, calls)
+
+    def test_reused_transaction_rebinding_clears_the_stale_disposition(self):
+        # THE CROSS-ROUND REUSE PATH, which neither the reopen tests above nor
+        # ReuseAvoidedCostTests reach: round 1 binds T-green pending_review and
+        # a genuine NON-verification revise supersedes it; the builder's fix is
+        # ARTIFACT-ONLY, so round 2 hits single-flight reuse and re-binds the
+        # SAME transaction id.
+        #
+        # Re-binding used to reset `disposition` in pointer.json ALONE, so
+        # round 1's `superseded_by_finding` kept winning in the trace/sidecar —
+        # which is what every render-time join and `_grant_gate_acceptance`'s
+        # guard actually read. The overlay then reported a superseded candidate
+        # that was freshly up for review, and an explicit approve at the gate
+        # was silently dropped (the guard returned early), stranding the
+        # transaction at superseded_by_finding in the record forever.
+        import unittest.mock as mock
+        trace = trace_store.Trace(
+            self.trace_path, session_uuid=self.session_uuid, run_id="R")
+        readiness = {"state": "verified", "transaction_id": self.TXN_ID}
+        with open(self.status_path, "w") as fh:
+            json.dump({"status": "ready_for_review"}, fh)
+        cowork._update_receipt_pointer_for_readiness(
+            self.session_uuid, "builder", 1, trace, self._fake_green(),
+            readiness, self.status_path)
+        cowork._emit_verification_disposition(
+            self.session_uuid, trace, self.TXN_ID, "superseded_by_finding",
+            review_round=1, reviewed_manifest_digest=self.MANIFEST)
+        self.assertEqual(
+            cowork._latest_verification_disposition(
+                self.session_uuid, self.TXN_ID), "superseded_by_finding")
+
+        pointer = cowork._update_receipt_pointer_for_readiness(
+            self.session_uuid, "builder", 2, trace, self._fake_green(),
+            readiness, self.status_path)
+        self.assertEqual(pointer["disposition"], "pending_review")
+        # The reset is a REAL disposition event: trace, sidecar and pointer
+        # all agree, rather than the pointer file disagreeing with both.
+        self.assertEqual(
+            [e.get("disposition") for e in self._events()
+             if e.get("event") == "verification.disposition"],
+            ["superseded_by_finding", "pending_review"])
+        self.assertEqual(
+            cowork._latest_verification_disposition(
+                self.session_uuid, self.TXN_ID), "pending_review")
+        overlay, _ = cowork._current_verification_overlay(self.session_uuid)
+        self.assertEqual(overlay["disposition"], "pending_review")
+        # And the gate can accept again: an approve on a re-reviewed green
+        # candidate is no longer swallowed by the stale-disposition guard.
+        with mock.patch.object(cowork.verification,
+                               "current_candidate_identity",
+                               return_value=(self.MANIFEST, self.INDEX)):
+            cowork._grant_gate_acceptance(self.session_uuid, trace)
+        self.assertEqual(
+            cowork._latest_verification_disposition(
+                self.session_uuid, self.TXN_ID), "accepted")
+
+
+class DispositionAndCostSplitTests(unittest.TestCase):
+    """ORCH-050 criterion 3: every owned transaction carries a review
+    disposition bound to (transaction id, reviewed manifest), supersession
+    names the review round + reviewed manifest, the report shows incurred cost
+    separately from accepted-verification cost, and completion value is
+    granted only for an `accepted` transaction."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = self.root
+
+        def restore():
+            if prior is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = prior
+        self.addCleanup(restore)
+        self.session_uuid = "S-dispo"
+        self.assets = state_store.session_assets_dir(self.session_uuid)
+        os.makedirs(self.assets, exist_ok=True)
+
+    def _result(self, txn_id, verdict, label, wall, finished):
+        return {
+            "transaction_id": txn_id, "request_key": "k-" + txn_id,
+            "verdict": verdict, "final_suite_label": label,
+            "final_suite_binding": ("ran_once" if verdict == "green"
+                                    else "not_reached"),
+            "attempts": [{"label": label, "kind": "final_suite",
+                          "exit_code": (0 if verdict == "green" else 1),
+                          "evidence_state": "present",
+                          "wall_time_s": wall}],
+            "mutation": None, "worker_identity_verified": True,
+            "reused_lock_result": False,
+            "snapshot": {"manifest_digest": "m-" + txn_id,
+                         "index_digest": "i-" + txn_id},
+            "created_at": "2026-08-01T00:00:00Z", "finished_at": finished,
+        }
+
+    def _write_json(self, name, obj):
+        with open(os.path.join(self.assets, name), "w") as fh:
+            json.dump(obj, fh)
+
+    def _write_jsonl(self, name, rows):
+        with open(os.path.join(self.assets, name), "w") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    def _build_fixture(self):
+        results = [
+            self._result("T1", "green", "suite_alpha", 2.0,
+                         "2026-08-01T00:01:00Z"),
+            self._result("T2", "green", "suite_beta", 3.0,
+                         "2026-08-01T00:02:00Z"),
+            self._result("T3", "green", "suite_gamma", 4.0,
+                         "2026-08-01T00:03:00Z"),
+            self._result("T4", "red", "suite_delta", 5.0,
+                         "2026-08-01T00:04:00Z"),
+        ]
+        for result in results:
+            state_store.write_json_atomic(
+                state_store.verification_result_path_for(
+                    self.session_uuid, result["transaction_id"]), result)
+        trace_rows = [
+            {"event": "verification.transaction",
+             "transaction_id": r["transaction_id"], "verdict": r["verdict"],
+             "reused_lock_result": False} for r in results]
+        trace_rows += [
+            # Green, then approved with manifest equality -> accepted.
+            {"event": "verification.disposition", "transaction_id": "T1",
+             "disposition": "accepted", "review_round": 1,
+             "reviewed_manifest_digest": "m-T1"},
+            # Green, then a VALID blocking finding -> superseded_by_finding.
+            {"event": "verification.disposition", "transaction_id": "T2",
+             "disposition": "superseded_by_finding", "review_round": 2,
+             "reviewed_manifest_digest": "m-T2"},
+            # Green, never reviewed, candidate abandoned -> rejected.
+            {"event": "verification.disposition", "transaction_id": "T3",
+             "disposition": "rejected", "review_round": None,
+             "reviewed_manifest_digest": "m-T3"},
+            # T4 (red) carries NO event: its disposition is DERIVED rejected.
+        ]
+        self._write_jsonl("trace.jsonl", trace_rows)
+        self._write_jsonl("ledger.jsonl", [
+            {"id": "F-0001", "kind": "finding", "state": "open",
+             "summary": "verification did not run (a defeated challenge)",
+             "severity": "blocking", "discoverer": "build-reviewer",
+             "round": 2, "phase": "building", "closure": "superseded",
+             "superseded_by_transaction": "T2",
+             "recorded_at": "2026-08-01T00:02:30Z"},
+        ])
+        self._write_json("completion_seeds.json", {"items": [
+            {"item": "accepted check delivered", "state": "delivered",
+             "evidence": ["suite_alpha"]},
+            {"item": "superseded check claimed delivered",
+             "state": "delivered", "evidence": ["suite_beta"]},
+            {"item": "mixed evidence", "state": "delivered",
+             "evidence": ["suite_alpha", "suite_beta"]},
+        ]})
+
+    def test_dispositions_cost_split_completion_and_findings(self):
+        self._build_fixture()
+        record = measure.build_record(self.session_uuid)
+        owned = record["owned_verification"]
+        by_id = {t["transaction_id"]: t for t in owned["transactions"]}
+        self.assertEqual(by_id["T1"]["disposition"], "accepted")
+        self.assertEqual(by_id["T2"]["disposition"],
+                         "superseded_by_finding")
+        # Supersession names the review round and the reviewed manifest.
+        self.assertEqual(by_id["T2"]["review_round"], 2)
+        self.assertEqual(by_id["T2"]["reviewed_manifest_digest"], "m-T2")
+        self.assertEqual(by_id["T3"]["disposition"], "rejected")
+        self.assertEqual(by_id["T4"]["disposition"], "rejected")  # derived
+        # Incurred cost covers ALL transactions; accepted covers ONLY T1.
+        self.assertEqual(owned["incurred_cost"]["work_items"], 4)
+        self.assertAlmostEqual(
+            owned["incurred_cost"]["subprocess_wall_time_s"], 14.0)
+        self.assertEqual(owned["accepted_cost"]["work_items"], 1)
+        self.assertAlmostEqual(
+            owned["accepted_cost"]["subprocess_wall_time_s"], 2.0)
+        self.assertEqual(owned["avoided_cost"]["reuse_count"], 0)
+        # Completion value is granted ONLY for an accepted transaction.
+        completion = {e["item"]: e["state"] for e in record["completion"]}
+        self.assertEqual(completion["accepted check delivered"], "delivered")
+        self.assertEqual(completion["superseded check claimed delivered"],
+                         "still_open")
+        self.assertEqual(completion["mixed evidence"], "partially_delivered")
+        # The superseded verification finding stays on the record, surfaced.
+        findings = record["findings"]
+        self.assertEqual(findings["total"], 1)
+        self.assertEqual(findings["superseded"], 1)
+        self.assertEqual(findings["confirmed"], 0)
+        surfaced = findings["superseded_findings"]
+        self.assertEqual(len(surfaced), 1)
+        self.assertEqual(surfaced[0]["id"], "F-0001")
+        self.assertEqual(surfaced[0]["superseded_by_transaction"], "T2")
+
+    def test_report_lists_all_transactions_and_the_cost_split(self):
+        self._build_fixture()
+        record = measure.build_record(self.session_uuid)
+        text = report.render_report(record)
+        self.assertIn("disposition=accepted", text)
+        self.assertIn("disposition=superseded_by_finding", text)
+        self.assertIn("disposition=rejected", text)
+        self.assertIn("round=2", text)
+        self.assertIn("reviewed_manifest=m-T2", text)
+        self.assertIn("incurred verification cost (ALL transactions): 4 "
+                      "work item(s)", text)
+        self.assertIn("accepted verification cost (accepted dispositions "
+                      "only): 1 work item(s)", text)
+
+    def test_sidecar_fills_dispositions_the_trace_never_named(self):
+        # D-0001: the sidecar is the reconciled read-through cache — a
+        # `--report`-only pass still renders a disposition the trace rotated
+        # away, with the trace remaining authoritative where it speaks.
+        self._build_fixture()
+        result = self._result("T5", "green", "suite_epsilon", 1.0,
+                              "2026-08-01T00:05:00Z")
+        state_store.write_json_atomic(
+            state_store.verification_result_path_for(
+                self.session_uuid, "T5"), result)
+        state_store.write_verification_disposition(self.session_uuid, {
+            "transaction_id": "T5", "disposition": "accepted",
+            "review_round": 3, "reviewed_manifest_digest": "m-T5"})
+        record = measure.build_record(self.session_uuid)
+        by_id = {t["transaction_id"]: t
+                 for t in record["owned_verification"]["transactions"]}
+        self.assertEqual(by_id["T5"]["disposition"], "accepted")
+        self.assertEqual(by_id["T5"]["review_round"], 3)
+        self.assertEqual(by_id["T5"]["reviewed_manifest_digest"], "m-T5")
+        # The trace's own dispositions still win where it speaks.
+        self.assertEqual(by_id["T2"]["disposition"],
+                         "superseded_by_finding")
+
+
+class ReuseAvoidedCostTests(_OwnedVerificationTestBase):
+    """ORCH-050 criterion 4 / D-0006: an artifact-only correction (candidate
+    manifest + git index unchanged) reuses the existing green exact-manifest
+    transaction result — ZERO commands re-executed on the second gate,
+    readiness still bound to the ORIGINAL transaction id, and the reuse
+    booked as avoided cost with no second incurred transaction."""
+
+    def _write_plan(self, marker):
+        assets = state_store.session_assets_dir(self.session_uuid)
+        os.makedirs(assets, exist_ok=True)
+        plan = {"result": {
+            "verification": [
+                {"label": "final",
+                 "command": self._append_marker_cmd(marker, "ran"),
+                 "execution_mode": "isolated_snapshot",
+                 "kind": "final_suite"}],
+            "verification_schema": 2}}
+        with open(os.path.join(assets, "planner.plan.json"), "w") as fh:
+            json.dump(plan, fh)
+
+    def test_artifact_only_correction_reuses_the_green_result(self):
+        marker = self._marker_path()
+        self._write_plan(marker)
+        trace = trace_store.Trace(
+            trace_store.trace_path_for(self.session_uuid),
+            session_uuid=self.session_uuid, run_id="R")
+        # First builder ready_for_review: the transaction really runs.
+        txn1, reason1 = cowork._run_owned_verification_transaction(
+            self.session_uuid, "builder", 1, trace, repo=self.repo)
+        self.assertIsNone(reason1)
+        self.assertEqual(txn1["verdict"], verification.VERDICT_GREEN)
+        self.assertFalse(txn1.get("reused_lock_result"))
+        readiness1 = cowork._record_readiness_from_transaction(
+            self.session_uuid, "builder", 1, trace, txn1, repo=self.repo)
+        self.assertEqual(readiness1["state"], "verified")
+        status_path = os.path.join(
+            state_store.session_assets_dir(self.session_uuid),
+            "builder.status.json")
+        pointer = cowork._update_receipt_pointer_for_readiness(
+            self.session_uuid, "builder", 1, trace, txn1, readiness1,
+            status_path)
+        self.assertIsNotNone(pointer)
+        # An ARTIFACT-ONLY correction: the builder's own artifacts (status
+        # JSON + summary, OUTSIDE the repo manifest) move; the candidate
+        # manifest and git index do not.
+        with open(status_path, "w") as fh:
+            json.dump({"status": "ready_for_review", "result": {
+                "verification": [{
+                    "label": "final", "ok": True,
+                    "source_manifest":
+                        txn1["snapshot"]["manifest_digest"]}]}}, fh)
+        with open(os.path.join(
+                state_store.session_assets_dir(self.session_uuid),
+                "builder.summary.md"), "w") as fh:
+            fh.write("# revised summary (artifact-only change)\n")
+        # Second builder ready_for_review: single-flight REUSE — the
+        # instrumented command (the marker append) must NOT execute again.
+        txn2, reason2 = cowork._run_owned_verification_transaction(
+            self.session_uuid, "builder", 2, trace, repo=self.repo)
+        self.assertIsNone(reason2)
+        self.assertTrue(txn2.get("reused_lock_result"))
+        self.assertEqual(txn2["transaction_id"], txn1["transaction_id"])
+        with open(marker) as fh:
+            self.assertEqual(fh.read().split(), ["ran"])  # 0 re-executions
+        readiness2 = cowork._record_readiness_from_transaction(
+            self.session_uuid, "builder", 2, trace, txn2, repo=self.repo)
+        self.assertEqual(readiness2["state"], "verified")
+        self.assertEqual(readiness2["transaction_id"],
+                         txn1["transaction_id"])
+        # The record books the reuse as avoided cost attributed to the
+        # reused transaction, with NO second incurred transaction.
+        record = measure.build_record(self.session_uuid)
+        owned = record["owned_verification"]
+        self.assertEqual(owned["transaction_count"], 1)
+        self.assertEqual(owned["incurred_cost"]["work_items"], 1)
+        avoided = owned["avoided_cost"]
+        self.assertEqual(avoided["reuse_count"], 1)
+        self.assertGreater(avoided["subprocess_wall_time_s"], 0)
+        self.assertEqual(len(avoided["reused"]), 1)
+        self.assertEqual(avoided["reused"][0]["transaction_id"],
+                         txn1["transaction_id"])
+        self.assertEqual(avoided["reused"][0]["reuse_count"], 1)
 
 
 class ActionPolicyDecisionTests(unittest.TestCase):

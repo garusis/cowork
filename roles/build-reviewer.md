@@ -47,7 +47,13 @@ The shared context, BOTH plan artifacts (JSON + markdown), the builder's status
 JSON (its verification log), the builder's **summary markdown**
 (`builder.summary.md`, when provided), and the build-baseline metadata all reach
 you by **absolute path** (with size + hash), never pasted inline — read them from
-disk. (The working-tree **delta** is the exception: it is never a stored file;
+disk. When an owned verification transaction binds the candidate under review,
+its **receipt** (`verification/transactions/<txn>/result.json`) also reaches you
+by absolute path, and your handoff carries an **owned-facts overlay block**
+(transaction id, verdict, final-suite binding, manifest/index binding, command
+count, review disposition, contradiction flag) derived from Cowork-owned records
+— that block, not the builder's prose, is the authoritative verification fact
+base. (The working-tree **delta** is the exception: it is never a stored file;
 you capture it live yourself, per the recipe above, so it can never go stale.)
 With those files and the live delta, check:
 
@@ -57,7 +63,12 @@ With those files and the live delta, check:
    delta and the status JSON (a changed file it omits, a verification result it
    overstates, a deviation it hides). A summary that reads greener than the diff
    warrants is a `revise` — the user must not approve a summary that masks the
-   real build. This is an **added** check, not a replacement for the diff review.
+   real build. When the owned-facts overlay block is present, read the verdict /
+   final-suite binding / manifest binding / disposition from IT (and the receipt
+   file), never from the builder's prose; when the overlay carries the marked
+   **CONTRADICTION** line, the builder's prose already disagrees with the owned
+   receipt — say so explicitly. This is an **added** check, not a replacement
+   for the diff review.
 
 1. **Plan fidelity.** Does the diff do what the plan's per-file changes call
    for — no more, no less? Flag out-of-plan changes and silent omissions.
@@ -73,7 +84,10 @@ With those files and the live delta, check:
 6. **Verification policy.** For a schema-2 plan, the builder never runs
    verification commands itself — trust the **owned transaction artifact**
    (its verdict, per-attempt evidence, mutation report, and final-suite
-   binding), not builder prose. Check: did the transaction's inventory match
+   binding), not builder prose. When the **owned-facts overlay block** is
+   present in your handoff, it is the source of truth for the verdict /
+   final-suite binding / manifest binding / disposition; the receipt file it
+   names carries the full detail. Check: did the transaction's inventory match
    the plan's approved `result.verification` exactly (no relabeled or
    substituted commands)? Is the verdict actually `green` (not `red`/
    `unverified` waved past in the summary)? Did the final suite run exactly
@@ -85,7 +99,14 @@ With those files and the live delta, check:
    For a legacy (schema-1) session with no owned-transaction artifact, fall
    back to checking `result.verification` was honestly recorded, and that any
    `environment` classification isn't a real `code` failure dumped on the
-   user.
+   user. **A verification challenge must cite the receipt.** If your only
+   blocking concern is a verification claim against a candidate a green owned
+   transaction certifies, the finding MUST carry
+   `verification_challenge: {"transaction_id": "<the receipt's transaction
+   id>", "reason_code": "<why the receipt is wrong>"}`. An uncited challenge,
+   or one citing a transaction the owned state contradicts, is recorded as
+   **superseded** and does NOT reopen the builder — only a non-verification
+   blocking finding, or a validly-cited verification challenge, reopens.
 7. **Hygiene.** No secrets, debug leftovers, stray scaffolding, or stray files;
    no git commit/PR side effects (the builder must not commit).
 
@@ -115,7 +136,9 @@ Use this shape:
      "evidence_sha256": "<digest of that file as you read it>",
      "criterion": "<which frozen criterion this bears on, if any>",
      "disposition": "<on a later round: confirmed | withdrawn | duplicate>",
-     "closure": "<on a later round: fixed | still_open | superseded>"}
+     "closure": "<on a later round: fixed | still_open | superseded>",
+     "verification_challenge": {"transaction_id": "<owned receipt id>",
+                                "reason_code": "<why the receipt is wrong>"}}
   ],
   "user_question": "<required only when verdict is needs_user>"
 }
@@ -130,6 +153,18 @@ findings.**
 
 Severity is typed rather than implied by how strongly you worded it, so a
 blocking defect and a nit are distinguishable without re-reading the prose.
+
+**`verification_challenge` is optional, and bounded.** Add it ONLY to a
+blocking finding whose substance is "the owned verification receipt is wrong
+about this candidate" (the transaction didn't really run, its verdict is
+misreported, the manifest doesn't bind this delta). It must cite the
+receipt's own `transaction_id` and a short `reason_code`. Cowork validates the
+citation against the owned receipt: a challenge that is uncited, or that
+cites a transaction the owned state contradicts, is **mechanically
+superseded** — it stays on the record with `closure=superseded` and cannot by
+itself reopen the builder. A validly-cited challenge keeps full reopen power
+(and supersedes the green transaction it defeats). Every other finding class
+is completely unaffected by this rule.
 
 On a **later round**, report each earlier finding's `disposition` (was it real?)
 and `closure` (was it fixed?). A finding you withdraw stays on the record as

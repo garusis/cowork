@@ -978,10 +978,16 @@ def finding_lifecycle(records):
     itself evidence about the reviewer. An approving round contributes ZERO
     corrective findings, which is the CV-030 fix: counting the raw length of a
     `findings` array made an approval's summary prose look like corrections.
+
+    CV-050: a verification challenge the orchestrator mechanically superseded
+    (uncited, or contradicted by the owned receipt) is recorded with
+    `closure=superseded` + `superseded_by_transaction` — it is counted as
+    superseded and SURFACED in `superseded_findings`, never dropped: the
+    finding stayed on the record even though it could not reopen the builder.
     """
     collapsed = ledger.collapse(records)
     out = {"confirmed": 0, "withdrawn": 0, "superseded": 0, "open": 0,
-           "by_severity": {}, "total": 0}
+           "by_severity": {}, "total": 0, "superseded_findings": []}
     for record in collapsed.values():
         if record.get("kind") != "finding":
             continue
@@ -989,8 +995,17 @@ def finding_lifecycle(records):
         state = record.get("state") or "open"
         if state == "withdrawn":
             out["withdrawn"] += 1
-        elif state == "superseded":
+        elif state == "superseded" or record.get("closure") == "superseded":
             out["superseded"] += 1
+            if record.get("closure") == "superseded":
+                out["superseded_findings"].append({
+                    "id": record.get("id"),
+                    "summary": record.get("summary"),
+                    "severity": record.get("severity"),
+                    "round": record.get("round"),
+                    "superseded_by_transaction": record.get(
+                        "superseded_by_transaction"),
+                })
         elif record.get("disposition") == "confirmed":
             out["confirmed"] += 1
         else:
@@ -1417,6 +1432,134 @@ def owned_focused_check_attribution(result):
 
 
 # --------------------------------------------------------------------------- #
+# Review dispositions + cost split for owned transactions (ORCH-050/CV-050).   #
+# --------------------------------------------------------------------------- #
+
+
+def _verification_dispositions(session_uuid, events):
+    """The LATEST review disposition per owned transaction id, as
+    `{transaction_id: {disposition, review_round, reviewed_manifest_digest}}`.
+
+    PRIMARY source: `verification.disposition` trace events (D-0001 — the
+    trace is the single source of truth; a later event for the same id wins).
+    The per-session sidecar is the reconciled read-through cache, consulted
+    ONLY for transaction ids the trace never names, so a `--report` pass over
+    a session whose trace was rotated away still renders what the orchestrator
+    durably recorded."""
+    out = {}
+    for event in events or []:
+        if event.get("event") != "verification.disposition":
+            continue
+        transaction_id = event.get("transaction_id")
+        if transaction_id:
+            out[transaction_id] = {
+                "disposition": event.get("disposition"),
+                "review_round": event.get("review_round"),
+                "reviewed_manifest_digest": event.get(
+                    "reviewed_manifest_digest"),
+            }
+    for transaction_id, entry in state_store.read_verification_dispositions(
+            session_uuid).items():
+        if transaction_id not in out:
+            out[transaction_id] = {
+                "disposition": entry.get("disposition"),
+                "review_round": entry.get("review_round"),
+                "reviewed_manifest_digest": entry.get(
+                    "reviewed_manifest_digest"),
+            }
+    return out
+
+
+def _apply_owned_dispositions(owned_transactions, dispositions):
+    """Join dispositions onto each owned transaction (ADDITIVE fields:
+    `disposition`, `review_round`, `reviewed_manifest_digest`). A transaction
+    the reviewer never judged keeps an honest derived state: `pending_review`
+    when it is green (a review may still come), `rejected` when it was
+    red/unverified (it can never be accepted)."""
+    for transaction in owned_transactions:
+        if not isinstance(transaction, dict):
+            continue
+        joined = dispositions.get(transaction.get("transaction_id")) or {}
+        disposition = joined.get("disposition")
+        if disposition not in verification.DISPOSITIONS:
+            disposition = (
+                verification.DISPOSITION_PENDING_REVIEW
+                if transaction.get("verdict") == verification.VERDICT_GREEN
+                else verification.DISPOSITION_REJECTED)
+        transaction["disposition"] = disposition
+        transaction["review_round"] = joined.get("review_round")
+        transaction["reviewed_manifest_digest"] = joined.get(
+            "reviewed_manifest_digest")
+    return owned_transactions
+
+
+def _owned_cost_rollups(owned_transactions, events):
+    """The incurred-vs-accepted verification cost split plus reuse accounting.
+
+    `incurred_cost` covers ALL owned transactions (every transaction really
+    ran its subprocess commands); `accepted_cost` covers ONLY transactions
+    whose review disposition is `accepted` — completion value is granted only
+    there. `avoided_cost` aggregates single-flight REUSE occurrences from the
+    `verification.transaction` trace event's `reused_lock_result` flag (the
+    ONLY durable carrier of a reuse — the reuse path writes no new result.json
+    and the original receipt carries `reused_lock_result=False`), attributed
+    to the reused transaction id with an occurrence count; each occurrence is
+    booked at the reused transaction's own subprocess wall time, the best
+    available proxy for the re-run that never happened.
+    """
+    incurred_wall = 0.0
+    accepted_wall = 0.0
+    accepted_items = 0
+    by_id = {}
+    for transaction in owned_transactions or []:
+        if not isinstance(transaction, dict):
+            continue
+        by_id[transaction.get("transaction_id")] = transaction
+        summary = owned_transaction_cost_summary(transaction) or {}
+        wall = summary.get("subprocess_wall_time_s") or 0.0
+        incurred_wall += wall
+        if transaction.get("disposition") == verification.DISPOSITION_ACCEPTED:
+            accepted_wall += wall
+            accepted_items += 1
+    reuse_counts = {}
+    for event in events or []:
+        if event.get("event") == "verification.transaction" \
+                and event.get("reused_lock_result"):
+            transaction_id = event.get("transaction_id")
+            if transaction_id:
+                reuse_counts[transaction_id] = reuse_counts.get(
+                    transaction_id, 0) + 1
+    reused = []
+    avoided_wall = 0.0
+    for transaction_id in sorted(reuse_counts):
+        count = reuse_counts[transaction_id]
+        transaction = by_id.get(transaction_id)
+        wall = 0.0
+        if isinstance(transaction, dict):
+            summary = owned_transaction_cost_summary(transaction) or {}
+            wall = summary.get("subprocess_wall_time_s") or 0.0
+        avoided_wall += wall * count
+        reused.append({"transaction_id": transaction_id,
+                       "reuse_count": count,
+                       "subprocess_wall_time_s": wall})
+    return {
+        "incurred_cost": {
+            "work_items": len(owned_transactions or []),
+            "subprocess_wall_time_s": incurred_wall,
+        },
+        "accepted_cost": {
+            "work_items": accepted_items,
+            "subprocess_wall_time_s": accepted_wall,
+        },
+        "avoided_cost": {
+            "reuse_count": sum(reuse_counts.values()),
+            "subprocess_wall_time_s": avoided_wall,
+            "reused": reused,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Building the record.                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -1681,6 +1824,12 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
     # `verification_attempts` above are computed UNCONDITIONALLY either way,
     # so a legacy session's report is unaffected by any of this.
     owned_transactions = owned_transactions_for(session_uuid)
+    # ORCH-050/CV-050: join the review dispositions (trace-primary, sidecar
+    # read-through) onto every transaction BEFORE the cost rollups, so the
+    # accepted-cost figure only ever counts what review actually accepted.
+    owned_dispositions = _verification_dispositions(session_uuid, events)
+    _apply_owned_dispositions(owned_transactions, owned_dispositions)
+    owned_rollups = _owned_cost_rollups(owned_transactions, events)
     owned_txn = owned_transactions[-1] if owned_transactions else None
     owned_cost = owned_transaction_cost_summary(owned_txn)
     owned_focused = owned_focused_check_attribution(owned_txn)
@@ -1728,6 +1877,13 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
             "latest": owned_txn,
             "cost": owned_cost,
             "focused_attribution": owned_focused,
+            # ORCH-050/CV-050 additive rollups (SCHEMA_VERSION stays 1): the
+            # incurred cost of EVERY transaction, the accepted-verification
+            # cost (accepted dispositions only — completion value lives here),
+            # and the avoided cost booked by single-flight reuse.
+            "incurred_cost": owned_rollups["incurred_cost"],
+            "accepted_cost": owned_rollups["accepted_cost"],
+            "avoided_cost": owned_rollups["avoided_cost"],
         },
         "tool_activity": tool_activity(ingest_results, work),
         "environment_recurrences": environment_recurrences(attempts),
@@ -2287,12 +2443,35 @@ def _evidence_is_substantive(reference, record):
     # `README.md#Measurement` as a verification label, so a real file citation
     # resolved as a check that never ran.
     label = reference.split("#", 1)[0].strip()
-    passing = _passing_verification_labels(record)
-    if passing is not None and label in passing:
-        return True
-    if passing is not None and _looks_like_verification_label(label):
-        # Named as a check, but not among the ones that passed.
-        return False
+    owned_transactions = ((record or {}).get("owned_verification")
+                          or {}).get("transactions")
+    if isinstance(owned_transactions, list) and owned_transactions:
+        # CV-050: with owned transactions on the record, a verification-label
+        # reference is substantive ONLY when it names a check whose binding
+        # transaction's review disposition is `accepted` — green is not
+        # automatically delivered value. A label no accepted transaction
+        # binds is unresolved (still_open / partially_delivered), never
+        # delivered. (A4: this gate applies ONLY when owned transactions
+        # exist; the legacy path below is byte-for-byte unchanged otherwise.)
+        accepted_labels = set()
+        for transaction in owned_transactions:
+            if not isinstance(transaction, dict) or transaction.get(
+                    "disposition") != verification.DISPOSITION_ACCEPTED:
+                continue
+            for attempt in transaction.get("attempts") or []:
+                if isinstance(attempt, dict) and attempt.get("label"):
+                    accepted_labels.add(attempt["label"])
+        if label in accepted_labels:
+            return True
+        if _looks_like_verification_label(label):
+            return False
+    else:
+        passing = _passing_verification_labels(record)
+        if passing is not None and label in passing:
+            return True
+        if passing is not None and _looks_like_verification_label(label):
+            # Named as a check, but not among the ones that passed.
+            return False
     candidate = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), label)
     return os.path.exists(candidate) or os.path.exists(label)
