@@ -233,6 +233,29 @@ artifacts — not the terminal transcript. For deep session forensics use the
 (`git status`, `git diff`). cowork commits nothing; the edits are sitting there
 uncommitted.
 
+## Watching a live run
+
+Two watchers, because an event tail alone cannot see the two worst failure
+modes — **silence** (a 45-minute healthy builder turn and a dead run look
+identical) and **process death** (a killed run emits no event at all).
+
+1. **Event tail** on `trace.jsonl`. Filter for the full lifecycle set — the
+   easy mistake is matching only happy-path events. Include at least:
+   `phase.`, `gate.`, `role.start|end|milestone`, `controller.turn.start|end`,
+   `controller.error|exit`, `review.verdict|run`, `status.invalidated`,
+   `stale_noop` (lead turn changed nothing on disk), `headless.auto`,
+   `run.end` (note: the terminal event is `run.end`, not `session.end`),
+   `run.resume`, `handoff`, `fallback`, `rate_limit`.
+2. **Watchdog loop** (every ~10 min): if the cowork process is gone, report
+   whether the trace ends with `run.end` (clean finish) or not (external
+   kill); if the trace has been silent >25 min while the process lives, flag
+   a long turn or hang.
+
+Also check `ps` occasionally for **orphaned controller children**: an
+externally killed cowork can leave its `opencode`/`claude`/`codex` child
+alive and detached (ppid 1) indefinitely — invisible to the trace and to
+every artifact.
+
 ## Status values a lead role writes
 
 - `working` — still going.
