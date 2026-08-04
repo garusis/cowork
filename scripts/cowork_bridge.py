@@ -779,8 +779,16 @@ OPENCODE_AGENT_SUBDIR = os.path.join(".opencode", "agents")
 # from the model's tool set while native glob/read/bash kept working, and the
 # `permission:` map still dominates natives — a `tools: true` entry does NOT
 # re-open a permission `deny`, so per-mode permission behavior is unchanged.
+# The `"*_*"` glob also matches opencode's underscore-named PERMISSIONS, not
+# just tool names: without the `external_directory: true` re-allow directly
+# after it, the built-in `external_directory: ask` (auto-approved under
+# `--auto`) hardens into a deny and every read/write outside the project dir
+# fails — including the role's own declared session artifacts. Live-verified
+# on opencode 1.18.10: session 02bd445d's planner had every session-dir write
+# rejected until the re-allow was added.
 OPENCODE_MCP_DENY_TOOL_LINES = [
     '  "*_*": false',
+    "  external_directory: true",
     "  read: true",
     "  edit: true",
     "  write: true",
