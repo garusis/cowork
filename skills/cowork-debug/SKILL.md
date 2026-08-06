@@ -19,9 +19,13 @@ Reconstruct what happened in a cowork run by joining four evidence sources:
    `~/.cowork/sessions/<session_uuid>/scout-review.json` for
    current/final artifacts. Also useful in the same directory:
    `identities.json` (per-role tool + resolved model + controller session id —
-   the fastest jump from a role to its controller log) and
+   the fastest jump from a role to its controller log),
    `evaluation_queue.jsonl` (raw peer-evaluation lifecycle; malformed or
-   silently-failed evaluations are visible only here, not in `scores.json`).
+   silently-failed evaluations are visible only here, not in `scores.json`),
+   and `orchestrator-evaluations.json` (targeted role evaluations written by
+   the external orchestrator/driver via `cowork --evaluate-role`; the source
+   for the per-role/controller/model breakdowns in `--report`, kept separate
+   from peer `scores.json` and never read by any phase gate).
 4. Claude/Codex/OpenCode local logs for role conversation and tool history.
 
 Do not rely on terminal transcripts. Do not mutate session artifacts while

@@ -56,6 +56,7 @@ import datetime
 import glob
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -517,6 +518,18 @@ def identities_path_for(session_uuid):
     return os.path.join(session_assets_dir(session_uuid), "identities.json")
 
 
+def orchestrator_evaluations_path_for(session_uuid):
+    """Path of the per-session ORCHESTRATOR-owned evaluations file: targeted,
+    structured scores an external orchestrator/driver records against an
+    individual role contribution (scout, planner, builder, a paired reviewer,
+    or `orchestration` itself). Semantically SEPARATE from the peer
+    `scores.json` — it is written by the driver, never by a role, and never read
+    by any phase gate. The root is overridable via COWORK_SESSIONS_ROOT so tests
+    never write to the real home dir (mirrors `scores_path_for`)."""
+    return os.path.join(session_assets_dir(session_uuid),
+                        "orchestrator-evaluations.json")
+
+
 def children_path_for(session_uuid):
     """Append-only child-attempt/provider-correlation ledger."""
     return os.path.join(session_assets_dir(session_uuid), "children.jsonl")
@@ -644,6 +657,229 @@ def read_role_identities(path):
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# The contributions an orchestrator evaluation may target, the orchestration
+# phase scopes, and the five score dimensions — the SINGLE source of truth,
+# re-exported by cowork.py so the CLI, the schema validation here, and the tests
+# never drift apart.
+ORCHESTRATOR_EVAL_ROLES = ("scout", "scout-reviewer", "planner",
+                           "planning-advisor", "builder", "build-reviewer",
+                           "orchestration")
+ORCHESTRATOR_EVAL_PHASES = ("scouting", "planning", "building", "session")
+ORCHESTRATOR_EVAL_SCORE_FIELDS = ("output_quality", "intent_alignment",
+                                  "evidence_quality", "self_sufficiency",
+                                  "cost_worthiness")
+
+_SHA256_HEX_CHARS = set("0123456789abcdef")
+
+
+def is_sha256_hex(value):
+    """Whether `value` is a well-formed lowercase-or-uppercase 64-char SHA-256
+    hex digest. A digest that is not exactly this is not a real fingerprint."""
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in _SHA256_HEX_CHARS for char in value.lower()))
+
+
+def _valid_orchestrator_score(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= 5)
+
+
+def valid_orchestrator_evaluation_entry(entry):
+    """Whether one stored entry conforms to the orchestrator-evaluation schema.
+
+    Fail-closed audit history: an entry that is not an object with a supported
+    role/target, all five integer 1-5 scores, the required target/session/
+    timestamp fields, and well-typed optional identity/digest/evidence fields is
+    REJECTED. A JSON array that parses fine but carries a string, an arbitrary
+    dict, or an out-of-range score is corrupt history, not scores to average.
+
+    The stored-fingerprint schema is enforced strictly: `artifact_digest_state`
+    is REQUIRED and limited to `observed` or `unavailable`; an `observed` entry
+    MUST carry a valid 64-hex `artifact_digest` and a non-negative
+    `artifact_size`, while an `unavailable` entry must NOT carry a digest, size,
+    or fingerprint status. Duration and cost evidence must be finite and
+    non-negative — NaN/inf or a negative figure is not honest evidence."""
+    if not isinstance(entry, dict):
+        return False
+    role = entry.get("role")
+    if role not in ORCHESTRATOR_EVAL_ROLES:
+        return False
+    if not (isinstance(entry.get("session_uuid"), str)
+            and entry.get("session_uuid")):
+        return False
+    if not (isinstance(entry.get("timestamp"), str) and entry.get("timestamp")):
+        return False
+    for field in ORCHESTRATOR_EVAL_SCORE_FIELDS:
+        if not _valid_orchestrator_score(entry.get(field)):
+            return False
+    if role == "orchestration":
+        # Orchestration is targeted by phase, never a work_id.
+        if entry.get("phase") not in ORCHESTRATOR_EVAL_PHASES:
+            return False
+        if "work_id" in entry:
+            return False
+    else:
+        if not (isinstance(entry.get("work_id"), str) and entry.get("work_id")):
+            return False
+        # A team role MAY carry a free phase annotation; it must be a string.
+        if entry.get("phase") is not None \
+                and not isinstance(entry.get("phase"), str):
+            return False
+    # Optional identity/annotation strings.
+    for field in ("tool", "model", "session_id", "effort", "notes",
+                  "artifact_fingerprint_status"):
+        if field in entry and not isinstance(entry[field], str):
+            return False
+    # artifact_digest_state is REQUIRED and limited to the two closed states.
+    # It is the field that declares whether a fingerprint was actually captured,
+    # so it must be present and one of {observed, unavailable}; an entry that
+    # merely omits it, or invents a third state, is not a valid record.
+    digest_state = entry.get("artifact_digest_state")
+    if digest_state not in ("observed", "unavailable"):
+        return False
+    if digest_state == "observed":
+        # 'observed' with no evidence is a contradiction: it MUST carry a real
+        # 64-hex digest and a non-negative integer size.
+        if not is_sha256_hex(entry.get("artifact_digest")):
+            return False
+        size = entry.get("artifact_size")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            return False
+    else:
+        # 'unavailable' must not smuggle digest evidence: a state that says
+        # "no fingerprint" cannot also carry a digest, size, or fingerprint
+        # status.
+        for field in ("artifact_digest", "artifact_size",
+                      "artifact_fingerprint_status"):
+            if field in entry:
+                return False
+    if "round" in entry:
+        rnd = entry["round"]
+        if not isinstance(rnd, int) or isinstance(rnd, bool):
+            return False
+    if "duration_s" in entry:
+        duration = entry["duration_s"]
+        if not isinstance(duration, (int, float)) \
+                or isinstance(duration, bool) \
+                or not math.isfinite(duration) or duration < 0:
+            return False
+    if "usage" in entry and not isinstance(entry["usage"], dict):
+        return False
+    if "cost_usd" in entry:
+        # Cost must be a real, non-negative number: NaN/inf and negatives are
+        # never honest evidence and must not enter the audit history.
+        cost = entry["cost_usd"]
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool) \
+                or not math.isfinite(cost) or cost < 0:
+            return False
+    return True
+
+
+def read_orchestrator_evaluations(path):
+    """The orchestrator-evaluations file as a validated JSON ARRAY of entries.
+
+    Distinguishes MISSING from MALFORMED, which is load-bearing: a missing file
+    is a new file with no history, while an unreadable/corrupt file means
+    history may exist but cannot be trusted. Silently treating either as `[]`
+    would destroy or skew an audit trail without warning.
+
+    - File genuinely absent (`FileNotFoundError`) -> `[]` (a fresh history).
+    - Any OTHER OSError (permission/read error) -> raise ValueError: the file
+      may exist and must NOT be reinitialized to an empty history.
+    - Not valid JSON, not a JSON array, OR any entry that fails the schema
+      (`valid_orchestrator_evaluation_entry`) -> raise ValueError, so the caller
+      preserves the bytes and surfaces the failure rather than silently skipping
+      bad entries or skewing history counts.
+    """
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ValueError(
+            "unreadable orchestrator evaluations file at %s: %s" % (path, exc))
+    except ValueError:
+        raise ValueError(
+            "malformed orchestrator evaluations file at %s" % path)
+    if not isinstance(data, list):
+        raise ValueError(
+            "malformed orchestrator evaluations file at %s "
+            "(not a JSON array)" % path)
+    for entry in data:
+        if not valid_orchestrator_evaluation_entry(entry):
+            raise ValueError(
+                "malformed orchestrator evaluations file at %s "
+                "(entry fails the evaluation schema)" % path)
+    return data
+
+
+def append_orchestrator_evaluation(path, entry):
+    """Append one targeted evaluation entry to the orchestrator-evaluations
+    array at `path`, atomically.
+
+    Mirrors `write_verification_disposition` above — the directly-analogous
+    orchestrator-written append-only JSON record — using `write_json_atomic`
+    with NO lock file (the project's deliberate lock-free pattern for this kind
+    of orchestrator sidecar).
+
+    - New entry fails the stored schema -> return
+      `{'ok': False, 'error': 'invalid_entry'}` and write NOTHING. The new entry
+      is validated up front (not only the existing history), so a malformed
+      digest state, a negative/non-finite duration or cost, or any other schema
+      violation can never be appended to the audit trail.
+    - Missing file -> start from `[]` and write a one-element array.
+    - Malformed / unreadable / wrong-schema EXISTING content -> return
+      `{'ok': False, 'error': 'malformed'}` and write NOTHING, so the existing
+      bytes are preserved for an operator to inspect rather than overwritten.
+    - Success -> `{'ok': True}`.
+    - Any write failure -> `{'ok': False, 'error': 'write_failed'}`.
+    """
+    if not valid_orchestrator_evaluation_entry(entry):
+        return {"ok": False, "error": "invalid_entry"}
+    try:
+        existing = read_orchestrator_evaluations(path)
+    except ValueError:
+        return {"ok": False, "error": "malformed"}
+    new_list = list(existing) + [entry]
+    if write_json_atomic(path, new_list):
+        return {"ok": True}
+    return {"ok": False, "error": "write_failed"}
+
+
+def resolve_work_id_identity(identities_data, role, work_id):
+    """FALLBACK identity resolver from `identities.json` observations[].
+
+    The AUTHORITATIVE source is the per-turn `identity` object on the matching
+    controller.turn.start/end trace event (see cowork._resolve_identity_from_
+    trace): the real identities.json observation carries role/tool/model/
+    session_id/observed_at but NO work_id, so it cannot correlate to a specific
+    turn. This helper stays as a defensive fallback for the rare observation
+    that DOES carry a work_id (never overwriting the trace-derived identity),
+    and reads the IMMUTABLE observations rather than the latest-wins map so a
+    correlatable observation is still historically correct.
+
+    Returns `{'tool', 'model', 'session_id'}` with None values stripped, or
+    `{}` when no observation carries a matching work_id. Tolerant: never
+    raises."""
+    if not isinstance(identities_data, dict) or not role or not work_id:
+        return {}
+    observations = identities_data.get("observations")
+    if not isinstance(observations, list):
+        return {}
+    for obs in observations:
+        if not isinstance(obs, dict):
+            continue
+        if obs.get("role") == role and obs.get("work_id") == work_id:
+            resolved = {
+                "tool": obs.get("tool"),
+                "model": obs.get("model"),
+                "session_id": obs.get("session_id"),
+            }
+            return {k: v for k, v in resolved.items() if v is not None}
+    return {}
 
 
 def evaluation_queue_path_for(session_uuid):

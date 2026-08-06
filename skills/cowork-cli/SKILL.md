@@ -195,6 +195,58 @@ compare their evaluation scores and token consumption.
 `--evaluation-policy all_rounds|final_round|sampled|off` controls how much of
 the run gets peer-scored; its overhead is reported separately.
 
+## Targeted role evaluations (`--evaluate-role`)
+
+An **external orchestrator/driver** can record structured, per-contribution
+scores for one Cowork role — separately from the peer `scores.json` and without
+ever touching a phase gate. These live in their own file,
+`orchestrator-evaluations.json`, and surface in `--report` as a clearly labeled,
+per-role/controller/model section.
+
+```bash
+cowork --evaluate-role builder --eval-session <SESSION_UUID> --work-id <WORK_ID> \
+       --output-quality 4 --intent-alignment 5 --evidence-quality 4 \
+       --self-sufficiency 3 --cost-worthiness 4 --notes "clean diff, one re-review"
+
+# orchestration itself is its own target — no work_id, a --phase scope instead
+cowork --evaluate-role orchestration --eval-session <SESSION_UUID> --phase building \
+       --output-quality 5 --intent-alignment 5 --evidence-quality 4 \
+       --self-sufficiency 5 --cost-worthiness 4
+```
+
+- **Targets** (`--evaluate-role`): `scout`, `scout-reviewer`, `planner`,
+  `planning-advisor`, `builder`, `build-reviewer`, and `orchestration`.
+- **`--eval-session`** (not `--session`) names the session UUID. The distinct
+  flag name avoids an argparse abbreviation collision with `--session-file`.
+- **`--work-id`** identifies the exact team-role contribution. Find work_ids in
+  **`trace.jsonl`**, on `controller.turn.start` events — the `role` and
+  `work_id` fields there identify each contribution. (The `evaluation_queue.jsonl`
+  file does **not** carry a work_id usable for this purpose.) Required for team
+  roles; not used for `orchestration`.
+- **`--phase`** is required for `orchestration` and validated against
+  `scouting | planning | building | session`; it is an optional annotation for
+  team roles. `--round` and `--notes` are always optional.
+- **The five score dimensions** are integers **1–5, higher is always better**:
+  `--output-quality`, `--intent-alignment`, `--evidence-quality`,
+  `--self-sufficiency` (the reverse framing of intervention/rework required — a
+  5 means the contribution needed no correction), and `--cost-worthiness`.
+- **Proof-of-contribution:** a team-role `(role, work_id)` must be confirmed in
+  historical trace/identity evidence before anything is written. An unrecognized
+  work_id exits `2` and writes nothing.
+- **Artifact provenance** is derived from the **historical trace fingerprint**
+  (the `role.fingerprint.after` event immediately following the target turn's
+  `controller.turn.end`), **not** from the current on-disk artifact — so
+  evaluating an older turn keeps that turn's digest even after the same role
+  overwrote the file on a later turn. There is deliberately **no
+  `--artifact-digest` flag**.
+- **Re-evaluating** the same target appends a new entry; `--report` shows the
+  latest entry per target for scoring while retaining every entry for audit
+  (both `current_target_count` and `history_entry_count` are shown).
+- **Exit codes:** `0` recorded; `1` write/malformed-file error (the existing
+  file is preserved, never overwritten); `2` validation error (unknown role,
+  a score outside 1–5, missing session, missing `--work-id`/`--phase`,
+  contribution not found, or an invalid orchestration phase).
+
 ## Where the output is
 
 Project-local anchor, in the directory cowork was launched from:
@@ -220,6 +272,7 @@ Per-session artifacts, keyed by that UUID (override root with
   builder.summary.md                     # human-readable build summary
   builder-review.json                    # build-reviewer verdict
   scores.json                            # aggregate peer-eval
+  orchestrator-evaluations.json          # driver-owned targeted role evals (see --evaluate-role)
   identities.json                        # tool + model + session id per role
   measurement.json                       # what --report renders
   trace.jsonl                            # orchestration trace (metadata only)

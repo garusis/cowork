@@ -2540,6 +2540,13 @@ class OpencodeSession:
         self._notified = False
         self._resuming_first = resume_session_id is not None
         self._started = False
+        # One immutable unit of work per attempted send (P1): a work_id is
+        # minted in send() and echoed on EVERY terminal path — success, denied,
+        # provider error, empty stream, exception, missing session, delivery
+        # fallback failure, or cancellation — so an in-flight, failed or
+        # cancelled opencode turn is joinable to its start (matching the
+        # claude/codex invariant), not invisible.
+        self.last_work_id = None
         # ORCH-053: the read-only bash allowlist is glob-prefix-matched by
         # opencode and therefore injectable, so it is only emitted when the
         # run will actually be wrapped in the kernel write boundary. Off
@@ -2584,6 +2591,21 @@ class OpencodeSession:
             if rp_bytes is not None:
                 self.trace.event("role.prompt.bytes", role=speaker,
                                  bytes=rp_bytes, delivery="opencode_agent")
+
+    def _identity(self):
+        """The canonical identity block stamped on this session's work (P1).
+
+        opencode never names the LIVE model in its event stream, so the
+        config-pinned model (None = the CLI's own default) is the best identity
+        available. The provider is embedded in the opencode `provider/model` id
+        rather than named separately, so it is left unstamped here."""
+        return trace_store.identity_meta(
+            controller="opencode",
+            model=self.model,
+            model_source=("config_pinned" if self.model else "unknown"),
+            controller_session_id=self.session_id,
+            effort=self.effort,
+            effort_source=("config_pinned" if self.effort else "unknown"))
 
     def _wrap(self, command):
         """Wrap an `opencode run` argv in the kernel write boundary when the
@@ -2662,7 +2684,7 @@ class OpencodeSession:
         return write_opencode_global_agent(
             content, self.speaker, self._fallback_token)
 
-    def _agent_delivery_failed(self, turn_started):
+    def _agent_delivery_failed(self, turn_started, work_id):
         duration_ms = int((time.monotonic() - turn_started) * 1000)
         self.io_out.write(
             "[error] opencode failed to load the cowork agent from %s and "
@@ -2674,36 +2696,120 @@ class OpencodeSession:
             self.trace.event("controller.turn.end", controller="opencode",
                              role=self.speaker, result="error",
                              error_type="agent_delivery_failed",
-                             duration_ms=duration_ms)
+                             session_id=self.session_id,
+                             **trace_store.work_meta(
+                                 work_id, "failed", usage_scope="unknown",
+                                 identity=self._identity(),
+                                 duration_ms=duration_ms))
         return turn_result(False, "error", error_type="agent_delivery_failed",
                            session_id=self.session_id, duration_ms=duration_ms)
 
     def send(self, text, meta=None):
         global _OPENCODE_GLOBAL_DELIVERY
+        meta = dict(meta or {})
+        # One work_id per attempted send, minted BEFORE any setup or early
+        # return so EVERY terminal path is joinable — including a pre-start
+        # guard-boundary or global-agent setup failure (P1/CV-005).
+        work_id = trace_store.new_work_id()
+        self.last_work_id = work_id
+        work_class = meta.get("work_class") or "productive"
+        turn_started = time.monotonic()
+
+        def _elapsed_ms():
+            return int((time.monotonic() - turn_started) * 1000)
+
+        def _rejected(error_type, end_class):
+            # A PRE-START terminal: no controller.turn.start has been emitted for
+            # this work_id, so this is a REJECTED turn (never an orphan end),
+            # carrying its own work_id, identity, duration, and failed/cancelled
+            # classification (P14) — mirroring codex's missing_thread_id path.
+            if self.trace:
+                self.trace.event(
+                    "controller.turn.rejected", controller="opencode",
+                    role=self.speaker,
+                    result=("cancelled" if end_class == "cancelled"
+                            else "error"),
+                    error_type=error_type, session_id=self.session_id,
+                    **trace_store.work_meta(
+                        work_id, end_class, usage_scope="unknown",
+                        identity=self._identity(), duration_ms=_elapsed_ms()))
+
+        def _cancelled_end():
+            # A POST-START cancellation: a JOINED controller.turn.end (C1); the
+            # elapsed is computed before re-raising so the turn keeps its
+            # duration (P14).
+            if self.trace:
+                self.trace.event(
+                    "controller.turn.end", controller="opencode",
+                    role=self.speaker, result="cancelled",
+                    session_id=self.session_id,
+                    **trace_store.work_meta(
+                        work_id, "cancelled", usage_scope="unknown",
+                        identity=self._identity(), duration_ms=_elapsed_ms()))
+
+        def _error_end(error_type):
+            # A POST-START error: a JOINED controller.turn.end. duration_ms is
+            # computed HERE so no end can emit without one (P14).
+            failed_ms = _elapsed_ms()
+            if self.trace:
+                self.trace.event(
+                    "controller.turn.end", controller="opencode",
+                    role=self.speaker, result="error", error_type=error_type,
+                    session_id=self.session_id,
+                    **trace_store.work_meta(
+                        work_id, "failed", usage_scope="unknown",
+                        identity=self._identity(), duration_ms=failed_ms))
+            return turn_result(False, "error", error_type=error_type,
+                               session_id=self.session_id,
+                               duration_ms=failed_ms)
+
+        def _prepare(resume_id, use_global):
+            # Build the opencode command (redelivering the global agent first
+            # when required). EVERY step that can fail — the global-agent write,
+            # the command build, and the kernel write-boundary wrap — runs HERE
+            # so one caller try can stamp the correct terminal event; no setup or
+            # command-building path escapes unstamped (P14).
+            agent_name = self.agent_name
+            global_path = None
+            if use_global:
+                self._use_global_agent = True
+                agent_name, global_path = self._write_global_agent()
+            command = self._wrap(build_opencode_command(
+                agent_name, text, self.mode, self.yolo, model=self.model,
+                effort=self.effort, resume_session_id=resume_id,
+                directory=os.getcwd()))
+            return agent_name, global_path, command
+
         resume_id = None
         if self._started or self._resuming_first:
             if not self.session_id:
                 self.io_out.write(
                     "[error] no opencode session id; cannot continue\n")
                 self.io_out.flush()
-                if self.trace:
-                    self.trace.event("controller.turn.end",
-                                     controller="opencode", role=self.speaker,
-                                     result="error",
-                                     error_type="missing_session_id")
+                _rejected("missing_session_id", "failed")
                 return turn_result(False, "error",
                                    error_type="missing_session_id")
             resume_id = self.session_id
         fresh = resume_id is None
-        agent_name = self.agent_name
-        global_path = None
-        if self._use_global_agent or _OPENCODE_GLOBAL_DELIVERY:
-            self._use_global_agent = True
-            agent_name, global_path = self._write_global_agent()
-        command = self._wrap(build_opencode_command(
-            agent_name, text, self.mode, self.yolo, model=self.model,
-            effort=self.effort, resume_session_id=resume_id,
-            directory=os.getcwd()))
+
+        # INITIAL setup (pre-start): guard parent-work stamping AND
+        # command-building both do file I/O and can raise. BOTH run inside this
+        # one try so a failure is a REJECTED turn — no controller.turn.start has
+        # been emitted for this work_id yet, so an end would be an orphan. Guard
+        # stamping is here (not right after minting) so it too is covered.
+        try:
+            if self._guard_runtime:
+                _stamp_guard_parent_work(self._guard_runtime, work_id)
+            agent_name, global_path, command = _prepare(
+                resume_id, self._use_global_agent or _OPENCODE_GLOBAL_DELIVERY)
+        except KeyboardInterrupt:
+            _rejected("KeyboardInterrupt", "cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _rejected(type(exc).__name__, "failed")
+            return turn_result(False, "error", error_type=type(exc).__name__,
+                               session_id=self.session_id,
+                               duration_ms=_elapsed_ms())
         self._started = True
         if self.trace:
             fields = {
@@ -2717,19 +2823,21 @@ class OpencodeSession:
             if meta:
                 fields.update({k: v for k, v in meta.items()
                                if v is not None and k not in ("fresh", "resume")})
+            fields.update(trace_store.work_meta(
+                work_id, work_class, usage_scope="turn_native",
+                identity=self._identity()))
             self.trace.event("controller.turn.start", **fields)
-        turn_started = time.monotonic()
+
         try:
             try:
                 events = self._run(command)
             finally:
                 _remove_agent_file_quiet(global_path)
+        except KeyboardInterrupt:
+            _cancelled_end()
+            raise
         except Exception as exc:  # noqa: BLE001
-            if self.trace:
-                self.trace.event("controller.turn.end", controller="opencode",
-                                 role=self.speaker, result="error",
-                                 error_type=type(exc).__name__)
-            return turn_result(False, "error", error_type=type(exc).__name__)
+            return _error_end(type(exc).__name__)
         parsed_events = [parse_opencode_event(obj) for obj in events]
         fallback = False
         if is_opencode_delivery_failure(parsed_events):
@@ -2745,28 +2853,27 @@ class OpencodeSession:
                     event_count=len(events))
             if global_path is not None:
                 # Already on the fallback path — nothing further to try.
-                return self._agent_delivery_failed(turn_started)
-            # ORCH-052: the failed run died server-side before any model
-            # turn, so one retry delivered via the global config dir costs
-            # nothing. The failed attempt's error envelope may carry a
-            # sessionID; it is deliberately not adopted — the retry reuses
-            # the resume id computed at the top of this send().
-            agent_name, global_path = self._write_global_agent()
-            command = self._wrap(build_opencode_command(
-                agent_name, text, self.mode, self.yolo, model=self.model,
-                effort=self.effort, resume_session_id=resume_id,
-                directory=os.getcwd()))
+                return self._agent_delivery_failed(turn_started, work_id)
+            # FALLBACK setup (post-start): a failure or cancellation here is a
+            # JOINED controller.turn.end, never an orphan start. ORCH-052: the
+            # failed run died server-side before any model turn, so one retry
+            # delivered via the global config dir costs nothing; the retry
+            # reuses the resume id computed at the top of this send().
+            try:
+                agent_name, global_path, command = _prepare(resume_id, True)
+            except KeyboardInterrupt:
+                _cancelled_end()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return _error_end(type(exc).__name__)
             try:
                 try:
                     events = self._run(command)
+                except KeyboardInterrupt:
+                    _cancelled_end()
+                    raise
                 except Exception as exc:  # noqa: BLE001
-                    if self.trace:
-                        self.trace.event(
-                            "controller.turn.end", controller="opencode",
-                            role=self.speaker, result="error",
-                            error_type=type(exc).__name__)
-                    return turn_result(False, "error",
-                                       error_type=type(exc).__name__)
+                    return _error_end(type(exc).__name__)
             finally:
                 _remove_agent_file_quiet(global_path)
             parsed_events = [parse_opencode_event(obj) for obj in events]
@@ -2779,11 +2886,11 @@ class OpencodeSession:
                     global_path=global_path,
                     result="failed" if retry_dead else "ok")
             if retry_dead:
-                return self._agent_delivery_failed(turn_started)
+                return self._agent_delivery_failed(turn_started, work_id)
             fallback = True
             self._use_global_agent = True
             _OPENCODE_GLOBAL_DELIVERY = True
-        duration_ms = int((time.monotonic() - turn_started) * 1000)
+        duration_ms = _elapsed_ms()
         sid = capture_opencode_session_id(events)
         if sid and not self.session_id:
             self.session_id = sid
@@ -2802,6 +2909,9 @@ class OpencodeSession:
         if result == "ok" and not events:
             result = "error"
         usage = opencode_usage(events)
+        # A failed turn is terminal-classed `failed`; ok/denied keep the start's
+        # purpose class. opencode reports usage per turn, so the scope is native.
+        end_class = work_class if result != "error" else "failed"
         # opencode events never name the live model, so the config-pinned one
         # is the best identity available (None = the CLI's own default).
         if self.trace:
@@ -2809,8 +2919,11 @@ class OpencodeSession:
                              role=self.speaker, result=result,
                              session_id=self.session_id,
                              event_count=len(events), usage=usage,
-                             model=self.model, duration_ms=duration_ms,
-                             fallback=fallback)
+                             model=self.model, fallback=fallback,
+                             **trace_store.work_meta(
+                                 work_id, end_class, usage_scope="turn_native",
+                                 identity=self._identity(),
+                                 duration_ms=duration_ms))
         if result == "error" and not events:
             return turn_result(False, "error", error_type="no_events",
                                session_id=self.session_id,

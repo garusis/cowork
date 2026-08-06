@@ -29338,3 +29338,1208 @@ class EvaluatorEffortPropagationTests(unittest.TestCase):
         self.assertEqual(missing["state"], "unknown")
         self.assertIsNone(cowork._isolated_evaluator_session(
             entry, missing, io_out=io.StringIO()))
+
+
+# --------------------------------------------------------------------------- #
+# Targeted orchestrator-owned evaluations (`cowork --evaluate-role ...`).      #
+#                                                                             #
+# Provider-free and deterministic: every test writes its own trace.jsonl /     #
+# identities.json fixtures and calls the pure state/CLI/measure/report code.   #
+# --------------------------------------------------------------------------- #
+
+
+class _OrchestratorEvalArgs(object):
+    """A bare args namespace for run_orchestrator_eval — every attribute the
+    function reads is set by _OrchestratorEvalBase.args()."""
+
+
+class _OrchestratorEvalBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._prior_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = self.tmp
+        self.addCleanup(self._restore_root)
+        self.session_uuid = "orch-eval-test"
+        self.assets = state_store.session_assets_dir(self.session_uuid)
+        os.makedirs(self.assets, exist_ok=True)
+
+    def _restore_root(self):
+        if self._prior_root is None:
+            os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        else:
+            os.environ["COWORK_SESSIONS_ROOT"] = self._prior_root
+
+    def eval_path(self, session=None):
+        return state_store.orchestrator_evaluations_path_for(
+            session or self.session_uuid)
+
+    def read_entries(self, session=None):
+        with open(self.eval_path(session)) as fh:
+            return json.load(fh)
+
+    def write_trace(self, events, session=None):
+        path = trace_store.trace_path_for(session or self.session_uuid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            for event in events:
+                fh.write(json.dumps(event) + "\n")
+
+    def write_identities(self, data, session=None):
+        path = state_store.identities_path_for(session or self.session_uuid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+
+    def write_evaluations(self, entries, session=None):
+        with open(self.eval_path(session), "w") as fh:
+            json.dump(entries, fh)
+
+    def sha(self, text):
+        """A REAL 64-hex SHA-256 digest for fixture fingerprints."""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def turn_events(self, role, work_id, sha=None, size=100,
+                    status="ready_for_review", usage=None, duration_ms=None,
+                    identity=None, exists=True, with_fingerprint=True,
+                    ts_start="2026-08-06T00:00:00Z",
+                    ts_end="2026-08-06T00:00:05Z"):
+        """One realistic turn sequence: controller.turn.start / .end (both
+        carrying the per-turn `identity` object, exactly as cowork_bridge emits
+        via work_meta), then this turn's role.fingerprint.after. `exists`
+        controls whether the fingerprint records a real artifact; when False the
+        sha256/size are omitted, exactly as the real trace does for a missing
+        file."""
+        start = {"event": "controller.turn.start", "role": role,
+                 "work_id": work_id, "ts": ts_start}
+        end = {"event": "controller.turn.end", "role": role,
+               "work_id": work_id, "ts": ts_end}
+        if identity is not None:
+            start["identity"] = identity
+            end["identity"] = identity
+        if usage is not None:
+            end["usage"] = usage
+        if duration_ms is not None:
+            end["duration_ms"] = duration_ms
+        events = [start, end]
+        if with_fingerprint:
+            fingerprint = {"event": "role.fingerprint.after", "role": role,
+                           "exists": exists, "status": status}
+            if exists:
+                fingerprint["sha256"] = sha or self.sha(work_id)
+                fingerprint["size"] = size
+            events.append(fingerprint)
+        return events
+
+    def identity_block(self, controller, model, session_id, effort):
+        """The per-turn identity object as cowork_trace.identity_meta shapes
+        it: controller/model/effort/controller_session_id."""
+        return {"controller": controller, "model": model, "effort": effort,
+                "controller_session_id": session_id}
+
+    def entry(self, role, work_id=None, phase=None, scores=(4, 5, 4, 3, 4),
+              session=None, **extra):
+        """A schema-valid stored evaluation entry (as append would write)."""
+        oq, ia, eq, ss, cw = scores
+        built = {
+            "session_uuid": session or self.session_uuid,
+            "timestamp": "2026-08-06T00:00:00Z",
+            "role": role,
+            "output_quality": oq, "intent_alignment": ia,
+            "evidence_quality": eq, "self_sufficiency": ss,
+            "cost_worthiness": cw,
+            "artifact_digest_state": "unavailable",
+        }
+        if work_id is not None:
+            built["work_id"] = work_id
+        if phase is not None:
+            built["phase"] = phase
+        built.update(extra)
+        return built
+
+    def args(self, **over):
+        base = {
+            "evaluate_role": None,
+            "eval_session": self.session_uuid,
+            "work_id": None,
+            "eval_phase": None,
+            "eval_round": None,
+            "eval_notes": None,
+            "output_quality": 4,
+            "intent_alignment": 5,
+            "evidence_quality": 4,
+            "self_sufficiency": 3,
+            "cost_worthiness": 4,
+        }
+        base.update(over)
+        namespace = _OrchestratorEvalArgs()
+        namespace.__dict__.update(base)
+        return namespace
+
+    def run_eval(self, **over):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cowork.run_orchestrator_eval(self.args(**over),
+                                              io_out=io.StringIO())
+        return rc, err.getvalue()
+
+
+class OrchestratorEvalContractTests(_OrchestratorEvalBase):
+    def test_team_entry_shape(self):
+        digest = self.sha("builder-wid-1-artifact")
+        self.write_trace(self.turn_events(
+            "builder", "wid-1", sha=digest, size=100))
+        rc, _ = self.run_eval(evaluate_role="builder", work_id="wid-1",
+                              output_quality=4, intent_alignment=5,
+                              evidence_quality=4, self_sufficiency=3,
+                              cost_worthiness=4)
+        self.assertEqual(rc, 0)
+        entry = self.read_entries()[0]
+        for field in ("session_uuid", "timestamp", "role", "work_id",
+                      "output_quality", "intent_alignment", "evidence_quality",
+                      "self_sufficiency", "cost_worthiness",
+                      "artifact_digest_state"):
+            self.assertIn(field, entry)
+        self.assertEqual(entry["role"], "builder")
+        self.assertEqual(entry["work_id"], "wid-1")
+        self.assertEqual(entry["artifact_digest_state"], "observed")
+        self.assertEqual(entry["artifact_digest"], digest)
+        self.assertEqual(entry["artifact_size"], 100)
+        # Optional fields not passed are ABSENT, never null.
+        self.assertNotIn("notes", entry)
+        # The written entry round-trips through the strict schema reader.
+        self.assertEqual(
+            state_store.read_orchestrator_evaluations(self.eval_path()), [entry])
+
+    def test_orchestration_entry_shape(self):
+        rc, _ = self.run_eval(evaluate_role="orchestration",
+                              eval_phase="building")
+        self.assertEqual(rc, 0)
+        entry = self.read_entries()[0]
+        self.assertEqual(entry["role"], "orchestration")
+        self.assertNotIn("work_id", entry)
+        self.assertEqual(entry["phase"], "building")
+        self.assertEqual(entry["artifact_digest_state"], "unavailable")
+
+    def test_usage_present_from_trace_and_absent_when_missing(self):
+        self.write_trace(self.turn_events(
+            "planner", "wid-u", size=10,
+            usage={"input_tokens": 5, "output_tokens": 7}, duration_ms=4200))
+        rc, _ = self.run_eval(evaluate_role="planner", work_id="wid-u")
+        self.assertEqual(rc, 0)
+        entry = self.read_entries()[0]
+        self.assertEqual(entry["usage"], {"input_tokens": 5,
+                                          "output_tokens": 7})
+        self.assertEqual(entry["duration_s"], 4.2)
+
+    def test_evidence_absent_when_trace_missing(self):
+        # A real identities.json observation carries NO work_id, so proof for a
+        # trace-only-provable contribution comes from the trace's own
+        # controller.turn.start. With no fingerprint/usage on that turn, both are
+        # OMITTED (not null) and the digest is unavailable.
+        self.write_trace([{"event": "controller.turn.start", "role": "scout",
+                           "work_id": "wid-x", "ts": "2026-08-06T00:00:00Z"}])
+        rc, _ = self.run_eval(evaluate_role="scout", work_id="wid-x")
+        self.assertEqual(rc, 0)
+        entry = self.read_entries()[0]
+        self.assertNotIn("usage", entry)
+        self.assertNotIn("duration_s", entry)
+        self.assertIn("artifact_digest_state", entry)
+        self.assertEqual(entry["artifact_digest_state"], "unavailable")
+
+    def test_parser_dests_align_with_run(self):
+        # The argparse dests must match what run_orchestrator_eval reads.
+        args = cowork.build_parser().parse_args([
+            "--evaluate-role", "orchestration",
+            "--eval-session", self.session_uuid, "--phase", "building",
+            "--round", "2", "--notes", "n",
+            "--output-quality", "5", "--intent-alignment", "5",
+            "--evidence-quality", "4", "--self-sufficiency", "5",
+            "--cost-worthiness", "4"])
+        self.assertEqual(args.evaluate_role, "orchestration")
+        self.assertEqual(args.eval_session, self.session_uuid)
+        self.assertEqual(args.eval_phase, "building")
+        self.assertEqual(args.eval_round, 2)
+        self.assertEqual(args.eval_notes, "n")
+        self.assertEqual(args.output_quality, 5)
+        rc = cowork.run_orchestrator_eval(args, io_out=io.StringIO())
+        self.assertEqual(rc, 0)
+        entry = self.read_entries()[0]
+        self.assertEqual(entry["role"], "orchestration")
+        self.assertEqual(entry["phase"], "building")
+        self.assertEqual(entry["round"], 2)
+        self.assertEqual(entry["notes"], "n")
+
+
+class OrchestratorEvalPersistenceTests(_OrchestratorEvalBase):
+    def test_append_creates_file(self):
+        path = self.eval_path()
+        self.assertFalse(os.path.exists(path))
+        result = state_store.append_orchestrator_evaluation(
+            path, self.entry("scout", work_id="w1"))
+        self.assertTrue(result["ok"])
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(len(self.read_entries()), 1)
+
+    def test_two_appends_two_entries(self):
+        path = self.eval_path()
+        state_store.append_orchestrator_evaluation(
+            path, self.entry("scout", work_id="w1"))
+        state_store.append_orchestrator_evaluation(
+            path, self.entry("planner", work_id="w2"))
+        entries = self.read_entries()
+        self.assertEqual(len(entries), 2)
+        self.assertEqual([e["role"] for e in entries], ["scout", "planner"])
+
+    def test_valid_json_array_after_each_append(self):
+        path = self.eval_path()
+        for i in range(3):
+            state_store.append_orchestrator_evaluation(
+                path, self.entry("scout", work_id="w%d" % i))
+            self.assertIsInstance(self.read_entries(), list)
+
+
+class OrchestratorEvalIdentityTests(_OrchestratorEvalBase):
+    # The REAL identities.json for this kind of session: a latest-wins map plus
+    # observations[] that carry role/tool/model/session_id/observed_at but NO
+    # work_id — so they cannot pinpoint a turn. Identity therefore has to come
+    # from the trace's per-turn `identity` object, which IS keyed by work_id.
+    def _realistic_identities(self):
+        return {
+            "scout": {"tool": "claude", "model": "claude-opus-4-8",
+                      "session_id": "sess_cl", "effort": "medium",
+                      "observed_at": "2026-08-06T00:00:06Z"},
+            "observations": [
+                {"role": "scout", "tool": "opencode",
+                 "model": "anthropic/claude-sonnet-4-5",
+                 "session_id": "ses_oc", "observed_at": "2026-08-06T00:00:01Z"},
+                {"role": "scout", "tool": "claude", "model": "claude-opus-4-8",
+                 "session_id": "sess_cl",
+                 "observed_at": "2026-08-06T00:00:06Z"}],
+        }
+
+    def test_trace_identity_resolution_maps_the_real_fields(self):
+        # cowork_trace.identity_meta shapes the per-turn object; the resolver
+        # maps controller->tool, controller_session_id->session_id, and keeps
+        # model/effort.
+        self.write_trace(self.turn_events(
+            "planner", "wid-1",
+            identity=self.identity_block("opencode", "anthropic/x", "ses_1",
+                                         "high")))
+        resolved = cowork._resolve_identity_from_trace(
+            self.session_uuid, "planner", "wid-1")
+        self.assertEqual(resolved, {"tool": "opencode", "model": "anthropic/x",
+                                    "session_id": "ses_1", "effort": "high"})
+        # A work_id with no matching turn resolves to nothing.
+        self.assertEqual(cowork._resolve_identity_from_trace(
+            self.session_uuid, "planner", "other"), {})
+
+    def test_controller_switch_stamps_distinct_real_identities(self):
+        # OpenCode -> Claude switch across two scout turns. The realistic
+        # observations carry no work_id; identity MUST come from each turn's own
+        # trace identity object, so each evaluation is stamped with the
+        # controller/model/session it ACTUALLY ran on.
+        self.write_identities(self._realistic_identities())
+        sha1 = self.sha("scout-turn-1")
+        sha2 = self.sha("scout-turn-2")
+        self.write_trace(
+            self.turn_events(
+                "scout", "wid-1", sha=sha1, size=100,
+                identity=self.identity_block(
+                    "opencode", "anthropic/claude-sonnet-4-5", "ses_oc",
+                    "high"))
+            + self.turn_events(
+                "scout", "wid-2", sha=sha2, size=200,
+                identity=self.identity_block(
+                    "claude", "claude-opus-4-8", "sess_cl", "medium")))
+        rc1, _ = self.run_eval(evaluate_role="scout", work_id="wid-1")
+        rc2, _ = self.run_eval(evaluate_role="scout", work_id="wid-2")
+        self.assertEqual((rc1, rc2), (0, 0))
+        by_work = {e["work_id"]: e for e in self.read_entries()}
+        self.assertEqual(by_work["wid-1"]["tool"], "opencode")
+        self.assertEqual(by_work["wid-1"]["model"],
+                         "anthropic/claude-sonnet-4-5")
+        self.assertEqual(by_work["wid-1"]["session_id"], "ses_oc")
+        self.assertEqual(by_work["wid-1"]["effort"], "high")
+        self.assertEqual(by_work["wid-1"]["artifact_digest"], sha1)
+        self.assertEqual(by_work["wid-2"]["tool"], "claude")
+        self.assertEqual(by_work["wid-2"]["model"], "claude-opus-4-8")
+        self.assertEqual(by_work["wid-2"]["session_id"], "sess_cl")
+        self.assertEqual(by_work["wid-2"]["effort"], "medium")
+        self.assertEqual(by_work["wid-2"]["artifact_digest"], sha2)
+
+    def test_identities_fallback_only_when_observation_carries_work_id(self):
+        # The defensive fallback: it fires only for the rare observation that
+        # DOES carry a work_id, and never for the real (work_id-less) shape.
+        with_work_id = {"observations": [
+            {"role": "scout", "work_id": "wid-1", "tool": "claude",
+             "model": "m1", "session_id": "s1"}]}
+        self.assertEqual(
+            state_store.resolve_work_id_identity(with_work_id, "scout",
+                                                 "wid-1"),
+            {"tool": "claude", "model": "m1", "session_id": "s1"})
+        real_shape = self._realistic_identities()
+        self.assertEqual(
+            state_store.resolve_work_id_identity(real_shape, "scout", "wid-1"),
+            {})
+
+
+class OrchestratorEvalCLIValidationTests(_OrchestratorEvalBase):
+    def _assert_no_file(self, session=None):
+        self.assertFalse(os.path.exists(self.eval_path(session)))
+
+    def test_unknown_role(self):
+        rc, err = self.run_eval(evaluate_role="bogus", work_id="w")
+        self.assertEqual(rc, 2)
+        self.assertIn("bogus", err)
+        self._assert_no_file()
+
+    def test_score_out_of_range(self):
+        rc, err = self.run_eval(evaluate_role="scout", work_id="w",
+                               output_quality=6)
+        self.assertEqual(rc, 2)
+        self.assertIn("output-quality", err)
+        self._assert_no_file()
+
+    def test_nonexistent_session(self):
+        rc, _ = self.run_eval(evaluate_role="scout", eval_session="nope",
+                             work_id="w")
+        self.assertEqual(rc, 2)
+        self._assert_no_file("nope")
+
+    def test_missing_work_id_for_team_role(self):
+        rc, err = self.run_eval(evaluate_role="scout", work_id=None)
+        self.assertEqual(rc, 2)
+        self.assertIn("work-id", err)
+        self._assert_no_file()
+
+    def test_missing_phase_for_orchestration(self):
+        rc, err = self.run_eval(evaluate_role="orchestration", eval_phase=None)
+        self.assertEqual(rc, 2)
+        self.assertIn("phase", err)
+        self._assert_no_file()
+
+    def test_contribution_not_found(self):
+        rc, err = self.run_eval(evaluate_role="scout", work_id="ghost")
+        self.assertEqual(rc, 2)
+        self.assertIn("contribution not found", err)
+        self._assert_no_file()
+
+    def test_invalid_orchestration_phase(self):
+        rc, err = self.run_eval(evaluate_role="orchestration",
+                               eval_phase="badphase")
+        self.assertEqual(rc, 2)
+        self.assertIn("badphase", err)
+        self._assert_no_file()
+
+
+class OrchestratorEvalAggregationTests(_OrchestratorEvalBase):
+    def test_reevaluation_averages_latest_only_with_visible_counts(self):
+        self.write_evaluations([
+            self.entry("scout", work_id="wid-1", scores=(2, 2, 2, 2, 2),
+                       tool="claude", model="m"),
+            self.entry("scout", work_id="wid-1", scores=(5, 5, 5, 5, 5),
+                       tool="claude", model="m")])
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        view = record["orchestrator_evaluations"]
+        self.assertEqual(view["current_target_count"], 1)
+        self.assertEqual(view["history_entry_count"], 2)
+        self.assertEqual(len(view["entries"]), 2)
+        # Averages reflect ONLY the latest entry for the target.
+        self.assertEqual(view["by_role"]["scout"]["output_quality"], 5)
+
+    def test_distinct_roles_and_controllers_both_present(self):
+        self.write_evaluations([
+            self.entry("scout", work_id="wid-1", scores=(4, 4, 4, 4, 4),
+                       tool="claude", model="mA"),
+            self.entry("planner", work_id="wid-2", scores=(3, 3, 3, 3, 3),
+                       tool="codex", model="mB")])
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        view = record["orchestrator_evaluations"]
+        self.assertEqual(set(view["by_role"]), {"scout", "planner"})
+        self.assertEqual(set(view["by_controller"]), {"claude", "codex"})
+        self.assertEqual(set(view["by_model"]), {"mA", "mB"})
+        self.assertEqual(view["current_target_count"], 2)
+
+
+class OrchestratorEvalReportTests(_OrchestratorEvalBase):
+    def test_report_renders_labeled_section(self):
+        self.write_evaluations([
+            self.entry("scout", work_id="wid-1", scores=(4, 4, 4, 4, 4),
+                       tool="claude", model="mA"),
+            self.entry("builder", work_id="wid-2", scores=(3, 3, 3, 3, 3),
+                       tool="codex", model="mB")])
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        self.assertEqual(set(record["orchestrator_evaluations"]["by_role"]),
+                         {"scout", "builder"})
+        self.assertIsNotNone(
+            record["orchestrator_evaluations"]["current_target_count"])
+        self.assertIsNotNone(
+            record["orchestrator_evaluations"]["history_entry_count"])
+        rendered = report.render_report(record)
+        self.assertIn("Orchestrator evaluations", rendered)
+        self.assertIn("scout", rendered)
+        self.assertIn("builder", rendered)
+
+
+class OrchestratorEvalMissingFileTests(_OrchestratorEvalBase):
+    def test_missing_file_omits_key_and_section(self):
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        self.assertNotIn("orchestrator_evaluations", record)
+        rendered = report.render_report(record)
+        self.assertNotIn("Orchestrator evaluations", rendered)
+
+    def test_empty_array_omits_key(self):
+        self.write_evaluations([])
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        self.assertNotIn("orchestrator_evaluations", record)
+
+
+class OrchestratorEvalCompatibilityTests(_OrchestratorEvalBase):
+    def test_scores_json_never_modified(self):
+        scores_path = state_store.scores_path_for(self.session_uuid)
+        with open(scores_path, "w") as fh:
+            json.dump({"evaluations": [{"phase": "building"}]}, fh)
+        with open(scores_path, "rb") as fh:
+            before = hashlib.sha256(fh.read()).hexdigest()
+        self.write_identities({"observations": [
+            {"role": "builder", "work_id": "wid-1", "tool": "claude"}]})
+        rc, _ = self.run_eval(evaluate_role="builder", work_id="wid-1")
+        self.assertEqual(rc, 0)
+        with open(scores_path, "rb") as fh:
+            after = hashlib.sha256(fh.read()).hexdigest()
+        self.assertEqual(before, after)
+        self.assertTrue(os.path.exists(self.eval_path()))
+
+
+class OrchestratorEvalProofOfContributionTests(_OrchestratorEvalBase):
+    def test_unknown_work_id_exits_2(self):
+        rc, _ = self.run_eval(evaluate_role="scout", work_id="none")
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(self.eval_path()))
+
+    def test_wrong_role_work_id_exits_2(self):
+        self.write_identities({"observations": [
+            {"role": "scout", "work_id": "wid-1", "tool": "claude"}]})
+        rc, _ = self.run_eval(evaluate_role="planner", work_id="wid-1")
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(self.eval_path()))
+
+    def test_valid_work_id_accepted_from_identities(self):
+        self.write_identities({"observations": [
+            {"role": "scout", "work_id": "wid-1", "tool": "claude"}]})
+        rc, _ = self.run_eval(evaluate_role="scout", work_id="wid-1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read_entries()[0]["work_id"], "wid-1")
+
+    def test_valid_work_id_accepted_from_trace_only(self):
+        self.write_trace([{"event": "controller.turn.start", "role": "scout",
+                           "work_id": "wid-2", "ts": "2026-08-06T00:00:00Z"}])
+        rc, _ = self.run_eval(evaluate_role="scout", work_id="wid-2")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read_entries()[0]["work_id"], "wid-2")
+
+
+class OrchestratorEvalMalformedFileTests(_OrchestratorEvalBase):
+    def test_malformed_bytes_preserved(self):
+        path = self.eval_path()
+        with open(path, "wb") as fh:
+            fh.write(b"{ this is not valid json")
+        result = state_store.append_orchestrator_evaluation(
+            path, self.entry("scout", work_id="w1"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "malformed")
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), b"{ this is not valid json")
+
+    def test_malformed_file_build_record_reports_state(self):
+        with open(self.eval_path(), "wb") as fh:
+            fh.write(b"not a json array")
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        self.assertEqual(record["orchestrator_evaluations"]["state"],
+                         "malformed")
+
+    def test_malformed_report_renders_warning(self):
+        record = {"orchestrator_evaluations": {
+            "state": "malformed", "entries": [],
+            "current_target_count": 0, "history_entry_count": 0}}
+        lines = report._section_orchestrator_evaluations(record)
+        self.assertTrue(any("MALFORMED" in line for line in lines))
+
+    def test_missing_file_creates_fresh(self):
+        path = self.eval_path()
+        self.assertFalse(os.path.exists(path))
+        result = state_store.append_orchestrator_evaluation(
+            path, self.entry("scout", work_id="z"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.read_entries()), 1)
+
+    # --- Item 3: wrong-schema audit history fails closed (not just bad JSON) ---
+
+    def _bad_history_cases(self):
+        # Each is a VALID JSON array that is nonetheless corrupt history.
+        good = self.entry("scout", work_id="w1")
+        return {
+            "string_element": [good, "not-an-object"],
+            "arbitrary_dict": [good, {"hello": "world"}],
+            "score_out_of_range": [dict(good, output_quality=9)],
+            "score_wrong_type": [dict(good, cost_worthiness="5")],
+            "missing_session": [{k: v for k, v in good.items()
+                                 if k != "session_uuid"}],
+            "missing_timestamp": [{k: v for k, v in good.items()
+                                   if k != "timestamp"}],
+            "team_role_missing_work_id": [{k: v for k, v in good.items()
+                                           if k != "work_id"}],
+            "unknown_role": [dict(good, role="mystery")],
+            "orchestration_bad_phase": [
+                self.entry("orchestration", phase="not-a-phase")],
+            "orchestration_with_work_id": [
+                self.entry("orchestration", work_id="wid", phase="session")],
+            "bad_artifact_digest": [dict(good, artifact_digest="short")],
+        }
+
+    def test_wrong_schema_history_is_malformed_and_preserved(self):
+        for name, entries in self._bad_history_cases().items():
+            with self.subTest(case=name):
+                path = self.eval_path()
+                with open(path, "w") as fh:
+                    json.dump(entries, fh)
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                with self.assertRaises(ValueError):
+                    state_store.read_orchestrator_evaluations(path)
+                result = state_store.append_orchestrator_evaluation(
+                    path, self.entry("planner", work_id="w2"))
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], "malformed")
+                # Bytes are untouched — bad history is never overwritten.
+                with open(path, "rb") as fh:
+                    self.assertEqual(fh.read(), raw)
+                os.unlink(path)
+
+    def test_wrong_schema_history_build_record_reports_malformed(self):
+        with open(self.eval_path(), "w") as fh:
+            json.dump([self.entry("scout", work_id="w1"), "corrupt"], fh)
+        record = measure.build_record(self.session_uuid, cwd=self.tmp)
+        # Reported as malformed, NOT silently skipping the bad element and
+        # skewing the counts to look like one clean entry.
+        self.assertEqual(record["orchestrator_evaluations"]["state"],
+                         "malformed")
+
+    def test_valid_history_round_trips(self):
+        entries = [self.entry("scout", work_id="w1"),
+                   self.entry("orchestration", phase="session")]
+        with open(self.eval_path(), "w") as fh:
+            json.dump(entries, fh)
+        self.assertEqual(
+            state_store.read_orchestrator_evaluations(self.eval_path()),
+            entries)
+
+    # --- Item 4: a non-missing OSError must NOT be treated as a fresh file ---
+
+    def test_non_missing_oserror_is_not_treated_as_missing(self):
+        # A directory where the file should be triggers IsADirectoryError (an
+        # OSError that is NOT FileNotFoundError). It must surface, never
+        # initialize an empty history that could mask/overwrite real state.
+        path = self.eval_path()
+        os.makedirs(path)
+        with self.assertRaises(ValueError):
+            state_store.read_orchestrator_evaluations(path)
+        result = state_store.append_orchestrator_evaluation(
+            path, self.entry("scout", work_id="w1"))
+        self.assertFalse(result["ok"])
+        self.assertTrue(os.path.isdir(path))
+
+
+class OrchestratorEvalArtifactBindingTests(_OrchestratorEvalBase):
+    def _trace_path(self):
+        return trace_store.trace_path_for(self.session_uuid)
+
+    def test_two_turn_overwrite_regression(self):
+        # Two turns of the SAME role overwriting the same artifact file. The
+        # digest for an OLD work_id must be that turn's historical fingerprint,
+        # never the current (latest) file — which is what a re-hash would give.
+        sha1 = self.sha("planner-revision-1")
+        sha2 = self.sha("planner-revision-2")
+        self.write_trace(
+            self.turn_events("planner", "wid-1", sha=sha1, size=100)
+            + self.turn_events("planner", "wid-2", sha=sha2, size=200))
+        first = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(first["state"], "observed")
+        self.assertEqual(first["sha256"], sha1)
+        self.assertEqual(first["size"], 100)
+        second = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-2")
+        self.assertEqual(second["state"], "observed")
+        self.assertEqual(second["sha256"], sha2)
+        self.assertEqual(second["size"], 200)
+
+    def test_unavailable_when_no_turn_end(self):
+        self.write_trace([{"event": "controller.turn.start", "role": "planner",
+                           "work_id": "wid-1", "ts": "2026-08-06T00:00:00Z"}])
+        result = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["reason"], "turn_not_found")
+
+    def test_unavailable_when_no_fingerprint_after(self):
+        self.write_trace(self.turn_events(
+            "planner", "wid-1", with_fingerprint=False))
+        result = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["reason"], "fingerprint_not_found")
+
+    def test_missing_fingerprint_bounded_by_next_same_role_turn(self):
+        # wid-1's turn has NO fingerprint; a later planner turn (wid-2) DOES.
+        # The lookup for wid-1 must stop at wid-2's turn boundary and report
+        # fingerprint_not_found — never drift forward into wid-2's digest.
+        sha2 = self.sha("planner-2")
+        self.write_trace(
+            self.turn_events("planner", "wid-1", with_fingerprint=False)
+            + self.turn_events("planner", "wid-2", sha=sha2, size=200))
+        result = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["reason"], "fingerprint_not_found")
+        self.assertNotIn("sha256", result)
+
+    def test_ambiguous_rejects(self):
+        sha_a = self.sha("a")
+        sha_b = self.sha("b")
+        self.write_trace(
+            self.turn_events("planner", "wid-1", sha=sha_a, size=1)
+            + self.turn_events("planner", "wid-1", sha=sha_b, size=2))
+        result = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["reason"], "ambiguous")
+
+    def test_artifact_absent_when_exists_false(self):
+        # A real fingerprint for a missing artifact records exists=False and no
+        # sha256/size. That is NOT an observed digest.
+        self.write_trace(self.turn_events(
+            "planner", "wid-1", exists=False))
+        result = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["reason"], "artifact_absent")
+
+    def test_invalid_digest_is_not_observed(self):
+        self.write_trace(self.turn_events(
+            "planner", "wid-1", sha="not-a-64-hex-digest"))
+        result = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["reason"], "invalid_digest")
+
+    def test_missing_digest_key_is_not_observed(self):
+        # exists=True but the sha256 field never made it into the event.
+        self.write_trace(
+            [{"event": "controller.turn.start", "role": "planner",
+              "work_id": "wid-1", "ts": "2026-08-06T00:00:00Z"},
+             {"event": "controller.turn.end", "role": "planner",
+              "work_id": "wid-1", "ts": "2026-08-06T00:00:05Z"},
+             {"event": "role.fingerprint.after", "role": "planner",
+              "exists": True, "status": "ready_for_review"}])
+        result = cowork._lookup_artifact_fingerprint_from_trace(
+            self._trace_path(), "planner", "wid-1")
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["reason"], "invalid_digest")
+
+    def test_unavailable_for_orchestration(self):
+        rc, _ = self.run_eval(evaluate_role="orchestration",
+                             eval_phase="session")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read_entries()[0]["artifact_digest_state"],
+                         "unavailable")
+
+
+class OrchestratorEvalEndFirstIdentityTests(_OrchestratorEvalBase):
+    """Correction (root audit #2): _resolve_identity_from_trace must prefer the
+    settled END identity field-by-field, falling back to the START only for a
+    field the end left absent — so a fresh start's config-pinned model never
+    overrides the live model the provider named on the end."""
+
+    def _split_turn(self, role, work_id, start_identity, end_identity):
+        start = {"event": "controller.turn.start", "role": role,
+                 "work_id": work_id, "ts": "2026-08-06T00:00:00Z",
+                 "identity": start_identity}
+        end = {"event": "controller.turn.end", "role": role,
+               "work_id": work_id, "ts": "2026-08-06T00:00:05Z",
+               "identity": end_identity}
+        return [start, end]
+
+    def test_end_live_model_wins_over_start_config_pinned(self):
+        # A fresh start still names the config-pinned 'sonnet'; the live provider
+        # event corrects it to 'claude-sonnet-4-6' on the end. The end wins.
+        self.write_trace(self._split_turn(
+            "planner", "wid-1",
+            self.identity_block("claude", "sonnet", "sess_1", "medium"),
+            self.identity_block("claude", "claude-sonnet-4-6", "sess_1",
+                                "medium")))
+        resolved = cowork._resolve_identity_from_trace(
+            self.session_uuid, "planner", "wid-1")
+        self.assertEqual(resolved["model"], "claude-sonnet-4-6")
+        self.assertEqual(resolved["tool"], "claude")
+
+    def test_start_fills_a_field_the_end_never_observed(self):
+        # The end never observed the session id / effort (None); the start did.
+        # The merge falls back field-by-field rather than dropping them.
+        self.write_trace(self._split_turn(
+            "planner", "wid-2",
+            self.identity_block("claude", "sonnet", "sess_start", "high"),
+            self.identity_block("claude", "claude-sonnet-4-6", None, None)))
+        resolved = cowork._resolve_identity_from_trace(
+            self.session_uuid, "planner", "wid-2")
+        self.assertEqual(resolved, {
+            "tool": "claude", "model": "claude-sonnet-4-6",
+            "session_id": "sess_start", "effort": "high"})
+
+    def test_start_identity_used_when_end_has_none(self):
+        # An end event with no identity object at all: the start's identity is
+        # used unchanged (never dropped just because the end was silent).
+        start = {"event": "controller.turn.start", "role": "scout",
+                 "work_id": "wid-3", "ts": "2026-08-06T00:00:00Z",
+                 "identity": self.identity_block("opencode", "anthropic/x",
+                                                 "ses_o", "low")}
+        end = {"event": "controller.turn.end", "role": "scout",
+               "work_id": "wid-3", "ts": "2026-08-06T00:00:05Z"}
+        self.write_trace([start, end])
+        resolved = cowork._resolve_identity_from_trace(
+            self.session_uuid, "scout", "wid-3")
+        self.assertEqual(resolved, {"tool": "opencode", "model": "anthropic/x",
+                                    "session_id": "ses_o", "effort": "low"})
+
+
+class OrchestratorEvalEntrySchemaTests(_OrchestratorEvalBase):
+    """Correction (root audit #3): the stored fingerprint schema is enforced —
+    artifact_digest_state is required and closed to {observed, unavailable};
+    observed needs a real digest + non-negative size; unavailable must carry
+    none of digest/size/fingerprint-status; duration/cost must be finite and
+    non-negative. append validates the NEW entry, not only existing history."""
+
+    def _observed(self, **over):
+        base = self.entry("builder", work_id="w1",
+                          artifact_digest_state="observed",
+                          artifact_digest=self.sha("artifact"),
+                          artifact_size=100)
+        base.update(over)
+        return base
+
+    def test_valid_observed_and_unavailable_pass(self):
+        self.assertTrue(state_store.valid_orchestrator_evaluation_entry(
+            self._observed()))
+        self.assertTrue(state_store.valid_orchestrator_evaluation_entry(
+            self.entry("builder", work_id="w1")))
+
+    def test_missing_digest_state_rejected(self):
+        bad = self.entry("scout", work_id="w1")
+        del bad["artifact_digest_state"]
+        self.assertFalse(state_store.valid_orchestrator_evaluation_entry(bad))
+
+    def test_unknown_digest_state_rejected(self):
+        self.assertFalse(state_store.valid_orchestrator_evaluation_entry(
+            self.entry("scout", work_id="w1", artifact_digest_state="maybe")))
+
+    def test_observed_without_digest_rejected(self):
+        bad = self._observed()
+        del bad["artifact_digest"]
+        self.assertFalse(state_store.valid_orchestrator_evaluation_entry(bad))
+
+    def test_observed_bad_size_rejected(self):
+        self.assertFalse(state_store.valid_orchestrator_evaluation_entry(
+            self._observed(artifact_size=-1)))
+        self.assertFalse(state_store.valid_orchestrator_evaluation_entry(
+            self._observed(artifact_size="100")))
+
+    def test_unavailable_carrying_fingerprint_evidence_rejected(self):
+        for field, value in (("artifact_digest", self.sha("x")),
+                             ("artifact_size", 10),
+                             ("artifact_fingerprint_status", "ready")):
+            bad = self.entry("scout", work_id="w1", **{field: value})
+            self.assertFalse(
+                state_store.valid_orchestrator_evaluation_entry(bad),
+                "unavailable + %s must be invalid" % field)
+
+    def test_non_finite_or_negative_duration_rejected(self):
+        for value in (float("nan"), float("inf"), float("-inf"), -0.5):
+            self.assertFalse(
+                state_store.valid_orchestrator_evaluation_entry(
+                    self.entry("scout", work_id="w1", duration_s=value)),
+                "duration_s=%r must be invalid" % value)
+
+    def test_non_finite_or_negative_cost_rejected(self):
+        for value in (float("nan"), float("inf"), -1.0):
+            self.assertFalse(
+                state_store.valid_orchestrator_evaluation_entry(
+                    self.entry("scout", work_id="w1", cost_usd=value)),
+                "cost_usd=%r must be invalid" % value)
+
+    def test_append_rejects_invalid_new_entry_and_writes_nothing(self):
+        path = self.eval_path()
+        result = state_store.append_orchestrator_evaluation(
+            path, self.entry("scout", work_id="w1",
+                             artifact_digest_state="bogus"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid_entry")
+        self.assertFalse(os.path.exists(path))
+
+    def test_append_rejects_invalid_entry_over_valid_history(self):
+        path = self.eval_path()
+        state_store.append_orchestrator_evaluation(
+            path, self.entry("scout", work_id="w1"))
+        with open(path, "rb") as fh:
+            before = fh.read()
+        result = state_store.append_orchestrator_evaluation(
+            path, self.entry("planner", work_id="w2", cost_usd=float("inf")))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid_entry")
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+
+class OpencodeWorkIdTraceTest(unittest.TestCase):
+    """Correction (root audit #1 / cowork-internal #53): OpencodeSession mints
+    one work_id per attempted send and stamps controller.turn.start plus EVERY
+    terminal path with work_meta + identity, matching the claude/codex
+    immutable-work invariant. Proves unique IDs, start/end joins, and the
+    failure/rejection/cancellation paths — all via a fake subprocess, no real
+    CLI."""
+
+    OK_LINES = [
+        json.dumps({"type": "text", "sessionID": "ses_W",
+                    "part": {"text": "hello"}}),
+        json.dumps({"type": "step_finish", "sessionID": "ses_W",
+                    "part": {"reason": "stop",
+                             "tokens": {"input": 1, "output": 2}}}),
+    ]
+
+    def setUp(self):
+        bridge._OPENCODE_GLOBAL_DELIVERY = False
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.trace_path = os.path.join(self.tmp, "trace.jsonl")
+
+    def _session(self, **kw):
+        rp = os.path.join(self.tmp, "role.md")
+        with open(rp, "w") as fh:
+            fh.write("ROLE")
+        return bridge.OpencodeSession(rp, "implement", True,
+                                      agent_base_dir=self.tmp,
+                                      trace=trace_store.Trace(self.trace_path),
+                                      **kw)
+
+    def _events(self, name):
+        with open(self.trace_path) as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        return [e for e in events if e.get("event") == name]
+
+    def _popen(self, lines):
+        def fake(command, **kwargs):
+            return OpencodeSessionTest.FakeProc(list(lines))
+        return fake
+
+    def test_success_start_end_share_work_id_with_identity(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)):
+            s = self._session(io_out=io.StringIO(), model="anthropic/x",
+                              effort="high")
+            r = s.send("go")
+        self.assertTrue(r["ok"])
+        starts = self._events("controller.turn.start")
+        ends = self._events("controller.turn.end")
+        self.assertEqual((len(starts), len(ends)), (1, 1))
+        start, end = starts[0], ends[0]
+        self.assertTrue(start["work_id"])
+        self.assertEqual(start["work_id"], end["work_id"])
+        self.assertEqual(s.last_work_id, start["work_id"])
+        for ev in (start, end):
+            self.assertEqual(ev["identity"]["controller"], "opencode")
+            self.assertEqual(ev["identity"]["model"], "anthropic/x")
+            self.assertEqual(ev["identity"]["effort"], "high")
+            self.assertEqual(ev["usage_scope"], "turn_native")
+        self.assertEqual(start["work_class"], "productive")
+        self.assertEqual(end["result"], "ok")
+        self.assertIn("duration_ms", end)
+
+    def test_unique_work_ids_across_turns_each_joins(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)):
+            s = self._session(io_out=io.StringIO())
+            s.send("one")
+            first = s.last_work_id
+            s.send("two")
+            second = s.last_work_id
+        self.assertTrue(first and second)
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            [e["work_id"] for e in self._events("controller.turn.start")],
+            [first, second])
+        self.assertEqual(
+            sorted(e["work_id"] for e in self._events("controller.turn.end")),
+            sorted([first, second]))
+
+    def test_provider_error_end_carries_work_id(self):
+        import unittest.mock as mock
+        lines = [json.dumps({"type": "error", "sessionID": "ses_E",
+                             "error": {"name": "APIError",
+                                       "data": {"message": "boom"}}})]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(lines)):
+            s = self._session(io_out=io.StringIO())
+            r = s.send("go")
+        self.assertEqual(r["result"], "error")
+        end = self._events("controller.turn.end")[0]
+        self.assertEqual(end["result"], "error")
+        self.assertEqual(end["work_id"], s.last_work_id)
+        self.assertEqual(end["work_class"], "failed")
+        self.assertEqual(end["identity"]["controller"], "opencode")
+        self.assertIn("duration_ms", end)
+
+    def test_empty_stream_end_carries_work_id(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen([])):
+            s = self._session(io_out=io.StringIO())
+            r = s.send("go")
+        self.assertEqual(r.get("error_type"), "no_events")
+        end = self._events("controller.turn.end")[0]
+        self.assertEqual(end["result"], "error")
+        self.assertEqual(end["work_id"], s.last_work_id)
+
+    def test_missing_session_is_rejected_with_work_id(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)):
+            s = self._session(io_out=io.StringIO())
+            s._started = True
+            s.session_id = None
+            r = s.send("go")
+        self.assertEqual(r.get("error_type"), "missing_session_id")
+        # No start is emitted; the attempt is a rejected turn carrying work_id.
+        self.assertEqual(self._events("controller.turn.start"), [])
+        self.assertEqual(self._events("controller.turn.end"), [])
+        rejected = self._events("controller.turn.rejected")
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["work_id"], s.last_work_id)
+        self.assertEqual(rejected[0]["identity"]["controller"], "opencode")
+
+    def test_spawn_exception_end_joins_start_with_work_id(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=RuntimeError("spawn boom")):
+            s = self._session(io_out=io.StringIO())
+            r = s.send("go")
+        self.assertEqual(r.get("error_type"), "RuntimeError")
+        start = self._events("controller.turn.start")[0]
+        end = self._events("controller.turn.end")[0]
+        self.assertEqual(end["result"], "error")
+        self.assertEqual(end["error_type"], "RuntimeError")
+        self.assertEqual(start["work_id"], end["work_id"])
+        self.assertEqual(end["work_id"], s.last_work_id)
+        self.assertIn("duration_ms", end)
+
+    def test_cancellation_end_carries_work_id_and_reraises(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=KeyboardInterrupt()):
+            s = self._session(io_out=io.StringIO())
+            with self.assertRaises(KeyboardInterrupt):
+                s.send("go")
+        end = self._events("controller.turn.end")[0]
+        self.assertEqual(end["result"], "cancelled")
+        self.assertEqual(end["work_class"], "cancelled")
+        self.assertEqual(end["work_id"], s.last_work_id)
+        self.assertIn("duration_ms", end)
+
+    def test_delivery_fallback_failure_end_carries_work_id(self):
+        import unittest.mock as mock
+        config = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, config, ignore_errors=True)
+        prior = os.environ.get("OPENCODE_CONFIG_DIR")
+        os.environ["OPENCODE_CONFIG_DIR"] = config
+        if prior is None:
+            self.addCleanup(
+                lambda: os.environ.pop("OPENCODE_CONFIG_DIR", None))
+        else:
+            self.addCleanup(
+                lambda: os.environ.__setitem__("OPENCODE_CONFIG_DIR", prior))
+        delivery_error = json.dumps(
+            {"type": "error",
+             "error": {"name": "UnknownError",
+                       "data": {"message": "Unexpected server error"}}})
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen([delivery_error])):
+            s = self._session(io_out=io.StringIO())
+            r = s.send("go")
+        self.assertEqual(r.get("error_type"), "agent_delivery_failed")
+        end = self._events("controller.turn.end")[-1]
+        self.assertEqual(end["error_type"], "agent_delivery_failed")
+        self.assertEqual(end["work_id"], s.last_work_id)
+        self.assertEqual(end["identity"]["controller"], "opencode")
+        self.assertIn("duration_ms", end)
+
+    # --- setup/command-building exceptions must never escape unstamped ---
+
+    def _set_config_dir(self):
+        config = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, config, ignore_errors=True)
+        prior = os.environ.get("OPENCODE_CONFIG_DIR")
+        os.environ["OPENCODE_CONFIG_DIR"] = config
+        if prior is None:
+            self.addCleanup(
+                lambda: os.environ.pop("OPENCODE_CONFIG_DIR", None))
+        else:
+            self.addCleanup(
+                lambda: os.environ.__setitem__("OPENCODE_CONFIG_DIR", prior))
+        return config
+
+    def test_initial_wrap_exception_is_rejected_with_work_id(self):
+        # A guard write-boundary that raises during PRE-START setup must produce
+        # a rejected turn carrying the work_id — never an unstamped escape.
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)):
+            s = self._session(io_out=io.StringIO())
+            s._wrap = mock.Mock(side_effect=RuntimeError("boundary unavailable"))
+            r = s.send("go")
+        self.assertEqual(r["result"], "error")
+        self.assertEqual(r.get("error_type"), "RuntimeError")
+        # No start and no end: a pre-start failure is a rejected turn.
+        self.assertEqual(self._events("controller.turn.start"), [])
+        self.assertEqual(self._events("controller.turn.end"), [])
+        rej = self._events("controller.turn.rejected")
+        self.assertEqual(len(rej), 1)
+        self.assertEqual(rej[0]["work_id"], s.last_work_id)
+        self.assertEqual(rej[0]["work_class"], "failed")
+        self.assertEqual(rej[0]["identity"]["controller"], "opencode")
+        self.assertIn("duration_ms", rej[0])
+
+    def test_initial_global_agent_write_exception_is_rejected(self):
+        # The sticky-fallback pre-start global-agent write raising must also be a
+        # rejected turn, not an unstamped escape.
+        import unittest.mock as mock
+        bridge._OPENCODE_GLOBAL_DELIVERY = True
+        self.addCleanup(
+            lambda: setattr(bridge, "_OPENCODE_GLOBAL_DELIVERY", False))
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)):
+            s = self._session(io_out=io.StringIO())
+            s._write_global_agent = mock.Mock(side_effect=OSError("disk full"))
+            r = s.send("go")
+        self.assertEqual(r.get("error_type"), "OSError")
+        self.assertEqual(self._events("controller.turn.start"), [])
+        self.assertEqual(self._events("controller.turn.end"), [])
+        rej = self._events("controller.turn.rejected")
+        self.assertEqual(len(rej), 1)
+        self.assertEqual(rej[0]["work_id"], s.last_work_id)
+        self.assertEqual(rej[0]["work_class"], "failed")
+
+    def test_initial_setup_cancellation_is_rejected_cancelled(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)):
+            s = self._session(io_out=io.StringIO())
+            s._wrap = mock.Mock(side_effect=KeyboardInterrupt())
+            with self.assertRaises(KeyboardInterrupt):
+                s.send("go")
+        self.assertEqual(self._events("controller.turn.start"), [])
+        self.assertEqual(self._events("controller.turn.end"), [])
+        rej = self._events("controller.turn.rejected")
+        self.assertEqual(len(rej), 1)
+        self.assertEqual(rej[0]["result"], "cancelled")
+        self.assertEqual(rej[0]["work_class"], "cancelled")
+        self.assertEqual(rej[0]["work_id"], s.last_work_id)
+
+    def test_fallback_setup_exception_emits_joined_end_not_orphan(self):
+        # After controller.turn.start, a FALLBACK-setup failure (the global-agent
+        # rebuild raising) must emit a joined controller.turn.end, never leave an
+        # orphan start.
+        import unittest.mock as mock
+        self._set_config_dir()
+        delivery_error = json.dumps(
+            {"type": "error",
+             "error": {"name": "UnknownError",
+                       "data": {"message": "Unexpected server error"}}})
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen([delivery_error])):
+            s = self._session(io_out=io.StringIO())
+            s._write_global_agent = mock.Mock(side_effect=OSError("disk full"))
+            r = s.send("go")
+        self.assertEqual(r["result"], "error")
+        self.assertEqual(r.get("error_type"), "OSError")
+        starts = self._events("controller.turn.start")
+        ends = self._events("controller.turn.end")
+        self.assertEqual((len(starts), len(ends)), (1, 1))
+        self.assertEqual(starts[0]["work_id"], ends[0]["work_id"])
+        self.assertEqual(ends[0]["work_id"], s.last_work_id)
+        self.assertEqual(ends[0]["result"], "error")
+        self.assertEqual(ends[0]["error_type"], "OSError")
+        self.assertIn("duration_ms", ends[0])
+        self.assertEqual(self._events("controller.turn.rejected"), [])
+
+    def test_fallback_setup_cancellation_emits_joined_end(self):
+        import unittest.mock as mock
+        self._set_config_dir()
+        delivery_error = json.dumps(
+            {"type": "error",
+             "error": {"name": "UnknownError",
+                       "data": {"message": "Unexpected server error"}}})
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen([delivery_error])):
+            s = self._session(io_out=io.StringIO())
+            s._write_global_agent = mock.Mock(side_effect=KeyboardInterrupt())
+            with self.assertRaises(KeyboardInterrupt):
+                s.send("go")
+        starts = self._events("controller.turn.start")
+        ends = self._events("controller.turn.end")
+        self.assertEqual((len(starts), len(ends)), (1, 1))
+        self.assertEqual(ends[0]["result"], "cancelled")
+        self.assertEqual(ends[0]["work_class"], "cancelled")
+        self.assertEqual(ends[0]["work_id"], s.last_work_id)
+        self.assertEqual(self._events("controller.turn.rejected"), [])
+
+    def test_guard_parent_stamp_exception_is_rejected_with_work_id(self):
+        # Guard parent-work stamping does file I/O and can raise. It runs during
+        # PRE-START setup, so a failure must be a rejected turn carrying the
+        # work_id — never an unstamped escape.
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)), \
+                mock.patch.object(bridge, "_stamp_guard_parent_work",
+                                  side_effect=RuntimeError("guard io")):
+            s = self._session(io_out=io.StringIO())
+            s._guard_runtime = {"dummy": True}
+            r = s.send("go")
+        self.assertEqual(r["result"], "error")
+        self.assertEqual(r.get("error_type"), "RuntimeError")
+        self.assertEqual(self._events("controller.turn.start"), [])
+        self.assertEqual(self._events("controller.turn.end"), [])
+        rej = self._events("controller.turn.rejected")
+        self.assertEqual(len(rej), 1)
+        self.assertEqual(rej[0]["work_id"], s.last_work_id)
+        self.assertEqual(rej[0]["work_class"], "failed")
+        self.assertEqual(rej[0]["identity"]["controller"], "opencode")
+        self.assertIn("duration_ms", rej[0])
+
+    def test_guard_parent_stamp_cancellation_is_rejected_cancelled(self):
+        import unittest.mock as mock
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._popen(self.OK_LINES)), \
+                mock.patch.object(bridge, "_stamp_guard_parent_work",
+                                  side_effect=KeyboardInterrupt()):
+            s = self._session(io_out=io.StringIO())
+            s._guard_runtime = {"dummy": True}
+            with self.assertRaises(KeyboardInterrupt):
+                s.send("go")
+        self.assertEqual(self._events("controller.turn.start"), [])
+        self.assertEqual(self._events("controller.turn.end"), [])
+        rej = self._events("controller.turn.rejected")
+        self.assertEqual(len(rej), 1)
+        self.assertEqual(rej[0]["result"], "cancelled")
+        self.assertEqual(rej[0]["work_class"], "cancelled")
+        self.assertEqual(rej[0]["work_id"], s.last_work_id)

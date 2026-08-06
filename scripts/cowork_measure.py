@@ -87,6 +87,8 @@ def _source_paths(session_uuid):
             session_uuid),
         "children": state_store.children_path_for(session_uuid),
         "actions": state_store.actions_path_for(session_uuid),
+        "orchestrator_evaluations":
+            state_store.orchestrator_evaluations_path_for(session_uuid),
     }
 
 
@@ -1560,6 +1562,98 @@ def _owned_cost_rollups(owned_transactions, events):
 
 
 # --------------------------------------------------------------------------- #
+# Targeted orchestrator-owned evaluations (kept SEMANTICALLY SEPARATE from the #
+# peer `score_cohorts` above: those are role-authored peer scores; these are   #
+# written by the external orchestrator/driver and never touch a phase gate).   #
+# --------------------------------------------------------------------------- #
+
+# The five orchestrator-evaluation dimensions. All are 1-5 integers, higher is
+# always better (self_sufficiency is the reverse framing of intervention/rework
+# required, so there is no confusing-direction dimension).
+ORCH_EVAL_DIMENSIONS = ("output_quality", "intent_alignment",
+                        "evidence_quality", "self_sufficiency",
+                        "cost_worthiness")
+
+
+def _orchestrator_eval_target_key(entry):
+    """The latest-per-target key: (role, work_id) for a team role, (role, phase)
+    for orchestration. Disjoint by construction, so unrelated contributions
+    never collapse under deduplication."""
+    role = entry.get("role")
+    if role == "orchestration":
+        return (role, entry.get("phase"))
+    return (role, entry.get("work_id"))
+
+
+def _orchestrator_eval_averages(entries, key_field):
+    """Per-`key_field` (role / tool / model) averages over ALREADY-DEDUPLICATED
+    entries. A dimension with no numeric value in a group averages to `unknown`,
+    never 0. Entries with no value for the key are grouped under `unknown`."""
+    groups = {}
+    for entry in entries:
+        key = entry.get(key_field)
+        if key is None:
+            key = UNKNOWN
+        bucket = groups.setdefault(key, {
+            "count": 0,
+            "_sums": {d: 0 for d in ORCH_EVAL_DIMENSIONS},
+            "_ns": {d: 0 for d in ORCH_EVAL_DIMENSIONS}})
+        bucket["count"] += 1
+        for dimension in ORCH_EVAL_DIMENSIONS:
+            value = entry.get(dimension)
+            if isinstance(value, int) and not isinstance(value, bool):
+                bucket["_sums"][dimension] += value
+                bucket["_ns"][dimension] += 1
+    out = {}
+    for key, bucket in groups.items():
+        row = {"count": bucket["count"]}
+        for dimension in ORCH_EVAL_DIMENSIONS:
+            n = bucket["_ns"][dimension]
+            row[dimension] = (round(bucket["_sums"][dimension] / n, 2)
+                              if n else UNKNOWN)
+        out[key] = row
+    return out
+
+
+def orchestrator_evaluations_view(path):
+    """Build the report view of orchestrator-owned evaluations, or None when
+    there is nothing to report.
+
+    - Missing file, or a present-but-empty array -> None: the report section is
+      omitted and `--report` output stays BYTE-IDENTICAL to a pre-feature run.
+    - Malformed existing bytes -> `{'state': 'malformed', ...}` so the report
+      warns rather than silently showing empty scores; the bytes are preserved.
+    - A valid non-empty array -> `{'state': 'ok', ...}` with the FULL entry list
+      kept for audit and every average computed from the DEDUPLICATED
+      latest-per-target view only. `current_target_count` (unique targets) and
+      `history_entry_count` (total including re-evaluations) are both shown so
+      the deduplication is transparent.
+    """
+    try:
+        entries = state_store.read_orchestrator_evaluations(path)
+    except ValueError:
+        return {"state": "malformed", "entries": [],
+                "current_target_count": 0, "history_entry_count": 0}
+    if not entries:
+        return None
+    latest = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        latest[_orchestrator_eval_target_key(entry)] = entry
+    deduped = list(latest.values())
+    return {
+        "state": "ok",
+        "entries": entries,
+        "current_target_count": len(deduped),
+        "history_entry_count": len(entries),
+        "by_role": _orchestrator_eval_averages(deduped, "role"),
+        "by_controller": _orchestrator_eval_averages(deduped, "tool"),
+        "by_model": _orchestrator_eval_averages(deduped, "model"),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Building the record.                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -1930,6 +2024,22 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
         "scores_summary": _jsonable_scores(summarize_scores(scores)),
         "incomplete": incomplete,
     }
+    # Targeted orchestrator-owned evaluations (additive; SCHEMA_VERSION stays
+    # 1). The key is present ONLY when the file exists AND holds at least one
+    # entry (or is malformed) — so a session without one renders byte-identical
+    # to a pre-feature report. Kept semantically distinct from `score_cohorts`.
+    orchestrator_evaluations = orchestrator_evaluations_view(
+        paths["orchestrator_evaluations"])
+    if orchestrator_evaluations is not None:
+        record["orchestrator_evaluations"] = orchestrator_evaluations
+        if orchestrator_evaluations.get("state") == "malformed":
+            incomplete.append({
+                "field": "record.orchestrator_evaluations",
+                "reason": "orchestrator-evaluations.json exists but is not a "
+                          "readable JSON array; scores cannot be rendered and "
+                          "the file is preserved for manual inspection",
+                "path": paths["orchestrator_evaluations"]})
+
     record["replay"] = replay_rounds(record)
     record["completion"] = completion_account(
         record, session_uuid, seeds=_completion_seeds(session_uuid))

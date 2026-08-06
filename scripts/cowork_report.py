@@ -230,6 +230,7 @@ def render_report(record):
     lines.extend(_section_findings(record))
     lines.extend(_section_marginal(record))
     lines.extend(_section_scores(record))
+    lines.extend(_section_orchestrator_evaluations(record))
     lines.extend(_section_enhancements(record))
     lines.extend(_section_replay(record))
     lines.extend(_section_pricing(record))
@@ -792,6 +793,59 @@ def _section_scores(record):
                ("  " + ", ".join(extras)) if extras else ""))
     lines.append("  Cohorts whose average is `unknown` have no numeric score "
                  "and are not ranked.")
+    lines.append("")
+    return lines
+
+
+def _section_orchestrator_evaluations(record):
+    """Targeted orchestrator-owned evaluations (`orchestrator_evaluations.*`).
+
+    A PURE lookup section, kept clearly distinct from the peer score cohorts
+    above. Returns `[]` when the record carries no such key (so a report for a
+    session without this file is byte-identical to a pre-feature one). When the
+    file was malformed the record carries `state=='malformed'`, and this renders
+    a warning instead of scores. All averages are read straight from the record;
+    no arithmetic happens here."""
+    evaluations = _at(record, "orchestrator_evaluations", None)
+    if not isinstance(evaluations, dict):
+        return []
+    state = evaluations.get("state")
+    lines = ["Orchestrator evaluations (driver-owned — separate from peer "
+             "scores)", "-" * 56]
+    if state == "malformed":
+        lines.append("  FILE MALFORMED — cannot render scores; the existing "
+                     "orchestrator-evaluations.json is preserved for manual "
+                     "inspection.")
+        lines.append("")
+        return lines
+    if state != "ok":
+        return []
+    lines.append("  %s unique target(s) scored, %s total entr%s "
+                 "(re-evaluations retained for audit; averages use the latest "
+                 "entry per target)"
+                 % (_fmt(_at(record,
+                             "orchestrator_evaluations.current_target_count")),
+                    _fmt(_at(record,
+                             "orchestrator_evaluations.history_entry_count")),
+                    "y" if _at(record, "orchestrator_evaluations."
+                               "history_entry_count") == 1 else "ies"))
+    for title, key in (("by role", "by_role"),
+                       ("by controller", "by_controller"),
+                       ("by model", "by_model")):
+        bucket = evaluations.get(key)
+        if not isinstance(bucket, dict) or not bucket:
+            lines.append("  %s: (none recorded)" % title)
+            continue
+        lines.append("  %s:" % title)
+        for name in sorted(bucket, key=lambda k: str(k)):
+            row = bucket[name] or {}
+            scores = ", ".join(
+                "%s=%s" % (dimension, _fmt(row.get(dimension)))
+                for dimension in ("output_quality", "intent_alignment",
+                                  "evidence_quality", "self_sufficiency",
+                                  "cost_worthiness"))
+            lines.append("    %-16s n=%-4s %s"
+                         % (name, _fmt(row.get("count")), scores))
     lines.append("")
     return lines
 

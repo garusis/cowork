@@ -127,6 +127,14 @@ BUILD_REVIEWER = handoff.ROLE_REGISTRY["builder"]["reviewer"]
 ROLES = handoff.selectable_roles()
 handoff.validate_role_topology()
 
+# The contributions an EXTERNAL orchestrator/driver may target with a
+# `--evaluate-role` evaluation, and the named `orchestration` phase scopes.
+# Canonical definitions live in cowork_state (the leaf module the schema
+# validation also uses), re-exported here so the CLI, the persisted-history
+# validation, and the tests read ONE authoritative list rather than drifting.
+VALID_EVAL_ROLES = state_store.ORCHESTRATOR_EVAL_ROLES
+VALID_ORCHESTRATION_PHASES = state_store.ORCHESTRATOR_EVAL_PHASES
+
 # Hand-back contract: a user-facing role may set `status: "handoff_back"` (plus
 # a `handoff` payload) in its status file to hand the work back to its
 # pre-processor through a user-confirmed gate. The contract is role-generic:
@@ -813,6 +821,57 @@ def build_parser():
                         "gates: roles never block, reviewers work with what they "
                         "have, rounds end on reviewer consensus or the review "
                         "round cap. Requires --context/--context-file.")
+    # Targeted orchestrator-owned evaluations. `--evaluate-role` is the dispatch
+    # flag (handled in main() before run_flow, like --check/--report). The
+    # session is named by --eval-session (NOT --session: that would make --sess
+    # ambiguous against --session-file under argparse's allow_abbrev). Artifact
+    # provenance is derived from the historical trace fingerprint, so there is
+    # deliberately NO --artifact-digest flag (D-eval-12).
+    p.add_argument("--evaluate-role", dest="evaluate_role",
+                   choices=list(VALID_EVAL_ROLES), metavar="ROLE",
+                   help="record ONE targeted, orchestrator-owned evaluation of "
+                        "a single role contribution in an existing session, "
+                        "then exit. Written to orchestrator-evaluations.json — "
+                        "SEPARATE from peer scores.json and never read by any "
+                        "phase gate. ROLE is one of: %s."
+                        % ", ".join(VALID_EVAL_ROLES))
+    p.add_argument("--eval-session", dest="eval_session", metavar="SESSION_UUID",
+                   help="with --evaluate-role: the session UUID whose "
+                        "contribution is being evaluated")
+    p.add_argument("--work-id", dest="work_id", metavar="WORK_ID",
+                   help="with --evaluate-role: the trace work_id identifying "
+                        "the exact team-role contribution (found in "
+                        "trace.jsonl controller.turn.start events). Required "
+                        "for team roles; not used for orchestration.")
+    p.add_argument("--phase", dest="eval_phase", metavar="PHASE",
+                   help="with --evaluate-role: for orchestration, the scope "
+                        "(one of: %s); optional annotation for team roles"
+                        % ", ".join(VALID_ORCHESTRATION_PHASES))
+    p.add_argument("--round", dest="eval_round", type=int, metavar="N",
+                   help="with --evaluate-role: optional review-round annotation")
+    p.add_argument("--output-quality", dest="output_quality", type=int,
+                   metavar="1-5",
+                   help="with --evaluate-role: output-quality score (1-5, "
+                        "higher is better)")
+    p.add_argument("--intent-alignment", dest="intent_alignment", type=int,
+                   metavar="1-5",
+                   help="with --evaluate-role: intent-alignment score (1-5, "
+                        "higher is better)")
+    p.add_argument("--evidence-quality", dest="evidence_quality", type=int,
+                   metavar="1-5",
+                   help="with --evaluate-role: evidence/reasoning-quality score "
+                        "(1-5, higher is better)")
+    p.add_argument("--self-sufficiency", dest="self_sufficiency", type=int,
+                   metavar="1-5",
+                   help="with --evaluate-role: self-sufficiency score (1-5, "
+                        "higher is better — the reverse framing of "
+                        "intervention/rework required, so high is always good)")
+    p.add_argument("--cost-worthiness", dest="cost_worthiness", type=int,
+                   metavar="1-5",
+                   help="with --evaluate-role: cost/latency-worthiness score "
+                        "(1-5, higher is better)")
+    p.add_argument("--notes", dest="eval_notes", metavar="TEXT",
+                   help="with --evaluate-role: optional free-form note")
     return p
 
 
@@ -911,6 +970,394 @@ def run_report(args, io_out=None):
 
     io_out.flush()
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Targeted orchestrator-owned evaluations (`cowork --evaluate-role ...`).      #
+#                                                                             #
+# An external orchestrator records structured, per-contribution scores for a  #
+# single Cowork role. Everything here is ADDITIVE and provably targeted: a    #
+# team-role evaluation is written only after the (role, work_id) contribution #
+# is CONFIRMED in historical trace/identity evidence, and the artifact digest #
+# is derived from the historical trace fingerprint recorded at that exact     #
+# turn — never re-hashed from the current on-disk file, which would bind an    #
+# older work_id to a later revision when a role runs multiple turns.          #
+# --------------------------------------------------------------------------- #
+
+
+def _ts_seconds(value):
+    """Parse a trace `ts` (ISO-8601, e.g. '2026-08-06T00:00:00Z') to a float
+    epoch-seconds figure, or None when it cannot be parsed. Tolerant."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _verify_work_id_exists(session_uuid, role, work_id):
+    """Proof-of-contribution gate (D-eval-09): confirm that (role, work_id) is a
+    REAL historical contribution before any evaluation is written.
+
+    Two evidence sources are checked so the gate works even for a session whose
+    identities.json was never written: (1) identities observations[] for a
+    matching (role, work_id); (2) trace.jsonl controller.turn.start events with
+    the matching (role, work_id). Returns True if EITHER confirms it. Fully
+    tolerant: any read failure is treated as 'not found' (returns False),
+    never raised."""
+    if not (session_uuid and role and work_id):
+        return False
+    try:
+        identities = state_store.read_role_identities(
+            state_store.identities_path_for(session_uuid))
+        for obs in (identities.get("observations") or []):
+            if isinstance(obs, dict) and obs.get("role") == role \
+                    and obs.get("work_id") == work_id:
+                return True
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        events = state_store.read_jsonl_tolerant(
+            trace_store.trace_path_for(session_uuid))
+        for event in events:
+            if event.get("event") == "controller.turn.start" \
+                    and event.get("work_id") == work_id \
+                    and event.get("role") == role:
+                return True
+    except (OSError, ValueError, TypeError):
+        pass
+    return False
+
+
+def _resolve_identity_from_trace(session_uuid, role, work_id):
+    """AUTHORITATIVE identity resolution for a (role, work_id) contribution.
+
+    The real identities.json observation carries role/tool/model/session_id but
+    NO work_id, so it cannot pinpoint a specific turn. The trace can: every
+    controller.turn.start/end event for the turn carries `work_id`, `role`, and
+    the per-turn `identity` object (controller/model/effort/controller_session_id
+    — see cowork_trace.identity_meta), so a contribution made before a
+    mid-session controller switch is stamped with the controller it ACTUALLY ran
+    on, not the role's latest one.
+
+    The turn's START and END both carry an identity, and they are NOT
+    interchangeable: a fresh start can still name a config-pinned model
+    (`model=sonnet`) that the live provider event later corrects on the end
+    (`model=claude-sonnet-4-6`). The END identity is therefore preferred and
+    merged FIELD BY FIELD, falling back to the START only for a field the end
+    left absent — so the settled, live values win without discarding a field the
+    end never observed.
+
+    Returns `{'tool', 'model', 'session_id', 'effort'}` with None values
+    stripped, or `{}` when no matching turn carries an identity. Tolerant."""
+    if not (session_uuid and role and work_id):
+        return {}
+    try:
+        events = state_store.read_jsonl_tolerant(
+            trace_store.trace_path_for(session_uuid))
+    except (OSError, ValueError, TypeError):
+        return {}
+    start_identity = None
+    end_identity = None
+    for event in events:
+        if event.get("role") != role or event.get("work_id") != work_id:
+            continue
+        identity = event.get("identity")
+        if not isinstance(identity, dict):
+            continue
+        name = event.get("event")
+        if name == "controller.turn.end" and end_identity is None:
+            end_identity = identity
+        elif name == "controller.turn.start" and start_identity is None:
+            start_identity = identity
+    if end_identity is None and start_identity is None:
+        return {}
+
+    def _prefer(field):
+        # End first (settled truth for the turn), start only as a gap-filler.
+        for source in (end_identity, start_identity):
+            if isinstance(source, dict):
+                value = source.get(field)
+                if value is not None:
+                    return value
+        return None
+
+    resolved = {
+        "tool": _prefer("controller"),
+        "model": _prefer("model"),
+        "session_id": _prefer("controller_session_id"),
+        "effort": _prefer("effort"),
+    }
+    return {k: v for k, v in resolved.items() if v is not None}
+
+
+def _lookup_artifact_fingerprint_from_trace(trace_path, role, work_id):
+    """Derive the artifact digest for one contribution turn from the HISTORICAL
+    trace fingerprint, never from the current on-disk file.
+
+    Evidence chain, strictly positional AND bounded to the target turn: find the
+    single controller.turn.end event whose (role, work_id) match; from that
+    position scan forward for THIS turn's role.fingerprint.after event (emitted
+    in-sequence right after the turn's send). The scan STOPS the instant it hits
+    another controller.turn.start/end for the same role first — the fingerprint
+    belongs to the next turn, and drifting into it would bind an old work_id to a
+    later revision. Ambiguity (more than one matching controller.turn.end) is
+    likewise rejected.
+
+    A fingerprint is `observed` only when the artifact actually existed
+    (`exists` is true), its `sha256` is a valid 64-hex digest, and its `size` is
+    a sensible non-negative integer. An absent artifact, or a missing/invalid
+    digest, is `unavailable` with a reason — never a fabricated `observed`.
+    Fully tolerant."""
+    try:
+        events = state_store.read_jsonl_tolerant(trace_path)
+    except (OSError, ValueError, TypeError):
+        return {"state": "unavailable", "reason": "trace_unreadable"}
+    if not events:
+        return {"state": "unavailable", "reason": "trace_unreadable"}
+    end_indices = [
+        i for i, event in enumerate(events)
+        if event.get("event") == "controller.turn.end"
+        and event.get("work_id") == work_id and event.get("role") == role]
+    if not end_indices:
+        return {"state": "unavailable", "reason": "turn_not_found"}
+    if len(end_indices) > 1:
+        return {"state": "unavailable", "reason": "ambiguous"}
+    for event in events[end_indices[0] + 1:]:
+        name = event.get("event")
+        # A later same-role turn boundary before this turn's fingerprint means
+        # the fingerprint never landed — do NOT walk into the next turn's.
+        if name in ("controller.turn.start", "controller.turn.end") \
+                and event.get("role") == role:
+            return {"state": "unavailable", "reason": "fingerprint_not_found"}
+        if name == "role.fingerprint.after" and event.get("role") == role:
+            if event.get("exists") is not True:
+                return {"state": "unavailable", "reason": "artifact_absent"}
+            sha256 = event.get("sha256")
+            if not state_store.is_sha256_hex(sha256):
+                return {"state": "unavailable", "reason": "invalid_digest"}
+            size = event.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                return {"state": "unavailable", "reason": "invalid_size"}
+            return {"state": "observed", "sha256": sha256, "size": size,
+                    "artifact_status": event.get("status")}
+    return {"state": "unavailable", "reason": "fingerprint_not_found"}
+
+
+def _lookup_work_id_evidence(session_uuid, work_id, model=None, tool=None):
+    """Non-fatal usage/duration/cost evidence for one contribution, joined from
+    trace.jsonl by work_id (D-eval-07). Returns a dict of ONLY the fields that
+    could be established — an absent field is omitted, never null, and never
+    fatal. Returns `{}` when the trace is missing or has no matching turn."""
+    out = {}
+    try:
+        events = state_store.read_jsonl_tolerant(
+            trace_store.trace_path_for(session_uuid))
+    except (OSError, ValueError, TypeError):
+        return out
+    start_event = None
+    end_event = None
+    for event in events:
+        if event.get("work_id") != work_id:
+            continue
+        name = event.get("event")
+        if name == "controller.turn.start" and start_event is None:
+            start_event = event
+        elif name == "controller.turn.end":
+            end_event = event
+    if end_event is not None:
+        duration_ms = end_event.get("duration_ms")
+        if isinstance(duration_ms, (int, float)) \
+                and not isinstance(duration_ms, bool):
+            out["duration_s"] = round(duration_ms / 1000.0, 3)
+        elif start_event is not None:
+            started = _ts_seconds(start_event.get("ts"))
+            ended = _ts_seconds(end_event.get("ts"))
+            if started is not None and ended is not None and ended >= started:
+                out["duration_s"] = round(ended - started, 3)
+        usage = end_event.get("usage")
+        if isinstance(usage, dict) and usage:
+            out["usage"] = usage
+            if model:
+                try:
+                    import cowork_pricing as pricing
+                    priced = pricing.price_usage(usage, model)
+                    if isinstance(priced, dict) \
+                            and priced.get("state") == "priced" \
+                            and priced.get("cost") is not None:
+                        out["cost_usd"] = priced.get("cost")
+                except Exception:  # noqa: BLE001 - cost is best-effort only
+                    pass
+    return out
+
+
+def run_orchestrator_eval(args, io_out=None):
+    """Handle `cowork --evaluate-role ...` — record ONE targeted evaluation of a
+    single role contribution, then exit. Never touches run_flow's machinery.
+
+    Exit codes: 0 success; 1 write/malformed error; 2 validation error. Every
+    validation error writes a specific message to stderr and writes NO file.
+    """
+    io_out = io_out or sys.stdout
+    role = args.evaluate_role
+
+    # (1) role — already constrained by argparse choices, but re-check so a
+    # direct call (tests) still fails cleanly rather than writing a bad entry.
+    if role not in VALID_EVAL_ROLES:
+        sys.stderr.write(
+            "cowork: --evaluate-role: unknown role %r (expected one of: %s)\n"
+            % (role, ", ".join(VALID_EVAL_ROLES)))
+        return 2
+
+    # (2) five scores: each required, an int in [1, 5]. Naming the bad dimension.
+    score_fields = (
+        ("output_quality", args.output_quality),
+        ("intent_alignment", args.intent_alignment),
+        ("evidence_quality", args.evidence_quality),
+        ("self_sufficiency", args.self_sufficiency),
+        ("cost_worthiness", args.cost_worthiness),
+    )
+    for name, value in score_fields:
+        if value is None:
+            sys.stderr.write(
+                "cowork: --evaluate-role: missing required score "
+                "--%s (an integer 1-5)\n" % name.replace("_", "-"))
+            return 2
+        if not isinstance(value, int) or isinstance(value, bool) \
+                or value < 1 or value > 5:
+            sys.stderr.write(
+                "cowork: --evaluate-role: --%s must be an integer 1-5 "
+                "(got %r)\n" % (name.replace("_", "-"), value))
+            return 2
+
+    # (3) session must exist (its assets dir is the authoritative per-session
+    # root; checking it is cheaper than loading a session file).
+    session_uuid = args.eval_session
+    if not session_uuid or not os.path.isdir(
+            state_store.session_assets_dir(session_uuid)):
+        sys.stderr.write(
+            "cowork: --evaluate-role: session not found: %r\n" % session_uuid)
+        return 2
+
+    is_orchestration = role == "orchestration"
+
+    if not is_orchestration:
+        # (4) team roles require --work-id.
+        if not args.work_id:
+            sys.stderr.write(
+                "cowork: --evaluate-role: role %r requires --work-id\n" % role)
+            return 2
+        # (4a) proof-of-contribution: the (role, work_id) must be real.
+        if not _verify_work_id_exists(session_uuid, role, args.work_id):
+            sys.stderr.write(
+                "cowork: --evaluate-role: contribution not found for role %s "
+                "work_id %s (no matching trace/identity evidence)\n"
+                % (role, args.work_id))
+            return 2
+    else:
+        # (5) orchestration requires --phase, validated against the enum.
+        if not args.eval_phase:
+            sys.stderr.write(
+                "cowork: --evaluate-role: orchestration requires --phase "
+                "(one of: %s)\n" % ", ".join(VALID_ORCHESTRATION_PHASES))
+            return 2
+        # (5a)
+        if args.eval_phase not in VALID_ORCHESTRATION_PHASES:
+            sys.stderr.write(
+                "cowork: --evaluate-role: invalid orchestration --phase %r "
+                "(expected one of: %s)\n"
+                % (args.eval_phase, ", ".join(VALID_ORCHESTRATION_PHASES)))
+            return 2
+
+    # (6) identity — historically-correct for this exact turn, non-fatal. The
+    # trace's per-turn identity object is AUTHORITATIVE (it is the only source
+    # keyed by work_id); identities.json observations are a defensive fallback
+    # for the rare case one carries a work_id, since the real observation schema
+    # cannot correlate to a specific turn.
+    identity = {}
+    if not is_orchestration:
+        identity = _resolve_identity_from_trace(session_uuid, role, args.work_id)
+        if not identity:
+            identities = state_store.read_role_identities(
+                state_store.identities_path_for(session_uuid))
+            identity = state_store.resolve_work_id_identity(
+                identities, role, args.work_id)
+
+    # (7) usage/duration/cost evidence, non-fatal.
+    evidence = {}
+    if not is_orchestration:
+        evidence = _lookup_work_id_evidence(
+            session_uuid, args.work_id, model=identity.get("model"),
+            tool=identity.get("tool"))
+
+    # (8) artifact fingerprint from the historical trace event.
+    if not is_orchestration:
+        fingerprint = _lookup_artifact_fingerprint_from_trace(
+            trace_store.trace_path_for(session_uuid), role, args.work_id)
+    else:
+        fingerprint = {"state": "unavailable",
+                       "reason": "orchestration_no_artifact"}
+
+    # (9) build the entry — required fields always present; optional fields
+    # present ONLY when set (an absent field is omitted, never null).
+    entry = {
+        "session_uuid": session_uuid,
+        "timestamp": _eval_now(),
+        "role": role,
+        "output_quality": args.output_quality,
+        "intent_alignment": args.intent_alignment,
+        "evidence_quality": args.evidence_quality,
+        "self_sufficiency": args.self_sufficiency,
+        "cost_worthiness": args.cost_worthiness,
+        "artifact_digest_state": fingerprint.get("state"),
+    }
+    if not is_orchestration:
+        entry["work_id"] = args.work_id
+    if fingerprint.get("state") == "observed":
+        if fingerprint.get("sha256") is not None:
+            entry["artifact_digest"] = fingerprint.get("sha256")
+        if fingerprint.get("size") is not None:
+            entry["artifact_size"] = fingerprint.get("size")
+        if fingerprint.get("artifact_status") is not None:
+            entry["artifact_fingerprint_status"] = \
+                fingerprint.get("artifact_status")
+    # Optional annotations.
+    if args.eval_phase:
+        entry["phase"] = args.eval_phase
+    if args.eval_round is not None:
+        entry["round"] = args.eval_round
+    if args.eval_notes:
+        entry["notes"] = args.eval_notes
+    # Identity (best-effort; contribution already proven).
+    for key in ("tool", "model", "session_id", "effort"):
+        if identity.get(key) is not None:
+            entry[key] = identity[key]
+    # Evidence (best-effort).
+    for key in ("duration_s", "usage", "cost_usd"):
+        if key in evidence:
+            entry[key] = evidence[key]
+
+    # (10) append atomically.
+    path = state_store.orchestrator_evaluations_path_for(session_uuid)
+    result = state_store.append_orchestrator_evaluation(path, entry)
+    if not result.get("ok"):
+        sys.stderr.write(
+            "cowork: --evaluate-role: could not record evaluation (%s); "
+            "existing file preserved: %s\n"
+            % (result.get("error", "unknown"), path))
+        return 1
+    io_out.write(
+        "cowork: recorded evaluation for %s%s in %s\n"
+        % (role, (" work_id %s" % args.work_id) if not is_orchestration
+           else " phase %s" % args.eval_phase, path))
+    return 0
+
+
+def _eval_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z")
 
 
 def parse_team(team_arg):
@@ -10537,6 +10984,11 @@ def main(argv=None):
             return preflight.main()
         if args.report:
             return run_report(args)
+        # Targeted orchestrator-owned evaluation: a read-mostly side channel
+        # (it writes only orchestrator-evaluations.json, never session state or
+        # a phase gate), dispatched here like --check/--report, before run_flow.
+        if getattr(args, "evaluate_role", None):
+            return run_orchestrator_eval(args)
         # Runtime controller dispatches are governed from this point onward.
         # Read-only --check/--report paths above never need a broker.
         prior_guard = bridge.set_nested_guard_active(True)
