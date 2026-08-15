@@ -37,6 +37,7 @@ sys.path.insert(0, _HERE)
 
 import cowork  # noqa: E402
 import cowork_bridge as bridge  # noqa: E402
+import cowork_dispatch_manifest as manifest_mod  # noqa: E402
 import cowork_preflight as preflight  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
@@ -32628,3 +32629,665 @@ class PackageDAdaptersTest(ControllerPolicyTestBase):
         cowork.bridge.ClaudeSession = _StubClaudeSession
         self.addCleanup(setattr, cowork.bridge, "ClaudeSession", original)
         return captured, _StubClaudeSession
+
+
+# ===========================================================================
+# ManifestSchemaTest — M1 P1
+# ===========================================================================
+
+def _minimal_capability():
+    return {
+        "inputs": ["instructions", "context"],
+        "outputs": ["intel"],
+        "runtime_roots": ["/tmp/workspace"],
+        "private_paths": [".cowork"],
+        "guard_required": False,
+        "socket": None,
+        "kernel_boundary": {"crosses": []},
+        "artifact_writes": [".cowork/sessions"],
+        "action_classes": ["read", "write"],
+        "command_adapters": {"git": "git"},
+    }
+
+
+def _minimal_binding(work_id="wk-001"):
+    return {
+        "work_id": work_id,
+        "controller": "claude",
+        "model": "claude-sonnet-4-6",
+        "config_digest": "a" * 64,
+        "instruction_digests": {"goal": "b" * 64},
+        "policy_snapshot": {"allowed": ["claude"]},
+        "worktree": None,
+        "candidate_snapshot": None,
+        "guard_snapshot": None,
+    }
+
+
+def _minimal_status(phase="compiling"):
+    return {"phase": phase, "preflight": [], "refusal": None}
+
+
+class ManifestSchemaTest(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td, ignore_errors=True)
+        # Isolate session assets to the temp dir.
+        self._orig_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = self._td
+        self.addCleanup(self._restore_root)
+
+    def _restore_root(self):
+        if self._orig_root is None:
+            os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        else:
+            os.environ["COWORK_SESSIONS_ROOT"] = self._orig_root
+
+    # ------------------------------------------------------------------ #
+    # compile_manifest — basic construction                               #
+    # ------------------------------------------------------------------ #
+
+    def test_compile_returns_dict_with_all_keys(self):
+        m = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        for key in ("schema_version", "work_id", "capability",
+                    "binding", "status", "digest"):
+            self.assertIn(key, m)
+
+    def test_compile_schema_version_is_1(self):
+        m = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        self.assertEqual(m["schema_version"], 1)
+
+    def test_compile_default_status_is_compiling(self):
+        m = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        self.assertEqual(m["status"]["phase"], "compiling")
+
+    def test_compile_explicit_status_proven(self):
+        m = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding(),
+            status=_minimal_status("proven"))
+        self.assertEqual(m["status"]["phase"], "proven")
+
+    def test_compile_explicit_status_refused_with_refusal(self):
+        status = {
+            "phase": "refused",
+            "preflight": [],
+            "refusal": {"code": "capability_missing",
+                        "message": "no network", "source": "preflight"},
+        }
+        m = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding(), status=status)
+        self.assertEqual(m["status"]["phase"], "refused")
+        self.assertIsNotNone(m["status"]["refusal"])
+
+    def test_compile_rejects_empty_work_id(self):
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest(
+                "", _minimal_capability(), _minimal_binding())
+
+    def test_compile_rejects_nonstring_work_id(self):
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest(
+                42, _minimal_capability(), _minimal_binding())
+
+    # ------------------------------------------------------------------ #
+    # manifest_digest — determinism and sensitivity                        #
+    # ------------------------------------------------------------------ #
+
+    def test_digest_is_64_hex_chars(self):
+        m = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        self.assertRegex(m["digest"], r'^[0-9a-f]{64}$')
+
+    def test_digest_matches_manifest_digest_function(self):
+        m = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        self.assertEqual(m["digest"], manifest_mod.manifest_digest(m))
+
+    def test_digest_changes_on_controller_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["controller"] = "codex"
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_changes_on_model_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["model"] = "claude-opus-4-8"
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_changes_on_config_digest_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["config_digest"] = "c" * 64
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_changes_on_instruction_digest_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["instruction_digests"] = {"goal": "d" * 64}
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_changes_on_policy_snapshot_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["policy_snapshot"] = {"allowed": ["claude", "codex"]}
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_changes_on_worktree_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["worktree"] = "/tmp/my-branch"
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_changes_on_candidate_snapshot_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["candidate_snapshot"] = {"sha": "abc"}
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_changes_on_guard_snapshot_change(self):
+        m1 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), _minimal_binding())
+        b2 = dict(_minimal_binding())
+        b2["guard_snapshot"] = {"nonce": "xyz"}
+        m2 = manifest_mod.compile_manifest(
+            "wk-001", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_digest_is_deterministic_same_inputs(self):
+        cap = _minimal_capability()
+        bind = _minimal_binding()
+        m1 = manifest_mod.compile_manifest("wk-001", cap, bind)
+        m2 = manifest_mod.compile_manifest("wk-001", cap, bind)
+        self.assertEqual(m1["digest"], m2["digest"])
+
+    # ------------------------------------------------------------------ #
+    # JSON round-trip preserves digest                                    #
+    # ------------------------------------------------------------------ #
+
+    def test_json_roundtrip_preserves_digest(self):
+        m = manifest_mod.compile_manifest(
+            "wk-rt", _minimal_capability(), _minimal_binding("wk-rt"))
+        path = os.path.join(self._td, "rt.json")
+        manifest_mod.persist_manifest(path, m)
+        m2 = manifest_mod.load_manifest(path)
+        self.assertIsNotNone(m2)
+        self.assertEqual(m["digest"], m2["digest"])
+
+    def test_json_roundtrip_preserves_all_binding_fields(self):
+        bind = _minimal_binding("wk-rt2")
+        m = manifest_mod.compile_manifest(
+            "wk-rt2", _minimal_capability(), bind)
+        path = os.path.join(self._td, "rt2.json")
+        manifest_mod.persist_manifest(path, m)
+        m2 = manifest_mod.load_manifest(path)
+        self.assertEqual(m2["binding"], m["binding"])
+
+    # ------------------------------------------------------------------ #
+    # manifest_is_stale                                                   #
+    # ------------------------------------------------------------------ #
+
+    def test_not_stale_when_binding_identical(self):
+        bind = _minimal_binding("wk-stale")
+        m = manifest_mod.compile_manifest(
+            "wk-stale", _minimal_capability(), bind)
+        self.assertFalse(manifest_mod.manifest_is_stale(m, bind))
+
+    def test_stale_when_controller_changed(self):
+        m = manifest_mod.compile_manifest(
+            "wk-stale", _minimal_capability(), _minimal_binding("wk-stale"))
+        new_bind = dict(_minimal_binding("wk-stale"))
+        new_bind["controller"] = "codex"
+        self.assertTrue(manifest_mod.manifest_is_stale(m, new_bind))
+
+    def test_stale_when_model_changed(self):
+        m = manifest_mod.compile_manifest(
+            "wk-stale", _minimal_capability(), _minimal_binding("wk-stale"))
+        new_bind = dict(_minimal_binding("wk-stale"))
+        new_bind["model"] = None
+        self.assertTrue(manifest_mod.manifest_is_stale(m, new_bind))
+
+    def test_stale_when_policy_snapshot_changed(self):
+        m = manifest_mod.compile_manifest(
+            "wk-stale", _minimal_capability(), _minimal_binding("wk-stale"))
+        new_bind = dict(_minimal_binding("wk-stale"))
+        new_bind["policy_snapshot"] = {}
+        self.assertTrue(manifest_mod.manifest_is_stale(m, new_bind))
+
+    def test_stale_reasons_report_multiple_leaf_differences_in_order(self):
+        m = manifest_mod.compile_manifest(
+            "wk-stale", _minimal_capability(), _minimal_binding("wk-stale"))
+        new_bind = dict(_minimal_binding("wk-stale"))
+        new_bind["controller"] = "codex"
+        new_bind["config_digest"] = "c" * 64
+        new_bind["policy_snapshot"] = {"allowed": ["claude", "codex"]}
+        self.assertEqual(
+            manifest_mod.manifest_stale_reasons(m, new_bind),
+            ["config_digest", "controller", "policy_snapshot.allowed"])
+        self.assertTrue(manifest_mod.manifest_is_stale(m, new_bind))
+
+    def test_stale_reasons_report_config_digest_change(self):
+        m = manifest_mod.compile_manifest(
+            "wk-stale", _minimal_capability(), _minimal_binding("wk-stale"))
+        new_bind = dict(_minimal_binding("wk-stale"))
+        new_bind["config_digest"] = "c" * 64
+        self.assertEqual(manifest_mod.manifest_stale_reasons(m, new_bind),
+                         ["config_digest"])
+
+    def test_stale_reasons_report_missing_manifest(self):
+        self.assertEqual(manifest_mod.manifest_stale_reasons(
+            None, _minimal_binding()), ["manifest_missing"])
+
+    def test_stale_when_manifest_is_none(self):
+        self.assertTrue(
+            manifest_mod.manifest_is_stale(None, _minimal_binding()))
+
+    def test_stale_when_manifest_is_empty_dict(self):
+        self.assertTrue(
+            manifest_mod.manifest_is_stale({}, _minimal_binding()))
+
+    # ------------------------------------------------------------------ #
+    # persist_manifest / load_manifest — happy path                      #
+    # ------------------------------------------------------------------ #
+
+    def test_persist_creates_file(self):
+        m = manifest_mod.compile_manifest(
+            "wk-p", _minimal_capability(), _minimal_binding("wk-p"))
+        path = os.path.join(self._td, "m.json")
+        manifest_mod.persist_manifest(path, m)
+        self.assertTrue(os.path.exists(path))
+
+    def test_persist_creates_parent_dirs(self):
+        m = manifest_mod.compile_manifest(
+            "wk-p2", _minimal_capability(), _minimal_binding("wk-p2"))
+        path = os.path.join(self._td, "nested", "deep", "m.json")
+        manifest_mod.persist_manifest(path, m)
+        self.assertTrue(os.path.exists(path))
+
+    def test_persist_is_valid_json(self):
+        m = manifest_mod.compile_manifest(
+            "wk-json", _minimal_capability(), _minimal_binding("wk-json"))
+        path = os.path.join(self._td, "valid.json")
+        manifest_mod.persist_manifest(path, m)
+        with open(path) as fh:
+            data = json.load(fh)
+        self.assertEqual(data["schema_version"], 1)
+
+    def test_persist_no_leftover_tmp_on_success(self):
+        m = manifest_mod.compile_manifest(
+            "wk-tmp", _minimal_capability(), _minimal_binding("wk-tmp"))
+        path = os.path.join(self._td, "no_tmp.json")
+        manifest_mod.persist_manifest(path, m)
+        tmp_files = [f for f in os.listdir(self._td) if f.endswith(".tmp")]
+        # Allow .tmp suffix files that are NOT from our write.
+        tmp_for_path = [f for f in tmp_files if "no_tmp" in f]
+        self.assertEqual(tmp_for_path, [])
+
+    # ------------------------------------------------------------------ #
+    # load_manifest — tolerance (all return None, never raise)           #
+    # ------------------------------------------------------------------ #
+
+    def test_load_missing_file_returns_none(self):
+        self.assertIsNone(
+            manifest_mod.load_manifest(os.path.join(self._td, "absent.json")))
+
+    def test_load_empty_path_returns_none(self):
+        self.assertIsNone(manifest_mod.load_manifest(""))
+
+    def test_load_none_path_returns_none(self):
+        self.assertIsNone(manifest_mod.load_manifest(None))
+
+    def test_load_unreadable_file_returns_none(self):
+        path = os.path.join(self._td, "noread.json")
+        with open(path, "w") as fh:
+            fh.write("{}")
+        os.chmod(path, 0o000)
+        try:
+            self.assertIsNone(manifest_mod.load_manifest(path))
+        finally:
+            os.chmod(path, 0o644)
+
+    def test_load_malformed_json_returns_none(self):
+        path = os.path.join(self._td, "bad.json")
+        with open(path, "w") as fh:
+            fh.write("{not valid json")
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    def test_load_wrong_schema_version_returns_none(self):
+        m = manifest_mod.compile_manifest(
+            "wk-sv", _minimal_capability(), _minimal_binding("wk-sv"))
+        m["schema_version"] = 99
+        path = os.path.join(self._td, "wrong_sv.json")
+        with open(path, "w") as fh:
+            json.dump(m, fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    def test_load_missing_top_level_key_returns_none(self):
+        m = manifest_mod.compile_manifest(
+            "wk-mk", _minimal_capability(), _minimal_binding("wk-mk"))
+        del m["digest"]
+        path = os.path.join(self._td, "missing_key.json")
+        with open(path, "w") as fh:
+            json.dump(m, fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    def test_load_extra_top_level_key_returns_none(self):
+        m = manifest_mod.compile_manifest(
+            "wk-ek", _minimal_capability(), _minimal_binding("wk-ek"))
+        m["unexpected_extra"] = "x"
+        path = os.path.join(self._td, "extra_key.json")
+        with open(path, "w") as fh:
+            json.dump(m, fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    def test_load_tampered_digest_returns_none(self):
+        m = manifest_mod.compile_manifest(
+            "wk-td", _minimal_capability(), _minimal_binding("wk-td"))
+        m["digest"] = "0" * 64
+        path = os.path.join(self._td, "tampered.json")
+        with open(path, "w") as fh:
+            json.dump(m, fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    def test_load_invalid_status_phase_returns_none(self):
+        m = manifest_mod.compile_manifest(
+            "wk-ph", _minimal_capability(), _minimal_binding("wk-ph"))
+        # Recompute as raw dict and corrupt status.phase — must also recompute
+        # digest because load validates it. Easier: just corrupt via raw write.
+        raw = json.loads(json.dumps(m))
+        raw["status"]["phase"] = "unknown_phase"
+        # Digest still matches old binding so validation reaches status check.
+        path = os.path.join(self._td, "bad_phase.json")
+        with open(path, "w") as fh:
+            json.dump(raw, fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    def test_load_non_dict_root_returns_none(self):
+        path = os.path.join(self._td, "list.json")
+        with open(path, "w") as fh:
+            json.dump([1, 2, 3], fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    # ------------------------------------------------------------------ #
+    # Capability section fields                                           #
+    # ------------------------------------------------------------------ #
+
+    def test_capability_guard_required_true_with_socket(self):
+        cap = dict(_minimal_capability())
+        cap["guard_required"] = True
+        cap["socket"] = "/tmp/cowork-guard-abc.sock"
+        m = manifest_mod.compile_manifest("wk-g", cap, _minimal_binding("wk-g"))
+        self.assertTrue(m["capability"]["guard_required"])
+        self.assertEqual(m["capability"]["socket"], "/tmp/cowork-guard-abc.sock")
+
+    def test_capability_action_classes_preserved(self):
+        cap = dict(_minimal_capability())
+        cap["action_classes"] = ["read", "exec", "git"]
+        m = manifest_mod.compile_manifest("wk-ac", cap, _minimal_binding("wk-ac"))
+        self.assertEqual(sorted(m["capability"]["action_classes"]),
+                         ["exec", "git", "read"])
+
+    def test_capability_command_adapters_preserved(self):
+        cap = dict(_minimal_capability())
+        cap["command_adapters"] = {"git": "git --no-pager", "make": "make -j4"}
+        m = manifest_mod.compile_manifest("wk-ca", cap, _minimal_binding("wk-ca"))
+        self.assertEqual(m["capability"]["command_adapters"]["git"], "git --no-pager")
+
+    def test_capability_kernel_boundary_preserved(self):
+        cap = dict(_minimal_capability())
+        cap["kernel_boundary"] = {"crosses": ["stdio"], "blocked": ["ptrace"]}
+        m = manifest_mod.compile_manifest("wk-kb", cap, _minimal_binding("wk-kb"))
+        self.assertEqual(m["capability"]["kernel_boundary"]["crosses"], ["stdio"])
+
+    def test_capability_missing_key_raises(self):
+        cap = dict(_minimal_capability())
+        del cap["artifact_writes"]
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-x", cap, _minimal_binding())
+
+    def test_capability_extra_key_raises(self):
+        cap = dict(_minimal_capability())
+        cap["unexpected"] = "nope"
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-x", cap, _minimal_binding())
+
+    def test_capability_guard_required_non_bool_raises(self):
+        cap = dict(_minimal_capability())
+        cap["guard_required"] = 1  # int, not bool
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-x", cap, _minimal_binding())
+
+    # ------------------------------------------------------------------ #
+    # Binding section fields                                              #
+    # ------------------------------------------------------------------ #
+
+    def test_binding_all_fields_roundtrip(self):
+        bind = {
+            "work_id": "wk-full",
+            "controller": "codex",
+            "model": "gpt-4o",
+            "config_digest": "e" * 64,
+            "instruction_digests": {"system": "f" * 64, "goal": "g" * 64},
+            "policy_snapshot": {"allowed": ["codex"], "source": "cli"},
+            "worktree": "/tmp/feat-branch",
+            "candidate_snapshot": {"sha256": "h" * 64, "path": "/tmp/c"},
+            "guard_snapshot": {"nonce": "abc123", "socket": "/tmp/s.sock"},
+        }
+        m = manifest_mod.compile_manifest("wk-full", _minimal_capability(), bind)
+        self.assertEqual(m["binding"]["worktree"], "/tmp/feat-branch")
+        self.assertEqual(m["binding"]["candidate_snapshot"]["sha256"], "h" * 64)
+        self.assertEqual(m["binding"]["guard_snapshot"]["nonce"], "abc123")
+
+    def test_binding_missing_key_raises(self):
+        bind = dict(_minimal_binding("wk-mn"))
+        del bind["controller"]
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-x", _minimal_capability(), bind)
+
+    def test_binding_extra_key_raises(self):
+        bind = dict(_minimal_binding())
+        bind["extra_field"] = "oops"
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-x", _minimal_capability(), bind)
+
+    def test_binding_empty_controller_raises(self):
+        bind = dict(_minimal_binding())
+        bind["controller"] = ""
+        with self.assertRaises(ValueError):
+                manifest_mod.compile_manifest("wk-x", _minimal_capability(), bind)
+
+    def test_binding_work_id_mismatch_raises(self):
+        bind = _minimal_binding("different-work")
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-x", _minimal_capability(), bind)
+
+    def test_binding_model_null_allowed(self):
+        bind = dict(_minimal_binding("wk-mn"))
+        bind["model"] = None
+        m = manifest_mod.compile_manifest("wk-mn", _minimal_capability(), bind)
+        self.assertIsNone(m["binding"]["model"])
+
+    def test_binding_model_non_string_raises(self):
+        bind = dict(_minimal_binding())
+        bind["model"] = 42
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-x", _minimal_capability(), bind)
+
+    # ------------------------------------------------------------------ #
+    # Status section — all three phases                                   #
+    # ------------------------------------------------------------------ #
+
+    def test_status_compiling_phase(self):
+        m = manifest_mod.compile_manifest(
+            "wk-sc", _minimal_capability(), _minimal_binding("wk-sc"),
+            status=_minimal_status("compiling"))
+        self.assertEqual(m["status"]["phase"], "compiling")
+        self.assertIsNone(m["status"]["refusal"])
+
+    def test_status_proven_phase(self):
+        m = manifest_mod.compile_manifest(
+            "wk-sp", _minimal_capability(), _minimal_binding("wk-sp"),
+            status=_minimal_status("proven"))
+        self.assertEqual(m["status"]["phase"], "proven")
+
+    def test_status_refused_phase_with_refusal(self):
+        status = {
+            "phase": "refused",
+            "preflight": [{"check": "tool", "ok": False}],
+            "refusal": {"code": "controller_tool_missing",
+                        "message": "claude not found", "source": "preflight"},
+        }
+        m = manifest_mod.compile_manifest(
+            "wk-sr", _minimal_capability(), _minimal_binding("wk-sr"), status=status)
+        self.assertEqual(m["status"]["phase"], "refused")
+        self.assertEqual(m["status"]["refusal"]["code"], "controller_tool_missing")
+        self.assertEqual(m["status"]["preflight"][0]["check"], "tool")
+
+    def test_status_invalid_phase_raises(self):
+        status = _minimal_status()
+        status["phase"] = "pending"
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest(
+                "wk-x", _minimal_capability(), _minimal_binding(), status=status)
+
+    def test_status_refusal_missing_code_raises(self):
+        status = {
+            "phase": "refused",
+            "preflight": [],
+            "refusal": {"message": "oops", "source": "preflight"},
+        }
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest(
+                "wk-x", _minimal_capability(), _minimal_binding(), status=status)
+
+    def test_status_missing_key_raises(self):
+        status = {"phase": "compiling", "preflight": []}  # missing refusal
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest(
+                "wk-x", _minimal_capability(), _minimal_binding(), status=status)
+
+    # ------------------------------------------------------------------ #
+    # Path helpers in cowork_state                                        #
+    # ------------------------------------------------------------------ #
+
+    def test_manifest_dir_for_valid_uuid(self):
+        sess = "12345678-1234-1234-1234-123456789abc"
+        d = state_store.manifest_dir_for(sess)
+        self.assertTrue(d.endswith("manifests"))
+        self.assertIn(sess, d)
+
+    def test_manifest_path_for_valid(self):
+        sess = "aaaabbbb-cccc-dddd-eeee-ffffgggghhhi"
+        path = state_store.manifest_path_for(sess, "wk-001")
+        self.assertTrue(path.endswith("manifest.wk-001.json"))
+        self.assertIn(sess, path)
+
+    def test_manifest_path_for_uses_manifest_dir(self):
+        sess = "test-sess-001"
+        path = state_store.manifest_path_for(sess, "wk-abc")
+        self.assertTrue(path.startswith(state_store.manifest_dir_for(sess)))
+
+    def test_manifest_dir_for_rejects_empty_uuid(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_dir_for("")
+
+    def test_manifest_dir_for_rejects_dot_dot(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_dir_for("../escape")
+
+    def test_manifest_dir_for_rejects_slash(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_dir_for("a/b")
+
+    def test_manifest_dir_for_rejects_none(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_dir_for(None)
+
+    def test_manifest_path_for_rejects_empty_work_id(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_path_for("valid-sess", "")
+
+    def test_manifest_path_for_rejects_slash_in_work_id(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_path_for("valid-sess", "a/b")
+
+    def test_manifest_path_for_rejects_dot_dot_work_id(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_path_for("valid-sess", "../escape")
+
+    def test_manifest_path_for_rejects_none_session(self):
+        with self.assertRaises(ValueError):
+            state_store.manifest_path_for(None, "wk-001")
+
+    def test_manifest_dir_is_under_session_assets_dir(self):
+        sess = "my-session-id"
+        assets = state_store.session_assets_dir(sess)
+        mdir = state_store.manifest_dir_for(sess)
+        self.assertTrue(mdir.startswith(assets))
+
+    # ------------------------------------------------------------------ #
+    # End-to-end: compile + persist + load                                #
+    # ------------------------------------------------------------------ #
+
+    def test_e2e_compile_persist_load(self):
+        sess = "e2e-session-x"
+        work_id = "wk-e2e"
+        cap = _minimal_capability()
+        bind = _minimal_binding(work_id)
+        m_orig = manifest_mod.compile_manifest(work_id, cap, bind,
+                                               status=_minimal_status("proven"))
+        path = state_store.manifest_path_for(sess, work_id)
+        manifest_mod.persist_manifest(path, m_orig)
+        m_loaded = manifest_mod.load_manifest(path)
+        self.assertIsNotNone(m_loaded)
+        self.assertEqual(m_loaded["work_id"], work_id)
+        self.assertEqual(m_loaded["digest"], m_orig["digest"])
+        self.assertEqual(m_loaded["status"]["phase"], "proven")
+
+    def test_e2e_mutation_makes_stale(self):
+        sess = "e2e-stale-x"
+        work_id = "wk-e2e-s"
+        bind = _minimal_binding(work_id)
+        m = manifest_mod.compile_manifest(work_id, _minimal_capability(), bind)
+        path = state_store.manifest_path_for(sess, work_id)
+        manifest_mod.persist_manifest(path, m)
+        m2 = manifest_mod.load_manifest(path)
+
+        new_bind = dict(bind)
+        new_bind["controller"] = "opencode"
+        self.assertTrue(manifest_mod.manifest_is_stale(m2, new_bind))
+        self.assertFalse(manifest_mod.manifest_is_stale(m2, bind))
+
+    def test_load_rejects_mismatched_top_level_and_binding_work_id(self):
+        m = manifest_mod.compile_manifest(
+            "wk-load", _minimal_capability(), _minimal_binding("wk-load"))
+        m["work_id"] = "different-work"
+        path = os.path.join(self._td, "mismatched-work-id.json")
+        with open(path, "w") as fh:
+            json.dump(m, fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))

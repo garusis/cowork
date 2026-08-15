@@ -58,6 +58,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 
@@ -1030,6 +1031,46 @@ def build_manifest_path_for(session_uuid):
     describing what the build actually started from."""
     return os.path.join(session_assets_dir(session_uuid),
                         "build_baseline.json")
+
+
+# Identifier validation for manifest path helpers. Rejects anything that could
+# traverse directories or produce ambiguous filenames. UUIDs, short slugs, and
+# dotted work IDs all pass; slashes, dots-only, and NUL bytes are refused.
+_SAFE_IDENTIFIER_RE = re.compile(
+    r'^[A-Za-z0-9][A-Za-z0-9_\-\.]{0,254}$')
+
+
+def _assert_safe_identifier(value, label):
+    """Raise ValueError for identifiers that could escape the intended directory."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("%s must be a nonempty string" % label)
+    if not _SAFE_IDENTIFIER_RE.match(value):
+        raise ValueError(
+            "%s %r is unsafe (must match [A-Za-z0-9][A-Za-z0-9_\\-.]{0,254})"
+            % (label, value))
+    # Extra guard: reject anything with os.sep or os.altsep embedded even if
+    # the regex somehow did not catch it (e.g. on a platform with exotic seps).
+    if os.sep in value or (os.altsep and os.altsep in value):
+        raise ValueError("%s %r contains a path separator" % (label, value))
+
+
+def manifest_dir_for(session_uuid):
+    """Directory holding dispatch manifests for one session.
+
+    Rejects unsafe session_uuid values (path traversal, empty, etc.).
+    Root is overridable via COWORK_SESSIONS_ROOT, same as all session assets."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid), "manifests")
+
+
+def manifest_path_for(session_uuid, work_id):
+    """Path of the per-work-item dispatch manifest JSON file.
+
+    Rejects unsafe session_uuid or work_id values."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    _assert_safe_identifier(work_id, "work_id")
+    return os.path.join(manifest_dir_for(session_uuid),
+                        "manifest.%s.json" % work_id)
 
 
 def get_evaluation_policy(state):
