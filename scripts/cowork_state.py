@@ -535,6 +535,12 @@ def children_path_for(session_uuid):
     return os.path.join(session_assets_dir(session_uuid), "children.jsonl")
 
 
+def dispatch_links_path_for(session_uuid):
+    """Append-only exactly-once AttemptLink ledger (pending_replay and gate_repair).
+    Keyed by idempotency_key so duplicate observations are idempotent."""
+    return os.path.join(session_assets_dir(session_uuid), "dispatch_links.jsonl")
+
+
 def actions_path_for(session_uuid):
     """Append-only sanitized action-policy decisions."""
     return os.path.join(session_assets_dir(session_uuid), "actions.jsonl")
@@ -1803,12 +1809,23 @@ def save_role_session(path, role, controller, session_id, prior=None):
     return state
 
 
-def save_pending_turn(path, role, text, prior=None):
-    """Persist a failed direct turn for `role` so any future resume or switch replays it."""
+def save_pending_turn(path, role, text, prior=None, source=None):
+    """Persist a failed direct turn for `role` so any future resume or switch replays it.
+
+    When `source` is provided (a pending_source/v1 dict truthfully referring to an
+    existing source — trace event, provider session, or delivery fingerprint), it is
+    stored as an additive `pending_source` sibling alongside `pending_turn`. Callers
+    that omit `source` get the same positional-only behavior as before; no extra
+    fields are added and existing test doubles remain compatible.
+    """
     state = dict(prior or load(path) or {})
     pending = dict(state.get("pending_switches") or {})
     entry = dict(pending.get(role) or {})
     entry["pending_turn"] = text
+    if source is not None:
+        entry["pending_source"] = source
+    else:
+        entry.pop("pending_source", None)
     pending[role] = entry
     state["pending_switches"] = pending
     save(path, state)
@@ -1896,6 +1913,11 @@ def _apply_role_switch(state, role, target_controller, reason=None,
     pt = pending_turn if pending_turn is not None else prev_entry.get("pending_turn")
     if pt is not None:
         switch_entry["pending_turn"] = pt
+    # Carry the pending_source/v1 sibling through the switch so text and source
+    # travel together and can be paired at replay time.
+    ps = prev_entry.get("pending_source")
+    if ps is not None:
+        switch_entry["pending_source"] = ps
     pending[role] = switch_entry
     state["pending_switches"] = pending
     return state

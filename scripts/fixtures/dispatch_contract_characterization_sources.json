@@ -1,0 +1,137 @@
+{
+  "_readme": [
+    "Versioned characterization of every controller-dispatch source in cowork,",
+    "as it behaves TODAY (M0-B baseline). Each entry's `record` is compared",
+    "against a record produced by EXECUTING the source in",
+    "scripts/test_dispatch_contract_characterization.py — it is not a static",
+    "inventory and it is not derived from source text. When M0-C extracts the",
+    "DispatchContract gateway/reducer, any divergence here is a behavior change",
+    "that must be justified, not silently absorbed.",
+    "`policy_block` names what the source does when cowork_policy forbids the",
+    "requested controller. Note the three different answers: that divergence IS",
+    "the missing gateway."
+  ],
+  "version": 1,
+  "base_commit": "aa1ebb6f5d41e0396ed8cb7cc9b5bc9edb82db31",
+  "sources": {
+    "fresh": {
+      "gap": 1,
+      "entry_point": "cowork.run_scout",
+      "note": "fresh codex role dispatch: no probe, no pre-dispatch guard",
+      "record": {
+        "controller": "codex",
+        "factory_kwargs": ["on_thread_id", "resume_thread_id"],
+        "resume_value": null,
+        "probe_spawns": 0,
+        "pre_dispatch_guard": false,
+        "policy_block": "clean_return_rc_1"
+      }
+    },
+    "resume": {
+      "gap": 1,
+      "entry_point": "cowork.run_scout",
+      "note": "resumed claude role dispatch still pays the live probe",
+      "record": {
+        "controller": "claude",
+        "factory_kwargs": ["on_session_id", "resume_id", "session_id"],
+        "resume_value": "RESUME-ID",
+        "session_id_pinned": false,
+        "probe_spawns": 1,
+        "pre_dispatch_guard": false,
+        "policy_block": "raises_DispatchBlocked_kind_probe"
+      }
+    },
+    "reviewer": {
+      "gap": 1,
+      "entry_point": "cowork.run_reviewer_once",
+      "note": "paired reviewer probes on fresh only; session_factory bypasses the probe",
+      "record": {
+        "controller": "claude",
+        "probe_spawns_fresh": 1,
+        "probe_spawns_resume": 0,
+        "probe_spawns_with_factory": 0,
+        "fresh_probe_failure_result": "probe_failed",
+        "pre_dispatch_guard": true,
+        "policy_block": "controller_failure_verdict_policy_blocked"
+      }
+    },
+    "evaluator": {
+      "gap": 1,
+      "entry_point": "cowork._isolated_evaluator_session",
+      "note": "fresh-only, internal, read-only, muted, declared-output",
+      "record": {
+        "controller": "claude",
+        "accepts_resume_kwarg": false,
+        "internal": true,
+        "repo_writable": false,
+        "declared_outputs_len": 1,
+        "mode": "plan",
+        "yolo": false,
+        "probe_spawns": 0,
+        "pre_dispatch_guard": false,
+        "policy_block": "raises_DispatchBlocked_kind_dispatch"
+      }
+    },
+    "worktree": {
+      "gap": 1,
+      "entry_point": "cowork.run_worktree",
+      "note": "the only source with a pre-dispatch guard AND a clean non-exception refusal",
+      "record": {
+        "controller": "claude",
+        "probe_spawns_with_factory": 0,
+        "probe_spawns_without_factory": 1,
+        "pre_dispatch_guard": true,
+        "policy_block": "clean_return_none"
+      }
+    },
+    "switch": {
+      "gap": 1,
+      "entry_point": "cowork.run_flow",
+      "note": "fresh dispatch after a controller switch; never a resume",
+      "record": {
+        "controller": "codex",
+        "resume_value": null,
+        "switch_note_blocks": 1,
+        "pending_turn_descriptors": 1,
+        "pending_turn_inlined": false,
+        "pending_switch_after": null
+      }
+    },
+    "retry": {
+      "gap": 1,
+      "entry_point": "cowork.retry_terminal_evaluations",
+      "note": "the one retry mechanism that links a new attempt to the prior one",
+      "record": {
+        "reopened": 1,
+        "state_after": "retried",
+        "prior_attempt_ref_present": true,
+        "prior_attempt_ref_points_at_terminal_marker": true
+      }
+    },
+    "probe": {
+      "gap": 1,
+      "entry_point": "cowork_bridge.probe_claude_stream_json",
+      "note": "the probe is itself a guarded dispatch (kind='probe'), decided before argv is spawned",
+      "record": {
+        "controller": "claude",
+        "guard_kind": "probe",
+        "spawns_when_allowed": 1,
+        "spawns_when_blocked": 0,
+        "policy_block": "raises_DispatchBlocked_kind_probe"
+      }
+    },
+    "headless": {
+      "gap": 1,
+      "entry_point": "cowork.run_scout",
+      "note": "same dispatch facts as `fresh`; only the gate adapter differs",
+      "record": {
+        "controller": "codex",
+        "factory_kwargs": ["on_thread_id", "resume_thread_id"],
+        "resume_value": null,
+        "probe_spawns": 0,
+        "pre_dispatch_guard": false,
+        "policy_block": "clean_return_rc_1"
+      }
+    }
+  }
+}

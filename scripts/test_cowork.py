@@ -97,6 +97,7 @@ def _materialize_nested_fixture_repo(name, root):
     git("init")
     git("config", "user.email", "fixture@example.invalid")
     git("config", "user.name", "Fixture")
+    git("config", "commit.gpgsign", "false")
     for relative, content in fixture["initial"].items():
         path = os.path.join(repo, relative)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -3260,17 +3261,28 @@ class RunScoutTest(unittest.TestCase):
         self.assertNotIn(role_text[:80], prompts[0])
 
     def test_run_scout_claude_probe_fail_aborts(self):
+        import unittest.mock as mock
+
         config = {"scout": {"controller": "claude", "yolo": True, "mode": "plan"}}
         out = io.StringIO()
+        calls = []
 
         def bad_spawn(cmd, stdin):
+            calls.append((cmd, stdin))
             return [{"type": "other"}]
 
-        rc = cowork.run_scout(config, "ctx", ["scout", "planner"],
-                              io_in=io.StringIO(""), io_out=out,
-                              claude_spawn=bad_spawn)
+        # The production probe cache is global and may already contain this
+        # shape from another test or process.  This failure-path test must
+        # exercise its injected spawn regardless of that external state.
+        with mock.patch.object(bridge.probe_cache, "cache_hit",
+                               return_value=False) as cache_hit:
+            rc = cowork.run_scout(config, "ctx", ["scout", "planner"],
+                                  io_in=io.StringIO(""), io_out=out,
+                                  claude_spawn=bad_spawn)
         self.assertEqual(rc, 1)
         self.assertIn("cowork:", out.getvalue())
+        self.assertTrue(cache_hit.called)
+        self.assertEqual(len(calls), 1)
 
 
 class InterruptTest(unittest.TestCase):
@@ -16760,6 +16772,370 @@ class ControllerPolicyDispatchTest(ControllerPolicyTestBase):
                                               "implement", True)
         self.assertFalse(os.path.exists(os.path.join(base, ".opencode")))
 
+    def test_reviewer_controller_check_blocks_before_any_reviewer_dispatch(self):
+        # Site 6: run_flow's reviewer_controller_check closure, exercised via
+        # the reviewer_controller_check_fn it threads into run_scout.
+        spath = self._session(
+            "DISPATCH-REVIEWER-CHECK", "scouting",
+            {"scout": "claude", cowork.SCOUT_REVIEWER: "opencode"},
+            team=["scout", cowork.SCOUT_REVIEWER],
+            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
+                          "source": "cli"})
+        captured = {}
+
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            check_fn = kw.get("reviewer_controller_check_fn")
+            captured["alerts"] = check_fn(cowork.SCOUT_REVIEWER)
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        popen = _RecordingPopen()
+        with patch_bridge_popen(popen):
+            rc, out = self._run(spath, run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(popen.calls, [])
+        self.assertEqual(len(captured["alerts"]), 1)
+        self.assertIn("does not allow", captured["alerts"][0])
+        blocked = [e for e in self._events(spath)
+                   if e["event"] == "review.controller_policy_blocked"]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["role"], cowork.SCOUT_REVIEWER)
+        self.assertEqual(blocked[0]["controller"], "opencode")
+        decisions = [e for e in self._events(spath)
+                     if e["event"] == "dispatch.decision"
+                     and e.get("site") == "run_flow.reviewer_controller_check"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+
+
+class DispatchContractAdapterTest(ControllerPolicyTestBase):
+    """M0-C Package B: every one of the six lead dispatch adapters routes an
+    equivalent policy denial through `cowork_dispatch.decide()` as ONE
+    `DispatchDecision/v1` (outcome=refuse, spawned=false) before any provider
+    probe or spawn — while preserving each site's exact legacy return value,
+    refusal text, and trace event."""
+
+    def setUp(self):
+        super().setUp()
+        # The probe-success cache is GLOBAL and keyed off the resolved claude
+        # binary + version (independent of COWORK_SESSIONS_ROOT's tmp path),
+        # so without an explicit per-test override a live probe in one test
+        # can cache-skip the live probe in a LATER test. Point it at a fresh,
+        # never-populated file so every probe call in this class is live.
+        cache_path = os.path.join(tempfile.mkdtemp(), "probe_cache.json")
+        self.addCleanup(lambda: shutil.rmtree(os.path.dirname(cache_path),
+                                              ignore_errors=True))
+        old = os.environ.get("COWORK_PROBE_CACHE")
+        os.environ["COWORK_PROBE_CACHE"] = cache_path
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_PROBE_CACHE", None)
+            else:
+                os.environ["COWORK_PROBE_CACHE"] = old
+        self.addCleanup(restore)
+
+    def _role_config(self, role, controller, mode="plan", yolo=True):
+        return {role: {"controller": controller, "mode": mode, "yolo": yolo,
+                       "model": None, "effort": None}}
+
+    def _probe_spawn(self, events=None):
+        calls = []
+
+        def spawn(command, stdin_text):
+            calls.append(list(command))
+            return list(events if events is not None else
+                        [{"type": "assistant",
+                          "message": {"content": [{"type": "text",
+                                                    "text": "ok"}]}},
+                         {"type": "result"}])
+        return calls, spawn
+
+    def _trace(self, name):
+        tpath = os.path.join(self._dir(), "trace.jsonl")
+        return tpath, trace_store.Trace(tpath, session_uuid=name, run_id="R")
+
+    def _trace_events(self, tpath):
+        if not os.path.exists(tpath):
+            return []
+        with open(tpath, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_run_scout_uniform_refusal(self):
+        # Site 1: run_scout's fresh-claude pre-dispatch check.
+        tpath, trace = self._trace("SCOUT-UNIFORM")
+        calls, spawn = self._probe_spawn()
+        out = io.StringIO()
+        with policy.restricted(("opencode",)):
+            rc = cowork.run_scout(
+                self._role_config("scout", "claude"), "goal", ["scout"],
+                io_in=io.StringIO(""), io_out=out,
+                intel_path=os.path.join(self._dir(), "scout.intel.json"),
+                claude_spawn=spawn, trace=trace)
+        self.assertEqual(rc, 1)
+        self.assertIn("does not allow", out.getvalue())
+        self.assertEqual(calls, [])
+        events = self._trace_events(tpath)
+        end = [e for e in events if e["event"] == "role.end"]
+        self.assertEqual(len(end), 1)
+        self.assertEqual(end[0]["result"], "policy_blocked")
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_scout"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+
+    def test_run_planner_uniform_refusal(self):
+        # Site 2: run_planner's fresh-claude pre-dispatch check.
+        tpath, trace = self._trace("PLANNER-UNIFORM")
+        calls, spawn = self._probe_spawn()
+        out = io.StringIO()
+        outcomes = []
+        with policy.restricted(("opencode",)):
+            rc = cowork.run_planner(
+                self._role_config("planner", "claude"), "goal", ["planner"],
+                io_in=io.StringIO(""), io_out=out, claude_spawn=spawn,
+                trace=trace, on_outcome=lambda o, p=None: outcomes.append(o))
+        self.assertEqual(rc, 1)
+        self.assertIn("does not allow", out.getvalue())
+        self.assertEqual(calls, [])
+        self.assertEqual(outcomes, ["ended"])
+        events = self._trace_events(tpath)
+        end = [e for e in events if e["event"] == "role.end"]
+        self.assertEqual(len(end), 1)
+        self.assertEqual(end[0]["result"], "policy_blocked")
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_planner"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+
+    def test_run_builder_uniform_refusal(self):
+        # Site 3: run_builder's fresh-claude pre-dispatch check.
+        tpath, trace = self._trace("BUILDER-UNIFORM")
+        calls, spawn = self._probe_spawn()
+        out = io.StringIO()
+        outcomes = []
+        with policy.restricted(("opencode",)):
+            rc = cowork.run_builder(
+                self._role_config("builder", "claude"), "goal", ["builder"],
+                io_in=io.StringIO(""), io_out=out, claude_spawn=spawn,
+                trace=trace, on_outcome=lambda o, p=None: outcomes.append(o))
+        self.assertEqual(rc, 1)
+        self.assertIn("does not allow", out.getvalue())
+        self.assertEqual(calls, [])
+        self.assertEqual(outcomes, ["ended"])
+        events = self._trace_events(tpath)
+        end = [e for e in events if e["event"] == "role.end"]
+        self.assertEqual(len(end), 1)
+        self.assertEqual(end[0]["result"], "policy_blocked")
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_builder"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+
+    def test_run_flow_pre_launch_guard_uniform_refusal(self):
+        # Site 4: run_flow's pre-launch controller guard
+        # (ensure_controller_dispatchable), reached through the real CLI
+        # entrypoint before any process is spawned.
+        spath = self._session(
+            "PRELAUNCH-UNIFORM", "scouting", {"scout": "opencode"},
+            team=["scout"],
+            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
+                          "source": "cli"})
+        popen = _RecordingPopen()
+        out = io.StringIO()
+        with patch_bridge_popen(popen):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath, "--context", "policy"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertEqual(rc, 1)
+        self.assertIn("scout is configured for opencode", out.getvalue())
+        self.assertEqual(popen.calls, [])
+        events = self._events(spath)
+        failures = [e for e in events if e["event"] == "controller.failure"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["reason"], "policy_blocked")
+        self.assertEqual(failures[0]["artifact_progress"], False)
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_flow_pre_launch"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+
+    def test_switch_controller_uniform_refusal(self):
+        # Site 5: run_flow.switch_controller, exercised via the
+        # switch_controller_fn threaded into run_scout — the real production
+        # closure, not a stand-in.
+        spath = self._session(
+            "SWITCH-UNIFORM", "scouting", {"scout": "claude"},
+            team=["scout"],
+            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
+                          "source": "cli"})
+        captured = {}
+
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            switch_fn = kw.get("switch_controller_fn")
+            captured["result"] = switch_fn("scout", target="opencode")
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        popen = _RecordingPopen()
+        out = io.StringIO()
+        with patch_bridge_popen(popen):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath, "--context", "policy"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(popen.calls, [])
+        self.assertIs(captured["result"], False)
+        self.assertIn("does not allow", out.getvalue())
+        events = self._events(spath)
+        ends = [e for e in events if e["event"] == "controller.switch.end"]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["result"], "policy_blocked")
+        self.assertEqual(ends[0]["controller"], "opencode")
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_flow.switch_controller"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+
+    def test_reviewer_pre_check_uniform_refusal(self):
+        # Site 6: run_flow's reviewer_controller_check closure, exercised via
+        # the reviewer_controller_check_fn it threads into run_scout — the
+        # real production closure, not a stand-in.
+        spath = self._session(
+            "REVIEWCHECK-UNIFORM", "scouting",
+            {"scout": "claude", cowork.SCOUT_REVIEWER: "opencode"},
+            team=["scout", cowork.SCOUT_REVIEWER],
+            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
+                          "source": "cli"})
+        captured = {}
+
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            check_fn = kw.get("reviewer_controller_check_fn")
+            captured["alerts"] = check_fn(cowork.SCOUT_REVIEWER)
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        popen = _RecordingPopen()
+        with patch_bridge_popen(popen):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath, "--context", "policy"]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(popen.calls, [])
+        self.assertEqual(len(captured["alerts"]), 1)
+        self.assertIn("does not allow", captured["alerts"][0])
+        events = self._events(spath)
+        blocked = [e for e in events
+                   if e["event"] == "review.controller_policy_blocked"]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["role"], cowork.SCOUT_REVIEWER)
+        self.assertEqual(blocked[0]["controller"], "opencode")
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_flow.reviewer_controller_check"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+
+    def test_thrown_denial_backstop_negative_control(self):
+        # A legacy bridge/session path that STILL throws `DispatchBlocked`
+        # (simulated here via a raising `session_factory`, standing in for a
+        # bridge construction path) is caught by the narrowed backstop and
+        # converted into the SAME normalized decision shape as the
+        # pre-dispatch check — never an escaping exception.
+        tpath, trace = self._trace("BACKSTOP-NEGATIVE")
+        calls, spawn = self._probe_spawn()
+
+        def raising_factory(controller, session_id=None, resume_id=None,
+                            on_session_id=None):
+            raise policy.DispatchBlocked("claude", role="scout",
+                                         kind="dispatch")
+
+        out = io.StringIO()
+        rc = cowork.run_scout(
+            self._role_config("scout", "claude"), "goal", ["scout"],
+            io_in=io.StringIO(""), io_out=out,
+            intel_path=os.path.join(self._dir(), "scout.intel.json"),
+            claude_spawn=spawn, trace=trace, session_factory=raising_factory)
+        self.assertEqual(rc, 1)
+        self.assertIn("does not allow", out.getvalue())
+        # The probe DID run (unrestricted policy, allowed) — only the
+        # construction step threw — proving this is a genuine backstop
+        # conversion, not the earlier pre-dispatch refusal.
+        self.assertEqual(len(calls), 1)
+        events = self._trace_events(tpath)
+        end = [e for e in events if e["event"] == "role.end"]
+        self.assertEqual(end[-1]["result"], "policy_blocked")
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_scout"]
+        # One allow (the fresh pre-dispatch check, unrestricted) + one refuse
+        # (the backstop conversion of the thrown denial).
+        self.assertEqual([d["outcome"] for d in decisions],
+                         ["allow", "refuse"])
+
+    def test_no_probe_spawn_after_refusal(self):
+        # No provider probe or spawn may occur after a pre-dispatch refusal,
+        # across all three fresh-claude lead adapters in one assertion.
+        for role, runner in (("scout", cowork.run_scout),
+                             ("planner", cowork.run_planner),
+                             ("builder", cowork.run_builder)):
+            with self.subTest(role=role):
+                calls, spawn = self._probe_spawn()
+                kwargs = {"claude_spawn": spawn}
+                if role == "scout":
+                    kwargs["intel_path"] = os.path.join(
+                        self._dir(), "scout.intel.json")
+                with policy.restricted(("opencode",)):
+                    rc = runner(
+                        self._role_config(role, "claude"), "goal", [role],
+                        io_in=io.StringIO(""), io_out=io.StringIO(),
+                        **kwargs)
+                self.assertEqual(rc, 1)
+                self.assertEqual(calls, [],
+                                 "%s must not probe after refusal" % role)
+
+    def test_unrestricted_policy_compatibility(self):
+        # Unrestricted/allowed policy: the existing probe, constructor,
+        # resume, and successful dispatch behavior are unchanged — the seam
+        # only intercepts a refusal, never an allow.
+        tpath, trace = self._trace("UNRESTRICTED-COMPAT")
+        calls, spawn = self._probe_spawn()
+        captured = {}
+
+        def factory(controller, session_id=None, resume_id=None,
+                   on_session_id=None):
+            captured["controller"] = controller
+            captured["session_id"] = session_id
+
+            class _Scripted:
+                def send(self, text, meta=None):
+                    return {"ok": True, "result": "ok"}
+
+                def close(self):
+                    pass
+            return _Scripted()
+
+        out = io.StringIO()
+        rc = cowork.run_scout(
+            self._role_config("scout", "claude"), "goal", ["scout"],
+            io_in=io.StringIO("end\n"), io_out=out,
+            intel_path=os.path.join(self._dir(), "scout.intel.json"),
+            claude_spawn=spawn, trace=trace, session_factory=factory)
+        self.assertEqual(len(calls), 1)                  # probe ran, allowed
+        self.assertEqual(captured["controller"], "claude")  # constructed
+        self.assertNotIn("does not allow", out.getvalue())
+        events = self._trace_events(tpath)
+        decisions = [e for e in events if e["event"] == "dispatch.decision"
+                    and e.get("site") == "run_scout"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "allow")
+        blocked = [e for e in events if e["event"] == "role.end"
+                  and e.get("result") == "policy_blocked"]
+        self.assertEqual(blocked, [])
+
 
 class ControllerPolicyMalformedTest(ControllerPolicyTestBase):
     """A damaged saved policy fails CLOSED: nothing launches, nothing is
@@ -27165,6 +27541,7 @@ class ChildArtifactDeltaTests(unittest.TestCase):
             git("init")
             git("config", "user.email", "fixture@example.invalid")
             git("config", "user.name", "Fixture")
+            git("config", "commit.gpgsign", "false")
             Path(os.path.join(repo, "modified.txt")).write_text("before")
             Path(os.path.join(repo, "deleted.txt")).write_text("before")
             git("add", ".")
@@ -27277,6 +27654,8 @@ class ChildArtifactDeltaTests(unittest.TestCase):
                             "fixture@example.invalid"], check=True)
             subprocess.run(["git", "-C", repo, "config", "user.name",
                             "Fixture"], check=True)
+            subprocess.run(["git", "-C", repo, "config", "commit.gpgsign",
+                            "false"], check=True)
             for name in ("child.txt", "contested.txt", "unknown.txt",
                          "reverted.txt"):
                 Path(os.path.join(repo, name)).write_text("before")
@@ -30543,3 +30922,1709 @@ class OpencodeWorkIdTraceTest(unittest.TestCase):
         self.assertEqual(rej[0]["result"], "cancelled")
         self.assertEqual(rej[0]["work_class"], "cancelled")
         self.assertEqual(rej[0]["work_id"], s.last_work_id)
+
+
+# ---------------------------------------------------------------------------
+# DispatchContract seam — Package A (cowork_dispatch)
+# ---------------------------------------------------------------------------
+
+import cowork_dispatch as dispatch  # noqa: E402
+
+
+def _make_contract(**overrides):
+    """Return a minimal valid DispatchContract dict."""
+    base = {
+        "schema_version": 1,
+        "record": "DispatchContract",
+        "contract_id": "00000000-0000-0000-0000-000000000001",
+        "role": "scout",
+        "phase": None,
+        "controller": "claude",
+        "kind": "dispatch",
+        "purpose": "launch",
+        "site": "run_scout",
+        "resume_session_id": None,
+        "created": 1700000000.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_decision(contract, outcome="allow", **overrides):
+    """Return a minimal valid DispatchDecision dict.
+
+    For outcome='allow' all refusal fields default to null. For outcome='refuse'
+    they default to valid values. Any other outcome is set verbatim (for negative
+    control tests). overrides are applied last so individual fields can be
+    replaced with invalid values for negative control tests.
+    """
+    base = {
+        "schema_version": 1,
+        "record": "DispatchDecision",
+        "decision_id": "00000000-0000-0000-0000-000000000002",
+        "contract_id": contract["contract_id"],
+        "outcome": outcome,
+        "refusal_code": None,
+        "refusal_message": None,
+        "source": None,
+        "spawned": False,
+        "trace_event_id": None,
+    }
+    if outcome == "refuse":
+        base["refusal_code"] = "controller_not_allowed"
+        base["refusal_message"] = "not allowed"
+        base["source"] = "policy_guard"
+    base.update(overrides)
+    return base
+
+
+def _make_source_ref(**overrides):
+    """Return a minimal valid source_ref dict."""
+    base = {
+        "kind": "trace_event",
+        "event_id": "EVT-001",
+        "event_name": None,
+        "session_id": None,
+        "prompt_sha256": None,
+        "created": 1700000000.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_delivery_ref(**overrides):
+    """Return a minimal valid delivery_ref dict."""
+    base = {
+        "prompt_kind": "seed",
+        "prompt_sha256": "a" * 64,
+        "prompt_bytes": 100,
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_attempt_link(role="scout", kind="pending_replay", ordinal=0, **overrides):
+    """Return a minimal valid AttemptLink dict."""
+    source_ref = overrides.pop("source_ref", _make_source_ref())
+    delivery_ref = overrides.pop("delivery_ref", _make_delivery_ref())
+    key = dispatch.build_attempt_link_idempotency_key(role, kind, source_ref, ordinal)
+    base = {
+        "schema_version": 1,
+        "record": "AttemptLink",
+        "attempt_id": "00000000-0000-0000-0000-000000000003",
+        "role": role,
+        "phase": None,
+        "kind": kind,
+        "source_ref": source_ref,
+        "delivery_ref": delivery_ref,
+        "idempotency_key": key,
+        "created": 1700000001.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _allow_fact(**overrides):
+    base = {"allowed": True, "refusal_code": None, "refusal_message": None, "source": None}
+    base.update(overrides)
+    return base
+
+
+def _refuse_fact(code="controller_not_allowed", message="refused", source="policy_guard",
+                 **overrides):
+    base = {"allowed": False, "refusal_code": code,
+            "refusal_message": message, "source": source}
+    base.update(overrides)
+    return base
+
+
+class DispatchContractValidatorTest(unittest.TestCase):
+    def test_valid_contract_returns_normalized_copy(self):
+        c = _make_contract()
+        result = dispatch.validate_dispatch_contract(c)
+        self.assertEqual(result, c)
+        self.assertIsNot(result, c)
+
+    def test_all_purposes_accepted(self):
+        for purpose in ("launch", "resume", "switch", "repair",
+                        "review", "worktree", "evaluator"):
+            with self.subTest(purpose=purpose):
+                c = _make_contract(purpose=purpose)
+                self.assertEqual(
+                    dispatch.validate_dispatch_contract(c)["purpose"], purpose)
+
+    def test_both_kinds_accepted(self):
+        for kind in ("dispatch", "probe"):
+            with self.subTest(kind=kind):
+                c = _make_contract(kind=kind)
+                self.assertEqual(
+                    dispatch.validate_dispatch_contract(c)["kind"], kind)
+
+    def test_phase_string_accepted(self):
+        c = _make_contract(phase="scouting")
+        self.assertEqual(dispatch.validate_dispatch_contract(c)["phase"], "scouting")
+
+    def test_phase_null_accepted(self):
+        c = _make_contract(phase=None)
+        self.assertIsNone(dispatch.validate_dispatch_contract(c)["phase"])
+
+    def test_resume_session_id_string_accepted(self):
+        c = _make_contract(resume_session_id="S1")
+        self.assertEqual(
+            dispatch.validate_dispatch_contract(c)["resume_session_id"], "S1")
+
+    def test_schema_version_2_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(schema_version=2))
+
+    def test_schema_version_string_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(schema_version="1"))
+
+    def test_schema_version_bool_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(schema_version=True))
+
+    def test_wrong_record_value_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(record="DispatchDecision"))
+
+    def test_missing_key_rejected(self):
+        c = _make_contract()
+        del c["role"]
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(c)
+
+    def test_extra_key_rejected(self):
+        c = _make_contract()
+        c["record_name"] = "x"
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(c)
+
+    def test_forbidden_extra_keys_rejected(self):
+        for extra in ("record_name", "dispatch_kind", "candidate_id",
+                      "delivery_ref", "resume_ref", "session_policy", "metadata"):
+            with self.subTest(extra=extra):
+                c = _make_contract()
+                c[extra] = "x"
+                with self.assertRaises(ValueError):
+                    dispatch.validate_dispatch_contract(c)
+
+    def test_empty_role_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(role=""))
+
+    def test_non_string_role_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(role=123))
+
+    def test_empty_controller_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(controller=""))
+
+    def test_empty_site_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(site=""))
+
+    def test_unknown_kind_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(kind="unknown"))
+
+    def test_unknown_purpose_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(purpose="unknown"))
+
+    def test_invalid_uuid_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(
+                _make_contract(contract_id="not-a-uuid"))
+
+    def test_boolean_created_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(created=True))
+
+    def test_string_created_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(created="now"))
+
+    def test_inf_created_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(created=float("inf")))
+
+    def test_nan_created_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(created=float("nan")))
+
+    def test_integer_created_accepted(self):
+        c = _make_contract(created=1700000000)
+        self.assertEqual(dispatch.validate_dispatch_contract(c)["created"], 1700000000)
+
+    def test_non_string_phase_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract(_make_contract(phase=42))
+
+    def test_non_dict_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_contract("not a dict")
+
+    def test_input_not_mutated(self):
+        c = _make_contract()
+        original = dict(c)
+        dispatch.validate_dispatch_contract(c)
+        self.assertEqual(c, original)
+
+    def test_json_round_trip(self):
+        c = _make_contract()
+        validated = dispatch.validate_dispatch_contract(c)
+        rt = json.loads(json.dumps(validated))
+        self.assertEqual(dispatch.validate_dispatch_contract(rt), validated)
+
+
+class DispatchDecisionValidatorTest(unittest.TestCase):
+    def _contract(self):
+        return _make_contract()
+
+    def test_valid_allow_decision_returns_normalized_copy(self):
+        c = self._contract()
+        d = _make_decision(c, "allow")
+        result = dispatch.validate_dispatch_decision(d, c)
+        self.assertEqual(result, d)
+        self.assertIsNot(result, d)
+
+    def test_valid_refuse_decision_accepted(self):
+        c = self._contract()
+        d = _make_decision(c, "refuse")
+        result = dispatch.validate_dispatch_decision(d, c)
+        self.assertEqual(result["outcome"], "refuse")
+
+    def test_all_refusal_codes_accepted(self):
+        c = self._contract()
+        for code in ("controller_not_allowed", "controller_tool_missing",
+                     "probe_failed", "capability_missing"):
+            with self.subTest(code=code):
+                d = _make_decision(c, "refuse", refusal_code=code)
+                self.assertEqual(
+                    dispatch.validate_dispatch_decision(d, c)["refusal_code"], code)
+
+    def test_all_refusal_sources_accepted(self):
+        c = self._contract()
+        for source in ("policy_guard", "preflight", "probe", "bridge_backstop"):
+            with self.subTest(source=source):
+                d = _make_decision(c, "refuse", source=source)
+                self.assertEqual(
+                    dispatch.validate_dispatch_decision(d, c)["source"], source)
+
+    def test_schema_version_2_rejected(self):
+        c = self._contract()
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(
+                _make_decision(c, schema_version=2), c)
+
+    def test_wrong_record_value_rejected(self):
+        c = self._contract()
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(
+                _make_decision(c, record="DispatchContract"), c)
+
+    def test_missing_key_rejected(self):
+        c = self._contract()
+        d = _make_decision(c)
+        del d["outcome"]
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_extra_key_rejected(self):
+        c = self._contract()
+        d = _make_decision(c)
+        d["extra"] = "x"
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_invalid_decision_uuid_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, decision_id="bad-uuid")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_contract_id_mismatch_rejected(self):
+        c = self._contract()
+        d = _make_decision(c)
+        d["contract_id"] = "11111111-1111-1111-1111-111111111111"
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_unknown_outcome_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, outcome="maybe")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_allow_with_refusal_code_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "allow", refusal_code="probe_failed")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_allow_with_refusal_message_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "allow", refusal_message="oops")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_allow_with_source_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "allow", source="policy_guard")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_refuse_with_null_code_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "refuse", refusal_code=None)
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_refuse_with_unknown_code_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "refuse", refusal_code="unknown_code")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_refuse_with_empty_message_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "refuse", refusal_message="")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_refuse_with_null_message_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "refuse", refusal_message=None)
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_refuse_with_null_source_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "refuse", source=None)
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_refuse_with_unknown_source_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, "refuse", source="unknown_source")
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_spawned_must_be_bool(self):
+        c = self._contract()
+        d = _make_decision(c, spawned=1)
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_trace_event_id_string_accepted(self):
+        c = self._contract()
+        d = _make_decision(c, trace_event_id="EVT-1")
+        result = dispatch.validate_dispatch_decision(d, c)
+        self.assertEqual(result["trace_event_id"], "EVT-1")
+
+    def test_trace_event_id_non_string_rejected(self):
+        c = self._contract()
+        d = _make_decision(c, trace_event_id=42)
+        with self.assertRaises(ValueError):
+            dispatch.validate_dispatch_decision(d, c)
+
+    def test_input_not_mutated(self):
+        c = self._contract()
+        d = _make_decision(c)
+        original_d = dict(d)
+        dispatch.validate_dispatch_decision(d, c)
+        self.assertEqual(d, original_d)
+
+    def test_json_round_trip(self):
+        c = self._contract()
+        d = _make_decision(c)
+        validated = dispatch.validate_dispatch_decision(d, c)
+        rt = json.loads(json.dumps(validated))
+        self.assertEqual(dispatch.validate_dispatch_decision(rt, c), validated)
+
+
+class DecideReducerTest(unittest.TestCase):
+    def _contract(self):
+        return _make_contract()
+
+    def test_no_facts_returns_allow(self):
+        c = self._contract()
+        result = dispatch.decide(c)
+        self.assertEqual(result["outcome"], "allow")
+        self.assertEqual(result["contract_id"], c["contract_id"])
+        self.assertIsNone(result["refusal_code"])
+        self.assertFalse(result["spawned"])
+
+    def test_all_allow_facts_returns_allow(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c, policy_result=_allow_fact(),
+            preflight_result=_allow_fact(), probe_result=_allow_fact())
+        self.assertEqual(result["outcome"], "allow")
+
+    def test_policy_refusal_wins(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c,
+            policy_result=_refuse_fact("controller_not_allowed", "blocked", "policy_guard"),
+            preflight_result=_allow_fact(),
+            probe_result=_allow_fact())
+        self.assertEqual(result["outcome"], "refuse")
+        self.assertEqual(result["refusal_code"], "controller_not_allowed")
+        self.assertEqual(result["source"], "policy_guard")
+
+    def test_preflight_refusal_wins_when_policy_allows(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c,
+            policy_result=_allow_fact(),
+            preflight_result=_refuse_fact("controller_tool_missing", "missing", "preflight"),
+            probe_result=_allow_fact())
+        self.assertEqual(result["outcome"], "refuse")
+        self.assertEqual(result["refusal_code"], "controller_tool_missing")
+        self.assertEqual(result["source"], "preflight")
+
+    def test_probe_refusal_wins_when_policy_and_preflight_allow(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c,
+            policy_result=_allow_fact(),
+            preflight_result=_allow_fact(),
+            probe_result=_refuse_fact("probe_failed", "probe err", "probe"))
+        self.assertEqual(result["outcome"], "refuse")
+        self.assertEqual(result["refusal_code"], "probe_failed")
+        self.assertEqual(result["source"], "probe")
+
+    def test_policy_refusal_takes_precedence_over_probe(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c,
+            policy_result=_refuse_fact("controller_not_allowed", "policy blocked", "policy_guard"),
+            probe_result=_refuse_fact("probe_failed", "probe err", "probe"))
+        self.assertEqual(result["refusal_code"], "controller_not_allowed")
+        self.assertEqual(result["source"], "policy_guard")
+
+    def test_preflight_refusal_takes_precedence_over_probe(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c,
+            preflight_result=_refuse_fact("capability_missing", "cap miss", "preflight"),
+            probe_result=_refuse_fact("probe_failed", "probe err", "probe"))
+        self.assertEqual(result["refusal_code"], "capability_missing")
+        self.assertEqual(result["source"], "preflight")
+
+    def test_null_facts_are_skipped(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c, policy_result=None, preflight_result=None, probe_result=None)
+        self.assertEqual(result["outcome"], "allow")
+
+    def test_only_probe_provided_and_refused(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c, probe_result=_refuse_fact("probe_failed", "probe err", "probe"))
+        self.assertEqual(result["outcome"], "refuse")
+        self.assertEqual(result["refusal_code"], "probe_failed")
+
+    def test_refusal_fields_are_verbatim(self):
+        c = self._contract()
+        fact = _refuse_fact("capability_missing", "specific message", "bridge_backstop")
+        result = dispatch.decide(c, policy_result=fact)
+        self.assertEqual(result["refusal_message"], "specific message")
+        self.assertEqual(result["source"], "bridge_backstop")
+
+    def test_result_has_new_decision_id_each_call(self):
+        c = self._contract()
+        r1 = dispatch.decide(c)
+        r2 = dispatch.decide(c)
+        self.assertNotEqual(r1["decision_id"], r2["decision_id"])
+
+    def test_result_is_valid_allow_decision(self):
+        c = self._contract()
+        result = dispatch.decide(c)
+        validated = dispatch.validate_dispatch_decision(result, c)
+        self.assertEqual(validated["outcome"], "allow")
+
+    def test_refuse_result_is_valid_decision(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c, policy_result=_refuse_fact("probe_failed", "err", "probe"))
+        validated = dispatch.validate_dispatch_decision(result, c)
+        self.assertEqual(validated["outcome"], "refuse")
+
+    def test_invalid_contract_raises(self):
+        bad = _make_contract(schema_version=2)
+        with self.assertRaises(ValueError):
+            dispatch.decide(bad)
+
+    def test_invalid_policy_fact_raises(self):
+        c = self._contract()
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result={"allowed": True})
+
+    def test_fact_with_extra_key_raises(self):
+        c = self._contract()
+        fact = _allow_fact()
+        fact["blocked"] = True
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_with_missing_key_raises(self):
+        c = self._contract()
+        fact = {"allowed": True, "refusal_code": None, "refusal_message": None}
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_allowed_true_with_nonempty_refusal_code_raises(self):
+        c = self._contract()
+        fact = _allow_fact(refusal_code="probe_failed")
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_allowed_false_with_null_code_raises(self):
+        c = self._contract()
+        fact = _refuse_fact(code=None)
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_allowed_false_with_empty_message_raises(self):
+        c = self._contract()
+        fact = _refuse_fact(message="")
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_allowed_false_with_null_source_raises(self):
+        c = self._contract()
+        fact = _refuse_fact(source=None)
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_allowed_false_with_unknown_source_raises(self):
+        c = self._contract()
+        fact = _refuse_fact(source="unknown")
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_allowed_false_with_unknown_code_raises(self):
+        c = self._contract()
+        fact = _refuse_fact(code="bad_code")
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_fact_allowed_is_not_boolean_raises(self):
+        c = self._contract()
+        fact = {"allowed": 1, "refusal_code": None,
+                "refusal_message": None, "source": None}
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, policy_result=fact)
+
+    def test_preflight_invalid_fact_raises(self):
+        c = self._contract()
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, preflight_result={"allowed": True, "extra": "x"})
+
+    def test_probe_invalid_fact_raises(self):
+        c = self._contract()
+        with self.assertRaises(ValueError):
+            dispatch.decide(c, probe_result="not a dict")
+
+    def test_spawned_is_always_false(self):
+        c = self._contract()
+        self.assertFalse(dispatch.decide(c)["spawned"])
+        self.assertFalse(dispatch.decide(
+            c, policy_result=_refuse_fact())["spawned"])
+
+    def test_trace_event_id_is_none(self):
+        c = self._contract()
+        self.assertIsNone(dispatch.decide(c)["trace_event_id"])
+
+    def test_contract_not_mutated(self):
+        c = _make_contract()
+        original = dict(c)
+        dispatch.decide(c)
+        self.assertEqual(c, original)
+
+    def test_fact_not_mutated(self):
+        c = self._contract()
+        fact = _allow_fact()
+        original = dict(fact)
+        dispatch.decide(c, policy_result=fact)
+        self.assertEqual(fact, original)
+
+
+class AttemptLinkValidatorTest(unittest.TestCase):
+    def test_valid_link_returns_normalized_copy(self):
+        link = _make_attempt_link()
+        result = dispatch.validate_attempt_link(link)
+        self.assertEqual(result, link)
+        self.assertIsNot(result, link)
+
+    def test_gate_repair_kind_accepted(self):
+        link = _make_attempt_link(kind="gate_repair")
+        result = dispatch.validate_attempt_link(link)
+        self.assertEqual(result["kind"], "gate_repair")
+
+    def test_missing_key_rejected(self):
+        link = _make_attempt_link()
+        del link["role"]
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_extra_key_rejected(self):
+        link = _make_attempt_link()
+        link["extra"] = "x"
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_schema_version_2_rejected(self):
+        link = _make_attempt_link()
+        link["schema_version"] = 2
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_wrong_record_value_rejected(self):
+        link = _make_attempt_link()
+        link["record"] = "DispatchContract"
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_invalid_attempt_id_uuid_rejected(self):
+        link = _make_attempt_link()
+        link["attempt_id"] = "not-a-uuid"
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_empty_role_rejected(self):
+        link = _make_attempt_link()
+        link["role"] = ""
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_unknown_kind_rejected(self):
+        link = _make_attempt_link()
+        link["kind"] = "unknown_kind"
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_nested_attempt_id_in_source_ref_rejected(self):
+        link = _make_attempt_link()
+        link["source_ref"] = dict(link["source_ref"])
+        link["source_ref"]["attempt_id"] = "fabricated"
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_source_ref_unknown_kind_rejected(self):
+        sr = _make_source_ref(kind="unknown_source_kind")
+        link = _make_attempt_link(source_ref=sr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_source_ref_all_kinds_accepted(self):
+        for kind in ("trace_event", "provider_session",
+                     "delivery_fingerprint", "legacy"):
+            with self.subTest(kind=kind):
+                sr = _make_source_ref(kind=kind)
+                link = _make_attempt_link(source_ref=sr)
+                result = dispatch.validate_attempt_link(link)
+                self.assertEqual(result["source_ref"]["kind"], kind)
+
+    def test_source_ref_missing_discriminator_rejected(self):
+        sr = _make_source_ref(event_id=None, event_name=None,
+                               session_id=None, prompt_sha256=None)
+        with self.assertRaises(ValueError):
+            _make_attempt_link(source_ref=sr)
+
+    def test_source_ref_extra_key_rejected(self):
+        sr = _make_source_ref()
+        sr["extra"] = "x"
+        link = _make_attempt_link(source_ref=sr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_source_ref_missing_key_rejected(self):
+        link = _make_attempt_link()
+        sr = dict(link["source_ref"])
+        del sr["event_id"]
+        link["source_ref"] = sr
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_source_timestamp_after_link_creation_rejected(self):
+        sr = _make_source_ref(created=9999999999.0)
+        link = _make_attempt_link(source_ref=sr)
+        link["created"] = 1000000000.0
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_source_timestamp_equal_to_link_creation_accepted(self):
+        sr = _make_source_ref(created=1700000000.0)
+        link = _make_attempt_link(source_ref=sr)
+        link["created"] = 1700000000.0
+        result = dispatch.validate_attempt_link(link)
+        self.assertEqual(result["created"], 1700000000.0)
+
+    def test_delivery_ref_sha256_must_be_lowercase_hex(self):
+        dr = _make_delivery_ref(prompt_sha256="A" * 64)
+        link = _make_attempt_link(delivery_ref=dr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_delivery_ref_sha256_too_short_rejected(self):
+        dr = _make_delivery_ref(prompt_sha256="a" * 63)
+        link = _make_attempt_link(delivery_ref=dr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_delivery_ref_bytes_bool_rejected(self):
+        dr = _make_delivery_ref(prompt_bytes=True)
+        link = _make_attempt_link(delivery_ref=dr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_delivery_ref_bytes_negative_rejected(self):
+        dr = _make_delivery_ref(prompt_bytes=-1)
+        link = _make_attempt_link(delivery_ref=dr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_delivery_ref_zero_bytes_accepted(self):
+        dr = _make_delivery_ref(prompt_bytes=0)
+        link = _make_attempt_link(delivery_ref=dr)
+        result = dispatch.validate_attempt_link(link)
+        self.assertEqual(result["delivery_ref"]["prompt_bytes"], 0)
+
+    def test_delivery_ref_empty_prompt_kind_rejected(self):
+        dr = _make_delivery_ref(prompt_kind="")
+        link = _make_attempt_link(delivery_ref=dr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_delivery_ref_missing_key_rejected(self):
+        dr = _make_delivery_ref()
+        del dr["prompt_kind"]
+        link = _make_attempt_link(delivery_ref=dr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_delivery_ref_extra_key_rejected(self):
+        dr = _make_delivery_ref()
+        dr["extra"] = "x"
+        link = _make_attempt_link(delivery_ref=dr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_idempotency_key_mismatch_rejected(self):
+        link = _make_attempt_link()
+        link["idempotency_key"] = "wrong:key:format:0"
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_input_not_mutated(self):
+        link = _make_attempt_link()
+        original = dict(link)
+        dispatch.validate_attempt_link(link)
+        self.assertEqual(link, original)
+
+    def test_json_round_trip(self):
+        link = _make_attempt_link()
+        validated = dispatch.validate_attempt_link(link)
+        rt = json.loads(json.dumps(validated))
+        self.assertEqual(dispatch.validate_attempt_link(rt), validated)
+
+    def test_phase_string_accepted(self):
+        link = _make_attempt_link()
+        link["phase"] = "scouting"
+        result = dispatch.validate_attempt_link(link)
+        self.assertEqual(result["phase"], "scouting")
+
+    def test_non_dict_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link("not a dict")
+
+
+class IdempotencyKeyBuilderTest(unittest.TestCase):
+    def _sr(self, **overrides):
+        return _make_source_ref(**overrides)
+
+    def test_key_format_with_event_id(self):
+        sr = self._sr(event_id="EVT-001")
+        key = dispatch.build_attempt_link_idempotency_key(
+            "scout", "pending_replay", sr, 0)
+        self.assertEqual(key, "scout:pending_replay:event_id=EVT-001:0")
+
+    def test_event_id_takes_priority_over_event_name(self):
+        sr = self._sr(event_id="EVT-001", event_name="named-event")
+        key = dispatch.build_attempt_link_idempotency_key(
+            "scout", "pending_replay", sr, 0)
+        self.assertIn("event_id=EVT-001", key)
+        self.assertNotIn("event_name", key)
+
+    def test_event_name_used_when_event_id_absent(self):
+        sr = self._sr(event_id=None, event_name="named-event")
+        key = dispatch.build_attempt_link_idempotency_key(
+            "scout", "pending_replay", sr, 0)
+        self.assertIn("event_name=named-event", key)
+
+    def test_session_id_used_when_earlier_fields_absent(self):
+        sr = self._sr(event_id=None, event_name=None, session_id="SID-1")
+        key = dispatch.build_attempt_link_idempotency_key(
+            "scout", "gate_repair", sr, 1)
+        self.assertIn("session_id=SID-1", key)
+
+    def test_prompt_sha256_used_as_fallback(self):
+        sr = self._sr(event_id=None, event_name=None, session_id=None,
+                      prompt_sha256="b" * 64)
+        key = dispatch.build_attempt_link_idempotency_key(
+            "scout", "pending_replay", sr, 0)
+        self.assertIn("prompt_sha256=" + "b" * 64, key)
+
+    def test_no_discriminator_raises(self):
+        sr = self._sr(event_id=None, event_name=None,
+                      session_id=None, prompt_sha256=None)
+        with self.assertRaises(ValueError):
+            dispatch.build_attempt_link_idempotency_key(
+                "scout", "pending_replay", sr, 0)
+
+    def test_same_inputs_produce_same_key(self):
+        sr = self._sr(event_id="EVT-001")
+        k1 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        k2 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        self.assertEqual(k1, k2)
+
+    def test_different_ordinal_produces_different_key(self):
+        sr = self._sr(event_id="EVT-001")
+        k1 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        k2 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 1)
+        self.assertNotEqual(k1, k2)
+
+    def test_different_discriminator_value_produces_different_key(self):
+        sr1 = self._sr(event_id="EVT-001")
+        sr2 = self._sr(event_id="EVT-002")
+        k1 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr1, 0)
+        k2 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr2, 0)
+        self.assertNotEqual(k1, k2)
+
+    def test_different_role_produces_different_key(self):
+        sr = self._sr(event_id="EVT-001")
+        k1 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        k2 = dispatch.build_attempt_link_idempotency_key("planner", "pending_replay", sr, 0)
+        self.assertNotEqual(k1, k2)
+
+    def test_different_kind_produces_different_key(self):
+        sr = self._sr(event_id="EVT-001")
+        k1 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        k2 = dispatch.build_attempt_link_idempotency_key("scout", "gate_repair", sr, 0)
+        self.assertNotEqual(k1, k2)
+
+    def test_key_has_four_colon_separated_parts(self):
+        sr = self._sr(event_id="EVT-001")
+        key = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        parts = key.split(":")
+        self.assertEqual(len(parts), 4)
+
+
+class DispatchControllerProbeTest(unittest.TestCase):
+    """Constructs the exact controller probe records and reducer facts."""
+
+    def _probe_contract(self):
+        return _make_contract(
+            contract_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            kind="probe",
+            purpose="launch",
+            site="bridge.probe_claude_stream_json",
+        )
+
+    def _policy_refuse_fact(self):
+        return {
+            "allowed": False,
+            "refusal_code": "controller_not_allowed",
+            "refusal_message": "controller not in allowed set",
+            "source": "policy_guard",
+        }
+
+    def _policy_allow_fact(self):
+        return {
+            "allowed": True,
+            "refusal_code": None,
+            "refusal_message": None,
+            "source": None,
+        }
+
+    def test_probe_contract_validates(self):
+        c = self._probe_contract()
+        result = dispatch.validate_dispatch_contract(c)
+        self.assertEqual(result["kind"], "probe")
+
+    def test_allow_decision_via_decide(self):
+        c = self._probe_contract()
+        result = dispatch.decide(c, policy_result=self._policy_allow_fact())
+        self.assertEqual(result["outcome"], "allow")
+        self.assertEqual(result["contract_id"], c["contract_id"])
+
+    def test_refuse_decision_via_decide(self):
+        c = self._probe_contract()
+        result = dispatch.decide(c, policy_result=self._policy_refuse_fact())
+        self.assertEqual(result["outcome"], "refuse")
+        self.assertEqual(result["refusal_code"], "controller_not_allowed")
+        self.assertEqual(result["source"], "policy_guard")
+
+    def test_refuse_result_passes_validator(self):
+        c = self._probe_contract()
+        decision = dispatch.decide(c, policy_result=self._policy_refuse_fact())
+        validated = dispatch.validate_dispatch_decision(decision, c)
+        self.assertEqual(validated["outcome"], "refuse")
+
+    def test_policy_before_preflight_before_probe_order(self):
+        c = self._probe_contract()
+        result = dispatch.decide(
+            c,
+            policy_result=self._policy_refuse_fact(),
+            preflight_result={"allowed": False, "refusal_code": "capability_missing",
+                              "refusal_message": "missing cap", "source": "preflight"},
+            probe_result={"allowed": False, "refusal_code": "probe_failed",
+                          "refusal_message": "probe err", "source": "probe"})
+        self.assertEqual(result["source"], "policy_guard")
+
+    def test_attempt_link_round_trip(self):
+        sr = _make_source_ref(
+            kind="trace_event",
+            event_id="PROBE-EVT-001",
+        )
+        dr = _make_delivery_ref(
+            prompt_kind="probe",
+            prompt_sha256="c" * 64,
+            prompt_bytes=42,
+        )
+        link = _make_attempt_link(
+            role="scout",
+            kind="pending_replay",
+            ordinal=0,
+            source_ref=sr,
+            delivery_ref=dr,
+        )
+        validated = dispatch.validate_attempt_link(link)
+        rt = json.loads(json.dumps(validated))
+        self.assertEqual(dispatch.validate_attempt_link(rt), validated)
+
+    def test_idempotency_key_is_deterministic(self):
+        sr = _make_source_ref(event_id="PROBE-EVT-001")
+        k1 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        k2 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr, 0)
+        self.assertEqual(k1, k2)
+
+    def test_idempotency_key_non_colliding(self):
+        sr1 = _make_source_ref(event_id="EVT-A")
+        sr2 = _make_source_ref(event_id="EVT-B")
+        k1 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr1, 0)
+        k2 = dispatch.build_attempt_link_idempotency_key("scout", "pending_replay", sr2, 0)
+        self.assertNotEqual(k1, k2)
+
+
+# ---------------------------------------------------------------------------
+# Package C — pending-turn and gate-repair retry linkage (M0-C Package C)
+# ---------------------------------------------------------------------------
+
+class PendingReplayLinkageTest(unittest.TestCase):
+    """Negative-control and contract coverage for pending-turn replay linkage.
+
+    Tests cover: save timing (no attempt_id at save), source precedence,
+    legacy replay normalization, source/pending mismatch detection, and
+    duplicate-replay idempotency via the exactly-once writer.
+    """
+
+    def _tmpdir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    def _session_path(self, uuid_str="PENDING-C-TEST"):
+        root = self._tmpdir()
+        os.environ.setdefault("COWORK_SESSIONS_ROOT", root)
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+        self.addCleanup(lambda: os.environ.update({"COWORK_SESSIONS_ROOT": prior})
+                        if prior else os.environ.pop("COWORK_SESSIONS_ROOT", None))
+        spath = os.path.join(root, ".cowork", "session.json")
+        os.makedirs(os.path.dirname(spath), exist_ok=True)
+        state_store.ensure_session(spath, None, uuid_str)
+        return spath, uuid_str
+
+    # ------------------------------------------------------------------ #
+    # NC-1: save creates no attempt_id at any depth                       #
+    # ------------------------------------------------------------------ #
+
+    def test_save_pending_turn_creates_no_attempt_id_at_any_depth(self):
+        spath, _ = self._session_path()
+        source_ref = {
+            "kind": "trace_event",
+            "event_id": "EVT-NC1",
+            "event_name": "role.send.start",
+            "session_id": None,
+            "prompt_sha256": None,
+            "created": 1700000000.0,
+        }
+        state = state_store.load(spath)
+        state = state_store.save_pending_turn(
+            spath, "scout", "attempt text", prior=state, source=source_ref)
+        entry = state_store.read_pending_switch(state, "scout")
+        self.assertIn("pending_turn", entry)
+        self.assertIn("pending_source", entry)
+        self.assertNotIn("attempt_id", entry)
+        import json as _json
+        serialized = _json.dumps(entry)
+        self.assertNotIn("attempt_id", serialized)
+
+    def test_save_without_source_produces_no_pending_source(self):
+        spath, _ = self._session_path()
+        state = state_store.load(spath)
+        state = state_store.save_pending_turn(
+            spath, "scout", "text", prior=state)
+        entry = state_store.read_pending_switch(state, "scout")
+        self.assertEqual(entry, {"pending_turn": "text"})
+
+    # ------------------------------------------------------------------ #
+    # NC-2: source precedence (trace > session > fingerprint)             #
+    # ------------------------------------------------------------------ #
+
+    def test_build_pending_source_ref_trace_event_takes_priority(self):
+        class _FakeSession:
+            session_id = "sess-id"
+        src = cowork._build_pending_source_ref(_FakeSession(), "EVT-TRACE", "text")
+        self.assertEqual(src["kind"], "trace_event")
+        self.assertEqual(src["event_id"], "EVT-TRACE")
+        self.assertIsNone(src["session_id"])
+
+    def test_build_pending_source_ref_falls_to_session_id(self):
+        class _FakeSession:
+            session_id = "sess-123"
+        src = cowork._build_pending_source_ref(_FakeSession(), None, "text")
+        self.assertEqual(src["kind"], "provider_session")
+        self.assertEqual(src["session_id"], "sess-123")
+        self.assertIsNone(src["event_id"])
+
+    def test_build_pending_source_ref_falls_to_fingerprint(self):
+        class _FakeSession:
+            session_id = None
+        text = "the pending text"
+        src = cowork._build_pending_source_ref(_FakeSession(), None, text)
+        self.assertEqual(src["kind"], "delivery_fingerprint")
+        expected_sha = hashlib.sha256(text.encode()).hexdigest()
+        self.assertEqual(src["prompt_sha256"], expected_sha)
+
+    def test_build_pending_source_ref_no_session_attr(self):
+        class _Plain:
+            pass
+        src = cowork._build_pending_source_ref(_Plain(), None, "txt")
+        self.assertEqual(src["kind"], "delivery_fingerprint")
+
+    # ------------------------------------------------------------------ #
+    # NC-3: mismatch / fabrication detection                              #
+    # ------------------------------------------------------------------ #
+
+    def test_delivery_fingerprint_mismatch_raises_before_replay(self):
+        bad_sha = "a" * 64
+        entry = {
+            "pending_turn": "actual text",
+            "pending_source": {
+                "kind": "delivery_fingerprint",
+                "event_id": None,
+                "event_name": None,
+                "session_id": None,
+                "prompt_sha256": bad_sha,
+                "created": 1700000000.0,
+            },
+        }
+        with self.assertRaises(ValueError) as ctx:
+            cowork._normalize_pending_source_for_replay(entry)
+        self.assertIn("mismatch", str(ctx.exception))
+
+    def test_source_ref_with_attempt_id_rejected_by_validate(self):
+        sr = _make_source_ref(event_id="EVT-001")
+        sr["attempt_id"] = "fabricated"
+        link = _make_attempt_link(source_ref=sr)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    def test_source_newer_than_link_rejected_by_validate(self):
+        sr = _make_source_ref(event_id="EVT-001", created=9999999999.0)
+        link = _make_attempt_link(source_ref=sr, created=1700000001.0)
+        with self.assertRaises(ValueError):
+            dispatch.validate_attempt_link(link)
+
+    # ------------------------------------------------------------------ #
+    # NC-4: duplicate replay appends one accepted link only               #
+    # ------------------------------------------------------------------ #
+
+    def test_duplicate_pending_replay_appends_exactly_one_link(self):
+        spath, session_uuid = self._session_path("PENDING-DEDUP")
+        state = state_store.load(spath)
+        source_ref = {
+            "kind": "delivery_fingerprint",
+            "event_id": None,
+            "event_name": None,
+            "session_id": None,
+            "prompt_sha256": hashlib.sha256(b"dup text").hexdigest(),
+            "created": 1700000000.0,
+        }
+        entry = {"pending_turn": "dup text", "pending_source": source_ref}
+        link1 = cowork._mint_pending_replay_link(
+            "scout", "scouting", entry, session_uuid)
+        link2 = cowork._mint_pending_replay_link(
+            "scout", "scouting", entry, session_uuid)
+        links_path = state_store.dispatch_links_path_for(session_uuid)
+        import json as _json
+        with open(links_path) as fh:
+            records = [_json.loads(l) for l in fh if l.strip()]
+        self.assertEqual(len(records), 1,
+                         "exactly one link must be appended despite two calls")
+        self.assertEqual(records[0]["kind"], "pending_replay")
+        self.assertEqual(link1["idempotency_key"], link2["idempotency_key"])
+
+    # ------------------------------------------------------------------ #
+    # NC-6: legacy text-only session replays with kind='legacy'           #
+    # ------------------------------------------------------------------ #
+
+    def test_legacy_entry_without_pending_source_normalizes_to_legacy_kind(self):
+        entry = {"pending_turn": "old turn text"}
+        source_ref, text = cowork._normalize_pending_source_for_replay(entry)
+        self.assertEqual(source_ref["kind"], "legacy")
+        self.assertEqual(text, "old turn text")
+        self.assertIsNone(source_ref["event_id"])
+        self.assertIsNone(source_ref["session_id"])
+        expected_sha = hashlib.sha256(b"old turn text").hexdigest()
+        self.assertEqual(source_ref["prompt_sha256"], expected_sha)
+
+    def test_legacy_entry_produces_valid_replay_link(self):
+        entry = {"pending_turn": "legacy text"}
+        link = cowork._mint_pending_replay_link("planner", "planning", entry)
+        validated = dispatch.validate_attempt_link(link)
+        self.assertEqual(validated["kind"], "pending_replay")
+        self.assertEqual(validated["source_ref"]["kind"], "legacy")
+
+    def test_legacy_entry_does_not_invent_event_id_or_session_id(self):
+        entry = {"pending_turn": "some text"}
+        source_ref, _ = cowork._normalize_pending_source_for_replay(entry)
+        self.assertIsNone(source_ref.get("event_id"))
+        self.assertIsNone(source_ref.get("session_id"))
+
+    # ------------------------------------------------------------------ #
+    # NC-5: text and source survive switch; cleared together on consume   #
+    # ------------------------------------------------------------------ #
+
+    def test_pending_source_carried_through_controller_switch(self):
+        spath, _ = self._session_path("PENDING-CARRY")
+        state = state_store.load(spath)
+        team = ["scout", "planner"]
+        state = state_store.save_config(
+            spath, team, {"scout": {}, "planner": {}}, prior=state)
+        state = state_store.save_role_session(
+            spath, "planner", "claude", "old-sess", prior=state)
+        source_ref = {
+            "kind": "provider_session",
+            "event_id": None,
+            "event_name": None,
+            "session_id": "old-sess",
+            "prompt_sha256": None,
+            "created": 1700000000.0,
+        }
+        state = state_store.save_pending_turn(
+            spath, "planner", "carried text", prior=state, source=source_ref)
+        entry_before = state_store.read_pending_switch(state, "planner")
+        self.assertEqual(entry_before.get("pending_turn"), "carried text")
+        self.assertIn("pending_source", entry_before)
+        state_store.switch_role_controller(
+            spath, "planner", "codex", prior=state,
+            reason="controller_failure", source="gate")
+        reloaded = state_store.load(spath)
+        entry_after = state_store.read_pending_switch(reloaded, "planner")
+        self.assertIsNotNone(entry_after)
+        self.assertEqual(entry_after.get("pending_turn"), "carried text")
+        self.assertIn("pending_source", entry_after,
+                      "pending_source must survive the controller switch")
+
+    def test_pending_source_removed_on_clear(self):
+        spath, _ = self._session_path("PENDING-CLEAR")
+        state = state_store.load(spath)
+        source_ref = {
+            "kind": "delivery_fingerprint",
+            "event_id": None,
+            "event_name": None,
+            "session_id": None,
+            "prompt_sha256": hashlib.sha256(b"to clear").hexdigest(),
+            "created": 1700000000.0,
+        }
+        state = state_store.save_pending_turn(
+            spath, "planner", "to clear", prior=state, source=source_ref)
+        self.assertIn("pending_source",
+                      state_store.read_pending_switch(state, "planner"))
+        state = state_store.clear_pending_switch(spath, "planner", prior=state)
+        self.assertIsNone(state_store.read_pending_switch(state, "planner"))
+
+
+class GateRepairLinkageTest(unittest.TestCase):
+    """Negative-control coverage for gate-repair AttemptLink minting.
+
+    Tests cover: distinct delivery identities, repaired-source linkage,
+    repeated-delivery idempotency, unchanged prompt bytes, and unchanged
+    repair cap / stuck behavior.
+    """
+
+    def _tmpdir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    # ------------------------------------------------------------------ #
+    # NC-7: two distinct deliveries → two distinct identities and keys    #
+    # ------------------------------------------------------------------ #
+
+    def test_two_repair_deliveries_have_distinct_attempt_ids(self):
+        delivery1 = cowork._repair_delivery("intel")
+        delivery2 = cowork._repair_delivery("intel")
+        self.assertNotEqual(
+            delivery1.attempt_link["attempt_id"],
+            delivery2.attempt_link["attempt_id"])
+
+    def test_two_repair_deliveries_with_distinct_ordinals_have_distinct_keys(self):
+        sr = {
+            "kind": "trace_event",
+            "event_id": "EVT-REP",
+            "event_name": "role.send.start",
+            "session_id": None,
+            "prompt_sha256": None,
+            "created": 1700000000.0,
+        }
+        link1 = cowork._build_gate_repair_attempt_link("builder", "building", sr, "text", 1)
+        link2 = cowork._build_gate_repair_attempt_link("builder", "building", sr, "text", 2)
+        self.assertNotEqual(link1["idempotency_key"], link2["idempotency_key"])
+
+    def test_two_deliveries_linked_to_same_source_still_differ(self):
+        sr = {
+            "kind": "delivery_fingerprint",
+            "event_id": None,
+            "event_name": None,
+            "session_id": None,
+            "prompt_sha256": "c" * 64,
+            "created": 1700000000.0,
+        }
+        link1 = cowork._build_gate_repair_attempt_link("builder", "building", sr, "text", 1)
+        link2 = cowork._build_gate_repair_attempt_link("builder", "building", sr, "text", 2)
+        self.assertNotEqual(link1["attempt_id"], link2["attempt_id"])
+        self.assertNotEqual(link1["idempotency_key"], link2["idempotency_key"])
+
+    # ------------------------------------------------------------------ #
+    # NC-7: re-emitting the same delivery is idempotent                   #
+    # ------------------------------------------------------------------ #
+
+    def test_same_repair_link_appended_twice_writes_one_record(self):
+        import json as _json
+        root = self._tmpdir()
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+        self.addCleanup(
+            lambda: os.environ.update({"COWORK_SESSIONS_ROOT": prior})
+            if prior else os.environ.pop("COWORK_SESSIONS_ROOT", None))
+        session_uuid = "REPAIR-DEDUP"
+        links_path = state_store.dispatch_links_path_for(session_uuid)
+        os.makedirs(os.path.dirname(links_path), exist_ok=True)
+        sr = {
+            "kind": "trace_event",
+            "event_id": "EVT-REPAIR-1",
+            "event_name": "role.send.start",
+            "session_id": None,
+            "prompt_sha256": None,
+            "created": 1700000000.0,
+        }
+        link = cowork._build_gate_repair_attempt_link("builder", "building", sr, "prompt", 1)
+        guard_broker.append_once(links_path, link, key="idempotency_key")
+        guard_broker.append_once(links_path, link, key="idempotency_key")
+        with open(links_path) as fh:
+            records = [_json.loads(l) for l in fh if l.strip()]
+        self.assertEqual(len(records), 1)
+
+    # ------------------------------------------------------------------ #
+    # NC-8: repair prompt bytes unchanged, repair cap unchanged           #
+    # ------------------------------------------------------------------ #
+
+    def test_repair_delivery_prompt_text_is_unchanged(self):
+        expected_text = cowork._repair_prompt("intel")
+        delivery = cowork._repair_delivery("intel")
+        self.assertEqual(str(delivery), expected_text)
+
+    def test_repair_delivery_carries_valid_attempt_link(self):
+        delivery = cowork._repair_delivery("intel")
+        link = dispatch.validate_attempt_link(delivery.attempt_link)
+        self.assertEqual(link["kind"], "gate_repair")
+        self.assertEqual(link["record"], "AttemptLink")
+
+    def test_repair_link_delivery_ref_matches_prompt_bytes(self):
+        prompt_text = cowork._repair_prompt("intel")
+        delivery = cowork._repair_delivery("intel")
+        expected_bytes = len(prompt_text.encode("utf-8"))
+        expected_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        self.assertEqual(delivery.attempt_link["delivery_ref"]["prompt_bytes"],
+                         expected_bytes)
+        self.assertEqual(delivery.attempt_link["delivery_ref"]["prompt_sha256"],
+                         expected_sha)
+
+    def test_repair_link_source_ref_has_no_attempt_id(self):
+        delivery = cowork._repair_delivery("intel")
+        self.assertNotIn("attempt_id", delivery.attempt_link["source_ref"])
+
+
+# ---------------------------------------------------------------------------
+# Package D — reviewer, worktree, and evaluator adapters
+# ---------------------------------------------------------------------------
+
+class PackageDAdaptersTest(ControllerPolicyTestBase):
+    """Package D: run_worktree, run_reviewer_once, and _isolated_evaluator_session
+    all route through dispatch.decide() before any provider spawn.
+
+    Focused tests prove:
+      - worktree refusal returns None, emits the legacy message, and spawns nothing;
+      - reviewer refusal returns the exact controller-failure verdict;
+      - evaluator refusal happens before spawn and returns None;
+      - unrestricted evaluator path keeps repo_writable=False and declared outputs;
+      - evaluator retry/aggregation behavior (None for unknown controller) unchanged;
+      - thrown-denial backstops route through decide() and do not create a second spawn.
+    """
+
+    def _status_path(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, "worktree.status.json")
+
+    def _trace(self, name):
+        d = self._dir()
+        tpath = os.path.join(d, "trace.jsonl")
+        return tpath, trace_store.Trace(tpath, session_uuid=name, run_id="R")
+
+    def _trace_events(self, tpath):
+        if not os.path.exists(tpath):
+            return []
+        with open(tpath, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _reviewer_config(self, controller="claude"):
+        cfg = cowork.default_config(["scout", cowork.SCOUT_REVIEWER])
+        cfg[cowork.SCOUT_REVIEWER]["controller"] = controller
+        return cfg
+
+    # ------------------------------------------------------------------ #
+    # run_worktree                                                         #
+    # ------------------------------------------------------------------ #
+
+    def test_worktree_refusal_returns_none_and_emits_message(self):
+        # A policy-blocked controller triggers a refuse DispatchDecision
+        # before any banner or spawn; returns None exactly like the legacy path.
+        spawn_calls = []
+
+        def factory(controller):
+            spawn_calls.append(controller)
+
+            class _S:
+                def send(self, t):
+                    pass
+                def close(self):
+                    pass
+            return _S()
+
+        tpath, trace = self._trace("WT-REFUSE")
+        out = io.StringIO()
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement"}
+        with policy.restricted(("opencode",)):
+            result = cowork.run_worktree(
+                cfg, self._status_path(), "/base", "feat", True,
+                io_out=out, session_factory=factory, trace=trace)
+
+        self.assertIsNone(result)
+        self.assertEqual(spawn_calls, [], "no spawn must happen after refusal")
+        self.assertIn("does not allow", out.getvalue())
+        events = self._trace_events(tpath)
+        decisions = [e for e in events
+                     if e["event"] == "dispatch.decision"
+                     and e.get("site") == "run_worktree"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+        end_events = [e for e in events
+                      if e["event"] == "worktree.run.end"]
+        self.assertEqual(len(end_events), 1)
+        self.assertEqual(end_events[0]["result"], "policy_blocked")
+
+    def test_worktree_refusal_no_banner_before_message(self):
+        # The refusal must happen BEFORE the banner and status-path clear —
+        # the status file must NOT be removed on a refused run.
+        status = self._status_path()
+        with open(status, "w") as fh:
+            json.dump({"status": "ready"}, fh)
+        out = io.StringIO()
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement"}
+        with policy.restricted(("opencode",)):
+            result = cowork.run_worktree(
+                cfg, status, "/base", "feat", True, io_out=out)
+        self.assertIsNone(result)
+        self.assertTrue(os.path.exists(status),
+                        "status file must NOT be cleared on a pre-spawn refusal")
+        self.assertNotIn("creating a git worktree", out.getvalue())
+
+    def test_worktree_backstop_returns_none_single_decision(self):
+        # A bridge-level DispatchBlocked thrown during opencode session
+        # construction is caught by the narrowed backstop, routed through
+        # decide() as a bridge_backstop refusal, and returns None.
+        # The pre-dispatch seam produced one allow; the backstop produces one
+        # more refuse → two decisions total, no second spawn.
+        spawn_calls = []
+        tpath, trace = self._trace("WT-BACKSTOP")
+
+        def raising_factory(controller):
+            spawn_calls.append(controller)
+            raise policy.DispatchBlocked(
+                "opencode", role=cowork.WORKTREE_ROLE, kind="dispatch")
+
+        out = io.StringIO()
+        cfg = {"controller": "opencode", "yolo": True, "mode": "implement"}
+        result = cowork.run_worktree(
+            cfg, self._status_path(), "/base", "feat", True,
+            io_out=out, session_factory=raising_factory, trace=trace)
+
+        self.assertIsNone(result)
+        self.assertEqual(len(spawn_calls), 1,
+                         "factory called exactly once — backstop does not retry")
+        events = self._trace_events(tpath)
+        decisions = [e for e in events
+                     if e["event"] == "dispatch.decision"
+                     and e.get("site") == "run_worktree"]
+        self.assertEqual(len(decisions), 2,
+                         "allow (pre-spawn) + refuse (backstop)")
+        self.assertEqual(decisions[0]["outcome"], "allow")
+        self.assertEqual(decisions[1]["outcome"], "refuse")
+
+    # ------------------------------------------------------------------ #
+    # run_reviewer_once                                                    #
+    # ------------------------------------------------------------------ #
+
+    def test_reviewer_refusal_returns_controller_failure_verdict(self):
+        # Policy-blocked reviewer returns the exact controller-failure dict
+        # that routes the caller to the reviewer-failure gate.
+        intel = os.path.join(self._dir(), "intel.json")
+        review = os.path.join(self._dir(), "review.json")
+        spawn_calls = []
+
+        def factory(controller, io_out):
+            spawn_calls.append(controller)
+
+            class _S:
+                def send(self, t):
+                    pass
+                def close(self):
+                    pass
+            return _S()
+
+        tpath, trace = self._trace("REV-REFUSE")
+        cfg = self._reviewer_config("claude")
+        with policy.restricted(("opencode",)):
+            verdict = cowork.run_reviewer_once(
+                cfg, "goal", ["scout", cowork.SCOUT_REVIEWER],
+                intel, review, session_factory=factory, trace=trace)
+
+        self.assertEqual(spawn_calls, [], "no spawn on reviewer refusal")
+        self.assertIsNotNone(verdict)
+        self.assertTrue(verdict.get("malformed"))
+        self.assertTrue(verdict.get("controller_failure"))
+        self.assertIn("policy_blocked",
+                      verdict.get("controller_failure_result", {}).get("result", ""))
+        events = self._trace_events(tpath)
+        decisions = [e for e in events
+                     if e["event"] == "dispatch.decision"
+                     and e.get("site") == "run_reviewer_once"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["outcome"], "refuse")
+        end_events = [e for e in events if e["event"] == "review.run.end"]
+        self.assertEqual(len(end_events), 1)
+        self.assertEqual(end_events[0]["result"], "policy_blocked")
+
+    def test_reviewer_backstop_returns_controller_failure_verdict(self):
+        # Bridge backstop for an opencode reviewer that raises DispatchBlocked
+        # during construction — routed through decide() and returns the verdict.
+        intel = os.path.join(self._dir(), "intel.json")
+        review = os.path.join(self._dir(), "review.json")
+        spawn_calls = []
+        tpath, trace = self._trace("REV-BACKSTOP")
+
+        def raising_factory(controller, io_out):
+            spawn_calls.append(controller)
+            raise policy.DispatchBlocked(
+                "opencode", role=cowork.SCOUT_REVIEWER, kind="dispatch")
+
+        cfg = self._reviewer_config("opencode")
+        verdict = cowork.run_reviewer_once(
+            cfg, "goal", ["scout", cowork.SCOUT_REVIEWER],
+            intel, review, session_factory=raising_factory, trace=trace)
+
+        self.assertEqual(len(spawn_calls), 1,
+                         "factory called exactly once — backstop does not retry")
+        self.assertIsNotNone(verdict)
+        self.assertTrue(verdict.get("malformed"))
+        self.assertTrue(verdict.get("controller_failure"))
+        events = self._trace_events(tpath)
+        decisions = [e for e in events
+                     if e["event"] == "dispatch.decision"
+                     and e.get("site") == "run_reviewer_once"]
+        self.assertEqual(len(decisions), 2,
+                         "allow (pre-spawn) + refuse (backstop)")
+        self.assertEqual(decisions[0]["outcome"], "allow")
+        self.assertEqual(decisions[1]["outcome"], "refuse")
+
+    # ------------------------------------------------------------------ #
+    # _isolated_evaluator_session                                          #
+    # ------------------------------------------------------------------ #
+
+    def test_evaluator_unrestricted_builds_fresh_readonly_session(self):
+        # Unrestricted policy: the allowed path constructs a session with
+        # repo_writable=False and the declared scratch output — unchanged.
+        d = self._dir()
+        captured, stub_cls = self._stub_claude_session()
+        scratch = os.path.join(d, "eval-scratch.json")
+        entry = {"scratch_path": scratch}
+        identity = {"tool": "claude", "model": "sonnet-4", "effort": "medium"}
+
+        session = cowork._isolated_evaluator_session(
+            entry, identity, io_out=io.StringIO())
+
+        self.assertIsInstance(session, stub_cls)
+        self.assertFalse(captured["kwargs"].get("repo_writable"),
+                         "repo_writable must be False")
+        self.assertIn(scratch, captured["kwargs"].get("declared_outputs", ()),
+                      "scratch_path must be a declared output")
+        self.assertEqual(captured["kwargs"].get("model"), "sonnet-4")
+        self.assertEqual(captured["kwargs"].get("effort"), "medium")
+        self.assertIs(captured["kwargs"].get("internal"), True)
+
+    def test_evaluator_unknown_controller_returns_none_unchanged(self):
+        # A truthy but unrecognized controller that passes policy still hits
+        # the final `return None` in _isolated_evaluator_session — the allowed
+        # path falls through exactly as before when no branch matches.
+        entry = {"scratch_path": os.path.join(self._dir(), "e.json")}
+        identity = {"tool": "opencode", "model": None, "effort": None}
+        session = cowork._isolated_evaluator_session(
+            entry, identity, io_out=io.StringIO())
+        self.assertIsNone(session)
+
+    def test_evaluator_empty_controller_returns_none_without_exception(self):
+        # When identity has no tool key the dispatch seam is skipped and the
+        # function returns None gracefully (matches caller guard in
+        # _run_one_queued_eval). No ValueError from contract validation.
+        entry = {"scratch_path": os.path.join(self._dir(), "e.json")}
+        self.assertIsNone(
+            cowork._isolated_evaluator_session(
+                entry, {}, io_out=io.StringIO()))
+
+    def test_evaluator_bridge_guard_raises_dispatch_blocked_when_restricted(self):
+        # Characterization contract (gap 4): when the active policy disallows
+        # a claude or codex evaluator, _isolated_evaluator_session must reach
+        # the bridge-layer guard (ClaudeSession/CodexSession __init__) and let
+        # it raise DispatchBlocked(kind="dispatch", role="evaluator").
+        # It must NOT silently return None and must NOT emit a pre-dispatch
+        # decision at site "_isolated_evaluator_session" (pre_dispatch_guard=False).
+        scratch = os.path.join(self._dir(), "eval.scratch.json")
+        entry = {"scratch_path": scratch}
+        for controller in ("claude", "codex"):
+            with self.subTest(controller=controller):
+                with policy.restricted(("opencode",)):
+                    with self.assertRaises(policy.DispatchBlocked) as ctx:
+                        cowork._isolated_evaluator_session(
+                            entry, {"tool": controller}, io_out=io.StringIO())
+                self.assertEqual(ctx.exception.kind, "dispatch")
+                self.assertEqual(ctx.exception.role, "evaluator")
+
+    def test_evaluator_retry_aggregation_unchanged(self):
+        # After adding the dispatch seam, callers that use session_factory
+        # to inject a session still receive the same None-means-malformed
+        # outcome from _score_queued_entry. The retry/aggregation paths
+        # are not affected by Package D changes.
+        d = self._dir()
+        review_path = os.path.join(d, "review.json")
+        with open(review_path, "w") as fh:
+            json.dump({"verdict": "approve", "findings": []}, fh)
+        factory_calls = []
+
+        def capture_factory(entry_arg, identity_arg, config=None,
+                            trace=None, io_out=None):
+            factory_calls.append(identity_arg)
+            return None
+
+        drain_entry = {
+            "entry_id": "E1",
+            "evaluator_seat": "builder",
+            "evaluatee": cowork.BUILD_REVIEWER,
+            "criteria": cowork.EVAL_CRITERIA.get(
+                ("builder", cowork.BUILD_REVIEWER)) or [],
+            "phase": "building",
+            "round": 1,
+            "review_path": review_path,
+            "scratch_path": os.path.join(d, "eval-scratch.json"),
+            "scores_path": os.path.join(d, "scores.jsonl"),
+            "identity_snapshot": {"tool": "claude", "model": "m",
+                                  "effort": None, "state": "ok"},
+        }
+        outcome = cowork._score_queued_entry(
+            drain_entry, None, "sess-uuid-d",
+            io_out=io.StringIO(), session_factory=capture_factory)
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["error_class"], "malformed_entry")
+        self.assertEqual(len(factory_calls), 1,
+                         "session factory called exactly once (retry not triggered)")
+
+    # ------------------------------------------------------------------ #
+    # Dispatch contract shape invariants                                   #
+    # ------------------------------------------------------------------ #
+
+    def test_worktree_decision_is_valid_dispatch_decision(self):
+        # The DispatchDecision emitted for run_worktree validates against
+        # the schema — purpose='worktree' is in the allowed set.
+        import cowork_dispatch as _dispatch
+        d = self._dir()
+        tpath = os.path.join(d, "trace.jsonl")
+        trace = trace_store.Trace(tpath, session_uuid="WT-VALID", run_id="R")
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement"}
+        with policy.restricted(("opencode",)):
+            cowork.run_worktree(
+                cfg, self._status_path(), "/base", "feat", True,
+                io_out=io.StringIO(), trace=trace)
+        events = self._trace_events(tpath)
+        contracts = [e for e in events if e["event"] == "dispatch.contract"
+                     and e.get("site") == "run_worktree"]
+        self.assertEqual(len(contracts), 1)
+        self.assertEqual(contracts[0]["role"], cowork.WORKTREE_ROLE)
+
+    def test_reviewer_decision_is_valid_dispatch_decision(self):
+        intel = os.path.join(self._dir(), "intel.json")
+        review = os.path.join(self._dir(), "review.json")
+        tpath = os.path.join(self._dir(), "trace.jsonl")
+        trace = trace_store.Trace(tpath, session_uuid="REV-VALID", run_id="R")
+        cfg = self._reviewer_config("claude")
+        with policy.restricted(("opencode",)):
+            cowork.run_reviewer_once(
+                cfg, "goal", ["scout", cowork.SCOUT_REVIEWER],
+                intel, review, trace=trace)
+        events = self._trace_events(tpath)
+        contracts = [e for e in events if e["event"] == "dispatch.contract"
+                     and e.get("site") == "run_reviewer_once"]
+        self.assertEqual(len(contracts), 1)
+        self.assertEqual(contracts[0]["role"], cowork.SCOUT_REVIEWER)
+
+    def _stub_claude_session(self):
+        captured = {}
+
+        class _StubClaudeSession(object):
+            def __init__(self, *args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+        original = cowork.bridge.ClaudeSession
+        cowork.bridge.ClaudeSession = _StubClaudeSession
+        self.addCleanup(setattr, cowork.bridge, "ClaudeSession", original)
+        return captured, _StubClaudeSession

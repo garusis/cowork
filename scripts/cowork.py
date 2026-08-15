@@ -52,6 +52,8 @@ import cowork_ingest as ingest  # noqa: E402
 import cowork_ledger as ledger  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 import cowork_eval as evaluation  # noqa: E402
+import cowork_dispatch as dispatch  # noqa: E402
+import cowork_guard_broker as guard_broker  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -1651,8 +1653,207 @@ def _worktree_seed_delivery(text):
     return _closed_static_delivery(text)
 
 
-def _repair_delivery(artifact_noun):
-    return _closed_static_delivery(_repair_prompt(artifact_noun))
+def _build_pending_source_ref(session, send_start_event_id, text):
+    """Return a pending_source/v1 dict for a failed send, using the first
+    available truthful discriminator: trace event ID > provider session ID >
+    SHA-256 delivery fingerprint.  Never invents an attempt_id."""
+    now = time.time()
+    if send_start_event_id:
+        return {
+            "kind": "trace_event",
+            "event_id": send_start_event_id,
+            "event_name": "role.send.start",
+            "session_id": None,
+            "prompt_sha256": None,
+            "created": now,
+        }
+    session_id = getattr(session, "session_id", None)
+    if session_id:
+        return {
+            "kind": "provider_session",
+            "event_id": None,
+            "event_name": None,
+            "session_id": session_id,
+            "prompt_sha256": None,
+            "created": now,
+        }
+    fingerprint = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+    return {
+        "kind": "delivery_fingerprint",
+        "event_id": None,
+        "event_name": None,
+        "session_id": None,
+        "prompt_sha256": fingerprint,
+        "created": now,
+    }
+
+
+def _normalize_pending_source_for_replay(pending_entry):
+    """Return (source_ref, text) for a pending switch entry, raising on mismatch.
+
+    Legacy entries (only pending_turn, no pending_source) receive a
+    deterministic in-memory source_ref of kind='legacy' derived from the text
+    fingerprint.  No historical attempt or event ID is invented.
+
+    For delivery_fingerprint sources, the stored prompt_sha256 must match the
+    SHA-256 of the current pending_turn text; a mismatch raises ValueError so
+    the replay fails closed rather than proceeding with mismatched state.
+    """
+    text = str(pending_entry.get("pending_turn") or "")
+    raw_source = pending_entry.get("pending_source")
+    if raw_source is None:
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        source_ref = {
+            "kind": "legacy",
+            "event_id": None,
+            "event_name": None,
+            "session_id": None,
+            "prompt_sha256": sha,
+            "created": 0.0,
+        }
+        return source_ref, text
+    if raw_source.get("kind") == "delivery_fingerprint":
+        expected_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        stored_sha = raw_source.get("prompt_sha256")
+        if stored_sha != expected_sha:
+            raise ValueError(
+                "pending_source/text mismatch: stored fingerprint %r does not "
+                "match SHA-256 of pending_turn text" % stored_sha)
+    return dict(raw_source), text
+
+
+def _mint_pending_replay_link(role, phase, pending_entry, session_uuid=None,
+                              trace=None):
+    """Mint and append one AttemptLink/v1 with kind='pending_replay'.
+
+    Called at the moment the pending turn is replayed (first send accepted).
+    Idempotent: re-observing the same entry is a no-op via the exactly-once
+    writer.  Returns the validated link dict.
+    """
+    source_ref, text = _normalize_pending_source_for_replay(pending_entry)
+    prompt_bytes = text.encode("utf-8")
+    sha = hashlib.sha256(prompt_bytes).hexdigest()
+    now = max(time.time(), source_ref.get("created") or 0.0)
+    delivery_ref = {
+        "prompt_kind": "pending_replay",
+        "prompt_sha256": sha,
+        "prompt_bytes": len(prompt_bytes),
+    }
+    key = dispatch.build_attempt_link_idempotency_key(
+        role, "pending_replay", source_ref, 0)
+    record = {
+        "schema_version": 1,
+        "record": "AttemptLink",
+        "attempt_id": str(uuid.uuid4()),
+        "role": role,
+        "phase": phase,
+        "kind": "pending_replay",
+        "source_ref": source_ref,
+        "delivery_ref": delivery_ref,
+        "idempotency_key": key,
+        "created": now,
+    }
+    link = dispatch.validate_attempt_link(record)
+    if session_uuid:
+        guard_broker.append_once(
+            state_store.dispatch_links_path_for(session_uuid),
+            link, key="idempotency_key")
+    if trace:
+        trace.event("dispatch.attempt_link", role=role,
+                    kind="pending_replay",
+                    attempt_id=link["attempt_id"],
+                    idempotency_key=link["idempotency_key"])
+    return link
+
+
+def _make_pending_replay_cb(role, pending_entry, curr_phase, session_uuid, trace,
+                            clear_fn):
+    """Return an on_first_send_accepted callback that mints a pending_replay
+    AttemptLink then clears the pending switch.  Minting failure is non-fatal
+    (logged as a trace event) so the replay is never blocked by a missing link."""
+    def _cb():
+        if pending_entry and pending_entry.get("pending_turn"):
+            try:
+                _mint_pending_replay_link(
+                    role, curr_phase, pending_entry, session_uuid, trace)
+            except Exception as exc:
+                if trace:
+                    trace.event("dispatch.attempt_link.error", role=role,
+                                kind="pending_replay", error=str(exc))
+        clear_fn(role)
+    return _cb
+
+
+def _build_gate_repair_attempt_link(role, phase, source_ref, prompt_text, ordinal):
+    """Construct and validate a gate_repair AttemptLink for one repair delivery."""
+    prompt_bytes = str(prompt_text).encode("utf-8")
+    sha = hashlib.sha256(prompt_bytes).hexdigest()
+    now = max(time.time(), source_ref.get("created", 0.0))
+    delivery_ref = {
+        "prompt_kind": "repair",
+        "prompt_sha256": sha,
+        "prompt_bytes": len(prompt_bytes),
+    }
+    key = dispatch.build_attempt_link_idempotency_key(role, "gate_repair",
+                                                      source_ref, ordinal)
+    record = {
+        "schema_version": 1,
+        "record": "AttemptLink",
+        "attempt_id": str(uuid.uuid4()),
+        "role": role,
+        "phase": phase,
+        "kind": "gate_repair",
+        "source_ref": source_ref,
+        "delivery_ref": delivery_ref,
+        "idempotency_key": key,
+        "created": now,
+    }
+    return dispatch.validate_attempt_link(record)
+
+
+def _repair_delivery(artifact_noun, attempt_link=None):
+    """Build the static repair prompt delivery and attach a gate_repair AttemptLink.
+
+    When `attempt_link` is provided (from `_role_loop` with full role/phase/source
+    context), it is attached as-is.  When omitted (standalone callers, tests),
+    a minimal link is constructed from the delivery fingerprint of the repair
+    prompt itself — giving the delivery a unique attempt_id while remaining
+    a valid AttemptLink/v1.  The repair prompt bytes are NEVER changed.
+    """
+    prompt_text = _repair_prompt(artifact_noun)
+    envelope = _closed_static_delivery(prompt_text)
+    if attempt_link is None:
+        now = time.time()
+        prompt_bytes = prompt_text.encode("utf-8")
+        sha = hashlib.sha256(prompt_bytes).hexdigest()
+        source_ref = {
+            "kind": "delivery_fingerprint",
+            "event_id": None,
+            "event_name": None,
+            "session_id": None,
+            "prompt_sha256": sha,
+            "created": now,
+        }
+        key = dispatch.build_attempt_link_idempotency_key(
+            "unknown", "gate_repair", source_ref, 0)
+        attempt_link = dispatch.validate_attempt_link({
+            "schema_version": 1,
+            "record": "AttemptLink",
+            "attempt_id": str(uuid.uuid4()),
+            "role": "unknown",
+            "phase": None,
+            "kind": "gate_repair",
+            "source_ref": source_ref,
+            "delivery_ref": {
+                "prompt_kind": "repair",
+                "prompt_sha256": sha,
+                "prompt_bytes": len(prompt_bytes),
+            },
+            "idempotency_key": key,
+            "created": now,
+        })
+    envelope.attempt_link = attempt_link
+    return envelope
 
 
 def _missing_question_delivery(artifact_noun):
@@ -4975,16 +5176,21 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     controller = wt_config["controller"]
-    # Pre-launch policy gate: a disallowed worktree controller is a clean block
-    # BEFORE the banner and before any process, not a mid-launch exception.
-    try:
-        policy.guard(controller, role=WORKTREE_ROLE, kind="dispatch",
-                     trace=trace)
-    except policy.DispatchBlocked as exc:
+    _wc = _make_dispatch_contract(WORKTREE_ROLE, controller, "worktree",
+                                  "run_worktree")
+    _wf = _guard_to_policy_fact(controller, WORKTREE_ROLE, trace=trace)
+    _wdec = dispatch.decide(_wc, policy_result=_wf)
+    if trace:
+        trace.event("dispatch.contract", role=WORKTREE_ROLE,
+                    site="run_worktree", contract_id=_wc["contract_id"])
+        trace.event("dispatch.decision", role=WORKTREE_ROLE,
+                    site="run_worktree", outcome=_wdec["outcome"],
+                    decision_id=_wdec["decision_id"])
+    if _wdec["outcome"] == "refuse":
         if trace:
             trace.event("worktree.run.end", result="policy_blocked",
                         controller=controller)
-        io_out.write(str(exc) + "\n")
+        io_out.write(_wdec["refusal_message"] + "\n")
         io_out.flush()
         return None
     brief = assemble_worktree_brief(status_path, base_toplevel, name, explicit)
@@ -5027,22 +5233,35 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
                 model=wt_config.get("model"), effort=wt_config.get("effort"))
         first = brief
     elif controller == "opencode":
-        if session_factory:
-            session = session_factory("opencode")
-        else:
-            try:
+        try:
+            if session_factory:
+                session = session_factory("opencode")
+            else:
                 session = bridge.OpencodeSession(
                     WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
                     io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
                     extra_writable_dir=extra_writable_dir,
                     model=wt_config.get("model"), effort=wt_config.get("effort"))
-            except policy.DispatchBlocked as exc:
-                if trace:
-                    trace.event("worktree.run.end", result="policy_blocked",
-                                controller=controller)
-                io_out.write(str(exc) + "\n")
-                io_out.flush()
-                return None
+        except policy.DispatchBlocked as exc:
+            _bwc = _make_dispatch_contract(WORKTREE_ROLE, controller,
+                                           "worktree", "run_worktree")
+            _bwf = {"allowed": False,
+                    "refusal_code": "controller_not_allowed",
+                    "refusal_message": str(exc),
+                    "source": "bridge_backstop"}
+            _bwdec = dispatch.decide(_bwc, policy_result=_bwf)
+            if trace:
+                trace.event("dispatch.contract", role=WORKTREE_ROLE,
+                            site="run_worktree",
+                            contract_id=_bwc["contract_id"])
+                trace.event("dispatch.decision", role=WORKTREE_ROLE,
+                            site="run_worktree", outcome=_bwdec["outcome"],
+                            decision_id=_bwdec["decision_id"])
+                trace.event("worktree.run.end", result="policy_blocked",
+                            controller=controller)
+            io_out.write(_bwdec["refusal_message"] + "\n")
+            io_out.flush()
+            return None
         first = brief  # role prompt rides in the generated agent file
     else:
         if session_factory:
@@ -5448,19 +5667,25 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     caller treats as revise)."""
     prompt_path = prompt_path or SCOUT_REVIEWER_PROMPT_PATH
     cfg = config.get(reviewer_role) or DEFAULTS[reviewer_role]
-    # Pre-launch policy gate for the paired reviewer: a disallowed reviewer
-    # controller becomes a clean controller-failure verdict (which routes to the
-    # reviewer-failure gate) rather than an exception out of the bridge backstop.
-    try:
-        policy.guard(cfg["controller"], role=reviewer_role, kind="dispatch",
-                     phase=phase, trace=trace)
-    except policy.DispatchBlocked as exc:
+    _rc = _make_dispatch_contract(reviewer_role, cfg["controller"], "review",
+                                  "run_reviewer_once", phase=phase)
+    _rf = _guard_to_policy_fact(cfg["controller"], reviewer_role, phase=phase,
+                                trace=trace)
+    _rdec = dispatch.decide(_rc, policy_result=_rf)
+    if trace:
+        trace.event("dispatch.contract", role=reviewer_role,
+                    site="run_reviewer_once", contract_id=_rc["contract_id"])
+        trace.event("dispatch.decision", role=reviewer_role,
+                    site="run_reviewer_once", outcome=_rdec["outcome"],
+                    decision_id=_rdec["decision_id"])
+    if _rdec["outcome"] == "refuse":
         if trace:
             trace.event("review.run.end", role=reviewer_role,
                         result="policy_blocked", controller=cfg["controller"],
                         phase=phase)
         return _controller_failure_verdict(
-            {"ok": False, "result": "policy_blocked"}, alert=str(exc))
+            {"ok": False, "result": "policy_blocked"},
+            alert=_rdec["refusal_message"])
     quiet = _QuietSink()
     # When `surface_io_out` is set the REVIEW turn streams to the user on the
     # wholly-internal (dim) channel under the reviewer's own label; otherwise it
@@ -5581,23 +5806,39 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         # Role prompt rides in the generated agent file (system prompt, like
         # claude) — never inlined into the reviewer prompt body.
         cb = (lambda i: on_session("opencode", i)) if on_session else None
-        if session_factory:
-            session = session_factory("opencode", review_io)
-        else:
-            try:
+        try:
+            if session_factory:
+                session = session_factory("opencode", review_io)
+            else:
                 session = bridge.OpencodeSession(
                     prompt_path, cfg["mode"], cfg["yolo"], io_out=review_io,
                     speaker=reviewer_role, internal=surface,
                     resume_session_id=resume_id, on_session_id=cb, trace=trace,
                     extra_writable_dir=extra_writable_dir,
                     model=cfg.get("model"), effort=cfg.get("effort"))
-            except policy.DispatchBlocked as exc:
-                if trace:
-                    trace.event("review.run.end", role=reviewer_role,
-                                result="policy_blocked",
-                                controller=cfg["controller"], phase=phase)
-                return _controller_failure_verdict(
-                    {"ok": False, "result": "policy_blocked"}, alert=str(exc))
+        except policy.DispatchBlocked as exc:
+            _brc = _make_dispatch_contract(reviewer_role,
+                                           cfg["controller"], "review",
+                                           "run_reviewer_once", phase=phase)
+            _brf = {"allowed": False,
+                    "refusal_code": "controller_not_allowed",
+                    "refusal_message": str(exc),
+                    "source": "bridge_backstop"}
+            _brdec = dispatch.decide(_brc, policy_result=_brf)
+            if trace:
+                trace.event("dispatch.contract", role=reviewer_role,
+                            site="run_reviewer_once",
+                            contract_id=_brc["contract_id"])
+                trace.event("dispatch.decision", role=reviewer_role,
+                            site="run_reviewer_once",
+                            outcome=_brdec["outcome"],
+                            decision_id=_brdec["decision_id"])
+                trace.event("review.run.end", role=reviewer_role,
+                            result="policy_blocked",
+                            controller=cfg["controller"], phase=phase)
+            return _controller_failure_verdict(
+                {"ok": False, "result": "policy_blocked"},
+                alert=_brdec["refusal_message"])
         prompt = (brief + "\n\n" + ctx_block).strip()
     else:  # codex
         cb = (lambda i: on_session("codex", i)) if on_session else None
@@ -6692,6 +6933,9 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     # the next send is re-checked for a no-op even without a fresh reopen.
     in_repair = False
     repair_reason = None  # reopen reason carried into the repair/escalation
+    repair_ordinal = 0  # increments each time _repair_delivery is actually dispatched
+    send_start_event_id = None  # trace event ID from the most recent role.send.start
+    last_send_source_ref = None  # source_ref built for the most recent send
     review_rounds = 0
     # Consecutive reviewer turns with no usable verdict (reset by a usable
     # verdict or by user re-engagement); once `skip_review` is set at the
@@ -6797,12 +7041,17 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             status=fp_before["status"],
                             sha256=fp_before["sha256"],
                             size=fp_before["size"], exists=fp_before["exists"])
-                trace.event("role.send.start", role=role,
-                            prompt_kind=lead_kind, phase=phase,
-                            fresh=lead_meta["fresh"], resume=lead_meta["resume"],
-                            context_revision=context_revision,
-                            artifacts=lead_meta["artifacts"],
-                            **trace_store.prompt_meta(pending))
+                send_start_event_id = trace.event(
+                    "role.send.start", role=role,
+                    prompt_kind=lead_kind, phase=phase,
+                    fresh=lead_meta["fresh"], resume=lead_meta["resume"],
+                    context_revision=context_revision,
+                    artifacts=lead_meta["artifacts"],
+                    **trace_store.prompt_meta(pending))
+            else:
+                send_start_event_id = None
+            last_send_source_ref = _build_pending_source_ref(
+                session, send_start_event_id, str(pending))
             send_result = _send(
                 session, delivery, meta=lead_meta)
             if trace:
@@ -6819,9 +7068,11 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             if (not send_result.get("ok", True)
                     and fp_after["sha256"] == fp_before["sha256"]):
                 if save_pending_turn_fn and pending:
-                    save_pending_turn_fn(role, pending)
+                    save_pending_turn_fn(role, pending,
+                                        source=last_send_source_ref)
                 elif spath and pending:
-                    state_store.save_pending_turn(spath, role, pending)
+                    state_store.save_pending_turn(spath, role, pending,
+                                                  source=last_send_source_ref)
                 if trace:
                     trace.event("controller.failure", role=role, phase=phase,
                                 reason="send_failed",
@@ -6910,7 +7161,21 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             before_sha256=fp_before["sha256"],
                             after_sha256=fp_after["sha256"],
                             repair_attempted=True)
-                    pending = _repair_delivery(artifact_noun)
+                    repair_ordinal += 1
+                    _repair_link = _build_gate_repair_attempt_link(
+                        role, phase, last_send_source_ref,
+                        _repair_prompt(artifact_noun), repair_ordinal)
+                    if session_uuid:
+                        guard_broker.append_once(
+                            state_store.dispatch_links_path_for(session_uuid),
+                            _repair_link, key="idempotency_key")
+                    if trace:
+                        trace.event("dispatch.attempt_link", role=role,
+                                    kind="gate_repair", ordinal=repair_ordinal,
+                                    attempt_id=_repair_link["attempt_id"],
+                                    idempotency_key=_repair_link["idempotency_key"])
+                    pending = _repair_delivery(artifact_noun,
+                                              attempt_link=_repair_link)
                     continue
                 # Second consecutive no-op: the automatic repair failed. Show the
                 # visible stuck gate instead of looping forever.
@@ -6957,7 +7222,21 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if trace:
                         trace.event("user.action", role=role,
                                     action="stuck_retry")
-                    pending = _repair_delivery(artifact_noun)
+                    repair_ordinal += 1
+                    _repair_link = _build_gate_repair_attempt_link(
+                        role, phase, last_send_source_ref,
+                        _repair_prompt(artifact_noun), repair_ordinal)
+                    if session_uuid:
+                        guard_broker.append_once(
+                            state_store.dispatch_links_path_for(session_uuid),
+                            _repair_link, key="idempotency_key")
+                    if trace:
+                        trace.event("dispatch.attempt_link", role=role,
+                                    kind="gate_repair", ordinal=repair_ordinal,
+                                    attempt_id=_repair_link["attempt_id"],
+                                    idempotency_key=_repair_link["idempotency_key"])
+                    pending = _repair_delivery(artifact_noun,
+                                              attempt_link=_repair_link)
                     in_repair = True  # re-checked; re-shows gate if still stuck
                     continue
                 if gate_decision is _STUCK_SWITCH or isinstance(
@@ -7919,6 +8198,36 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     return review_fn
 
 
+def _make_dispatch_contract(role, controller, purpose, site,
+                            resume_session_id=None, phase=None):
+    """Build a DispatchContract/v1 record for a dispatch decision site."""
+    return {
+        "schema_version": 1,
+        "record": "DispatchContract",
+        "contract_id": str(uuid.uuid4()),
+        "role": role,
+        "phase": phase,
+        "controller": controller,
+        "kind": "dispatch",
+        "purpose": purpose,
+        "site": site,
+        "resume_session_id": resume_session_id,
+        "created": time.time(),
+    }
+
+
+def _guard_to_policy_fact(controller, role, phase=None, trace=None):
+    """Call policy.guard and return a reducer fact dict for dispatch.decide()."""
+    try:
+        policy.guard(controller, role=role, kind="dispatch", phase=phase,
+                     trace=trace)
+        return {"allowed": True, "refusal_code": None,
+                "refusal_message": None, "source": None}
+    except policy.DispatchBlocked as exc:
+        return {"allowed": False, "refusal_code": "controller_not_allowed",
+                "refusal_message": str(exc), "source": "policy_guard"}
+
+
 def run_scout(config, context, selected, io_in=None, io_out=None,
               evaluation_policy=None,
               claude_spawn=None, resume_id=None, on_session=None,
@@ -8010,6 +8319,26 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     io_out.flush()
 
     if cfg["controller"] == "claude":
+        if resume_id is None:
+            _sc = _make_dispatch_contract("scout", cfg["controller"],
+                                          "launch", "run_scout")
+            _sf = _guard_to_policy_fact(cfg["controller"], "scout", trace=trace)
+            _dec = dispatch.decide(_sc, policy_result=_sf)
+            if trace:
+                trace.event("dispatch.contract", role="scout",
+                            site="run_scout",
+                            contract_id=_sc["contract_id"])
+                trace.event("dispatch.decision", role="scout",
+                            site="run_scout", outcome=_dec["outcome"],
+                            decision_id=_dec["decision_id"])
+            if _dec["outcome"] == "refuse":
+                if trace:
+                    trace.event("role.end", role="scout",
+                                result="policy_blocked",
+                                controller=cfg["controller"])
+                io_out.write(_dec["refusal_message"] + "\n")
+                io_out.flush()
+                return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
             io_out, "starting scout",
@@ -8047,12 +8376,22 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
-            # The bridge-level backstop fired: surface the policy message
-            # instead of the generic "failed to start" text.
+            _bsc = _make_dispatch_contract("scout", cfg["controller"],
+                                           "launch", "run_scout",
+                                           resume_session_id=resume_id)
+            _bfact = {"allowed": False, "refusal_code": "controller_not_allowed",
+                      "refusal_message": str(exc), "source": "bridge_backstop"}
+            _bdec = dispatch.decide(_bsc, policy_result=_bfact)
             if trace:
+                trace.event("dispatch.contract", role="scout",
+                            site="run_scout",
+                            contract_id=_bsc["contract_id"])
+                trace.event("dispatch.decision", role="scout",
+                            site="run_scout", outcome=_bdec["outcome"],
+                            decision_id=_bdec["decision_id"])
                 trace.event("role.end", role="scout", result="policy_blocked",
                             controller=cfg["controller"])
-            io_out.write(str(exc) + "\n")
+            io_out.write(_bdec["refusal_message"] + "\n")
             io_out.flush()
             return 1
         except Exception as exc:  # noqa: BLE001
@@ -8279,6 +8618,28 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         clear_pending_turn_fn=clear_pending_turn_fn)
 
     if cfg["controller"] == "claude":
+        if resume_id is None:
+            _pc = _make_dispatch_contract("planner", cfg["controller"],
+                                          "launch", "run_planner")
+            _pf = _guard_to_policy_fact(cfg["controller"], "planner",
+                                        trace=trace)
+            _pdec = dispatch.decide(_pc, policy_result=_pf)
+            if trace:
+                trace.event("dispatch.contract", role="planner",
+                            site="run_planner",
+                            contract_id=_pc["contract_id"])
+                trace.event("dispatch.decision", role="planner",
+                            site="run_planner", outcome=_pdec["outcome"],
+                            decision_id=_pdec["decision_id"])
+            if _pdec["outcome"] == "refuse":
+                if trace:
+                    trace.event("role.end", role="planner",
+                                result="policy_blocked",
+                                controller=cfg["controller"])
+                io_out.write(_pdec["refusal_message"] + "\n")
+                io_out.flush()
+                report("ended", None)
+                return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
             io_out, "starting planner",
@@ -8318,12 +8679,22 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
-            # The bridge-level backstop fired: surface the policy message
-            # instead of the generic "failed to start" text.
+            _bpc = _make_dispatch_contract("planner", cfg["controller"],
+                                           "launch", "run_planner",
+                                           resume_session_id=resume_id)
+            _bpf = {"allowed": False, "refusal_code": "controller_not_allowed",
+                    "refusal_message": str(exc), "source": "bridge_backstop"}
+            _bpdec = dispatch.decide(_bpc, policy_result=_bpf)
             if trace:
+                trace.event("dispatch.contract", role="planner",
+                            site="run_planner",
+                            contract_id=_bpc["contract_id"])
+                trace.event("dispatch.decision", role="planner",
+                            site="run_planner", outcome=_bpdec["outcome"],
+                            decision_id=_bpdec["decision_id"])
                 trace.event("role.end", role="planner", result="policy_blocked",
                             controller=cfg["controller"])
-            io_out.write(str(exc) + "\n")
+            io_out.write(_bpdec["refusal_message"] + "\n")
             io_out.flush()
             report("ended", None)
             return 1
@@ -8568,6 +8939,28 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         build_summary_path=build_summary_path)
 
     if cfg["controller"] == "claude":
+        if resume_id is None:
+            _bc = _make_dispatch_contract("builder", cfg["controller"],
+                                          "launch", "run_builder")
+            _bf = _guard_to_policy_fact(cfg["controller"], "builder",
+                                        trace=trace)
+            _bdec2 = dispatch.decide(_bc, policy_result=_bf)
+            if trace:
+                trace.event("dispatch.contract", role="builder",
+                            site="run_builder",
+                            contract_id=_bc["contract_id"])
+                trace.event("dispatch.decision", role="builder",
+                            site="run_builder", outcome=_bdec2["outcome"],
+                            decision_id=_bdec2["decision_id"])
+            if _bdec2["outcome"] == "refuse":
+                if trace:
+                    trace.event("role.end", role="builder",
+                                result="policy_blocked",
+                                controller=cfg["controller"])
+                io_out.write(_bdec2["refusal_message"] + "\n")
+                io_out.flush()
+                report("ended", None)
+                return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
             io_out, "starting builder",
@@ -8605,12 +8998,22 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
-            # The bridge-level backstop fired: surface the policy message
-            # instead of the generic "failed to start" text.
+            _bbsc = _make_dispatch_contract("builder", cfg["controller"],
+                                            "launch", "run_builder",
+                                            resume_session_id=resume_id)
+            _bbf = {"allowed": False, "refusal_code": "controller_not_allowed",
+                    "refusal_message": str(exc), "source": "bridge_backstop"}
+            _bbdec = dispatch.decide(_bbsc, policy_result=_bbf)
             if trace:
+                trace.event("dispatch.contract", role="builder",
+                            site="run_builder",
+                            contract_id=_bbsc["contract_id"])
+                trace.event("dispatch.decision", role="builder",
+                            site="run_builder", outcome=_bbdec["outcome"],
+                            decision_id=_bbdec["decision_id"])
                 trace.event("role.end", role="builder", result="policy_blocked",
                             controller=cfg["controller"])
-            io_out.write(str(exc) + "\n")
+            io_out.write(_bbdec["refusal_message"] + "\n")
             io_out.flush()
             report("ended", None)
             return 1
@@ -9632,13 +10035,22 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         controller = config[role].get("controller")
         # Policy first: a reviewer on a disallowed controller is blocked before
         # its executable is even looked for, and never spawned.
-        try:
-            policy.guard(controller, role=role, kind="dispatch", phase=phase,
-                         trace=trace)
-        except policy.DispatchBlocked as exc:
+        _rcc = _make_dispatch_contract(role, controller, "review",
+                                       "run_flow.reviewer_controller_check",
+                                       phase=phase)
+        _rcf = _guard_to_policy_fact(controller, role, phase=phase, trace=trace)
+        _rcdec = dispatch.decide(_rcc, policy_result=_rcf)
+        trace.event("dispatch.contract", role=role,
+                    site="run_flow.reviewer_controller_check",
+                    contract_id=_rcc["contract_id"])
+        trace.event("dispatch.decision", role=role,
+                    site="run_flow.reviewer_controller_check",
+                    outcome=_rcdec["outcome"],
+                    decision_id=_rcdec["decision_id"])
+        if _rcdec["outcome"] == "refuse":
             trace.event("review.controller_policy_blocked", role=role,
                         phase=phase, controller=controller)
-            return [str(exc)]
+            return [_rcdec["refusal_message"]]
         ok, alerts = check_controller_tool(controller)
         if ok:
             return None
@@ -9682,11 +10094,20 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # The policy decision runs FIRST — before the executable preflight and
         # before the claude probe below — so a disallowed target is never
         # preflighted, never probed, and never spawned.
-        try:
-            policy.guard(target, role=role, kind="dispatch", phase=phase,
-                         trace=trace)
-        except policy.DispatchBlocked as exc:
-            io_out.write(str(exc) + "\n")
+        _swc = _make_dispatch_contract(role, target, "switch",
+                                       "run_flow.switch_controller",
+                                       phase=phase)
+        _swf = _guard_to_policy_fact(target, role, phase=phase, trace=trace)
+        _swdec = dispatch.decide(_swc, policy_result=_swf)
+        trace.event("dispatch.contract", role=role,
+                    site="run_flow.switch_controller",
+                    contract_id=_swc["contract_id"])
+        trace.event("dispatch.decision", role=role,
+                    site="run_flow.switch_controller",
+                    outcome=_swdec["outcome"],
+                    decision_id=_swdec["decision_id"])
+        if _swdec["outcome"] == "refuse":
+            io_out.write(_swdec["refusal_message"] + "\n")
             io_out.flush()
             trace.event("controller.switch.end", role=role, phase=phase,
                         result="policy_blocked", controller=target)
@@ -9760,11 +10181,18 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         interactive mode alike. The missing-executable retry/switch/end loop
         below it is unchanged."""
         controller = config[role].get("controller")
-        try:
-            policy.guard(controller, role=role, kind="dispatch", phase=phase,
-                         trace=trace)
-        except policy.DispatchBlocked as exc:
-            io_out.write(str(exc) + "\n")
+        _elc = _make_dispatch_contract(role, controller, "launch",
+                                       "run_flow_pre_launch", phase=phase)
+        _elf = _guard_to_policy_fact(controller, role, phase=phase, trace=trace)
+        _eldec = dispatch.decide(_elc, policy_result=_elf)
+        trace.event("dispatch.contract", role=role,
+                    site="run_flow_pre_launch",
+                    contract_id=_elc["contract_id"])
+        trace.event("dispatch.decision", role=role,
+                    site="run_flow_pre_launch", outcome=_eldec["outcome"],
+                    decision_id=_eldec["decision_id"])
+        if _eldec["outcome"] == "refuse":
+            io_out.write(_eldec["refusal_message"] + "\n")
             io_out.flush()
             trace.event("controller.failure", role=role, phase=phase,
                         controller=controller, reason="policy_blocked",
@@ -10367,10 +10795,11 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                      % (wt_path, wt_branch))
         io_out.flush()
 
-    def save_pending_turn_for(role, pending_text):
+    def save_pending_turn_for(role, pending_text, source=None):
         if session_enabled:
             holder["state"] = state_store.save_pending_turn(
-                spath, role, pending_text, prior=holder["state"])
+                spath, role, pending_text, prior=holder["state"],
+                source=source)
 
     def pending_switch_for(role):
         if session_enabled:
@@ -10704,7 +11133,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 reviewer_switch_note_fn=switch_note_for,
                 on_reviewer_switch_consumed=clear_pending_switch_for,
                 on_first_send_accepted=(
-                    (lambda: clear_pending_switch_for("scout"))
+                    _make_pending_replay_cb(
+                        "scout", pending_switch_for("scout"), phase,
+                        session_uuid, trace, clear_pending_switch_for)
                     if pending_switch_for("scout") else None),
                 reviewer_controller_check_fn=reviewer_controller_check,
                 headless=headless,
@@ -10787,7 +11218,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 reviewer_switch_note_fn=switch_note_for,
                 on_reviewer_switch_consumed=clear_pending_switch_for,
                 on_first_send_accepted=(
-                    (lambda: clear_pending_switch_for("planner"))
+                    _make_pending_replay_cb(
+                        "planner", pending_switch_for("planner"), phase,
+                        session_uuid, trace, clear_pending_switch_for)
                     if pending_switch_for("planner") else None),
                 reviewer_controller_check_fn=reviewer_controller_check,
                 headless=headless,
@@ -10903,7 +11336,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             reviewer_switch_note_fn=switch_note_for,
             on_reviewer_switch_consumed=clear_pending_switch_for,
             on_first_send_accepted=(
-                (lambda: clear_pending_switch_for("builder"))
+                _make_pending_replay_cb(
+                    "builder", pending_switch_for("builder"), phase,
+                    session_uuid, trace, clear_pending_switch_for)
                 if pending_switch_for("builder") else None),
             reviewer_controller_check_fn=reviewer_controller_check,
             headless=headless,
