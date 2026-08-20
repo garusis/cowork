@@ -558,3 +558,8 @@ def sanitize(decision, action=None, work_id=None, parent_work_id=None,
             "target_count": len(targets),
         }),
     }
+
+
+def rtk_command_forms():
+    """Closed tuple of every allowed rtk command form — pure derivation of readonly_bash_commands()."""
+    return tuple("rtk " + cmd for cmd in readonly_bash_commands())

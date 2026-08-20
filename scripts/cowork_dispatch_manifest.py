@@ -26,6 +26,10 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
+from cowork_action_policy import (
+    SHELL_META, REDIRECT, SAFE_GIT_FLAGS, _safe_flag, _real, _inside,
+)
 
 SCHEMA_VERSION = 1
 
@@ -361,3 +365,186 @@ def manifest_refused(manifest, preflight_checks, refusal_code, refusal_message):
         },
     }
     return result
+
+
+# ---------------------------------------------------------------------------
+# P3: Command-contract layer
+# ---------------------------------------------------------------------------
+
+_REFUSED_GIT_SUBCOMMANDS = frozenset({"push", "merge", "checkout"})
+_ALLOWED_WORKTREE_OPERATIONS = frozenset({
+    "list", "add", "remove", "lock", "unlock", "prune", "repair", "move",
+})
+
+
+@dataclass(frozen=True)
+class ContractDecision:
+    allow: bool
+    capability: str
+    reason: str
+    repair_hint: str
+
+
+def validate_rtk_present(rtk_path, stat_fn=os.stat):
+    """Verify rtk exists and is executable. Pure apart from stat_fn seam."""
+    try:
+        st = stat_fn(rtk_path)
+    except OSError:
+        return ContractDecision(
+            allow=False, capability="rtk_present",
+            reason="rtk not found at path",
+            repair_hint="install rtk and ensure it is on PATH",
+        )
+    if st.st_mode & 0o111 == 0:
+        return ContractDecision(
+            allow=False, capability="rtk_present",
+            reason="rtk is not executable",
+            repair_hint="chmod +x the rtk binary",
+        )
+    return ContractDecision(
+        allow=True, capability="rtk_present",
+        reason="rtk present and executable", repair_hint="",
+    )
+
+
+def validate_argv_form(argv):
+    """Reject shell metacharacters and redirect operators. Executes nothing."""
+    joined = " ".join(argv) if isinstance(argv, (list, tuple)) else str(argv)
+    if SHELL_META.search(joined):
+        return ContractDecision(
+            allow=False, capability="argv_form",
+            reason="shell metacharacter in argv",
+            repair_hint="remove shell metacharacters from argv",
+        )
+    if REDIRECT.search(joined):
+        return ContractDecision(
+            allow=False, capability="argv_form",
+            reason="redirect operator in argv",
+            repair_hint="remove redirect operators from argv",
+        )
+    return ContractDecision(
+        allow=True, capability="argv_form", reason="argv form is safe", repair_hint="",
+    )
+
+
+def validate_cwd(cwd, runtime_roots, stat_fn=os.stat):
+    """Fail-closed cwd validator. Pure apart from stat_fn seam."""
+    real_cwd = _real(cwd)
+    real_tmp = _real("/tmp")
+    if real_cwd == real_tmp or real_cwd.startswith(real_tmp + os.sep):
+        return ContractDecision(
+            allow=False, capability="cwd",
+            reason="cwd is under /tmp and is unconditionally refused",
+            repair_hint="use a non-tmp working directory",
+        )
+    try:
+        st = stat_fn(cwd)
+        if st.st_mode & 0o1002 == 0o1002:
+            return ContractDecision(
+                allow=False, capability="cwd",
+                reason="cwd is a world-writable sticky path",
+                repair_hint="use a non-sticky working directory",
+            )
+    except OSError:
+        return ContractDecision(
+            allow=False, capability="cwd",
+            reason="cwd is not accessible",
+            repair_hint="use an accessible working directory",
+        )
+    for root in runtime_roots:
+        real_root = _real(root)
+        if _inside(real_cwd, real_root) and real_cwd != real_root:
+            return ContractDecision(
+                allow=True, capability="cwd",
+                reason="cwd is a strict descendant of a declared runtime root",
+                repair_hint="",
+            )
+    return ContractDecision(
+        allow=False, capability="cwd",
+        reason="cwd is not a strict descendant of any declared runtime root",
+        repair_hint="use a subdirectory of a declared runtime root",
+    )
+
+
+def validate_git_operation(subcommand, flags=()):
+    """Allow only SAFE_GIT_FLAGS subcommands/flags; push/merge/checkout are unconditionally refused."""
+    if subcommand in _REFUSED_GIT_SUBCOMMANDS:
+        return ContractDecision(
+            allow=False, capability="git_operation",
+            reason="git %s is unconditionally refused" % subcommand,
+            repair_hint="use a read-only git subcommand",
+        )
+    if subcommand not in SAFE_GIT_FLAGS:
+        return ContractDecision(
+            allow=False, capability="git_operation",
+            reason="git subcommand not in safe allowlist: %s" % subcommand,
+            repair_hint="use an allowlisted git subcommand",
+        )
+    allowed = SAFE_GIT_FLAGS[subcommand]
+    for flag in flags:
+        if not _safe_flag(flag, allowed):
+            return ContractDecision(
+                allow=False, capability="git_operation",
+                reason="unsafe flag for git %s: %s" % (subcommand, flag),
+                repair_hint="remove unsafe flags",
+            )
+    return ContractDecision(
+        allow=True, capability="git_operation", reason="git operation allowed", repair_hint="",
+    )
+
+
+def validate_plan_verification_command(adapter_name, artifact_writes, manifest_capability):
+    """Verify adapter membership and that artifact writes are a declared subset."""
+    adapters = manifest_capability.get("command_adapters", {})
+    if adapter_name not in adapters:
+        return ContractDecision(
+            allow=False, capability="plan_verification",
+            reason="adapter %s not declared in manifest capability" % adapter_name,
+            repair_hint="declare the adapter in the manifest capability",
+        )
+    allowed_writes = set(manifest_capability.get("artifact_writes", []))
+    excess = set(artifact_writes) - allowed_writes
+    if excess:
+        return ContractDecision(
+            allow=False, capability="plan_verification",
+            reason="artifact writes not allowed: %s" % sorted(excess),
+            repair_hint="restrict artifact writes to declared paths",
+        )
+    return ContractDecision(
+        allow=True, capability="plan_verification",
+        reason="plan verification command allowed", repair_hint="",
+    )
+
+
+def validate_worktree_operation(path, operation, manifest_binding, isdir=os.path.isdir):
+    """Pure worktree validator apart from isdir seam."""
+    if operation not in _ALLOWED_WORKTREE_OPERATIONS:
+        return ContractDecision(
+            allow=False, capability="worktree_operation",
+            reason="operation not recognized: %s" % operation,
+            repair_hint="use a recognized worktree operation",
+        )
+    if "worktree" not in manifest_binding or manifest_binding.get("worktree") is None:
+        return ContractDecision(
+            allow=False, capability="worktree_operation",
+            reason="no worktree declared in manifest binding",
+            repair_hint="declare a worktree in the manifest binding",
+        )
+    declared = manifest_binding["worktree"]
+    if not isdir(declared):
+        return ContractDecision(
+            allow=False, capability="worktree_operation",
+            reason="declared worktree is not an existing directory: %s" % declared,
+            repair_hint="ensure the worktree directory exists",
+        )
+    real_declared = _real(declared)
+    real_path = _real(path)
+    if not _inside(real_path, real_declared):
+        return ContractDecision(
+            allow=False, capability="worktree_operation",
+            reason="path outside declared worktree: %s" % path,
+            repair_hint="use a path inside or equal to the declared worktree",
+        )
+    return ContractDecision(
+        allow=True, capability="worktree_operation", reason="worktree operation allowed", repair_hint="",
+    )

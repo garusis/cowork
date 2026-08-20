@@ -33608,3 +33608,298 @@ class ManifestPreflightTest(unittest.TestCase):
             platform="darwin",
         )
         self.assertEqual(out["status"]["phase"], "proven")
+
+
+# --- P3: CommandContractTest ---
+
+from cowork_dispatch_manifest import (  # noqa: E402
+    ContractDecision,
+    validate_rtk_present,
+    validate_argv_form,
+    validate_cwd,
+    validate_git_operation,
+    validate_plan_verification_command,
+    validate_worktree_operation,
+)
+import dataclasses as _dataclasses
+
+
+class CommandContractTest(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td)
+
+    def _root(self):
+        """Return a subdirectory path under self._td (not /tmp on macOS)."""
+        return self._td
+
+    def _ok_stat(self):
+        return type("S", (), {"st_mode": 0o100755})()
+
+    def _cap(self):
+        return {
+            "command_adapters": {"test_adapter": {}},
+            "artifact_writes": ["/repo/foo.py", "/repo/bar.py"],
+        }
+
+    # -- ContractDecision shape --
+
+    def test_contract_decision_fields(self):
+        fields = {f.name for f in _dataclasses.fields(ContractDecision)}
+        self.assertEqual(fields, {"allow", "capability", "reason", "repair_hint"})
+
+    def test_contract_decision_frozen(self):
+        cd = ContractDecision(allow=True, capability="c", reason="r", repair_hint="")
+        with self.assertRaises(_dataclasses.FrozenInstanceError):
+            cd.allow = False
+
+    # -- rtk_command_forms --
+
+    def test_rtk_command_forms_length(self):
+        from cowork_action_policy import rtk_command_forms, readonly_bash_commands
+        self.assertEqual(len(rtk_command_forms()), len(readonly_bash_commands()))
+
+    def test_rtk_command_forms_prefix(self):
+        from cowork_action_policy import rtk_command_forms
+        for form in rtk_command_forms():
+            self.assertTrue(form.startswith("rtk "), msg=form)
+
+    def test_rtk_command_forms_no_duplicates(self):
+        from cowork_action_policy import rtk_command_forms
+        forms = rtk_command_forms()
+        self.assertEqual(len(forms), len(set(forms)))
+
+    def test_rtk_command_forms_mirrors_readonly(self):
+        from cowork_action_policy import rtk_command_forms, readonly_bash_commands
+        forms = rtk_command_forms()
+        raw = readonly_bash_commands()
+        for i, (form, cmd) in enumerate(zip(forms, raw)):
+            self.assertEqual(form, "rtk " + cmd, msg="index %d" % i)
+
+    # -- validate_rtk_present --
+
+    def test_validate_rtk_present_missing(self):
+        result = validate_rtk_present(
+            "/nonexistent/rtk",
+            stat_fn=lambda p: (_ for _ in ()).throw(OSError("no such file")),
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("not found", result.reason)
+
+    def test_validate_rtk_present_not_executable(self):
+        result = validate_rtk_present(
+            "/usr/local/bin/rtk",
+            stat_fn=lambda p: type("S", (), {"st_mode": 0o100644})(),
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("executable", result.reason)
+
+    def test_validate_rtk_present_ok(self):
+        result = validate_rtk_present(
+            "/usr/local/bin/rtk",
+            stat_fn=lambda p: type("S", (), {"st_mode": 0o100755})(),
+        )
+        self.assertTrue(result.allow)
+
+    # -- validate_argv_form --
+
+    def test_validate_argv_form_semicolon_denied(self):
+        result = validate_argv_form(["git", "status;", "rm", "-rf", "/"])
+        self.assertFalse(result.allow)
+        self.assertIn("metacharacter", result.reason)
+
+    def test_validate_argv_form_other_meta_denied(self):
+        for char in ("$VAR", "`cmd`", "a|b", "a&b"):
+            with self.subTest(char=char):
+                result = validate_argv_form(["rtk", char])
+                self.assertFalse(result.allow)
+                self.assertIn("metacharacter", result.reason)
+
+    def test_validate_argv_form_redirect_denied(self):
+        for op, target in ((">>", "out.log"), (">", "out.log"), ("2>", "err.log")):
+            with self.subTest(op=op):
+                result = validate_argv_form(["rtk", "git", "log", op, target])
+                self.assertFalse(result.allow)
+                self.assertIn("redirect", result.reason)
+
+    def test_validate_argv_form_ok(self):
+        result = validate_argv_form(["rtk", "git", "status", "-s", "--branch"])
+        self.assertTrue(result.allow)
+
+    # -- validate_cwd --
+
+    def test_validate_cwd_rejects_tmp(self):
+        result = validate_cwd("/tmp", ["/tmp"])
+        self.assertFalse(result.allow)
+        self.assertIn("tmp", result.reason)
+
+    def test_validate_cwd_rejects_sticky(self):
+        subdir = os.path.join(self._td, "work")
+        result = validate_cwd(
+            subdir, ["/some/unrelated/root"],
+            stat_fn=lambda p: type("S", (), {"st_mode": 0o41777})(),
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("sticky", result.reason)
+
+    def test_validate_cwd_rejects_cwd_equal_to_root(self):
+        root = self._td
+        result = validate_cwd(
+            root, [root],
+            stat_fn=lambda p: type("S", (), {"st_mode": 0o40755})(),
+        )
+        self.assertFalse(result.allow)
+
+    def test_validate_cwd_allows_subdir(self):
+        root = self._td
+        subdir = os.path.join(root, "work")
+        result = validate_cwd(
+            subdir, [root],
+            stat_fn=lambda p: type("S", (), {"st_mode": 0o40755})(),
+        )
+        self.assertTrue(result.allow)
+
+    def test_validate_cwd_rejects_outside_roots(self):
+        subdir = os.path.join(self._td, "work")
+        other_root = os.path.join(self._td, "other")
+        result = validate_cwd(
+            subdir, [other_root],
+            stat_fn=lambda p: type("S", (), {"st_mode": 0o40755})(),
+        )
+        self.assertFalse(result.allow)
+
+    def test_validate_cwd_rejects_inaccessible(self):
+        result = validate_cwd(
+            "/nonexistent/path", ["/nonexistent"],
+            stat_fn=lambda p: (_ for _ in ()).throw(OSError("no access")),
+        )
+        self.assertFalse(result.allow)
+
+    # -- validate_git_operation --
+
+    def test_validate_git_operation_push_refused(self):
+        result = validate_git_operation("push")
+        self.assertFalse(result.allow)
+        self.assertIn("unconditionally refused", result.reason)
+
+    def test_validate_git_operation_merge_refused(self):
+        result = validate_git_operation("merge")
+        self.assertFalse(result.allow)
+        self.assertIn("unconditionally refused", result.reason)
+
+    def test_validate_git_operation_checkout_refused(self):
+        result = validate_git_operation("checkout")
+        self.assertFalse(result.allow)
+        self.assertIn("unconditionally refused", result.reason)
+
+    def test_validate_git_operation_unknown_subcommand(self):
+        result = validate_git_operation("fetch")
+        self.assertFalse(result.allow)
+        self.assertNotIn("unconditionally refused", result.reason)
+
+    def test_validate_git_operation_unsafe_flag(self):
+        result = validate_git_operation("status", ["--format"])
+        self.assertFalse(result.allow)
+        self.assertIn("--format", result.reason)
+
+    def test_validate_git_operation_ok(self):
+        result = validate_git_operation("status", ["-s", "--branch"])
+        self.assertTrue(result.allow)
+
+    # -- validate_plan_verification_command --
+
+    def test_validate_plan_undeclared_adapter(self):
+        result = validate_plan_verification_command(
+            "unknown_adapter", [], self._cap()
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("not declared", result.reason)
+
+    def test_validate_plan_excess_writes(self):
+        result = validate_plan_verification_command(
+            "test_adapter",
+            ["/repo/foo.py", "/repo/secret.py"],
+            self._cap(),
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("/repo/secret.py", result.reason)
+
+    def test_validate_plan_ok(self):
+        result = validate_plan_verification_command(
+            "test_adapter", ["/repo/foo.py"], self._cap()
+        )
+        self.assertTrue(result.allow)
+
+    # -- validate_worktree_operation --
+
+    def test_validate_worktree_unknown_operation(self):
+        result = validate_worktree_operation(
+            self._td, "clone", {"worktree": self._td},
+            isdir=lambda p: True,
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("recognized", result.reason)
+
+    def test_validate_worktree_no_worktree_declared(self):
+        result = validate_worktree_operation(
+            self._td, "list", {},
+            isdir=lambda p: True,
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("no worktree declared", result.reason)
+
+    def test_validate_worktree_isdir_false(self):
+        result = validate_worktree_operation(
+            self._td, "list", {"worktree": self._td},
+            isdir=lambda p: False,
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("not an existing directory", result.reason)
+
+    def test_validate_worktree_path_outside(self):
+        other = os.path.join(self._td, "other")
+        declared = os.path.join(self._td, "declared")
+        result = validate_worktree_operation(
+            other, "list", {"worktree": declared},
+            isdir=lambda p: True,
+        )
+        self.assertFalse(result.allow)
+        self.assertIn("outside", result.reason)
+
+    def test_validate_worktree_ok(self):
+        result = validate_worktree_operation(
+            self._td, "list", {"worktree": self._td},
+            isdir=lambda p: True,
+        )
+        self.assertTrue(result.allow)
+
+    # -- no-I/O smoke --
+
+    def test_no_validator_spawns_a_process(self):
+        root = self._td
+        subdir = os.path.join(root, "work")
+        ok_stat = lambda p: type("S", (), {"st_mode": 0o100755})()
+        ok_dir_stat = lambda p: type("S", (), {"st_mode": 0o40755})()
+
+        r1 = validate_rtk_present("/usr/local/bin/rtk", stat_fn=ok_stat)
+        self.assertIsInstance(r1, ContractDecision)
+
+        r2 = validate_argv_form(["rtk", "git", "status"])
+        self.assertIsInstance(r2, ContractDecision)
+
+        r3 = validate_cwd(subdir, [root], stat_fn=ok_dir_stat)
+        self.assertIsInstance(r3, ContractDecision)
+
+        r4 = validate_git_operation("status", ["-s"])
+        self.assertIsInstance(r4, ContractDecision)
+
+        cap = {"command_adapters": {"a": {}}, "artifact_writes": []}
+        r5 = validate_plan_verification_command("a", [], cap)
+        self.assertIsInstance(r5, ContractDecision)
+
+        r6 = validate_worktree_operation(
+            root, "list", {"worktree": root},
+            isdir=lambda p: True,
+        )
+        self.assertIsInstance(r6, ContractDecision)
