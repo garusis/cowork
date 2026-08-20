@@ -10,8 +10,11 @@ Python 3.9+, stdlib only.
 """
 
 import importlib.util
+import os
 import shutil
+import socket as _socket_mod
 import sys
+import time
 
 # Interpreter floor. cowork targets 3.9 so it runs on the local interpreter
 # without forcing an upgrade.
@@ -179,3 +182,239 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------------------------------------------------------------------------
+# P2: Capability manifest preflight
+# ---------------------------------------------------------------------------
+
+def capability_check_result(capability, ok, reason="", repair_hint=""):
+    """Build a CapabilityCheckResult with exactly {capability, ok, reason, repair_hint}."""
+    return {
+        "capability": capability,
+        "ok": bool(ok),
+        "reason": reason,
+        "repair_hint": repair_hint,
+    }
+
+
+def check_runtime_roots(capability):
+    """Fail if any declared runtime root does not exist."""
+    cap = capability or {}
+    for root in (cap.get("runtime_roots") or []):
+        if not os.path.exists(root):
+            return capability_check_result(
+                "runtime_roots", False,
+                reason="runtime root does not exist: %s" % root,
+                repair_hint="create the directory or update capability.runtime_roots")
+    return capability_check_result("runtime_roots", True)
+
+
+def check_private_paths(capability):
+    """Fail if a private path is missing or world-readable."""
+    cap = capability or {}
+    for path in (cap.get("private_paths") or []):
+        if not path:
+            continue
+        if not os.path.lexists(path):
+            return capability_check_result(
+                "private_paths", False,
+                reason="private path missing: %s" % path,
+                repair_hint="initialize the private path before dispatch")
+        try:
+            if os.stat(path).st_mode & 0o004:
+                return capability_check_result(
+                    "private_paths", False,
+                    reason="private path is world-readable: %s" % path,
+                    repair_hint="restrict permissions: chmod o-r %s" % path)
+        except OSError:
+            pass
+    return capability_check_result("private_paths", True)
+
+
+def _default_guard_connect(socket_path, timeout):
+    """AF_UNIX connect attempt used by check_guard_socket by default."""
+    s = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(socket_path)
+        s.close()
+        return True, None
+    except FileNotFoundError:
+        return False, "socket not found"
+    except ConnectionRefusedError:
+        return False, "connection refused"
+    except _socket_mod.timeout:
+        return False, "connection timed out"
+    except OSError as exc:
+        return False, str(exc)
+
+
+def check_guard_socket(capability, connect_fn=None):
+    """Fail if guard_required is True and the guard socket is unreachable.
+
+    connect_fn(socket_path, timeout) -> (ok: bool, reason: str | None).
+    Defaults to an AF_UNIX connection attempt.
+    """
+    cap = capability or {}
+    if not cap.get("guard_required"):
+        return capability_check_result("guard_socket", True)
+    socket_path = cap.get("socket")
+    if not socket_path:
+        return capability_check_result(
+            "guard_socket", False,
+            reason="guard_required but capability.socket is absent",
+            repair_hint="set capability.socket to the guard socket path")
+    fn = connect_fn if connect_fn is not None else _default_guard_connect
+    ok, reason = fn(socket_path, 2.0)
+    if not ok:
+        return capability_check_result(
+            "guard_socket", False,
+            reason="guard socket unreachable: %s" % reason,
+            repair_hint="start the guard process or fix the socket path")
+    return capability_check_result("guard_socket", True)
+
+
+def check_kernel_boundary(capability, platform=None):
+    """On Linux, fail when the capability crosses any kernel boundaries."""
+    if platform is None:
+        platform = sys.platform
+    cap = capability or {}
+    crosses = ((cap.get("kernel_boundary") or {}).get("crosses") or [])
+    if str(platform).startswith("linux") and crosses:
+        return capability_check_result(
+            "kernel_boundary", False,
+            reason="kernel boundary crossed on Linux (isolation unavailable): %s" % crosses,
+            repair_hint="run on a non-Linux host or remove kernel boundary crossings")
+    return capability_check_result("kernel_boundary", True)
+
+
+def check_artifact_destinations(capability):
+    """Fail if any artifact write destination is empty or contains path traversal."""
+    cap = capability or {}
+    for dest in (cap.get("artifact_writes") or []):
+        if not dest:
+            return capability_check_result(
+                "artifact_destinations", False,
+                reason="empty artifact destination in capability.artifact_writes",
+                repair_hint="remove empty entries from capability.artifact_writes")
+        parts = dest.replace("\\", "/").split("/")
+        if ".." in parts:
+            return capability_check_result(
+                "artifact_destinations", False,
+                reason="artifact destination contains path traversal: %s" % dest,
+                repair_hint="use paths without '..' in capability.artifact_writes")
+    return capability_check_result("artifact_destinations", True)
+
+
+def check_controller_config(capability, binding):
+    """Fail when cowork_action_policy.capability_decision() denies the controller."""
+    import cowork_action_policy as _action_policy
+    cap = capability or {}
+    bind = binding or {}
+    controller = bind.get("controller") or ""
+    policy_snap = bind.get("policy_snapshot") or {}
+    delegation = policy_snap.get("delegation") or "unknown"
+    mutation_gate = policy_snap.get("mutation_gate") or "none"
+    crosses = ((cap.get("kernel_boundary") or {}).get("crosses") or [])
+    kernel_boundary = not bool(crosses)
+    action_classes = cap.get("action_classes") or []
+    mode = ("implement"
+            if any(c in action_classes for c in ("write", "exec"))
+            else "plan")
+    decision = _action_policy.capability_decision(
+        controller=controller,
+        mode=mode,
+        delegation=delegation,
+        mutation_gate=mutation_gate,
+        kernel_boundary=kernel_boundary,
+    )
+    if not decision.get("allow"):
+        return capability_check_result(
+            "controller_config", False,
+            reason=decision.get("reason") or "capability_denied",
+            repair_hint="consult the controller capability matrix")
+    return capability_check_result("controller_config", True)
+
+
+_CODEX_CONFIG_MAX_AGE = 60 * 60 * 24 * 7  # 7 days in seconds
+
+
+def _codex_config_path():
+    """Resolve the Codex config file path via CODEX_HOME or the default location."""
+    home = os.environ.get("CODEX_HOME")
+    if home:
+        base = os.path.abspath(os.path.expanduser(home))
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".codex")
+    return os.path.join(base, "config.toml")
+
+
+def check_codex_config_freshness(capability, binding, stat_fn=None):
+    """Fail if the Codex config is absent or its mtime exceeds _CODEX_CONFIG_MAX_AGE.
+
+    stat_fn(path) -> os.stat_result is injectable so tests perform no real I/O.
+    Only checked when binding.controller == 'codex'.
+    """
+    if stat_fn is None:
+        stat_fn = os.stat
+    bind = binding or {}
+    if bind.get("controller") != "codex":
+        return capability_check_result("codex_config_freshness", True)
+    config_path = _codex_config_path()
+    try:
+        st = stat_fn(config_path)
+    except OSError:
+        return capability_check_result(
+            "codex_config_freshness", False,
+            reason="Codex config not found: %s" % config_path,
+            repair_hint="initialize Codex config or set CODEX_HOME")
+    age = time.time() - st.st_mtime
+    if age > _CODEX_CONFIG_MAX_AGE:
+        return capability_check_result(
+            "codex_config_freshness", False,
+            reason="Codex config is stale (age %.0fs > max %ds)" % (age, _CODEX_CONFIG_MAX_AGE),
+            repair_hint="update the Codex config to refresh its mtime")
+    return capability_check_result("codex_config_freshness", True)
+
+
+def run_manifest_preflight(manifest, connect_fn=None, stat_fn=None, platform=None):
+    """Run all capability checks against the manifest. Return a new manifest.
+
+    Does not mutate the input manifest (deep copy). First failure wins — checks
+    stop at the first failing result. All checks passing → status.phase='proven';
+    any failure → status.phase='refused' with a deterministic refusal block.
+    """
+    import cowork_dispatch_manifest as _manifest_mod
+
+    if platform is None:
+        platform = sys.platform
+
+    cap = (manifest or {}).get("capability") or {}
+    bind = (manifest or {}).get("binding") or {}
+
+    checks_run = []
+    first_failure = None
+
+    for check_fn in (
+        lambda: check_runtime_roots(cap),
+        lambda: check_private_paths(cap),
+        lambda: check_guard_socket(cap, connect_fn=connect_fn),
+        lambda: check_kernel_boundary(cap, platform=platform),
+        lambda: check_artifact_destinations(cap),
+        lambda: check_controller_config(cap, bind),
+        lambda: check_codex_config_freshness(cap, bind, stat_fn=stat_fn),
+    ):
+        result = check_fn()
+        checks_run.append(result)
+        if not result["ok"]:
+            first_failure = result
+            break
+
+    if first_failure is None:
+        return _manifest_mod.manifest_proven(manifest, checks_run)
+    return _manifest_mod.manifest_refused(
+        manifest, checks_run,
+        refusal_code=first_failure["capability"],
+        refusal_message=first_failure["reason"] or "preflight check failed",
+    )

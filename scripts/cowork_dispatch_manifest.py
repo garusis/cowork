@@ -20,6 +20,7 @@ Public API:
 Python 3.9+, stdlib only.
 """
 
+import copy
 import hashlib
 import json
 import os
@@ -324,3 +325,39 @@ def _check_exact_keys(record, expected_keys, record_name):
         raise ValueError("%s missing keys: %s" % (record_name, sorted(missing)))
     if extra:
         raise ValueError("%s has extra keys: %s" % (record_name, sorted(extra)))
+
+
+# ---------------------------------------------------------------------------
+# Preflight status transitions (P2)
+# ---------------------------------------------------------------------------
+
+def manifest_proven(manifest, preflight_checks):
+    """Return a new manifest with status.phase='proven'.
+
+    Does not mutate the input. preflight_checks is the ordered list of
+    CapabilityCheckResult dicts collected during the preflight run."""
+    result = copy.deepcopy(manifest)
+    result["status"] = {
+        "phase": "proven",
+        "preflight": list(preflight_checks),
+        "refusal": None,
+    }
+    return result
+
+
+def manifest_refused(manifest, preflight_checks, refusal_code, refusal_message):
+    """Return a new manifest with status.phase='refused' and a refusal block.
+
+    Does not mutate the input. refusal_code and refusal_message must be
+    nonempty strings; source is always 'preflight'."""
+    result = copy.deepcopy(manifest)
+    result["status"] = {
+        "phase": "refused",
+        "preflight": list(preflight_checks),
+        "refusal": {
+            "code": refusal_code,
+            "message": refusal_message,
+            "source": "preflight",
+        },
+    }
+    return result

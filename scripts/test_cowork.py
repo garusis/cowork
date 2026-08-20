@@ -33291,3 +33291,320 @@ class ManifestSchemaTest(unittest.TestCase):
         with open(path, "w") as fh:
             json.dump(m, fh)
         self.assertIsNone(manifest_mod.load_manifest(path))
+
+
+# ---------------------------------------------------------------------------
+# P2: ManifestPreflightTest — focused coverage of run_manifest_preflight
+# ---------------------------------------------------------------------------
+
+def _preflight_capability(runtime_roots=None, private_paths=None,
+                          guard_required=False, socket=None,
+                          kernel_boundary=None, artifact_writes=None,
+                          action_classes=None):
+    """Minimal capability suitable for preflight tests; callers override fields."""
+    cap = dict(_minimal_capability())
+    if runtime_roots is not None:
+        cap["runtime_roots"] = runtime_roots
+    if private_paths is not None:
+        cap["private_paths"] = private_paths
+    cap["guard_required"] = guard_required
+    cap["socket"] = socket
+    if kernel_boundary is not None:
+        cap["kernel_boundary"] = kernel_boundary
+    if artifact_writes is not None:
+        cap["artifact_writes"] = artifact_writes
+    if action_classes is not None:
+        cap["action_classes"] = action_classes
+    return cap
+
+
+def _preflight_binding(controller="claude", delegation="enforceably_disabled",
+                       mutation_gate="pre_execution_record", work_id="wk-pf"):
+    """Minimal binding with policy_snapshot fields needed to pass capability_decision."""
+    bind = dict(_minimal_binding(work_id))
+    bind["controller"] = controller
+    bind["policy_snapshot"] = {
+        "delegation": delegation,
+        "mutation_gate": mutation_gate,
+    }
+    return bind
+
+
+class ManifestPreflightTest(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td, ignore_errors=True)
+        # A private dir that exists and is not world-readable.
+        self._private = os.path.join(self._td, "private")
+        os.makedirs(self._private, mode=0o700)
+        # A runtime root that exists.
+        self._root = os.path.join(self._td, "workspace")
+        os.makedirs(self._root)
+
+    def _make_manifest(self, cap=None, bind=None, work_id="wk-pf"):
+        cap = cap or _preflight_capability(
+            runtime_roots=[self._root],
+            private_paths=[self._private],
+            action_classes=["write"],
+        )
+        bind = bind or _preflight_binding(work_id=work_id)
+        return manifest_mod.compile_manifest(work_id, cap, bind)
+
+    # ------------------------------------------------------------------ #
+    # CapabilityCheckResult shape                                         #
+    # ------------------------------------------------------------------ #
+
+    def test_capability_check_result_has_required_fields(self):
+        r = preflight.capability_check_result("runtime_roots", True)
+        self.assertEqual(set(r.keys()), {"capability", "ok", "reason", "repair_hint"})
+
+    def test_capability_check_result_ok_false_carries_reason(self):
+        r = preflight.capability_check_result("guard_socket", False,
+                                              reason="refused",
+                                              repair_hint="start guard")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "refused")
+        self.assertEqual(r["repair_hint"], "start guard")
+
+    # ------------------------------------------------------------------ #
+    # check_runtime_roots                                                 #
+    # ------------------------------------------------------------------ #
+
+    def test_check_runtime_roots_pass(self):
+        cap = _preflight_capability(runtime_roots=[self._root])
+        r = preflight.check_runtime_roots(cap)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["capability"], "runtime_roots")
+
+    def test_check_runtime_roots_missing_root(self):
+        missing = os.path.join(self._td, "does_not_exist")
+        cap = _preflight_capability(runtime_roots=[missing])
+        r = preflight.check_runtime_roots(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn(missing, r["reason"])
+
+    # ------------------------------------------------------------------ #
+    # check_private_paths                                                 #
+    # ------------------------------------------------------------------ #
+
+    def test_check_private_paths_pass(self):
+        cap = _preflight_capability(private_paths=[self._private])
+        r = preflight.check_private_paths(cap)
+        self.assertTrue(r["ok"])
+
+    def test_check_private_paths_missing(self):
+        absent = os.path.join(self._td, "no_such_private")
+        cap = _preflight_capability(private_paths=[absent])
+        r = preflight.check_private_paths(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("missing", r["reason"])
+
+    def test_check_private_paths_world_readable(self):
+        pub = os.path.join(self._td, "public_dir")
+        os.makedirs(pub, mode=0o755)  # world-readable
+        cap = _preflight_capability(private_paths=[pub])
+        r = preflight.check_private_paths(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("world-readable", r["reason"])
+
+    # ------------------------------------------------------------------ #
+    # check_guard_socket                                                  #
+    # ------------------------------------------------------------------ #
+
+    def test_check_guard_socket_pass_when_not_required(self):
+        cap = _preflight_capability(guard_required=False)
+        r = preflight.check_guard_socket(cap)
+        self.assertTrue(r["ok"])
+
+    def test_check_guard_socket_injected_connect_fn_pass(self):
+        cap = _preflight_capability(guard_required=True, socket="/tmp/g.sock")
+        r = preflight.check_guard_socket(cap, connect_fn=lambda p, t: (True, None))
+        self.assertTrue(r["ok"])
+
+    def test_check_guard_socket_refused(self):
+        cap = _preflight_capability(guard_required=True, socket="/tmp/g.sock")
+        r = preflight.check_guard_socket(
+            cap, connect_fn=lambda p, t: (False, "connection refused"))
+        self.assertFalse(r["ok"])
+        self.assertIn("connection refused", r["reason"])
+
+    def test_check_guard_socket_timeout(self):
+        cap = _preflight_capability(guard_required=True, socket="/tmp/g.sock")
+        r = preflight.check_guard_socket(
+            cap, connect_fn=lambda p, t: (False, "connection timed out"))
+        self.assertFalse(r["ok"])
+        self.assertIn("timed out", r["reason"])
+
+    def test_check_guard_socket_dead(self):
+        cap = _preflight_capability(guard_required=True, socket="/tmp/g.sock")
+        r = preflight.check_guard_socket(
+            cap, connect_fn=lambda p, t: (False, "socket not found"))
+        self.assertFalse(r["ok"])
+        self.assertIn("socket not found", r["reason"])
+
+    def test_check_guard_socket_missing_socket_path(self):
+        cap = _preflight_capability(guard_required=True, socket=None)
+        r = preflight.check_guard_socket(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("absent", r["reason"])
+
+    # ------------------------------------------------------------------ #
+    # check_kernel_boundary                                               #
+    # ------------------------------------------------------------------ #
+
+    def test_check_kernel_boundary_pass_non_linux(self):
+        cap = _preflight_capability(kernel_boundary={"crosses": ["stdio"]})
+        r = preflight.check_kernel_boundary(cap, platform="darwin")
+        self.assertTrue(r["ok"])
+
+    def test_check_kernel_boundary_fail_linux_with_crosses(self):
+        cap = _preflight_capability(kernel_boundary={"crosses": ["stdio"]})
+        r = preflight.check_kernel_boundary(cap, platform="linux")
+        self.assertFalse(r["ok"])
+        self.assertIn("linux", r["reason"].lower())
+
+    # ------------------------------------------------------------------ #
+    # check_artifact_destinations                                         #
+    # ------------------------------------------------------------------ #
+
+    def test_check_artifact_destinations_pass(self):
+        cap = _preflight_capability(artifact_writes=[".cowork/sessions", "out"])
+        r = preflight.check_artifact_destinations(cap)
+        self.assertTrue(r["ok"])
+
+    def test_check_artifact_destinations_empty_entry(self):
+        cap = _preflight_capability(artifact_writes=[""])
+        r = preflight.check_artifact_destinations(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("empty", r["reason"])
+
+    def test_check_artifact_destinations_path_traversal(self):
+        cap = _preflight_capability(artifact_writes=["../escape/path"])
+        r = preflight.check_artifact_destinations(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("traversal", r["reason"])
+
+    # ------------------------------------------------------------------ #
+    # check_controller_config                                             #
+    # ------------------------------------------------------------------ #
+
+    def test_check_controller_config_pass(self):
+        cap = _preflight_capability(action_classes=["write"],
+                                    kernel_boundary={"crosses": []})
+        bind = _preflight_binding(controller="claude",
+                                  delegation="enforceably_disabled",
+                                  mutation_gate="pre_execution_record")
+        r = preflight.check_controller_config(cap, bind)
+        self.assertTrue(r["ok"])
+
+    def test_check_controller_config_denied(self):
+        cap = _preflight_capability(action_classes=["write"],
+                                    kernel_boundary={"crosses": []})
+        bind = _preflight_binding(controller="claude",
+                                  delegation="unknown",
+                                  mutation_gate="none")
+        r = preflight.check_controller_config(cap, bind)
+        self.assertFalse(r["ok"])
+
+    # ------------------------------------------------------------------ #
+    # check_codex_config_freshness                                        #
+    # ------------------------------------------------------------------ #
+
+    def test_check_codex_config_freshness_pass_non_codex(self):
+        cap = _preflight_capability()
+        bind = _preflight_binding(controller="claude")
+        r = preflight.check_codex_config_freshness(cap, bind, stat_fn=os.stat)
+        self.assertTrue(r["ok"])
+
+    def test_check_codex_config_freshness_pass_fresh(self):
+        fresh = type("S", (), {"st_mtime": time.time() - 60})()
+        cap = _preflight_capability()
+        bind = _preflight_binding(controller="codex")
+        r = preflight.check_codex_config_freshness(cap, bind,
+                                                    stat_fn=lambda p: fresh)
+        self.assertTrue(r["ok"])
+
+    def test_check_codex_config_freshness_missing(self):
+        def _absent(p):
+            raise FileNotFoundError(p)
+        cap = _preflight_capability()
+        bind = _preflight_binding(controller="codex")
+        r = preflight.check_codex_config_freshness(cap, bind, stat_fn=_absent)
+        self.assertFalse(r["ok"])
+        self.assertIn("not found", r["reason"])
+
+    def test_check_codex_config_freshness_stale(self):
+        old = type("S", (), {"st_mtime": time.time() - 60 * 60 * 24 * 30})()
+        cap = _preflight_capability()
+        bind = _preflight_binding(controller="codex")
+        r = preflight.check_codex_config_freshness(cap, bind,
+                                                    stat_fn=lambda p: old)
+        self.assertFalse(r["ok"])
+        self.assertIn("stale", r["reason"])
+
+    # ------------------------------------------------------------------ #
+    # run_manifest_preflight — orchestration                              #
+    # ------------------------------------------------------------------ #
+
+    def test_run_manifest_preflight_all_pass_proven(self):
+        m = self._make_manifest()
+        out = preflight.run_manifest_preflight(m, platform="darwin")
+        self.assertEqual(out["status"]["phase"], "proven")
+        self.assertIsNone(out["status"]["refusal"])
+        self.assertGreater(len(out["status"]["preflight"]), 0)
+
+    def test_run_manifest_preflight_first_failure_refused(self):
+        missing_root = os.path.join(self._td, "no_root")
+        cap = _preflight_capability(
+            runtime_roots=[missing_root],
+            private_paths=[self._private],
+            action_classes=["write"],
+        )
+        m = self._make_manifest(cap=cap)
+        out = preflight.run_manifest_preflight(m, platform="darwin")
+        self.assertEqual(out["status"]["phase"], "refused")
+        refusal = out["status"]["refusal"]
+        self.assertEqual(refusal["code"], "runtime_roots")
+        self.assertEqual(refusal["source"], "preflight")
+
+    def test_run_manifest_preflight_no_mutation(self):
+        m = self._make_manifest()
+        original_phase = m["status"]["phase"]
+        preflight.run_manifest_preflight(m, platform="darwin")
+        self.assertEqual(m["status"]["phase"], original_phase)
+
+    def test_run_manifest_preflight_first_failure_wins(self):
+        missing_root = os.path.join(self._td, "no_root")
+        absent_private = os.path.join(self._td, "no_private")
+        cap = _preflight_capability(
+            runtime_roots=[missing_root],
+            private_paths=[absent_private],
+            action_classes=["write"],
+        )
+        m = self._make_manifest(cap=cap)
+        out = preflight.run_manifest_preflight(m, platform="darwin")
+        # First check (runtime_roots) wins; private_paths check never ran.
+        self.assertEqual(out["status"]["refusal"]["code"], "runtime_roots")
+        self.assertEqual(len(out["status"]["preflight"]), 1)
+
+    def test_run_manifest_preflight_injected_seam_no_io(self):
+        cap = _preflight_capability(
+            runtime_roots=[self._root],
+            private_paths=[self._private],
+            guard_required=True,
+            socket="/tmp/guard.sock",
+            action_classes=["write"],
+        )
+        bind = _preflight_binding(controller="codex",
+                                  delegation="enforceably_disabled",
+                                  mutation_gate="pre_execution_record")
+        m = manifest_mod.compile_manifest("wk-pf", cap, bind)
+        fresh = type("S", (), {"st_mtime": time.time() - 60})()
+        out = preflight.run_manifest_preflight(
+            m,
+            connect_fn=lambda p, t: (True, None),
+            stat_fn=lambda p: fresh,
+            platform="darwin",
+        )
+        self.assertEqual(out["status"]["phase"], "proven")
