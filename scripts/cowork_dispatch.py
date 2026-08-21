@@ -236,13 +236,17 @@ def _validate_fact(fact, name):
 # Reducer
 # ---------------------------------------------------------------------------
 
-def decide(contract, policy_result=None, preflight_result=None, probe_result=None):
+def decide(contract, policy_result=None, preflight_result=None, probe_result=None,
+           manifest_id=None):
     """Validate contract and facts, then produce a DispatchDecision.
 
     Evaluates facts in strict order: policy_result, preflight_result,
     probe_result. The first fact with allowed=False maps its three refusal
     fields verbatim into a normalized refuse decision. With no refused fact,
     returns a normalized allow decision.
+
+    `manifest_id` is optional traceability: when provided it is copied into
+    `trace_event_id` and never changes the decision outcome.
 
     Never spawns, persists, emits, or performs I/O.
     """
@@ -272,7 +276,7 @@ def decide(contract, policy_result=None, preflight_result=None, probe_result=Non
                 "refusal_message": fact["refusal_message"],
                 "source": fact["source"],
                 "spawned": False,
-                "trace_event_id": None,
+                "trace_event_id": manifest_id,
             }
 
     return {
@@ -285,7 +289,7 @@ def decide(contract, policy_result=None, preflight_result=None, probe_result=Non
         "refusal_message": None,
         "source": None,
         "spawned": False,
-        "trace_event_id": None,
+        "trace_event_id": manifest_id,
     }
 
 

@@ -1073,6 +1073,35 @@ def manifest_path_for(session_uuid, work_id):
                         "manifest.%s.json" % work_id)
 
 
+def invalidate_manifest_for(session_uuid, work_id):
+    """Delete the persisted manifest so the next compile starts fresh.
+
+    Tolerant: any OSError (file missing, bad path) is swallowed silently.
+    """
+    try:
+        path = manifest_path_for(session_uuid, work_id)
+        if os.path.exists(path):
+            os.unlink(path)
+    except (OSError, ValueError):
+        pass
+
+
+def current_manifest_status(session_uuid, work_id):
+    """Return status.phase of the current manifest, or None.
+
+    None means the manifest is absent, unreadable, or schema-invalid.
+    """
+    try:
+        import cowork_dispatch_manifest as _dm
+        path = manifest_path_for(session_uuid, work_id)
+        manifest = _dm.load_manifest(path)
+        if manifest is None:
+            return None
+        return (manifest.get("status") or {}).get("phase")
+    except Exception:
+        return None
+
+
 def get_evaluation_policy(state):
     """The saved evaluation policy, defaulting to `all_rounds`. Unlike the
     controller policy an unreadable value is NOT a hard error: this setting

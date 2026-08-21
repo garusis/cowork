@@ -18096,6 +18096,54 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
                     if e["event"] == "controller.policy.rejected"]
         self.assertEqual(len(rejected), 1)
 
+    def test_lone_switch_to_a_forbidden_target_emits_policy_preserving_escalation(self):
+        # Blocker 2 (P4-v3): the lone --switch-controller mapping-only path is
+        # THE real policy-preserving repair (cowork_state.
+        # apply_controller_transition calls this exact shape "a single-write,
+        # POLICY-PRESERVING transition"). A target that would broaden the
+        # session's allowed set must be rejected AND traced with a typed
+        # dispatch.escalation record — exercised here through run_flow end to
+        # end, not by calling the predicate or the emitter directly.
+        saved = {"allowed": ["claude", "codex"], "updated": 11.0,
+                 "source": "cli"}
+        spath = self._planning("BACKCOMPAT-LONE-ESCALATE",
+                               policy_value=dict(saved))
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--switch-controller", "planner=opencode"]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 2)
+        self.assertEqual(popen.calls, [])
+        self.assertEqual(claude_spawn.calls, [])
+        escalations = [e for e in self._events(spath)
+                       if e["event"] == "dispatch.escalation"]
+        self.assertEqual(len(escalations), 1)
+        e = escalations[0]
+        self.assertEqual(e["role"], "planner")
+        self.assertEqual(e["missing_capability"], "policy_preserving_repair")
+        self.assertIn("repair_hint", e)
+        self.assertEqual(e["blocked_action"], "controller_change")
+        # A --allow-controllers proposal legitimately widens the set — that is
+        # not a repair, and must never be blocked or escalated by this fence.
+        spath2 = self._planning("BACKCOMPAT-WIDEN-OK", policy_value=dict(saved))
+        rc2 = cowork.run_flow(
+            self._args(["--session-file", spath2,
+                        "--allow-controllers", "claude,codex,opencode",
+                        "--switch-controller", "planner=opencode"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc2, 0)
+        self.assertEqual(
+            [e for e in self._events(spath2)
+             if e["event"] == "dispatch.escalation"], [])
+
     def test_the_four_trace_events_carry_their_documented_fields(self):
         # change (set) + rejected
         spath = self._planning("BACKCOMPAT-TRACE")
@@ -31542,6 +31590,27 @@ class DecideReducerTest(unittest.TestCase):
         c = self._contract()
         self.assertIsNone(dispatch.decide(c)["trace_event_id"])
 
+    def test_manifest_id_copied_to_trace_event_id_on_allow(self):
+        c = self._contract()
+        result = dispatch.decide(c, manifest_id="manifest-123")
+        self.assertEqual(result["outcome"], "allow")
+        self.assertEqual(result["trace_event_id"], "manifest-123")
+
+    def test_manifest_id_copied_to_trace_event_id_on_refuse(self):
+        c = self._contract()
+        result = dispatch.decide(
+            c, policy_result=_refuse_fact(), manifest_id="manifest-456")
+        self.assertEqual(result["outcome"], "refuse")
+        self.assertEqual(result["trace_event_id"], "manifest-456")
+
+    def test_manifest_id_never_changes_outcome(self):
+        c = self._contract()
+        without_id = dispatch.decide(c, policy_result=_refuse_fact())
+        with_id = dispatch.decide(
+            c, policy_result=_refuse_fact(), manifest_id="manifest-789")
+        self.assertEqual(without_id["outcome"], with_id["outcome"])
+        self.assertEqual(without_id["refusal_code"], with_id["refusal_code"])
+
     def test_contract_not_mutated(self):
         c = _make_contract()
         original = dict(c)
@@ -33903,3 +33972,227 @@ class CommandContractTest(unittest.TestCase):
             isdir=lambda p: True,
         )
         self.assertIsInstance(r6, ContractDecision)
+
+
+class DispatchManifestIntegrationTest(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td)
+        self._session_uuid = str(uuid.uuid4())
+        # Ensure the manifest directory exists before tests run.
+        mdir = os.path.join(self._td, "sessions", self._session_uuid,
+                            "manifests")
+        os.makedirs(mdir, exist_ok=True)
+        self._orig_manifest_path = state_store.manifest_path_for
+        state_store.manifest_path_for = lambda suuid, wid: os.path.join(
+            self._td, "sessions", suuid, "manifests",
+            "manifest.%s.json" % wid)
+
+    def tearDown(self):
+        state_store.manifest_path_for = self._orig_manifest_path
+
+    def _make_manifest(self, work_id="scout"):
+        m, _ = cowork._compile_role_manifest(
+            role=work_id, session_uuid=self._session_uuid, work_id=work_id,
+            controller="claude", mode="implement", model="claude-sonnet-4-6",
+            sessions_dir=self._td, force_recompile=True)
+        return m
+
+    # 1. compile then serve from cache (was_recompiled=False on second call)
+    def test_resume_recompiles_manifest(self):
+        sessions_dir = self._td
+        first, recompiled_first = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="scout",
+            controller="claude", mode="implement", model="claude-sonnet-4-6",
+            sessions_dir=sessions_dir, force_recompile=False)
+        self.assertTrue(recompiled_first)
+        self.assertEqual((first.get("status") or {}).get("phase"), "proven")
+
+        second, recompiled_second = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="scout",
+            controller="claude", mode="implement", model="claude-sonnet-4-6",
+            sessions_dir=sessions_dir, force_recompile=False)
+        self.assertFalse(recompiled_second)
+
+        third, recompiled_third = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="scout",
+            controller="claude", mode="implement", model="claude-sonnet-4-6",
+            sessions_dir=sessions_dir, force_recompile=True)
+        self.assertTrue(recompiled_third)
+
+    # 2. invalidate → current_manifest_status returns None → next compile recompiles
+    def test_invalidate_forces_recompile(self):
+        self._make_manifest("planner")
+        self.assertEqual(
+            state_store.current_manifest_status(self._session_uuid, "planner"),
+            "proven")
+        state_store.invalidate_manifest_for(self._session_uuid, "planner")
+        self.assertIsNone(
+            state_store.current_manifest_status(self._session_uuid, "planner"))
+        _m, was_recompiled = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid, work_id="planner",
+            controller="claude", mode="implement", model="claude-sonnet-4-6",
+            sessions_dir=self._td, force_recompile=False)
+        self.assertTrue(was_recompiled)
+
+    # 3. manifest compiled before brief assembly (call-order guarantee)
+    def test_manifest_compiled_before_brief_assembly(self):
+        call_order = []
+        orig_compile = cowork._compile_role_manifest
+
+        def spy_compile(*a, **kw):
+            call_order.append("compile")
+            return orig_compile(*a, **kw)
+
+        orig_assemble = cowork.assemble_scout_brief
+
+        def spy_assemble(*a, **kw):
+            call_order.append("assemble")
+            return orig_assemble(*a, **kw)
+
+        cowork._compile_role_manifest = spy_compile
+        cowork.assemble_scout_brief = spy_assemble
+        try:
+            intel_path = os.path.join(self._td, "intel.json")
+            with open(intel_path, "w") as f:
+                json.dump({"summary": "x", "result": {}}, f)
+            selected = [{"path": "README.md", "score": 1.0}]
+            config = {
+                "scout": {"controller": "claude", "mode": "implement",
+                          "model": "claude-sonnet-4-6", "yolo": False},
+            }
+
+            class _FakeSession:
+                def __init__(self, *a, **kw):
+                    pass
+                def send(self, *a, **kw):
+                    return False
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    pass
+
+            cowork.run_scout(
+                config, "", selected, intel_path, intel_md_path=None,
+                session_factory=_FakeSession,
+                session_uuid=self._session_uuid)
+        except Exception:
+            pass
+        finally:
+            cowork._compile_role_manifest = orig_compile
+            cowork.assemble_scout_brief = orig_assemble
+
+        compile_idx = next((i for i, v in enumerate(call_order)
+                            if v == "compile"), None)
+        assemble_idx = next((i for i, v in enumerate(call_order)
+                             if v == "assemble"), None)
+        self.assertIsNotNone(compile_idx, "manifest was never compiled")
+        self.assertIsNotNone(assemble_idx, "brief was never assembled")
+        self.assertLess(compile_idx, assemble_idx)
+
+    # 4. the REAL scout/planning-advisor/build-review runner closures — the
+    # ones run_scout/run_planner/run_builder actually construct in production
+    # when no reviewer_runner is test-injected — run the manifest fence before
+    # any brief assembly or model turn (Blocker 1, P4-v3).
+    def _real_reviewer_closures(self):
+        return [
+            (cowork.SCOUT_REVIEWER,
+             cowork.make_scout_reviewer_runner(
+                 os.path.join(self._td, "intel.md"),
+                 extra_writable_dir=self._td)),
+            (cowork.PLANNING_ADVISOR,
+             cowork.make_planning_advisor_runner(
+                 os.path.join(self._td, "plan.md"),
+                 extra_writable_dir=self._td)),
+            (cowork.BUILD_REVIEWER,
+             cowork.make_build_reviewer_runner(
+                 os.path.join(self._td, "plan.json"),
+                 os.path.join(self._td, "plan.md"),
+                 extra_writable_dir=self._td,
+                 session_uuid=self._session_uuid)),
+        ]
+
+    def test_real_reviewer_runner_closures_fence_before_brief_assembly(self):
+        orig_preflight = preflight.run_manifest_preflight
+        orig_assemble = cowork.assemble_reviewer_brief
+        assembled = []
+
+        def refusing_preflight(manifest):
+            result = dict(manifest)
+            result["status"] = {"phase": "refused",
+                                 "checks": [], "errors": ["test_refused"]}
+            return result
+
+        def spy_assemble(*a, **kw):
+            assembled.append(True)
+            return orig_assemble(*a, **kw)
+
+        preflight.run_manifest_preflight = refusing_preflight
+        cowork.assemble_reviewer_brief = spy_assemble
+        try:
+            for role, runner in self._real_reviewer_closures():
+                verdict = runner(
+                    {}, "context", [role], "artifact.json", "review.json",
+                    session_uuid=self._session_uuid)
+                self.assertTrue(verdict.get("controller_failure"),
+                                "%s did not refuse on an unproven manifest"
+                                % role)
+                self.assertEqual(
+                    verdict.get("controller_failure_result", {}).get("result"),
+                    "manifest_refused")
+        finally:
+            preflight.run_manifest_preflight = orig_preflight
+            cowork.assemble_reviewer_brief = orig_assemble
+        self.assertEqual(assembled, [],
+                         "the reviewer brief was assembled after a refused "
+                         "manifest — the fence did not run first")
+
+    # 5. exact resume revalidation: a real closure called with a resume_id
+    # forces a fresh compile+preflight rather than trusting a stale cache.
+    # Preflight is kept refusing throughout so every call returns right after
+    # the fence (never reaching real session creation) while still proving
+    # the force_recompile flag the fence passed on each call.
+    def test_real_reviewer_runner_closures_revalidate_on_resume(self):
+        orig_preflight = preflight.run_manifest_preflight
+
+        def refusing_preflight(manifest):
+            result = dict(manifest)
+            result["status"] = {"phase": "refused",
+                                 "checks": [], "errors": ["test_refused"]}
+            return result
+
+        calls = []
+        orig_compile = cowork._compile_role_manifest
+
+        def spy_compile(*a, **kw):
+            calls.append(kw.get("force_recompile"))
+            return orig_compile(*a, **kw)
+
+        preflight.run_manifest_preflight = refusing_preflight
+        cowork._compile_role_manifest = spy_compile
+        try:
+            for role, runner in self._real_reviewer_closures():
+                del calls[:]
+                verdict = runner(
+                    {}, "context", [role], "artifact.json", "review.json",
+                    session_uuid=self._session_uuid)
+                self.assertEqual(calls, [False],
+                                 "%s: a fresh (non-resume) pass must not force "
+                                 "a recompile" % role)
+                self.assertEqual(
+                    verdict.get("controller_failure_result", {}).get("result"),
+                    "manifest_refused")
+                del calls[:]
+                verdict = runner(
+                    {}, "context", [role], "artifact.json", "review.json",
+                    resume_id="resumed-thread", session_uuid=self._session_uuid)
+                self.assertEqual(calls, [True],
+                                 "%s: an exact-resume pass must force a fresh "
+                                 "recompile+preflight" % role)
+                self.assertEqual(
+                    verdict.get("controller_failure_result", {}).get("result"),
+                    "manifest_refused")
+        finally:
+            preflight.run_manifest_preflight = orig_preflight
+            cowork._compile_role_manifest = orig_compile

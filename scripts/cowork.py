@@ -53,6 +53,7 @@ import cowork_ledger as ledger  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 import cowork_eval as evaluation  # noqa: E402
 import cowork_dispatch as dispatch  # noqa: E402
+import cowork_dispatch_manifest as dispatch_manifest  # noqa: E402
 import cowork_guard_broker as guard_broker  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -4450,9 +4451,13 @@ def _score_queued_entry(entry, verification, session_uuid, config=None,
     # actually took. See the failure path below.
     started_at = time.monotonic()
     try:
-        factory = session_factory or _isolated_evaluator_session
-        session = factory(entry, identity, config=config, trace=trace,
-                          io_out=io_out)
+        if session_factory is None:
+            session = _isolated_evaluator_session(entry, identity, config=config,
+                                                  trace=trace, io_out=io_out,
+                                                  session_uuid=session_uuid)
+        else:
+            session = session_factory(entry, identity, config=config, trace=trace,
+                                      io_out=io_out)
         if session is None:
             return {"ok": False, "error_class": "malformed_entry"}
         if trace:
@@ -4565,7 +4570,7 @@ def _envelope_artifacts(entry):
 
 
 def _isolated_evaluator_session(entry, identity, config=None, trace=None,
-                                io_out=None):
+                                io_out=None, session_uuid=None):
     """A FRESH controller session for one evaluation.
 
     Fresh is the requirement, not an optimization: an evaluator resumed from a
@@ -4579,6 +4584,25 @@ def _isolated_evaluator_session(entry, identity, config=None, trace=None,
     effort = identity.get("effort")
     scratch_path = entry.get("scratch_path")
     assets_dir = os.path.dirname(scratch_path) if scratch_path else None
+    cfg_obj = config or {}
+    if session_uuid:
+        try:
+            _eval_manifest, _ = _compile_role_manifest(
+                role="evaluator", session_uuid=session_uuid,
+                work_id="evaluator",
+                controller=controller or "claude",
+                mode="plan",
+                model=model,
+                instruction_paths=[EVALUATOR_PROMPT_PATH],
+                sessions_dir=assets_dir,
+                force_recompile=False)
+        except Exception:
+            _eval_manifest = {}
+        if (_eval_manifest.get("status") or {}).get("phase") != "proven":
+            _emit_dispatch_escalation(trace, "evaluator", "manifest_proven",
+                                      "recompile and preflight the manifest",
+                                      "session_creation")
+            return None
     if controller == "claude":
         return bridge.ClaudeSession(
             EVALUATOR_PROMPT_PATH, "plan", False,
@@ -4639,14 +4663,14 @@ def make_scout_reviewer_runner(intel_md_path, trace=None,
     def runner(config, context, selected, intel_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None, surface_io_out=None,
-               context_revision=None):
+               context_revision=None, session_uuid=None):
         return run_reviewer_once(
             config, context, selected, intel_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
             extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
-            context_revision=context_revision,
+            context_revision=context_revision, session_uuid=session_uuid,
             artifact_paths=[intel_path, intel_md_path], phase="scouting",
             reviewer_role=SCOUT_REVIEWER,
             prompt_path=SCOUT_REVIEWER_PROMPT_PATH,
@@ -4874,14 +4898,14 @@ def make_planning_advisor_runner(plan_md_path, trace=None,
     def runner(config, context, selected, plan_json_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None, surface_io_out=None,
-               context_revision=None):
+               context_revision=None, session_uuid=None):
         return run_reviewer_once(
             config, context, selected, plan_json_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
             extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
-            context_revision=context_revision,
+            context_revision=context_revision, session_uuid=session_uuid,
             artifact_paths=[plan_json_path, plan_md_path], phase="planning",
             reviewer_role=PLANNING_ADVISOR,
             prompt_path=PLANNING_ADVISOR_PROMPT_PATH,
@@ -5193,6 +5217,24 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
         io_out.write(_wdec["refusal_message"] + "\n")
         io_out.flush()
         return None
+    if session_uuid:
+        try:
+            _wt_manifest, _ = _compile_role_manifest(
+                role=WORKTREE_ROLE, session_uuid=session_uuid,
+                work_id=WORKTREE_ROLE,
+                controller=controller,
+                mode=wt_config.get("mode", "implement"),
+                model=wt_config.get("model"),
+                instruction_paths=[WORKTREE_PROMPT_PATH],
+                sessions_dir=extra_writable_dir,
+                force_recompile=False)
+        except Exception:
+            _wt_manifest = {}
+        if (_wt_manifest.get("status") or {}).get("phase") != "proven":
+            _emit_dispatch_escalation(
+                trace, WORKTREE_ROLE, "manifest_proven",
+                "recompile and preflight the manifest", "prompt_assembly")
+            return None
     brief = assemble_worktree_brief(status_path, base_toplevel, name, explicit)
     # Clear any stale artifact so a failed/no-write run reads as None, never a
     # leftover 'ready' from an earlier attempt.
@@ -5554,14 +5596,14 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
     def runner(config, context, selected, build_status_path, review_path,
                resume_id=None, on_session=None, context_update=None,
                eval_scratch_path=None, eval_specs=None, surface_io_out=None,
-               context_revision=None):
+               context_revision=None, session_uuid=None):
         return run_reviewer_once(
             config, context, selected, build_status_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
             extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
-            context_revision=context_revision,
+            context_revision=context_revision, session_uuid=session_uuid,
             artifact_paths=[plan_json_path, plan_md_path, build_status_path,
                             build_summary_path], phase="building",
             reviewer_role=BUILD_REVIEWER,
@@ -5643,7 +5685,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                       protected="the scout intel file",
                       eval_scratch_path=None, eval_specs=None,
                       extra_writable_dir=None, surface_io_out=None,
-                      context_revision=None, artifact_paths=None, phase=None):
+                      context_revision=None, artifact_paths=None, phase=None,
+                      session_uuid=None):
     """Spawn (or resume) a paired reviewer for one pass and return its verdict.
 
     Role-generic: by default this is the scout-reviewer reviewing the scout
@@ -5693,6 +5736,24 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     # The reviewer's peer-eval send always stays muted (D-eval-stays-muted).
     surface = surface_io_out is not None
     review_io = surface_io_out if surface else quiet
+    if session_uuid:
+        try:
+            _rev_manifest, _ = _compile_role_manifest(
+                role=reviewer_role, session_uuid=session_uuid,
+                work_id=reviewer_role,
+                controller=cfg["controller"], mode=cfg.get("mode", "implement"),
+                model=cfg.get("model"),
+                instruction_paths=[prompt_path or SCOUT_REVIEWER_PROMPT_PATH],
+                sessions_dir=extra_writable_dir,
+                force_recompile=bool(resume_id))
+        except Exception:
+            _rev_manifest = {}
+        if (_rev_manifest.get("status") or {}).get("phase") != "proven":
+            _emit_dispatch_escalation(trace, reviewer_role, "manifest_proven",
+                                      "recompile and preflight the manifest",
+                                      "prompt_assembly")
+            return _controller_failure_verdict(
+                {"ok": False, "result": "manifest_refused"})
     brief = assemble_reviewer_brief(review_path, protected=protected)
     # Measurable-goal structural check: scout intel that reached review without
     # a non-empty result.success_criteria gets an auto-finding note in the
@@ -8094,6 +8155,16 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
         # test-injected runners stay byte-identical.
         if phase is not None and reviewer_runner is None:
             kwargs["phase"] = phase
+        # The manifest preflight fence (D-manifest-fence) is inside
+        # run_reviewer_once, so session_uuid must reach it not only on the
+        # default path but through every real closure runner too — the same
+        # surface-capable guard that already carries surface_io_out and
+        # context_revision to those closures. Test-injected runners are
+        # neither None nor surface-capable, so they stay byte-identical.
+        if session_uuid is not None and (
+                reviewer_runner is None
+                or getattr(runner, "_coplan_surface_capable", False)):
+            kwargs["session_uuid"] = session_uuid
         # Context-revision (#4) rides the same surface-capable guard so the
         # transport can key the persisted shared-context file by revision: the
         # default run_reviewer_once and the real runner closures accept it;
@@ -8198,6 +8269,110 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     return review_fn
 
 
+def _compile_role_manifest(
+        role, session_uuid, work_id,
+        controller, mode, model,
+        instruction_paths=None,
+        sessions_dir=None,
+        worktree=None,
+        policy_snapshot=None,
+        guard_snapshot=None,
+        candidate_snapshot=None,
+        force_recompile=False):
+    """Compile, preflight, and persist the dispatch manifest for one role.
+
+    Returns (manifest, was_recompiled). Raises OSError if persist fails
+    (the caller must catch this and treat it as a fence failure — fail closed).
+    """
+    import cowork_action_policy as _ap
+
+    if policy_snapshot is None:
+        row = _ap.CONTROLLER_CAPABILITY_MATRIX.get((controller, mode)) or {}
+        policy_snapshot = {
+            "delegation": row.get("delegation", "unknown"),
+            "mutation_gate": row.get("mutation_gate", "none"),
+        }
+
+    inst_digests = {}
+    for p in (instruction_paths or []):
+        try:
+            with open(p, "rb") as fh:
+                inst_digests[p] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            inst_digests[p] = ""
+
+    config_digest = hashlib.sha256(
+        json.dumps({"controller": controller, "mode": mode, "model": model},
+                   sort_keys=True).encode()).hexdigest()
+
+    if sessions_dir:
+        os.makedirs(sessions_dir, exist_ok=True)
+
+    capability = {
+        "inputs": list(instruction_paths or []),
+        "outputs": [],
+        "runtime_roots": [sessions_dir] if sessions_dir else [],
+        "private_paths": [],
+        "guard_required": False,
+        "socket": None,
+        "kernel_boundary": {"crosses": []},
+        "artifact_writes": [],
+        "action_classes": [],
+        "command_adapters": {},
+    }
+
+    binding = {
+        "work_id": work_id,
+        "controller": controller,
+        "model": model,
+        "config_digest": config_digest,
+        "instruction_digests": inst_digests,
+        "policy_snapshot": policy_snapshot,
+        "worktree": worktree,
+        "candidate_snapshot": candidate_snapshot,
+        "guard_snapshot": guard_snapshot,
+    }
+
+    mpath = state_store.manifest_path_for(session_uuid, work_id)
+    existing = dispatch_manifest.load_manifest(mpath)
+    already_proven = (
+        existing is not None
+        and (existing.get("status") or {}).get("phase") == "proven"
+        and not dispatch_manifest.manifest_is_stale(existing, binding)
+    )
+    if already_proven and not force_recompile:
+        return existing, False
+
+    fresh = dispatch_manifest.compile_manifest(work_id, capability, binding)
+    result = preflight.run_manifest_preflight(fresh)
+
+    dispatch_manifest.persist_manifest(mpath, result)
+
+    return result, True
+
+
+def _is_policy_preserving_repair(old_allowed, new_allowed):
+    """True only when new_allowed does not broaden the active controller set.
+
+    A repair that adds any controller not already in old_allowed is rejected.
+    When old_allowed is None (unrestricted), all repairs are trivially preserving.
+    """
+    if old_allowed is None:
+        return True
+    return frozenset(new_allowed or ()) <= frozenset(old_allowed)
+
+
+def _emit_dispatch_escalation(trace, role, missing_capability,
+                               repair_hint, blocked_action):
+    """Emit a typed dispatch.escalation trace event."""
+    if trace:
+        trace.event("dispatch.escalation",
+                    role=role,
+                    missing_capability=missing_capability,
+                    repair_hint=repair_hint,
+                    blocked_action=blocked_action)
+
+
 def _make_dispatch_contract(role, controller, purpose, site,
                             resume_session_id=None, phase=None):
     """Build a DispatchContract/v1 record for a dispatch decision site."""
@@ -8267,11 +8442,28 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     cfg = config["scout"]
-    brief = assemble_scout_brief(selected, intel_path or "", intel_md_path)
     # Writable root granted to the agent CLIs so a no-yolo role can write its
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    if session_uuid:
+        try:
+            _scout_manifest, _ = _compile_role_manifest(
+                role="scout", session_uuid=session_uuid, work_id="scout",
+                controller=cfg["controller"],
+                mode=cfg.get("mode", "implement"),
+                model=cfg.get("model"),
+                instruction_paths=[SCOUT_PROMPT_PATH],
+                sessions_dir=sessions_dir,
+                force_recompile=bool(resume_id))
+        except Exception:
+            _scout_manifest = {}
+        if (_scout_manifest.get("status") or {}).get("phase") != "proven":
+            _emit_dispatch_escalation(
+                trace, "scout", "manifest_proven",
+                "recompile and preflight the manifest", "prompt_assembly")
+            return 1
+    brief = assemble_scout_brief(selected, intel_path or "", intel_md_path)
     # The real scout-reviewer runner embeds BOTH intel files (JSON + markdown) so
     # the reviewer actually receives the markdown (D8); a test-injected
     # reviewer_runner overrides it byte-identically to the other phases.
@@ -8545,11 +8737,30 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     cfg = config["planner"]
-    brief = assemble_planner_brief(plan_json_path or "", plan_md_path or "")
     # Writable root granted to the agent CLIs so a no-yolo role can write its
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    if session_uuid:
+        try:
+            _planner_manifest, _ = _compile_role_manifest(
+                role="planner", session_uuid=session_uuid, work_id="planner",
+                controller=cfg["controller"],
+                mode=cfg.get("mode", "implement"),
+                model=cfg.get("model"),
+                instruction_paths=[PLANNER_PROMPT_PATH],
+                sessions_dir=sessions_dir,
+                force_recompile=bool(resume_id))
+        except Exception:
+            _planner_manifest = {}
+        if (_planner_manifest.get("status") or {}).get("phase") != "proven":
+            _emit_dispatch_escalation(
+                trace, "planner", "manifest_proven",
+                "recompile and preflight the manifest", "prompt_assembly")
+            if on_outcome:
+                on_outcome("ended", None)
+            return 1
+    brief = assemble_planner_brief(plan_json_path or "", plan_md_path or "")
     runner = reviewer_runner or make_planning_advisor_runner(
         plan_md_path, trace=trace, extra_writable_dir=sessions_dir,
         intel_path=intel_path, intel_md_path=intel_md_path)
@@ -8837,11 +9048,30 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     cfg = config["builder"]
-    brief = assemble_builder_brief(build_status_path or "", build_summary_path)
     # Writable root granted to the agent CLIs so a no-yolo role can write its
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    if session_uuid:
+        try:
+            _builder_manifest, _ = _compile_role_manifest(
+                role="builder", session_uuid=session_uuid, work_id="builder",
+                controller=cfg["controller"],
+                mode=cfg.get("mode", "implement"),
+                model=cfg.get("model"),
+                instruction_paths=[BUILDER_PROMPT_PATH],
+                sessions_dir=sessions_dir,
+                force_recompile=bool(resume_id))
+        except Exception:
+            _builder_manifest = {}
+        if (_builder_manifest.get("status") or {}).get("phase") != "proven":
+            _emit_dispatch_escalation(
+                trace, "builder", "manifest_proven",
+                "recompile and preflight the manifest", "prompt_assembly")
+            if on_outcome:
+                on_outcome("ended", None)
+            return 1
+    brief = assemble_builder_brief(build_status_path or "", build_summary_path)
     runner = reviewer_runner or make_build_reviewer_runner(
         plan_json_path, plan_md_path, baseline_note=baseline_note,
         baseline_repos=baseline_repos, trace=trace,
@@ -10141,6 +10371,29 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                              % (role, alert))
                 io_out.flush()
                 return False
+        if session_uuid:
+            _sw_cfg = config.get(role) or {}
+            _sw_sdir = state_store.session_assets_dir(session_uuid)
+            try:
+                _sw_manifest, _ = _compile_role_manifest(
+                    role=role, session_uuid=session_uuid, work_id=role,
+                    controller=target,
+                    mode=_sw_cfg.get("mode", "implement"),
+                    model=_sw_cfg.get("model"),
+                    instruction_paths=[ROLE_PROMPT_PATHS.get(role)
+                                       or SCOUT_PROMPT_PATH],
+                    sessions_dir=_sw_sdir, force_recompile=True)
+            except Exception:
+                _sw_manifest = {}
+            if (_sw_manifest.get("status") or {}).get("phase") != "proven":
+                _emit_dispatch_escalation(trace, role, "manifest_proven",
+                                          "recompile and preflight the manifest",
+                                          "switch_controller")
+                io_out.write(
+                    "cowork: manifest not proven for %s switch — blocked.\n"
+                    % role)
+                io_out.flush()
+                return False
         entry = {
             "from_controller": current,
             "to_controller": target,
@@ -10166,6 +10419,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         trace.event("controller.switch.commit", role=role, phase=phase,
                     source=source, reason=reason, from_controller=current,
                     to_controller=target)
+        if session_uuid:
+            state_store.invalidate_manifest_for(session_uuid, role)
         io_out.write("cowork: switched %s controller %s -> %s\n"
                      % (role, current, target))
         io_out.flush()
@@ -10198,6 +10453,29 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         controller=controller, reason="policy_blocked",
                         artifact_progress=False)
             return False
+        if session_uuid:
+            _disp_cfg = config.get(role) or {}
+            _disp_sdir = state_store.session_assets_dir(session_uuid)
+            try:
+                _disp_manifest, _ = _compile_role_manifest(
+                    role=role, session_uuid=session_uuid, work_id=role,
+                    controller=controller,
+                    mode=_disp_cfg.get("mode", "implement"),
+                    model=_disp_cfg.get("model"),
+                    instruction_paths=[ROLE_PROMPT_PATHS.get(role)
+                                       or SCOUT_PROMPT_PATH],
+                    sessions_dir=_disp_sdir, force_recompile=False)
+            except Exception:
+                _disp_manifest = {}
+            if (_disp_manifest.get("status") or {}).get("phase") != "proven":
+                _emit_dispatch_escalation(trace, role, "manifest_proven",
+                                          "recompile and preflight the manifest",
+                                          "pre_launch")
+                io_out.write(
+                    "cowork: manifest not proven for %s — dispatch blocked.\n"
+                    % role)
+                io_out.flush()
+                return False
         while True:
             controller = config[role].get("controller")
             ok, alerts = check_controller_tool(controller)
@@ -10312,6 +10590,20 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                        else "set")
         mapping_list = ["%s=%s" % (r, c) for r, c in (proposal.mappings or [])]
         if err:
+            if proposal.policy is policy.PRESERVE:
+                # The lone --switch-controller mapping-only path is the CLI's
+                # policy-preserving repair (cowork_state.apply_controller_transition
+                # calls this exact shape "a single-write, POLICY-PRESERVING
+                # transition"). Invoke the named predicate on THIS real path —
+                # not in isolation — and escalate every mapping it would have
+                # widened beyond the session's currently allowed set.
+                for role, target in (proposal.mappings or []):
+                    if not _is_policy_preserving_repair(saved_allowed, (target,)):
+                        _emit_dispatch_escalation(
+                            trace, role, "policy_preserving_repair",
+                            "choose a controller within the session's allowed "
+                            "set, or pass --allow-controllers to widen it",
+                            "controller_change")
             trace.event("controller.policy.rejected", reason=err,
                         source=proposal.source, persisted=False,
                         policy_action=action_name,
@@ -10402,6 +10694,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 }
         for role, _target in mappings:
             local_ids.pop(role, None)
+        if session_uuid:
+            for role, _target in mappings:
+                state_store.invalidate_manifest_for(session_uuid, role)
 
         # -- only now is anything reported, and only then does work resume -- #
         trace.event("controller.policy.change", policy_action=action_name,
@@ -10520,6 +10815,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             trace.event("context.saved", source="input",
                         context_revision=state_store.get_context_revision(
                             holder["state"]))
+            if session_uuid:
+                for _inv_role in list(config):
+                    state_store.invalidate_manifest_for(session_uuid, _inv_role)
         state = holder["state"]
         current_text = state_store.get_context(state) or ""
         current_rev = state_store.get_context_revision(state)
@@ -10784,6 +11082,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             if session_enabled:
                 holder["state"] = state_store.set_worktree(
                     spath, wt_path, wt_branch, prior=holder["state"])
+                if session_uuid:
+                    state_store.invalidate_manifest_for(session_uuid,
+                                                        WORKTREE_ROLE)
             trace.event("worktree.created", path=wt_path, branch=wt_branch)
         # Redirect the rest of the session into the worktree: every spawned CLI
         # uses cwd=os.getcwd() (cowork_bridge), and run_cwd drives discovery and
