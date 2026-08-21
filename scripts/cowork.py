@@ -4592,7 +4592,7 @@ def _isolated_evaluator_session(entry, identity, config=None, trace=None,
                 work_id="evaluator",
                 controller=controller or "claude",
                 mode="plan",
-                model=model,
+                model=model, effort=effort,
                 instruction_paths=[EVALUATOR_PROMPT_PATH],
                 sessions_dir=assets_dir,
                 force_recompile=False)
@@ -5213,14 +5213,27 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
     _wt_manifest = None
     if _wf["allowed"] and session_uuid:
         try:
+            # base_toplevel is the real evidence for this exact dispatch: the
+            # `--worktree` gate already proved it via `git rev-parse
+            # --show-toplevel` (git_worktree_toplevel) before this role was
+            # ever considered, so the manifest declares the SAME safe,
+            # read-only git operation that produced it — never a fabricated
+            # or mutating one (`git worktree add` is the AGENT's own, later,
+            # live-guarded action, not a manifest-declared capability).
             _wt_manifest, _ = _compile_role_manifest(
                 role=WORKTREE_ROLE, session_uuid=session_uuid,
                 work_id=WORKTREE_ROLE,
                 controller=controller,
                 mode=wt_config.get("mode", "implement"),
                 model=wt_config.get("model"),
+                effort=wt_config.get("effort"),
                 instruction_paths=[WORKTREE_PROMPT_PATH],
                 sessions_dir=extra_writable_dir,
+                action_classes=["git"] if base_toplevel else [],
+                command_adapters=(
+                    {"git": {"subcommand": "rev-parse",
+                             "flags": ["--show-toplevel"]}}
+                    if base_toplevel else {}),
                 force_recompile=False)
         except Exception:
             _wt_manifest = {}
@@ -5736,9 +5749,15 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 role=reviewer_role, session_uuid=session_uuid,
                 work_id=reviewer_role,
                 controller=cfg["controller"], mode=cfg.get("mode", "implement"),
-                model=cfg.get("model"),
+                model=cfg.get("model"), effort=cfg.get("effort"),
                 instruction_paths=[prompt_path or SCOUT_REVIEWER_PROMPT_PATH],
                 sessions_dir=extra_writable_dir,
+                # intel_path is the exact artifact THIS reviewer pass judges
+                # (scout intel, plan, or build status depending on
+                # reviewer_role) — a real candidate snapshot, not fabricated;
+                # its content changing between compiles is a genuine
+                # revalidation trigger.
+                candidate_snapshot=_file_snapshot(intel_path),
                 force_recompile=bool(resume_id))
         except Exception:
             _rev_manifest = {}
@@ -8288,17 +8307,89 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     return review_fn
 
 
+def _file_snapshot(path):
+    """Read-only content snapshot of one real file: `{"path", "sha256"}`.
+
+    `None` means the fact itself is not applicable to this dispatch (no
+    candidate/guard file governs it). A non-null `path` with `sha256=None`
+    means the fact IS applicable but the file does not exist/is unreadable
+    right now — still real, distinguishable evidence, never fabricated."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        digest = None
+    return {"path": path, "sha256": digest}
+
+
+def _capability_evidence_covered(requested, existing):
+    """True when `existing` capability already declares (with matching
+    adapter evidence) every action class `requested` declares.
+
+    Binding-only staleness (manifest_is_stale) cannot see capability at all,
+    so a role-generic gate that compiles first with no evidence (e.g. the
+    pre-launch check) would otherwise "prove" a manifest a later,
+    evidence-owning call (e.g. run_builder's real git evidence) would then
+    silently reuse as-is — losing the very evidence the later call declared.
+    This is intentionally ASYMMETRIC/monotonic: a request that declares LESS
+    than what is already proven still reuses the existing (fuller) proof
+    unchanged — it never downgrades a persisted capability — while a request
+    that declares evidence the existing capability lacks forces a fresh
+    compile so that evidence is actually captured and preflighted."""
+    existing = existing or {}
+    requested_classes = set(requested.get("action_classes") or [])
+    existing_classes = set(existing.get("action_classes") or [])
+    if not requested_classes <= existing_classes:
+        return False
+    requested_adapters = requested.get("command_adapters") or {}
+    existing_adapters = existing.get("command_adapters") or {}
+    for key, value in requested_adapters.items():
+        if existing_adapters.get(key) != value:
+            return False
+    return True
+
+
 def _compile_role_manifest(
         role, session_uuid, work_id,
-        controller, mode, model,
+        controller, mode, model, effort=None,
         instruction_paths=None,
         sessions_dir=None,
         worktree=None,
+        worktree_base=None,
         policy_snapshot=None,
         guard_snapshot=None,
         candidate_snapshot=None,
+        action_classes=None,
+        command_adapters=None,
         force_recompile=False):
     """Compile, preflight, and persist the dispatch manifest for one role.
+
+    `effort` joins controller/model/mode as dispatch identity (bound in both
+    `config_digest` and its own binding field, so an effort change alone
+    changes the digest and forces recompile/revalidation).
+
+    `worktree` is the real git worktree this dispatch runs in (or None when
+    none is active — genuinely not applicable, not missing evidence);
+    `worktree_base` is the real ancestor root it was created under, added to
+    `capability.runtime_roots` ONLY when a worktree is bound, so preflight's
+    `check_cwd` can prove the declared worktree is a strict descendant of a
+    declared runtime root. Never invents either.
+
+    `candidate_snapshot` is a real `_file_snapshot(...)` of the artifact this
+    dispatch is bound to (an upstream artifact a role builds/plans from, or
+    the artifact a reviewer is reviewing) — callers that own no such artifact
+    pass None (not applicable). `guard_snapshot` defaults (when the caller
+    passes none) to a snapshot of this session's own pinned capability
+    allowlist file, real per-session state this compiler can read without
+    fabricating anything; a caller that owns a more specific guard fact may
+    override it explicitly.
+
+    `action_classes`/`command_adapters` declare real command evidence this
+    exact dispatch site possesses (e.g. the git subcommand/flags cowork
+    itself already ran to produce a fact this dispatch depends on) — absent
+    real evidence, callers leave them empty, never a permissive constant.
 
     Returns (manifest, was_recompiled). Raises OSError if persist fails
     (the caller must catch this and treat it as a fence failure — fail closed).
@@ -8321,29 +8412,41 @@ def _compile_role_manifest(
             inst_digests[p] = ""
 
     config_digest = hashlib.sha256(
-        json.dumps({"controller": controller, "mode": mode, "model": model},
+        json.dumps({"controller": controller, "mode": mode, "model": model,
+                    "effort": effort},
                    sort_keys=True).encode()).hexdigest()
 
     if sessions_dir:
         os.makedirs(sessions_dir, exist_ok=True)
 
+    runtime_roots = []
+    if sessions_dir:
+        runtime_roots.append(sessions_dir)
+    if worktree is not None and worktree_base:
+        runtime_roots.append(worktree_base)
+
     capability = {
         "inputs": list(instruction_paths or []),
         "outputs": [],
-        "runtime_roots": [sessions_dir] if sessions_dir else [],
+        "runtime_roots": runtime_roots,
         "private_paths": [],
         "guard_required": False,
         "socket": None,
         "kernel_boundary": {"crosses": []},
         "artifact_writes": [],
-        "action_classes": [],
-        "command_adapters": {},
+        "action_classes": list(action_classes or []),
+        "command_adapters": dict(command_adapters or {}),
     }
+
+    if guard_snapshot is None and session_uuid:
+        guard_snapshot = _file_snapshot(
+            state_store.capability_pins_path_for(session_uuid))
 
     binding = {
         "work_id": work_id,
         "controller": controller,
         "model": model,
+        "effort": effort,
         "config_digest": config_digest,
         "instruction_digests": inst_digests,
         "policy_snapshot": policy_snapshot,
@@ -8358,6 +8461,7 @@ def _compile_role_manifest(
         existing is not None
         and (existing.get("status") or {}).get("phase") == "proven"
         and not dispatch_manifest.manifest_is_stale(existing, binding)
+        and _capability_evidence_covered(capability, existing.get("capability"))
     )
     if already_proven and not force_recompile:
         return existing, False
@@ -8501,7 +8605,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               on_first_send_accepted=None,
               reviewer_controller_check_fn=None, headless=False,
               gate_preview=None, save_pending_turn_fn=None,
-              clear_pending_turn_fn=None):
+              clear_pending_turn_fn=None, worktree=None, worktree_base=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -8538,9 +8642,10 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                 role="scout", session_uuid=session_uuid, work_id="scout",
                 controller=cfg["controller"],
                 mode=cfg.get("mode", "implement"),
-                model=cfg.get("model"),
+                model=cfg.get("model"), effort=cfg.get("effort"),
                 instruction_paths=[SCOUT_PROMPT_PATH],
                 sessions_dir=sessions_dir,
+                worktree=worktree, worktree_base=worktree_base,
                 force_recompile=bool(resume_id))
         except Exception:
             _scout_manifest = {}
@@ -8807,7 +8912,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 on_first_send_accepted=None,
                 reviewer_controller_check_fn=None, headless=False,
                 gate_preview=None, save_pending_turn_fn=None,
-                clear_pending_turn_fn=None):
+                clear_pending_turn_fn=None, worktree=None, worktree_base=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -8840,9 +8945,14 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 role="planner", session_uuid=session_uuid, work_id="planner",
                 controller=cfg["controller"],
                 mode=cfg.get("mode", "implement"),
-                model=cfg.get("model"),
+                model=cfg.get("model"), effort=cfg.get("effort"),
                 instruction_paths=[PLANNER_PROMPT_PATH],
                 sessions_dir=sessions_dir,
+                worktree=worktree, worktree_base=worktree_base,
+                # intel_path is the approved scout intel the planner plans
+                # FROM — a real upstream candidate; it changing between
+                # compiles is a genuine revalidation trigger.
+                candidate_snapshot=_file_snapshot(intel_path),
                 force_recompile=bool(resume_id))
         except Exception:
             _planner_manifest = {}
@@ -9122,7 +9232,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 on_first_send_accepted=None,
                 reviewer_controller_check_fn=None, headless=False,
                 gate_preview=None, save_pending_turn_fn=None,
-                clear_pending_turn_fn=None):
+                clear_pending_turn_fn=None, worktree=None, worktree_base=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -9152,13 +9262,27 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     _builder_manifest = None
     if session_uuid:
         try:
+            # baseline_repos is real evidence: run_flow's build_baseline()
+            # already ran `git status --porcelain` against each entry (via
+            # _git_build_baseline) before this dispatch, so a non-empty set
+            # declares the SAME safe, read-only git operation as proof —
+            # never a fabricated one.
             _builder_manifest, _ = _compile_role_manifest(
                 role="builder", session_uuid=session_uuid, work_id="builder",
                 controller=cfg["controller"],
                 mode=cfg.get("mode", "implement"),
-                model=cfg.get("model"),
+                model=cfg.get("model"), effort=cfg.get("effort"),
                 instruction_paths=[BUILDER_PROMPT_PATH],
                 sessions_dir=sessions_dir,
+                worktree=worktree, worktree_base=worktree_base,
+                # plan_json_path is the approved plan the builder builds
+                # FROM — a real upstream candidate; it changing between
+                # compiles is a genuine revalidation trigger.
+                candidate_snapshot=_file_snapshot(plan_json_path),
+                action_classes=["git"] if baseline_repos else [],
+                command_adapters=(
+                    {"git": {"subcommand": "status", "flags": ["--porcelain"]}}
+                    if baseline_repos else {}),
                 force_recompile=bool(resume_id))
         except Exception:
             _builder_manifest = {}
@@ -10136,6 +10260,23 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             io_out.write("cowork: --worktree requires launching inside a git "
                          "work tree; %s is not one.\n" % run_cwd)
             return 2
+    # The real worktree path this session's roles dispatch into, once
+    # created/reused below — None until then (and always None when no
+    # worktree was requested), never invented. Bound to every role manifest
+    # compiled after that point so `binding.worktree`/`check_cwd` reflect the
+    # actual working directory, not the launch directory.
+    active_worktree = None
+    # The real runtime root that CONTAINS active_worktree, derived from the
+    # validated worktree path itself (its own parent directory) rather than
+    # assumed to be worktree_base (the base repo toplevel): roles/worktree.md
+    # documents BOTH a nested convention (base/.worktrees/<name>, a
+    # descendant of worktree_base) AND a sibling convention
+    # (../<repo>-worktrees/<name>, a descendant of worktree_base's PARENT,
+    # not of worktree_base itself). Taking the validated worktree's own
+    # dirname is correct for either convention (or any other a repo
+    # documents) without broadening trust beyond what was actually created
+    # and independently verified by validate_worktree.
+    active_worktree_root = None
 
     # Session store: select which of the directory's sessions this run uses
     # (resume-or-new prompt, --new/--resume, picker) BEFORE any team/config/phase
@@ -10465,14 +10606,20 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             _sw_cfg = config.get(role) or {}
             _sw_sdir = state_store.session_assets_dir(session_uuid)
             try:
+                _sw_artifacts = switch_artifacts_for(role)
                 _sw_manifest, _ = _compile_role_manifest(
                     role=role, session_uuid=session_uuid, work_id=role,
                     controller=target,
                     mode=_sw_cfg.get("mode", "implement"),
-                    model=_sw_cfg.get("model"),
+                    model=_sw_cfg.get("model"), effort=_sw_cfg.get("effort"),
                     instruction_paths=[ROLE_PROMPT_PATHS.get(role)
                                        or SCOUT_PROMPT_PATH],
-                    sessions_dir=_sw_sdir, force_recompile=True)
+                    sessions_dir=_sw_sdir,
+                    worktree=active_worktree, worktree_base=active_worktree_root,
+                    candidate_snapshot=(
+                        _file_snapshot(_sw_artifacts[0])
+                        if _sw_artifacts else None),
+                    force_recompile=True)
             except Exception:
                 _sw_manifest = {}
             _swmdec = _decide_and_trace(
@@ -10550,14 +10697,20 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             _disp_cfg = config.get(role) or {}
             _disp_sdir = state_store.session_assets_dir(session_uuid)
             try:
+                _disp_artifacts = switch_artifacts_for(role)
                 _disp_manifest, _ = _compile_role_manifest(
                     role=role, session_uuid=session_uuid, work_id=role,
                     controller=controller,
                     mode=_disp_cfg.get("mode", "implement"),
-                    model=_disp_cfg.get("model"),
+                    model=_disp_cfg.get("model"), effort=_disp_cfg.get("effort"),
                     instruction_paths=[ROLE_PROMPT_PATHS.get(role)
                                        or SCOUT_PROMPT_PATH],
-                    sessions_dir=_disp_sdir, force_recompile=False)
+                    sessions_dir=_disp_sdir,
+                    worktree=active_worktree, worktree_base=active_worktree_root,
+                    candidate_snapshot=(
+                        _file_snapshot(_disp_artifacts[0])
+                        if _disp_artifacts else None),
+                    force_recompile=False)
             except Exception:
                 _disp_manifest = {}
             _dispdec = _decide_and_trace(
@@ -11189,6 +11342,12 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # the build baseline.
         os.chdir(wt_path)
         run_cwd = wt_path
+        active_worktree = wt_path
+        # wt_path is already validate_worktree()'s realpath'd, git-registered
+        # result (fresh-create or reuse alike) — its own dirname is a real,
+        # already-existing directory that strictly contains it by
+        # construction, whichever worktree convention the repo used.
+        active_worktree_root = os.path.dirname(wt_path)
         trace.event("worktree.redirect", cwd=wt_path)
         io_out.write("cowork: running inside worktree %s (branch %s)\n"
                      % (wt_path, wt_branch))
@@ -11542,6 +11701,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     "scout", planner_on_team, session_enabled),
                 save_pending_turn_fn=save_pending_turn_for,
                 clear_pending_turn_fn=clear_pending_switch_for,
+                worktree=active_worktree, worktree_base=active_worktree_root,
                 on_outcome=lambda o, p=None: outcome_box.update(
                     outcome=o, payload=p))
             if rc != 0:
@@ -11627,6 +11787,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     "planner", builder_on_team, session_enabled),
                 save_pending_turn_fn=save_pending_turn_for,
                 clear_pending_turn_fn=clear_pending_switch_for,
+                worktree=active_worktree, worktree_base=active_worktree_root,
                 on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
             if rc != 0:
                 action = recover_controller_failure("planner", "startup_or_probe")
@@ -11745,6 +11906,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 "builder", builder_on_team, session_enabled),
             save_pending_turn_fn=save_pending_turn_for,
             clear_pending_turn_fn=clear_pending_switch_for,
+            worktree=active_worktree, worktree_base=active_worktree_root,
             on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
         if rc != 0:
             action = recover_controller_failure("builder", "startup_or_probe")

@@ -31,7 +31,12 @@ from cowork_action_policy import (
     SHELL_META, REDIRECT, SAFE_GIT_FLAGS, _safe_flag, _real, _inside,
 )
 
-SCHEMA_VERSION = 1
+# v2 (M1 production repair): binding.effort joined controller/model/mode as
+# dispatch identity. A v1 manifest on disk lacks binding.effort, so
+# _validate_manifest's exact-key check on binding rejects it outright —
+# load_manifest returns None, which the compiler treats as "no manifest" and
+# recompiles fresh rather than silently reusing stale v1 facts.
+SCHEMA_VERSION = 2
 
 # Allowed phases for the status block.
 _STATUS_PHASES = frozenset({"compiling", "proven", "refused"})
@@ -55,7 +60,7 @@ _CAPABILITY_KEYS = frozenset({
 
 # Required binding sub-keys.
 _BINDING_KEYS = frozenset({
-    "work_id", "controller", "model", "config_digest",
+    "work_id", "controller", "model", "effort", "config_digest",
     "instruction_digests", "policy_snapshot",
     "worktree", "candidate_snapshot", "guard_snapshot",
 })
@@ -283,6 +288,9 @@ def _validate_binding(bind):
     model = bind.get("model")
     if model is not None and not isinstance(model, str):
         raise ValueError("binding.model must be a string or null")
+    effort = bind.get("effort")
+    if effort is not None and not isinstance(effort, str):
+        raise ValueError("binding.effort must be a string or null")
     if not isinstance(bind.get("config_digest"), str):
         raise ValueError("binding.config_digest must be a string")
     if not isinstance(bind.get("instruction_digests"), dict):

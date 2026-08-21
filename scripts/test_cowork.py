@@ -12172,6 +12172,27 @@ class WorktreeFlowTest(unittest.TestCase):
                                "branch": name}}
         return fn
 
+    def _creating_fn_sibling(self, calls):
+        """A run_worktree_fn that really creates the worktree as a SIBLING
+        of the base repo (`../<repo>-worktrees/<name>`) — the OTHER
+        convention roles/worktree.md documents when the repo declares none of
+        its own. Regression coverage for CAP-BIND-001: a sibling worktree is
+        NOT a descendant of the base repo toplevel."""
+        def fn(wt_config, status_path, base, name, explicit, **kw):
+            calls.append({"base": base, "name": name, "explicit": explicit,
+                          "controller": wt_config["controller"]})
+            parent = os.path.dirname(base)
+            path = os.path.join(
+                parent, os.path.basename(base) + "-worktrees", name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            subprocess.run(
+                ["git", "-C", base, "worktree", "add", path, "-b", name],
+                check=True, capture_output=True)
+            return {"status": "ready",
+                    "result": {"worktree_path": os.path.realpath(path),
+                               "branch": name}}
+        return fn
+
     def test_gate_outside_git_repo_is_rc2(self):
         import tempfile
         nongit = os.path.realpath(tempfile.mkdtemp())
@@ -12220,6 +12241,69 @@ class WorktreeFlowTest(unittest.TestCase):
         self.assertEqual(seen["cwd"],
                          os.path.realpath(os.path.join(repo, ".worktrees",
                                                        "feat")))
+
+    def test_creates_and_redirects_into_sibling_worktree_and_proves(self):
+        # CAP-BIND-001 regression: drives the REAL --worktree/run_flow path
+        # with a worktree created as a SIBLING of the base repo (the OTHER
+        # documented convention, roles/worktree.md), then reproduces the
+        # exact real (worktree, worktree_base) facts run_flow computed
+        # through the REAL `_compile_role_manifest` compiler + preflight to
+        # prove the resulting manifest is proven, not wrongly refused for
+        # cwd just because the worktree is not nested under the base repo.
+        repo = self._repo()
+        os.chdir(repo)
+        spath = os.path.join(repo, ".cowork", "session.json")
+        calls = []
+        captured = {}
+
+        def scout_capture(config, context, selected, session_uuid=None,
+                          worktree=None, worktree_base=None, **kw):
+            captured["session_uuid"] = session_uuid
+            captured["worktree"] = worktree
+            captured["worktree_base"] = worktree_base
+            captured["cwd"] = os.path.realpath(os.getcwd())
+            return 0
+
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--wt-controller", "codex",
+                        "--team", "scout", "--context", "x",
+                        "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=scout_capture,
+            run_worktree_fn=self._creating_fn_sibling(calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        sibling_path = os.path.realpath(os.path.join(
+            os.path.dirname(repo), os.path.basename(repo) + "-worktrees",
+            "feat"))
+        self.assertEqual(captured["cwd"], sibling_path)
+        self.assertEqual(captured["worktree"], sibling_path)
+        self.assertIsNotNone(captured["session_uuid"])
+        self.assertIsNotNone(captured["worktree_base"])
+        # The sibling worktree is NOT contained by the base repo toplevel —
+        # binding the base repo as the runtime root (the pre-fix behavior)
+        # would make every dispatch under this documented convention
+        # wrongly refuse.
+        self.assertNotEqual(
+            os.path.realpath(captured["worktree_base"]),
+            os.path.realpath(repo))
+        self.assertTrue(
+            sibling_path.startswith(
+                os.path.realpath(captured["worktree_base"]) + os.sep),
+            "the declared runtime root must actually contain the worktree")
+
+        manifest, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=captured["session_uuid"],
+            work_id="scout", controller="codex", mode="implement",
+            model=None,
+            sessions_dir=state_store.session_assets_dir(
+                captured["session_uuid"]),
+            worktree=captured["worktree"],
+            worktree_base=captured["worktree_base"])
+        self.assertEqual(
+            manifest["status"]["phase"], "proven",
+            "a documented sibling-layout worktree must not be refused by "
+            "cwd preflight: %r" % (manifest["status"].get("refusal"),))
 
     def test_validation_failure_no_chdir_rc2(self):
         repo = self._repo()
@@ -32724,6 +32808,7 @@ def _minimal_binding(work_id="wk-001"):
         "work_id": work_id,
         "controller": "claude",
         "model": "claude-sonnet-4-6",
+        "effort": None,
         "config_digest": "a" * 64,
         "instruction_digests": {"goal": "b" * 64},
         "policy_snapshot": {"allowed": ["claude"]},
@@ -32764,10 +32849,10 @@ class ManifestSchemaTest(unittest.TestCase):
                     "binding", "status", "digest"):
             self.assertIn(key, m)
 
-    def test_compile_schema_version_is_1(self):
+    def test_compile_schema_version_is_2(self):
         m = manifest_mod.compile_manifest(
             "wk-001", _minimal_capability(), _minimal_binding())
-        self.assertEqual(m["schema_version"], 1)
+        self.assertEqual(m["schema_version"], 2)
 
     def test_compile_default_status_is_compiling(self):
         m = manifest_mod.compile_manifest(
@@ -33005,7 +33090,7 @@ class ManifestSchemaTest(unittest.TestCase):
         manifest_mod.persist_manifest(path, m)
         with open(path) as fh:
             data = json.load(fh)
-        self.assertEqual(data["schema_version"], 1)
+        self.assertEqual(data["schema_version"], 2)
 
     def test_persist_no_leftover_tmp_on_success(self):
         m = manifest_mod.compile_manifest(
@@ -33052,6 +33137,22 @@ class ManifestSchemaTest(unittest.TestCase):
             "wk-sv", _minimal_capability(), _minimal_binding("wk-sv"))
         m["schema_version"] = 99
         path = os.path.join(self._td, "wrong_sv.json")
+        with open(path, "w") as fh:
+            json.dump(m, fh)
+        self.assertIsNone(manifest_mod.load_manifest(path))
+
+    def test_load_legacy_v1_manifest_without_effort_returns_none(self):
+        # A manifest persisted by the pre-M1 (v1) compiler has no
+        # binding.effort and is stamped schema_version=1 — load_manifest
+        # must fail closed (never silently reuse stale v1 facts), which
+        # forces the caller to recompile fresh with the current contract.
+        m = manifest_mod.compile_manifest(
+            "wk-legacy", _minimal_capability(), _minimal_binding("wk-legacy"))
+        legacy_binding = dict(m["binding"])
+        del legacy_binding["effort"]
+        m["binding"] = legacy_binding
+        m["schema_version"] = 1
+        path = os.path.join(self._td, "legacy_v1.json")
         with open(path, "w") as fh:
             json.dump(m, fh)
         self.assertIsNone(manifest_mod.load_manifest(path))
@@ -33160,6 +33261,7 @@ class ManifestSchemaTest(unittest.TestCase):
             "work_id": "wk-full",
             "controller": "codex",
             "model": "gpt-4o",
+            "effort": "high",
             "config_digest": "e" * 64,
             "instruction_digests": {"system": "f" * 64, "goal": "g" * 64},
             "policy_snapshot": {"allowed": ["codex"], "source": "cli"},
@@ -33169,8 +33271,36 @@ class ManifestSchemaTest(unittest.TestCase):
         }
         m = manifest_mod.compile_manifest("wk-full", _minimal_capability(), bind)
         self.assertEqual(m["binding"]["worktree"], "/tmp/feat-branch")
+        self.assertEqual(m["binding"]["effort"], "high")
         self.assertEqual(m["binding"]["candidate_snapshot"]["sha256"], "h" * 64)
         self.assertEqual(m["binding"]["guard_snapshot"]["nonce"], "abc123")
+
+    def test_binding_effort_null_allowed(self):
+        bind = dict(_minimal_binding("wk-ef"))
+        bind["effort"] = None
+        m = manifest_mod.compile_manifest("wk-ef", _minimal_capability(), bind)
+        self.assertIsNone(m["binding"]["effort"])
+
+    def test_binding_effort_non_string_raises(self):
+        bind = dict(_minimal_binding("wk-ef2"))
+        bind["effort"] = 3
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-ef2", _minimal_capability(), bind)
+
+    def test_binding_missing_effort_raises(self):
+        bind = dict(_minimal_binding("wk-ef3"))
+        del bind["effort"]
+        with self.assertRaises(ValueError):
+            manifest_mod.compile_manifest("wk-ef3", _minimal_capability(), bind)
+
+    def test_digest_changes_on_effort_change(self):
+        b1 = dict(_minimal_binding("wk-ef4"))
+        b1["effort"] = "low"
+        b2 = dict(_minimal_binding("wk-ef4"))
+        b2["effort"] = "high"
+        m1 = manifest_mod.compile_manifest("wk-ef4", _minimal_capability(), b1)
+        m2 = manifest_mod.compile_manifest("wk-ef4", _minimal_capability(), b2)
+        self.assertNotEqual(m1["digest"], m2["digest"])
 
     def test_binding_missing_key_raises(self):
         bind = dict(_minimal_binding("wk-mn"))
@@ -34416,6 +34546,18 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
             "manifest.%s.json" % wid)
         self.addCleanup(
             setattr, state_store, "manifest_path_for", self._orig_manifest_path)
+        # session_assets_dir (used by the compiler's default guard_snapshot
+        # read of capability-pins.json) is COWORK_SESSIONS_ROOT-overridable —
+        # sandbox it so no test ever touches the real home directory.
+        self._orig_sessions_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = os.path.join(self._td, "sessions")
+        self.addCleanup(self._restore_sessions_root)
+
+    def _restore_sessions_root(self):
+        if self._orig_sessions_root is None:
+            os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        else:
+            os.environ["COWORK_SESSIONS_ROOT"] = self._orig_sessions_root
 
     def _trace(self, name):
         tpath = os.path.join(self._td, name + ".trace.jsonl")
@@ -34624,8 +34766,14 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
             role=cowork.SCOUT_REVIEWER, session_uuid=self._session_uuid,
             work_id=cowork.SCOUT_REVIEWER, controller="claude",
             mode=cfg[cowork.SCOUT_REVIEWER].get("mode", "implement"),
-            model=None, instruction_paths=[cowork.SCOUT_REVIEWER_PROMPT_PATH],
-            sessions_dir=self._td, force_recompile=False)
+            model=None, effort=cfg[cowork.SCOUT_REVIEWER].get("effort"),
+            instruction_paths=[cowork.SCOUT_REVIEWER_PROMPT_PATH],
+            sessions_dir=self._td,
+            # run_reviewer_once binds candidate_snapshot from the artifact it
+            # reviews (intel) — the reproduction must supply the same real
+            # fact to land on the SAME binding/digest as the live call.
+            candidate_snapshot=cowork._file_snapshot(intel),
+            force_recompile=False)
         self.assertEqual((manifest.get("status") or {}).get("phase"),
                          "proven")
 
@@ -35087,10 +35235,11 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
             command_adapters={"exec": ["git", "status", "-s", "--branch"]})
 
     def test_worktree_default_dispatch_unaffected_by_new_validators(self):
-        # No git/tool/exec action class and no worktree declared: the four
-        # new validators are all inapplicable, exactly as every current
-        # production role dispatch presents today. P1-P4 behavior (proven +
-        # allow + spawn) is unchanged.
+        # No injected override here: run_worktree's OWN real "git" evidence
+        # (rev-parse --show-toplevel, the same call that already produced
+        # base_toplevel) is a safe, allowlisted operation, so cwd/tool/exec
+        # stay inapplicable and P1-P4 behavior (proven + allow + spawn) is
+        # unchanged.
         self._worktree_allow_case()
 
 
@@ -35296,3 +35445,449 @@ class ManifestBindingFlowGateTest(ControllerPolicyTestBase):
         self.assertEqual(
             [e for e in events if e.get("event") == "role.prompt.bytes"], [],
             "zero full-prompt bytes when compile raises")
+
+
+# ===========================================================================
+# ManifestCapabilityPopulationTest — M1 production repair
+# ===========================================================================
+#
+# P5-v3 found `_compile_role_manifest` always compiling empty
+# action_classes/command_adapters and never binding effort/worktree/
+# candidate_snapshot/guard_snapshot, so the P2/P3 preflight validators wired
+# in earlier packages never actually fired from a real compiler caller. These
+# tests drive the REAL `_compile_role_manifest` compiler and real role
+# dispatch sites (never a fabricated compile/preflight/refusal decision) to
+# prove every fact is now populated, real evidence blocks before model
+# activity, and effort/candidate/worktree/guard changes force recompile.
+
+class ManifestCapabilityPopulationTest(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td, True)
+        self._session_uuid = str(uuid.uuid4())
+        self._orig_manifest_path = state_store.manifest_path_for
+        state_store.manifest_path_for = lambda suuid, wid: os.path.join(
+            self._td, "manifests", "manifest.%s.json" % wid)
+        self.addCleanup(
+            setattr, state_store, "manifest_path_for", self._orig_manifest_path)
+        # session_assets_dir (used by the compiler's default guard_snapshot
+        # read of capability-pins.json) is COWORK_SESSIONS_ROOT-overridable —
+        # sandbox it so no test ever touches the real home directory.
+        self._orig_sessions_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = os.path.join(self._td, "sessions")
+        self.addCleanup(self._restore_sessions_root)
+
+    def _restore_sessions_root(self):
+        if self._orig_sessions_root is None:
+            os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        else:
+            os.environ["COWORK_SESSIONS_ROOT"] = self._orig_sessions_root
+
+    # ------------------------------------------------------------------ #
+    # effort                                                              #
+    # ------------------------------------------------------------------ #
+
+    def test_effort_binds_and_change_forces_recompile(self):
+        m1, recompiled1 = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="w-effort",
+            controller="claude", mode="implement", model="m1", effort="low",
+            sessions_dir=self._td)
+        self.assertTrue(recompiled1)
+        self.assertEqual(m1["binding"]["effort"], "low")
+        self.assertEqual(m1["status"]["phase"], "proven")
+
+        # Identical inputs reuse the proven manifest (no spurious recompile).
+        m2, recompiled2 = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="w-effort",
+            controller="claude", mode="implement", model="m1", effort="low",
+            sessions_dir=self._td)
+        self.assertFalse(recompiled2)
+        self.assertEqual(m1["digest"], m2["digest"])
+
+        # Effort alone changing must force recompile/revalidation.
+        m3, recompiled3 = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="w-effort",
+            controller="claude", mode="implement", model="m1", effort="high",
+            sessions_dir=self._td)
+        self.assertTrue(recompiled3, "an effort change must force recompile")
+        self.assertNotEqual(m1["digest"], m3["digest"])
+        self.assertEqual(m3["binding"]["effort"], "high")
+
+    # ------------------------------------------------------------------ #
+    # worktree / runtime_roots                                            #
+    # ------------------------------------------------------------------ #
+
+    def test_worktree_strict_descendant_of_real_root_proves(self):
+        base = os.path.join(self._td, "repo")
+        wt = os.path.join(base, ".worktrees", "feat")
+        os.makedirs(wt)
+        m, _ = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="w-wt-ok", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            worktree=wt, worktree_base=base)
+        self.assertEqual(m["status"]["phase"], "proven")
+        self.assertIn(base, m["capability"]["runtime_roots"])
+        self.assertEqual(m["binding"]["worktree"], wt)
+
+    def test_worktree_not_under_declared_root_fails_closed(self):
+        # `wt` lives OUTSIDE both declared roots (worktree_base AND
+        # sessions_dir) — neither is an ancestor, so preflight must refuse
+        # rather than trust the declared worktree on its own say-so.
+        base = os.path.join(self._td, "repo")
+        os.makedirs(base)
+        elsewhere = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        wt = os.path.join(elsewhere, "not-under-base")
+        os.makedirs(wt)
+        m, _ = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="w-wt-bad", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            worktree=wt, worktree_base=base)
+        self.assertEqual(m["status"]["phase"], "refused")
+        self.assertEqual(m["status"]["refusal"]["code"], "cwd")
+
+    def test_no_worktree_leaves_runtime_roots_unbroadened(self):
+        m, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-wt-none", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td)
+        self.assertEqual(m["capability"]["runtime_roots"], [self._td])
+        self.assertIsNone(m["binding"]["worktree"])
+
+    def test_worktree_change_forces_recompile(self):
+        base = os.path.join(self._td, "repo")
+        wt1 = os.path.join(base, ".worktrees", "one")
+        wt2 = os.path.join(base, ".worktrees", "two")
+        os.makedirs(wt1)
+        os.makedirs(wt2)
+        m1, r1 = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="w-wt-chg", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            worktree=wt1, worktree_base=base)
+        self.assertTrue(r1)
+        m2, r2 = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="w-wt-chg", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            worktree=wt2, worktree_base=base)
+        self.assertTrue(r2, "a worktree change must force recompile")
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    # ------------------------------------------------------------------ #
+    # candidate_snapshot                                                  #
+    # ------------------------------------------------------------------ #
+
+    def test_candidate_snapshot_none_when_not_applicable(self):
+        m, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-cand-none", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td)
+        self.assertIsNone(m["binding"]["candidate_snapshot"])
+
+    def test_candidate_snapshot_content_change_forces_recompile(self):
+        intel_path = os.path.join(self._td, "intel.json")
+        with open(intel_path, "w") as fh:
+            fh.write('{"v": 1}')
+        m1, r1 = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="w-cand", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            candidate_snapshot=cowork._file_snapshot(intel_path))
+        self.assertTrue(r1)
+        self.assertEqual(m1["binding"]["candidate_snapshot"]["path"], intel_path)
+        self.assertIsNotNone(m1["binding"]["candidate_snapshot"]["sha256"])
+
+        with open(intel_path, "w") as fh:
+            fh.write('{"v": 2}')
+        m2, r2 = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="w-cand", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            candidate_snapshot=cowork._file_snapshot(intel_path))
+        self.assertTrue(r2, "candidate artifact content change must force "
+                            "recompile")
+        self.assertNotEqual(m1["digest"], m2["digest"])
+        self.assertNotEqual(
+            m1["binding"]["candidate_snapshot"]["sha256"],
+            m2["binding"]["candidate_snapshot"]["sha256"])
+
+    def test_planner_dispatch_binds_real_candidate_snapshot_of_intel(self):
+        intel_path = os.path.join(self._td, "scout.intel.json")
+        with open(intel_path, "w") as fh:
+            fh.write('{"result": {}}')
+        config = {"planner": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+
+        def factory(controller, session_id=None, resume_id=None,
+                   on_session_id=None):
+            class _S:
+                def send(self, t, meta=None):
+                    return {"ok": True, "result": "ok"}
+                def close(self):
+                    pass
+            return _S()
+
+        cowork.run_planner(
+            config, "", ["planner"], io_in=io.StringIO("end\n"),
+            io_out=io.StringIO(), session_factory=factory,
+            resume_id="resumed-thread", session_uuid=self._session_uuid,
+            intel_path=intel_path)
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(self._session_uuid, "planner"))
+        self.assertEqual(manifest["status"]["phase"], "proven")
+        self.assertEqual(
+            manifest["binding"]["candidate_snapshot"]["path"], intel_path)
+        self.assertEqual(
+            manifest["binding"]["candidate_snapshot"]["sha256"],
+            hashlib.sha256(b'{"result": {}}').hexdigest())
+
+    # ------------------------------------------------------------------ #
+    # guard_snapshot                                                      #
+    # ------------------------------------------------------------------ #
+
+    def test_guard_snapshot_defaults_from_capability_pins(self):
+        m, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-guard-none", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td)
+        snap = m["binding"]["guard_snapshot"]
+        self.assertIsNotNone(snap)
+        self.assertEqual(
+            snap["path"],
+            state_store.capability_pins_path_for(self._session_uuid))
+        self.assertIsNone(snap["sha256"], "no pins file yet: applicable but "
+                                          "no evidence, not fabricated")
+
+    def test_guard_snapshot_change_forces_recompile(self):
+        pins_path = state_store.capability_pins_path_for(self._session_uuid)
+        os.makedirs(os.path.dirname(pins_path), exist_ok=True)
+        m1, r1 = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-guard-chg", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td)
+        self.assertTrue(r1)
+        self.assertIsNone(m1["binding"]["guard_snapshot"]["sha256"])
+
+        with open(pins_path, "w") as fh:
+            json.dump({"capabilities": []}, fh)
+        m2, r2 = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-guard-chg", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td)
+        self.assertTrue(r2, "a pinned capability allowlist change must "
+                            "force recompile")
+        self.assertIsNotNone(m2["binding"]["guard_snapshot"]["sha256"])
+        self.assertNotEqual(m1["digest"], m2["digest"])
+
+    def test_guard_snapshot_explicit_override_respected(self):
+        override = {"nonce": "abc123", "socket": "/tmp/s.sock"}
+        m, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-guard-override", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td, guard_snapshot=override)
+        self.assertEqual(m["binding"]["guard_snapshot"], override)
+
+    # ------------------------------------------------------------------ #
+    # action_classes / command_adapters — real production git evidence   #
+    # ------------------------------------------------------------------ #
+
+    def test_worktree_dispatch_declares_real_git_evidence_and_proves(self):
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        spawn_calls = []
+
+        def factory(controller):
+            spawn_calls.append(controller)
+
+            class _S:
+                def send(self, t):
+                    pass
+                def close(self):
+                    pass
+            return _S()
+
+        status_path = os.path.join(self._td, "wt.status.json")
+        cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            extra_writable_dir=self._td)
+        self.assertEqual(spawn_calls, ["claude"])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(
+                self._session_uuid, cowork.WORKTREE_ROLE))
+        self.assertEqual(manifest["status"]["phase"], "proven")
+        self.assertEqual(manifest["capability"]["action_classes"], ["git"])
+        self.assertEqual(
+            manifest["capability"]["command_adapters"]["git"],
+            {"subcommand": "rev-parse", "flags": ["--show-toplevel"]})
+
+    def test_builder_dispatch_declares_real_git_evidence_from_baseline(self):
+        config = {"builder": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+
+        def factory(controller, session_id=None, resume_id=None,
+                   on_session_id=None):
+            class _S:
+                def send(self, t, meta=None):
+                    return {"ok": True, "result": "ok"}
+                def close(self):
+                    pass
+            return _S()
+
+        cowork.run_builder(
+            config, "", ["builder"], io_in=io.StringIO("end\n"),
+            io_out=io.StringIO(), session_factory=factory,
+            resume_id="resumed-thread", session_uuid=self._session_uuid,
+            baseline_repos=[{"path": self._td, "has_head": True}])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(self._session_uuid, "builder"))
+        self.assertEqual(manifest["status"]["phase"], "proven")
+        self.assertEqual(manifest["capability"]["action_classes"], ["git"])
+        self.assertEqual(
+            manifest["capability"]["command_adapters"]["git"],
+            {"subcommand": "status", "flags": ["--porcelain"]})
+
+    def test_pre_launch_reuse_does_not_lose_builders_git_evidence(self):
+        # CAP-BIND-002 regression. The pre-launch gate
+        # (ensure_controller_dispatchable) is role-generic: it compiles
+        # FIRST, with no capability evidence of its own, using EXACTLY the
+        # shape it really uses (mirrored here: same role/work_id, same
+        # instruction path, same candidate_snapshot source). run_builder
+        # then compiles SECOND, with real git evidence from the build
+        # baseline. Binding is identical between the two real compiles (same
+        # controller/model/effort/worktree/candidate), so a staleness-only
+        # reuse check would let run_builder silently return the first,
+        # empty-capability, already-proven manifest — losing the git
+        # evidence. Drives the REAL `_compile_role_manifest` (the pre-launch
+        # call) followed by the REAL `run_builder` with resume_id=None (so
+        # force_recompile=False on both, the exact condition that reuses),
+        # and asserts the PERSISTED manifest still carries the git evidence.
+        plan_json_path = os.path.join(self._td, "plan.json")
+        with open(plan_json_path, "w") as fh:
+            fh.write('{"result": {}}')
+
+        pre_manifest, pre_recompiled = cowork._compile_role_manifest(
+            role="builder", session_uuid=self._session_uuid,
+            work_id="builder", controller="claude", mode="implement",
+            model=None, effort=None,
+            instruction_paths=[cowork.BUILDER_PROMPT_PATH],
+            sessions_dir=state_store.session_assets_dir(self._session_uuid),
+            candidate_snapshot=cowork._file_snapshot(plan_json_path),
+            force_recompile=False)
+        self.assertTrue(pre_recompiled)
+        self.assertEqual(pre_manifest["status"]["phase"], "proven")
+        self.assertEqual(pre_manifest["capability"]["action_classes"], [],
+                         "the pre-launch gate is role-generic: no evidence "
+                         "of its own")
+
+        config = {"builder": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+
+        def factory(controller, session_id=None, resume_id=None,
+                   on_session_id=None):
+            class _S:
+                def send(self, t, meta=None):
+                    return {"ok": True, "result": "ok"}
+                def close(self):
+                    pass
+            return _S()
+
+        cowork.run_builder(
+            config, "", ["builder"], io_in=io.StringIO("end\n"),
+            io_out=io.StringIO(), session_factory=factory,
+            resume_id=None, session_uuid=self._session_uuid,
+            plan_json_path=plan_json_path,
+            baseline_repos=[{"path": self._td, "has_head": True}])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(self._session_uuid, "builder"))
+        self.assertEqual(manifest["status"]["phase"], "proven")
+        self.assertEqual(
+            manifest["capability"]["action_classes"], ["git"],
+            "run_builder's real git evidence must not be lost to the "
+            "pre-launch gate's earlier, evidence-free compile")
+        self.assertEqual(
+            manifest["capability"]["command_adapters"]["git"],
+            {"subcommand": "status", "flags": ["--porcelain"]})
+
+    def test_builder_dispatch_without_baseline_repos_declares_no_git(self):
+        # No repos in the build baseline: no real evidence to declare, so
+        # action_classes stays empty exactly as every other role today —
+        # never a permissive constant standing in for real evidence.
+        config = {"builder": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+
+        def factory(controller, session_id=None, resume_id=None,
+                   on_session_id=None):
+            class _S:
+                def send(self, t, meta=None):
+                    return {"ok": True, "result": "ok"}
+                def close(self):
+                    pass
+            return _S()
+
+        cowork.run_builder(
+            config, "", ["builder"], io_in=io.StringIO("end\n"),
+            io_out=io.StringIO(), session_factory=factory,
+            resume_id="resumed-thread", session_uuid=self._session_uuid,
+            baseline_repos=[])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(self._session_uuid, "builder"))
+        self.assertEqual(manifest["status"]["phase"], "proven")
+        self.assertEqual(manifest["capability"]["action_classes"], [])
+        self.assertEqual(manifest["capability"]["command_adapters"], {})
+
+    # ------------------------------------------------------------------ #
+    # missing evidence refuses before model activity (the compiler seam) #
+    # ------------------------------------------------------------------ #
+
+    def test_declared_git_without_adapter_evidence_refuses_before_proven(self):
+        m, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-missing-git", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            action_classes=["git"])
+        self.assertEqual(m["status"]["phase"], "refused")
+        self.assertEqual(m["status"]["refusal"]["code"], "git_operation")
+
+    def test_declared_tool_without_adapter_evidence_refuses_before_proven(self):
+        m, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-missing-tool", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            action_classes=["tool"])
+        self.assertEqual(m["status"]["phase"], "refused")
+        self.assertEqual(m["status"]["refusal"]["code"], "rtk_present")
+
+    def test_declared_exec_without_adapter_evidence_refuses_before_proven(self):
+        m, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid,
+            work_id="w-missing-exec", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td,
+            action_classes=["exec"])
+        self.assertEqual(m["status"]["phase"], "refused")
+        self.assertEqual(m["status"]["refusal"]["code"], "argv_form")
+
+    def test_unrelated_role_declares_no_action_classes_by_default(self):
+        # Bullet 7: an unrelated role's manifest stays byte-for-byte
+        # compatible — no git/tool declared just because the mechanism now
+        # exists.
+        m, _ = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="w-unrelated", controller="claude", mode="implement",
+            model=None, sessions_dir=self._td)
+        self.assertEqual(m["capability"]["action_classes"], [])
+        self.assertEqual(m["capability"]["command_adapters"], {})
+        self.assertEqual(m["status"]["phase"], "proven")
