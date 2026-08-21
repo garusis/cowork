@@ -1,18 +1,24 @@
 {
   "_readme": [
     "Versioned characterization of every controller-dispatch source in cowork,",
-    "as it behaves TODAY (M0-B baseline). Each entry's `record` is compared",
-    "against a record produced by EXECUTING the source in",
+    "as it behaves TODAY. Each entry's `record` is compared against a record",
+    "produced by EXECUTING the source in",
     "scripts/test_dispatch_contract_characterization.py — it is not a static",
     "inventory and it is not derived from source text. When M0-C extracts the",
     "DispatchContract gateway/reducer, any divergence here is a behavior change",
     "that must be justified, not silently absorbed.",
     "`policy_block` names what the source does when cowork_policy forbids the",
     "requested controller. Note the three different answers: that divergence IS",
-    "the missing gateway."
+    "the missing gateway.",
+    "v2 (M1 P5): rebaselined onto the signed capability-binding repair",
+    "(binding.effort joins the manifest schema at SCHEMA_VERSION=2). All nine",
+    "sources are additionally exercised by BackendCriterion1Test in",
+    "scripts/test_dispatch_contract_characterization.py, which proves each one",
+    "non-vacuously against real manifest-bound allows and real production",
+    "refusals — not just the M0-B record shape pinned below."
   ],
-  "version": 1,
-  "base_commit": "aa1ebb6f5d41e0396ed8cb7cc9b5bc9edb82db31",
+  "version": 2,
+  "base_commit": "e07b7ee3c6e0e47654fe3e72b43e35e8ee9102da",
   "sources": {
     "fresh": {
       "gap": 1,

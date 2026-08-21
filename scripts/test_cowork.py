@@ -35891,3 +35891,922 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
         self.assertEqual(m["capability"]["action_classes"], [])
         self.assertEqual(m["capability"]["command_adapters"], {})
         self.assertEqual(m["status"]["phase"], "proven")
+
+
+# ---------------------------------------------------------------------------
+# M1 P5-v4: real fault injection through the production dispatch fence.
+#
+# All eleven named faults are driven through the REAL compiled manifest, the
+# REAL `run_manifest_preflight`, and the REAL `run_worktree`/`run_flow`
+# dispatch fence delivered by P2-v3/P4/the capability-binding repair — never
+# a hypothetical refusal factory and never an absence-of-caller assertion.
+# Each fault proves the exact production refusal capability/code, zero
+# controller spawns, and zero full-prompt bytes wherever preflight blocks.
+# ---------------------------------------------------------------------------
+
+class FaultInjectionManifestTest(unittest.TestCase):
+    """Faults 1-10: every one is a real capability/binding fact fed to the
+    unmodified `compile_manifest` + `run_manifest_preflight` fence, driven
+    through the real `run_worktree` production dispatch. `_inject` patches
+    only the FACTS a real caller would supply (capability fields, binding
+    fields) — the validators themselves (`validate_git_operation`,
+    `validate_cwd`, `validate_rtk_present`, `validate_argv_form`,
+    `check_runtime_roots`, `check_guard_socket`, `check_codex_config_freshness`,
+    `check_artifact_destinations`, `check_private_paths`) run for real."""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td, True)
+        self._session_uuid = str(uuid.uuid4())
+        mdir = os.path.join(self._td, "sessions", self._session_uuid,
+                            "manifests")
+        os.makedirs(mdir, exist_ok=True)
+        self._orig_manifest_path = state_store.manifest_path_for
+        state_store.manifest_path_for = lambda suuid, wid: os.path.join(
+            self._td, "sessions", suuid, "manifests",
+            "manifest.%s.json" % wid)
+        self.addCleanup(
+            setattr, state_store, "manifest_path_for",
+            self._orig_manifest_path)
+        old_home = os.environ.get("CODEX_HOME")
+        self.addCleanup(self._restore_codex_home, old_home)
+
+    def _restore_codex_home(self, old):
+        if old is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = old
+
+    def _trace(self, name):
+        tpath = os.path.join(self._td, name + ".trace.jsonl")
+        return tpath, trace_store.Trace(tpath, session_uuid=name, run_id="R")
+
+    def _trace_events(self, tpath):
+        if not os.path.exists(tpath):
+            return []
+        with open(tpath, "r", encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _refusals(self, events):
+        return [e for e in events if e.get("event") == "dispatch.decision"
+                and e.get("site") == "run_worktree"
+                and e.get("outcome") == "refuse"]
+
+    def _inject(self, action_classes=None, command_adapters=None,
+               worktree=None, artifact_writes=None, guard_required=None,
+               socket=None, runtime_roots=None, private_paths=None):
+        """Patch `compile_manifest` so the NEXT compile carries the given
+        capability/binding facts; the real validators decide from there."""
+        orig = cowork.dispatch_manifest.compile_manifest
+
+        def patched(work_id, capability, binding, status=None):
+            capability = dict(capability)
+            if action_classes is not None:
+                capability["action_classes"] = list(action_classes)
+            if command_adapters is not None:
+                capability["command_adapters"] = dict(command_adapters)
+            if artifact_writes is not None:
+                capability["artifact_writes"] = list(artifact_writes)
+            if guard_required is not None:
+                capability["guard_required"] = guard_required
+            if socket is not None:
+                capability["socket"] = socket
+            if runtime_roots is not None:
+                capability["runtime_roots"] = list(runtime_roots)
+            if private_paths is not None:
+                capability["private_paths"] = list(private_paths)
+            binding = dict(binding)
+            if worktree is not None:
+                binding["worktree"] = worktree
+            return orig(work_id, capability, binding, status=status)
+
+        cowork.dispatch_manifest.compile_manifest = patched
+        self.addCleanup(setattr, cowork.dispatch_manifest, "compile_manifest",
+                        orig)
+
+    def _fault_case(self, name, controller="claude", **inject_kwargs):
+        """Drive one fault through the real `run_worktree` dispatch fence.
+        Returns the persisted manifest's `status.refusal` dict (the exact
+        production capability/code), after proving zero spawns and zero
+        full-prompt bytes."""
+        self._inject(**inject_kwargs)
+        spawn_calls = []
+
+        def factory(controller_arg):
+            spawn_calls.append(controller_arg)
+            self.fail("%s: fault must refuse before any controller spawn"
+                      % name)
+
+        tpath, trace = self._trace("FAULT-%s" % name)
+        cfg = {"controller": controller, "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(self._td, "wt.%s.status.json" % name)
+        result = cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            trace=trace, extra_writable_dir=self._td)
+        self.assertIsNone(result)
+        self.assertEqual(spawn_calls, [],
+                         "%s: zero controller spawns on refusal" % name)
+
+        events = self._trace_events(tpath)
+        refusals = self._refusals(events)
+        self.assertEqual(len(refusals), 1,
+                         "%s: exactly one bound refusal decision" % name)
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "%s: zero full-prompt bytes on refusal" % name)
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(self._session_uuid,
+                                          cowork.WORKTREE_ROLE))
+        self.assertIsNotNone(manifest, "%s: manifest must persist" % name)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "refused")
+        self.assertEqual(refusals[0].get("trace_event_id"), manifest["digest"])
+        return manifest["status"]["refusal"]
+
+    # -- fault 1: missing runtime root --------------------------------- #
+
+    def test_fault_missing_runtime_root_refuses_before_spawn(self):
+        missing = os.path.join(self._td, "does-not-exist")
+        refusal = self._fault_case(
+            "missing-runtime-root", runtime_roots=[missing])
+        self.assertEqual(refusal["code"], "runtime_roots")
+        self.assertIn(missing, refusal["message"])
+
+    # -- fault 2: stale Codex config ------------------------------------ #
+
+    def test_fault_stale_codex_config_refuses_before_spawn(self):
+        home = os.path.join(self._td, "codex-home")
+        os.makedirs(home)
+        cfg_path = os.path.join(home, "config.toml")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            fh.write("# stale\n")
+        stale_time = time.time() - 60 * 60 * 24 * 30
+        os.utime(cfg_path, (stale_time, stale_time))
+        os.environ["CODEX_HOME"] = home
+        refusal = self._fault_case("stale-codex-config", controller="codex")
+        self.assertEqual(refusal["code"], "codex_config_freshness")
+        self.assertIn("stale", refusal["message"])
+
+    # -- fault 3: dead guard --------------------------------------------- #
+
+    def test_fault_dead_guard_refuses_before_spawn(self):
+        dead_socket = os.path.join(self._td, "dead-guard.sock")
+        refusal = self._fault_case(
+            "dead-guard", guard_required=True, socket=dead_socket)
+        self.assertEqual(refusal["code"], "guard_socket")
+        self.assertIn("unreachable", refusal["message"])
+
+    # -- fault 4: denied Git subcommand ----------------------------------- #
+
+    def test_fault_denied_git_subcommand_refuses_before_spawn(self):
+        refusal = self._fault_case(
+            "denied-git-subcommand", action_classes=["git"],
+            command_adapters={"git": {"subcommand": "push", "flags": []}})
+        self.assertEqual(refusal["code"], "git_operation")
+        self.assertIn("unconditionally refused", refusal["message"])
+
+    # -- fault 5: cwd under /tmp ------------------------------------------ #
+
+    def test_fault_cwd_under_tmp_refuses_before_spawn(self):
+        refusal = self._fault_case("cwd-tmp", worktree="/tmp")
+        self.assertEqual(refusal["code"], "cwd")
+        self.assertIn("tmp", refusal["message"])
+
+    # -- fault 6: missing rtk ---------------------------------------------- #
+
+    def test_fault_missing_rtk_refuses_before_spawn(self):
+        refusal = self._fault_case(
+            "missing-rtk", action_classes=["tool"],
+            command_adapters={"rtk": {"path": os.path.join(
+                self._td, "no-such-rtk-binary")}})
+        self.assertEqual(refusal["code"], "rtk_present")
+
+    # -- fault 7: unsafe shell syntax --------------------------------------- #
+
+    def test_fault_unsafe_shell_syntax_refuses_before_spawn(self):
+        refusal = self._fault_case(
+            "unsafe-argv", action_classes=["exec"],
+            command_adapters={
+                "exec": ["git", "status;", "rm", "-rf", "/"]})
+        self.assertEqual(refusal["code"], "argv_form")
+        self.assertIn("metacharacter", refusal["message"])
+
+    # -- fault 8: denied artifact write --------------------------------- #
+
+    def test_fault_denied_artifact_write_refuses_before_spawn(self):
+        refusal = self._fault_case(
+            "denied-artifact-write", artifact_writes=["../escape/path"])
+        self.assertEqual(refusal["code"], "artifact_destinations")
+        self.assertIn("traversal", refusal["message"])
+
+    # -- fault 9: changed manifest/config digest (on-disk tamper) -------- #
+
+    def test_fault_changed_manifest_digest_is_never_trusted(self):
+        """A manifest tampered on disk (digest no longer matches its own
+        binding) must never be trusted as an already-proven allow. The fence
+        recomputes from the LIVE capability/binding every time — it never
+        reads `status.phase` off a file whose digest it has not itself just
+        verified."""
+        mpath = state_store.manifest_path_for(self._session_uuid,
+                                              cowork.WORKTREE_ROLE)
+        os.makedirs(os.path.dirname(mpath), exist_ok=True)
+        legit = manifest_mod.compile_manifest(
+            cowork.WORKTREE_ROLE, _minimal_capability(),
+            _minimal_binding(work_id=cowork.WORKTREE_ROLE))
+        proven = manifest_mod.manifest_proven(legit, [])
+        tampered = dict(proven)
+        tampered["digest"] = "0" * 64  # forged: no longer matches its binding
+        with open(mpath, "w", encoding="utf-8") as fh:
+            json.dump(tampered, fh)
+
+        # SPECIFIC production evidence: the exact mechanism that rejects the
+        # tamper is `_validate_manifest`'s own digest-mismatch check — not a
+        # generic parse/type failure. It raises naming BOTH the forged
+        # stored value and the real recomputed one.
+        with self.assertRaises(ValueError) as ctx:
+            manifest_mod._validate_manifest(tampered)
+        self.assertIn("digest mismatch", str(ctx.exception))
+        self.assertIn("0" * 64, str(ctx.exception))
+
+        # The tamper is real: a direct load fails closed (never returns a
+        # forged "proven" manifest).
+        self.assertIsNone(manifest_mod.load_manifest(mpath))
+
+        # A bad runtime root proves the fence re-evaluated LIVE facts rather
+        # than short-circuiting on the forged phase="proven" tampered file.
+        missing = os.path.join(self._td, "still-missing")
+        refusal = self._fault_case(
+            "changed-manifest-digest", runtime_roots=[missing])
+        self.assertEqual(refusal["code"], "runtime_roots")
+
+        # SPECIFIC evidence the forged digest is never adopted: the refusal
+        # just persisted over the SAME path carries a freshly recomputed
+        # digest, never the "0"*64 the tampered file on disk carried.
+        reloaded = manifest_mod.load_manifest(mpath)
+        self.assertIsNotNone(reloaded)
+        self.assertNotEqual(reloaded["digest"], "0" * 64)
+
+    # -- fault 10: missing manifest file ---------------------------------- #
+
+    def test_fault_missing_manifest_file_never_defaults_to_allow(self):
+        """No manifest has EVER been compiled for this role: absence must
+        never be read as an implicit allow. The fence still runs the full
+        real preflight against live capability facts."""
+        mpath = state_store.manifest_path_for(self._session_uuid,
+                                              cowork.WORKTREE_ROLE)
+        self.assertFalse(os.path.exists(mpath),
+                         "precondition: no manifest file exists yet")
+
+        # SPECIFIC production evidence at the compiler seam: absence alone
+        # (force_recompile=False) drives a full recompile — `existing is
+        # None` makes `_compile_role_manifest`'s own `already_proven` check
+        # False unconditionally, never an implicit "nothing changed, reuse"
+        # no-op that would require a manifest to already exist.
+        fresh, was_recompiled = cowork._compile_role_manifest(
+            role=cowork.WORKTREE_ROLE, session_uuid=self._session_uuid,
+            work_id=cowork.WORKTREE_ROLE, controller="claude",
+            mode="implement", model=None, sessions_dir=self._td,
+            force_recompile=False)
+        self.assertTrue(was_recompiled,
+                        "absence must recompile UNFORCED, never reuse a "
+                        "nonexistent prior proof")
+        self.assertEqual((fresh.get("status") or {}).get("phase"), "proven")
+
+        # Re-erase the manifest this direct compile just persisted so the
+        # dispatch-fence assertion below starts from TRUE absence again.
+        os.remove(mpath)
+        self.assertFalse(os.path.exists(mpath),
+                         "precondition: absence restored before the fence "
+                         "runs its own compile")
+
+        absent_private = os.path.join(self._td, "no-such-private-path")
+        refusal = self._fault_case(
+            "missing-manifest-file", private_paths=[absent_private])
+        self.assertEqual(refusal["code"], "private_paths")
+        self.assertIn("missing", refusal["message"])
+
+    # -- negative control: a clean capability set still proves and allows - #
+
+    def test_default_capability_still_proves_and_allows(self):
+        spawn_calls = []
+
+        def factory(controller_arg):
+            spawn_calls.append(controller_arg)
+
+            class _S:
+                def send(self, t):
+                    pass
+
+                def close(self):
+                    pass
+            return _S()
+
+        tpath, trace = self._trace("FAULT-NEGATIVE-CONTROL")
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(self._td, "wt.negative.status.json")
+        cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            trace=trace, extra_writable_dir=self._td)
+        self.assertEqual(spawn_calls, ["claude"])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(self._session_uuid,
+                                          cowork.WORKTREE_ROLE))
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+
+class FaultInjectionPolicyTest(ControllerPolicyTestBase):
+    """Fault 11: disallowed policy broadening, driven through the real
+    `run_flow --switch-controller` CLI path (never `_is_policy_preserving_repair`
+    called in isolation)."""
+
+    def test_fault_disallowed_policy_broadening_refuses_untouched(self):
+        saved = {"allowed": ["claude", "codex"], "updated": 11.0,
+                 "source": "cli"}
+        spath = self._session("FAULT-POLICY-BROADEN", "planning",
+                              {"planner": "claude"}, team=["scout", "planner"],
+                              policy_value=dict(saved))
+        before = self._sha(spath)
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--switch-controller", "planner=opencode"]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 2)
+        self.assertEqual(popen.calls, [], "zero controller spawns")
+        self.assertEqual(claude_spawn.calls, [], "zero controller spawns")
+        self.assertEqual(self._sha(spath), before,
+                         "the broadened policy must never be persisted")
+
+        escalations = [e for e in self._events(spath)
+                       if e["event"] == "dispatch.escalation"]
+        self.assertEqual(len(escalations), 1)
+        self.assertEqual(escalations[0]["role"], "planner")
+        self.assertEqual(escalations[0]["missing_capability"],
+                         "policy_preserving_repair")
+        self.assertEqual(escalations[0]["blocked_action"], "controller_change")
+
+        # A legitimate --allow-controllers widening is NOT a repair and must
+        # never be blocked or escalated by this fence.
+        spath2 = self._session("FAULT-POLICY-WIDEN-OK", "planning",
+                               {"planner": "claude"},
+                               team=["scout", "planner"],
+                               policy_value=dict(saved))
+        rc2 = cowork.run_flow(
+            self._args(["--session-file", spath2,
+                        "--allow-controllers", "claude,codex,opencode",
+                        "--switch-controller", "planner=opencode"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc2, 0)
+        self.assertEqual(
+            [e for e in self._events(spath2)
+             if e["event"] == "dispatch.escalation"], [])
+
+
+# ---------------------------------------------------------------------------
+# M1 P5-v4: all eight real invalidation/revalidation triggers, driven through
+# the real `_compile_role_manifest` production entry point (never a
+# fabricated staleness factory). Each trigger recompiles UNFORCED
+# (force_recompile=False) purely because the live facts diverged from what
+# was cached, or because production explicitly invalidated the cache entry.
+# ---------------------------------------------------------------------------
+
+class RevalidationTriggerTest(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td, True)
+        self._session_uuid = str(uuid.uuid4())
+        mdir = os.path.join(self._td, "sessions", self._session_uuid,
+                            "manifests")
+        os.makedirs(mdir, exist_ok=True)
+        self._orig_manifest_path = state_store.manifest_path_for
+        state_store.manifest_path_for = lambda suuid, wid: os.path.join(
+            self._td, "sessions", suuid, "manifests",
+            "manifest.%s.json" % wid)
+        self.addCleanup(
+            setattr, state_store, "manifest_path_for",
+            self._orig_manifest_path)
+
+    def _base_kwargs(self, **overrides):
+        kw = dict(role="scout", session_uuid=self._session_uuid,
+                  work_id="scout", controller="claude", mode="implement",
+                  model="m", sessions_dir=self._td, force_recompile=False)
+        kw.update(overrides)
+        return kw
+
+    def _assert_unforced_revalidation(self, first_kwargs, second_kwargs):
+        m1, r1 = cowork._compile_role_manifest(**first_kwargs)
+        self.assertTrue(r1)
+        self.assertEqual((m1.get("status") or {}).get("phase"), "proven")
+        m2, r2 = cowork._compile_role_manifest(**second_kwargs)
+        self.assertTrue(r2, "the changed binding must recompile UNFORCED")
+        self.assertEqual((m2.get("status") or {}).get("phase"), "proven")
+        self.assertNotEqual(m1["digest"], m2["digest"])
+        return m1, m2
+
+    def test_trigger_candidate_snapshot_change(self):
+        self._assert_unforced_revalidation(
+            self._base_kwargs(candidate_snapshot={"sha": "a"}),
+            self._base_kwargs(candidate_snapshot={"sha": "b"}))
+
+    def test_trigger_config_model_effort_change(self):
+        self._assert_unforced_revalidation(
+            self._base_kwargs(model="model-a"),
+            self._base_kwargs(model="model-b"))
+
+    def test_trigger_effort_only_change(self):
+        """`effort` alone (controller/model/mode unchanged) is production
+        dispatch identity (M1 capability-binding repair: `binding.effort`
+        joins the digest) — this must recompile UNFORCED too, distinctly
+        from a model change."""
+        self._assert_unforced_revalidation(
+            self._base_kwargs(effort="low"),
+            self._base_kwargs(effort="high"))
+
+    def test_trigger_policy_snapshot_change(self):
+        self._assert_unforced_revalidation(
+            self._base_kwargs(policy_snapshot={
+                "delegation": "enforceably_disabled",
+                "mutation_gate": "pre_execution_record"}),
+            self._base_kwargs(policy_snapshot={
+                "delegation": "proven_absent",
+                "mutation_gate": "pre_execution_record"}))
+
+    def test_trigger_worktree_change(self):
+        a = os.path.join(self._td, "wt-a")
+        b = os.path.join(self._td, "wt-b")
+        os.makedirs(a)
+        os.makedirs(b)
+        self._assert_unforced_revalidation(
+            self._base_kwargs(worktree=a), self._base_kwargs(worktree=b))
+
+    def test_trigger_guard_socket_snapshot_change(self):
+        self._assert_unforced_revalidation(
+            self._base_kwargs(guard_snapshot={"pid": 1}),
+            self._base_kwargs(guard_snapshot={"pid": 2}))
+
+    def test_trigger_instruction_digest_change(self):
+        ipath = os.path.join(self._td, "instr.md")
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write("v1")
+        m1, r1 = cowork._compile_role_manifest(
+            **self._base_kwargs(instruction_paths=[ipath]))
+        self.assertTrue(r1)
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write("v2 — changed instruction content")
+        m2, r2 = cowork._compile_role_manifest(
+            **self._base_kwargs(instruction_paths=[ipath]))
+        self.assertTrue(r2,
+                        "an edited instruction file must recompile UNFORCED")
+        self.assertNotEqual(m1["digest"], m2["digest"])
+        self.assertNotEqual(m1["binding"]["instruction_digests"],
+                            m2["binding"]["instruction_digests"])
+
+    # Trigger 6 (runtime roots) is proven through the REAL `run_flow
+    # --worktree` CLI path by RevalidationRuntimeRootTest below, not by this
+    # class calling `state_store.invalidate_manifest_for` directly — that
+    # class also needs a real git repo + `ControllerPolicyTestBase`'s
+    # session-file/policy scaffolding, which this plain TestCase does not
+    # set up.
+
+
+class RevalidationControllerSwitchTest(ControllerPolicyTestBase):
+    """Trigger 8: a controller switch through the REAL CLI path invalidates
+    the switched role's manifest, so the next dispatch recompiles UNFORCED."""
+
+    def test_controller_switch_invalidates_and_next_dispatch_recompiles(self):
+        spath = self._session("REVALIDATE-SWITCH", "scouting",
+                              {"scout": "claude"}, team=["scout"])
+        saved = state_store.load(spath)
+        session_uuid = state_store.get_session_uuid(saved)
+
+        m0, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=session_uuid, work_id="scout",
+            controller="claude", mode="implement", model=None,
+            instruction_paths=[cowork.SCOUT_PROMPT_PATH],
+            sessions_dir=state_store.session_assets_dir(session_uuid),
+            force_recompile=False)
+        self.assertEqual((m0.get("status") or {}).get("phase"), "proven")
+
+        captured = {}
+
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            switch_fn = kw.get("switch_controller_fn")
+            captured["result"] = switch_fn("scout", target="codex")
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "go"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertIs(captured["result"], True)
+
+        after = state_store.load(spath)
+        self.assertEqual(after["config"]["scout"]["controller"], "codex")
+        self.assertIsNone(
+            state_store.current_manifest_status(session_uuid, "scout"),
+            "the real CLI switch must invalidate the switched role's "
+            "manifest")
+
+        m1, was_recompiled = cowork._compile_role_manifest(
+            role="scout", session_uuid=session_uuid, work_id="scout",
+            controller="codex", mode="implement", model=None,
+            instruction_paths=[cowork.SCOUT_PROMPT_PATH],
+            sessions_dir=state_store.session_assets_dir(session_uuid),
+            force_recompile=False)
+        self.assertTrue(was_recompiled,
+                        "a switched controller must recompile UNFORCED")
+        self.assertEqual((m1.get("status") or {}).get("phase"), "proven")
+        self.assertNotEqual(m0["digest"], m1["digest"])
+
+
+class RevalidationRuntimeRootTest(ControllerPolicyTestBase):
+    """Trigger 6 (runtime roots): the REAL `run_flow --worktree` dispatch
+    path invalidates the worktree role's manifest via the exact
+    `state_store.invalidate_manifest_for` call production makes right after
+    `state_store.set_worktree` persists a freshly (re)created worktree path
+    (cowork.py's run_flow --worktree pre-phase, the real worktree-creation
+    dispatch site). This test never calls `invalidate_manifest_for` itself —
+    the invalidation is observed as a side effect of two real `run_flow`
+    launches."""
+
+    def _repo(self):
+        repo = _init_git_repo()
+        self.addCleanup(shutil.rmtree, repo, True)
+        return repo
+
+    def _creating_fn(self, calls):
+        """A run_worktree_fn that really creates the worktree (real `git
+        worktree add`) and records the requested name."""
+        def fn(wt_config, status_path, base, name, explicit, **kw):
+            calls.append(name)
+            path = os.path.join(base, ".worktrees", name)
+            subprocess.run(
+                ["git", "-C", base, "worktree", "add", path, "-b", name],
+                check=True, capture_output=True)
+            return {"status": "ready",
+                    "result": {"worktree_path": os.path.realpath(path),
+                              "branch": name}}
+        return fn
+
+    def test_real_worktree_creation_invalidates_runtime_root_and_recompiles_unforced(self):
+        repo = self._repo()
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(repo)
+        spath = self._session(
+            "REVALIDATE-RUNTIME-ROOT", "scouting", {"scout": "claude"},
+            team=["scout"],
+            spath=os.path.join(repo, ".cowork", "session.json"))
+        saved = state_store.load(spath)
+        session_uuid = state_store.get_session_uuid(saved)
+
+        def fake_scout(config, context, selected, **kw):
+            return 0
+
+        # First real launch: creates worktree "feat" through the genuine
+        # --worktree pre-phase (run_worktree_fn is a real git-worktree
+        # creator, never a fabricated artifact).
+        calls = []
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--context", "x",
+                        "--session-file", spath]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_scout,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["feat"])
+        first_wt_path = os.path.realpath(
+            os.path.join(repo, ".worktrees", "feat"))
+
+        # A REAL manifest, proven directly via the SAME production compiler
+        # every dispatch site uses, establishes the baseline this test then
+        # invalidates through the CLI path below — never a synthetic
+        # staleness factory.
+        m1, r1 = cowork._compile_role_manifest(
+            role=cowork.WORKTREE_ROLE, session_uuid=session_uuid,
+            work_id=cowork.WORKTREE_ROLE, controller="claude",
+            mode="implement", model=None,
+            sessions_dir=state_store.session_assets_dir(session_uuid),
+            force_recompile=False)
+        self.assertTrue(r1)
+        self.assertEqual(
+            state_store.current_manifest_status(
+                session_uuid, cowork.WORKTREE_ROLE), "proven")
+
+        # Force the FIRST worktree out of `git worktree list` (a real,
+        # independently-verifiable fact) so the next real launch's D6 reuse
+        # check genuinely fails and falls through to a real re-creation —
+        # never a test-fabricated staleness.
+        subprocess.run(
+            ["git", "-C", repo, "worktree", "remove", "--force",
+             first_wt_path], check=True, capture_output=True)
+        os.chdir(repo)
+
+        # Second real launch, same session: the recorded "feat" worktree no
+        # longer validates, so run_flow really re-creates a fresh worktree
+        # ("feat2") through the SAME production code path, which persists it
+        # via state_store.set_worktree and then — in the very next real
+        # line of cowork.py — calls state_store.invalidate_manifest_for on
+        # the worktree role. This test issues neither call itself.
+        calls2 = []
+        rc2 = cowork.run_flow(
+            self._args(["--worktree", "feat2", "--context", "x",
+                        "--session-file", spath]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_scout,
+            run_worktree_fn=self._creating_fn(calls2))
+        self.assertEqual(rc2, 0)
+        self.assertEqual(
+            calls2, ["feat2"],
+            "the stale recorded worktree must really be rejected and a "
+            "fresh one really (re)created, not silently reused")
+
+        self.assertIsNone(
+            state_store.current_manifest_status(
+                session_uuid, cowork.WORKTREE_ROLE),
+            "the real --worktree re-creation dispatch must invalidate the "
+            "worktree role's manifest via its own production code path, "
+            "never a test-invoked invalidate_manifest_for call")
+
+        second_wt_path = os.path.realpath(
+            os.path.join(repo, ".worktrees", "feat2"))
+        second_wt_base = os.path.dirname(second_wt_path)
+        m2, r2 = cowork._compile_role_manifest(
+            role=cowork.WORKTREE_ROLE, session_uuid=session_uuid,
+            work_id=cowork.WORKTREE_ROLE, controller="claude",
+            mode="implement", model=None,
+            sessions_dir=state_store.session_assets_dir(session_uuid),
+            worktree=second_wt_path, worktree_base=second_wt_base,
+            force_recompile=False)
+        self.assertTrue(
+            r2, "the invalidated runtime root must recompile UNFORCED")
+        self.assertEqual((m2.get("status") or {}).get("phase"), "proven")
+        self.assertNotEqual(m1["digest"], m2["digest"])
+        self.assertIn(second_wt_base, m2["capability"]["runtime_roots"])
+        self.assertNotIn(second_wt_base, m1["capability"]["runtime_roots"])
+
+
+# ---------------------------------------------------------------------------
+# M1 P5-v4: the mechanical exit audit. Discovery-based (it reads cowork.py's
+# real source, never a hand-maintained inventory), so a new dispatch site
+# added later is caught automatically instead of requiring this test to be
+# remembered. A discovered site is either manifest-fenced (its
+# `_decide_and_trace` call is wired to a `manifest=` variable that a real
+# `_compile_role_manifest` call, earlier in the SAME function, produced) or it
+# is on the small explicit semantic allowlist below, each entry naming the
+# real reason no manifest exists yet at that call. Anything else is a named
+# violation. Discovery finding nothing is ALSO a failure — a silent, empty
+# audit is exactly the exit-audit omission this class exists to close.
+# ---------------------------------------------------------------------------
+
+class M1ExitAuditTest(unittest.TestCase):
+    """Every real dispatch surface in cowork.py, audited by parsing the
+    actual production source (not by re-describing it from memory)."""
+
+    # (enclosing function, 1-based ordinal of the `_decide_and_trace` call
+    # WITHIN that function) -> the documented reason no manifest governs it.
+    # Each reason is paraphrased from the comment already sitting above the
+    # real call site in cowork.py (see the cited line for the source of
+    # truth): a genuine policy-only pre-check that runs strictly BEFORE any
+    # manifest for that attempt could exist, with the manifest-bound decision
+    # for an allowed target/controller following immediately afterward in
+    # the same function.
+    _POLICY_ONLY_ALLOWLIST = {
+        ("reviewer_controller_check", 1): (
+            "run_flow.reviewer_controller_check: a policy-only pre-check "
+            "ahead of the real reviewer dispatch; run_reviewer_once compiles "
+            "and binds its own manifest"),
+        ("switch_controller", 1): (
+            "run_flow.switch_controller: the policy decision for the switch "
+            "TARGET runs before any manifest exists for it; the "
+            "manifest-bound decision for an allowed target follows "
+            "immediately after (ordinal 2 in the same function)"),
+        ("ensure_controller_dispatchable", 1): (
+            "run_flow_pre_launch: the policy gate runs before the manifest "
+            "is compiled for the launch attempt; the manifest-bound decision "
+            "follows immediately after (ordinal 2 in the same function)"),
+    }
+
+    def _cowork_source(self):
+        path = cowork.__file__
+        with open(path, "r", encoding="utf-8") as fh:
+            return path, fh.read()
+
+    @staticmethod
+    def _callee_name(call_node):
+        """The audited callee name whether invoked as a bare name
+        (`_decide_and_trace(...)`) or through ANY qualified/attribute access
+        (`self._decide_and_trace(...)`, `mod._decide_and_trace(...)`) — a
+        future refactor that turns either audited function into a method, or
+        moves it behind a module/object reference, must not silently vanish
+        from discovery just because it is no longer a bare name."""
+        func = call_node.func
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return None
+
+    def _discover_sites(self, source=None, path=None):
+        """Parse cowork.py (or, for `test_discovery_resolves_qualified_...`
+        only, a synthetic `source` override) and return every
+        `_decide_and_trace(...)` call site: enclosing function name,
+        per-function ordinal, source line, whether it carries a live
+        `manifest=` binding, and whether a real `_compile_role_manifest(`
+        call precedes it in the same function."""
+        if source is None:
+            path, source = self._cowork_source()
+        tree = ast.parse(source, filename=path or "<test>")
+        sites = []
+        ordinals = collections.defaultdict(int)
+        compiles_seen = collections.defaultdict(list)
+        callee_name = self._callee_name
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self):
+                self.func_stack = []
+
+            def _enter(self, node):
+                self.func_stack.append(node.name)
+                self.generic_visit(node)
+                self.func_stack.pop()
+
+            visit_FunctionDef = _enter
+            visit_AsyncFunctionDef = _enter
+
+            def visit_Call(self, node):
+                func = self.func_stack[-1] if self.func_stack else None
+                name = callee_name(node)
+                if name == "_compile_role_manifest":
+                    compiles_seen[func].append(node.lineno)
+                elif name == "_decide_and_trace":
+                    ordinals[func] += 1
+                    manifest_kw = next(
+                        (kw for kw in node.keywords
+                         if kw.arg == "manifest"), None)
+                    manifest_bound = bool(
+                        manifest_kw is not None
+                        and not (isinstance(manifest_kw.value, ast.Constant)
+                                 and manifest_kw.value.value is None))
+                    sites.append({
+                        "function": func,
+                        "ordinal": ordinals[func],
+                        "lineno": node.lineno,
+                        "manifest_bound": manifest_bound,
+                    })
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        for site in sites:
+            earlier_compiles = [
+                ln for ln in compiles_seen.get(site["function"], ())
+                if ln < site["lineno"]]
+            site["compile_precedes"] = bool(earlier_compiles)
+        return sites
+
+    def test_discovery_resolves_qualified_attribute_call_sites_too(self):
+        """Closes the AST discovery gap: a future refactor that calls the
+        audited functions through ANY attribute access (`self.x(...)`,
+        `mod.x(...)`) — not just a bare name — must still be discovered,
+        never silently omitted from the exit audit. Proven against a
+        synthetic snippet (this test exercises the discovery MECHANISM
+        itself, not a claim about cowork.py's current source)."""
+        snippet = (
+            "class _Helper(object):\n"
+            "    def dispatch(self):\n"
+            "        m = self._compile_role_manifest()\n"
+            "        self._decide_and_trace(manifest=m)\n"
+        )
+        sites = self._discover_sites(source=snippet, path="<synthetic>")
+        self.assertEqual(
+            len(sites), 1,
+            "a qualified-attribute _decide_and_trace call must still be "
+            "discovered: %r" % (sites,))
+        self.assertEqual(sites[0]["function"], "dispatch")
+        self.assertTrue(sites[0]["manifest_bound"])
+        self.assertTrue(
+            sites[0]["compile_precedes"],
+            "a qualified-attribute _compile_role_manifest call must still "
+            "be recognized as preceding evidence")
+
+    def test_assembly_present_discovery_is_not_silently_empty(self):
+        """Assembly-absence check: a broken import, a renamed reducer, or a
+        parse failure must fail LOUDLY here, never read as zero violations."""
+        self.assertTrue(hasattr(cowork, "_decide_and_trace"),
+                        "cowork._decide_and_trace no longer exists — the "
+                        "audited reducer/trace seam is gone")
+        self.assertTrue(hasattr(cowork, "_compile_role_manifest"),
+                        "cowork._compile_role_manifest no longer exists — "
+                        "the audited manifest fence is gone")
+        sites = self._discover_sites()
+        self.assertGreaterEqual(
+            len(sites), 15,
+            "the exit audit discovered too few (or zero) dispatch sites — "
+            "this must fail loudly, never silently pass as an empty "
+            "violation set: %r" % (sites,))
+
+    def test_every_discovered_site_is_manifest_fenced_or_named_allowlisted(self):
+        sites = self._discover_sites()
+        violations = []
+        for site in sites:
+            key = (site["function"], site["ordinal"])
+            if site["manifest_bound"] and site["compile_precedes"]:
+                continue
+            if key in self._POLICY_ONLY_ALLOWLIST:
+                continue
+            violations.append(
+                "%s#%d (cowork.py:%d) has no manifest compilation and is "
+                "not on the semantic allowlist"
+                % (site["function"], site["ordinal"], site["lineno"]))
+        self.assertEqual(
+            violations, [],
+            "discovered manifest-fenced dispatch site(s) with no manifest "
+            "compilation:\n  " + "\n  ".join(violations))
+
+    def test_allowlist_entries_are_exactly_the_real_policy_only_precheck_sites(self):
+        """The allowlist is small and exact: every entry must correspond to
+        a REAL discovered site that is genuinely policy-only (no manifest
+        kwarg at all), and no allowlisted key may be unused — an unused
+        entry would let a removed policy-only site silently keep a
+        justification it no longer needs."""
+        sites = self._discover_sites()
+        by_key = {(s["function"], s["ordinal"]): s for s in sites}
+        for key, reason in self._POLICY_ONLY_ALLOWLIST.items():
+            self.assertIn(key, by_key,
+                          "allowlisted site %r (%s) was not discovered — "
+                          "stale allowlist entry" % (key, reason))
+            self.assertFalse(
+                by_key[key]["manifest_bound"],
+                "allowlisted site %r (%s) actually carries a manifest "
+                "binding now — remove it from the allowlist" % (key, reason))
+            self.assertTrue(reason, "every allowlist entry must carry a "
+                                    "nonempty reason")
+
+    def test_every_audited_turn_binds_its_real_manifest_id(self):
+        """Cross-check the static classification against real execution: a
+        manifest-fenced site's ALLOW decision binds `trace_event_id` to the
+        digest of the exact manifest that governed it — not a placeholder,
+        not a synthetic id."""
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        session_uuid = str(uuid.uuid4())
+        os.makedirs(os.path.join(td, "sessions", session_uuid, "manifests"),
+                   exist_ok=True)
+        orig = state_store.manifest_path_for
+        state_store.manifest_path_for = lambda s, w: os.path.join(
+            td, "sessions", s, "manifests", "manifest.%s.json" % w)
+        self.addCleanup(setattr, state_store, "manifest_path_for", orig)
+
+        def factory(controller):
+            class _S:
+                def send(self, t):
+                    pass
+
+                def close(self):
+                    pass
+            return _S()
+
+        tpath = os.path.join(td, "audit.trace.jsonl")
+        trace = trace_store.Trace(tpath, session_uuid=session_uuid, run_id="R")
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(td, "wt.status.json")
+        cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=session_uuid, trace=trace,
+            extra_writable_dir=td)
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, cowork.WORKTREE_ROLE))
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        with open(tpath, "r", encoding="utf-8") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        allows = [e for e in events if e.get("event") == "dispatch.decision"
+                 and e.get("site") == "run_worktree"
+                 and e.get("outcome") == "allow"]
+        self.assertEqual(len(allows), 1)
+        self.assertEqual(allows[0]["trace_event_id"], manifest["digest"])
+        self.assertIsNotNone(allows[0]["trace_event_id"])
