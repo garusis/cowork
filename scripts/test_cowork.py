@@ -34196,3 +34196,739 @@ class DispatchManifestIntegrationTest(unittest.TestCase):
         finally:
             preflight.run_manifest_preflight = orig_preflight
             cowork._compile_role_manifest = orig_compile
+
+
+# ---------------------------------------------------------------------------
+# M1 P4-v5: every real dispatch.decide() call site binds the exact manifest
+# that governs it, and the trace carries that binding.
+# ---------------------------------------------------------------------------
+
+class ManifestBindingProductionPathTest(unittest.TestCase):
+    """P4-v5: drives the REAL production call sites (never a fabricated
+    decision/turn event) and inspects their normal trace seam to prove every
+    dispatch.decision is bound to the exact manifest that governed it, and
+    that resume/reviewer/evaluator/probe/switch never reach a controller turn
+    on a vacuous (unbound) decision."""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._td, True)
+        self._session_uuid = str(uuid.uuid4())
+        mdir = os.path.join(self._td, "sessions", self._session_uuid,
+                            "manifests")
+        os.makedirs(mdir, exist_ok=True)
+        self._orig_manifest_path = state_store.manifest_path_for
+        state_store.manifest_path_for = lambda suuid, wid: os.path.join(
+            self._td, "sessions", suuid, "manifests",
+            "manifest.%s.json" % wid)
+        self.addCleanup(
+            setattr, state_store, "manifest_path_for", self._orig_manifest_path)
+
+    def _trace(self, name):
+        tpath = os.path.join(self._td, name + ".trace.jsonl")
+        return tpath, trace_store.Trace(tpath, session_uuid=name, run_id="R")
+
+    def _trace_events(self, tpath):
+        if not os.path.exists(tpath):
+            return []
+        with open(tpath, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _force_refused_preflight(self):
+        orig = preflight.run_manifest_preflight
+
+        def refusing(manifest, *a, **kw):
+            import cowork_dispatch_manifest as _mm
+            checks = [{"capability": "runtime_roots", "ok": False,
+                      "reason": "forced_test_refusal", "repair_hint": ""}]
+            return _mm.manifest_refused(
+                manifest, checks, refusal_code="runtime_roots",
+                refusal_message="forced_test_refusal")
+
+        preflight.run_manifest_preflight = refusing
+        self.addCleanup(
+            setattr, preflight, "run_manifest_preflight", orig)
+
+    def _force_manifest_compile_raise(self):
+        """Force `_compile_role_manifest` itself to raise (a persist/OSError
+        failure, per its own docstring) rather than returning an unproven
+        manifest — the `{}` fallback every call site's `except Exception:`
+        leaves behind. Every fence site must still refuse through the
+        preflight fact (never silently allow), never spawn, and never
+        assemble a prompt."""
+        orig = cowork._compile_role_manifest
+
+        def raising(*a, **kw):
+            raise OSError("forced_test_persist_failure")
+
+        cowork._compile_role_manifest = raising
+        self.addCleanup(setattr, cowork, "_compile_role_manifest", orig)
+
+    def _decisions(self, events, site, outcome=None):
+        out = [e for e in events if e.get("event") == "dispatch.decision"
+               and e.get("site") == site]
+        if outcome is not None:
+            out = [e for e in out if e.get("outcome") == outcome]
+        return out
+
+    # ------------------------------------------------------------------ #
+    # run_worktree                                                        #
+    # ------------------------------------------------------------------ #
+
+    def test_worktree_allow_decision_binds_the_compiled_manifest_digest(self):
+        spawn_calls = []
+
+        def factory(controller):
+            spawn_calls.append(controller)
+
+            class _S:
+                def send(self, t):
+                    pass
+                def close(self):
+                    pass
+            return _S()
+
+        tpath, trace = self._trace("WT-BIND")
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(self._td, "wt.status.json")
+        cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            trace=trace, extra_writable_dir=self._td)
+        self.assertEqual(spawn_calls, ["claude"])
+
+        manifest, _ = cowork._compile_role_manifest(
+            role=cowork.WORKTREE_ROLE, session_uuid=self._session_uuid,
+            work_id=cowork.WORKTREE_ROLE, controller="claude",
+            mode="implement", model=None,
+            instruction_paths=[cowork.WORKTREE_PROMPT_PATH],
+            sessions_dir=self._td, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        events = self._trace_events(tpath)
+        allows = self._decisions(events, "run_worktree", "allow")
+        self.assertEqual(len(allows), 1)
+        self.assertEqual(allows[0].get("trace_event_id"), manifest["digest"])
+
+    def test_worktree_manifest_refusal_binds_digest_and_spawns_nothing(self):
+        self._force_refused_preflight()
+        spawn_calls = []
+
+        def factory(controller):
+            spawn_calls.append(controller)
+            self.fail("worktree must not spawn on a refused manifest")
+
+        tpath, trace = self._trace("WT-REFUSE-BIND")
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(self._td, "wt.status.json")
+        result = cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            trace=trace, extra_writable_dir=self._td)
+        self.assertIsNone(result)
+        self.assertEqual(spawn_calls, [], "zero turns on a refused manifest")
+
+        manifest, _ = cowork._compile_role_manifest(
+            role=cowork.WORKTREE_ROLE, session_uuid=self._session_uuid,
+            work_id=cowork.WORKTREE_ROLE, controller="claude",
+            mode="implement", model=None,
+            instruction_paths=[cowork.WORKTREE_PROMPT_PATH],
+            sessions_dir=self._td, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "refused")
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(events, "run_worktree", "refuse")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0].get("trace_event_id"), manifest["digest"])
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+
+    def test_worktree_compile_raise_binds_a_refusal_and_spawns_nothing(self):
+        self._force_manifest_compile_raise()
+        spawn_calls = []
+
+        def factory(controller):
+            spawn_calls.append(controller)
+            self.fail("worktree must not spawn when the manifest compile "
+                      "raises")
+
+        tpath, trace = self._trace("WT-COMPILE-RAISE-BIND")
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(self._td, "wt.status.json")
+        result = cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            trace=trace, extra_writable_dir=self._td)
+        self.assertIsNone(result)
+        self.assertEqual(spawn_calls, [],
+                         "zero controller spawns when compile raises")
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(events, "run_worktree", "refuse")
+        self.assertEqual(len(refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")
+
+    # ------------------------------------------------------------------ #
+    # run_reviewer_once — resume must not be a vacuous absence of decision #
+    # ------------------------------------------------------------------ #
+
+    def test_reviewer_resume_emits_a_manifest_bound_allow_decision(self):
+        cfg = cowork.default_config(["scout", cowork.SCOUT_REVIEWER])
+        cfg[cowork.SCOUT_REVIEWER]["controller"] = "claude"
+        intel = os.path.join(self._td, "intel.json")
+        review = os.path.join(self._td, "review.json")
+
+        def factory(controller, io_out):
+            class _S:
+                def send(self, t, meta=None):
+                    return {"ok": True, "result": "ok"}
+                def close(self):
+                    pass
+            return _S()
+
+        tpath, trace = self._trace("REV-RESUME-BIND")
+        cowork.run_reviewer_once(
+            cfg, "goal", ["scout", cowork.SCOUT_REVIEWER], intel, review,
+            resume_id="resumed-thread", session_factory=factory, trace=trace,
+            session_uuid=self._session_uuid,
+            extra_writable_dir=self._td)
+
+        manifest, _ = cowork._compile_role_manifest(
+            role=cowork.SCOUT_REVIEWER, session_uuid=self._session_uuid,
+            work_id=cowork.SCOUT_REVIEWER, controller="claude",
+            mode=cfg[cowork.SCOUT_REVIEWER].get("mode", "implement"),
+            model=None, instruction_paths=[cowork.SCOUT_REVIEWER_PROMPT_PATH],
+            sessions_dir=self._td, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        events = self._trace_events(tpath)
+        allows = self._decisions(events, "run_reviewer_once", "allow")
+        self.assertEqual(len(allows), 1,
+                         "resume must not be a vacuous absence of decisions")
+        self.assertEqual(allows[0].get("trace_event_id"), manifest["digest"])
+
+    def test_reviewer_compile_raise_binds_a_refusal_and_spawns_nothing(self):
+        self._force_manifest_compile_raise()
+        cfg = cowork.default_config(["scout", cowork.SCOUT_REVIEWER])
+        cfg[cowork.SCOUT_REVIEWER]["controller"] = "claude"
+        intel = os.path.join(self._td, "intel.json")
+        review = os.path.join(self._td, "review.json")
+        spawn_calls = []
+
+        def factory(controller, io_out):
+            spawn_calls.append(controller)
+            self.fail("reviewer must not spawn when the manifest compile "
+                      "raises")
+
+        tpath, trace = self._trace("REV-COMPILE-RAISE-BIND")
+        verdict = cowork.run_reviewer_once(
+            cfg, "goal", ["scout", cowork.SCOUT_REVIEWER], intel, review,
+            session_factory=factory, trace=trace,
+            session_uuid=self._session_uuid, extra_writable_dir=self._td)
+        self.assertTrue(cowork._is_review_failure(verdict))
+        self.assertEqual(spawn_calls, [],
+                         "zero controller spawns when compile raises")
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(events, "run_reviewer_once", "refuse")
+        self.assertEqual(len(refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")
+
+    # ------------------------------------------------------------------ #
+    # run_scout / run_planner / run_builder — resume must bind a decision #
+    # ------------------------------------------------------------------ #
+
+    def _scripted_factory(self):
+        def factory(controller, session_id=None, resume_id=None,
+                   on_session_id=None):
+            class _S:
+                def send(self, t, meta=None):
+                    return {"ok": True, "result": "ok"}
+                def close(self):
+                    pass
+            return _S()
+        return factory
+
+    def test_scout_resume_emits_a_manifest_bound_allow_decision(self):
+        config = {"scout": {"controller": "claude", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        tpath, trace = self._trace("SCOUT-RESUME-BIND")
+        cowork.run_scout(
+            config, "", ["scout"], io_in=io.StringIO("end\n"),
+            io_out=io.StringIO(),
+            intel_path=os.path.join(self._td, "scout.intel.json"),
+            session_factory=self._scripted_factory(),
+            resume_id="resumed-thread", trace=trace,
+            session_uuid=self._session_uuid)
+
+        manifest, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="scout",
+            controller="claude", mode="implement", model=None,
+            instruction_paths=[cowork.SCOUT_PROMPT_PATH],
+            sessions_dir=None, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        events = self._trace_events(tpath)
+        allows = self._decisions(events, "run_scout", "allow")
+        self.assertGreaterEqual(
+            len(allows), 1,
+            "resume must not be a vacuous absence of decisions")
+        for d in allows:
+            self.assertEqual(d.get("trace_event_id"), manifest["digest"])
+
+    def test_planner_resume_emits_a_manifest_bound_allow_decision(self):
+        config = {"planner": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+        tpath, trace = self._trace("PLANNER-RESUME-BIND")
+        cowork.run_planner(
+            config, "", ["planner"], io_in=io.StringIO("end\n"),
+            io_out=io.StringIO(), session_factory=self._scripted_factory(),
+            resume_id="resumed-thread", trace=trace,
+            session_uuid=self._session_uuid)
+
+        manifest, _ = cowork._compile_role_manifest(
+            role="planner", session_uuid=self._session_uuid,
+            work_id="planner", controller="claude", mode="implement",
+            model=None, instruction_paths=[cowork.PLANNER_PROMPT_PATH],
+            sessions_dir=None, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        events = self._trace_events(tpath)
+        allows = self._decisions(events, "run_planner", "allow")
+        self.assertGreaterEqual(
+            len(allows), 1,
+            "resume must not be a vacuous absence of decisions")
+        for d in allows:
+            self.assertEqual(d.get("trace_event_id"), manifest["digest"])
+
+    def test_builder_resume_emits_a_manifest_bound_allow_decision(self):
+        config = {"builder": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+        tpath, trace = self._trace("BUILDER-RESUME-BIND")
+        cowork.run_builder(
+            config, "", ["builder"], io_in=io.StringIO("end\n"),
+            io_out=io.StringIO(), session_factory=self._scripted_factory(),
+            resume_id="resumed-thread", trace=trace,
+            session_uuid=self._session_uuid)
+
+        manifest, _ = cowork._compile_role_manifest(
+            role="builder", session_uuid=self._session_uuid,
+            work_id="builder", controller="claude", mode="implement",
+            model=None, instruction_paths=[cowork.BUILDER_PROMPT_PATH],
+            sessions_dir=None, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        events = self._trace_events(tpath)
+        allows = self._decisions(events, "run_builder", "allow")
+        self.assertGreaterEqual(
+            len(allows), 1,
+            "resume must not be a vacuous absence of decisions")
+        for d in allows:
+            self.assertEqual(d.get("trace_event_id"), manifest["digest"])
+
+    def test_scout_compile_raise_binds_a_refusal_and_spawns_nothing(self):
+        self._force_manifest_compile_raise()
+        config = {"scout": {"controller": "claude", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        tpath, trace = self._trace("SCOUT-COMPILE-RAISE-BIND")
+
+        def factory(*a, **kw):
+            self.fail("scout must not spawn when the manifest compile raises")
+
+        rc = cowork.run_scout(
+            config, "goal", ["scout"], io_in=io.StringIO(""),
+            io_out=io.StringIO(),
+            intel_path=os.path.join(self._td, "scout.intel.json"),
+            session_factory=factory, trace=trace,
+            session_uuid=self._session_uuid)
+        self.assertEqual(rc, 1)
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(events, "run_scout", "refuse")
+        self.assertEqual(len(refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")
+
+    def test_planner_compile_raise_binds_a_refusal_and_spawns_nothing(self):
+        self._force_manifest_compile_raise()
+        config = {"planner": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+        tpath, trace = self._trace("PLANNER-COMPILE-RAISE-BIND")
+
+        def factory(*a, **kw):
+            self.fail("planner must not spawn when the manifest compile "
+                      "raises")
+
+        rc = cowork.run_planner(
+            config, "goal", ["planner"], io_in=io.StringIO(""),
+            io_out=io.StringIO(), session_factory=factory, trace=trace,
+            session_uuid=self._session_uuid)
+        self.assertEqual(rc, 1)
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(events, "run_planner", "refuse")
+        self.assertEqual(len(refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")
+
+    def test_builder_compile_raise_binds_a_refusal_and_spawns_nothing(self):
+        self._force_manifest_compile_raise()
+        config = {"builder": {"controller": "claude", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+        tpath, trace = self._trace("BUILDER-COMPILE-RAISE-BIND")
+
+        def factory(*a, **kw):
+            self.fail("builder must not spawn when the manifest compile "
+                      "raises")
+
+        rc = cowork.run_builder(
+            config, "goal", ["builder"], io_in=io.StringIO(""),
+            io_out=io.StringIO(), session_factory=factory, trace=trace,
+            session_uuid=self._session_uuid)
+        self.assertEqual(rc, 1)
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(events, "run_builder", "refuse")
+        self.assertEqual(len(refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")
+
+    # ------------------------------------------------------------------ #
+    # probe — a failed controller-CLI probe must still bind a decision     #
+    # ------------------------------------------------------------------ #
+
+    def test_scout_probe_failure_binds_manifest_digest_zero_turn(self):
+        import unittest.mock as mock
+        config = {"scout": {"controller": "claude", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        tpath, trace = self._trace("SCOUT-PROBE-BIND")
+
+        def bad_spawn(cmd, stdin):
+            return [{"type": "other"}]
+
+        with mock.patch.object(cowork.bridge.probe_cache, "cache_hit",
+                               return_value=False):
+            rc = cowork.run_scout(
+                config, "goal", ["scout"], io_in=io.StringIO(""),
+                io_out=io.StringIO(),
+                intel_path=os.path.join(self._td, "scout.intel.json"),
+                claude_spawn=bad_spawn, trace=trace,
+                session_uuid=self._session_uuid)
+        self.assertEqual(rc, 1)
+
+        manifest, _ = cowork._compile_role_manifest(
+            role="scout", session_uuid=self._session_uuid, work_id="scout",
+            controller="claude", mode="implement", model=None,
+            instruction_paths=[cowork.SCOUT_PROMPT_PATH],
+            sessions_dir=None, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        events = self._trace_events(tpath)
+        probe_refusals = [
+            e for e in self._decisions(events, "run_scout", "refuse")
+            if e.get("refusal_code") == "probe_failed"]
+        self.assertEqual(len(probe_refusals), 1,
+                         "probe must not be a vacuous absence of decisions")
+        self.assertEqual(probe_refusals[0].get("source"), "probe")
+        self.assertEqual(probe_refusals[0].get("trace_event_id"),
+                         manifest["digest"])
+        turn_starts = [e for e in events if e.get("event") == "role.start"
+                      and e.get("controller") == "claude"]
+        # role.start fires before the probe; confirm no session/turn artifact
+        # (controller.turn.start) exists — the probe failure returns before
+        # any session is constructed.
+        self.assertEqual(len(turn_starts), 1)
+        self.assertEqual(
+            [e for e in events if e.get("event") == "controller.turn.start"],
+            [])
+
+    # ------------------------------------------------------------------ #
+    # evaluator — manifest refusal must bind a decision, zero session      #
+    # ------------------------------------------------------------------ #
+
+    def test_evaluator_manifest_refusal_binds_digest_zero_session(self):
+        self._force_refused_preflight()
+        tpath, trace = self._trace("EVAL-REFUSE-BIND")
+        entry = {"scratch_path": os.path.join(self._td, "eval.scratch.json")}
+        session = cowork._isolated_evaluator_session(
+            entry, {"tool": "claude", "model": "m", "effort": None},
+            trace=trace, io_out=io.StringIO(),
+            session_uuid=self._session_uuid)
+        self.assertIsNone(session, "zero turns on a refused manifest")
+
+        manifest, _ = cowork._compile_role_manifest(
+            role="evaluator", session_uuid=self._session_uuid,
+            work_id="evaluator", controller="claude", mode="plan",
+            model="m", instruction_paths=[cowork.EVALUATOR_PROMPT_PATH],
+            sessions_dir=self._td, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "refused")
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(
+            events, "_isolated_evaluator_session", "refuse")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0].get("trace_event_id"), manifest["digest"])
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+
+    def test_evaluator_compile_raise_binds_a_refusal_and_spawns_nothing(self):
+        self._force_manifest_compile_raise()
+        tpath, trace = self._trace("EVAL-COMPILE-RAISE-BIND")
+        entry = {"scratch_path": os.path.join(self._td, "eval.scratch.json")}
+        session = cowork._isolated_evaluator_session(
+            entry, {"tool": "claude", "model": "m", "effort": None},
+            trace=trace, io_out=io.StringIO(),
+            session_uuid=self._session_uuid)
+        self.assertIsNone(session,
+                          "zero controller spawns when compile raises")
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(
+            events, "_isolated_evaluator_session", "refuse")
+        self.assertEqual(len(refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")
+
+
+class ManifestBindingFlowGateTest(ControllerPolicyTestBase):
+    """P4-v5: switch and the pre-launch retry gate — driven through the real
+    `run_flow` closures, never fabricated."""
+
+    def test_switch_controller_manifest_refusal_binds_digest_zero_switch(self):
+        spath = self._session(
+            "SWITCH-MANIFEST-BIND", "scouting", {"scout": "claude"},
+            team=["scout"])
+        orig_preflight = preflight.run_manifest_preflight
+
+        def refusing(manifest, *a, **kw):
+            import cowork_dispatch_manifest as _mm
+            checks = [{"capability": "runtime_roots", "ok": False,
+                      "reason": "forced_test_refusal", "repair_hint": ""}]
+            return _mm.manifest_refused(
+                manifest, checks, refusal_code="runtime_roots",
+                refusal_message="forced_test_refusal")
+
+        captured = {}
+
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            switch_fn = kw.get("switch_controller_fn")
+            preflight.run_manifest_preflight = refusing
+            try:
+                captured["result"] = switch_fn("scout", target="codex")
+            finally:
+                preflight.run_manifest_preflight = orig_preflight
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "policy"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertIs(captured["result"], False)
+        after = state_store.load(spath)
+        self.assertEqual(after["config"]["scout"]["controller"], "claude",
+                         "a refused manifest must not commit the switch")
+
+        session_uuid = state_store.get_session_uuid(after)
+        events = self._events(spath)
+        refusals = [e for e in events
+                    if e.get("event") == "dispatch.decision"
+                    and e.get("site") == "run_flow.switch_controller"
+                    and e.get("outcome") == "refuse"]
+        manifest_refusals = [e for e in refusals
+                             if e.get("refusal_code") == "capability_missing"]
+        self.assertEqual(len(manifest_refusals), 1,
+                         "switch must not be a vacuous absence of decisions")
+        self.assertIsNotNone(manifest_refusals[0].get("trace_event_id"))
+
+        # Read back the persisted (refused) manifest directly — recompiling
+        # after `preflight.run_manifest_preflight` is restored would retry
+        # and re-prove it, masking the digest actually bound above.
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "refused")
+        self.assertEqual(manifest_refusals[0].get("trace_event_id"),
+                         manifest["digest"])
+
+    def test_pre_launch_manifest_refusal_binds_digest_zero_launch(self):
+        spath = self._session(
+            "PRELAUNCH-MANIFEST-BIND", "scouting", {"scout": "claude"},
+            team=["scout"])
+        orig_preflight = preflight.run_manifest_preflight
+
+        def refusing(manifest, *a, **kw):
+            import cowork_dispatch_manifest as _mm
+            checks = [{"capability": "runtime_roots", "ok": False,
+                      "reason": "forced_test_refusal", "repair_hint": ""}]
+            return _mm.manifest_refused(
+                manifest, checks, refusal_code="runtime_roots",
+                refusal_message="forced_test_refusal")
+
+        preflight.run_manifest_preflight = refusing
+        popen = _RecordingPopen()
+        out = io.StringIO()
+        try:
+            with patch_bridge_popen(popen):
+                rc = cowork.run_flow(
+                    self._args(["--session-file", spath,
+                               "--context", "policy"]),
+                    io_in=io.StringIO(), io_out=out,
+                    which=lambda c: "/bin/" + c)
+        finally:
+            preflight.run_manifest_preflight = orig_preflight
+        self.assertEqual(rc, 1)
+        self.assertEqual(popen.calls, [], "zero turns on a refused manifest")
+        self.assertIn("manifest not proven", out.getvalue())
+
+        saved = state_store.load(spath)
+        session_uuid = state_store.get_session_uuid(saved)
+        events = self._events(spath)
+        refusals = [e for e in events
+                    if e.get("event") == "dispatch.decision"
+                    and e.get("site") == "run_flow_pre_launch"
+                    and e.get("outcome") == "refuse"
+                    and e.get("refusal_code") == "capability_missing"]
+        self.assertEqual(len(refusals), 1,
+                         "the pre-launch retry gate must not be a vacuous "
+                         "absence of decisions")
+        self.assertIsNotNone(refusals[0].get("trace_event_id"))
+
+        # Read back the persisted (refused) manifest directly — recompiling
+        # after `preflight.run_manifest_preflight` is restored would retry
+        # and re-prove it, masking the digest actually bound above.
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "refused")
+        self.assertEqual(refusals[0].get("trace_event_id"), manifest["digest"])
+
+    def test_switch_controller_compile_raise_binds_a_refusal_and_zero_switch(
+            self):
+        spath = self._session(
+            "SWITCH-COMPILE-RAISE-BIND", "scouting", {"scout": "claude"},
+            team=["scout"])
+        orig_compile = cowork._compile_role_manifest
+
+        def raising(*a, **kw):
+            raise OSError("forced_test_persist_failure")
+
+        captured = {}
+
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            switch_fn = kw.get("switch_controller_fn")
+            cowork._compile_role_manifest = raising
+            try:
+                captured["result"] = switch_fn("scout", target="codex")
+            finally:
+                cowork._compile_role_manifest = orig_compile
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "policy"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertIs(captured["result"], False)
+        after = state_store.load(spath)
+        self.assertEqual(after["config"]["scout"]["controller"], "claude",
+                         "a compile-raise must not commit the switch")
+
+        events = self._events(spath)
+        refusals = [e for e in events
+                    if e.get("event") == "dispatch.decision"
+                    and e.get("site") == "run_flow.switch_controller"
+                    and e.get("outcome") == "refuse"]
+        manifest_refusals = [e for e in refusals
+                             if e.get("refusal_code") == "capability_missing"]
+        self.assertEqual(len(manifest_refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(manifest_refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")
+
+    def test_pre_launch_compile_raise_binds_a_refusal_and_zero_launch(self):
+        spath = self._session(
+            "PRELAUNCH-COMPILE-RAISE-BIND", "scouting", {"scout": "claude"},
+            team=["scout"])
+        orig_compile = cowork._compile_role_manifest
+
+        def raising(*a, **kw):
+            raise OSError("forced_test_persist_failure")
+
+        cowork._compile_role_manifest = raising
+        popen = _RecordingPopen()
+        out = io.StringIO()
+        try:
+            with patch_bridge_popen(popen):
+                rc = cowork.run_flow(
+                    self._args(["--session-file", spath,
+                               "--context", "policy"]),
+                    io_in=io.StringIO(), io_out=out,
+                    which=lambda c: "/bin/" + c)
+        finally:
+            cowork._compile_role_manifest = orig_compile
+        self.assertEqual(rc, 1)
+        self.assertEqual(popen.calls, [],
+                         "zero controller spawns when compile raises")
+        self.assertIn("manifest not proven", out.getvalue())
+
+        events = self._events(spath)
+        refusals = [e for e in events
+                    if e.get("event") == "dispatch.decision"
+                    and e.get("site") == "run_flow_pre_launch"
+                    and e.get("outcome") == "refuse"
+                    and e.get("refusal_code") == "capability_missing"]
+        self.assertEqual(len(refusals), 1,
+                         "a compile-raise must still bind a decision")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes when compile raises")

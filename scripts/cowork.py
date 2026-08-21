@@ -4598,7 +4598,11 @@ def _isolated_evaluator_session(entry, identity, config=None, trace=None,
                 force_recompile=False)
         except Exception:
             _eval_manifest = {}
-        if (_eval_manifest.get("status") or {}).get("phase") != "proven":
+        _edec = _decide_and_trace(
+            trace, "evaluator", controller or "claude", "evaluator",
+            "_isolated_evaluator_session", manifest=_eval_manifest,
+            preflight_result=_manifest_preflight_fact(_eval_manifest))
+        if _edec["outcome"] == "refuse":
             _emit_dispatch_escalation(trace, "evaluator", "manifest_proven",
                                       "recompile and preflight the manifest",
                                       "session_creation")
@@ -5200,24 +5204,14 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     controller = wt_config["controller"]
-    _wc = _make_dispatch_contract(WORKTREE_ROLE, controller, "worktree",
-                                  "run_worktree")
+    # Fail-closed order: check policy FIRST (cheap, no side effects) so a
+    # policy-disallowed controller never pays for a manifest compile; only a
+    # policy-allowed controller reaches compile/revalidate. Either way, the
+    # single dispatch decision (policy + manifest preflight) binds to it and
+    # refuses before any brief/prompt assembly.
     _wf = _guard_to_policy_fact(controller, WORKTREE_ROLE, trace=trace)
-    _wdec = dispatch.decide(_wc, policy_result=_wf)
-    if trace:
-        trace.event("dispatch.contract", role=WORKTREE_ROLE,
-                    site="run_worktree", contract_id=_wc["contract_id"])
-        trace.event("dispatch.decision", role=WORKTREE_ROLE,
-                    site="run_worktree", outcome=_wdec["outcome"],
-                    decision_id=_wdec["decision_id"])
-    if _wdec["outcome"] == "refuse":
-        if trace:
-            trace.event("worktree.run.end", result="policy_blocked",
-                        controller=controller)
-        io_out.write(_wdec["refusal_message"] + "\n")
-        io_out.flush()
-        return None
-    if session_uuid:
+    _wt_manifest = None
+    if _wf["allowed"] and session_uuid:
         try:
             _wt_manifest, _ = _compile_role_manifest(
                 role=WORKTREE_ROLE, session_uuid=session_uuid,
@@ -5230,11 +5224,28 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
                 force_recompile=False)
         except Exception:
             _wt_manifest = {}
-        if (_wt_manifest.get("status") or {}).get("phase") != "proven":
+    _wdec = _decide_and_trace(
+        trace, WORKTREE_ROLE, controller, "worktree", "run_worktree",
+        manifest=_wt_manifest, policy_result=_wf,
+        preflight_result=_manifest_preflight_fact(_wt_manifest))
+    if _wdec["outcome"] == "refuse":
+        manifest_refused = _wdec["source"] == "preflight"
+        if manifest_refused:
             _emit_dispatch_escalation(
                 trace, WORKTREE_ROLE, "manifest_proven",
                 "recompile and preflight the manifest", "prompt_assembly")
-            return None
+        if trace:
+            trace.event(
+                "worktree.run.end",
+                result="manifest_refused" if manifest_refused
+                else "policy_blocked",
+                controller=controller)
+        # Base semantics: a manifest refusal is escalated via the trace, not
+        # surfaced on io_out — only a policy refusal writes its message here.
+        if not manifest_refused:
+            io_out.write(_wdec["refusal_message"] + "\n")
+            io_out.flush()
+        return None
     brief = assemble_worktree_brief(status_path, base_toplevel, name, explicit)
     # Clear any stale artifact so a failed/no-write run reads as None, never a
     # leftover 'ready' from an earlier attempt.
@@ -5263,6 +5274,13 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
                     role=WORKTREE_ROLE, extra_writable_dir=extra_writable_dir,
                     cache_enabled=True))
             if not ok:
+                _decide_and_trace(
+                    trace, WORKTREE_ROLE, controller, "worktree",
+                    "run_worktree", manifest=_wt_manifest,
+                    policy_result=_ALLOW_FACT,
+                    preflight_result=(_ALLOW_FACT if _wt_manifest
+                                      else None),
+                    probe_result=_probe_fact(alert))
                 if trace:
                     trace.event("worktree.run.end", result="probe_failed")
                 io_out.write("cowork: " + alert + "\n")
@@ -5285,20 +5303,14 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
                     extra_writable_dir=extra_writable_dir,
                     model=wt_config.get("model"), effort=wt_config.get("effort"))
         except policy.DispatchBlocked as exc:
-            _bwc = _make_dispatch_contract(WORKTREE_ROLE, controller,
-                                           "worktree", "run_worktree")
             _bwf = {"allowed": False,
                     "refusal_code": "controller_not_allowed",
                     "refusal_message": str(exc),
                     "source": "bridge_backstop"}
-            _bwdec = dispatch.decide(_bwc, policy_result=_bwf)
+            _bwdec = _decide_and_trace(
+                trace, WORKTREE_ROLE, controller, "worktree", "run_worktree",
+                manifest=_wt_manifest, policy_result=_bwf)
             if trace:
-                trace.event("dispatch.contract", role=WORKTREE_ROLE,
-                            site="run_worktree",
-                            contract_id=_bwc["contract_id"])
-                trace.event("dispatch.decision", role=WORKTREE_ROLE,
-                            site="run_worktree", outcome=_bwdec["outcome"],
-                            decision_id=_bwdec["decision_id"])
                 trace.event("worktree.run.end", result="policy_blocked",
                             controller=controller)
             io_out.write(_bwdec["refusal_message"] + "\n")
@@ -5710,33 +5722,15 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     caller treats as revise)."""
     prompt_path = prompt_path or SCOUT_REVIEWER_PROMPT_PATH
     cfg = config.get(reviewer_role) or DEFAULTS[reviewer_role]
-    _rc = _make_dispatch_contract(reviewer_role, cfg["controller"], "review",
-                                  "run_reviewer_once", phase=phase)
+    # Fail-closed order: check policy FIRST (cheap, no side effects) so a
+    # policy-disallowed controller never pays for a manifest compile; only a
+    # policy-allowed controller reaches compile/revalidate. Either way, the
+    # single dispatch decision (policy + manifest preflight) binds to it and
+    # refuses before any brief/prompt assembly.
     _rf = _guard_to_policy_fact(cfg["controller"], reviewer_role, phase=phase,
                                 trace=trace)
-    _rdec = dispatch.decide(_rc, policy_result=_rf)
-    if trace:
-        trace.event("dispatch.contract", role=reviewer_role,
-                    site="run_reviewer_once", contract_id=_rc["contract_id"])
-        trace.event("dispatch.decision", role=reviewer_role,
-                    site="run_reviewer_once", outcome=_rdec["outcome"],
-                    decision_id=_rdec["decision_id"])
-    if _rdec["outcome"] == "refuse":
-        if trace:
-            trace.event("review.run.end", role=reviewer_role,
-                        result="policy_blocked", controller=cfg["controller"],
-                        phase=phase)
-        return _controller_failure_verdict(
-            {"ok": False, "result": "policy_blocked"},
-            alert=_rdec["refusal_message"])
-    quiet = _QuietSink()
-    # When `surface_io_out` is set the REVIEW turn streams to the user on the
-    # wholly-internal (dim) channel under the reviewer's own label; otherwise it
-    # goes to the quiet sink, byte-identical to the historical hidden behavior.
-    # The reviewer's peer-eval send always stays muted (D-eval-stays-muted).
-    surface = surface_io_out is not None
-    review_io = surface_io_out if surface else quiet
-    if session_uuid:
+    _rev_manifest = None
+    if _rf["allowed"] and session_uuid:
         try:
             _rev_manifest, _ = _compile_role_manifest(
                 role=reviewer_role, session_uuid=session_uuid,
@@ -5748,12 +5742,37 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 force_recompile=bool(resume_id))
         except Exception:
             _rev_manifest = {}
-        if (_rev_manifest.get("status") or {}).get("phase") != "proven":
+    _rdec = _decide_and_trace(
+        trace, reviewer_role, cfg["controller"], "review", "run_reviewer_once",
+        manifest=_rev_manifest, policy_result=_rf,
+        preflight_result=_manifest_preflight_fact(_rev_manifest), phase=phase,
+        resume_session_id=resume_id)
+    if _rdec["outcome"] == "refuse":
+        manifest_refused = _rdec["source"] == "preflight"
+        if manifest_refused:
             _emit_dispatch_escalation(trace, reviewer_role, "manifest_proven",
                                       "recompile and preflight the manifest",
                                       "prompt_assembly")
-            return _controller_failure_verdict(
-                {"ok": False, "result": "manifest_refused"})
+        if trace:
+            trace.event("review.run.end", role=reviewer_role,
+                        result=("manifest_refused" if manifest_refused
+                                else "policy_blocked"),
+                        controller=cfg["controller"], phase=phase)
+        # Base semantics: a manifest refusal is escalated via the trace, not
+        # surfaced as a controller_failure_alert — only a policy refusal
+        # carries its message onto the verdict.
+        return _controller_failure_verdict(
+            {"ok": False,
+             "result": "manifest_refused" if manifest_refused
+             else "policy_blocked"},
+            alert=None if manifest_refused else _rdec["refusal_message"])
+    quiet = _QuietSink()
+    # When `surface_io_out` is set the REVIEW turn streams to the user on the
+    # wholly-internal (dim) channel under the reviewer's own label; otherwise it
+    # goes to the quiet sink, byte-identical to the historical hidden behavior.
+    # The reviewer's peer-eval send always stays muted (D-eval-stays-muted).
+    surface = surface_io_out is not None
+    review_io = surface_io_out if surface else quiet
     brief = assemble_reviewer_brief(review_path, protected=protected)
     # Measurable-goal structural check: scout intel that reached review without
     # a non-empty result.success_criteria gets an auto-finding note in the
@@ -5839,6 +5858,13 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 role=reviewer_role, extra_writable_dir=extra_writable_dir,
                 cache_enabled=True)
             if not ok:
+                _decide_and_trace(
+                    trace, reviewer_role, cfg["controller"], "review",
+                    "run_reviewer_once", manifest=_rev_manifest,
+                    policy_result=_ALLOW_FACT,
+                    preflight_result=(_ALLOW_FACT if _rev_manifest
+                                      else None),
+                    probe_result=_probe_fact(alert), phase=phase)
                 verdict = _controller_failure_verdict(
                     {"ok": False, "result": "probe_failed"}, alert=alert)
                 if trace:
@@ -5878,22 +5904,15 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                     extra_writable_dir=extra_writable_dir,
                     model=cfg.get("model"), effort=cfg.get("effort"))
         except policy.DispatchBlocked as exc:
-            _brc = _make_dispatch_contract(reviewer_role,
-                                           cfg["controller"], "review",
-                                           "run_reviewer_once", phase=phase)
             _brf = {"allowed": False,
                     "refusal_code": "controller_not_allowed",
                     "refusal_message": str(exc),
                     "source": "bridge_backstop"}
-            _brdec = dispatch.decide(_brc, policy_result=_brf)
+            _brdec = _decide_and_trace(
+                trace, reviewer_role, cfg["controller"], "review",
+                "run_reviewer_once", manifest=_rev_manifest,
+                policy_result=_brf, phase=phase, resume_session_id=resume_id)
             if trace:
-                trace.event("dispatch.contract", role=reviewer_role,
-                            site="run_reviewer_once",
-                            contract_id=_brc["contract_id"])
-                trace.event("dispatch.decision", role=reviewer_role,
-                            site="run_reviewer_once",
-                            outcome=_brdec["outcome"],
-                            decision_id=_brdec["decision_id"])
                 trace.event("review.run.end", role=reviewer_role,
                             result="policy_blocked",
                             controller=cfg["controller"], phase=phase)
@@ -8391,6 +8410,69 @@ def _make_dispatch_contract(role, controller, purpose, site,
     }
 
 
+_ALLOW_FACT = {"allowed": True, "refusal_code": None, "refusal_message": None,
+              "source": None}
+
+
+def _manifest_preflight_fact(manifest):
+    """Turn a compiled/preflighted capability manifest into the
+    `preflight_result` reducer fact for `dispatch.decide()`: allowed only
+    when `status.phase == 'proven'`. `manifest` is `None` when no manifest
+    governs this dispatch (no `preflight_result` is contributed). Any other
+    falsy value — notably `{}`, what a failed compile/persist attempt leaves
+    behind — still governs this dispatch and must refuse, not silently drop
+    the fence."""
+    if manifest is None:
+        return None
+    status = manifest.get("status") or {}
+    if status.get("phase") == "proven":
+        return dict(_ALLOW_FACT)
+    refusal = status.get("refusal") or {}
+    return {
+        "allowed": False,
+        "refusal_code": "capability_missing",
+        "refusal_message": refusal.get("message") or (
+            "capability manifest is not proven; recompile and preflight "
+            "the manifest"),
+        "source": "preflight",
+    }
+
+
+def _probe_fact(alert):
+    """The `probe_result` reducer fact for a failed controller-CLI probe."""
+    return {"allowed": False, "refusal_code": "probe_failed",
+            "refusal_message": alert or "controller probe failed",
+            "source": "probe"}
+
+
+def _decide_and_trace(trace, role, controller, purpose, site, manifest=None,
+                      policy_result=None, preflight_result=None,
+                      probe_result=None, resume_session_id=None, phase=None):
+    """Build a fresh DispatchContract, call `dispatch.decide()` bound to the
+    exact manifest identifier governing this dispatch (`manifest['digest']`,
+    when a manifest was compiled/revalidated for this attempt), and emit the
+    paired `dispatch.contract` / `dispatch.decision` trace events every
+    production call site shares. Returns the DispatchDecision dict."""
+    contract = _make_dispatch_contract(role, controller, purpose, site,
+                                       resume_session_id=resume_session_id,
+                                       phase=phase)
+    decision = dispatch.decide(
+        contract, policy_result=policy_result,
+        preflight_result=preflight_result, probe_result=probe_result,
+        manifest_id=(manifest or {}).get("digest"))
+    if trace:
+        trace.event("dispatch.contract", role=role, site=site,
+                    contract_id=contract["contract_id"])
+        trace.event("dispatch.decision", role=role, site=site,
+                    outcome=decision["outcome"],
+                    decision_id=decision["decision_id"],
+                    trace_event_id=decision["trace_event_id"],
+                    refusal_code=decision["refusal_code"],
+                    refusal_message=decision["refusal_message"],
+                    source=decision["source"])
+    return decision
+
+
 def _guard_to_policy_fact(controller, role, phase=None, trace=None):
     """Call policy.guard and return a reducer fact dict for dispatch.decide()."""
     try:
@@ -8446,6 +8528,10 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    # Fail-closed order: compile/revalidate the manifest FIRST, bind a
+    # dispatch decision to it (resume included — force_recompile revalidates),
+    # and require allow before any brief/prompt assembly.
+    _scout_manifest = None
     if session_uuid:
         try:
             _scout_manifest, _ = _compile_role_manifest(
@@ -8458,7 +8544,12 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                 force_recompile=bool(resume_id))
         except Exception:
             _scout_manifest = {}
-        if (_scout_manifest.get("status") or {}).get("phase") != "proven":
+        _mdec = _decide_and_trace(
+            trace, "scout", cfg["controller"], "launch", "run_scout",
+            manifest=_scout_manifest,
+            preflight_result=_manifest_preflight_fact(_scout_manifest),
+            resume_session_id=resume_id)
+        if _mdec["outcome"] == "refuse":
             _emit_dispatch_escalation(
                 trace, "scout", "manifest_proven",
                 "recompile and preflight the manifest", "prompt_assembly")
@@ -8511,26 +8602,25 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     io_out.flush()
 
     if cfg["controller"] == "claude":
-        if resume_id is None:
-            _sc = _make_dispatch_contract("scout", cfg["controller"],
-                                          "launch", "run_scout")
-            _sf = _guard_to_policy_fact(cfg["controller"], "scout", trace=trace)
-            _dec = dispatch.decide(_sc, policy_result=_sf)
+        _sf = _guard_to_policy_fact(cfg["controller"], "scout", trace=trace)
+        _dec = _decide_and_trace(
+            trace, "scout", cfg["controller"], "launch", "run_scout",
+            manifest=_scout_manifest, policy_result=_sf,
+            resume_session_id=resume_id)
+        # A resumed claude scout still pays the live probe (pinned
+        # characterization): the manifest-bound decision above is traced
+        # either way, but a policy refusal on resume is NOT short-circuited
+        # here — it is surfaced by the probe's own uncaught `policy.guard`
+        # (kind="probe") below, exactly as it always has been. Only a fresh
+        # dispatch (no resume) refuses cleanly before ever reaching it.
+        if _dec["outcome"] == "refuse" and not resume_id:
             if trace:
-                trace.event("dispatch.contract", role="scout",
-                            site="run_scout",
-                            contract_id=_sc["contract_id"])
-                trace.event("dispatch.decision", role="scout",
-                            site="run_scout", outcome=_dec["outcome"],
-                            decision_id=_dec["decision_id"])
-            if _dec["outcome"] == "refuse":
-                if trace:
-                    trace.event("role.end", role="scout",
-                                result="policy_blocked",
-                                controller=cfg["controller"])
-                io_out.write(_dec["refusal_message"] + "\n")
-                io_out.flush()
-                return 1
+                trace.event("role.end", role="scout",
+                            result="policy_blocked",
+                            controller=cfg["controller"])
+            io_out.write(_dec["refusal_message"] + "\n")
+            io_out.flush()
+            return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
             io_out, "starting scout",
@@ -8539,6 +8629,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                 role_prompt_file=SCOUT_PROMPT_PATH, trace=trace, role="scout",
                 extra_writable_dir=sessions_dir, cache_enabled=True))
         if not ok:
+            _decide_and_trace(
+                trace, "scout", cfg["controller"], "launch", "run_scout",
+                manifest=_scout_manifest, policy_result=_ALLOW_FACT,
+                preflight_result=(_ALLOW_FACT if _scout_manifest else None),
+                probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
                 trace.event("role.end", role="scout", result="probe_failed")
             io_out.write("cowork: " + alert + "\n")
@@ -8568,19 +8663,13 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
-            _bsc = _make_dispatch_contract("scout", cfg["controller"],
-                                           "launch", "run_scout",
-                                           resume_session_id=resume_id)
             _bfact = {"allowed": False, "refusal_code": "controller_not_allowed",
                       "refusal_message": str(exc), "source": "bridge_backstop"}
-            _bdec = dispatch.decide(_bsc, policy_result=_bfact)
+            _bdec = _decide_and_trace(
+                trace, "scout", cfg["controller"], "launch", "run_scout",
+                manifest=_scout_manifest, policy_result=_bfact,
+                resume_session_id=resume_id)
             if trace:
-                trace.event("dispatch.contract", role="scout",
-                            site="run_scout",
-                            contract_id=_bsc["contract_id"])
-                trace.event("dispatch.decision", role="scout",
-                            site="run_scout", outcome=_bdec["outcome"],
-                            decision_id=_bdec["decision_id"])
                 trace.event("role.end", role="scout", result="policy_blocked",
                             controller=cfg["controller"])
             io_out.write(_bdec["refusal_message"] + "\n")
@@ -8741,6 +8830,10 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    # Fail-closed order: compile/revalidate the manifest FIRST, bind a
+    # dispatch decision to it (resume included — force_recompile revalidates),
+    # and require allow before any brief/prompt assembly.
+    _planner_manifest = None
     if session_uuid:
         try:
             _planner_manifest, _ = _compile_role_manifest(
@@ -8753,7 +8846,12 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 force_recompile=bool(resume_id))
         except Exception:
             _planner_manifest = {}
-        if (_planner_manifest.get("status") or {}).get("phase") != "proven":
+        _mdec = _decide_and_trace(
+            trace, "planner", cfg["controller"], "launch", "run_planner",
+            manifest=_planner_manifest,
+            preflight_result=_manifest_preflight_fact(_planner_manifest),
+            resume_session_id=resume_id)
+        if _mdec["outcome"] == "refuse":
             _emit_dispatch_escalation(
                 trace, "planner", "manifest_proven",
                 "recompile and preflight the manifest", "prompt_assembly")
@@ -8829,28 +8927,25 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         clear_pending_turn_fn=clear_pending_turn_fn)
 
     if cfg["controller"] == "claude":
-        if resume_id is None:
-            _pc = _make_dispatch_contract("planner", cfg["controller"],
-                                          "launch", "run_planner")
-            _pf = _guard_to_policy_fact(cfg["controller"], "planner",
-                                        trace=trace)
-            _pdec = dispatch.decide(_pc, policy_result=_pf)
+        _pf = _guard_to_policy_fact(cfg["controller"], "planner", trace=trace)
+        _pdec = _decide_and_trace(
+            trace, "planner", cfg["controller"], "launch", "run_planner",
+            manifest=_planner_manifest, policy_result=_pf,
+            resume_session_id=resume_id)
+        # A resumed claude planner still pays the live probe (base
+        # semantics): the manifest-bound decision above is traced either way,
+        # but a policy refusal on resume is surfaced by the probe's own
+        # uncaught `policy.guard` (kind="probe") below, not short-circuited
+        # here. Only a fresh dispatch (no resume) refuses cleanly first.
+        if _pdec["outcome"] == "refuse" and not resume_id:
             if trace:
-                trace.event("dispatch.contract", role="planner",
-                            site="run_planner",
-                            contract_id=_pc["contract_id"])
-                trace.event("dispatch.decision", role="planner",
-                            site="run_planner", outcome=_pdec["outcome"],
-                            decision_id=_pdec["decision_id"])
-            if _pdec["outcome"] == "refuse":
-                if trace:
-                    trace.event("role.end", role="planner",
-                                result="policy_blocked",
-                                controller=cfg["controller"])
-                io_out.write(_pdec["refusal_message"] + "\n")
-                io_out.flush()
-                report("ended", None)
-                return 1
+                trace.event("role.end", role="planner",
+                            result="policy_blocked",
+                            controller=cfg["controller"])
+            io_out.write(_pdec["refusal_message"] + "\n")
+            io_out.flush()
+            report("ended", None)
+            return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
             io_out, "starting planner",
@@ -8860,6 +8955,11 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 role="planner", extra_writable_dir=sessions_dir,
                 cache_enabled=True))
         if not ok:
+            _decide_and_trace(
+                trace, "planner", cfg["controller"], "launch", "run_planner",
+                manifest=_planner_manifest, policy_result=_ALLOW_FACT,
+                preflight_result=(_ALLOW_FACT if _planner_manifest else None),
+                probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
                 trace.event("role.end", role="planner", result="probe_failed")
             io_out.write("cowork: " + alert + "\n")
@@ -8890,19 +8990,13 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
-            _bpc = _make_dispatch_contract("planner", cfg["controller"],
-                                           "launch", "run_planner",
-                                           resume_session_id=resume_id)
             _bpf = {"allowed": False, "refusal_code": "controller_not_allowed",
                     "refusal_message": str(exc), "source": "bridge_backstop"}
-            _bpdec = dispatch.decide(_bpc, policy_result=_bpf)
+            _bpdec = _decide_and_trace(
+                trace, "planner", cfg["controller"], "launch", "run_planner",
+                manifest=_planner_manifest, policy_result=_bpf,
+                resume_session_id=resume_id)
             if trace:
-                trace.event("dispatch.contract", role="planner",
-                            site="run_planner",
-                            contract_id=_bpc["contract_id"])
-                trace.event("dispatch.decision", role="planner",
-                            site="run_planner", outcome=_bpdec["outcome"],
-                            decision_id=_bpdec["decision_id"])
                 trace.event("role.end", role="planner", result="policy_blocked",
                             controller=cfg["controller"])
             io_out.write(_bpdec["refusal_message"] + "\n")
@@ -9052,6 +9146,10 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    # Fail-closed order: compile/revalidate the manifest FIRST, bind a
+    # dispatch decision to it (resume included — force_recompile revalidates),
+    # and require allow before any brief/prompt assembly.
+    _builder_manifest = None
     if session_uuid:
         try:
             _builder_manifest, _ = _compile_role_manifest(
@@ -9064,7 +9162,12 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 force_recompile=bool(resume_id))
         except Exception:
             _builder_manifest = {}
-        if (_builder_manifest.get("status") or {}).get("phase") != "proven":
+        _mdec = _decide_and_trace(
+            trace, "builder", cfg["controller"], "launch", "run_builder",
+            manifest=_builder_manifest,
+            preflight_result=_manifest_preflight_fact(_builder_manifest),
+            resume_session_id=resume_id)
+        if _mdec["outcome"] == "refuse":
             _emit_dispatch_escalation(
                 trace, "builder", "manifest_proven",
                 "recompile and preflight the manifest", "prompt_assembly")
@@ -9169,28 +9272,25 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         build_summary_path=build_summary_path)
 
     if cfg["controller"] == "claude":
-        if resume_id is None:
-            _bc = _make_dispatch_contract("builder", cfg["controller"],
-                                          "launch", "run_builder")
-            _bf = _guard_to_policy_fact(cfg["controller"], "builder",
-                                        trace=trace)
-            _bdec2 = dispatch.decide(_bc, policy_result=_bf)
+        _bf = _guard_to_policy_fact(cfg["controller"], "builder", trace=trace)
+        _bdec2 = _decide_and_trace(
+            trace, "builder", cfg["controller"], "launch", "run_builder",
+            manifest=_builder_manifest, policy_result=_bf,
+            resume_session_id=resume_id)
+        # A resumed claude builder still pays the live probe (base
+        # semantics): the manifest-bound decision above is traced either way,
+        # but a policy refusal on resume is surfaced by the probe's own
+        # uncaught `policy.guard` (kind="probe") below, not short-circuited
+        # here. Only a fresh dispatch (no resume) refuses cleanly first.
+        if _bdec2["outcome"] == "refuse" and not resume_id:
             if trace:
-                trace.event("dispatch.contract", role="builder",
-                            site="run_builder",
-                            contract_id=_bc["contract_id"])
-                trace.event("dispatch.decision", role="builder",
-                            site="run_builder", outcome=_bdec2["outcome"],
-                            decision_id=_bdec2["decision_id"])
-            if _bdec2["outcome"] == "refuse":
-                if trace:
-                    trace.event("role.end", role="builder",
-                                result="policy_blocked",
-                                controller=cfg["controller"])
-                io_out.write(_bdec2["refusal_message"] + "\n")
-                io_out.flush()
-                report("ended", None)
-                return 1
+                trace.event("role.end", role="builder",
+                            result="policy_blocked",
+                            controller=cfg["controller"])
+            io_out.write(_bdec2["refusal_message"] + "\n")
+            io_out.flush()
+            report("ended", None)
+            return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
             io_out, "starting builder",
@@ -9200,6 +9300,11 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 role="builder", extra_writable_dir=sessions_dir,
                 cache_enabled=True))
         if not ok:
+            _decide_and_trace(
+                trace, "builder", cfg["controller"], "launch", "run_builder",
+                manifest=_builder_manifest, policy_result=_ALLOW_FACT,
+                preflight_result=(_ALLOW_FACT if _builder_manifest else None),
+                probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
                 trace.event("role.end", role="builder", result="probe_failed")
             io_out.write("cowork: " + alert + "\n")
@@ -9228,19 +9333,13 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
-            _bbsc = _make_dispatch_contract("builder", cfg["controller"],
-                                            "launch", "run_builder",
-                                            resume_session_id=resume_id)
             _bbf = {"allowed": False, "refusal_code": "controller_not_allowed",
                     "refusal_message": str(exc), "source": "bridge_backstop"}
-            _bbdec = dispatch.decide(_bbsc, policy_result=_bbf)
+            _bbdec = _decide_and_trace(
+                trace, "builder", cfg["controller"], "launch", "run_builder",
+                manifest=_builder_manifest, policy_result=_bbf,
+                resume_session_id=resume_id)
             if trace:
-                trace.event("dispatch.contract", role="builder",
-                            site="run_builder",
-                            contract_id=_bbsc["contract_id"])
-                trace.event("dispatch.decision", role="builder",
-                            site="run_builder", outcome=_bbdec["outcome"],
-                            decision_id=_bbdec["decision_id"])
                 trace.event("role.end", role="builder", result="policy_blocked",
                             controller=cfg["controller"])
             io_out.write(_bbdec["refusal_message"] + "\n")
@@ -10264,19 +10363,15 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             return None
         controller = config[role].get("controller")
         # Policy first: a reviewer on a disallowed controller is blocked before
-        # its executable is even looked for, and never spawned.
-        _rcc = _make_dispatch_contract(role, controller, "review",
-                                       "run_flow.reviewer_controller_check",
-                                       phase=phase)
+        # its executable is even looked for, and never spawned. No manifest
+        # exists yet at this point (this is a pre-check ahead of the real
+        # reviewer dispatch, which compiles and binds its own manifest inside
+        # run_reviewer_once), so nothing is bound here.
         _rcf = _guard_to_policy_fact(controller, role, phase=phase, trace=trace)
-        _rcdec = dispatch.decide(_rcc, policy_result=_rcf)
-        trace.event("dispatch.contract", role=role,
-                    site="run_flow.reviewer_controller_check",
-                    contract_id=_rcc["contract_id"])
-        trace.event("dispatch.decision", role=role,
-                    site="run_flow.reviewer_controller_check",
-                    outcome=_rcdec["outcome"],
-                    decision_id=_rcdec["decision_id"])
+        _rcdec = _decide_and_trace(
+            trace, role, controller, "review",
+            "run_flow.reviewer_controller_check", policy_result=_rcf,
+            phase=phase)
         if _rcdec["outcome"] == "refuse":
             trace.event("review.controller_policy_blocked", role=role,
                         phase=phase, controller=controller)
@@ -10323,19 +10418,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             return False
         # The policy decision runs FIRST — before the executable preflight and
         # before the claude probe below — so a disallowed target is never
-        # preflighted, never probed, and never spawned.
-        _swc = _make_dispatch_contract(role, target, "switch",
-                                       "run_flow.switch_controller",
-                                       phase=phase)
+        # preflighted, never probed, and never spawned. No manifest exists yet
+        # at this point (it is compiled below, only for an allowed target), so
+        # nothing is bound here — binding a not-yet-compiled manifest would be
+        # inventing an identifier.
         _swf = _guard_to_policy_fact(target, role, phase=phase, trace=trace)
-        _swdec = dispatch.decide(_swc, policy_result=_swf)
-        trace.event("dispatch.contract", role=role,
-                    site="run_flow.switch_controller",
-                    contract_id=_swc["contract_id"])
-        trace.event("dispatch.decision", role=role,
-                    site="run_flow.switch_controller",
-                    outcome=_swdec["outcome"],
-                    decision_id=_swdec["decision_id"])
+        _swdec = _decide_and_trace(
+            trace, role, target, "switch", "run_flow.switch_controller",
+            policy_result=_swf, phase=phase)
         if _swdec["outcome"] == "refuse":
             io_out.write(_swdec["refusal_message"] + "\n")
             io_out.flush()
@@ -10385,7 +10475,12 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     sessions_dir=_sw_sdir, force_recompile=True)
             except Exception:
                 _sw_manifest = {}
-            if (_sw_manifest.get("status") or {}).get("phase") != "proven":
+            _swmdec = _decide_and_trace(
+                trace, role, target, "switch", "run_flow.switch_controller",
+                manifest=_sw_manifest,
+                preflight_result=_manifest_preflight_fact(_sw_manifest),
+                phase=phase)
+            if _swmdec["outcome"] == "refuse":
                 _emit_dispatch_escalation(trace, role, "manifest_proven",
                                           "recompile and preflight the manifest",
                                           "switch_controller")
@@ -10436,16 +10531,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         interactive mode alike. The missing-executable retry/switch/end loop
         below it is unchanged."""
         controller = config[role].get("controller")
-        _elc = _make_dispatch_contract(role, controller, "launch",
-                                       "run_flow_pre_launch", phase=phase)
+        # No manifest exists yet at this point (it is compiled below, only
+        # once policy allows this controller), so nothing is bound here —
+        # binding a not-yet-compiled manifest would be inventing an
+        # identifier.
         _elf = _guard_to_policy_fact(controller, role, phase=phase, trace=trace)
-        _eldec = dispatch.decide(_elc, policy_result=_elf)
-        trace.event("dispatch.contract", role=role,
-                    site="run_flow_pre_launch",
-                    contract_id=_elc["contract_id"])
-        trace.event("dispatch.decision", role=role,
-                    site="run_flow_pre_launch", outcome=_eldec["outcome"],
-                    decision_id=_eldec["decision_id"])
+        _eldec = _decide_and_trace(
+            trace, role, controller, "launch", "run_flow_pre_launch",
+            policy_result=_elf, phase=phase)
         if _eldec["outcome"] == "refuse":
             io_out.write(_eldec["refusal_message"] + "\n")
             io_out.flush()
@@ -10467,7 +10560,12 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     sessions_dir=_disp_sdir, force_recompile=False)
             except Exception:
                 _disp_manifest = {}
-            if (_disp_manifest.get("status") or {}).get("phase") != "proven":
+            _dispdec = _decide_and_trace(
+                trace, role, controller, "launch", "run_flow_pre_launch",
+                manifest=_disp_manifest,
+                preflight_result=_manifest_preflight_fact(_disp_manifest),
+                phase=phase)
+            if _dispdec["outcome"] == "refuse":
                 _emit_dispatch_escalation(trace, role, "manifest_proven",
                                           "recompile and preflight the manifest",
                                           "pre_launch")
