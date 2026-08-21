@@ -307,6 +307,105 @@ def check_artifact_destinations(capability):
     return capability_check_result("artifact_destinations", True)
 
 
+def check_git_operation(capability):
+    """Fail if capability.action_classes declares 'git' without a provable
+    git subcommand/flags in capability.command_adapters['git'].
+
+    Applicability is explicit: only manifests that declare the 'git' action
+    class are checked, so non-Git dispatches are never silently exempted by
+    the mere absence of adapter data — a declared 'git' action class with
+    missing/malformed adapter evidence fails closed instead of passing.
+    """
+    import cowork_dispatch_manifest as _manifest_mod
+    cap = capability or {}
+    if "git" not in (cap.get("action_classes") or []):
+        return capability_check_result("git_operation", True)
+    spec = (cap.get("command_adapters") or {}).get("git")
+    subcommand = spec.get("subcommand") if isinstance(spec, dict) else None
+    if not isinstance(subcommand, str) or not subcommand:
+        return capability_check_result(
+            "git_operation", False,
+            reason="git action class declared but capability.command_adapters"
+                   "['git'] has no subcommand",
+            repair_hint="declare command_adapters['git'] = "
+                        "{'subcommand': ..., 'flags': [...]}")
+    flags = spec.get("flags", [])
+    if not isinstance(flags, list) or not all(isinstance(f, str) for f in flags):
+        return capability_check_result(
+            "git_operation", False,
+            reason="capability.command_adapters['git']['flags'] must be a "
+                   "list of strings",
+            repair_hint="declare flags as a list of strings")
+    decision = _manifest_mod.validate_git_operation(subcommand, flags)
+    return capability_check_result(
+        decision.capability, decision.allow, decision.reason, decision.repair_hint)
+
+
+def check_cwd(capability, binding, stat_fn=None):
+    """Fail if binding.worktree is declared and is an unsafe working directory.
+
+    Applicability is explicit: binding.worktree is a required schema field
+    (string or null); null is the manifest's own declared statement that no
+    working directory is bound to this dispatch, not missing evidence.
+    """
+    import cowork_dispatch_manifest as _manifest_mod
+    bind = binding or {}
+    worktree = bind.get("worktree")
+    if worktree is None:
+        return capability_check_result("cwd", True)
+    cap = capability or {}
+    fn = stat_fn if stat_fn is not None else os.stat
+    decision = _manifest_mod.validate_cwd(
+        worktree, cap.get("runtime_roots") or [], stat_fn=fn)
+    return capability_check_result(
+        decision.capability, decision.allow, decision.reason, decision.repair_hint)
+
+
+def check_rtk_present(capability, stat_fn=None):
+    """Fail if capability.action_classes declares 'tool' without a provable
+    rtk executable path in capability.command_adapters['rtk'].
+    """
+    import cowork_dispatch_manifest as _manifest_mod
+    cap = capability or {}
+    if "tool" not in (cap.get("action_classes") or []):
+        return capability_check_result("rtk_present", True)
+    spec = (cap.get("command_adapters") or {}).get("rtk")
+    path = spec.get("path") if isinstance(spec, dict) else None
+    if not isinstance(path, str) or not path:
+        return capability_check_result(
+            "rtk_present", False,
+            reason="tool action class declared but capability.command_adapters"
+                   "['rtk'] has no path",
+            repair_hint="declare command_adapters['rtk'] = "
+                        "{'path': '/path/to/rtk'}")
+    fn = stat_fn if stat_fn is not None else os.stat
+    decision = _manifest_mod.validate_rtk_present(path, stat_fn=fn)
+    return capability_check_result(
+        decision.capability, decision.allow, decision.reason, decision.repair_hint)
+
+
+def check_argv_form(capability):
+    """Fail if capability.action_classes declares 'exec' without a provable,
+    shell-metacharacter-free argv in capability.command_adapters['exec'].
+    """
+    import cowork_dispatch_manifest as _manifest_mod
+    cap = capability or {}
+    if "exec" not in (cap.get("action_classes") or []):
+        return capability_check_result("argv_form", True)
+    argv = (cap.get("command_adapters") or {}).get("exec")
+    if not isinstance(argv, list) or not argv or not all(
+            isinstance(a, str) for a in argv):
+        return capability_check_result(
+            "argv_form", False,
+            reason="exec action class declared but capability.command_adapters"
+                   "['exec'] has no argv",
+            repair_hint="declare command_adapters['exec'] as a nonempty list "
+                        "of argv strings")
+    decision = _manifest_mod.validate_argv_form(argv)
+    return capability_check_result(
+        decision.capability, decision.allow, decision.reason, decision.repair_hint)
+
+
 def check_controller_config(capability, binding):
     """Fail when cowork_action_policy.capability_decision() denies the controller."""
     import cowork_action_policy as _action_policy
@@ -402,6 +501,10 @@ def run_manifest_preflight(manifest, connect_fn=None, stat_fn=None, platform=Non
         lambda: check_guard_socket(cap, connect_fn=connect_fn),
         lambda: check_kernel_boundary(cap, platform=platform),
         lambda: check_artifact_destinations(cap),
+        lambda: check_git_operation(cap),
+        lambda: check_cwd(cap, bind, stat_fn=stat_fn),
+        lambda: check_rtk_present(cap, stat_fn=stat_fn),
+        lambda: check_argv_form(cap),
         lambda: check_controller_config(cap, bind),
         lambda: check_codex_config_freshness(cap, bind, stat_fn=stat_fn),
     ):

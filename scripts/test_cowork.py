@@ -33613,6 +33613,132 @@ class ManifestPreflightTest(unittest.TestCase):
         self.assertIn("stale", r["reason"])
 
     # ------------------------------------------------------------------ #
+    # check_git_operation — M1 P2-v3 successor                            #
+    # ------------------------------------------------------------------ #
+
+    def test_check_git_operation_not_applicable_without_git_action_class(self):
+        cap = _preflight_capability(action_classes=["write"])
+        r = preflight.check_git_operation(cap)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["capability"], "git_operation")
+
+    def test_check_git_operation_missing_evidence_fails_closed(self):
+        cap = _preflight_capability(action_classes=["git"])
+        r = preflight.check_git_operation(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("no subcommand", r["reason"])
+
+    def test_check_git_operation_denied_subcommand(self):
+        cap = _preflight_capability(action_classes=["git"])
+        cap["command_adapters"] = {"git": {"subcommand": "push", "flags": []}}
+        r = preflight.check_git_operation(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("unconditionally refused", r["reason"])
+
+    def test_check_git_operation_unsafe_flag(self):
+        cap = _preflight_capability(action_classes=["git"])
+        cap["command_adapters"] = {
+            "git": {"subcommand": "status", "flags": ["--format"]}}
+        r = preflight.check_git_operation(cap)
+        self.assertFalse(r["ok"])
+
+    def test_check_git_operation_pass(self):
+        cap = _preflight_capability(action_classes=["git"])
+        cap["command_adapters"] = {
+            "git": {"subcommand": "status", "flags": ["-s"]}}
+        r = preflight.check_git_operation(cap)
+        self.assertTrue(r["ok"])
+
+    # ------------------------------------------------------------------ #
+    # check_cwd — M1 P2-v3 successor                                      #
+    # ------------------------------------------------------------------ #
+
+    def test_check_cwd_not_applicable_without_worktree(self):
+        cap = _preflight_capability()
+        bind = _preflight_binding()
+        r = preflight.check_cwd(cap, bind)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["capability"], "cwd")
+
+    def test_check_cwd_rejects_tmp(self):
+        cap = _preflight_capability(runtime_roots=["/tmp"])
+        bind = dict(_preflight_binding())
+        bind["worktree"] = "/tmp"
+        r = preflight.check_cwd(cap, bind)
+        self.assertFalse(r["ok"])
+        self.assertIn("tmp", r["reason"])
+
+    def test_check_cwd_allows_declared_subdir(self):
+        subdir = os.path.join(self._root, "work")
+        os.makedirs(subdir)
+        cap = _preflight_capability(runtime_roots=[self._root])
+        bind = dict(_preflight_binding())
+        bind["worktree"] = subdir
+        r = preflight.check_cwd(cap, bind)
+        self.assertTrue(r["ok"])
+
+    # ------------------------------------------------------------------ #
+    # check_rtk_present — M1 P2-v3 successor                              #
+    # ------------------------------------------------------------------ #
+
+    def test_check_rtk_present_not_applicable_without_tool_action_class(self):
+        cap = _preflight_capability(action_classes=["write"])
+        r = preflight.check_rtk_present(cap)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["capability"], "rtk_present")
+
+    def test_check_rtk_present_missing_evidence_fails_closed(self):
+        cap = _preflight_capability(action_classes=["tool"])
+        r = preflight.check_rtk_present(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("no path", r["reason"])
+
+    def test_check_rtk_present_missing_binary(self):
+        cap = _preflight_capability(action_classes=["tool"])
+        cap["command_adapters"] = {"rtk": {"path": "/nonexistent/rtk"}}
+        r = preflight.check_rtk_present(
+            cap, stat_fn=lambda p: (_ for _ in ()).throw(OSError("no")))
+        self.assertFalse(r["ok"])
+        self.assertIn("not found", r["reason"])
+
+    def test_check_rtk_present_pass(self):
+        cap = _preflight_capability(action_classes=["tool"])
+        cap["command_adapters"] = {"rtk": {"path": "/usr/local/bin/rtk"}}
+        r = preflight.check_rtk_present(
+            cap, stat_fn=lambda p: type("S", (), {"st_mode": 0o100755})())
+        self.assertTrue(r["ok"])
+
+    # ------------------------------------------------------------------ #
+    # check_argv_form — M1 P2-v3 successor                                #
+    # ------------------------------------------------------------------ #
+
+    def test_check_argv_form_not_applicable_without_exec_action_class(self):
+        cap = _preflight_capability(action_classes=["write"])
+        r = preflight.check_argv_form(cap)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["capability"], "argv_form")
+
+    def test_check_argv_form_missing_evidence_fails_closed(self):
+        cap = _preflight_capability(action_classes=["exec"])
+        r = preflight.check_argv_form(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("no argv", r["reason"])
+
+    def test_check_argv_form_unsafe_syntax(self):
+        cap = _preflight_capability(action_classes=["exec"])
+        cap["command_adapters"] = {
+            "exec": ["git", "status;", "rm", "-rf", "/"]}
+        r = preflight.check_argv_form(cap)
+        self.assertFalse(r["ok"])
+        self.assertIn("metacharacter", r["reason"])
+
+    def test_check_argv_form_pass(self):
+        cap = _preflight_capability(action_classes=["exec"])
+        cap["command_adapters"] = {"exec": ["git", "status", "-s"]}
+        r = preflight.check_argv_form(cap)
+        self.assertTrue(r["ok"])
+
+    # ------------------------------------------------------------------ #
     # run_manifest_preflight — orchestration                              #
     # ------------------------------------------------------------------ #
 
@@ -33676,6 +33802,73 @@ class ManifestPreflightTest(unittest.TestCase):
             stat_fn=lambda p: fresh,
             platform="darwin",
         )
+        self.assertEqual(out["status"]["phase"], "proven")
+
+    # ------------------------------------------------------------------ #
+    # run_manifest_preflight — git/cwd/rtk/argv wiring (P2-v3 successor)   #
+    # ------------------------------------------------------------------ #
+
+    def test_run_manifest_preflight_refuses_denied_git_operation(self):
+        cap = _preflight_capability(
+            runtime_roots=[self._root], private_paths=[],
+            action_classes=["git"])
+        cap["command_adapters"] = {"git": {"subcommand": "push", "flags": []}}
+        m = self._make_manifest(cap=cap)
+        out = preflight.run_manifest_preflight(m, platform="darwin")
+        self.assertEqual(out["status"]["phase"], "refused")
+        self.assertEqual(out["status"]["refusal"]["code"], "git_operation")
+
+    def test_run_manifest_preflight_refuses_tmp_cwd(self):
+        cap = _preflight_capability(runtime_roots=[self._root], private_paths=[])
+        bind = dict(_preflight_binding())
+        bind["worktree"] = "/tmp"
+        m = manifest_mod.compile_manifest("wk-pf", cap, bind)
+        out = preflight.run_manifest_preflight(m, platform="darwin")
+        self.assertEqual(out["status"]["phase"], "refused")
+        self.assertEqual(out["status"]["refusal"]["code"], "cwd")
+
+    def test_run_manifest_preflight_refuses_missing_rtk(self):
+        cap = _preflight_capability(
+            runtime_roots=[self._root], private_paths=[],
+            action_classes=["tool"])
+        cap["command_adapters"] = {
+            "rtk": {"path": os.path.join(self._td, "no-such-rtk")}}
+        m = self._make_manifest(cap=cap)
+        out = preflight.run_manifest_preflight(m, platform="darwin")
+        self.assertEqual(out["status"]["phase"], "refused")
+        self.assertEqual(out["status"]["refusal"]["code"], "rtk_present")
+
+    def test_run_manifest_preflight_refuses_unsafe_argv(self):
+        cap = _preflight_capability(
+            runtime_roots=[self._root], private_paths=[],
+            action_classes=["exec"])
+        cap["command_adapters"] = {
+            "exec": ["git", "status;", "rm", "-rf", "/"]}
+        m = self._make_manifest(cap=cap)
+        out = preflight.run_manifest_preflight(m, platform="darwin")
+        self.assertEqual(out["status"]["phase"], "refused")
+        self.assertEqual(out["status"]["refusal"]["code"], "argv_form")
+
+    def test_run_manifest_preflight_valid_git_cwd_rtk_argv_still_proven(self):
+        subdir = os.path.join(self._root, "work")
+        os.makedirs(subdir)
+        rtk_path = os.path.join(self._td, "rtk")
+        with open(rtk_path, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(rtk_path, 0o755)
+        cap = _preflight_capability(
+            runtime_roots=[self._root], private_paths=[],
+            action_classes=["write", "git", "tool", "exec"],
+        )
+        cap["command_adapters"] = {
+            "git": {"subcommand": "status", "flags": ["-s"]},
+            "rtk": {"path": rtk_path},
+            "exec": ["git", "status", "-s"],
+        }
+        bind = dict(_preflight_binding())
+        bind["worktree"] = subdir
+        m = manifest_mod.compile_manifest("wk-pf", cap, bind)
+        out = preflight.run_manifest_preflight(m, platform="darwin")
         self.assertEqual(out["status"]["phase"], "proven")
 
 
@@ -34264,6 +34457,30 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
         cowork._compile_role_manifest = raising
         self.addCleanup(setattr, cowork, "_compile_role_manifest", orig)
 
+    def _inject_capability_facts(self, action_classes=None,
+                                 command_adapters=None, worktree=None):
+        """Mutate the capability/binding a real role dispatch compiles, then
+        delegate to the REAL `compile_manifest` + (unmodified)
+        `run_manifest_preflight` fence. Unlike `_force_refused_preflight`,
+        this does not fabricate a refusal — it feeds the real P3 validators
+        (git/cwd/rtk/argv) real evidence so their own logic decides."""
+        orig = cowork.dispatch_manifest.compile_manifest
+
+        def patched(work_id, capability, binding, status=None):
+            capability = dict(capability)
+            if action_classes is not None:
+                capability["action_classes"] = list(action_classes)
+            if command_adapters is not None:
+                capability["command_adapters"] = dict(command_adapters)
+            binding = dict(binding)
+            if worktree is not None:
+                binding["worktree"] = worktree
+            return orig(work_id, capability, binding, status=status)
+
+        cowork.dispatch_manifest.compile_manifest = patched
+        self.addCleanup(
+            setattr, cowork.dispatch_manifest, "compile_manifest", orig)
+
     def _decisions(self, events, site, outcome=None):
         out = [e for e in events if e.get("event") == "dispatch.decision"
                and e.get("site") == site]
@@ -34728,6 +34945,153 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
         self.assertEqual(
             [e for e in events if e.get("event") == "role.prompt.bytes"], [],
             "zero full-prompt bytes when compile raises")
+
+    # ------------------------------------------------------------------ #
+    # M1 P2-v3 successor — git/cwd/rtk/argv validators wired into the real #
+    # run_manifest_preflight fence, driven through the real run_worktree   #
+    # production dispatch (never a fabricated refusal).                   #
+    # ------------------------------------------------------------------ #
+
+    def _worktree_case(self, action_classes=None, command_adapters=None,
+                       worktree=None):
+        self._inject_capability_facts(
+            action_classes=action_classes, command_adapters=command_adapters,
+            worktree=worktree)
+        spawn_calls = []
+
+        def factory(controller):
+            spawn_calls.append(controller)
+            self.fail("worktree must not spawn on a refused manifest")
+
+        tpath, trace = self._trace("WT-VALIDATOR-%s" % id(self))
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(self._td, "wt.status.json")
+        result = cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            trace=trace, extra_writable_dir=self._td)
+        self.assertIsNone(result)
+        self.assertEqual(spawn_calls, [], "zero turns on a refused manifest")
+
+        manifest, _ = cowork._compile_role_manifest(
+            role=cowork.WORKTREE_ROLE, session_uuid=self._session_uuid,
+            work_id=cowork.WORKTREE_ROLE, controller="claude",
+            mode="implement", model=None,
+            instruction_paths=[cowork.WORKTREE_PROMPT_PATH],
+            sessions_dir=self._td, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "refused")
+
+        events = self._trace_events(tpath)
+        refusals = self._decisions(events, "run_worktree", "refuse")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0].get("refusal_code"), "capability_missing")
+        self.assertEqual(refusals[0].get("source"), "preflight")
+        self.assertEqual(
+            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
+            "zero full-prompt bytes on a refused manifest")
+        return manifest
+
+    def test_worktree_denied_git_operation_refuses_before_spawn(self):
+        manifest = self._worktree_case(
+            action_classes=["git"],
+            command_adapters={"git": {"subcommand": "push", "flags": []}})
+        self.assertEqual(manifest["status"]["refusal"]["code"], "git_operation")
+
+    def test_worktree_tmp_cwd_refuses_before_spawn(self):
+        manifest = self._worktree_case(worktree="/tmp")
+        self.assertEqual(manifest["status"]["refusal"]["code"], "cwd")
+
+    def test_worktree_missing_rtk_refuses_before_spawn(self):
+        manifest = self._worktree_case(
+            action_classes=["tool"],
+            command_adapters={"rtk": {"path": os.path.join(
+                self._td, "no-such-rtk-binary")}})
+        self.assertEqual(manifest["status"]["refusal"]["code"], "rtk_present")
+
+    def test_worktree_unsafe_argv_refuses_before_spawn(self):
+        manifest = self._worktree_case(
+            action_classes=["exec"],
+            command_adapters={
+                "exec": ["git", "status;", "rm", "-rf", "/"]})
+        self.assertEqual(manifest["status"]["refusal"]["code"], "argv_form")
+
+    # -- negative controls: valid command context still proves and allows --
+
+    def _worktree_allow_case(self, action_classes=None, command_adapters=None,
+                             worktree=None):
+        self._inject_capability_facts(
+            action_classes=action_classes, command_adapters=command_adapters,
+            worktree=worktree)
+        spawn_calls = []
+
+        def factory(controller):
+            spawn_calls.append(controller)
+
+            class _S:
+                def send(self, t):
+                    pass
+                def close(self):
+                    pass
+            return _S()
+
+        tpath, trace = self._trace("WT-VALIDATOR-OK-%s" % id(self))
+        cfg = {"controller": "claude", "yolo": True, "mode": "implement",
+              "model": None, "effort": None}
+        status_path = os.path.join(self._td, "wt.status.json")
+        cowork.run_worktree(
+            cfg, status_path, "/base", "feat", True, io_out=io.StringIO(),
+            session_factory=factory, session_uuid=self._session_uuid,
+            trace=trace, extra_writable_dir=self._td)
+        self.assertEqual(spawn_calls, ["claude"])
+
+        manifest, _ = cowork._compile_role_manifest(
+            role=cowork.WORKTREE_ROLE, session_uuid=self._session_uuid,
+            work_id=cowork.WORKTREE_ROLE, controller="claude",
+            mode="implement", model=None,
+            instruction_paths=[cowork.WORKTREE_PROMPT_PATH],
+            sessions_dir=self._td, force_recompile=False)
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+        events = self._trace_events(tpath)
+        allows = self._decisions(events, "run_worktree", "allow")
+        self.assertEqual(len(allows), 1)
+        self.assertEqual(allows[0].get("trace_event_id"), manifest["digest"])
+        return manifest
+
+    def test_worktree_allowed_git_operation_still_proven_and_allowed(self):
+        self._worktree_allow_case(
+            action_classes=["git"],
+            command_adapters={"git": {"subcommand": "status",
+                                      "flags": ["-s", "--branch"]}})
+
+    def test_worktree_valid_cwd_still_proven_and_allowed(self):
+        subdir = os.path.join(self._td, "work")
+        os.makedirs(subdir)
+        self._worktree_allow_case(worktree=subdir)
+
+    def test_worktree_present_rtk_still_proven_and_allowed(self):
+        rtk_path = os.path.join(self._td, "rtk")
+        with open(rtk_path, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(rtk_path, 0o755)
+        self._worktree_allow_case(
+            action_classes=["tool"],
+            command_adapters={"rtk": {"path": rtk_path}})
+
+    def test_worktree_safe_argv_still_proven_and_allowed(self):
+        self._worktree_allow_case(
+            action_classes=["exec"],
+            command_adapters={"exec": ["git", "status", "-s", "--branch"]})
+
+    def test_worktree_default_dispatch_unaffected_by_new_validators(self):
+        # No git/tool/exec action class and no worktree declared: the four
+        # new validators are all inapplicable, exactly as every current
+        # production role dispatch presents today. P1-P4 behavior (proven +
+        # allow + spawn) is unchanged.
+        self._worktree_allow_case()
 
 
 class ManifestBindingFlowGateTest(ControllerPolicyTestBase):
