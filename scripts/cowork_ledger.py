@@ -635,6 +635,101 @@ def _atomic_commit_batch(path, raw_prefix, batch):
         return False
 
 
+
+# --------------------------------------------------------------------------- #
+# Durable recovery-breaker trip history (M2 Package D).                       #
+#                                                                              #
+# Additive only: these two functions are the SOLE way anything durably       #
+# records or reads a breaker's per-cause attempt history. Both reuse the     #
+# SAME primitives every other allocation-sensitive ledger write already      #
+# uses (`_with_ledger_lock`, `_strict_raw_and_records_for_allocation`,       #
+# `_atomic_commit_batch`) rather than inventing a second storage mechanism,  #
+# so breaker history gets the identical crash-safety guarantee the rest of  #
+# the ledger has. `cowork_recovery_breaker.py` owns the fingerprint         #
+# derivation (via `cowork_control_plane.fingerprint`) and the trip           #
+# threshold; this module only durably counts and appends records keyed by   #
+# whatever fingerprint string it is given.                                  #
+# --------------------------------------------------------------------------- #
+
+
+def append_breaker_attempt(path, breaker_fingerprint, threshold, fields=None):
+    """Atomically decide trip/no-trip for the NEXT `breaker_fingerprint`
+    attempt against durable history, and append it only when the decision is
+    no-trip — all under the SAME session-ledger allocation lock
+    (`_with_ledger_lock`) and the SAME real atomic commit
+    (`_atomic_commit_batch`) every other allocation-sensitive ledger write
+    uses. Combining the count-and-append into one locked operation is what
+    stops two concurrent callers for the identical cause from both observing
+    "under threshold" and both appending, pushing the durable count one past
+    `threshold` — the same class of race `mint_owned_attempts_batch` closes
+    for id allocation.
+
+    `breaker_fingerprint` must already be the exact digest
+    `cowork_control_plane.fingerprint()` produced for this cause; this
+    function does not compute, validate, or otherwise reconstruct it — it
+    only stores and counts whatever string it is given. `threshold` is the
+    caller's trip threshold (an int).
+
+    Fails CLOSED: an unreadable or malformed ledger (see
+    `LedgerAllocationReadError`) is treated as tripped rather than as empty
+    history, so a durability failure can never be silently read as "this
+    cause has never been tried" and allow an unbounded retry.
+
+    Returns `{"attempt_count": <durable count BEFORE this call>, "tripped":
+    <bool>, "record": <the appended record> or None}`. `record` is None
+    whenever `tripped` is True — nothing is ever appended for a refused
+    attempt — or when the append itself failed.
+    """
+    if not path or not breaker_fingerprint:
+        return {"attempt_count": 0, "tripped": True, "record": None}
+
+    def _do():
+        try:
+            raw_prefix, existing = _strict_raw_and_records_for_allocation(
+                path)
+        except LedgerAllocationReadError:
+            return {"attempt_count": 0, "tripped": True, "record": None}
+        count = sum(
+            1 for rec in existing
+            if rec.get("kind") == "breaker_attempt"
+            and rec.get("fingerprint") == breaker_fingerprint)
+        if count >= threshold:
+            return {"attempt_count": count, "tripped": True, "record": None}
+        record = dict(fields or {})
+        record.update({
+            "kind": "breaker_attempt",
+            "fingerprint": breaker_fingerprint,
+            "recorded_at": _utc_now(),
+        })
+        if not _atomic_commit_batch(path, raw_prefix, [record]):
+            return {"attempt_count": count, "tripped": True, "record": None}
+        return {"attempt_count": count, "tripped": False, "record": record}
+
+    outcome = _with_ledger_lock(path, _do)
+    if outcome is False:
+        return {"attempt_count": 0, "tripped": True, "record": None}
+    return outcome
+
+
+def read_breaker_history(path, breaker_fingerprint):
+    """Every durable `breaker_attempt` record for `breaker_fingerprint`,
+    oldest first — for inspection/diagnostics.
+
+    Reads straight from `path` on every call and is never cached, so it
+    reflects trip truth even immediately after a crash/restart between the
+    attempt that tripped the breaker and the next process that asks. This is
+    NOT the trip decision itself: `append_breaker_attempt` counts under the
+    allocation lock for a consistent, race-free decision; a caller that only
+    wants to inspect "how many durable attempts exist so far" without
+    attempting one more can use this directly instead.
+    """
+    if not breaker_fingerprint:
+        return []
+    return [rec for rec in read_ledger(path)
+            if rec.get("kind") == "breaker_attempt"
+            and rec.get("fingerprint") == breaker_fingerprint]
+
+
 def mint_owned_attempts_batch(path, transaction_id, entries):
     """Allocate a stable V id for EVERY `(label, fields)` pair in `entries`,
     ALL-OR-NOTHING, under one held session-ledger allocation lock.
