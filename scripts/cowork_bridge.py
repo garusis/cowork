@@ -2960,3 +2960,531 @@ class OpencodeSession:
     def close(self):
         _close_guard_runtime(self._guard_runtime)
         self._guard_runtime = None
+
+
+# ===========================================================================
+# M3 Package C -- pure controller raw-failure normalization
+# ===========================================================================
+#
+# Everything below this line is a pure, total, side-effect-free evidence
+# transform: (raw controller output) -> Package A's closed ControllerOutcome
+# taxonomy (`cowork_capacity.CONTROLLER_OUTCOMES`), plus trusted reset/retry
+# evidence and an unpersisted CapacityPacket candidate for quota outcomes.
+# It performs zero file writes, zero cowork_state.py calls, and zero
+# cowork.py imports; it makes no policy decision (no retry/fallback/overage
+# permission is ever granted here) and writes nothing durable -- Package E is
+# the sole writer of the real, persisted CapacityPacket via Package B.
+#
+# Provenance note: this repository contains no captured issue #14/#28/#61
+# evidence (no references/ directory, no matching real-world text anywhere
+# outside this package's own fixtures). The token/status vocabulary below is
+# therefore this package's own closed, documented classification contract --
+# aligned with the repository's only two ATTESTED raw claude failure shapes
+# (`scripts/test_cowork.py:3079-3096`: an `assistant`/`isApiErrorMessage`
+# event carrying the literal string `error="authentication_failed"`, and a
+# `system`/`subtype=="api_error"` event carrying only `error={"formatted":
+# "401 OAuth token expired"}` with no structured type/status field at all) --
+# rather than a verified transcription of a real provider capture. Both
+# attested shapes are named fixtures in the accompanying test module and
+# both classify correctly (see `_AUTHENTICATION_ERROR_TOKENS` and
+# `_extract_leading_http_status` below).
+#
+# Raw-evidence contract
+# ----------------------
+# Each `classify_<controller>_failure(raw)` function takes a dict describing
+# one already-terminal (non-successful) controller turn. Two shapes are
+# shared verbatim across all three controllers, because they name a local,
+# controller-agnostic condition rather than anything the provider itself
+# returned:
+#
+#   {"type": "local_guard", "status": "unreachable" | "denied", ...}
+#       The cowork guard broker's own local signal, however the controller
+#       CLI happened to surface it -- "unreachable" means the broker itself
+#       could not be reached (an infra failure); "denied" means the broker
+#       responded but refused because a local budget/limit was reached. Any
+#       OTHER key on this dict (e.g. a free-text "detail") is carried along
+#       only as descriptive evidence and is NEVER inspected to decide the
+#       outcome -- classification here is a pure `status` lookup
+#       (`classify_local_guard_evidence`), so text that happens to resemble a
+#       provider quota message (or vice versa) cannot flip the outcome. A
+#       `status` outside {"unreachable", "denied"} (missing, wrong type, or
+#       any other value) is itself an unrecognized raw shape: every public
+#       `classify_<controller>_failure` catches that case and returns
+#       `unknown_provider_failure` rather than raising -- totality holds at
+#       the public boundary even though `classify_local_guard_evidence`
+#       itself still raises ValueError for a caller invoking it directly
+#       with a malformed status.
+#
+#   {"type": "transport_error", "exception_type": <str, optional>, ...}
+#       The controller process/stream could not be communicated with at all
+#       (a dead duplex, a subprocess launch exception, a connection reset) --
+#       never a response the provider itself returned.
+#
+# Every other shape is controller-specific, extending that CLI's own raw
+# error envelope as already produced elsewhere in this module (see
+# `parse_claude_event`/`parse_codex_event`/`parse_opencode_event`) with the
+# additional machine-readable discriminants (`type`/`code`/`status`) a real
+# backend attaches beside its human-readable message:
+#   - claude: the stream-json `assistant` event (an `isApiErrorMessage` flag
+#     OR a bare `error` field -- mirroring `parse_claude_event`'s own
+#     `obj.get("isApiErrorMessage") or obj.get("error")` trigger) and the
+#     `system`/`subtype=="api_error"` event.
+#   - codex: the `codex exec --json` `{"type": "error", ...}` event.
+#   - opencode: the `{"type": "error", "error": {"name": ..., "data": {...}}}`
+#     event.
+#
+# Classification of the provider-specific shapes keys ONLY on machine-
+# readable discriminants -- an exact-match provider error-type/code token
+# (e.g. "rate_limit_error", "overloaded_error", "authentication_failed",
+# "refusal") or a numeric HTTP-like status code (429/529/503/401/403) -- via
+# the closed `_QUOTA_ERROR_TOKENS`/`_OVERLOAD_ERROR_TOKENS`/etc. tables
+# below. A present, non-null token always takes precedence over any status
+# code also present (`_classify_error_token` only ever falls back to
+# `http_status` when `token` is None): a specific, named-but-unrecognized
+# token is never silently overridden by a coincidental numeric status, so
+# e.g. `policy_blocked` and `authentication_failed` stay distinct even when
+# both a policy token and an auth-shaped status happen to appear together.
+# One narrow, closed-grammar exception -- NOT a general text heuristic --
+# lets the ONE attested claude shape above resolve: when a claude
+# `system`/`api_error` event carries neither a `type` token nor a `status`
+# int, `_extract_leading_http_status` looks for a 3-digit HTTP-like code at
+# the very START of `error["formatted"]` (e.g. "401 OAuth token expired");
+# it never searches for a number anywhere else in the string. A human-
+# readable message otherwise rides along purely as descriptive evidence and
+# is never pattern-matched to decide the outcome: an unrecognized token/
+# status (or a shape with none present at all) always falls through to
+# `unknown_provider_failure`, never `quota_limited` or `malformed_output` by
+# default.
+#
+# `malformed_output` sits entirely outside this raw-failure vocabulary: it
+# names a SUCCESSFUL controller turn whose role reply failed to parse as
+# JSON, so it is produced by the separate `classify_role_reply_outcome`
+# below, never by a `classify_<controller>_failure` call (a failed turn has
+# no successful role reply to validate).
+#
+# Reset/retry evidence is likewise extracted structurally, never asserted by
+# a caller: `extract_retry_evidence` reads an optional `raw["retry_evidence"]
+# = {"source": <one of A's own TRUST_SOURCE_KINDS>, "value": <retry-after
+# TEXT SHAPE>}` sub-object out of the SAME raw evidence being classified.
+# `capacity_packet_candidate` calls this (and independently re-classifies
+# `raw_evidence` via the matching `classify_<controller>_failure`, requiring
+# `quota_limited`) BEFORE ever calling into Package A's trust/parser
+# functions -- so both the trust source and the retry text are cross-checked
+# facts pulled from the actual evidence, never caller-supplied assertions.
+
+import hashlib  # noqa: E402
+
+import cowork_capacity as capacity_contracts  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Local-guard disambiguation (structural: a `status` lookup, never text)
+# ---------------------------------------------------------------------------
+
+_LOCAL_GUARD_STATUS_OUTCOMES = {
+    "unreachable": "guard_unavailable",
+    "denied": "local_guard_exhausted",
+}
+
+
+def classify_local_guard_evidence(guard_status):
+    """Map the local guard broker's own `status` to its ControllerOutcome:
+    "unreachable" -> guard_unavailable (the broker itself could not be
+    reached), "denied" -> local_guard_exhausted (the broker responded but a
+    local budget/limit was reached). Any other value (including None, an
+    empty string, or free text) raises ValueError -- callers must supply the
+    broker's own honest status, never a guess derived from message text.
+    Called directly, this helper is intentionally partial (a caller-contract
+    violation IS an error); the three public `classify_<controller>_failure`
+    functions instead catch this ValueError and degrade to
+    `unknown_provider_failure`, so totality holds at the public boundary."""
+    if not isinstance(guard_status, str) or guard_status not in _LOCAL_GUARD_STATUS_OUTCOMES:
+        raise ValueError(
+            "guard_status must be 'unreachable' or 'denied', got %r" % (guard_status,))
+    return _LOCAL_GUARD_STATUS_OUTCOMES[guard_status]
+
+
+def _classify_local_guard_or_unknown(guard_status):
+    """The public-boundary wrapper every `classify_<controller>_failure`
+    calls for a `local_guard` shape: total, never raises -- a malformed
+    `guard_status` (missing, wrong type, or any value outside
+    {"unreachable","denied"}) is itself an unrecognized raw shape and
+    classifies `unknown_provider_failure`, exactly like any other
+    unrecognized input, rather than propagating an exception out of a
+    classifier whose whole contract is totality."""
+    try:
+        return classify_local_guard_evidence(guard_status)
+    except ValueError:
+        return "unknown_provider_failure"
+
+
+# ---------------------------------------------------------------------------
+# Provider raw-failure token/status tables (closed, exact-match only)
+# ---------------------------------------------------------------------------
+#
+# Each set names either a real provider machine-readable error-type/code
+# string (e.g. "rate_limit_error", "insufficient_quota") or, where the
+# repository's own attested convention already uses an outcome-shaped
+# literal directly (see the provenance note above and at module top), that
+# exact literal (e.g. "authentication_failed", "usage_limit" -- the latter
+# already used as a bridge-level error_type elsewhere in this file).
+
+_QUOTA_ERROR_TOKENS = frozenset({
+    "rate_limit_error", "rate_limit_exceeded", "insufficient_quota",
+    "usage_limit_reached", "quota_exceeded", "session_limit_reached",
+    "quota_limited", "rate_limit", "usage_limit",
+})
+_OVERLOAD_ERROR_TOKENS = frozenset({
+    "overloaded_error", "engine_overloaded", "server_overloaded", "overloaded",
+})
+_AUTHENTICATION_ERROR_TOKENS = frozenset({
+    "authentication_error", "invalid_api_key", "permission_error", "unauthorized",
+    "authentication_failed",
+})
+_POLICY_ERROR_TOKENS = frozenset({
+    "refusal", "policy_violation", "content_policy_violation", "policy_blocked",
+})
+_TRANSPORT_ERROR_TOKENS = frozenset({
+    "eof", "connection_error", "connection_reset", "connection_refused",
+    "timeout", "broken_pipe",
+    "ConnectionError", "ConnectionResetError", "ConnectionRefusedError",
+    "ConnectionAbortedError", "TimeoutError", "BrokenPipeError",
+    "OSError", "FileNotFoundError",
+})
+
+_QUOTA_HTTP_STATUS = frozenset({429})
+_OVERLOAD_HTTP_STATUS = frozenset({529, 503})
+_AUTHENTICATION_HTTP_STATUS = frozenset({401, 403})
+
+# A narrow, closed grammar (never a generic substring search): matches ONLY
+# a 3-digit HTTP-like status code at the very START of a formatted message,
+# e.g. "401 OAuth token expired" or "529 Overloaded" -- the exact shape the
+# repository's one attested claude system/api_error fixture uses. A number
+# appearing anywhere else in the text is never matched.
+_LEADING_HTTP_STATUS_RE = re.compile(r'^\s*([1-5]\d{2})\b')
+
+
+def _extract_leading_http_status(text):
+    """Return the leading 3-digit HTTP-like status code in `text` (per
+    `_LEADING_HTTP_STATUS_RE`), or None when `text` is not a string or does
+    not open with one. This is the ONLY text inspection anywhere in this
+    package's outcome-decision path, and it is deliberately narrow: it
+    fires only as a last resort, when a claude `system`/`api_error` event
+    carries neither a structured `type` token nor a `status` int (see
+    `classify_claude_failure`)."""
+    if not isinstance(text, str):
+        return None
+    m = _LEADING_HTTP_STATUS_RE.match(text)
+    return int(m.group(1)) if m else None
+
+
+def _classify_error_token(token, http_status):
+    """Shared, closed decision table behind every per-controller classifier
+    below. A non-None `token` is matched EXACTLY against the closed tables,
+    in priority order (quota, overload, authentication, policy, transport);
+    an unrecognized non-None token is `unknown_provider_failure` WITHOUT
+    ever falling back to `http_status` -- a specific, named-but-unknown
+    token is never silently overridden by a coincidental numeric status.
+    `http_status` is consulted only when `token` is None. Never inspects
+    any free-text message field."""
+    if token is not None:
+        if token in _QUOTA_ERROR_TOKENS:
+            return "quota_limited"
+        if token in _OVERLOAD_ERROR_TOKENS:
+            return "overloaded"
+        if token in _AUTHENTICATION_ERROR_TOKENS:
+            return "authentication_failed"
+        if token in _POLICY_ERROR_TOKENS:
+            return "policy_blocked"
+        if token in _TRANSPORT_ERROR_TOKENS:
+            return "transport_failed"
+        return "unknown_provider_failure"
+    if http_status in _QUOTA_HTTP_STATUS:
+        return "quota_limited"
+    if http_status in _OVERLOAD_HTTP_STATUS:
+        return "overloaded"
+    if http_status in _AUTHENTICATION_HTTP_STATUS:
+        return "authentication_failed"
+    return "unknown_provider_failure"
+
+
+def _as_str_or_none(value):
+    return value if isinstance(value, str) else None
+
+
+def _as_int_status_or_none(value):
+    # bool is an int subclass; never treat True/False as an HTTP-like status.
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+# ---------------------------------------------------------------------------
+# Per-controller raw-failure classifiers
+# ---------------------------------------------------------------------------
+
+def classify_claude_failure(raw):
+    """Classify one raw, terminal (non-successful) claude controller failure
+    into Package A's closed ControllerOutcome taxonomy. `raw` is one of:
+    the shared `local_guard`/`transport_error` shapes documented above; a
+    claude `assistant` event carrying an `isApiErrorMessage` flag or a bare
+    `error` field (mirroring `parse_claude_event`'s own trigger condition;
+    `error` carries the CLI's own already-classified error token); or a
+    claude `system`/`subtype=="api_error"` event (`error` is a dict whose
+    `type`/`status` are the machine-readable discriminants -- falling back,
+    ONLY when both are absent, to a leading HTTP-like status code in
+    `error["formatted"]`; see `_extract_leading_http_status`). Any other
+    shape -- including a recognized event `type` with no recognized
+    discriminant at all, or a wholly unrecognized `type` -- is
+    `unknown_provider_failure`. A malformed `local_guard` shape is also
+    `unknown_provider_failure`, never a raised exception."""
+    if not isinstance(raw, dict):
+        raise ValueError("raw must be a dict, got %r" % (type(raw),))
+    rtype = raw.get("type")
+    if rtype == "local_guard":
+        return _classify_local_guard_or_unknown(raw.get("status"))
+    if rtype == "transport_error":
+        return "transport_failed"
+    if rtype == "assistant" and (raw.get("isApiErrorMessage") or raw.get("error")):
+        return _classify_error_token(_as_str_or_none(raw.get("error")), None)
+    if rtype == "system" and raw.get("subtype") == "api_error":
+        error = raw.get("error")
+        error = error if isinstance(error, dict) else {}
+        token = _as_str_or_none(error.get("type"))
+        status = _as_int_status_or_none(error.get("status"))
+        if token is None and status is None:
+            status = _extract_leading_http_status(error.get("formatted"))
+        return _classify_error_token(token, status)
+    return "unknown_provider_failure"
+
+
+def classify_codex_failure(raw):
+    """Classify one raw, terminal codex controller failure into Package A's
+    closed ControllerOutcome taxonomy. `raw` is one of the shared
+    `local_guard`/`transport_error` shapes, or a codex `{"type": "error",
+    "message": <str>, "code": <str, optional>, "status": <int, optional>}`
+    event -- `code`/`status` are the machine-readable discriminants,
+    `message` is descriptive-only text. Any other shape is
+    `unknown_provider_failure`; a malformed `local_guard` shape is also
+    `unknown_provider_failure`, never a raised exception."""
+    if not isinstance(raw, dict):
+        raise ValueError("raw must be a dict, got %r" % (type(raw),))
+    rtype = raw.get("type")
+    if rtype == "local_guard":
+        return _classify_local_guard_or_unknown(raw.get("status"))
+    if rtype == "transport_error":
+        return "transport_failed"
+    if rtype == "error":
+        return _classify_error_token(
+            _as_str_or_none(raw.get("code")),
+            _as_int_status_or_none(raw.get("status")))
+    return "unknown_provider_failure"
+
+
+def classify_opencode_failure(raw):
+    """Classify one raw, terminal opencode controller failure into Package
+    A's closed ControllerOutcome taxonomy. `raw` is one of the shared
+    `local_guard`/`transport_error` shapes, or an opencode `{"type": "error",
+    "error": {"name": <str, optional>, "data": {"message": <str, optional>,
+    "status": <int, optional>}}}` event (mirroring `parse_opencode_event`'s
+    own error envelope) -- `name`/`data.status` are the machine-readable
+    discriminants, `data.message` is descriptive-only text. Any other shape
+    is `unknown_provider_failure`; a malformed `local_guard` shape is also
+    `unknown_provider_failure`, never a raised exception."""
+    if not isinstance(raw, dict):
+        raise ValueError("raw must be a dict, got %r" % (type(raw),))
+    rtype = raw.get("type")
+    if rtype == "local_guard":
+        return _classify_local_guard_or_unknown(raw.get("status"))
+    if rtype == "transport_error":
+        return "transport_failed"
+    if rtype == "error":
+        error = raw.get("error")
+        error = error if isinstance(error, dict) else {}
+        data = error.get("data")
+        data = data if isinstance(data, dict) else {}
+        return _classify_error_token(
+            _as_str_or_none(error.get("name")),
+            _as_int_status_or_none(data.get("status")))
+    return "unknown_provider_failure"
+
+
+_CONTROLLER_FAILURE_CLASSIFIERS = {
+    "claude": classify_claude_failure,
+    "codex": classify_codex_failure,
+    "opencode": classify_opencode_failure,
+}
+
+
+# ---------------------------------------------------------------------------
+# Successful-turn role-output classification (malformed_output)
+# ---------------------------------------------------------------------------
+
+def classify_role_reply_outcome(turn_succeeded, role_json_valid):
+    """The ONLY path to `malformed_output`: a controller turn that itself
+    SUCCEEDED (no provider-level failure) but whose role reply did not parse
+    as the expected JSON. Returns "malformed_output" when
+    `role_json_valid` is False, or None when the reply parsed fine (a
+    genuinely successful turn, entirely outside the ControllerOutcome
+    taxonomy -- callers should not classify it at all).
+
+    Raises ValueError when `turn_succeeded` is not True: a failed turn is
+    never eligible for `malformed_output` regardless of what its role output
+    looked like -- use one of the `classify_<controller>_failure` functions
+    instead. This is what keeps a parse failure on a genuinely successful
+    turn from ever being conflated with a raw, unclassifiable provider
+    failure (`unknown_provider_failure`), and vice versa."""
+    if turn_succeeded is not True:
+        raise ValueError(
+            "classify_role_reply_outcome requires a successful turn "
+            "(turn_succeeded=True); got %r" % (turn_succeeded,))
+    if role_json_valid is not True and role_json_valid is not False:
+        raise ValueError(
+            "role_json_valid must be a bool, got %r" % (role_json_valid,))
+    return None if role_json_valid else "malformed_output"
+
+
+# ---------------------------------------------------------------------------
+# Structural reset/retry evidence extraction (never a caller assertion)
+# ---------------------------------------------------------------------------
+
+# Any raw evidence that does not carry a well-shaped, closed-set-sourced
+# retry_evidence sub-object degrades to this explicit sentinel rather than
+# `None`: `capacity_source.kind` must always be a valid nonempty string (so
+# it always satisfies `validate_capacity_source`'s shape check and can
+# always be copied verbatim), while still classifying "untrustworthy" via
+# A's `classify_trust_source` (this literal is deliberately outside
+# `TRUST_SOURCE_KINDS`).
+_UNVERIFIED_EVIDENCE_SOURCE = "unverified"
+
+
+def extract_retry_evidence(raw):
+    """Pure structural extraction of reset/retry evidence from a raw
+    controller-output dict -- never caller-asserted, never inferred from
+    any other field (message text, http_status, etc). Returns
+    {"source": <str>, "value": <str or None>}.
+
+    The ONLY recognized shape is an optional `raw["retry_evidence"]` dict of
+    exactly `{"source", "value"}` where `source` is one of Package A's own
+    `TRUST_SOURCE_KINDS` ("provider_header", "provider_event",
+    "provider_api") -- literally naming HOW the retry/reset value was
+    actually obtained -- and `value` is a nonempty retry-after/reset TEXT
+    SHAPE string. Any other raw shape (non-dict `raw`, missing key, wrong
+    type, a `source` outside A's closed set, or a missing/empty `value`)
+    extracts to `{"source": "unverified", "value": None}` -- absent,
+    unverifiable evidence, never a guessed or asserted one -- which A's
+    `classify_trust_source` then correctly degrades to "untrustworthy"
+    rather than raising."""
+    absent = {"source": _UNVERIFIED_EVIDENCE_SOURCE, "value": None}
+    if not isinstance(raw, dict):
+        return absent
+    evidence = raw.get("retry_evidence")
+    if not isinstance(evidence, dict):
+        return absent
+    source = evidence.get("source")
+    value = evidence.get("value")
+    if not isinstance(source, str) or source not in capacity_contracts.TRUST_SOURCE_KINDS:
+        return absent
+    if not isinstance(value, str) or not value:
+        return absent
+    return {"source": source, "value": value}
+
+
+# ---------------------------------------------------------------------------
+# Unpersisted CapacityPacket candidate (quota_limited outcomes only)
+# ---------------------------------------------------------------------------
+
+def capacity_packet_candidate(controller, provider, raw_evidence, issued_at):
+    """Build the pure, unpersisted CapacityPacket CANDIDATE for a
+    `quota_limited` classification -- Package A's `capacity.json` shape,
+    partially populated with exactly what a bridge-level evidence-
+    normalization step can honestly know.
+
+    `controller`: one of "claude"/"codex"/"opencode". This function FIRST
+    re-classifies `raw_evidence` via the matching `classify_<controller>_
+    failure` and requires the result to be exactly `quota_limited`, raising
+    ValueError otherwise -- a cross-check that runs BEFORE any call into
+    Package A's trust/parser functions, so this candidate can never be built
+    from evidence this package's own classifier would not itself call a
+    quota signal.
+
+    `raw_evidence`: the exact raw controller-output dict that produced the
+    quota_limited outcome. Hashed verbatim (via `json.dumps(...,
+    sort_keys=True)`, with NO type coercion) into `capacity_source["sha256"]`
+    -- this package never fabricates, reshapes, or silently coerces the
+    evidence it hashes; a `raw_evidence` containing a non-JSON-serializable
+    value raises ValueError rather than producing a non-reproducible digest.
+
+    Reset/retry evidence and its provenance are BOTH extracted from
+    `raw_evidence` itself via `extract_retry_evidence` -- never accepted as
+    separate caller-supplied parameters, so a caller can never assert a
+    trust level or retry text the actual evidence does not carry. The
+    extracted `source` is passed UNCHANGED into A's `classify_trust_source`;
+    this package computes no trust level of its own and never upgrades an
+    untrustworthy source. The extracted `value` (or None) is parsed via A's
+    `parse_retry_after_text` only to decide `resume_mode` ("scheduled" when
+    it parses, else "manual_signal") -- never itself checked against
+    MAX_RETRY_HORIZON_SECONDS here (that bound belongs to
+    `validate_capacity_packet`, which only Package E can call once this
+    candidate's identity/lease fields are filled in for real).
+
+    `issued_at` must be an RFC3339-shaped timestamp string (validated via
+    A's own `rfc3339_to_epoch_seconds`); `provider` must be a nonempty
+    string.
+
+    Returns a dict with exactly: schema_version, provider,
+    provider_capacity_class (always "subscription_quota_exhausted" -- direct
+    Claude, subscription_only per the frozen brief; no credits/overage/
+    alias/fallback capacity class exists to name), resume_mode, retry_after,
+    capacity_source (exactly Package A's `{"kind", "sha256"}` shape, `kind`
+    ALWAYS a valid nonempty string -- either a genuine TRUST_SOURCE_KINDS
+    member or the explicit "unverified" sentinel -- so it always satisfies
+    `validate_capacity_source` and Package E can copy it verbatim into a
+    real CapacityPacket), issued_at, and a sibling diagnostic-only `trust`
+    field (NOT part of the durable CapacityPacket schema; Package E copies
+    `capacity_source` in, never `trust`).
+
+    `package_id`, `binding`, `wakeup`, and `manual_resume` are deliberately
+    ABSENT (not merely null): only Package E, wiring this candidate into a
+    real WorkUnit/session/lease/dispatch-package context, knows those
+    identity fields, so this candidate can never satisfy
+    `validate_capacity_packet`'s exact key set on its own -- it is never
+    mistakable for, and can never be persisted as, a complete, durable
+    CapacityPacket."""
+    classify = _CONTROLLER_FAILURE_CLASSIFIERS.get(controller)
+    if classify is None:
+        raise ValueError(
+            "controller must be one of %s, got %r"
+            % (sorted(_CONTROLLER_FAILURE_CLASSIFIERS), controller))
+    outcome = classify(raw_evidence)
+    if outcome != "quota_limited":
+        raise ValueError(
+            "capacity_packet_candidate requires raw_evidence to classify "
+            "quota_limited via classify_%s_failure; got %r"
+            % (controller, outcome))
+    if not isinstance(provider, str) or not provider:
+        raise ValueError("provider must be a nonempty string, got %r" % (provider,))
+    if capacity_contracts.rfc3339_to_epoch_seconds(issued_at) is None:
+        raise ValueError(
+            "issued_at must be an RFC3339-shaped timestamp string, got %r" % (issued_at,))
+
+    retry_evidence = extract_retry_evidence(raw_evidence)
+    evidence_source = retry_evidence["source"]
+    retry_after = retry_evidence["value"]
+    parsed_retry = capacity_contracts.parse_retry_after_text(retry_after)
+    resume_mode = "scheduled" if parsed_retry is not None else "manual_signal"
+
+    try:
+        evidence_bytes = json.dumps(raw_evidence, sort_keys=True).encode("utf-8")
+    except TypeError as exc:
+        raise ValueError(
+            "raw_evidence must be JSON-serializable for verbatim hashing: %s" % (exc,))
+    digest = hashlib.sha256(evidence_bytes).hexdigest()
+
+    return {
+        "schema_version": capacity_contracts.SCHEMA_VERSION,
+        "provider": provider,
+        "provider_capacity_class": "subscription_quota_exhausted",
+        "resume_mode": resume_mode,
+        "retry_after": retry_after if resume_mode == "scheduled" else None,
+        "capacity_source": {"kind": evidence_source, "sha256": digest},
+        "issued_at": issued_at,
+        "trust": capacity_contracts.classify_trust_source(evidence_source),
+    }
