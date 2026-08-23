@@ -53,6 +53,7 @@ import cowork_profiles as controller_profiles  # noqa: E402
 import cowork_report as report  # noqa: E402
 import cowork_eval as evaluation  # noqa: E402
 import cowork_recovery_breaker as recovery_breaker  # noqa: E402
+import cowork_workunit as workunit  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
 # that exercise the real libraries skip when they are absent — same pattern as the
@@ -38220,3 +38221,475 @@ class UnboundFirstSendInterruptTest(ControllerPolicyTestBase):
         self.assertIsNotNone(current)
         self.assertEqual(current["state"], "aborted")
         self.assertEqual(current["evidence"]["reason"], "keyboard_interrupt")
+
+
+# --------------------------------------------------------------------------- #
+# M2 Package E: live graph wiring v1 (F-LIVE-GRAPH-WIRING-1).                 #
+#                                                                              #
+# Package C's `cowork_preflight.check_dependency_graph_declaration` is now    #
+# called from the real production seam (`_compile_role_manifest`, the sole   #
+# live call site of `run_manifest_preflight`), unconditionally, before that   #
+# call -- never a dormant helper invoked only by a test. These tests drive    #
+# the REAL `cowork.run_scout`/`run_planner`/`run_builder` entry points,       #
+# never a fabricated decision.                                                #
+# --------------------------------------------------------------------------- #
+
+
+class GraphDeclarationStructuralGateTest(unittest.TestCase):
+    """Structural zero-bypass check: the live manifest-preflight seam
+    (`_compile_role_manifest`, the sole call site of `run_manifest_preflight`
+    in cowork.py) cannot reach that call without first applying the WorkUnit
+    graph decision."""
+
+    def _source(self):
+        path = os.path.join(_HERE, "cowork.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_run_manifest_preflight_has_exactly_one_live_call_site(self):
+        src = self._source()
+        self.assertEqual(
+            len(re.findall(r'preflight\.run_manifest_preflight\(', src)), 1,
+            "run_manifest_preflight must have exactly one live call site")
+
+    def test_graph_decision_precedes_the_sole_run_manifest_preflight_call(self):
+        src = self._source()
+        fn_start = src.index("def _compile_role_manifest(")
+        next_def = src.index("\ndef ", fn_start + 1)
+        body = src[fn_start:next_def]
+        graph_idx = body.index("preflight.check_dependency_graph_declaration(")
+        preflight_idx = body.index("preflight.run_manifest_preflight(")
+        self.assertLess(
+            graph_idx, preflight_idx,
+            "the graph declaration check must run before "
+            "run_manifest_preflight in the live manifest-preflight seam")
+
+
+class LiveGraphWiringTest(unittest.TestCase):
+    """F-LIVE-GRAPH-WIRING-1: a persisted, current, attempt-scoped WorkUnit's
+    own `graph_revision` declaration is checked before this manifest is ever
+    preflighted, session-constructed, or dispatched to a controller. A
+    malformed/stale/mismatched declaration fails closed, persists a truthful
+    `rejected_preflight` outcome bound to that exact WorkUnit, and performs
+    zero dispatch; a valid or genuinely-absent declaration preserves the
+    pre-existing dispatch path exactly (see `PhaseTruthCompletionBindingTest`
+    for the unmodified pre-graph-wiring completion path this preserves)."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def _mint(self, session_uuid, role_work_id, role, controller="opencode",
+              graph_revision=None, predecessor_work_ids=()):
+        record = {
+            "schema_version": workunit.SCHEMA_VERSION, "record": "WorkUnit",
+            "work_id": role_work_id, "session_id": session_uuid, "phase": None,
+            "role": role, "seat": 0, "round": 0, "attempt": 0,
+            "controller": controller, "provider": controller,
+            "requested_model": None, "effective_model": None, "effort": None,
+            "candidate_manifest_digest": None, "candidate_index": None,
+            "prompt_digest": None, "pending_turn_digest": None,
+            "parent_work_id": None, "governed_child_policy": None,
+            "graph_revision": graph_revision,
+            "predecessor_work_ids": list(predecessor_work_ids),
+            "fan_join_id": None,
+            "lifecycle_state": "pending", "terminal_reason": None,
+        }
+        return state_store.mint_work_unit(record)
+
+    def test_valid_graph_declaration_preserves_normal_dispatch(self):
+        session_uuid = str(uuid.uuid4())
+        role_work_id = cowork._role_work_id(session_uuid, "scout", None)
+        state_store.append_graph_revision(session_uuid, [{
+            "work_id": role_work_id, "candidate_manifest_digest": None,
+            "candidate_index": None, "governed_child_policy": None,
+            "predecessor_work_ids": [],
+        }])
+        self._mint(session_uuid, role_work_id, "scout", graph_revision=1)
+
+        config = {"scout": {"controller": "opencode", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        intel = os.path.join(state_store.session_assets_dir(session_uuid),
+                             "scout.intel.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+
+        def factory(controller, resume_session_id=None, on_session_id=None):
+            class FakeScout:
+                def send(self, text, meta=None):
+                    with open(intel, "w") as fh:
+                        json.dump({"status": "ready_for_review",
+                                  "result": {"finding": "F1"}}, fh)
+                    return {"ok": True, "result": "ok"}
+
+                def close(self):
+                    pass
+            return FakeScout()
+
+        rc = cowork.run_scout(
+            config, "goal", ["scout"], io_in=io.StringIO("\n"),
+            io_out=io.StringIO(), intel_path=intel, session_factory=factory,
+            session_uuid=session_uuid)
+        self.assertEqual(rc, 0)
+
+        current = state_store.current_phase_state(session_uuid, role_work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "completed")
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertIsNotNone(manifest, "a valid declaration must still reach "
+                             "manifest preflight")
+        self.assertEqual((manifest.get("status") or {}).get("phase"),
+                         "proven")
+
+    def test_self_edge_declaration_rejects_before_any_dispatch(self):
+        session_uuid = str(uuid.uuid4())
+        role_work_id = cowork._role_work_id(session_uuid, "scout", None)
+        other_work_id = str(uuid.uuid4())
+        state_store.append_graph_revision(session_uuid, [{
+            "work_id": other_work_id, "candidate_manifest_digest": None,
+            "candidate_index": None, "governed_child_policy": None,
+            "predecessor_work_ids": [],
+        }])
+        self._mint(session_uuid, role_work_id, "scout", graph_revision=1,
+                  predecessor_work_ids=[role_work_id])
+
+        config = {"scout": {"controller": "opencode", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        intel = os.path.join(state_store.session_assets_dir(session_uuid),
+                             "scout.intel.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+
+        calls = []
+
+        def factory(controller, resume_session_id=None, on_session_id=None):
+            calls.append(controller)
+
+            class _NeverSend:
+                def send(self, text, meta=None):
+                    raise AssertionError(
+                        "a rejected graph declaration must never send")
+
+                def close(self):
+                    pass
+            return _NeverSend()
+
+        rc = cowork.run_scout(
+            config, "goal", ["scout"], io_in=io.StringIO("\n"),
+            io_out=io.StringIO(), intel_path=intel, session_factory=factory,
+            session_uuid=session_uuid)
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [], "zero dispatch: no session was ever "
+                         "constructed")
+        self.assertFalse(os.path.exists(intel),
+                         "zero dispatch: no intel was ever written")
+
+        current = state_store.current_phase_state(session_uuid, role_work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "rejected_preflight")
+        self.assertEqual(current["reason_code"], "preflight_rejected")
+        self.assertIn("self_edge",
+                      current["evidence"]["dependency_graph_declaration"])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertIsNone(manifest,
+                          "the manifest must never be compiled or persisted")
+
+        work_unit = state_store.work_unit_from_history_record(
+            state_store.current_work_unit_state(session_uuid, role_work_id))
+        self.assertEqual(work_unit["lifecycle_state"], "rejected_preflight")
+        self.assertEqual(work_unit["terminal_reason"], "preflight_rejected")
+
+    def test_stale_graph_revision_rejects_before_any_dispatch(self):
+        session_uuid = str(uuid.uuid4())
+        role_work_id = cowork._role_work_id(session_uuid, "builder", None)
+        # No revision was ever appended for this session -- the WorkUnit
+        # declares one anyway (stale/mismatched: it names a revision B never
+        # durably stored).
+        self._mint(session_uuid, role_work_id, "builder", graph_revision=7)
+
+        config = {"builder": {"controller": "opencode", "model": None,
+                              "effort": None, "yolo": True,
+                              "mode": "implement"}}
+        calls = []
+
+        def factory(controller, resume_session_id=None, on_session_id=None):
+            calls.append(controller)
+
+            class _NeverSend:
+                def send(self, text, meta=None):
+                    raise AssertionError(
+                        "a rejected graph declaration must never send")
+
+                def close(self):
+                    pass
+            return _NeverSend()
+
+        rc = cowork.run_builder(
+            config, "goal", ["builder"], io_in=io.StringIO("\n"),
+            io_out=io.StringIO(), session_factory=factory,
+            session_uuid=session_uuid)
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [], "zero dispatch: no session was ever "
+                         "constructed")
+
+        current = state_store.current_phase_state(session_uuid, role_work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "rejected_preflight")
+        self.assertEqual(current["reason_code"], "preflight_rejected")
+        self.assertIn("not found in stored revisions",
+                      current["evidence"]["dependency_graph_declaration"])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "builder"))
+        self.assertIsNone(manifest,
+                          "the manifest must never be compiled or persisted")
+
+    def test_legacy_no_applicable_graph_preserves_existing_dispatch(self):
+        session_uuid = str(uuid.uuid4())
+        role_work_id = cowork._role_work_id(session_uuid, "scout", None)
+        # No premint and no appended graph revision: the ordinary path every
+        # pre-graph-wiring M2 E session already exercises -- `_ensure_work_
+        # unit` mints a fresh WorkUnit whose own `graph_revision` defaults to
+        # None, `check_dependency_graph_declaration`'s own trivial-pass case.
+        config = {"scout": {"controller": "opencode", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        intel = os.path.join(state_store.session_assets_dir(session_uuid),
+                             "scout.intel.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+
+        def factory(controller, resume_session_id=None, on_session_id=None):
+            class FakeScout:
+                def send(self, text, meta=None):
+                    with open(intel, "w") as fh:
+                        json.dump({"status": "ready_for_review",
+                                  "result": {"finding": "F1"}}, fh)
+                    return {"ok": True, "result": "ok"}
+
+                def close(self):
+                    pass
+            return FakeScout()
+
+        rc = cowork.run_scout(
+            config, "goal", ["scout"], io_in=io.StringIO("\n"),
+            io_out=io.StringIO(), intel_path=intel, session_factory=factory,
+            session_uuid=session_uuid)
+        self.assertEqual(rc, 0)
+
+        current = state_store.current_phase_state(session_uuid, role_work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "completed")
+        work_unit = state_store.work_unit_from_history_record(
+            state_store.current_work_unit_state(session_uuid, role_work_id))
+        self.assertIsNone(work_unit["graph_revision"])
+        self.assertFalse(
+            os.path.exists(state_store.graph_revisions_path_for(session_uuid)),
+            "a genuinely absent graph declaration must never touch the "
+            "graph revision store")
+
+    def test_malformed_persisted_graph_node_rejects_with_zero_dispatch(self):
+        """M2 Package E live-graph-wiring correction (M-2): a hand-corrupted
+        persisted revision node (never producible through `append_graph_
+        revision`'s own validated write path) makes `cowork_workunit.
+        validate_graph_node` raise a plain `ValueError` -- not the
+        `GraphValidationError` `check_dependency_graph_declaration` itself
+        catches. The live seam must still convert this into the SAME
+        `GraphDeclarationRejected` -> `rejected_preflight` outcome with
+        zero dispatch, never let it fall through into an unrelated
+        `capability_missing`/`needs_authority` degrade."""
+        session_uuid = str(uuid.uuid4())
+        role_work_id = cowork._role_work_id(session_uuid, "scout", None)
+        revisions_path = state_store.graph_revisions_path_for(session_uuid)
+        os.makedirs(os.path.dirname(revisions_path), exist_ok=True)
+        malformed_revision = {
+            "schema_version": 1, "record": "DependencyGraphRevision",
+            "graph_revision": 1,
+            "nodes": [{"work_id": "not-a-real-uuid",
+                      "candidate_manifest_digest": None,
+                      "candidate_index": None,
+                      "governed_child_policy": None,
+                      "predecessor_work_ids": []}],
+            "recorded_at": "2024-01-01T00:00:00Z",
+        }
+        with open(revisions_path, "w") as fh:
+            fh.write(json.dumps(malformed_revision) + "\n")
+        self._mint(session_uuid, role_work_id, "scout", graph_revision=1)
+
+        config = {"scout": {"controller": "opencode", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        calls = []
+
+        def factory(controller, resume_session_id=None, on_session_id=None):
+            calls.append(controller)
+
+            class _NeverSend:
+                def send(self, text, meta=None):
+                    raise AssertionError(
+                        "a rejected graph declaration must never send")
+
+                def close(self):
+                    pass
+            return _NeverSend()
+
+        rc = cowork.run_scout(
+            config, "goal", ["scout"], io_in=io.StringIO("\n"),
+            io_out=io.StringIO(), session_factory=factory,
+            session_uuid=session_uuid)
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [], "zero dispatch: no session was ever "
+                         "constructed")
+
+        current = state_store.current_phase_state(session_uuid, role_work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "rejected_preflight")
+        self.assertEqual(current["reason_code"], "preflight_rejected")
+        self.assertIn("malformed persisted graph declaration",
+                      current["evidence"]["dependency_graph_declaration"])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertIsNone(manifest,
+                          "the manifest must never be compiled or persisted")
+
+
+class GraphDeclarationPreLaunchAndSwitchSeamTest(ControllerPolicyTestBase):
+    """M2 Package E live-graph-wiring correction (M-1): pre-launch
+    (`ensure_controller_dispatchable`) and controller-switch
+    (`switch_controller`) must bind their OWN manifest compile to the
+    current attempt-scoped WorkUnit's `role_work_id` -- driven through the
+    real `run_flow` closures, never a fabricated decision -- so a rejected
+    graph declaration is caught BEFORE `run_scout_fn`/a controller spawn is
+    ever reached, not merely by that role's own later, redundant check."""
+
+    def test_pre_launch_graph_declaration_rejects_before_any_dispatch(self):
+        session_uuid = str(uuid.uuid4())
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "claude"}, team=["scout"])
+        role_work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
+        other_work_id = str(uuid.uuid4())
+        state_store.append_graph_revision(session_uuid, [{
+            "work_id": other_work_id, "candidate_manifest_digest": None,
+            "candidate_index": None, "governed_child_policy": None,
+            "predecessor_work_ids": [],
+        }])
+        state_store.mint_work_unit({
+            "schema_version": workunit.SCHEMA_VERSION, "record": "WorkUnit",
+            "work_id": role_work_id, "session_id": session_uuid,
+            "phase": None, "role": "scout", "seat": 0, "round": 0,
+            "attempt": 0, "controller": "claude", "provider": "claude",
+            "requested_model": None, "effective_model": None, "effort": None,
+            "candidate_manifest_digest": None, "candidate_index": None,
+            "prompt_digest": None, "pending_turn_digest": None,
+            "parent_work_id": None, "governed_child_policy": None,
+            "graph_revision": 1, "predecessor_work_ids": [role_work_id],
+            "fan_join_id": None,
+            "lifecycle_state": "pending", "terminal_reason": None,
+        })
+
+        popen = _RecordingPopen()
+        out = io.StringIO()
+        with patch_bridge_popen(popen):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                           "--context", "m1 pre-launch"]),
+                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+        self.assertEqual(rc, 1)
+        self.assertEqual(popen.calls, [], "zero controller spawns when the "
+                         "graph declaration is rejected")
+        self.assertIn("manifest not proven", out.getvalue())
+
+        current = state_store.current_phase_state(session_uuid, role_work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "rejected_preflight")
+        self.assertEqual(current["reason_code"], "preflight_rejected")
+        self.assertIn("self_edge",
+                      current["evidence"]["dependency_graph_declaration"])
+
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertIsNone(manifest,
+                          "the manifest must never be compiled or persisted")
+
+        events = self._events(spath)
+        failures = [e for e in events
+                   if e.get("event") == "controller.failure"
+                   and e.get("role") == "scout"
+                   and e.get("reason") == "graph_declaration_rejected"]
+        self.assertEqual(len(failures), 1,
+                         "pre-launch rejection must not be a vacuous "
+                         "absence of trace events")
+
+    def test_switch_controller_graph_declaration_rejects_zero_switch(self):
+        session_uuid = str(uuid.uuid4())
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "claude"}, team=["scout"])
+        role_work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
+        orig_graph_check = preflight.check_dependency_graph_declaration
+
+        def rejecting(work_unit, session_id, state_module=None):
+            return preflight.capability_check_result(
+                "dependency_graph_declaration", False,
+                reason="graph declaration rejected: self_edge")
+
+        captured = {}
+
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            switch_fn = kw.get("switch_controller_fn")
+            preflight.check_dependency_graph_declaration = rejecting
+            try:
+                captured["result"] = switch_fn("scout", target="codex")
+            finally:
+                preflight.check_dependency_graph_declaration = orig_graph_check
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "m1 switch"]),
+            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        self.assertIs(captured["result"], False)
+        after = state_store.load(spath)
+        self.assertEqual(after["config"]["scout"]["controller"], "claude",
+                         "a rejected graph declaration must not commit the "
+                         "switch")
+
+        current = state_store.current_phase_state(session_uuid, role_work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "rejected_preflight")
+        self.assertEqual(current["reason_code"], "preflight_rejected")
+        self.assertIn("self_edge",
+                      current["evidence"]["dependency_graph_declaration"])
+
+        # The pre-launch gate already compiled/persisted a manifest for the
+        # ORIGINAL "claude" controller before `fake_scout` ever ran (its own
+        # graph check was untouched then); a rejected switch's OWN compile
+        # attempt for the "codex" target must never overwrite it -- the
+        # persisted manifest.binding.controller staying "claude" proves the
+        # switch's compile/persist never ran.
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest["binding"]["controller"], "claude",
+                         "a rejected switch must never compile/persist a "
+                         "manifest for the target controller")
+
+        events = self._events(spath)
+        switch_ends = [e for e in events
+                      if e.get("event") == "controller.switch.end"
+                      and e.get("role") == "scout"]
+        self.assertTrue(
+            any(e.get("result") == "graph_declaration_rejected"
+               for e in switch_ends),
+            "switch rejection must not be a vacuous absence of trace events")

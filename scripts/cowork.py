@@ -8537,6 +8537,24 @@ def _capability_evidence_covered(requested, existing):
     return True
 
 
+class GraphDeclarationRejected(Exception):
+    """Raised by `_compile_role_manifest` (F-LIVE-GRAPH-WIRING-1) when the
+    current, attempt-scoped WorkUnit's OWN persisted `graph_revision`
+    declaration fails Package C's dispatch-time check
+    (`cowork_preflight.check_dependency_graph_declaration`) -- a self-edge,
+    dangling predecessor, cycle, or cross-candidate/cross-policy fan-in
+    against the durably stored graph revision. `run_manifest_preflight` is
+    NEVER reached for the call that raises this: `.reason` is the exact
+    check reason, for the caller to bind onto the WorkUnit's
+    `preflight_rejected` -> `rejected_preflight` transition (the existing E
+    preflight-rejection seam) verbatim -- never a re-derived or summarized
+    message."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _compile_role_manifest(
         role, session_uuid, work_id,
         controller, mode, model, effort=None,
@@ -8549,8 +8567,26 @@ def _compile_role_manifest(
         candidate_snapshot=None,
         action_classes=None,
         command_adapters=None,
-        force_recompile=False):
+        force_recompile=False,
+        role_work_id=None):
     """Compile, preflight, and persist the dispatch manifest for one role.
+
+    `role_work_id` (M2 Package E live graph wiring, F-LIVE-GRAPH-WIRING-1):
+    the current, attempt-scoped WorkUnit identity (`_role_work_id`) whose OWN
+    persisted `graph_revision` declaration is checked -- via
+    `cowork_preflight.check_dependency_graph_declaration`, Package C's
+    dispatch-time graph primitive -- unconditionally, before this call ever
+    reaches `run_manifest_preflight` below: the live manifest-preflight seam
+    cannot call it without first applying the WorkUnit graph decision. A
+    caller with no WorkUnit-tracked identity for this dispatch (evaluator/
+    worktree/reviewer/switch/pre-launch) passes `role_work_id=None`, and a
+    WorkUnit that was minted but declares no graph participation
+    (`graph_revision` is `None`) is `check_dependency_graph_declaration`'s
+    own trivial-pass case -- both resolve identically to "not applicable",
+    never a fabricated or parallel identity, and preserve the pre-existing
+    dispatch path exactly. A malformed, stale, or mismatched declaration
+    raises `GraphDeclarationRejected` instead of returning -- this manifest
+    is never compiled, preflighted, or persisted for that call.
 
     `effort` joins controller/model/mode as dispatch identity (bound in both
     `config_digest` and its own binding field, so an effort change alone
@@ -8579,8 +8615,36 @@ def _compile_role_manifest(
 
     Returns (manifest, was_recompiled). Raises OSError if persist fails
     (the caller must catch this and treat it as a fence failure — fail closed).
+    Raises GraphDeclarationRejected -- see that class's own docstring --
+    before any of the above.
     """
     import cowork_action_policy as _ap
+
+    _work_unit = None
+    if role_work_id and session_uuid:
+        _work_unit = state_store.work_unit_from_history_record(
+            state_store.current_work_unit_state(session_uuid, role_work_id))
+    # M2 Package E live-graph-wiring correction (M-2): a malformed PERSISTED
+    # graph shape (a hand-tampered/corrupted revisions.jsonl or WorkUnit
+    # record -- never producible through this codebase's own validated
+    # write paths) can make `check_dependency_graph_declaration` itself
+    # raise instead of returning an ok=False result (e.g. `graph_node_from_
+    # work_unit`/`validate_revision` schema-validating a malformed stored
+    # node). Every such exception is fail-closed here into the SAME
+    # GraphDeclarationRejected outcome as an ordinary ok=False result --
+    # never left to fall through to the generic `except Exception:` a call
+    # site's own manifest-compile guard already has, which would silently
+    # degrade a graph-identity failure into an unrelated capability_missing/
+    # needs_authority outcome instead of the truthful graph rejection.
+    try:
+        _graph_check = preflight.check_dependency_graph_declaration(
+            _work_unit, session_uuid, state_module=state_store)
+    except Exception as _graph_exc:
+        raise GraphDeclarationRejected(
+            "malformed persisted graph declaration (%s): %s"
+            % (type(_graph_exc).__name__, _graph_exc))
+    if not _graph_check["ok"]:
+        raise GraphDeclarationRejected(_graph_check["reason"])
 
     if policy_snapshot is None:
         row = _ap.CONTROLLER_CAPABILITY_MATRIX.get((controller, mode)) or {}
@@ -8877,6 +8941,41 @@ def _advance_phase(session_uuid, work_id, event, evidence=None, source=None,
     return record
 
 
+def _reject_graph_declaration(session_uuid, role_work_id, role, controller,
+                              reason, model=None, effort=None, source=None):
+    """Persist a truthful `rejected_preflight` outcome for `role_work_id`
+    after `_compile_role_manifest` raises `GraphDeclarationRejected` at a
+    seam (pre-launch, controller-switch) that runs BEFORE that role's own
+    `_ensure_work_unit`/`preflight_started` sequence -- unlike `run_scout`/
+    `run_planner`/`run_builder`, which can assume `preflight_started` has
+    already fired by the time their own rejection paths run (see their BL-2
+    comment), these seams cannot.
+
+    Mints the WorkUnit (idempotent -- a no-op if already minted, exactly
+    like `_ensure_work_unit`'s own contract) and advances it through
+    `preflight_started` first, so the terminal `preflight_rejected`
+    transition this then applies is legal from a fresh/`pending` WorkUnit
+    -- never a silent `illegal_transition` no-op that would leave a
+    truthful rejection unrecorded. A WorkUnit ALREADY at `preflighting`
+    (e.g. this same role's own runner already started it) hits the
+    identical `preflight_started` no-op `_advance_phase` itself already
+    documents as safe, then proceeds to `preflight_rejected` normally. A
+    WorkUnit already PAST `preflighting` (e.g. `running`, mid-turn) has no
+    legal edge to `rejected_preflight` in Package A's closed reducer --
+    `_advance_phase` no-ops there too, exactly like every other rejection
+    seam in this file when the reducer refuses a transition; this function
+    never redesigns that reducer to force one."""
+    if not session_uuid or not role_work_id:
+        return
+    _ensure_work_unit(session_uuid, role_work_id, role, controller,
+                      model=model, effort=effort)
+    _advance_phase(session_uuid, role_work_id, "preflight_started",
+                   source=source)
+    _advance_phase(session_uuid, role_work_id, "preflight_rejected",
+                   evidence={"dependency_graph_declaration": reason},
+                   source="dependency_graph_declaration")
+
+
 def _mirror_work_unit_lifecycle(session_uuid, work_id, state, reason_code):
     """Best-effort: keep the WorkUnit's own `lifecycle_state` (the join-key
     record every later seam reads) in step with the PhaseState record
@@ -9142,7 +9241,14 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                 instruction_paths=[SCOUT_PROMPT_PATH],
                 sessions_dir=sessions_dir,
                 worktree=worktree, worktree_base=worktree_base,
-                force_recompile=bool(resume_id))
+                force_recompile=bool(resume_id),
+                role_work_id=role_work_id)
+        except GraphDeclarationRejected as _grej:
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"dependency_graph_declaration": _grej.reason},
+                source="dependency_graph_declaration")
+            return 1
         except Exception:
             _scout_manifest = {}
         _mdec = _decide_and_trace(
@@ -9526,7 +9632,16 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 # FROM — a real upstream candidate; it changing between
                 # compiles is a genuine revalidation trigger.
                 candidate_snapshot=_file_snapshot(intel_path),
-                force_recompile=bool(resume_id))
+                force_recompile=bool(resume_id),
+                role_work_id=role_work_id)
+        except GraphDeclarationRejected as _grej:
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"dependency_graph_declaration": _grej.reason},
+                source="dependency_graph_declaration")
+            if on_outcome:
+                on_outcome(_OUTCOME_ENDED, None)
+            return 1
         except Exception:
             _planner_manifest = {}
         _mdec = _decide_and_trace(
@@ -9909,7 +10024,16 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 command_adapters=(
                     {"git": {"subcommand": "status", "flags": ["--porcelain"]}}
                     if baseline_repos else {}),
-                force_recompile=bool(resume_id))
+                force_recompile=bool(resume_id),
+                role_work_id=role_work_id)
+        except GraphDeclarationRejected as _grej:
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"dependency_graph_declaration": _grej.reason},
+                source="dependency_graph_declaration")
+            if on_outcome:
+                on_outcome(_OUTCOME_ENDED, None)
+            return 1
         except Exception:
             _builder_manifest = {}
         _mdec = _decide_and_trace(
@@ -11272,6 +11396,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         if session_uuid:
             _sw_cfg = config.get(role) or {}
             _sw_sdir = state_store.session_assets_dir(session_uuid)
+            _sw_role_work_id = _current_role_work_id(role)
             try:
                 _sw_artifacts = switch_artifacts_for(role)
                 _sw_manifest, _ = _compile_role_manifest(
@@ -11286,7 +11411,22 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     candidate_snapshot=(
                         _file_snapshot(_sw_artifacts[0])
                         if _sw_artifacts else None),
-                    force_recompile=True)
+                    force_recompile=True,
+                    role_work_id=_sw_role_work_id)
+            except GraphDeclarationRejected as _grej:
+                _reject_graph_declaration(
+                    session_uuid, _sw_role_work_id, role, target,
+                    _grej.reason, model=_sw_cfg.get("model"),
+                    effort=_sw_cfg.get("effort"),
+                    source="run_flow.switch_controller")
+                trace.event("controller.switch.end", role=role, phase=phase,
+                            result="graph_declaration_rejected",
+                            controller=target)
+                io_out.write(
+                    "cowork: manifest not proven for %s switch — blocked.\n"
+                    % role)
+                io_out.flush()
+                return False
             except Exception:
                 _sw_manifest = {}
             _swmdec = _decide_and_trace(
@@ -11363,6 +11503,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         if session_uuid:
             _disp_cfg = config.get(role) or {}
             _disp_sdir = state_store.session_assets_dir(session_uuid)
+            _disp_role_work_id = _current_role_work_id(role)
             try:
                 _disp_artifacts = switch_artifacts_for(role)
                 _disp_manifest, _ = _compile_role_manifest(
@@ -11377,7 +11518,23 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     candidate_snapshot=(
                         _file_snapshot(_disp_artifacts[0])
                         if _disp_artifacts else None),
-                    force_recompile=False)
+                    force_recompile=False,
+                    role_work_id=_disp_role_work_id)
+            except GraphDeclarationRejected as _grej:
+                _reject_graph_declaration(
+                    session_uuid, _disp_role_work_id, role, controller,
+                    _grej.reason, model=_disp_cfg.get("model"),
+                    effort=_disp_cfg.get("effort"),
+                    source="run_flow_pre_launch")
+                trace.event("controller.failure", role=role, phase=phase,
+                            controller=controller,
+                            reason="graph_declaration_rejected",
+                            artifact_progress=False)
+                io_out.write(
+                    "cowork: manifest not proven for %s — dispatch blocked.\n"
+                    % role)
+                io_out.flush()
+                return False
             except Exception:
                 _disp_manifest = {}
             _dispdec = _decide_and_trace(
@@ -12291,6 +12448,33 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             session_uuid, "planner", epoch_box["epoch"])
         builder_attempt_box["attempt"] = _resolve_attempt_start(
             session_uuid, "builder", building_epoch_box["epoch"])
+
+    def _current_role_work_id(role):
+        """The current, attempt-scoped WorkUnit identity for one of the
+        three primary WorkUnit-tracked roles -- the SAME identity `_role_
+        work_id` derives inside that role's own runner (`run_scout`/`run_
+        planner`/`run_builder`), computed from the SAME epoch/attempt boxes
+        this loop already threads into `review_packet_ctx` for it (M2
+        Package E live-graph-wiring correction, M-1): `switch_controller`/
+        `ensure_controller_dispatchable` bind their OWN manifest compile to
+        this exact identity instead of trivially skipping the graph check
+        (`role_work_id=None`). A reviewer role (scout-reviewer/planning-
+        advisor/build-reviewer) or `worktree` has no WorkUnit tracked in
+        the existing E v3 design -- `None`, never a fabricated identity."""
+        if not session_uuid:
+            return None
+        if role == "scout":
+            return _role_work_id(session_uuid, "scout",
+                                 scouting_epoch_box["epoch"],
+                                 scout_attempt_box["attempt"])
+        if role == "planner":
+            return _role_work_id(session_uuid, "planner", epoch_box["epoch"],
+                                 planner_attempt_box["attempt"])
+        if role == "builder":
+            return _role_work_id(session_uuid, "builder",
+                                 building_epoch_box["epoch"],
+                                 builder_attempt_box["attempt"])
+        return None
 
     # Reviewer hash-gate (scout + planner only). Each bundle's three callables
     # close over the active session-state holder + the phase epoch box + the
