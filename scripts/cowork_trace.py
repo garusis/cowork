@@ -62,13 +62,22 @@ def strip_ansi(value):
 
 
 def work_meta(work_id, work_class, usage_scope=None, identity=None,
-              duration_ms=None, parent_work_id=None, work_kind=None):
+              duration_ms=None, parent_work_id=None, work_kind=None,
+              governed_child_policy=None, graph_revision=None):
     """Build the stamped work-record fields shared by every emission site (P1).
 
     `duration_ms` is required on end events (P14) — an end event that omits it
     leaves the turn's cost unattributable in time, so every end path computes
     elapsed BEFORE emitting. A turn with a start and no end is `in_flight` and
     the record reports its duration as `unknown`, never 0.
+
+    `governed_child_policy` and `graph_revision` (M2 Package C, additive):
+    the same-named fields on a `cowork_workunit.validate_work_unit` record —
+    carried here verbatim, never re-derived — so a work item's trace record
+    can name its WorkUnit's own governed-child policy and dependency-graph
+    revision. Omitted (as by every caller that predates M2) they are absent
+    from the returned dict exactly as before, so this addition changes no
+    existing caller's output shape.
     """
     meta = {"work_id": work_id, "work_class": work_class}
     if usage_scope is not None:
@@ -81,20 +90,33 @@ def work_meta(work_id, work_class, usage_scope=None, identity=None,
         meta["parent_work_id"] = parent_work_id
     if work_kind is not None:
         meta["work_kind"] = work_kind
+    if governed_child_policy is not None:
+        meta["governed_child_policy"] = governed_child_policy
+    if graph_revision is not None:
+        meta["graph_revision"] = graph_revision
     return meta
 
 
 def identity_meta(controller=None, provider=None, model=None,
                   model_source=None, controller_session_id=None,
-                  effort=None, effort_source=None):
+                  effort=None, effort_source=None,
+                  candidate_manifest_digest=None, candidate_index=None):
     """The canonical identity block stamped on a unit of work.
 
     `model_source` says how the model was learned: `live_event` (the controller
     named it in its own event stream), `config_pinned` (cowork's configured
     value, used when the controller never names one) or `unknown`. Values are
-    ANSI-stripped so a styled fragment can never enter the record (CV-002)."""
+    ANSI-stripped so a styled fragment can never enter the record (CV-002).
+
+    `candidate_manifest_digest`/`candidate_index` (M2 Package C, additive):
+    the same-named PAIR on a `cowork_workunit.validate_work_unit` record,
+    identifying which candidate this unit of work is bound to — carried here
+    verbatim. Omitted (as by every caller that predates M2), the returned
+    dict keeps its original 7-key shape exactly; this addition changes no
+    existing caller's output.
+    """
     source = model_source if model_source in MODEL_SOURCES else "unknown"
-    return {
+    result = {
         "controller": strip_ansi(controller),
         "provider": strip_ansi(provider),
         "model": strip_ansi(model),
@@ -104,6 +126,11 @@ def identity_meta(controller=None, provider=None, model=None,
                           else "unknown"),
         "controller_session_id": strip_ansi(controller_session_id),
     }
+    if candidate_manifest_digest is not None:
+        result["candidate_manifest_digest"] = candidate_manifest_digest
+    if candidate_index is not None:
+        result["candidate_index"] = candidate_index
+    return result
 
 
 # --------------------------------------------------------------------------- #

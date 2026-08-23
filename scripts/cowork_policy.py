@@ -33,6 +33,8 @@ cowork_bridge.py, so it can be a leaf dependency of both.
 
 import collections
 import contextlib
+import fcntl
+import os
 
 # Canonical controller set. `cowork.CONTROLLERS` re-exports this name so there
 # is exactly one definition.
@@ -312,3 +314,193 @@ def guard_child(requested_child, parent_effective, pin_capability=True):
         allowed = (parent_effective or {}).get("controller"),
     return decide_child(requested_child, parent_effective, allowed,
                         pin_capability=pin_capability)
+
+
+# --------------------------------------------------------------------------- #
+# M2 Package C: atomic controller policy/config transition (issue #13).       #
+#                                                                              #
+# `cowork_state.propose_controller_transition` (Package B) already provides   #
+# the durable, revision-CAS'd atomic write: it holds this session's ONE       #
+# controller-transition lock for its whole read-check-write sequence and      #
+# writes NOTHING on any rejection path, so a rejected transition always      #
+# leaves both the persisted and (via the mirroring below) active state       #
+# byte-identical to their pre-attempt values. This section exposes that       #
+# primitive as the WorkUnit-typed decision function E will call, and closes   #
+# the "zero dispatch while pending" half of the invariant by giving dispatch  #
+# a guard that is SERIALIZED against the very same lock — never by inventing  #
+# a second, competing locking scheme. `cowork_state.py` is imported lazily,   #
+# function-local, mirroring the LAZY DEPENDENCY convention that module        #
+# itself documents for its own Package A imports (this module must stay      #
+# importable — see the module docstring — even in a deployment where         #
+# `cowork_state.py` is genuinely absent, and calling neither new function     #
+# here never happens).                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def _transition_lock_path(session_id):
+    import cowork_state as state_store
+    return state_store.controller_transition_path_for(session_id) + ".lock"
+
+
+@contextlib.contextmanager
+def _held_transition_lock(session_id):
+    """Hold the SAME per-session flock `cowork_state.
+    propose_controller_transition` holds for its entire read-check-write
+    sequence — never a second, independent lock — so any caller inside this
+    context is genuinely serialized against an in-flight transition attempt
+    for `session_id`, and vice versa."""
+    lock_path = _transition_lock_path(session_id)
+    dirname = os.path.dirname(lock_path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    lock_fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fh.close()
+
+
+def _allowed_from_transition_policy(transition_policy):
+    """Extract the `allowed` controller tuple `activate()` expects from a
+    durable transition's `policy` field, which is shaped like the existing
+    session-embedded `controller_policy` block (`{"allowed": [...], ...}`,
+    see `cowork_state.POLICY_KEY`/`apply_controller_transition`) — never a
+    bare list, so this primitive stores the SAME shape E's eventual live
+    wiring already persists elsewhere, not a second competing convention.
+    A dict with `allowed=None` (the explicit `ALL`/unrestricted marker) and
+    a non-dict `transition_policy` (nothing ever explicitly committed) both
+    yield `None` here — unrestricted, matching `activate`'s own convention
+    — but callers that must tell "explicitly unrestricted" apart from
+    "nothing committed" (see `decide_controller_policy_transition` and
+    `guard_serialized_with_transition`) inspect `transition_policy` itself
+    (`is not None`) BEFORE calling this function, never this function's
+    return value alone.
+    """
+    if not isinstance(transition_policy, dict):
+        return None
+    return transition_policy.get("allowed")
+
+
+_ALL_TRANSITION_POLICY = {"allowed": None}
+
+
+def decide_controller_policy_transition(session_id, expected_revision,
+                                        policy=PRESERVE, config=None,
+                                        reason=None, source=None,
+                                        validate=None):
+    """WorkUnit-typed atomic controller policy/config transition decision
+    (issue #13 primitive).
+
+    Delegates the actual atomic compare-and-swap to `cowork_state.
+    propose_controller_transition` (Package B), so the durable guarantee —
+    a rejected transition writes nothing, leaving the persisted state
+    byte-identical to its pre-attempt value — is proven exactly once, in
+    Package B, never re-implemented here.
+
+    `policy` names one of the module's own THREE DISTINCT proposal states
+    (see the module docstring) — never a two-way None/dict collapse:
+
+      * `PRESERVE` (the default, also accepted as bare `None` for callers
+        that only propose a `config` change) — no policy change is
+        proposed. The durable `controller_transition.json` policy field is
+        left exactly as Package B's own PRESERVE semantics already carry it
+        forward (`policy if policy is not None else current.get("policy")`
+        in `cowork_state.propose_controller_transition`), and — this is the
+        fix for issue B1 — this process's in-memory active policy holder
+        (`activate`) is NEVER touched by a PRESERVE commit: a config-only
+        transition can therefore never silently erase an in-force
+        allowlist, nor clear an `activate_invalid` fail-closed state, no
+        matter what happens to be sitting in the durable transition file.
+      * `ALL` — an explicit, intentional reset to unrestricted. Durably
+        recorded as the unambiguous marker `{"allowed": None}` (distinct
+        from "nothing was ever proposed"), and on commit DOES re-activate
+        this process's policy holder to unrestricted — explicit unrestricted
+        remains a real, provable event, never confused with PRESERVE.
+      * a dict `{"allowed": [...]}` naming a valid, nonempty controller
+        allowlist (see `normalize`) — the same shape `cowork_state.
+        POLICY_KEY` already uses. Validated BEFORE anything is written: an
+        internal `validate` wrapper checks this first (so a malformed
+        policy is rejected with nothing written, same as any other
+        rejection path) and then chains the caller's own optional
+        `validate` for cross-field checks (e.g. a fresh team/config
+        combined with `--allow-controllers`, per issue #13's evidence) —
+        either raising ValueError rejects atomically with zero partial
+        state. On commit, re-activates the policy holder to this set.
+
+    Never wires cowork.py's live call sites (10892, 10978, 10980, 11005,
+    11027, 11033) — that remains Package E's job; this function is the
+    primitive E's wiring calls.
+    """
+    import cowork_state as state_store
+
+    preserve = policy is PRESERVE or policy is None
+    if preserve:
+        raw_policy = None
+    elif policy is ALL:
+        raw_policy = _ALL_TRANSITION_POLICY
+    else:
+        raw_policy = policy
+
+    def _validate(current, proposed_policy, proposed_config):
+        if proposed_policy is not None and proposed_policy != _ALL_TRANSITION_POLICY:
+            allowed = _allowed_from_transition_policy(proposed_policy)
+            if not allowed:
+                raise ValueError(
+                    "policy must be a dict with a nonempty 'allowed' list "
+                    "(use cowork_policy.ALL for an explicit unrestricted "
+                    "reset, or cowork_policy.PRESERVE to leave it untouched)")
+            normalize(allowed)
+        if validate is not None:
+            validate(current, proposed_policy, proposed_config)
+
+    result = state_store.propose_controller_transition(
+        session_id, expected_revision, policy=raw_policy, config=config,
+        validate=_validate, reason=reason, source=source)
+    if result.get("outcome") == "committed" and not preserve:
+        committed_policy = (result.get("state") or {}).get("policy")
+        activate(_allowed_from_transition_policy(committed_policy))
+    return result
+
+
+def guard_serialized_with_transition(session_id, controller, role=None,
+                                     kind="dispatch", phase=None, trace=None):
+    """Fail-closed dispatch guard serialized against any in-flight
+    `decide_controller_policy_transition` for `session_id` — the "zero
+    dispatch is possible while the transition is pending" half of issue
+    #13's invariant.
+
+    Acquires the SAME per-session controller-transition lock
+    `cowork_state.propose_controller_transition` holds for its entire
+    read-check-write sequence (see `_held_transition_lock`): a transition
+    already in flight is waited out before this function ever reads the
+    durable policy, so a dispatch decision can never observe a stale
+    pre-transition policy while a commit is underway — and a transition
+    cannot commit while a dispatch decision is mid-read under this same
+    lock. Re-syncs the active in-memory policy from the durable state
+    before delegating to `guard()`, self-healing a process that missed an
+    `activate` call — but ONLY when the durable state carries an explicit
+    policy (a genuine `{"allowed": [...]}` restriction or the explicit
+    `ALL` marker `{"allowed": None}`, see `decide_controller_policy_
+    transition`). A durable policy of bare `None` means no explicit policy
+    has ever been committed (every commit so far was PRESERVE-shaped, or
+    none has ever been attempted): re-syncing from that would silently
+    activate "unrestricted" and could clobber this process's genuinely
+    active state (an in-force allowlist established outside this primitive,
+    or an `activate_invalid` fail-closed mode) — exactly issue B1's second
+    repro. So a PRESERVE-shaped durable state is left untouched here too.
+    """
+    import cowork_state as state_store
+    with _held_transition_lock(session_id):
+        transition = state_store.read_controller_transition(session_id)
+        committed_policy = transition.get("policy")
+        if transition.get("revision", 0) and committed_policy is not None:
+            activate(_allowed_from_transition_policy(committed_policy),
+                    trace=trace, phase=phase)
+        return guard(controller, role=role, kind=kind, phase=phase, trace=trace)

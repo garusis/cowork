@@ -15,11 +15,34 @@ except ImportError:  # Windows: the process-local lock still serializes writes.
 
 import cowork_action_policy as action_policy
 import cowork_delta
+import cowork_workunit
 
 
 MAX_REQUEST_BYTES = 256 * 1024
 _PATH_LOCKS = {}
 _PATH_LOCKS_GUARD = threading.Lock()
+
+# Guard/child-tracking lifecycle marker for a fully finalized child (written
+# at :374, read at :105/:107). M2 Package C (frozen-plan invariant): this is
+# an explicit SHARED constant with `cowork_measure.py`'s own consumption of
+# the identical literal, decoupling both from `cowork_control_plane`'s
+# closed PhaseState taxonomy BY NAME ONLY — it is a distinct guard/child
+# lifecycle concept, never a PhaseState value, and this rename changes no
+# behavior (see test_rename_ended_constant_value_equality in
+# test_cowork_dispatch_identity.py, which asserts the literal value never
+# moved).
+CHILD_LIFECYCLE_ENDED = "ended"
+
+# Guard/child-tracking lifecycle marker for a SubagentStop whose agent_id
+# cannot be correlated to any started child work_id (the residual gap named
+# by the frozen plan for issue #48: this branch previously only emitted a
+# trace event — see `_record_ungoverned_terminal` and the SubagentStop
+# handling in `handle` below). Distinct from CHILD_LIFECYCLE_ENDED: a
+# governed child that ran to completion is "ended"; an uncorrelated
+# SubagentStop that could never be bound to a started child is
+# "ungoverned_terminal" — the outcome is still durably recorded and still
+# terminal, but it was never an observed, correlated child lifecycle.
+CHILD_LIFECYCLE_UNGOVERNED_TERMINAL = "ungoverned_terminal"
 
 
 def append_once(path, record, key="guard_attempt_id", sync=True):
@@ -60,7 +83,8 @@ class GuardBroker:
     def __init__(self, socket_path, token, scope, actions_path,
                  children_path, trace_path, parent_identity,
                  allowed_controllers=("claude",), capability_allowlist=None,
-                 installed_schemas=None, max_request_bytes=MAX_REQUEST_BYTES):
+                 installed_schemas=None, max_request_bytes=MAX_REQUEST_BYTES,
+                 session_id=None):
         self.socket_path = socket_path
         self.token = token
         self.scope = scope
@@ -72,6 +96,15 @@ class GuardBroker:
         self.capability_allowlist = capability_allowlist or {}
         self.installed_schemas = installed_schemas or {}
         self.max_request_bytes = max_request_bytes
+        # Additive (M2 Package C, issue M2): when the live caller eventually
+        # supplies it, this is the session an ungoverned-terminal record's
+        # `parent_work_id` is validated to name a real, minted WorkUnit
+        # within (see `_validate_ungoverned_parent_work_id`). `None` (every
+        # existing call site, including `cowork_bridge.py`'s) keeps that
+        # existence check unavailable — this constructor's signature stays
+        # fully backward compatible; nothing that omits it changes behavior
+        # beyond the parent_work_id SHAPE validation M2 requires regardless.
+        self.session_id = session_id
         self._snapshots = {}
         self._children_by_tool = {}
         self._children_by_agent = {}
@@ -100,12 +133,29 @@ class GuardBroker:
             work_id = record.get("work_id")
             if not work_id:
                 continue
-            if record.get("state") == "started":
+            state = record.get("state")
+            if state == "started":
                 open_by_work[work_id] = record
-            elif record.get("state") in ("ended", "blocked"):
+            elif state in (CHILD_LIFECYCLE_ENDED, "blocked"):
                 open_by_work.pop(work_id, None)
-                if record.get("state") == "ended":
+                if state == CHILD_LIFECYCLE_ENDED:
                     self._finalized.add(work_id)
+            elif state == CHILD_LIFECYCLE_UNGOVERNED_TERMINAL:
+                # B2 fix: terminal by construction (see
+                # `_record_ungoverned_terminal`) so it must rehydrate as
+                # finalized -- otherwise a stray future reference to this
+                # minted work_id (e.g. a duplicate SubagentStop) could mint
+                # a phantom `ended` record via `finalize_child`. It must
+                # NEVER populate `_children_by_agent` below: this record's
+                # entire meaning is that `agent_id` could NOT be correlated
+                # to a governed child, and mapping it into
+                # `_children_by_agent` on restart would let an identical
+                # future PreToolUse for that same uncorrelated agent_id
+                # silently pass `handle()`'s uncorrelated-child guard
+                # (`if agent_id and agent_id not in self._children_by_agent`)
+                # -- flipping a deny into an allow across a broker restart.
+                self._finalized.add(work_id)
+                continue
             if record.get("agent_id"):
                 self._children_by_agent[record["agent_id"]] = work_id
         for work_id, record in open_by_work.items():
@@ -179,9 +229,9 @@ class GuardBroker:
                     work_id, agent_id=payload.get("agent_id"),
                     terminal_source="subagent_stop")
             elif payload.get("agent_id"):
-                self._trace(
-                    "child.ungoverned", attempt_id,
-                    reason="child_agent_correlation_unavailable")
+                self._record_ungoverned_terminal(
+                    attempt_id, payload.get("agent_id"),
+                    payload.get("parent_work_id"))
             return {}
         if event_name == "SubagentStart":
             agent_id = payload.get("agent_id")
@@ -371,7 +421,7 @@ class GuardBroker:
             self._child_started_at.get(work_id), ended_at)
         self._record(self.children_path, {
             "guard_attempt_id": "delta-" + work_id,
-            "work_id": work_id, "state": "ended", "delta": delta,
+            "work_id": work_id, "state": CHILD_LIFECYCLE_ENDED, "delta": delta,
             "agent_id": agent_id, "terminal_source": terminal_source,
             "ts": ended_at, "duration_ms": duration_ms,
             "usage": usage, "usage_scope": (
@@ -381,6 +431,111 @@ class GuardBroker:
         self._trace("child.work.end", "delta-" + work_id,
                     work_id=work_id, work_kind="child")
         return delta
+
+    def _validate_ungoverned_parent_work_id(self, parent_work_id):
+        """Return `parent_work_id` normalized to canonical lowercase when it
+        validates as a real WorkUnit identity this ungoverned-terminal
+        outcome may honestly be bound to; `None` otherwise (frozen-plan
+        M2). Never raises: an untrusted hook payload value only ever
+        becomes the durable `parent_work_id` after clearing every check
+        here, never verbatim.
+
+        Two layers, both required:
+
+          1. Shape: `parent_work_id` must be a non-null, UUID-shaped string
+             (`cowork_workunit._check_uuid`, the same canonical check
+             `validate_work_unit` itself applies to this exact field) — a
+             missing, empty, or malformed value (e.g. a path-traversal
+             string) fails closed here, unconditionally.
+          2. Existence: when this broker knows its own `session_id` (see
+             `__init__`), `parent_work_id` must additionally name a WorkUnit
+             this session actually minted (`cowork_state.
+             current_work_unit_state` projected via `work_unit_from_
+             history_record` and re-validated through `cowork_workunit.
+             validate_work_unit`) — a UUID-shaped string that names no real
+             parent is not a genuine binding either. When `session_id` is
+             unknown (no live caller has wired it yet — see `__init__`),
+             only the shape check applies; this is the same "identity
+             propagation is unbound" boundary every other live emission
+             site in this package already sits behind.
+        """
+        if not isinstance(parent_work_id, str) or not parent_work_id:
+            return None
+        try:
+            normalized = cowork_workunit._check_uuid(
+                parent_work_id, "parent_work_id")
+        except ValueError:
+            return None
+        if not self.session_id:
+            return normalized
+        import cowork_state as state_store
+        try:
+            history_record = state_store.current_work_unit_state(
+                self.session_id, normalized)
+            projected = state_store.work_unit_from_history_record(
+                history_record)
+            if projected is None:
+                return None
+            cowork_workunit.validate_work_unit(projected)
+        except (OSError, ValueError):
+            return None
+        return normalized
+
+    def _record_ungoverned_terminal(self, attempt_id, agent_id, parent_work_id):
+        """Durable, WorkUnit-bound terminal governed outcome for a
+        SubagentStop whose `agent_id` cannot be correlated to any started
+        child work_id (frozen-plan C: closes issue #48's residual
+        trace-only gap at the SubagentStop branch — see
+        `CHILD_LIFECYCLE_UNGOVERNED_TERMINAL`).
+
+        `parent_work_id` is validated (`_validate_ungoverned_parent_work_id`,
+        frozen-plan M2) BEFORE anything is written: a missing or malformed
+        parent identity — never honestly attributable to a real WorkUnit —
+        fails closed to a trace-only `child.ungoverned` event (this
+        function's pre-M2 behavior), exactly like every other unwritable
+        rejection path in this class; it never persists a children.jsonl
+        row naming a null or unverifiable parent.
+
+        Once validated, this MINTS a fresh work_id and durably records it,
+        bound to the validated `parent_work_id`, in `self.children_path`:
+        the SAME durable append-only store (via `append_once`, which fsyncs
+        before returning) every other child lifecycle record in this class
+        lands in, never a trace-only side channel. The record is added to
+        `self._finalized` immediately — it is terminal by construction, not
+        merely observed — and a `child.ungoverned` trace event is still
+        emitted (unchanged from before), now carrying the same `work_id`/
+        `parent_work_id` the durable record carries, so the trace and the
+        durable outcome are provably the same event under two views rather
+        than two independently-drifting records.
+
+        Returns the minted work_id, or `None` when the fail-closed path was
+        taken (nothing durable was recorded).
+        """
+        validated_parent = self._validate_ungoverned_parent_work_id(
+            parent_work_id)
+        if validated_parent is None:
+            self._trace(
+                "child.ungoverned", attempt_id, parent_work_id=parent_work_id,
+                reason="parent_work_id_unbound")
+            return None
+        work_id = str(uuid.uuid4())
+        ts = _utc_now()
+        self._record(self.children_path, {
+            "guard_attempt_id": "ungoverned-" + work_id,
+            "work_id": work_id,
+            "parent_work_id": validated_parent,
+            "agent_id": agent_id,
+            "state": CHILD_LIFECYCLE_UNGOVERNED_TERMINAL,
+            "terminal_source": "subagent_stop",
+            "reason": "child_agent_correlation_unavailable",
+            "ts": ts,
+        })
+        self._finalized.add(work_id)
+        self._trace(
+            "child.ungoverned", attempt_id, work_id=work_id,
+            parent_work_id=validated_parent,
+            reason="child_agent_correlation_unavailable")
+        return work_id
 
     def work_id_for_tool(self, tool_use_id):
         return self._children_by_tool.get(tool_use_id)

@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cowork_ingest as ingest  # noqa: E402
 import cowork_ledger as ledger  # noqa: E402
 import cowork_delta as delta_store  # noqa: E402
+import cowork_guard_broker as guard_broker  # noqa: E402
 import cowork_pricing as pricing  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
@@ -275,7 +276,7 @@ def child_work_from_ledger(records):
         elif state == "started":
             item.setdefault("work_state", "in_flight")
             item.setdefault("started_at", record.get("ts"))
-        elif state == "ended":
+        elif state == guard_broker.CHILD_LIFECYCLE_ENDED:
             item["work_state"] = "complete"
             item["ended_at"] = record.get("ts")
             item["duration_ms"] = record.get("duration_ms", UNKNOWN)

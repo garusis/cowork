@@ -13,6 +13,8 @@ import os
 import re
 import shlex
 
+import cowork_workunit as _work_unit_mod
+
 
 KNOWN_IDENTITY_SOURCES = frozenset(("live_event", "config_pinned"))
 CHILD_TOOLS = frozenset(("Agent", "Task"))
@@ -333,6 +335,122 @@ def decide_child(requested_child, parent_effective, allowed_controllers,
     return {"allow": True, "reason": "child_identity_pinned",
             "requested": requested_child, "effective": effective,
             "updated_input": pinned, "pinned_input_digest": _digest(pinned)}
+
+
+# --------------------------------------------------------------------------- #
+# M2 Package C: governed-child-policy inheritance.                            #
+#                                                                              #
+# `decide_child` proves three of the four required inheritance fields —      #
+# controller, model, effort. This section proves the fourth,                 #
+# `governed_child_policy` (`cowork_workunit.GOVERNED_CHILD_POLICIES`), the    #
+# same way: an absent or unknown policy is never silently read as `inherit`  #
+# or `denied`, exactly like a missing controller/model/effort is never       #
+# silently read as inherited. `decide_child_governed` composes both checks   #
+# into the single WorkUnit-typed child-dispatch decision function this       #
+# package exposes for E to call (frozen-plan invariant: "a child missing     #
+# any one of the four fails closed").                                        #
+# --------------------------------------------------------------------------- #
+
+
+def parent_effective_from_work_unit(work_unit, controller_source=None,
+                                    model_source=None, effort_source=None):
+    """Project a validated parent WorkUnit dict (`cowork_workunit.
+    validate_work_unit`) down to the `parent_effective` shape `decide_child`/
+    `decide_child_governed` consume — mirrors `cowork_workunit.
+    graph_node_from_work_unit`'s own projection pattern, so a child-dispatch
+    decision reads its parent's identity FROM a real WorkUnit record rather
+    than a hand-built shadow copy of the same fields. Never mutates input.
+
+    Frozen-plan M3 fix: `WorkUnit` carries NO `*_source` provenance fields
+    (see `cowork_workunit._WORK_UNIT_KEYS`), so this projection can never
+    honestly derive `controller_source`/`model_source`/`effort_source` from
+    the WorkUnit itself — doing so from mere presence (the pre-fix
+    behavior: `"config_pinned" if controller else None`) fabricates
+    provenance and degrades `decide_child`'s `source not in
+    KNOWN_IDENTITY_SOURCES` gate to a non-null check, mislabelling a value
+    genuinely learned from `live_event` as `config_pinned`.
+
+    Each `*_source` argument is therefore an EXPLICIT, caller-supplied
+    identity source — the caller's own honest account of how it resolved
+    `controller`/`effective_model`/`effort` for THIS WorkUnit (e.g.
+    `'config_pinned'` when session configuration pinned it, `'live_event'`
+    when it was observed from the controller's own output). A source not
+    named in `KNOWN_IDENTITY_SOURCES` (including the default `None`, i.e.
+    no source supplied) projects to `None`, which `decide_child`'s existing
+    gate already fails closed on — never silently accepted. This function
+    performs no Package A expansion and wires no live call site: a caller
+    with no honest source to supply gets a fail-closed projection, not a
+    new WorkUnit field.
+    """
+    work_unit = dict(work_unit or {})
+
+    def _known_source(source):
+        return source if source in KNOWN_IDENTITY_SOURCES else None
+
+    return {
+        "controller": work_unit.get("controller"),
+        "controller_source": _known_source(controller_source),
+        "model": work_unit.get("effective_model"),
+        "model_source": _known_source(model_source),
+        "effort": work_unit.get("effort"),
+        "effort_source": _known_source(effort_source),
+        "governed_child_policy": work_unit.get("governed_child_policy"),
+    }
+
+
+def decide_child_policy_inheritance(parent_effective, allowed_child_policies=None):
+    """Fail-closed governed-child-policy inheritance check.
+
+    `parent_effective` must carry a non-null `governed_child_policy` naming a
+    member of `cowork_workunit.GOVERNED_CHILD_POLICIES` — an absent or
+    unrecognized value is refused (`parent_policy_unresolved`), never read as
+    permission. `denied` always refuses (`governed_child_denied`): this
+    parent may not spawn governed children at all. `inherit` and `isolated`
+    both permit spawning (they differ only in how the CHILD is subsequently
+    governed, a distinction later stages own) unless the caller supplies
+    `allowed_child_policies` and the parent's policy is not among them.
+    """
+    parent = dict(parent_effective or {})
+    child_policy = parent.get("governed_child_policy")
+    if child_policy not in _work_unit_mod.GOVERNED_CHILD_POLICIES:
+        return {"allow": False, "reason": "parent_policy_unresolved",
+                "governed_child_policy": child_policy}
+    if child_policy == "denied":
+        return {"allow": False, "reason": "governed_child_denied",
+                "governed_child_policy": child_policy}
+    if (allowed_child_policies is not None
+            and child_policy not in set(allowed_child_policies)):
+        return {"allow": False, "reason": "child_policy_not_permitted",
+                "governed_child_policy": child_policy}
+    return {"allow": True, "reason": "governed_child_policy_inherited",
+            "governed_child_policy": child_policy}
+
+
+def decide_child_governed(requested_child, parent_effective, allowed_controllers,
+                          allowed_child_policies=None, pin_capability=True):
+    """WorkUnit-typed child-dispatch decision function (frozen-plan C
+    deliverable): the single decision proving ALL FOUR required inheritance
+    fields before a child may dispatch — controller, model, effort (via
+    `decide_child`) AND `governed_child_policy` (via
+    `decide_child_policy_inheritance`). A child missing any one of the four
+    fails closed. `decide_child` runs first since it is already the
+    production correlation-blocking primitive; the policy check only
+    NARROWS an already-allowed decision and can never loosen a `decide_child`
+    denial.
+    """
+    decision = decide_child(requested_child, parent_effective,
+                            allowed_controllers, pin_capability=pin_capability)
+    if not decision.get("allow"):
+        return decision
+    policy_decision = decide_child_policy_inheritance(
+        parent_effective, allowed_child_policies=allowed_child_policies)
+    if not policy_decision.get("allow"):
+        return {"allow": False, "reason": policy_decision["reason"],
+                "requested": requested_child, "effective": decision.get("effective"),
+                "governed_child_policy": policy_decision.get("governed_child_policy")}
+    result = dict(decision)
+    result["governed_child_policy"] = policy_decision["governed_child_policy"]
+    return result
 
 
 def _resolve(value, cwd):

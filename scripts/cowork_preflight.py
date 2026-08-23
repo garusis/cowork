@@ -477,6 +477,162 @@ def check_codex_config_freshness(capability, binding, stat_fn=None):
     return capability_check_result("codex_config_freshness", True)
 
 
+# ---------------------------------------------------------------------------
+# M2 Package C: dispatch-time dependency-graph declaration check +
+# WorkUnit-typed preflight decision.
+#
+# `check_dependency_graph_declaration` is a FUNCTION ONLY: it is never
+# folded into `run_manifest_preflight`'s own check pipeline below (that
+# function is already a live call site inside cowork.py — see the frozen
+# plan's boundary that C never touches an existing live call site's
+# behavior). E calls this new function separately, BEFORE preflight
+# proceeds, exactly as the frozen plan's deliverable names it.
+# ---------------------------------------------------------------------------
+
+def check_dependency_graph_declaration(work_unit, session_id, state_module=None):
+    """Dispatch-time dependency-graph declaration check (frozen-plan C
+    deliverable, issue #48/#13 primitive family): validate `work_unit`'s own
+    declared graph participation against Package B's durably stored graph
+    revisions for `session_id`, via Package A's `validate_revision` —
+    closing cross-candidate and cross-policy fan-in at dispatch time, not
+    merely at revision-append time.
+
+    A WorkUnit that declares no graph participation (`graph_revision` is
+    None) trivially passes — there is nothing to validate. A WorkUnit that
+    declares a `graph_revision` B never stored fails closed. Otherwise this
+    projects `work_unit` to its graph-node form (`cowork_workunit.
+    graph_node_from_work_unit`) and re-validates the full node set of the
+    matching stored revision WITH this node substituted in — so a stale or
+    tampered declaration (self-edge, dangling predecessor, cycle,
+    cross-candidate fan-in, cross-policy fan-in) is caught here even if the
+    node this WorkUnit describes was never the one durably appended.
+
+    Returns a CapabilityCheckResult-shaped dict (see `capability_check_
+    result`): `{"capability": "dependency_graph_declaration", "ok": bool,
+    "reason": str, "repair_hint": str}`. Read-only: performs no write of
+    its own (only `state_module.read_graph_revisions`, an existing durable
+    reader).
+    """
+    import cowork_workunit as workunit_mod
+    if state_module is None:
+        import cowork_state as state_module
+    graph_revision = (work_unit or {}).get("graph_revision")
+    if graph_revision is None:
+        return capability_check_result("dependency_graph_declaration", True)
+    revisions = state_module.read_graph_revisions(session_id)
+    matching = next(
+        (rev for rev in revisions if rev.get("graph_revision") == graph_revision),
+        None)
+    if matching is None:
+        return capability_check_result(
+            "dependency_graph_declaration", False,
+            reason=("declared graph_revision %r not found in stored "
+                    "revisions for session" % (graph_revision,)),
+            repair_hint=("append the revision (cowork_state.append_graph_"
+                         "revision) before dispatching a WorkUnit that "
+                         "declares it"))
+    node = workunit_mod.graph_node_from_work_unit(work_unit)
+    by_id = {n["work_id"]: n for n in (matching.get("nodes") or [])}
+    by_id[node["work_id"]] = node
+    try:
+        workunit_mod.validate_revision(list(by_id.values()))
+    except workunit_mod.GraphValidationError as exc:
+        codes = ", ".join(v["code"] for v in exc.violations)
+        return capability_check_result(
+            "dependency_graph_declaration", False,
+            reason="graph declaration rejected: %s" % codes,
+            repair_hint="resolve the declared graph violation before dispatch")
+    return capability_check_result("dependency_graph_declaration", True)
+
+
+def _advance_work_unit(control_plane, work_unit, event, terminal_message):
+    """Apply one `cowork_control_plane.advance()` event to `work_unit`.
+    Returns `(new_work_unit, reason_code)`.
+
+    Frozen-plan M1 fix: when the transition is illegal for `work_unit`'s
+    current `lifecycle_state` (`reason_code == 'illegal_transition'`),
+    `advance()` itself returns the state UNCHANGED — this helper mirrors
+    that at the WorkUnit level by returning `work_unit` completely
+    UNCHANGED (the identical object, not a same-valued reconstruction), so
+    a rejected/refused advance can never masquerade as an ordinary,
+    unchanged-but-passing WorkUnit: the ONLY way `decide_work_unit_
+    preflight` returns a non-advanced WorkUnit is `reason_code ==
+    'illegal_transition'`, and that WorkUnit is byte-for-byte, object-for-
+    object identical to the input, including `terminal_reason` — an
+    illegal transition attempted against an already-terminal WorkUnit can
+    therefore never overwrite its existing terminal history.
+    """
+    new_state, reason_code = control_plane.advance(
+        work_unit["lifecycle_state"], event)
+    if reason_code == "illegal_transition":
+        return work_unit, reason_code
+    terminal_reason = (
+        terminal_message if new_state in control_plane.TERMINAL_STATES
+        else None)
+    new_work_unit = dict(work_unit, lifecycle_state=new_state,
+                         terminal_reason=terminal_reason)
+    return new_work_unit, reason_code
+
+
+def decide_work_unit_preflight(work_unit, manifest, session_id,
+                               connect_fn=None, stat_fn=None, platform=None,
+                               state_module=None):
+    """WorkUnit-typed preflight decision function (frozen-plan C
+    deliverable): every preflight decision function reads and writes
+    through a WorkUnit.
+
+    Runs, in order: (1) `check_dependency_graph_declaration` against
+    `work_unit`'s own declared graph participation, then (2)
+    `run_manifest_preflight` against `manifest`. The first failing check
+    wins (matching `run_manifest_preflight`'s own first-failure-wins
+    contract). The outcome is translated into a `cowork_control_plane.
+    advance()` transition for `work_unit['lifecycle_state']` — event
+    `preflight_passed` on an all-pass result, `preflight_rejected`
+    otherwise — using Package A's pure reducer, never a hand-rolled state
+    change.
+
+    EXPLICIT CONTRACT (frozen-plan M1 fix): `reason_code == 'illegal_
+    transition'` invalidates the returned WorkUnit — it is the literal,
+    unmodified input `work_unit`, not a rejected/refused outcome, and the
+    caller MUST treat it as "no preflight decision was made" rather than
+    inspecting `lifecycle_state` alone. This only arises when `work_unit`'s
+    `lifecycle_state` was not `preflighting` (the only state `advance()`
+    accepts either preflight event from) — a caller invoking this function
+    against a WorkUnit outside that state gets back its own input, never a
+    deceptively-unchanged nonterminal WorkUnit and never a rewritten
+    terminal_reason.
+
+    Reads and writes through a WorkUnit VALUE ONLY: this function persists
+    nothing (neither the returned manifest nor the returned WorkUnit are
+    written to disk here) and performs no I/O beyond the two checks it
+    composes. E is the sole live caller responsible for durably persisting
+    the returned WorkUnit/PhaseState transition (Package B's
+    `cowork_state.append_work_unit_transition`/`append_phase_state_entry`)
+    inside cowork.py; this function never wires that live path itself.
+
+    Returns `(new_manifest, new_work_unit, reason_code)`.
+    """
+    import cowork_control_plane as control_plane
+
+    graph_check = check_dependency_graph_declaration(
+        work_unit, session_id, state_module=state_module)
+    if not graph_check["ok"]:
+        new_work_unit, reason_code = _advance_work_unit(
+            control_plane, work_unit, "preflight_rejected",
+            graph_check["reason"])
+        return manifest, new_work_unit, reason_code
+
+    new_manifest = run_manifest_preflight(
+        manifest, connect_fn=connect_fn, stat_fn=stat_fn, platform=platform)
+    proven = (new_manifest.get("status") or {}).get("phase") == "proven"
+    event = "preflight_passed" if proven else "preflight_rejected"
+    refusal = (new_manifest.get("status") or {}).get("refusal") or {}
+    terminal_message = refusal.get("message") or refusal.get("code")
+    new_work_unit, reason_code = _advance_work_unit(
+        control_plane, work_unit, event, terminal_message)
+    return new_manifest, new_work_unit, reason_code
+
+
 def run_manifest_preflight(manifest, connect_fn=None, stat_fn=None, platform=None):
     """Run all capability checks against the manifest. Return a new manifest.
 
