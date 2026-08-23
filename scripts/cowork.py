@@ -29,6 +29,7 @@ import inspect
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,9 @@ import cowork_eval as evaluation  # noqa: E402
 import cowork_dispatch as dispatch  # noqa: E402
 import cowork_dispatch_manifest as dispatch_manifest  # noqa: E402
 import cowork_guard_broker as guard_broker  # noqa: E402
+import cowork_workunit as workunit  # noqa: E402
+import cowork_control_plane as control_plane  # noqa: E402
+import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -1783,6 +1787,37 @@ def _make_pending_replay_cb(role, pending_entry, curr_phase, session_uuid, trace
                                 kind="pending_replay", error=str(exc))
         clear_fn(role)
     return _cb
+
+
+def _first_send_delivery_tracker(pending_cb=None):
+    """Return `(on_first_send_accepted, on_first_send_rejected, box)` for one
+    role-phase invocation.
+
+    `box["delivered"]` starts True -- the historical assumption every
+    existing caller (production and test-injected `run_scout_fn`/
+    `run_planner_fn`/`run_builder_fn` alike) already relies on: a role
+    invocation that returns success delivered whatever it was seeded with.
+    `_role_loop` flips it to False ONLY when it can affirmatively prove this
+    invocation's very first send was never accepted before the loop ended
+    (see `_role_loop`'s own `first_send and on_first_send_rejected` call,
+    fired at each of its send-failure-terminates-the-loop sites) -- the one
+    scenario where `rc == 0` alone would otherwise wrongly justify acking a
+    context the role never actually saw. A caller that never reaches (or
+    never wires) either callback leaves the box at its safe default, so a
+    test-injected fake that bypasses `_role_loop` entirely is byte-identical
+    to its historical behavior. `pending_cb` (the pending-replay callback,
+    when a pending switch turn is being replayed) fires exactly as before;
+    this wrapper adds the flag without changing that callback's own
+    behavior or arguments."""
+    box = {"delivered": True}
+
+    def _accepted():
+        if pending_cb:
+            pending_cb()
+
+    def _rejected():
+        box["delivered"] = False
+    return _accepted, _rejected, box
 
 
 def _build_gate_repair_attempt_link(role, phase, source_ref, prompt_text, ordinal):
@@ -3516,7 +3551,8 @@ def _owned_transaction_reason(result):
 
 def _run_owned_verification_transaction(session_uuid, role, round_index,
                                         trace, repo=None,
-                                        run_transaction_fn=None):
+                                        run_transaction_fn=None,
+                                        work_id=None):
     """Synchronously submit ONE owned verification transaction for the
     approved plan's inventory, at the builder's ready-for-review transition.
 
@@ -3528,6 +3564,11 @@ def _run_owned_verification_transaction(session_uuid, role, round_index,
     reason means the transaction could not even be attempted (missing/invalid
     plan inventory, no session), which is itself an unverified outcome for
     the caller to hand back exactly like a red transaction.
+
+    `work_id` (M2 Package E, additive): the builder's own WorkUnit join key
+    (see `_role_work_id`), threaded straight through to `run_transaction`'s
+    own additive `work_id` — purely a correlation field on the persisted
+    verification request document.
     """
     run_transaction_fn = run_transaction_fn or verification.run_transaction
     if not session_uuid or not trace:
@@ -3548,7 +3589,7 @@ def _run_owned_verification_transaction(session_uuid, role, round_index,
             "invalid (%s): %s" % (exc.code, exc)
     repo = repo or os.getcwd()
     try:
-        result = run_transaction_fn(repo, session_uuid, raw)
+        result = run_transaction_fn(repo, session_uuid, raw, work_id=work_id)
     except verification.InventoryError as exc:
         return None, "the approved plan's verification inventory is " \
             "invalid (%s): %s" % (exc.code, exc)
@@ -6130,6 +6171,22 @@ SkipBaseline = collections.namedtuple(
     "SkipBaseline", ["compute_composite", "eligible", "record"])
 
 
+# The single, historical `_role_loop`/run_* outcome string for "this role's
+# turn loop ended without an approval, a handoff, or a controller switch" —
+# EOF, /quit, /stop, a controller failure, a stuck gate, or a pre-loop
+# refusal (manifest/policy/probe/start) all collapse to this ONE outward
+# value, which `run_flow` and the existing test suite depend on byte-for-byte
+# (see e.g. test_run_flow_traces_context_and_saved_session and every
+# `self.assertEqual(outcome, "ended")` in test_cowork.py). M2 Package E does
+# NOT change this outward contract — "preserve legacy behavior outside the
+# named seams" — it replaces the literal `"ended"` source pattern at every
+# assignment/call site with this named constant AND, at each site, drives an
+# individually justified `cowork_control_plane.advance()` event so the
+# durable PhaseState this outward "ended" was silently standing in for is no
+# longer ambiguous. See `_advance_phase`/`_role_work_id` below.
+_OUTCOME_ENDED = "ended"
+
+
 # Returned by the turn readers to mean "end the conversation" (EOF / Ctrl-D /
 # explicit /quit), distinct from a blank line (which re-prompts).
 _END = object()
@@ -6964,11 +7021,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                handoff_declined_text_fn=handoff_declined_text,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
                phase=None, is_resume=False, seed_artifact_paths=None,
-               on_first_send_accepted=None, headless=False,
+               on_first_send_accepted=None, on_first_send_rejected=None,
+               headless=False,
                  review_allow_ask=True, gate_preview=None,
                   require_pending_question=False, review_path=None,
                   save_pending_turn_fn=None, clear_pending_turn_fn=None,
-                  spath=None, session_uuid=None, build_summary_path=None):
+                  spath=None, session_uuid=None, build_summary_path=None,
+                  role_work_id=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -7011,6 +7070,17 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
         first, (handoff.DeliveryEnvelope, handoff.HandoffBlock))
                else _initial_user_delivery(first))
     first = pending
+    # E-MJ2-UNBOUND-FIRST-SEND: bound here, BEFORE the `try:` below, so an
+    # interrupt landing during one of the pre-first-send I/O seams inside it
+    # (the `you: ...` echo, `read_status`/`invalidate_ready_status`,
+    # `fingerprint_status`) -- all of which run before the loop body's own
+    # `first_send = pending is first` at the top of its first iteration --
+    # never reaches the `except KeyboardInterrupt` handler with `first_send`
+    # unbound. `pending is first` is trivially True here (identical object,
+    # just assigned above), matching the loop's own computation for this
+    # same first iteration exactly, so this is not a distinct value, only an
+    # earlier binding of the same one.
+    first_send = True
     # The event that caused the pending reopen, so the resulting
     # status.invalidated can name its cause (P16).
     pending_reopen_event_id = None
@@ -7048,8 +7118,41 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     # One automatic repair is enough; a second malformed turn becomes an
     # explicit diagnostic at the input gate instead of an invisible loop.
     missing_question_repairs = 0
-    outcome_kind = "ended"
+    outcome_kind = _OUTCOME_ENDED
     payload = None
+
+    def _breaker_decision(reason):
+        """Ask D's durable recovery breaker whether ANOTHER attempt at this
+        exact cause (role, config_digest, controller, candidate, reason) is
+        still permitted, atomically recording this attempt against durable
+        history first. Returns the breaker's decision dict, or None when
+        there is no session/proven manifest to key a genuine fingerprint on
+        -- the breaker is silent rather than fabricating one. Keyed on the
+        SAME manifest digest `_complete_phase` binds as this WorkUnit's
+        candidate, so the breaker's cause identity and the WorkUnit's
+        candidate identity are never two competing definitions of "which
+        dispatch this is"."""
+        if not session_uuid:
+            return None
+        manifest = dispatch_manifest.load_manifest(
+            state_store.manifest_path_for(session_uuid, role))
+        config_digest = ((manifest or {}).get("binding") or {}).get(
+            "config_digest")
+        if not config_digest:
+            return None
+        controller_name = getattr(session, "controller", None) or "unknown"
+        candidate = (manifest or {}).get("digest")
+        decision = recovery_breaker.attempt(
+            state_store.ledger_path_for(session_uuid), role, config_digest,
+            controller_name, candidate, reason)
+        if trace:
+            trace.event("recovery.breaker.decision", role=role, reason=reason,
+                        fingerprint=decision["fingerprint"],
+                        attempt_count=decision["attempt_count"],
+                        threshold=decision["threshold"],
+                        tripped=decision["tripped"])
+        return decision
+
     try:
         # Controller-switch packets are controller-only recovery context.  The
         # switch itself already has a compact user-facing status line; echoing
@@ -7134,6 +7237,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 "resume": is_resume or not first_send,
                 "context_revision": context_revision,
                 "artifacts": lead_artifacts,
+                # MJ-1: the genuine WorkUnit identity for this engagement --
+                # threaded through so the bridge session can stamp the REAL
+                # parent WorkUnit (not its own per-turn trace work_id) into
+                # the guard context a child-dispatch/ungoverned-terminal
+                # hook payload carries as `parent_work_id` (see
+                # `cowork_bridge.py`'s `_send_turn`/`send` methods).
+                "role_work_id": role_work_id,
             }
             if trace:
                 trace.event("role.fingerprint.before", role=role,
@@ -7186,7 +7296,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if trace:
                         trace.event("headless.auto", role=role,
                                     gate="controller_failure", action="end")
-                    outcome_kind = "ended"
+                    _advance_phase(
+                        session_uuid, role_work_id, "execution_failed",
+                        evidence={"reason": "send_failed", "headless": True},
+                        source="headless.auto")
+                    if first_send and on_first_send_rejected:
+                        on_first_send_rejected()
+                    outcome_kind = _OUTCOME_ENDED
                     break
                 outcome_kind = None
                 while True:
@@ -7206,6 +7322,23 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         on_discard=gate_discard,
                         on_drain_fail=gate_drain_fail)
                     if action is _CTRL_RETRY:
+                        breaker = _breaker_decision("controller_failure")
+                        if breaker and breaker["tripped"]:
+                            if trace:
+                                trace.event(
+                                    "user.action", role=role,
+                                    action="controller_failure_retry_blocked",
+                                    fingerprint=breaker["fingerprint"])
+                            _advance_phase(
+                                session_uuid, role_work_id, "execution_failed",
+                                evidence={
+                                    "reason": "recovery_breaker_tripped",
+                                    "fingerprint": breaker["fingerprint"]},
+                                source="recovery_breaker")
+                            if first_send and on_first_send_rejected:
+                                on_first_send_rejected()
+                            outcome_kind = _OUTCOME_ENDED
+                            break
                         if trace:
                             trace.event("user.action", role=role,
                                         action="controller_failure_retry")
@@ -7228,9 +7361,16 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if trace:
                         trace.event("user.action", role=role,
                                     action="controller_failure_end")
-                    outcome_kind = "ended"
+                    _advance_phase(
+                        session_uuid, role_work_id, "execution_failed",
+                        evidence={"reason": "send_failed",
+                                 "user_action": "controller_failure_end"},
+                        source="user.action")
+                    if first_send and on_first_send_rejected:
+                        on_first_send_rejected()
+                    outcome_kind = _OUTCOME_ENDED
                     break
-                if outcome_kind in ("switch_controller", "ended"):
+                if outcome_kind in ("switch_controller", _OUTCOME_ENDED):
                     break
                 continue
             if send_result.get("ok", True):
@@ -7295,7 +7435,11 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if trace:
                         trace.event("headless.auto", role=role, gate="stuck",
                                     action="end")
-                    outcome_kind = "ended"
+                    _advance_phase(
+                        session_uuid, role_work_id, "execution_failed",
+                        evidence={"reason": "stale_noop", "headless": True},
+                        source="headless.auto")
+                    outcome_kind = _OUTCOME_ENDED
                     break
                 gate_decision = None
                 while gate_decision is None:
@@ -7355,7 +7499,11 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 # _STUCK_END: end this phase cleanly, like EOF.
                 if trace:
                     trace.event("user.action", role=role, action="stuck_end")
-                outcome_kind = "ended"
+                _advance_phase(
+                    session_uuid, role_work_id, "execution_failed",
+                    evidence={"reason": "stale_noop", "user_action": "stuck_end"},
+                    source="user.action")
+                outcome_kind = _OUTCOME_ENDED
                 break
             # Progress (the file changed) — clear any repair state and proceed.
             in_repair = False
@@ -7445,7 +7593,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     # manifest/index, never a controller-log rejoin.
                     txn_result, txn_missing_reason = (
                         _run_owned_verification_transaction(
-                            session_uuid, role, review_rounds, trace))
+                            session_uuid, role, review_rounds, trace,
+                            work_id=role_work_id))
                     readiness = _record_readiness_from_transaction(
                         session_uuid, role, review_rounds, trace, txn_result,
                         missing_reason=txn_missing_reason)
@@ -7851,7 +8000,11 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if review_action == "continue":
                         continue
                     if review_action == "end":
-                        outcome_kind = "ended"
+                        _advance_phase(
+                            session_uuid, role_work_id, "execution_failed",
+                            evidence={"reason": "reviewer_failure_end"},
+                            source="user.action")
+                        outcome_kind = _OUTCOME_ENDED
                         break
                 if trace:
                     trace.event("gate.show", role=role,
@@ -7894,7 +8047,12 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     if trace:
                         trace.event("user.action", role=role, action="stop",
                                     gate="ready_for_review")
-                    outcome_kind = "ended"
+                    _advance_phase(
+                        session_uuid, role_work_id, "cancelled",
+                        evidence={"reason": "user_stop",
+                                 "gate": "ready_for_review"},
+                        source="user.action")
+                    outcome_kind = _OUTCOME_ENDED
                     break
                 if outcome is _ITERATE:
                     # Hand the reviewer's unresolved findings straight back to
@@ -7926,6 +8084,14 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         _grant_gate_acceptance(session_uuid, trace)
                     ui.banner(io_out, done_text(
                         status_path, ui.is_tty(io_out)), "done")
+                    if session_uuid and role_work_id:
+                        _approved_manifest = dispatch_manifest.load_manifest(
+                            state_store.manifest_path_for(session_uuid, role))
+                        _approved_digest = (_approved_manifest or {}).get("digest")
+                        if _approved_digest:
+                            _complete_phase(session_uuid, role_work_id,
+                                            _approved_digest,
+                                            source="user.action")
                     outcome_kind = "approved"
                     break
                 if (isinstance(outcome, tuple) and len(outcome) == 2
@@ -8011,7 +8177,12 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             trace.event("headless.auto", role=role,
                                         gate="needs_input", action="end",
                                         nudges=headless_nudges)
-                        outcome_kind = "ended"
+                        _advance_phase(
+                            session_uuid, role_work_id, "execution_failed",
+                            evidence={"reason": "headless_nudge_cap",
+                                     "nudges": headless_nudges},
+                            source="headless.auto")
+                        outcome_kind = _OUTCOME_ENDED
                         break
                     if trace:
                         trace.event("headless.auto", role=role,
@@ -8025,7 +8196,10 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 if outcome is _END:
                     if trace:
                         trace.event("user.action", role=role, action="eof")
-                    outcome_kind = "ended"
+                    _advance_phase(
+                        session_uuid, role_work_id, "cancelled",
+                        evidence={"reason": "eof"}, source="user.action")
+                    outcome_kind = _OUTCOME_ENDED
                     break
                 pending = _user_lead_delivery(outcome)
                 if trace:
@@ -8036,6 +8210,16 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     except KeyboardInterrupt:
         if trace:
             trace.event("role.interrupted", role=role)
+        # MJ-2: an interrupt on the FIRST send means the context that rode
+        # it was never affirmatively delivered (the model may never have
+        # received or processed it) -- the same "no accepted send this
+        # invocation" fact `on_first_send_rejected` already exists to
+        # report, just reached via an interrupt rather than a refused send.
+        if first_send and on_first_send_rejected:
+            on_first_send_rejected()
+        _advance_phase(session_uuid, role_work_id, "aborted",
+                       evidence={"reason": "keyboard_interrupt"},
+                       source="signal")
         outcome_kind = "interrupted"
     finally:
         session.close()
@@ -8048,10 +8232,11 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
                 review_fn=None, trace=None, on_outcome=None,
                 evaluate_fn=None, intel_md_path=None, skip_baseline=None,
                 context_revision=None, is_resume=False,
-                on_first_send_accepted=None, headless=False,
+                on_first_send_accepted=None, on_first_send_rejected=None,
+                headless=False,
                 gate_preview=None, review_path=None,
                 save_pending_turn_fn=None, clear_pending_turn_fn=None,
-                session_uuid=None):
+                session_uuid=None, role_work_id=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
     `run_flow` can chain into the planning phase on approval.
@@ -8075,8 +8260,9 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
             lambda _p, en=False: scout_done_text(intel_md_path, en))
     rc, outcome, payload = _role_loop(
         session, first, intel_path, context, io_in, io_out,
-        on_first_send_accepted=on_first_send_accepted, **loop_kwargs,
-            session_uuid=session_uuid)
+        on_first_send_accepted=on_first_send_accepted,
+        on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
+            session_uuid=session_uuid, role_work_id=role_work_id)
     if on_outcome:
         try:
             params = inspect.signature(on_outcome).parameters
@@ -8474,6 +8660,301 @@ def _compile_role_manifest(
     return result, True
 
 
+# --------------------------------------------------------------------------- #
+# M2 Package E: live phase-truth integration.                                 #
+#                                                                              #
+# WorkUnit (Package A/`cowork_workunit`) is the join key for a role's live    #
+# dispatch: `_role_work_id` derives ONE stable identity per (session, role,   #
+# phase-engagement epoch) and every seam below — manifest preflight, launch,  #
+# gates, and terminal correlation — keys off it. `_advance_phase` is the ONE  #
+# place in this file that calls A's closed reducer (`cowork_control_plane.    #
+# advance`) and persists the result via B's public                           #
+# `cowork_state.append_phase_state_entry`; no exit code, EOF, headless        #
+# fallthrough, or status-file read ever sets `lifecycle_state` directly. A    #
+# transition the reducer refuses (illegal for the current state, or missing/ #
+# mismatched gate evidence) writes nothing and this helper returns the durable#
+# record UNCHANGED — advancing on a bad event can never fabricate progress.   #
+# --------------------------------------------------------------------------- #
+
+
+def _role_work_id(session_uuid, role, epoch=None, attempt=None):
+    """The stable WorkUnit identity for one (session, role) phase engagement
+    attempt.
+
+    `epoch` is the role-family's existing phase-engagement counter (the
+    scouting/planning/building epoch already bumped on every hand-back round
+    trip — see `bump_scouting_epoch`/`bump_planning_epoch`/
+    `bump_building_epoch`), so a genuine re-engagement of the same role after
+    a hand-back mints a FRESH WorkUnit rather than reusing one whose history
+    may already be terminal (a terminal PhaseState record has no legal
+    outbound transition — see `cowork_control_plane.TERMINAL_STATES`).
+
+    `attempt` (M2 Package E, BL-3) is the SAME epoch's own relaunch counter
+    (see `scout_attempt_box`/`planner_attempt_box`/`builder_attempt_box` in
+    `run_flow`, bumped on a launch-time retry, a launch-time controller
+    switch, or a mid-turn controller switch — every same-epoch `continue`
+    that re-invokes `run_scout_fn`/`run_planner_fn`/`run_builder_fn` without
+    a fresh hand-back): a launch-time failure can leave the epoch's WorkUnit
+    terminal (`rejected_preflight`/`needs_authority`), and a mid-turn switch
+    leaves it `running` -- neither state has a legal `preflight_started`
+    reducer edge back to `preflighting`, so reusing that identity for the
+    next attempt would silently no-op every PhaseState call for it. Folding
+    `attempt` into the identity mints a fresh WorkUnit per attempt instead,
+    exactly like `epoch` already does per hand-back.
+
+    Deterministic: a resumed process re-derives the SAME work_id for an
+    in-flight engagement instead of minting a second WorkUnit for it."""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        "cowork:workunit:%s:%s:%s:%s" % (
+            session_uuid, role, epoch if epoch is not None else 0,
+            attempt if attempt is not None else 0)))
+
+
+# A resumed process re-derives `_role_work_id`'s attempt-0 identity for its
+# current epoch exactly like an in-flight engagement (see `_role_work_id`'s
+# own docstring) -- correct ONLY while that identity's durable PhaseState is
+# still live. `scout_attempt_box`/etc (in `run_flow`) are plain in-process
+# dicts with no memory across a restart, so a process that died mid-attempt
+# (a launch-time retry/switch already bumped the in-memory counter past 0,
+# then a real SIGTERM landed) always restarts scanning from 0 -- reusing an
+# attempt whose WorkUnit the dead process already drove to
+# `rejected_preflight`/`needs_authority`/`aborted`. Neither state has a
+# legal `preflight_started` reducer edge back to `preflighting`
+# (`cowork_control_plane.TRANSITIONS`), so every subsequent PhaseState call
+# on that reused identity would silently no-op (`illegal_transition`),
+# permanently losing observability into the resumed attempt (BL-3-RESIDUAL).
+_MAX_ATTEMPT_SCAN = 10000
+
+
+def _resolve_attempt_start(session_uuid, role, epoch):
+    """The attempt number a process must begin at for (role, epoch),
+    derived deterministically from durable PhaseState alone -- never
+    persisted itself, so there is nothing new to keep in sync or corrupt.
+
+    Scans attempt 0, 1, 2, ... at this epoch and returns the first one whose
+    WorkUnit has no durable PhaseState yet (never minted -- a genuinely
+    unused identity) or whose current PhaseState is neither terminal
+    (`cowork_control_plane.TERMINAL_STATES`) nor `needs_authority` (a live,
+    resumable engagement -- `pending`/`preflighting`/`running`/
+    `awaiting_gate`/`blocked`). A fresh session (no session_uuid) or an
+    epoch that has never been touched both resolve to 0 on the very first
+    read, so this is a no-op cost for the overwhelmingly common case.
+
+    Capped at `_MAX_ATTEMPT_SCAN` purely as a defensive bound against a
+    hypothetically corrupt store wedging every attempt terminal forever; in
+    that pathological case it returns the cap rather than spinning, so a
+    fresh WorkUnit still eventually mints (see `_ensure_work_unit`) instead
+    of the process hanging."""
+    if not session_uuid:
+        return 0
+    attempt = 0
+    while attempt < _MAX_ATTEMPT_SCAN:
+        work_id = _role_work_id(session_uuid, role, epoch, attempt)
+        current = state_store.current_phase_state(session_uuid, work_id)
+        if current is None:
+            return attempt
+        state = current.get("state")
+        if state not in control_plane.TERMINAL_STATES and state != "needs_authority":
+            return attempt
+        attempt += 1
+    return attempt
+
+
+def _ensure_work_unit(session_uuid, work_id, role, controller, model=None,
+                      effort=None):
+    """Mint (once) the WorkUnit naming this role engagement's live dispatch,
+    or return the already-minted record. Idempotent: a second call for an
+    already-minted work_id (a resume) returns the existing record rather
+    than raising, including when this call loses a mint race against a
+    sibling process for the same identity.
+
+    `model`/`effort` are the role's OWN resolved config values (`cfg.get(
+    "model")`/`cfg.get("effort")` at the call site) -- the same genuine
+    identity `_guard_runtime`'s parent-identity dict threads into child-
+    dispatch pinning. Never fabricated: an unconfigured value stays `None`
+    on the WorkUnit exactly as it is in the role config, rather than
+    inventing a placeholder string."""
+    if not session_uuid or not work_id:
+        return None
+    existing = state_store.current_work_unit_state(session_uuid, work_id)
+    if existing is not None:
+        return existing
+    record = {
+        "schema_version": workunit.SCHEMA_VERSION, "record": "WorkUnit",
+        "work_id": work_id, "session_id": session_uuid, "phase": None,
+        "role": role, "seat": 0, "round": 0, "attempt": 0,
+        "controller": controller or "unknown",
+        "provider": controller or "unknown",
+        "requested_model": model, "effective_model": None, "effort": effort,
+        "candidate_manifest_digest": None, "candidate_index": None,
+        "prompt_digest": None, "pending_turn_digest": None,
+        "parent_work_id": None, "governed_child_policy": None,
+        "graph_revision": None, "predecessor_work_ids": [],
+        "fan_join_id": None,
+        "lifecycle_state": "pending", "terminal_reason": None,
+    }
+    try:
+        return state_store.mint_work_unit(record)
+    except ValueError:
+        return state_store.current_work_unit_state(session_uuid, work_id)
+
+
+def _bind_candidate(session_uuid, work_id, candidate_manifest_digest,
+                    candidate_index=None):
+    """Bind the role engagement's WorkUnit to the real dispatch-manifest
+    digest governing it, so a later `gate_validated` advance can name it as
+    the candidate `cowork_control_plane.advance`'s fail-closed identity rule
+    requires (`_validate_phase_state_args` derives `expected_candidate` from
+    exactly this field on the durable WorkUnit — never from a value the
+    caller merely asserts at advance time). A no-op when already bound to
+    this exact identity, or when the WorkUnit was never minted."""
+    if not session_uuid or not work_id or not candidate_manifest_digest:
+        return None
+    current = state_store.current_work_unit_state(session_uuid, work_id)
+    projected = state_store.work_unit_from_history_record(current)
+    if projected is None:
+        return None
+    if (projected.get("candidate_manifest_digest") == candidate_manifest_digest
+            and projected.get("candidate_index") == candidate_index):
+        return current
+    projected["candidate_manifest_digest"] = candidate_manifest_digest
+    projected["candidate_index"] = candidate_index
+    try:
+        return state_store.append_work_unit_transition(projected)
+    except ValueError:
+        return current
+
+
+def _advance_phase(session_uuid, work_id, event, evidence=None, source=None,
+                   unlocked=False):
+    """The one seam every production phase advance in this file passes
+    through: A's closed reducer decides the next PhaseState from the durable
+    current one, and B's public persistence contract makes it durable.
+
+    `unlocked=True` routes the durable append through B's reentrant twin
+    (`cowork_state.append_phase_state_entry_unlocked`) instead of the
+    locked `append_phase_state_entry` -- the ONLY safe choice for a caller
+    that may run while THIS SAME PROCESS already holds this (session_uuid,
+    work_id)'s PhaseState lock via a DIFFERENT fd (a `signal.signal`
+    handler interrupting an in-flight locked append for the same work_id):
+    flock locks attach to the open file description, not the process, so a
+    second locked append here would block forever, not merely wait (B's own
+    SELF-DEADLOCK banner in `cowork_state.py`). `_handle_external_kill` is
+    the one production caller that sets this; it also routes the WorkUnit
+    lifecycle mirror (MJ-4) through its own reentrant twin
+    (`_mirror_work_unit_lifecycle_unlocked`) on this path, for the identical
+    self-deadlock reason applied to the WorkUnit lock instead of the
+    PhaseState lock -- see that function's docstring.
+
+    Returns the durably persisted PhaseState record, or the unchanged
+    current record when there is no session to bind to (--no-session), the
+    reducer refused the transition, or a prior call already made this
+    work_id's history terminal (a concurrent external kill, most often —
+    `append_phase_state_entry`/`_unlocked` raises ValueError for any append
+    attempted after a terminal record; that durable terminal truth is never
+    overwritten or masked here)."""
+    if not session_uuid or not work_id:
+        return None
+    current = state_store.current_phase_state(session_uuid, work_id)
+    state = (current or {}).get("state", "pending")
+    new_state, reason_code = control_plane.advance(state, event, evidence=evidence)
+    if new_state == state and reason_code in (
+            "illegal_transition", "gate_evidence_missing",
+            "gate_evidence_candidate_mismatch"):
+        return current
+    append = (state_store.append_phase_state_entry_unlocked if unlocked
+             else state_store.append_phase_state_entry)
+    try:
+        record = append(
+            session_uuid, work_id, new_state, reason_code, event,
+            evidence, source)
+    except ValueError:
+        return state_store.current_phase_state(session_uuid, work_id)
+    mirror = (_mirror_work_unit_lifecycle_unlocked if unlocked
+             else _mirror_work_unit_lifecycle)
+    mirror(session_uuid, work_id, new_state, reason_code)
+    return record
+
+
+def _mirror_work_unit_lifecycle(session_uuid, work_id, state, reason_code):
+    """Best-effort: keep the WorkUnit's own `lifecycle_state` (the join-key
+    record every later seam reads) in step with the PhaseState record
+    `_advance_phase` just durably appended, so a reader that joins on
+    WorkUnit alone never sees a stale `pending`/`running` after real
+    progress. `current_phase_state` remains the sole AUTHORITATIVE source
+    every decision in this file is actually based on; this mirror is
+    read-side convenience only -- a failure here (no minted WorkUnit, a
+    lost race) never blocks or reverts the PhaseState write that already
+    landed durably."""
+    current = state_store.current_work_unit_state(session_uuid, work_id)
+    projected = state_store.work_unit_from_history_record(current)
+    if projected is None or projected.get("lifecycle_state") == state:
+        return
+    projected["lifecycle_state"] = state
+    projected["terminal_reason"] = (
+        reason_code if state in control_plane.TERMINAL_STATES else None)
+    try:
+        state_store.append_work_unit_transition(projected)
+    except ValueError:
+        pass
+
+
+def _mirror_work_unit_lifecycle_unlocked(session_uuid, work_id, state,
+                                         reason_code):
+    """Reentrant twin of `_mirror_work_unit_lifecycle`, for the SAME
+    self-deadlock reason `_advance_phase`'s `unlocked=True` path exists
+    (see its docstring): calls B's `append_work_unit_transition_unlocked`
+    instead of the locked `append_work_unit_transition`, so
+    `_handle_external_kill` mirrors the terminal PhaseState it just wrote
+    onto the SAME WorkUnit join key without risking a second `flock()` on
+    this process's own already-open WorkUnit lock fd for this work_id
+    (MJ-4: without this, a real SIGTERM left the WorkUnit's own
+    `lifecycle_state` stale at whatever it was before the kill -- most
+    often `running` -- even though PhaseState itself was durably `aborted`,
+    so a reader joining on the WorkUnit alone saw a contradictory,
+    non-terminal record for an engagement a real SIGTERM had already ended).
+
+    Best-effort, exactly like the locked twin: no minted WorkUnit, an
+    already-matching lifecycle_state, or a lost race against a concurrent
+    writer is silently skipped -- this mirror never raises out of a signal
+    handler, and never blocks or reverts the PhaseState write that already
+    landed durably."""
+    current = state_store.current_work_unit_state(session_uuid, work_id)
+    projected = state_store.work_unit_from_history_record(current)
+    if projected is None or projected.get("lifecycle_state") == state:
+        return
+    projected["lifecycle_state"] = state
+    projected["terminal_reason"] = (
+        reason_code if state in control_plane.TERMINAL_STATES else None)
+    try:
+        state_store.append_work_unit_transition_unlocked(projected)
+    except ValueError:
+        pass
+
+
+def _complete_phase(session_uuid, work_id, candidate_manifest_digest,
+                    source=None):
+    """Advance a role engagement's WorkUnit to `completed` — the ONLY path
+    any production code in this file uses to reach that state. Binds the
+    real candidate digest first (see `_bind_candidate`), then drives the
+    reducer through `turn_completed` (running -> awaiting_gate) and
+    `gate_validated` with candidate-bound evidence naming it (awaiting_gate
+    -> completed). Exit code 0, EOF, headless fallthrough, and status-file
+    presence never appear here — only an explicit user/headless APPROVAL at
+    the `ready_for_review` gate calls this, and only when a real proven
+    manifest digest exists to bind."""
+    if not session_uuid or not work_id or not candidate_manifest_digest:
+        return None
+    _bind_candidate(session_uuid, work_id, candidate_manifest_digest)
+    _advance_phase(session_uuid, work_id, "turn_completed", source=source)
+    evidence = {"gate_validation": {
+        "candidate_manifest_digest": candidate_manifest_digest,
+        "candidate_index": None, "verdict": "pass"}}
+    return _advance_phase(session_uuid, work_id, "gate_validated",
+                          evidence=evidence, source=source)
+
+
 def _is_policy_preserving_repair(old_allowed, new_allowed):
     """True only when new_allowed does not broaden the active controller set.
 
@@ -8602,7 +9083,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               skip_baseline=None, review_packet_ctx=None,
               switch_controller_fn=None, reviewer_switch_note_fn=None,
               on_reviewer_switch_consumed=None,
-              on_first_send_accepted=None,
+              on_first_send_accepted=None, on_first_send_rejected=None,
               reviewer_controller_check_fn=None, headless=False,
               gate_preview=None, save_pending_turn_fn=None,
               clear_pending_turn_fn=None, worktree=None, worktree_base=None):
@@ -8632,6 +9113,21 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    # WorkUnit join key for this scout engagement (M2 Package E): minted once
+    # per (session, role, scouting-epoch) so a genuine re-engagement after a
+    # hand-back gets a fresh WorkUnit rather than reusing an already-terminal
+    # one. See `_role_work_id`.
+    role_work_id = (
+        _role_work_id(session_uuid, "scout",
+                     (review_packet_ctx or {}).get("epoch"),
+                     (review_packet_ctx or {}).get("attempt"))
+        if session_uuid else None)
+    if role_work_id:
+        _ensure_work_unit(session_uuid, role_work_id, "scout",
+                          cfg["controller"], model=cfg.get("model"),
+                          effort=cfg.get("effort"))
+        _advance_phase(session_uuid, role_work_id, "preflight_started",
+                       source="run_scout")
     # Fail-closed order: compile/revalidate the manifest FIRST, bind a
     # dispatch decision to it (resume included — force_recompile revalidates),
     # and require allow before any brief/prompt assembly.
@@ -8658,6 +9154,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             _emit_dispatch_escalation(
                 trace, "scout", "manifest_proven",
                 "recompile and preflight the manifest", "prompt_assembly")
+            _advance_phase(
+                session_uuid, role_work_id, "capability_missing",
+                evidence={"refusal_code": _mdec.get("refusal_code"),
+                         "refusal_message": _mdec.get("refusal_message")},
+                source="manifest_preflight")
             return 1
     brief = assemble_scout_brief(selected, intel_path or "", intel_md_path)
     # The real scout-reviewer runner embeds BOTH intel files (JSON + markdown) so
@@ -8705,6 +9206,16 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         intel_md_path or intel_path or "", resuming=bool(resume_id),
         enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
+    # `preflight_passed` (preflighting -> running) is bound per controller
+    # branch below, ONLY once that branch's own policy/probe/session-start
+    # checks have all actually succeeded -- never here, unconditionally,
+    # before them. Firing it this early would move the WorkUnit to `running`
+    # while policy_blocked/probe_failed/start_failed can still legitimately
+    # reject the dispatch, and the reducer has no `("running",
+    # "preflight_rejected")` edge -- only `("preflighting",
+    # "preflight_rejected")` -- so every one of those later rejections would
+    # silently no-op (`illegal_transition`) against an already-`running`
+    # state instead of durably recording the rejection (BL-2).
 
     if cfg["controller"] == "claude":
         _sf = _guard_to_policy_fact(cfg["controller"], "scout", trace=trace)
@@ -8725,6 +9236,10 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(_dec["refusal_message"] + "\n")
             io_out.flush()
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"refusal_code": _dec.get("refusal_code")},
+                source="policy_guard")
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
@@ -8743,6 +9258,9 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                 trace.event("role.end", role="scout", result="probe_failed")
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"reason": "probe_failed"}, source="probe")
             return 1
         if resume_id:
             session_id, rid = None, resume_id
@@ -8779,6 +9297,9 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(_bdec["refusal_message"] + "\n")
             io_out.flush()
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"reason": "policy_blocked"}, source="bridge_backstop")
             return 1
         except Exception as exc:  # noqa: BLE001
             if trace:
@@ -8787,7 +9308,18 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             io_out.write("cowork: failed to start scout controller: %s\n"
                          % type(exc).__name__)
             io_out.flush()
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"reason": "start_failed",
+                         "error_type": type(exc).__name__},
+                source="session_start")
             return 1
+        # The claude session is genuinely live now: every preceding check
+        # that could still legally reject this dispatch (manifest, policy,
+        # probe, session-start) has already passed, so this is the ONE point
+        # this branch may legally advance preflighting -> running (BL-2).
+        _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                       source="run_scout")
         first = _role_seed_delivery(brief, context)
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
@@ -8798,9 +9330,13 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                                "context_revision"),
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
+                           on_first_send_rejected=on_first_send_rejected,
                            headless=headless, gate_preview=gate_preview,
                            review_path=review_path,
-                               session_uuid=session_uuid)
+                           save_pending_turn_fn=save_pending_turn_fn,
+                           clear_pending_turn_fn=clear_pending_turn_fn,
+                               session_uuid=session_uuid,
+                               role_work_id=role_work_id)
 
     if cfg["controller"] == "opencode":
         # opencode delivers the role prompt as a generated agent file (a system
@@ -8831,6 +9367,9 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(str(exc) + "\n")
             io_out.flush()
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"reason": "policy_blocked"}, source="bridge_backstop")
             return 1
         except Exception as exc:  # noqa: BLE001
             if trace:
@@ -8839,7 +9378,17 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             io_out.write("cowork: failed to start scout controller: %s\n"
                          % type(exc).__name__)
             io_out.flush()
+            _advance_phase(
+                session_uuid, role_work_id, "preflight_rejected",
+                evidence={"reason": "start_failed",
+                         "error_type": type(exc).__name__},
+                source="session_start")
             return 1
+        # The opencode session is genuinely live now -- see the claude
+        # branch's identical comment above (BL-2): this is the ONE point
+        # this branch may legally advance preflighting -> running.
+        _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                       source="run_scout")
         first = _role_seed_delivery(brief, context)
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
@@ -8850,11 +9399,13 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                                "context_revision"),
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
+                           on_first_send_rejected=on_first_send_rejected,
                            headless=headless, gate_preview=gate_preview,
                            review_path=review_path,
                            save_pending_turn_fn=save_pending_turn_fn,
                            clear_pending_turn_fn=clear_pending_turn_fn,
-                               session_uuid=session_uuid)
+                               session_uuid=session_uuid,
+                               role_work_id=role_work_id)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -8878,7 +9429,15 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                         controller="codex")
         io_out.write(str(exc) + "\n")
         io_out.flush()
+        _advance_phase(
+            session_uuid, role_work_id, "preflight_rejected",
+            evidence={"reason": "policy_blocked"}, source="bridge_backstop")
         return 1
+    # The codex session is genuinely live now -- see the claude branch's
+    # identical comment above (BL-2): this is the ONE point this branch may
+    # legally advance preflighting -> running.
+    _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                   source="run_scout")
     return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
                        review_fn=review_fn, trace=trace, on_outcome=on_outcome,
                        evaluate_fn=evaluate_fn, intel_md_path=intel_md_path,
@@ -8887,11 +9446,13 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                            "context_revision"),
                        is_resume=bool(resume_id),
                        on_first_send_accepted=on_first_send_accepted,
+                       on_first_send_rejected=on_first_send_rejected,
                         headless=headless, gate_preview=gate_preview,
                         review_path=review_path,
                         save_pending_turn_fn=save_pending_turn_fn,
                         clear_pending_turn_fn=clear_pending_turn_fn,
-                            session_uuid=session_uuid)
+                            session_uuid=session_uuid,
+                            role_work_id=role_work_id)
 
 
 def run_planner(config, context, selected, io_in=None, io_out=None,
@@ -8909,7 +9470,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 review_packet_ctx=None, switch_controller_fn=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
-                on_first_send_accepted=None,
+                on_first_send_accepted=None, on_first_send_rejected=None,
                 reviewer_controller_check_fn=None, headless=False,
                 gate_preview=None, save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None):
@@ -8935,6 +9496,18 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    # WorkUnit join key for this planner engagement (M2 Package E): see
+    # `run_scout`'s twin comment.
+    role_work_id = (
+        _role_work_id(session_uuid, "planner", planning_epoch,
+                     (review_packet_ctx or {}).get("attempt"))
+        if session_uuid else None)
+    if role_work_id:
+        _ensure_work_unit(session_uuid, role_work_id, "planner",
+                          cfg["controller"], model=cfg.get("model"),
+                          effort=cfg.get("effort"))
+        _advance_phase(session_uuid, role_work_id, "preflight_started",
+                       source="run_planner")
     # Fail-closed order: compile/revalidate the manifest FIRST, bind a
     # dispatch decision to it (resume included — force_recompile revalidates),
     # and require allow before any brief/prompt assembly.
@@ -8965,8 +9538,13 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             _emit_dispatch_escalation(
                 trace, "planner", "manifest_proven",
                 "recompile and preflight the manifest", "prompt_assembly")
+            _advance_phase(
+                session_uuid, role_work_id, "capability_missing",
+                evidence={"refusal_code": _mdec.get("refusal_code"),
+                         "refusal_message": _mdec.get("refusal_message")},
+                source="manifest_preflight")
             if on_outcome:
-                on_outcome("ended", None)
+                on_outcome(_OUTCOME_ENDED, None)
             return 1
     brief = assemble_planner_brief(plan_json_path or "", plan_md_path or "")
     runner = reviewer_runner or make_planning_advisor_runner(
@@ -9014,10 +9592,22 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                                          resuming=bool(resume_id),
                                          enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
+    # `preflight_passed` (preflighting -> running) is bound per controller
+    # branch below, ONLY once that branch's own policy/probe/session-start
+    # checks have all actually succeeded -- see run_scout's identical BL-2
+    # comment for why firing it unconditionally here would silently drop
+    # every later `_reject(...)` (no `("running", "preflight_rejected")`
+    # reducer edge).
 
     def report(outcome, payload):
         if on_outcome:
             on_outcome(outcome, payload)
+
+    def _reject(reason, source, **extra):
+        evidence = {"reason": reason}
+        evidence.update(extra)
+        _advance_phase(session_uuid, role_work_id, "preflight_rejected",
+                       evidence=evidence, source=source)
 
     loop_kwargs = dict(
         role="planner", review_fn=review_fn, trace=trace,
@@ -9054,7 +9644,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(_pdec["refusal_message"] + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("policy_blocked", "policy_guard")
+            report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
@@ -9074,7 +9665,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 trace.event("role.end", role="planner", result="probe_failed")
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("probe_failed", "probe")
+            report(_OUTCOME_ENDED, None)
             return 1
         if resume_id:
             session_id, rid = None, resume_id
@@ -9111,7 +9703,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(_bpdec["refusal_message"] + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("policy_blocked", "bridge_backstop")
+            report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
             if trace:
@@ -9120,13 +9713,20 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             io_out.write("cowork: failed to start planner controller: %s\n"
                          % type(exc).__name__)
             io_out.flush()
-            report("ended", None)
+            _reject("start_failed", "session_start",
+                   error_type=type(exc).__name__)
+            report(_OUTCOME_ENDED, None)
             return 1
+        # The claude session is genuinely live now (BL-2): the ONE point
+        # this branch may legally advance preflighting -> running.
+        _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                       source="run_planner")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, plan_json_path, context, io_in, io_out,
-            on_first_send_accepted=on_first_send_accepted, **loop_kwargs,
-                session_uuid=session_uuid)
+            on_first_send_accepted=on_first_send_accepted,
+            on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
+                session_uuid=session_uuid, role_work_id=role_work_id)
         report(outcome, payload)
         return rc
 
@@ -9158,7 +9758,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(str(exc) + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("policy_blocked", "bridge_backstop")
+            report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
             if trace:
@@ -9167,13 +9768,20 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             io_out.write("cowork: failed to start planner controller: %s\n"
                          % type(exc).__name__)
             io_out.flush()
-            report("ended", None)
+            _reject("start_failed", "session_start",
+                   error_type=type(exc).__name__)
+            report(_OUTCOME_ENDED, None)
             return 1
+        # The opencode session is genuinely live now (BL-2): the ONE point
+        # this branch may legally advance preflighting -> running.
+        _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                       source="run_planner")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, plan_json_path, context, io_in, io_out,
-            on_first_send_accepted=on_first_send_accepted, **loop_kwargs,
-                session_uuid=session_uuid)
+            on_first_send_accepted=on_first_send_accepted,
+            on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
+                session_uuid=session_uuid, role_work_id=role_work_id)
         report(outcome, payload)
         return rc
 
@@ -9203,12 +9811,18 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                         controller="codex")
         io_out.write(str(exc) + "\n")
         io_out.flush()
-        report("ended", None)
+        _reject("policy_blocked", "bridge_backstop")
+        report(_OUTCOME_ENDED, None)
         return 1
+    # The codex session is genuinely live now (BL-2): the ONE point this
+    # branch may legally advance preflighting -> running.
+    _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                   source="run_planner")
     rc, outcome, payload = _role_loop(
         session, prompt, plan_json_path, context, io_in, io_out,
-        on_first_send_accepted=on_first_send_accepted, **loop_kwargs,
-            session_uuid=session_uuid)
+        on_first_send_accepted=on_first_send_accepted,
+            on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
+            session_uuid=session_uuid, role_work_id=role_work_id)
     report(outcome, payload)
     return rc
 
@@ -9229,7 +9843,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 review_packet_ctx=None, switch_controller_fn=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
-                on_first_send_accepted=None,
+                on_first_send_accepted=None, on_first_send_rejected=None,
                 reviewer_controller_check_fn=None, headless=False,
                 gate_preview=None, save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None):
@@ -9256,6 +9870,18 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     # relocated session artifacts (which live outside cwd).
     sessions_dir = (state_store.session_assets_dir(session_uuid)
                     if session_uuid else None)
+    # WorkUnit join key for this builder engagement (M2 Package E): see
+    # `run_scout`'s twin comment.
+    role_work_id = (
+        _role_work_id(session_uuid, "builder", building_epoch,
+                     (review_packet_ctx or {}).get("attempt"))
+        if session_uuid else None)
+    if role_work_id:
+        _ensure_work_unit(session_uuid, role_work_id, "builder",
+                          cfg["controller"], model=cfg.get("model"),
+                          effort=cfg.get("effort"))
+        _advance_phase(session_uuid, role_work_id, "preflight_started",
+                       source="run_builder")
     # Fail-closed order: compile/revalidate the manifest FIRST, bind a
     # dispatch decision to it (resume included — force_recompile revalidates),
     # and require allow before any brief/prompt assembly.
@@ -9295,8 +9921,13 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             _emit_dispatch_escalation(
                 trace, "builder", "manifest_proven",
                 "recompile and preflight the manifest", "prompt_assembly")
+            _advance_phase(
+                session_uuid, role_work_id, "capability_missing",
+                evidence={"refusal_code": _mdec.get("refusal_code"),
+                         "refusal_message": _mdec.get("refusal_message")},
+                source="manifest_preflight")
             if on_outcome:
-                on_outcome("ended", None)
+                on_outcome(_OUTCOME_ENDED, None)
             return 1
     brief = assemble_builder_brief(build_status_path or "", build_summary_path)
     runner = reviewer_runner or make_build_reviewer_runner(
@@ -9350,10 +9981,22 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                                          resuming=bool(resume_id),
                                          enabled=ui.is_tty(io_out)), "start")
     io_out.flush()
+    # `preflight_passed` (preflighting -> running) is bound per controller
+    # branch below, ONLY once that branch's own policy/probe/session-start
+    # checks have all actually succeeded -- see run_scout's identical BL-2
+    # comment for why firing it unconditionally here would silently drop
+    # every later `_reject(...)` (no `("running", "preflight_rejected")`
+    # reducer edge).
 
     def report(outcome, payload):
         if on_outcome:
             on_outcome(outcome, payload)
+
+    def _reject(reason, source, **extra):
+        evidence = {"reason": reason}
+        evidence.update(extra)
+        _advance_phase(session_uuid, role_work_id, "preflight_rejected",
+                       evidence=evidence, source=source)
 
     def _gate_review_text(_p, en=False):
         # UX-021: the human gate renders the SAME derived overlay the reviewer
@@ -9413,7 +10056,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(_bdec2["refusal_message"] + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("policy_blocked", "policy_guard")
+            report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = _with_status_spinner(
@@ -9433,7 +10077,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 trace.event("role.end", role="builder", result="probe_failed")
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("probe_failed", "probe")
+            report(_OUTCOME_ENDED, None)
             return 1
         if resume_id:
             session_id, rid = None, resume_id
@@ -9468,7 +10113,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(_bbdec["refusal_message"] + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("policy_blocked", "bridge_backstop")
+            report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
             if trace:
@@ -9477,13 +10123,20 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             io_out.write("cowork: failed to start builder controller: %s\n"
                          % type(exc).__name__)
             io_out.flush()
-            report("ended", None)
+            _reject("start_failed", "session_start",
+                   error_type=type(exc).__name__)
+            report(_OUTCOME_ENDED, None)
             return 1
+        # The claude session is genuinely live now (BL-2): the ONE point
+        # this branch may legally advance preflighting -> running.
+        _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                       source="run_builder")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, build_status_path, context, io_in, io_out,
-            on_first_send_accepted=on_first_send_accepted, **loop_kwargs,
-                session_uuid=session_uuid)
+            on_first_send_accepted=on_first_send_accepted,
+            on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
+                session_uuid=session_uuid, role_work_id=role_work_id)
         report(outcome, payload)
         return rc
 
@@ -9515,7 +10168,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                             controller=cfg["controller"])
             io_out.write(str(exc) + "\n")
             io_out.flush()
-            report("ended", None)
+            _reject("policy_blocked", "bridge_backstop")
+            report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
             if trace:
@@ -9524,13 +10178,20 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             io_out.write("cowork: failed to start builder controller: %s\n"
                          % type(exc).__name__)
             io_out.flush()
-            report("ended", None)
+            _reject("start_failed", "session_start",
+                   error_type=type(exc).__name__)
+            report(_OUTCOME_ENDED, None)
             return 1
+        # The opencode session is genuinely live now (BL-2): the ONE point
+        # this branch may legally advance preflighting -> running.
+        _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                       source="run_builder")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
             session, first, build_status_path, context, io_in, io_out,
-            on_first_send_accepted=on_first_send_accepted, **loop_kwargs,
-                session_uuid=session_uuid)
+            on_first_send_accepted=on_first_send_accepted,
+            on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
+                session_uuid=session_uuid, role_work_id=role_work_id)
         report(outcome, payload)
         return rc
 
@@ -9560,12 +10221,18 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                         controller="codex")
         io_out.write(str(exc) + "\n")
         io_out.flush()
-        report("ended", None)
+        _reject("policy_blocked", "bridge_backstop")
+        report(_OUTCOME_ENDED, None)
         return 1
+    # The codex session is genuinely live now (BL-2): the ONE point this
+    # branch may legally advance preflighting -> running.
+    _advance_phase(session_uuid, role_work_id, "preflight_passed",
+                   source="run_builder")
     rc, outcome, payload = _role_loop(
         session, prompt, build_status_path, context, io_in, io_out,
-        on_first_send_accepted=on_first_send_accepted, **loop_kwargs,
-            session_uuid=session_uuid)
+        on_first_send_accepted=on_first_send_accepted,
+            on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
+            session_uuid=session_uuid, role_work_id=role_work_id)
     report(outcome, payload)
     return rc
 
@@ -10823,10 +11490,64 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # resume. Any validation failure: rc 2, one message, no write, no dispatch. #
     # ---------------------------------------------------------------------- #
 
+    def _durable_transition_policy():
+        """C's durable `controller_transition.json` policy field, or None
+        when nothing has ever been explicitly committed through the atomic
+        transition primitive (a PRESERVE-shaped or absent durable record) --
+        see `cowork_policy.decide_controller_policy_transition`."""
+        if not session_uuid:
+            return None
+        transition = state_store.read_controller_transition(session_uuid)
+        if not transition.get("revision", 0):
+            return None
+        return transition.get("policy")
+
     def _saved_policy():
+        """The tagged `(kind, raw)` policy read, resolved across BOTH stores
+        this session may carry: the legacy session-embedded `controller_
+        policy` key, and C's durable CAS'd `controller_transition.json`.
+        `read_controller_policy` alone is legacy-only and blind to a policy
+        committed only through the atomic transition primitive; consulting
+        only the durable store would be blind to a session that has never
+        gone through it. When both carry an explicit policy and they
+        DISAGREE, this fails CLOSED (`invalid`) rather than picking one --
+        two sources of truth that should never diverge in correctly-wired
+        code are treated as untrustworthy the moment they do, exactly like a
+        present-but-unreadable legacy policy already is."""
         if not session_enabled:
             return ("unrestricted", None)
-        return state_store.read_controller_policy(holder["state"])
+        legacy_kind, legacy_raw = state_store.read_controller_policy(
+            holder["state"])
+        if legacy_kind == "invalid":
+            return (legacy_kind, legacy_raw)
+        durable_policy = _durable_transition_policy()
+        if durable_policy is None:
+            return (legacy_kind, legacy_raw)
+        durable_allowed = (durable_policy.get("allowed")
+                           if isinstance(durable_policy, dict) else None)
+        durable_kind = "unrestricted" if durable_allowed is None else "allowed"
+        agrees = (durable_kind == legacy_kind and (
+            durable_kind == "unrestricted"
+            or sorted(durable_allowed) == sorted(legacy_raw or ())))
+        if agrees:
+            return (legacy_kind, legacy_raw)
+        return ("invalid", {"legacy_kind": legacy_kind,
+                            "durable_kind": durable_kind,
+                            "reason": "two_store_policy_disagreement"})
+
+    def _activate_policy(kind, raw):
+        """The ONE place in this file that calls `policy.activate`/
+        `policy.activate_invalid` directly. `kind` is `"unrestricted"` /
+        `"allowed"` / `"invalid"` (the same vocabulary `_saved_policy` and
+        `policy.active_meta()['mode']` both use); every other seam in this
+        file that needs to put a policy in force calls THIS function, never
+        the raw primitives, so activation is always derived from one
+        consistent decision (the structural zero-bypass invariant)."""
+        if kind == "invalid":
+            policy.activate_invalid(raw, trace=trace, phase=phase)
+        else:
+            policy.activate(raw if kind == "allowed" else None,
+                            trace=trace, phase=phase)
 
     def apply_controller_update(proposal):
         """Run one controller update end to end. Returns `(ok, message, rc)`;
@@ -10889,7 +11610,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # The effective set is in force for the ENTIRE pre-write window, so
         # preflight and the claude probe are themselves guarded and can only
         # ever touch a controller that will be permitted once this completes.
-        policy.activate(effective, trace=trace, phase=phase)
+        _activate_policy("allowed" if effective is not None else "unrestricted",
+                         effective)
         for target in dict.fromkeys(t for _r, t in mappings):
             ok, alerts = check_controller_tool(target)
             if not ok:
@@ -10920,19 +11642,55 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 return reject("cannot switch %s to claude: %s" % (role, alert),
                               1)
 
-        # -- the single state write ---------------------------------------- #
+        # -- the single state write, atomic via C's CAS primitive ---------- #
+        # `decide_controller_policy_transition` is proposed and must COMMIT
+        # before anything durable or in-memory changes: a conflicting (stale
+        # revision) or invalid transition is rejected here with zero writes
+        # and zero dispatch — `reject()` below restores the pre-attempt
+        # active policy and returns without ever reaching the legacy state
+        # write or a role launch.
         from_allowed = list(saved_allowed) if kind == "allowed" else None
         stamp = time.time()
         if session_enabled:
             pending = {r: pending_switch_turns.get(r) for r, _c in mappings
                        if pending_switch_turns.get(r) is not None}
-            holder["state"] = state_store.apply_controller_transition(
-                spath, mappings,
-                allowed=(None if proposal.policy is policy.ALL else effective),
-                set_policy=(proposal.policy is not policy.PRESERVE),
-                prior=holder["state"], source=proposal.source,
-                reason=proposal.source, created=stamp,
-                pending_turns=pending or None)
+            if session_uuid:
+                expected_revision = state_store.read_controller_transition(
+                    session_uuid).get("revision", 0)
+                cas_policy = (
+                    policy.ALL if proposal.policy is policy.ALL
+                    else policy.PRESERVE if proposal.policy is policy.PRESERVE
+                    else {"allowed": list(effective)})
+                transition_result = policy.decide_controller_policy_transition(
+                    session_uuid, expected_revision, policy=cas_policy,
+                    reason=proposal.source, source=proposal.source)
+                if transition_result.get("outcome") != "committed":
+                    return reject(
+                        "controller policy transition conflicted (%s); "
+                        "nothing was switched." % transition_result.get("reason"),
+                        1)
+            # MJ-3: the CAS transition above may already have committed
+            # (durable, revision bumped) by the time THIS write is attempted
+            # -- an interruption here must still leave the trace narrative
+            # coherent (a clean rejection, not a bare crash mid-request) and
+            # the in-memory policy restored to its pre-attempt value, exactly
+            # like every other rejection this function already routes
+            # through `reject()`. Catching only OSError: this is a durability
+            # failure of the write itself (see `cowork_state.save`'s
+            # tmp-write + os.replace), never a validation error, which has
+            # already run to completion above.
+            try:
+                holder["state"] = state_store.apply_controller_transition(
+                    spath, mappings,
+                    allowed=(None if proposal.policy is policy.ALL else effective),
+                    set_policy=(proposal.policy is not policy.PRESERVE),
+                    prior=holder["state"], source=proposal.source,
+                    reason=proposal.source, created=stamp,
+                    pending_turns=pending or None)
+            except OSError as exc:
+                return reject(
+                    "controller state write failed (%s); nothing was "
+                    "switched." % type(exc).__name__, 1)
             for role, _target in mappings:
                 config[role] = dict(holder["state"]["config"][role])
         else:
@@ -10974,10 +11732,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     def _restore_policy(meta):
         """Put back whatever was active before a rejected proposal's probe
         window, so a rejection leaves not a trace of itself in force."""
-        if meta.get("mode") == "invalid":
-            policy.activate_invalid(meta.get("raw"), trace=trace, phase=phase)
-        else:
-            policy.activate(meta.get("allowed"), trace=trace, phase=phase)
+        mode = meta.get("mode")
+        _activate_policy(mode, meta.get("raw") if mode == "invalid"
+                         else meta.get("allowed"))
 
     saved_policy_kind, saved_policy_raw = _saved_policy()
 
@@ -11002,7 +11759,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # to replace it with, so a lone --switch-controller takes the same abort.
     if saved_policy_kind == "invalid" and (
             proposal is None or proposal.policy is policy.PRESERVE):
-        policy.activate_invalid(saved_policy_raw, trace=trace, phase=phase)
+        _activate_policy("invalid", saved_policy_raw)
         trace.event("controller.policy.invalid", session_file=spath,
                     raw_policy_type=type(saved_policy_raw).__name__,
                     reason="controller_policy is not a readable allowed set",
@@ -11024,15 +11781,12 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # Re-activate from the freshly saved state so the in-force policy and
         # the persisted one can never disagree after a write.
         kind_now, raw_now = _saved_policy()
-        policy.activate(raw_now if kind_now == "allowed" else None,
-                        trace=trace, phase=phase)
+        _activate_policy(kind_now, raw_now)
     else:
         # Ordinary resume of a saved session: the policy is activated here,
         # BEFORE any role dispatch or worktree launch, so a restricted resume is
         # guarded exactly like an update.
-        policy.activate(
-            saved_policy_raw if saved_policy_kind == "allowed" else None,
-            trace=trace, phase=phase)
+        _activate_policy(saved_policy_kind, saved_policy_raw)
 
     # Resolved BEFORE the context step so we can skip the goal prompt on a
     # resume of the current phase's user-facing role.
@@ -11468,6 +12222,22 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     building_epoch_box = {"epoch": state_store.get_building_epoch(
         holder["state"]) if session_enabled else 0}
 
+    # M2 Package E (BL-3): a per-epoch attempt counter, folded into
+    # `_role_work_id` alongside the epoch, so a same-epoch relaunch (a
+    # launch-time retry, a launch-time controller switch, or a mid-turn
+    # controller switch) mints a FRESH WorkUnit instead of reusing one whose
+    # PhaseState history may already be terminal (`rejected_preflight`,
+    # `needs_authority`) or `running` from the PRIOR controller -- neither of
+    # which has a legal `("...", "preflight_started")` reducer edge back to
+    # `preflighting`, so every subsequent PhaseState call on a reused
+    # identity would silently no-op (`illegal_transition`), permanently
+    # losing observability into the retried/switched attempt. Reset to 0
+    # exactly when the epoch itself bumps (a hand-back is a genuinely fresh
+    # engagement, not a same-epoch retry).
+    scout_attempt_box = {"attempt": 0}
+    planner_attempt_box = {"attempt": 0}
+    builder_attempt_box = {"attempt": 0}
+
     def bump_planning_epoch():
         if session_enabled:
             holder["state"] = state_store.bump_planning_epoch(
@@ -11476,6 +12246,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 holder["state"])
         else:
             epoch_box["epoch"] += 1
+        planner_attempt_box["attempt"] = 0
 
     def bump_building_epoch():
         if session_enabled:
@@ -11485,6 +12256,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 holder["state"])
         else:
             building_epoch_box["epoch"] += 1
+        builder_attempt_box["attempt"] = 0
 
     # Scouting-phase epoch: the scout-side analogue of planning_epoch. Bumped on
     # every planning -> scouting transition (a user-confirmed planner -> scout
@@ -11502,6 +12274,23 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 holder["state"])
         else:
             scouting_epoch_box["epoch"] += 1
+        scout_attempt_box["attempt"] = 0
+
+    # M2 Package E (BL-3-RESIDUAL): now that every phase epoch box holds its
+    # persisted value, resolve each role's actual starting attempt from
+    # durable PhaseState rather than trusting the box's `0` initializer --
+    # see `_resolve_attempt_start`. A fresh session (or an epoch this
+    # process is the first to touch) resolves back to 0 on its very first
+    # read, so this changes nothing for the overwhelmingly common case; it
+    # only matters for a process resuming an epoch a PRIOR process already
+    # drove one or more attempts into a terminal/needs_authority state.
+    if session_enabled:
+        scout_attempt_box["attempt"] = _resolve_attempt_start(
+            session_uuid, "scout", scouting_epoch_box["epoch"])
+        planner_attempt_box["attempt"] = _resolve_attempt_start(
+            session_uuid, "planner", epoch_box["epoch"])
+        builder_attempt_box["attempt"] = _resolve_attempt_start(
+            session_uuid, "builder", building_epoch_box["epoch"])
 
     # Reviewer hash-gate (scout + planner only). Each bundle's three callables
     # close over the active session-state holder + the phase epoch box + the
@@ -11648,305 +12437,391 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             builder_seed = assemble_builder_seed(
                 plan_json_path, plan_md_path, shared_context,
                 intel_dir, current_rev)
-    while True:
-        if phase == "scouting":
-            if "scout" not in selected:
-                # Only reachable through a hand-back on a team that resumed into
-                # planning without the scout. The fresh-team case was refused
-                # above.
-                io_out.write(
-                    "cowork: cannot run the scouting phase — scout is not on "
-                    "the team.\n")
-                rc = 2
-                break
-            if not ensure_controller_available("scout", reason="lead_launch"):
-                rc = 1
-                break
-            outcome_box = {"outcome": None, "payload": None}
-            rc = run_scout_fn(
-                config,
-                with_headless_lead(seed_with_switch_note(
-                    "scout", deliver_context("scout", scout_seed))),
-                selected,
-                io_in=io_in, io_out=io_out,
-                evaluation_policy=evaluation_policy,
-                resume_id=role_resume_id("scout"),
-                on_session=role_saver("scout"),
-                intel_path=intel_path, review_path=review_path,
-                reviewer_resume_id=role_resume_id(SCOUT_REVIEWER),
-                on_reviewer_session=role_saver(SCOUT_REVIEWER),
-                reviewer_context=reviewer_ctx,
-                reviewer_context_update=reviewer_gap(SCOUT_REVIEWER)
-                if SCOUT_REVIEWER in selected else None,
-                on_reviewer_context_ack=context_acker(SCOUT_REVIEWER),
-                trace=trace,
-                eval_scratch_path=eval_scratch["scout"],
-                reviewer_eval_scratch_path=eval_scratch[SCOUT_REVIEWER],
-                scores_path=scores_path, session_uuid=session_uuid,
-                intel_md_path=intel_md_path,
-                skip_baseline=scout_skip_baseline,
-                review_packet_ctx={"epoch": scouting_epoch_box["epoch"],
-                                   "context_revision": current_rev},
-                switch_controller_fn=switch_controller,
-                reviewer_switch_note_fn=switch_note_for,
-                on_reviewer_switch_consumed=clear_pending_switch_for,
-                on_first_send_accepted=(
+
+    # M2 Package E: durable external-kill terminal truth. `active_work_box`
+    # names the WorkUnit engagement currently live -- gate or mid-turn, it
+    # does not matter which, since a signal handler interrupts whatever is
+    # blocking at the moment it arrives -- so a real SIGTERM durably records
+    # `aborted` for THAT engagement via A's reducer + B's persistence
+    # contract, distinguishable at read time from a live `running`/
+    # `awaiting_gate` record and never `completed` (only an explicit,
+    # candidate-bound gate approval ever reaches that state). The handler
+    # never fabricates a `role_work_id`: `_role_work_id` is a pure function
+    # of (session_uuid, role, epoch), so it recomputes the SAME identity
+    # `run_scout`/`run_planner`/`run_builder` mint internally, rather than
+    # threading a second, competing identity back out of them.
+    active_work_box = {"session_uuid": session_uuid, "work_id": None}
+    _prior_sigterm_handler = None
+
+    def _handle_external_kill(signum, frame):
+        _advance_phase(
+            active_work_box["session_uuid"], active_work_box["work_id"],
+            "aborted", evidence={"reason": "sigterm"}, source="signal",
+            unlocked=True)
+        if trace:
+            trace.event("run.external_kill", role_work_id=active_work_box["work_id"])
+        raise SystemExit(128 + signum)
+
+    try:
+        _prior_sigterm_handler = signal.signal(signal.SIGTERM,
+                                               _handle_external_kill)
+    except (ValueError, RuntimeError):
+        # Not the main thread (or platform without SIGTERM): the durable
+        # external-kill record is unavailable in this runtime context, but
+        # every other seam in this file is unaffected -- never blocks a run.
+        _prior_sigterm_handler = None
+
+    try:
+        while True:
+            active_work_box["work_id"] = (
+                _role_work_id(session_uuid, "scout",
+                             scouting_epoch_box["epoch"],
+                             scout_attempt_box["attempt"])
+                if phase == "scouting" and session_uuid else
+                _role_work_id(session_uuid, "planner", epoch_box["epoch"],
+                             planner_attempt_box["attempt"])
+                if phase == "planning" and session_uuid else
+                _role_work_id(session_uuid, "builder",
+                             building_epoch_box["epoch"],
+                             builder_attempt_box["attempt"])
+                if phase == "building" and session_uuid else None)
+            if phase == "scouting":
+                if "scout" not in selected:
+                    # Only reachable through a hand-back on a team that resumed into
+                    # planning without the scout. The fresh-team case was refused
+                    # above.
+                    io_out.write(
+                        "cowork: cannot run the scouting phase — scout is not on "
+                        "the team.\n")
+                    rc = 2
+                    break
+                if not ensure_controller_available("scout", reason="lead_launch"):
+                    rc = 1
+                    break
+                outcome_box = {"outcome": None, "payload": None}
+                (scout_first_send_cb, scout_first_send_rejected_cb,
+                 scout_first_send_box) = _first_send_delivery_tracker(
                     _make_pending_replay_cb(
                         "scout", pending_switch_for("scout"), phase,
                         session_uuid, trace, clear_pending_switch_for)
-                    if pending_switch_for("scout") else None),
-                reviewer_controller_check_fn=reviewer_controller_check,
-                headless=headless,
-                gate_preview=make_gate_preview(
-                    "scout", planner_on_team, session_enabled),
-                save_pending_turn_fn=save_pending_turn_for,
-                clear_pending_turn_fn=clear_pending_switch_for,
-                worktree=active_worktree, worktree_base=active_worktree_root,
-                on_outcome=lambda o, p=None: outcome_box.update(
-                    outcome=o, payload=p))
-            if rc != 0:
-                action = recover_controller_failure("scout", "startup_or_probe")
-                if action == "retry":
-                    continue
-                if action == "switch":
-                    scout_seed = prepare_fresh_seed_after_switch("scout")
+                    if pending_switch_for("scout") else None)
+                rc = run_scout_fn(
+                    config,
+                    with_headless_lead(seed_with_switch_note(
+                        "scout", deliver_context("scout", scout_seed))),
+                    selected,
+                    io_in=io_in, io_out=io_out,
+                    evaluation_policy=evaluation_policy,
+                    resume_id=role_resume_id("scout"),
+                    on_session=role_saver("scout"),
+                    intel_path=intel_path, review_path=review_path,
+                    reviewer_resume_id=role_resume_id(SCOUT_REVIEWER),
+                    on_reviewer_session=role_saver(SCOUT_REVIEWER),
+                    reviewer_context=reviewer_ctx,
+                    reviewer_context_update=reviewer_gap(SCOUT_REVIEWER)
+                    if SCOUT_REVIEWER in selected else None,
+                    on_reviewer_context_ack=context_acker(SCOUT_REVIEWER),
+                    trace=trace,
+                    eval_scratch_path=eval_scratch["scout"],
+                    reviewer_eval_scratch_path=eval_scratch[SCOUT_REVIEWER],
+                    scores_path=scores_path, session_uuid=session_uuid,
+                    intel_md_path=intel_md_path,
+                    skip_baseline=scout_skip_baseline,
+                    review_packet_ctx={"epoch": scouting_epoch_box["epoch"],
+                                       "attempt": scout_attempt_box["attempt"],
+                                       "context_revision": current_rev},
+                    switch_controller_fn=switch_controller,
+                    reviewer_switch_note_fn=switch_note_for,
+                    on_reviewer_switch_consumed=clear_pending_switch_for,
+                    on_first_send_accepted=scout_first_send_cb,
+                    on_first_send_rejected=scout_first_send_rejected_cb,
+                    reviewer_controller_check_fn=reviewer_controller_check,
+                    headless=headless,
+                    gate_preview=make_gate_preview(
+                        "scout", planner_on_team, session_enabled),
+                    save_pending_turn_fn=save_pending_turn_for,
+                    clear_pending_turn_fn=clear_pending_switch_for,
+                    worktree=active_worktree, worktree_base=active_worktree_root,
+                    on_outcome=lambda o, p=None: outcome_box.update(
+                        outcome=o, payload=p))
+                if rc != 0:
+                    action = recover_controller_failure("scout", "startup_or_probe")
+                    if action == "retry":
+                        # BL-3: a fresh attempt, not a fresh epoch -- the
+                        # prior attempt's WorkUnit may already be terminal
+                        # (rejected_preflight/needs_authority), so the next
+                        # attempt must mint its own identity.
+                        scout_attempt_box["attempt"] += 1
+                        continue
+                    if action == "switch":
+                        scout_attempt_box["attempt"] += 1
+                        scout_seed = prepare_fresh_seed_after_switch("scout")
+                        continue
+                    break
+                if (rc == 0 and outcome_box["outcome"] == "switch_controller"):
+                    payload = outcome_box["payload"] or {}
+                    if payload.get("pending"):
+                        pending_switch_turns["scout"] = payload.get("pending")
+                    if switch_controller("scout", reason=payload.get("reason"),
+                                         source="gate",
+                                         target=payload.get("target")):
+                        # BL-3: this engagement was `running` under the OLD
+                        # controller; the NEW controller's launch needs a
+                        # fresh WorkUnit (no legal `preflight_started` edge
+                        # back to `preflighting` from `running`).
+                        scout_attempt_box["attempt"] += 1
+                        scout_seed = prepare_fresh_seed_after_switch("scout")
+                        continue
+                    rc = 1
+                    break
+                if rc == 0 and scout_first_send_box["delivered"]:
+                    ack_lead("scout")
+                if (rc == 0 and outcome_box["outcome"] == "approved"
+                        and planner_on_team):
+                    phase = set_phase("planning")
+                    bump_planning_epoch()
+                    # A planner session that already exists (hand-back round trip,
+                    # or a crash after planning started) digests the updated intel;
+                    # a fresh one is seeded with the approved intel + context.
+                    if role_resume_id("planner"):
+                        planner_seed = intel_updated_block(intel_path)
+                    else:
+                        planner_seed = assemble_planner_seed(
+                            intel_path, shared_context, intel_dir, current_rev)
                     continue
                 break
-            if (rc == 0 and outcome_box["outcome"] == "switch_controller"):
-                payload = outcome_box["payload"] or {}
-                if payload.get("pending"):
-                    pending_switch_turns["scout"] = payload.get("pending")
-                if switch_controller("scout", reason=payload.get("reason"),
-                                     source="gate",
-                                     target=payload.get("target")):
-                    scout_seed = prepare_fresh_seed_after_switch("scout")
-                    continue
-                rc = 1
-                break
-            if rc == 0:
-                ack_lead("scout")
-            if (rc == 0 and outcome_box["outcome"] == "approved"
-                    and planner_on_team):
-                phase = set_phase("planning")
-                bump_planning_epoch()
-                # A planner session that already exists (hand-back round trip,
-                # or a crash after planning started) digests the updated intel;
-                # a fresh one is seeded with the approved intel + context.
-                if role_resume_id("planner"):
-                    planner_seed = intel_updated_block(intel_path)
-                else:
-                    planner_seed = assemble_planner_seed(
-                        intel_path, shared_context, intel_dir, current_rev)
-                continue
-            break
 
-        if phase == "planning":
-            if not ensure_controller_available("planner", reason="lead_launch"):
+            if phase == "planning":
+                if not ensure_controller_available("planner", reason="lead_launch"):
+                    rc = 1
+                    break
+                planner_box = {"outcome": None, "payload": None}
+                (planner_first_send_cb, planner_first_send_rejected_cb,
+                 planner_first_send_box) = _first_send_delivery_tracker(
+                    _make_pending_replay_cb(
+                        "planner", pending_switch_for("planner"), phase,
+                        session_uuid, trace, clear_pending_switch_for)
+                    if pending_switch_for("planner") else None)
+                rc = run_planner_fn(
+                    config,
+                    with_headless_lead(seed_with_switch_note(
+                        "planner",
+                        deliver_context(
+                            "planner",
+                            planner_seed if planner_seed is not None else ""))),
+                    selected, io_in=io_in, io_out=io_out,
+                    evaluation_policy=evaluation_policy,
+                    resume_id=role_resume_id("planner"),
+                    on_session=role_saver("planner"),
+                    plan_json_path=plan_json_path, plan_md_path=plan_md_path,
+                    review_path=planner_review_path,
+                    reviewer_resume_id=role_resume_id(PLANNING_ADVISOR),
+                    on_reviewer_session=role_saver(PLANNING_ADVISOR),
+                    reviewer_context=reviewer_ctx,
+                    reviewer_context_update=reviewer_gap(PLANNING_ADVISOR)
+                    if PLANNING_ADVISOR in selected else None,
+                    on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
+                    trace=trace,
+                    eval_scratch_path=eval_scratch["planner"],
+                    reviewer_eval_scratch_path=eval_scratch[PLANNING_ADVISOR],
+                    scores_path=scores_path, session_uuid=session_uuid,
+                    intel_path=intel_path, planning_epoch=epoch_box["epoch"],
+                    intel_md_path=intel_md_path,
+                    skip_baseline=planner_skip_baseline,
+                    review_packet_ctx={"epoch": epoch_box["epoch"],
+                                       "attempt": planner_attempt_box["attempt"],
+                                       "context_revision": current_rev},
+                    switch_controller_fn=switch_controller,
+                    reviewer_switch_note_fn=switch_note_for,
+                    on_reviewer_switch_consumed=clear_pending_switch_for,
+                    on_first_send_accepted=planner_first_send_cb,
+                    on_first_send_rejected=planner_first_send_rejected_cb,
+                    reviewer_controller_check_fn=reviewer_controller_check,
+                    headless=headless,
+                    gate_preview=make_gate_preview(
+                        "planner", builder_on_team, session_enabled),
+                    save_pending_turn_fn=save_pending_turn_for,
+                    clear_pending_turn_fn=clear_pending_switch_for,
+                    worktree=active_worktree, worktree_base=active_worktree_root,
+                    on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+                if rc != 0:
+                    action = recover_controller_failure("planner", "startup_or_probe")
+                    if action == "retry":
+                        # BL-3: see the scout phase's identical comment --
+                        # a fresh attempt, not a fresh epoch.
+                        planner_attempt_box["attempt"] += 1
+                        continue
+                    if action == "switch":
+                        planner_attempt_box["attempt"] += 1
+                        planner_seed = prepare_fresh_seed_after_switch("planner")
+                        continue
+                    break
+                if (rc == 0 and planner_box["outcome"] == "switch_controller"):
+                    payload = planner_box["payload"] or {}
+                    if payload.get("pending"):
+                        pending_switch_turns["planner"] = payload.get("pending")
+                    if switch_controller("planner", reason=payload.get("reason"),
+                                         source="gate",
+                                         target=payload.get("target")):
+                        planner_attempt_box["attempt"] += 1
+                        planner_seed = prepare_fresh_seed_after_switch("planner")
+                        continue
+                    rc = 1
+                    break
+                if rc == 0 and planner_first_send_box["delivered"]:
+                    ack_lead("planner")
+                if rc == 0 and planner_box["outcome"] == "handoff":
+                    # User-confirmed hand-back (planner -> its pre-processor):
+                    # resume the scout session with the handoff payload and run the
+                    # full scout cycle again.
+                    phase = set_phase("scouting")
+                    # Each planner -> scout hand-back is a new scouting phase: bump
+                    # the scouting epoch so a stale scout hash-gate baseline from the
+                    # prior pass cannot authorize a skip on the re-investigated intel.
+                    bump_scouting_epoch()
+                    trace.event("handoff.execute", from_role="planner",
+                                to_role=HANDBACK_PREPROCESSOR["planner"],
+                                **trace_store.prompt_meta(
+                                    planner_box["payload"] or "", prefix="payload"))
+                    scout_seed = with_discovery(
+                        handoff_wake_block(planner_box["payload"], intel_dir))
+                    planner_seed = None
+                    continue
+                if (rc == 0 and planner_box["outcome"] == "approved"
+                        and builder_on_team):
+                    # Plan approved with a builder on the team: chain into the
+                    # building phase. Each plan-approved -> building transition is a
+                    # new building phase (the epoch bumps so the consumed-plan evals
+                    # re-fire after a hand-back round trip even on byte-identical
+                    # re-approved plans). A builder session that already exists
+                    # (hand-back round trip, or a crash after building started)
+                    # digests the updated plan; a fresh one is seeded from scratch.
+                    phase = set_phase("building")
+                    bump_building_epoch()
+                    if role_resume_id("builder"):
+                        builder_seed = plan_updated_block(
+                            plan_json_path, plan_md_path)
+                    else:
+                        builder_seed = assemble_builder_seed(
+                            plan_json_path, plan_md_path, shared_context,
+                            intel_dir, current_rev)
+                    continue
+                if (rc == 0 and planner_box["outcome"] == "approved"
+                        and not builder_on_team):
+                    # No builder on the team: the plan is the deliverable. Informa-
+                    # tional only; the phase stays `planning` so a rerun resumes the
+                    # planner conversation.
+                    io_out.write(
+                        "cowork: building not selected — run ends with the plan as "
+                        "the deliverable.\n")
+                # Plan approval (no builder), EOF, or interrupt ends the run the
+                # same way the scout loop always has.
+                break
+
+            # building phase
+            if not ensure_controller_available("builder", reason="lead_launch"):
                 rc = 1
                 break
-            planner_box = {"outcome": None, "payload": None}
-            rc = run_planner_fn(
+            builder_box = {"outcome": None, "payload": None}
+            (builder_first_send_cb, builder_first_send_rejected_cb,
+             builder_first_send_box) = _first_send_delivery_tracker(
+                _make_pending_replay_cb(
+                    "builder", pending_switch_for("builder"), phase,
+                    session_uuid, trace, clear_pending_switch_for)
+                if pending_switch_for("builder") else None)
+            rc = run_builder_fn(
                 config,
                 with_headless_lead(seed_with_switch_note(
-                    "planner",
-                    deliver_context(
-                        "planner",
-                        planner_seed if planner_seed is not None else ""))),
+                    "builder",
+                    deliver_context("builder",
+                                    builder_seed if builder_seed is not None else ""))),
                 selected, io_in=io_in, io_out=io_out,
                 evaluation_policy=evaluation_policy,
-                resume_id=role_resume_id("planner"),
-                on_session=role_saver("planner"),
-                plan_json_path=plan_json_path, plan_md_path=plan_md_path,
-                review_path=planner_review_path,
-                reviewer_resume_id=role_resume_id(PLANNING_ADVISOR),
-                on_reviewer_session=role_saver(PLANNING_ADVISOR),
+                resume_id=role_resume_id("builder"),
+                on_session=role_saver("builder"),
+                build_status_path=build_status_path,
+                build_review_path=build_review_path,
+                reviewer_resume_id=role_resume_id(BUILD_REVIEWER),
+                on_reviewer_session=role_saver(BUILD_REVIEWER),
                 reviewer_context=reviewer_ctx,
-                reviewer_context_update=reviewer_gap(PLANNING_ADVISOR)
-                if PLANNING_ADVISOR in selected else None,
-                on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
+                reviewer_context_update=reviewer_gap(BUILD_REVIEWER)
+                if BUILD_REVIEWER in selected else None,
+                on_reviewer_context_ack=context_acker(BUILD_REVIEWER),
                 trace=trace,
-                eval_scratch_path=eval_scratch["planner"],
-                reviewer_eval_scratch_path=eval_scratch[PLANNING_ADVISOR],
+                eval_scratch_path=eval_scratch["builder"],
+                reviewer_eval_scratch_path=eval_scratch[BUILD_REVIEWER],
                 scores_path=scores_path, session_uuid=session_uuid,
-                intel_path=intel_path, planning_epoch=epoch_box["epoch"],
-                intel_md_path=intel_md_path,
-                skip_baseline=planner_skip_baseline,
-                review_packet_ctx={"epoch": epoch_box["epoch"],
+                plan_json_path=plan_json_path, plan_md_path=plan_md_path,
+                building_epoch=building_epoch_box["epoch"],
+                baseline_note=build_baseline()["note"],
+                baseline_repos=build_baseline()["repos"],
+                build_summary_path=build_summary_path,
+                review_packet_ctx={"epoch": building_epoch_box["epoch"],
+                                   "attempt": builder_attempt_box["attempt"],
                                    "context_revision": current_rev},
                 switch_controller_fn=switch_controller,
                 reviewer_switch_note_fn=switch_note_for,
                 on_reviewer_switch_consumed=clear_pending_switch_for,
-                on_first_send_accepted=(
-                    _make_pending_replay_cb(
-                        "planner", pending_switch_for("planner"), phase,
-                        session_uuid, trace, clear_pending_switch_for)
-                    if pending_switch_for("planner") else None),
+                on_first_send_accepted=builder_first_send_cb,
+                on_first_send_rejected=builder_first_send_rejected_cb,
                 reviewer_controller_check_fn=reviewer_controller_check,
                 headless=headless,
                 gate_preview=make_gate_preview(
-                    "planner", builder_on_team, session_enabled),
+                    "builder", builder_on_team, session_enabled),
                 save_pending_turn_fn=save_pending_turn_for,
                 clear_pending_turn_fn=clear_pending_switch_for,
                 worktree=active_worktree, worktree_base=active_worktree_root,
-                on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+                on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
             if rc != 0:
-                action = recover_controller_failure("planner", "startup_or_probe")
+                action = recover_controller_failure("builder", "startup_or_probe")
                 if action == "retry":
+                    # BL-3: see the scout phase's identical comment -- a
+                    # fresh attempt, not a fresh epoch.
+                    builder_attempt_box["attempt"] += 1
                     continue
                 if action == "switch":
-                    planner_seed = prepare_fresh_seed_after_switch("planner")
+                    builder_attempt_box["attempt"] += 1
+                    builder_seed = prepare_fresh_seed_after_switch("builder")
                     continue
                 break
-            if (rc == 0 and planner_box["outcome"] == "switch_controller"):
-                payload = planner_box["payload"] or {}
+            if (rc == 0 and builder_box["outcome"] == "switch_controller"):
+                payload = builder_box["payload"] or {}
                 if payload.get("pending"):
-                    pending_switch_turns["planner"] = payload.get("pending")
-                if switch_controller("planner", reason=payload.get("reason"),
+                    pending_switch_turns["builder"] = payload.get("pending")
+                if switch_controller("builder", reason=payload.get("reason"),
                                      source="gate",
                                      target=payload.get("target")):
-                    planner_seed = prepare_fresh_seed_after_switch("planner")
+                    builder_attempt_box["attempt"] += 1
+                    builder_seed = prepare_fresh_seed_after_switch("builder")
                     continue
                 rc = 1
                 break
-            if rc == 0:
-                ack_lead("planner")
-            if rc == 0 and planner_box["outcome"] == "handoff":
-                # User-confirmed hand-back (planner -> its pre-processor):
-                # resume the scout session with the handoff payload and run the
-                # full scout cycle again.
-                phase = set_phase("scouting")
-                # Each planner -> scout hand-back is a new scouting phase: bump
-                # the scouting epoch so a stale scout hash-gate baseline from the
-                # prior pass cannot authorize a skip on the re-investigated intel.
-                bump_scouting_epoch()
-                trace.event("handoff.execute", from_role="planner",
-                            to_role=HANDBACK_PREPROCESSOR["planner"],
+            if rc == 0 and builder_first_send_box["delivered"]:
+                ack_lead("builder")
+            if rc == 0 and builder_box["outcome"] == "handoff":
+                # User-confirmed hand-back (builder -> planner): resume the planner
+                # session with the handoff payload, re-plan, and chain forward into
+                # the building phase again on the next plan approval.
+                phase = set_phase("planning")
+                bump_planning_epoch()
+                trace.event("handoff.execute", from_role="builder",
+                            to_role=HANDBACK_PREPROCESSOR["builder"],
                             **trace_store.prompt_meta(
-                                planner_box["payload"] or "", prefix="payload"))
-                scout_seed = with_discovery(
-                    handoff_wake_block(planner_box["payload"], intel_dir))
-                planner_seed = None
+                                builder_box["payload"] or "", prefix="payload"))
+                planner_seed = plan_handback_wake_block(
+                    builder_box["payload"], intel_dir)
+                builder_seed = None
                 continue
-            if (rc == 0 and planner_box["outcome"] == "approved"
-                    and builder_on_team):
-                # Plan approved with a builder on the team: chain into the
-                # building phase. Each plan-approved -> building transition is a
-                # new building phase (the epoch bumps so the consumed-plan evals
-                # re-fire after a hand-back round trip even on byte-identical
-                # re-approved plans). A builder session that already exists
-                # (hand-back round trip, or a crash after building started)
-                # digests the updated plan; a fresh one is seeded from scratch.
-                phase = set_phase("building")
-                bump_building_epoch()
-                if role_resume_id("builder"):
-                    builder_seed = plan_updated_block(
-                        plan_json_path, plan_md_path)
-                else:
-                    builder_seed = assemble_builder_seed(
-                        plan_json_path, plan_md_path, shared_context,
-                        intel_dir, current_rev)
-                continue
-            if (rc == 0 and planner_box["outcome"] == "approved"
-                    and not builder_on_team):
-                # No builder on the team: the plan is the deliverable. Informa-
-                # tional only; the phase stays `planning` so a rerun resumes the
-                # planner conversation.
-                io_out.write(
-                    "cowork: building not selected — run ends with the plan as "
-                    "the deliverable.\n")
-            # Plan approval (no builder), EOF, or interrupt ends the run the
-            # same way the scout loop always has.
+            # Build approval is terminal for this run (the phase stays `building`,
+            # so a rerun resumes the builder conversation), and EOF/interrupt ends
+            # the run the same way.
             break
-
-        # building phase
-        if not ensure_controller_available("builder", reason="lead_launch"):
-            rc = 1
-            break
-        builder_box = {"outcome": None, "payload": None}
-        rc = run_builder_fn(
-            config,
-            with_headless_lead(seed_with_switch_note(
-                "builder",
-                deliver_context("builder",
-                                builder_seed if builder_seed is not None else ""))),
-            selected, io_in=io_in, io_out=io_out,
-            evaluation_policy=evaluation_policy,
-            resume_id=role_resume_id("builder"),
-            on_session=role_saver("builder"),
-            build_status_path=build_status_path,
-            build_review_path=build_review_path,
-            reviewer_resume_id=role_resume_id(BUILD_REVIEWER),
-            on_reviewer_session=role_saver(BUILD_REVIEWER),
-            reviewer_context=reviewer_ctx,
-            reviewer_context_update=reviewer_gap(BUILD_REVIEWER)
-            if BUILD_REVIEWER in selected else None,
-            on_reviewer_context_ack=context_acker(BUILD_REVIEWER),
-            trace=trace,
-            eval_scratch_path=eval_scratch["builder"],
-            reviewer_eval_scratch_path=eval_scratch[BUILD_REVIEWER],
-            scores_path=scores_path, session_uuid=session_uuid,
-            plan_json_path=plan_json_path, plan_md_path=plan_md_path,
-            building_epoch=building_epoch_box["epoch"],
-            baseline_note=build_baseline()["note"],
-            baseline_repos=build_baseline()["repos"],
-            build_summary_path=build_summary_path,
-            review_packet_ctx={"epoch": building_epoch_box["epoch"],
-                               "context_revision": current_rev},
-            switch_controller_fn=switch_controller,
-            reviewer_switch_note_fn=switch_note_for,
-            on_reviewer_switch_consumed=clear_pending_switch_for,
-            on_first_send_accepted=(
-                _make_pending_replay_cb(
-                    "builder", pending_switch_for("builder"), phase,
-                    session_uuid, trace, clear_pending_switch_for)
-                if pending_switch_for("builder") else None),
-            reviewer_controller_check_fn=reviewer_controller_check,
-            headless=headless,
-            gate_preview=make_gate_preview(
-                "builder", builder_on_team, session_enabled),
-            save_pending_turn_fn=save_pending_turn_for,
-            clear_pending_turn_fn=clear_pending_switch_for,
-            worktree=active_worktree, worktree_base=active_worktree_root,
-            on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
-        if rc != 0:
-            action = recover_controller_failure("builder", "startup_or_probe")
-            if action == "retry":
-                continue
-            if action == "switch":
-                builder_seed = prepare_fresh_seed_after_switch("builder")
-                continue
-            break
-        if (rc == 0 and builder_box["outcome"] == "switch_controller"):
-            payload = builder_box["payload"] or {}
-            if payload.get("pending"):
-                pending_switch_turns["builder"] = payload.get("pending")
-            if switch_controller("builder", reason=payload.get("reason"),
-                                 source="gate",
-                                 target=payload.get("target")):
-                builder_seed = prepare_fresh_seed_after_switch("builder")
-                continue
-            rc = 1
-            break
-        if rc == 0:
-            ack_lead("builder")
-        if rc == 0 and builder_box["outcome"] == "handoff":
-            # User-confirmed hand-back (builder -> planner): resume the planner
-            # session with the handoff payload, re-plan, and chain forward into
-            # the building phase again on the next plan approval.
-            phase = set_phase("planning")
-            bump_planning_epoch()
-            trace.event("handoff.execute", from_role="builder",
-                        to_role=HANDBACK_PREPROCESSOR["builder"],
-                        **trace_store.prompt_meta(
-                            builder_box["payload"] or "", prefix="payload"))
-            planner_seed = plan_handback_wake_block(
-                builder_box["payload"], intel_dir)
-            builder_seed = None
-            continue
-        # Build approval is terminal for this run (the phase stays `building`,
-        # so a rerun resumes the builder conversation), and EOF/interrupt ends
-        # the run the same way.
-        break
+    finally:
+        if _prior_sigterm_handler is not None:
+            try:
+                signal.signal(signal.SIGTERM, _prior_sigterm_handler)
+            except (ValueError, RuntimeError):
+                pass
 
     # SESSION END: the last checkpoint. It also drains anything queued during
     # the final phase, so a normally-ending run leaves nothing pending.

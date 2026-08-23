@@ -402,7 +402,8 @@ def _guard_runtime(trace, role, assets_dir, model, effort,
         if controller == "codex"
         else state_store.guard_settings_path_for(session_uuid, role))
     parent = {
-        "controller": controller, "controller_source": "config_pinned",
+        "controller": controller, "controller_source": (
+            "config_pinned" if controller else "unknown"),
         "model": model, "model_source": (
             "config_pinned" if model else "unknown"),
         "effort": effort, "effort_source": (
@@ -428,7 +429,8 @@ def _guard_runtime(trace, role, assets_dir, model, effort,
         socket_path, token, scope, state_store.actions_path_for(session_uuid),
         state_store.children_path_for(session_uuid),
         trace_store.trace_path_for(session_uuid), parent,
-        capability_allowlist=capability_allowlist)
+        capability_allowlist=capability_allowlist,
+        session_id=session_uuid)
     thread = threading.Thread(target=broker.serve_forever,
                               name="cowork-guard-%s" % role, daemon=True)
     thread.start()
@@ -1823,7 +1825,21 @@ class ClaudeSession:
 
     def _send_turn(self, text, meta, work_id, work_class, turn_started):
         if self._guard_runtime:
-            _stamp_guard_parent_work(self._guard_runtime, work_id)
+            # MJ-1: `work_id` here is the per-turn TRACE correlation id
+            # (`trace_store.new_work_id()`, minted fresh every send to pair
+            # controller.turn.start/end) -- never a real, durable WorkUnit
+            # identity. When the caller (cowork.py's `_role_loop`) threads
+            # the genuine WorkUnit `role_work_id` through `meta`, stamp THAT
+            # as the guard context's `current_parent_work_id` instead, so a
+            # child-dispatch/ungoverned-terminal hook payload names a parent
+            # `cowork_guard_broker`'s existence check (E-WIRE-001) can
+            # actually verify against the minted WorkUnit store -- a random
+            # per-turn trace id never resolves there and would always fail
+            # closed. Falls back to the trace id only when no real
+            # WorkUnit context is available (e.g. a reviewer/advisor turn
+            # with no live role engagement of its own).
+            _stamp_guard_parent_work(
+                self._guard_runtime, meta.get("role_work_id") or work_id)
         if self.trace:
             fields = {"controller": "claude", "role": self.speaker,
                       "mcp_free": True,
@@ -2349,7 +2365,11 @@ class CodexSession:
         work_id = trace_store.new_work_id()
         self.last_work_id = work_id
         if self._guard_runtime:
-            _stamp_guard_parent_work(self._guard_runtime, work_id)
+            # MJ-1: prefer the genuine WorkUnit `role_work_id` (see
+            # ClaudeSession._send_turn's identical comment) over the
+            # per-turn trace `work_id` when the caller supplies one.
+            _stamp_guard_parent_work(
+                self._guard_runtime, meta.get("role_work_id") or work_id)
         work_class = meta.get("work_class") or "productive"
         if not self._started and not self._resuming_first:
             command = build_codex_command(
@@ -2799,7 +2819,11 @@ class OpencodeSession:
         # stamping is here (not right after minting) so it too is covered.
         try:
             if self._guard_runtime:
-                _stamp_guard_parent_work(self._guard_runtime, work_id)
+                # MJ-1: prefer the genuine WorkUnit `role_work_id` (see
+                # ClaudeSession._send_turn's identical comment) over the
+                # per-turn trace `work_id` when the caller supplies one.
+                _stamp_guard_parent_work(
+                    self._guard_runtime, meta.get("role_work_id") or work_id)
             agent_name, global_path, command = _prepare(
                 resume_id, self._use_global_agent or _OPENCODE_GLOBAL_DELIVERY)
         except KeyboardInterrupt:

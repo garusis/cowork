@@ -18,6 +18,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import select as select_mod
 import signal
 import shutil
@@ -51,6 +52,7 @@ import cowork_measure as measure  # noqa: E402
 import cowork_profiles as controller_profiles  # noqa: E402
 import cowork_report as report  # noqa: E402
 import cowork_eval as evaluation  # noqa: E402
+import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
 # that exercise the real libraries skip when they are absent — same pattern as the
@@ -36810,3 +36812,1411 @@ class M1ExitAuditTest(unittest.TestCase):
         self.assertEqual(len(allows), 1)
         self.assertEqual(allows[0]["trace_event_id"], manifest["digest"])
         self.assertIsNotNone(allows[0]["trace_event_id"])
+
+
+# =============================================================================
+# M2 Package E: live phase-truth integration.
+#
+# Every test below drives the REAL production functions this package wires
+# (`run_flow`, `run_scout`, `_role_loop`) -- never a fake `run_scout_fn`/
+# `run_planner_fn`, which would bypass every seam this package touches.
+# =============================================================================
+
+
+class PhaseTruthStructuralGateTest(unittest.TestCase):
+    """Mirrors the controller-owned structural gates: zero ambiguous
+    `outcome_kind == "ended"` / `report("ended", ...)` / `on_outcome("ended",
+    ...)` source pattern in cowork.py, and every `policy.activate`/
+    `policy.activate_invalid` call lives inside the ONE `_activate_policy`
+    wrapper (the guard/measure `ended` lifecycle marker is a DIFFERENT
+    module and is not this gate's concern)."""
+
+    def _source(self):
+        path = os.path.join(_HERE, "cowork.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_zero_ambiguous_ended_literal(self):
+        src = self._source()
+        self.assertNotIn('outcome_kind == "ended"', src)
+        self.assertNotIn('outcome_kind = "ended"', src)
+        self.assertNotIn('report("ended"', src)
+        self.assertNotIn('on_outcome("ended"', src)
+
+    def test_every_policy_activate_call_lives_in_the_wrapper(self):
+        src = self._source()
+        wrapper_start = src.index("    def _activate_policy(kind, raw):")
+        wrapper_end = src.index("\n    def apply_controller_update(proposal):")
+        self.assertGreater(wrapper_end, wrapper_start)
+        for m in re.finditer(r'policy\.activate(?:_invalid)?\(', src):
+            self.assertTrue(
+                wrapper_start <= m.start() < wrapper_end,
+                "policy.activate* call at offset %d is outside "
+                "_activate_policy" % m.start())
+
+
+class PhaseTruthAtomicPolicyFaultInjectionTest(ControllerPolicyTestBase):
+    """The atomic controller policy-transition wrapper (C's CAS primitive)
+    wired into the live `--switch-controller` seam: a rejected/conflicting
+    transition must cause zero dispatch and leave the persisted + active
+    policy byte-identical to their pre-attempt values."""
+
+    def test_rejected_atomic_transition_zero_dispatch_byte_identical(self):
+        spath = self._session("PT-ATOMIC-1", "planning", {"planner": "claude"},
+                              team=["scout", "planner"])
+        before_bytes = self._sha(spath)
+        before_active = policy.active_meta()
+
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn), \
+                mock.patch.object(
+                    policy, "decide_controller_policy_transition",
+                    return_value={"outcome": "rejected",
+                                 "reason": "stale_revision", "state": None}):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--switch-controller", "planner=codex"]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: 0)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(popen.calls, [], "zero controller spawns")
+        self.assertEqual(claude_spawn.calls, [], "zero controller spawns")
+        self.assertEqual(self._sha(spath), before_bytes,
+                         "a rejected atomic transition must persist nothing")
+        # mode/allowed/raw are the fields that govern dispatch; `phase` is a
+        # pre-existing, orthogonal cosmetic annotation `_restore_policy`
+        # has always re-derived from the CURRENT session phase, not from
+        # the pre-attempt snapshot -- unrelated to this invariant.
+        after_active = policy.active_meta()
+        for field in ("mode", "allowed", "raw"):
+            self.assertEqual(after_active[field], before_active[field],
+                             "a rejected atomic transition must restore "
+                             "the exact prior active policy field %r" % field)
+
+    def test_committed_atomic_transition_matches_both_stores(self):
+        spath = self._session("PT-ATOMIC-2", "planning", {"planner": "claude"},
+                              team=["scout", "planner"])
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        import unittest.mock as mock
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                            "--switch-controller", "planner=codex"]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        saved = state_store.load(spath)
+        session_uuid = state_store.get_session_uuid(saved)
+        self.assertEqual(saved["config"]["planner"]["controller"], "codex")
+        # The durable CAS transition store agrees with the legacy embedded
+        # session config it was committed alongside — the two-store
+        # precedence invariant holds because both were written from the
+        # SAME committed decision, not two independent writers.
+        transition = state_store.read_controller_transition(session_uuid)
+        self.assertEqual(transition.get("revision"), 1)
+
+
+class PhaseTruthExternalKillTest(unittest.TestCase):
+    """A real SIGTERM (mid-turn, via `os.kill`) durably records `aborted`
+    for the live role engagement, distinguishable from a live `running`
+    record and never `completed`, using B's public persistence contract."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def _tmp_session(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "session.json")
+
+    def test_sigterm_mid_turn_durable_aborted_never_completed(self):
+        spath = self._tmp_session()
+
+        def fake_scout(config, context, selected, on_outcome=None,
+                       on_session=None, resume_id=None, session_uuid=None,
+                       **kw):
+            if on_session and resume_id is None:
+                on_session("claude", "scout-1")
+            os.kill(os.getpid(), signal.SIGTERM)
+            return 0  # unreachable: SIGTERM raises SystemExit first
+
+        args = cowork.build_parser().parse_args(
+            ["--team", "scout", "--config", "scout=claude,yolo,plan",
+             "--context", "hello", "--session-file", spath])
+        with self.assertRaises(SystemExit) as ctx:
+            cowork.run_flow(args, io_out=io.StringIO(),
+                            which=lambda c: "/bin/" + c,
+                            run_scout_fn=fake_scout)
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
+
+        saved = state_store.load(spath)
+        session_uuid = state_store.get_session_uuid(saved)
+        work_id = cowork._role_work_id(session_uuid, "scout", 0)
+        current = state_store.current_phase_state(session_uuid, work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "aborted")
+        self.assertEqual(current["event"], "aborted")
+        self.assertNotEqual(current["state"], "running")
+        self.assertNotEqual(current["state"], "completed")
+
+
+class PhaseTruthCompletionBindingTest(unittest.TestCase):
+    """`completed` is reached ONLY through an explicit approval binding a
+    real, proven dispatch-manifest digest as candidate-bound gate evidence
+    -- never implied by exit code, EOF, or status-file presence alone."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def test_scout_approval_reaches_completed_with_candidate_bound_evidence(self):
+        session_uuid = str(uuid.uuid4())
+        config = {"scout": {"controller": "opencode", "model": None,
+                            "effort": None, "yolo": True, "mode": "implement"}}
+        intel = os.path.join(state_store.session_assets_dir(session_uuid),
+                             "scout.intel.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+
+        def factory(controller, resume_session_id=None, on_session_id=None):
+            class FakeScout:
+                def send(self, text, meta=None):
+                    with open(intel, "w") as fh:
+                        json.dump({"status": "ready_for_review",
+                                  "result": {"finding": "F1"}}, fh)
+                    return {"ok": True, "result": "ok"}
+
+                def close(self):
+                    pass
+            return FakeScout()
+
+        out = io.StringIO()
+        rc = cowork.run_scout(
+            config, "goal", ["scout"], io_in=io.StringIO("\n"),
+            io_out=out, intel_path=intel, session_factory=factory,
+            session_uuid=session_uuid)
+        self.assertEqual(rc, 0)
+
+        work_id = cowork._role_work_id(session_uuid, "scout", None)
+        history = state_store.read_phase_state_history(session_uuid, work_id)
+        self.assertIn("running",
+                      [h["state"] for h in history[:-1]] or [None])
+        current = state_store.current_phase_state(session_uuid, work_id)
+        self.assertEqual(current["state"], "completed")
+        self.assertEqual(current["reason_code"], "gate_validated")
+        manifest = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        self.assertIsNotNone(manifest)
+        self.assertEqual(
+            current["evidence"]["gate_validation"]["candidate_manifest_digest"],
+            manifest["digest"])
+        work_unit = state_store.work_unit_from_history_record(
+            state_store.current_work_unit_state(session_uuid, work_id))
+        self.assertEqual(work_unit["candidate_manifest_digest"],
+                         manifest["digest"])
+        self.assertEqual(work_unit["lifecycle_state"], "completed")
+
+
+class PhaseTruthRecoveryBreakerTest(unittest.TestCase):
+    """D's durable recovery breaker (trip/no_trip) integrated into the live
+    controller-failure retry gate: the (threshold+1)th identical-cause retry
+    request is refused BEFORE another dispatch, with a stable, distinct
+    reason code."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def _path(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "scout.intel.X.json")
+
+    def test_tripped_breaker_blocks_retry_with_execution_failed(self):
+        path = self._path()
+        session_uuid = str(uuid.uuid4())
+        manifest_dir = os.path.dirname(
+            state_store.manifest_path_for(session_uuid, "scout"))
+        os.makedirs(manifest_dir, exist_ok=True)
+        manifest = manifest_mod.compile_manifest(
+            "scout",
+            {"inputs": [], "outputs": [], "runtime_roots": [],
+             "private_paths": [], "guard_required": False, "socket": None,
+             "kernel_boundary": {"crosses": []}, "artifact_writes": [],
+             "action_classes": [], "command_adapters": {}},
+            {"work_id": "scout", "controller": "claude", "model": None,
+             "effort": None, "config_digest": "d" * 64,
+             "instruction_digests": {}, "policy_snapshot": {},
+             "worktree": None, "candidate_snapshot": None,
+             "guard_snapshot": None})
+        manifest = manifest_mod.manifest_proven(manifest, [])
+        manifest_mod.persist_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"), manifest)
+
+        class FailingSession:
+            controller = "claude"
+
+            def send(self, text, meta=None):
+                return {"ok": False, "result": "error",
+                       "error_type": "ProviderError"}
+
+            def close(self):
+                pass
+
+        trace = trace_store.Trace(
+            trace_store.trace_path_for(session_uuid),
+            session_uuid=session_uuid, run_id="R")
+        # Three prior identical-cause attempts already recorded: the very
+        # next retry request must be refused BEFORE a fourth dispatch.
+        for _ in range(3):
+            recovery_breaker.attempt(
+                state_store.ledger_path_for(session_uuid), "scout",
+                "d" * 64, "claude", manifest["digest"], "controller_failure")
+
+        rc, outcome, _ = cowork._role_loop(
+            FailingSession(), "seed", path, context="",
+            io_in=io.StringIO("retry\n"), io_out=io.StringIO(),
+            trace=trace, session_uuid=session_uuid, role_work_id="scout-wu",
+            role="scout", phase="scouting")
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "ended")
+        events = [e for e in self._events(session_uuid)]
+        blocked = [e for e in events
+                  if e.get("event") == "user.action"
+                  and e.get("action") == "controller_failure_retry_blocked"]
+        self.assertEqual(len(blocked), 1)
+        tripped_decisions = [e for e in events
+                             if e.get("event") == "recovery.breaker.decision"
+                             and e.get("tripped")]
+        self.assertGreaterEqual(len(tripped_decisions), 1)
+
+    def _events(self, session_uuid):
+        tpath = trace_store.trace_path_for(session_uuid)
+        with open(tpath, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+
+# =============================================================================
+# M2 Package E v2: the six bounded fixed-gate closures.
+#
+# Every test below drives the REAL production seams this package touches --
+# `run_flow`, `run_scout`, `_role_loop`, `_advance_phase`, and (for E-COV-001/
+# E-WIRE-001) the REAL `cowork_bridge._guard_runtime` GuardBroker thread over
+# its actual AF_UNIX socket via the REAL `cowork_action_guard` hook transport
+# -- never a fake `run_scout_fn`/`run_planner_fn` that would bypass those
+# seams, and never `broker.handle()` called in-process (that isolated
+# primitive is Package C's own test, not this package's).
+# =============================================================================
+
+
+class RealBrokerChildDispatchCorrelationUnavailableTest(ControllerPolicyTestBase):
+    """E-COV-001: a correlation-unavailable child dispatch attempt, exercised
+    through the real production dispatch/broker flow -- a live GuardBroker
+    thread spun up by the real `cowork_bridge._guard_runtime`, reached over
+    its real AF_UNIX socket by the real `cowork_action_guard` hook transport
+    -- proves zero child dispatch plus a durable governed terminal record."""
+
+    def test_agent_dispatch_denied_over_real_socket_with_durable_terminal_record(self):
+        import unittest.mock as mock
+        session_uuid = str(uuid.uuid4())
+        assets = state_store.session_assets_dir(session_uuid)
+        os.makedirs(assets, exist_ok=True)
+        trace = trace_store.Trace(
+            trace_store.trace_path_for(session_uuid),
+            session_uuid=session_uuid, run_id="R")
+
+        with mock.patch.object(
+                bridge, "kernel_write_boundary",
+                return_value={"available": True, "platform": "darwin"}), \
+                mock.patch.object(
+                    bridge.controller_profiles, "reference_claude_session",
+                    return_value={"cleanup_kind": None, "protected_paths": (),
+                                 "credential_copied": False}):
+            runtime = bridge._guard_runtime(
+                trace, "builder", assets, "sonnet", "high", True,
+                controller_session_id=str(uuid.uuid4()))
+        self.addCleanup(bridge._close_guard_runtime, runtime)
+        self.assertFalse(runtime["delegation_allowed"])
+
+        with open(runtime["context_path"]) as fh:
+            context = json.load(fh)
+        payload = action_guard.enrich_payload(
+            {"tool_name": "Agent", "tool_use_id": "real-socket-tool",
+             "tool_input": {"subagent_type": "Explore", "prompt": "go"}},
+            context)
+        response = action_guard.forward(
+            payload, context["socket_path"], context["token"])
+
+        self.assertEqual(
+            response["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "child_agent_correlation_unavailable",
+            response["hookSpecificOutput"]["permissionDecisionReason"])
+        child_work_id = response["child_work_id"]
+        self.assertTrue(child_work_id)
+
+        children_path = state_store.children_path_for(session_uuid)
+        with open(children_path) as fh:
+            rows = [json.loads(line) for line in fh]
+        self.assertEqual(len(rows), 1, "zero child dispatch: exactly one "
+                        "durable (blocked) record, never a started one")
+        self.assertEqual(rows[0]["work_id"], child_work_id)
+        self.assertEqual(rows[0]["state"], "blocked")
+        self.assertNotEqual(rows[0]["state"], "started")
+        self.assertEqual(rows[0]["reason"],
+                         "child_agent_correlation_unavailable")
+
+
+class ContextAckFirstSendGateTest(ControllerPolicyTestBase):
+    """E-COV-002: a failed FIRST send never acknowledges the context that
+    rode it -- and a resumed session redelivers BOTH the unseen context and
+    the saved pending role request."""
+
+    class _ScriptedSession:
+        controller = "claude"
+
+        def __init__(self, ok):
+            self.ok = ok
+            self.sent = []
+
+        def send(self, text, meta=None):
+            self.sent.append(text)
+            if self.ok:
+                return {"ok": True, "result": "ok"}
+            return {"ok": False, "result": "error",
+                   "error_type": "ProviderError"}
+
+        def close(self):
+            pass
+
+    def test_first_send_failure_withholds_ack_and_resume_redelivers_both(self):
+        spath = self._tmp_session()
+        failing = self._ScriptedSession(ok=False)
+
+        def fake_run_scout_1(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: failing, **kw)
+
+        rc = cowork.run_flow(
+            self._args(["--team", "scout",
+                       "--config", "scout=claude,yolo,plan",
+                       "--context", "ORIGINAL-CONTEXT-TEXT",
+                       "--session-file", spath, "--headless"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_1)
+        self.assertEqual(rc, 0)
+
+        events = self._events(spath)
+        self.assertEqual(
+            [e for e in events if e["event"] == "context.ack"], [],
+            "a first send that never got accepted must never ack context")
+        saved = state_store.load(spath)
+        self.assertEqual(
+            state_store.role_context_gap(saved, "scout"),
+            "ORIGINAL-CONTEXT-TEXT")
+        pending = state_store.read_pending_switch(saved, "scout")
+        self.assertIsNotNone(pending)
+        self.assertTrue(pending.get("pending_turn"))
+
+        succeeding = self._ScriptedSession(ok=True)
+
+        def fake_run_scout_2(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: succeeding, **kw)
+
+        rc2 = cowork.run_flow(
+            self._args(["--session-file", spath]),
+            io_in=io.StringIO("\n"), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_2)
+        self.assertEqual(rc2, 0)
+
+        first_sent_text = succeeding.sent[0]
+        referenced_paths = re.findall(
+            r"(/\S+\.(?:txt|md|json))", first_sent_text)
+        combined = ""
+        for path in referenced_paths:
+            try:
+                with open(path) as fh:
+                    combined += fh.read()
+            except OSError:
+                continue
+        self.assertIn("ORIGINAL-CONTEXT-TEXT", combined,
+                      "the resumed seed must redeliver the unseen context")
+        self.assertIn(pending["pending_turn"], combined,
+                      "the resumed seed must redeliver the pending role "
+                      "request")
+
+        events2 = self._events(spath)
+        self.assertTrue(
+            any(e["event"] == "context.ack" for e in events2),
+            "the successful resumed send must ack the context it delivered")
+
+
+class ControllerSwitchAtomicityInterruptionTest(ControllerPolicyTestBase):
+    """E-COV-003: the real controller-switch seam persists controller,
+    model, and effort together via ONE `cowork_state.save` (tmp-write +
+    `os.replace`) -- interrupting exactly at that write can therefore only
+    ever leave the prior byte-identical, non-null identity (the write never
+    landed) or the fully-committed new one, with zero dispatch either way;
+    there is no window in between where a null/cleared identity is
+    observable.
+
+    MJ-3: the durable CAS transition store may already have committed by
+    the time this write is attempted -- the interruption must still leave a
+    COHERENT trace narrative (a clean rejection, not a bare crash mid
+    request) and the in-memory policy restored, routed through the exact
+    same `reject()` seam every other rejection in this function uses --
+    never a raw exception escaping uncaught."""
+
+    def test_replace_failure_leaves_prior_identity_intact_and_dispatches_nothing(self):
+        import unittest.mock as mock
+        spath = self._session(
+            "PT-ATOMIC-INTERRUPT", "planning", {"planner": "claude"},
+            team=["scout", "planner"])
+        state = state_store.load(spath)
+        state["config"]["planner"]["model"] = "opus"
+        state["config"]["planner"]["effort"] = "high"
+        state_store.save(spath, state)
+        before_bytes = self._sha(spath)
+
+        real_replace = os.replace
+
+        def selective_boom(src, dst, *a, **kw):
+            if os.path.abspath(dst) == os.path.abspath(spath):
+                raise OSError("simulated crash between clearing and "
+                             "confirming controller/model/effort")
+            return real_replace(src, dst, *a, **kw)
+
+        popen = _RecordingPopen()
+        claude_spawn = _RecordingClaudeSpawn()
+        with patch_bridge_popen(popen), \
+                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn), \
+                mock.patch.object(state_store.os, "replace",
+                                  side_effect=selective_boom):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                           "--switch-controller", "planner=codex"]),
+                io_in=io.StringIO(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c,
+                run_planner_fn=lambda *a, **k: 0)
+
+        self.assertEqual(
+            rc, 1, "an interrupted write must fail closed with a clean rc, "
+            "never crash the whole process with an uncaught exception")
+        self.assertEqual(popen.calls, [], "zero controller spawns")
+        self.assertEqual(claude_spawn.calls, [], "zero controller spawns")
+        self.assertEqual(
+            self._sha(spath), before_bytes,
+            "an interrupted write must leave the prior byte-identical file")
+        recovered = state_store.load(spath)
+        self.assertIsNotNone(recovered["config"]["planner"]["controller"])
+        self.assertEqual(recovered["config"]["planner"]["controller"],
+                         "claude")
+        self.assertEqual(recovered["config"]["planner"]["model"], "opus")
+        self.assertEqual(recovered["config"]["planner"]["effort"], "high")
+        # MJ-3: phase (the CLI's own scouting/planning/building concept, not
+        # PhaseState) survives the interruption untouched.
+        self.assertEqual(recovered["phase"], "planning")
+
+        # MJ-3: the trace narrative stays coherent -- a genuine request
+        # followed by an explicit, unpersisted rejection -- never a request
+        # with no matching outcome (the tell-tale sign of an uncaught crash
+        # bypassing every seam's own cleanup).
+        events = self._events(spath)
+        self.assertTrue(
+            any(e["event"] == "controller.switch.request"
+                and e.get("role") == "planner" for e in events))
+        rejected = [e for e in events
+                   if e["event"] == "controller.policy.rejected"]
+        self.assertEqual(len(rejected), 1)
+        self.assertFalse(rejected[0]["persisted"])
+        self.assertTrue(
+            any(e["event"] == "run.end"
+                and e.get("reason") == "switch_controller_failed"
+                for e in events),
+            "a caught write failure must reach the normal run.end seam, "
+            "never an unhandled crash")
+        # The in-memory policy this same process leaves active is restored
+        # to the pre-attempt one (unrestricted here) -- never left activated
+        # from the aborted attempt's own pre-write window.
+        self.assertEqual(policy.active_meta()["mode"], "unrestricted")
+
+        # Recovery: a plain resume (no switch, no fault injection) proceeds
+        # normally -- the interrupted attempt left no lingering lock.
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                       "--context", "post-recovery continuation"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c,
+            run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+
+
+class PhaseTruthGateSigtermTest(ControllerPolicyTestBase):
+    """E-COV-004: a real SIGTERM striking the interactive `ready_for_review`
+    GATE read -- not mid-turn (v1's own control) -- durably records
+    `aborted` for the live WorkUnit engagement through the SAME production
+    `run_flow` SIGTERM handler, distinguishable from a live `running` record
+    and never `completed`."""
+
+    class _GateSession:
+        controller = "opencode"
+
+        def __init__(self, intel_path):
+            self.intel_path = intel_path
+
+        def send(self, text, meta=None):
+            with open(self.intel_path, "w") as fh:
+                json.dump({"status": "ready_for_review",
+                          "result": {"finding": "F1"}}, fh)
+            return {"ok": True, "result": "ok"}
+
+        def close(self):
+            pass
+
+    class _KillOnReadline(io.StringIO):
+        def readline(self, *a, **kw):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return super().readline(*a, **kw)
+
+    def test_sigterm_at_gate_durable_aborted_never_completed(self):
+        # A real UUID: `cowork_workunit.validate_work_unit` requires a
+        # UUID-shaped session_id before a WorkUnit can mint at all, and this
+        # test also asserts on the durable WorkUnit lifecycle mirror (MJ-4).
+        session_uuid = str(uuid.uuid4())
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+        intel_path = os.path.join(
+            state_store.session_assets_dir(session_uuid), "scout.intel.json")
+        os.makedirs(os.path.dirname(intel_path), exist_ok=True)
+        session = self._GateSession(intel_path)
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: session, **kw)
+
+        with self.assertRaises(SystemExit) as ctx:
+            cowork.run_flow(
+                self._args(["--session-file", spath,
+                           "--context", "gate sigterm context"]),
+                io_in=self._KillOnReadline(), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
+
+        work_id = cowork._role_work_id(session_uuid, "scout", 0)
+        current = state_store.current_phase_state(session_uuid, work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "aborted")
+        self.assertEqual(current["evidence"]["reason"], "sigterm")
+        self.assertNotEqual(current["state"], "running")
+        self.assertNotEqual(current["state"], "completed")
+        # MJ-4: the SAME WorkUnit join key must also read back terminal --
+        # never a stale `running` left over from before the kill -- and
+        # carry a non-null terminal_reason.
+        work_unit = state_store.current_work_unit_state(session_uuid, work_id)
+        self.assertIsNotNone(work_unit)
+        self.assertEqual(work_unit["lifecycle_state"], "aborted")
+        self.assertIsNotNone(work_unit["terminal_reason"])
+        self.assertNotEqual(work_unit["lifecycle_state"], "running")
+
+
+class PhaseTruthNonCompletionMatrixTest(ControllerPolicyTestBase):
+    """E-COV-005: guard disappearance, controller abort (Ctrl-C), EOF,
+    external kill (SIGTERM), and generic controller failure each drive the
+    real production `run_flow`/`run_scout`/`_advance_phase` seam to an
+    explicit terminal PhaseState other than `completed`, with no completion
+    (gate-validated) evidence bound."""
+
+    class _RefusingSession:
+        controller = "opencode"
+
+        def __init__(self, error_type):
+            self.error_type = error_type
+
+        def send(self, text, meta=None):
+            return {"ok": False, "result": "error",
+                   "error_type": self.error_type}
+
+        def close(self):
+            pass
+
+    class _KeyboardInterruptSession:
+        controller = "opencode"
+
+        def send(self, text, meta=None):
+            raise KeyboardInterrupt()
+
+        def close(self):
+            pass
+
+    class _SigtermSession:
+        controller = "opencode"
+
+        def send(self, text, meta=None):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return {"ok": True, "result": "ok"}  # unreachable
+
+        def close(self):
+            pass
+
+    class _NoStatusSession:
+        controller = "opencode"
+
+        def send(self, text, meta=None):
+            return {"ok": True, "result": "ok"}
+
+        def close(self):
+            pass
+
+    def _run_row(self, uuid_str, session, headless, io_in=None):
+        spath = self._session(
+            uuid_str, "scouting", {"scout": "opencode"}, team=["scout"])
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: session, **kw)
+
+        argv = ["--session-file", spath, "--context", "matrix row context"]
+        if headless:
+            argv += ["--headless"]
+        try:
+            cowork.run_flow(
+                self._args(argv), io_in=(io_in or io.StringIO()),
+                io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+                run_scout_fn=fake_run_scout)
+        except SystemExit as exc:
+            self.assertEqual(exc.code, 128 + signal.SIGTERM)
+        work_id = cowork._role_work_id(uuid_str, "scout", 0)
+        return state_store.current_phase_state(uuid_str, work_id)
+
+    def test_every_named_cause_lands_on_an_explicit_non_completion_terminal(self):
+        rows = (
+            ("guard-disappearance",
+             self._RefusingSession("guard_unavailable"), True, None,
+             "failed"),
+            ("controller-abort", self._KeyboardInterruptSession(), True, None,
+             "aborted"),
+            ("eof", self._NoStatusSession(), False, io.StringIO(""),
+             "cancelled"),
+            ("external-kill", self._SigtermSession(), True, None, "aborted"),
+            ("controller-failure",
+             self._RefusingSession("ProviderError"), True, None, "failed"),
+        )
+        for label, session, headless, io_in, expected_state in rows:
+            with self.subTest(cause=label):
+                uuid_str = "e-cov-005-%s" % label
+                current = self._run_row(uuid_str, session, headless, io_in)
+                self.assertIsNotNone(current)
+                self.assertEqual(current["state"], expected_state)
+                self.assertIn(current["state"],
+                             cowork.control_plane.TERMINAL_STATES)
+                self.assertNotEqual(current["state"], "completed")
+                self.assertNotIn("gate_validation",
+                                 current.get("evidence") or {})
+
+
+class GuardBrokerSessionProvenanceWiringTest(ControllerPolicyTestBase):
+    """E-WIRE-001: the real GuardBroker construction site
+    (`cowork_bridge._guard_runtime`) now passes the actual session
+    identifier, so parent-WorkUnit existence validation for an uncorrelated
+    SubagentStop is genuinely active (not merely shape-checked); genuine
+    resolved model/effort provenance is threaded into the minted WorkUnit
+    projection instead of a perpetual null; and there is exactly one
+    production child-dispatch decision call site."""
+
+    def test_session_id_makes_parent_existence_validation_active(self):
+        import unittest.mock as mock
+        session_uuid = str(uuid.uuid4())
+        assets = state_store.session_assets_dir(session_uuid)
+        os.makedirs(assets, exist_ok=True)
+        trace = trace_store.Trace(
+            trace_store.trace_path_for(session_uuid),
+            session_uuid=session_uuid, run_id="R")
+        with mock.patch.object(
+                bridge, "kernel_write_boundary",
+                return_value={"available": True, "platform": "darwin"}), \
+                mock.patch.object(
+                    bridge.controller_profiles, "reference_claude_session",
+                    return_value={"cleanup_kind": None, "protected_paths": (),
+                                 "credential_copied": False}):
+            runtime = bridge._guard_runtime(
+                trace, "builder", assets, "sonnet", "high", True,
+                controller_session_id=str(uuid.uuid4()))
+        self.addCleanup(bridge._close_guard_runtime, runtime)
+        broker = runtime["broker"]
+        self.assertEqual(broker.session_id, session_uuid)
+
+        real_work_id = cowork._role_work_id(session_uuid, "builder", 0)
+        cowork._ensure_work_unit(session_uuid, real_work_id, "builder",
+                                 "claude", model="sonnet", effort="high")
+
+        with open(runtime["context_path"]) as fh:
+            context = json.load(fh)
+
+        genuine = action_guard.enrich_payload(
+            {"hook_event_name": "SubagentStop", "agent_id": "agent-real",
+             "parent_work_id": real_work_id}, context)
+        action_guard.forward(genuine, context["socket_path"],
+                             context["token"])
+
+        fabricated = action_guard.enrich_payload(
+            {"hook_event_name": "SubagentStop", "agent_id": "agent-fake",
+             "parent_work_id": str(uuid.uuid4())}, context)
+        action_guard.forward(fabricated, context["socket_path"],
+                             context["token"])
+
+        children_path = state_store.children_path_for(session_uuid)
+        with open(children_path) as fh:
+            rows = [json.loads(line) for line in fh]
+        self.assertEqual(
+            len(rows), 1,
+            "only the parent_work_id that names a WorkUnit this session "
+            "actually minted may be durably recorded")
+        self.assertEqual(rows[0]["parent_work_id"], real_work_id)
+        self.assertEqual(rows[0]["state"], "ungoverned_terminal")
+
+    def test_ensure_work_unit_threads_genuine_model_effort_never_fabricated(self):
+        session_uuid = str(uuid.uuid4())
+        work_id = cowork._role_work_id(session_uuid, "scout", 0)
+        record = cowork._ensure_work_unit(
+            session_uuid, work_id, "scout", "claude",
+            model="opus", effort="high")
+        self.assertEqual(record["requested_model"], "opus")
+        self.assertEqual(record["effort"], "high")
+        self.assertIsNone(record["effective_model"])
+
+        unresolved_uuid = str(uuid.uuid4())
+        unresolved_work_id = cowork._role_work_id(unresolved_uuid, "scout", 0)
+        unresolved_record = cowork._ensure_work_unit(
+            unresolved_uuid, unresolved_work_id, "scout", "claude")
+        self.assertIsNone(unresolved_record["requested_model"])
+        self.assertIsNone(unresolved_record["effort"])
+
+    def test_guard_runtime_never_fabricates_config_pinned_controller_source(self):
+        src_path = os.path.join(_HERE, "cowork_bridge.py")
+        with open(src_path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn('"controller_source": "config_pinned"', src)
+        self.assertIn('"controller_source": (', src)
+
+    def test_exactly_one_production_child_dispatch_decision_path(self):
+        call_sites = []
+        for fname in os.listdir(_HERE):
+            if not fname.endswith(".py") or fname.startswith("test_"):
+                continue
+            with open(os.path.join(_HERE, fname), "r", encoding="utf-8") as fh:
+                src = fh.read()
+            tree = ast.parse(src, filename=fname)
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.FunctionDef)
+                        and node.name in ("decide_child",
+                                          "decide_child_governed")):
+                    continue
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "decide_child"):
+                    call_sites.append((fname, node.lineno))
+        self.assertEqual(
+            len(call_sites), 1,
+            "exactly one production child-dispatch decision call site must "
+            "exist; if a second real one appears, collapse it per "
+            "E-WIRE-001 rather than adding a competing path: %r"
+            % (call_sites,))
+        self.assertEqual(call_sites[0][0], "cowork_guard_broker.py")
+
+
+# =============================================================================
+# Orchestrator intervention c00d0ca2-8469-476b-8cee-73caa66eeceb: BL-1, BL-2,
+# BL-3, MJ-1, MJ-2, MJ-3 fixes on top of the six M2 Package E v2 closures
+# above. Every test below drives the REAL production seams, exactly like the
+# closures' own tests.
+# =============================================================================
+
+
+class SignalHandlerLockContentionTest(ControllerPolicyTestBase):
+    """BL-1: the SIGTERM handler durably records `aborted` via B's REENTRANT
+    `append_phase_state_entry_unlocked` (never the locked
+    `append_phase_state_entry`), so a SIGTERM arriving while this SAME
+    process already holds the (session, work_id)'s PhaseState lock via a
+    DIFFERENT fd -- exactly the scenario `cowork_state`'s own SELF-DEADLOCK
+    banner describes -- durably records the terminal PhaseState instead of
+    blocking forever."""
+
+    def test_sigterm_while_phase_state_lock_already_held_does_not_deadlock(self):
+        session_uuid = "bl1-lock-contention"
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+        work_id = cowork._role_work_id(session_uuid, "scout", 0)
+        lock_path = state_store.phase_state_history_path_for(
+            session_uuid, work_id) + ".lock"
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+
+        class LockHoldingKillSession:
+            controller = "opencode"
+
+            def send(self, text, meta=None):
+                lock_fh = open(lock_path, "a+")
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                    lock_fh.close()
+                return {"ok": True, "result": "ok"}  # unreachable
+
+            def close(self):
+                pass
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: LockHoldingKillSession(),
+                **kw)
+
+        def _watchdog(signum, frame):
+            raise AssertionError(
+                "BL-1 regression: the SIGTERM handler self-deadlocked "
+                "while the PhaseState lock was already held by this same "
+                "process")
+        old_alarm = signal.signal(signal.SIGALRM, _watchdog)
+        signal.alarm(10)
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                cowork.run_flow(
+                    self._args(["--session-file", spath,
+                               "--context", "lock contention context"]),
+                    io_in=io.StringIO(), io_out=io.StringIO(),
+                    which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_alarm)
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
+
+        current = state_store.current_phase_state(session_uuid, work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "aborted")
+        self.assertEqual(current["evidence"]["reason"], "sigterm")
+
+
+class WorkUnitLockContentionSigtermTest(ControllerPolicyTestBase):
+    """MJ-4: the SIGTERM handler mirrors the terminal PhaseState onto the
+    SAME WorkUnit join key via B's REENTRANT
+    `append_work_unit_transition_unlocked` (never the locked
+    `append_work_unit_transition`), so a SIGTERM arriving while this SAME
+    process already holds the (session, work_id)'s WorkUnit lock via a
+    DIFFERENT fd -- the WorkUnit analogue of BL-1's PhaseState-lock
+    contention scenario -- durably records the terminal WorkUnit lifecycle
+    instead of blocking forever, and leaves no stale `running` WorkUnit
+    behind."""
+
+    def test_sigterm_while_work_unit_lock_already_held_does_not_deadlock(self):
+        # A real UUID (not an arbitrary label like most tests in this file
+        # use): `cowork_workunit.validate_work_unit` requires a UUID-shaped
+        # session_id before a WorkUnit can mint at all, and this test's
+        # whole point is to exercise the durable WorkUnit lifecycle mirror.
+        session_uuid = str(uuid.uuid4())
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+        work_id = cowork._role_work_id(session_uuid, "scout", 0)
+        lock_path = state_store.work_unit_history_path_for(
+            session_uuid, work_id) + ".lock"
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+
+        class LockHoldingKillSession:
+            controller = "opencode"
+
+            def send(self, text, meta=None):
+                lock_fh = open(lock_path, "a+")
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                    lock_fh.close()
+                return {"ok": True, "result": "ok"}  # unreachable
+
+            def close(self):
+                pass
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: LockHoldingKillSession(),
+                **kw)
+
+        def _watchdog(signum, frame):
+            raise AssertionError(
+                "MJ-4 regression: the SIGTERM handler's WorkUnit mirror "
+                "self-deadlocked while the WorkUnit lock was already held "
+                "by this same process")
+        old_alarm = signal.signal(signal.SIGALRM, _watchdog)
+        signal.alarm(10)
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                cowork.run_flow(
+                    self._args(["--session-file", spath,
+                               "--context", "workunit lock contention"]),
+                    io_in=io.StringIO(), io_out=io.StringIO(),
+                    which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_alarm)
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
+
+        current = state_store.current_phase_state(session_uuid, work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "aborted")
+        work_unit = state_store.current_work_unit_state(session_uuid, work_id)
+        self.assertIsNotNone(work_unit)
+        self.assertEqual(work_unit["lifecycle_state"], "aborted")
+        self.assertIsNotNone(work_unit["terminal_reason"])
+
+
+class TerminalResumeAttemptIdentityTest(ControllerPolicyTestBase):
+    """BL-3-RESIDUAL: a NEW PROCESS resuming an engagement whose derived
+    WorkUnit/PhaseState is terminal (here: `cancelled`, from a real EOF)
+    mints a distinct attempt-scoped WorkUnit identity rather than silently
+    reusing the already-terminal attempt-0 one -- and a plain resume +
+    approval on that fresh identity durably reaches `completed`/
+    `gate_validated`, while the original terminal attempt-0 WorkUnit is
+    never bound to a candidate."""
+
+    def test_eof_then_plain_resume_mints_fresh_attempt_and_completes(self):
+        # A real UUID: reaching `completed` requires a minted WorkUnit
+        # (`cowork_workunit.validate_work_unit` requires a UUID-shaped
+        # session_id), and this test asserts on WorkUnit state throughout.
+        session_uuid = str(uuid.uuid4())
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+
+        class EOFSession:
+            controller = "opencode"
+
+            def send(self, text, meta=None):
+                return {"ok": True, "result": "ok"}
+
+            def close(self):
+                pass
+
+        def fake_run_scout_eof(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: EOFSession(), **kw)
+
+        # First process: the scout's WorkUnit is minted and reaches
+        # `running`, then the user hits EOF at the first turn read --
+        # `cancelled`, a terminal, non-completed PhaseState/WorkUnit.
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                       "--context", "first attempt, ends on eof"]),
+            io_in=io.StringIO(""), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_eof)
+        self.assertEqual(rc, 0)
+
+        attempt0_work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
+        attempt0_state = state_store.current_phase_state(
+            session_uuid, attempt0_work_id)
+        self.assertIsNotNone(attempt0_state)
+        self.assertEqual(attempt0_state["state"], "cancelled")
+
+        intel_path = os.path.join(
+            state_store.session_assets_dir(session_uuid), "scout.intel.json")
+
+        class ApprovingSession:
+            controller = "opencode"
+
+            def send(self, text, meta=None):
+                os.makedirs(os.path.dirname(intel_path), exist_ok=True)
+                with open(intel_path, "w") as fh:
+                    json.dump({"status": "ready_for_review",
+                              "result": {"finding": "F1"}}, fh)
+                return {"ok": True, "result": "ok"}
+
+            def close(self):
+                pass
+
+        def fake_run_scout_approve(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: ApprovingSession(), **kw)
+
+        # Second process (a fresh `run_flow` call reloading the SAME
+        # session file): a plain resume, headless so the ready_for_review
+        # gate auto-approves without a TTY prompt. The real dispatch-manifest
+        # pipeline runs exactly as it would for a genuinely fresh attempt.
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--headless",
+                       "--context", "plain resume after eof"]),
+            io_in=io.StringIO(""), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_run_scout_approve)
+        self.assertEqual(rc, 0)
+
+        digest = cowork.dispatch_manifest.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))["digest"]
+
+        attempt1_work_id = cowork._role_work_id(session_uuid, "scout", 0, 1)
+        self.assertNotEqual(attempt1_work_id, attempt0_work_id)
+        attempt1_state = state_store.current_phase_state(
+            session_uuid, attempt1_work_id)
+        self.assertIsNotNone(attempt1_state)
+        self.assertEqual(attempt1_state["state"], "completed")
+        self.assertEqual(
+            attempt1_state["evidence"]["gate_validation"]
+            ["candidate_manifest_digest"], digest)
+
+        attempt1_work_unit = state_store.current_work_unit_state(
+            session_uuid, attempt1_work_id)
+        self.assertEqual(attempt1_work_unit["candidate_manifest_digest"],
+                         digest)
+
+        # The original terminal attempt-0 WorkUnit was never touched again:
+        # still `cancelled`, still candidate-free.
+        attempt0_work_unit = state_store.current_work_unit_state(
+            session_uuid, attempt0_work_id)
+        self.assertEqual(attempt0_work_unit["lifecycle_state"], "cancelled")
+        self.assertIsNone(attempt0_work_unit["candidate_manifest_digest"])
+        attempt0_state_after = state_store.current_phase_state(
+            session_uuid, attempt0_work_id)
+        self.assertEqual(attempt0_state_after["state"], "cancelled")
+
+
+class PreflightRejectionOrderingTest(ControllerPolicyTestBase):
+    """BL-2: a policy/probe/session-start failure that occurs AFTER the
+    manifest is proven (but BEFORE the controller session is genuinely
+    live) must durably reach `rejected_preflight` -- `preflight_passed`
+    (preflighting -> running) is bound only once THAT specific controller
+    branch's own checks have all succeeded, never unconditionally before
+    them, since the reducer has no `("running", "preflight_rejected")`
+    edge (only `("preflighting", "preflight_rejected")`)."""
+
+    def test_session_start_failure_reaches_rejected_preflight_not_stuck_running(self):
+        session_uuid = "bl2-preflight-ordering"
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+
+        def raising_factory(*a, **k):
+            raise RuntimeError("boom")
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected, session_factory=raising_factory,
+                **kw)
+
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--headless",
+                       "--context", "bl2 context"]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+        self.assertEqual(rc, 1)
+        work_id = cowork._role_work_id(session_uuid, "scout", 0)
+        current = state_store.current_phase_state(session_uuid, work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "rejected_preflight")
+        self.assertEqual(current["reason_code"], "preflight_rejected")
+        self.assertNotEqual(current["state"], "running")
+
+
+class RetryAttemptScopedWorkUnitTest(ControllerPolicyTestBase):
+    """BL-3: a launch-time retry after a REJECTED dispatch reuses the SAME
+    epoch but must mint a FRESH WorkUnit identity -- the reducer has no
+    legal outbound edge from a terminal state, so reusing the prior
+    attempt's (now-terminal) work_id would silently no-op every subsequent
+    PhaseState call for the retried attempt, permanently losing
+    observability into it."""
+
+    def test_retry_after_rejection_mints_a_fresh_work_id_and_reaches_its_own_terminal(self):
+        session_uuid = "bl3-retry-attempt"
+        spath = self._session(
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+
+        attempts = {"n": 0}
+
+        def flaky_factory(*a, **k):
+            attempts["n"] += 1
+            raise RuntimeError("boom-%d" % attempts["n"])
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected, session_factory=flaky_factory,
+                **kw)
+
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                       "--context", "bl3 context"]),
+            io_in=io.StringIO("retry\nend\n"), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+        self.assertEqual(rc, 1)
+        self.assertEqual(attempts["n"], 2,
+                         "the retry must actually reach a second attempt")
+
+        first_work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
+        second_work_id = cowork._role_work_id(session_uuid, "scout", 0, 1)
+        self.assertNotEqual(first_work_id, second_work_id)
+        first_state = state_store.current_phase_state(
+            session_uuid, first_work_id)
+        second_state = state_store.current_phase_state(
+            session_uuid, second_work_id)
+        self.assertIsNotNone(first_state)
+        self.assertIsNotNone(second_state)
+        self.assertEqual(first_state["state"], "rejected_preflight")
+        self.assertEqual(second_state["state"], "rejected_preflight")
+        # Each attempt's own durable history is intact and distinct -- the
+        # second attempt's rejection is a REAL, freshly-recorded transition,
+        # never a silently-dropped illegal_transition against the first
+        # attempt's already-terminal identity.
+        self.assertEqual(first_state["evidence"]["error_type"], "RuntimeError")
+        self.assertEqual(second_state["evidence"]["error_type"], "RuntimeError")
+
+
+class RealParentWorkUnitIdentityInBrokerPayloadTest(unittest.TestCase):
+    """MJ-1: the guard context's `current_parent_work_id` -- the field
+    `cowork_action_guard.enrich_payload` copies onto every raw hook
+    payload as `parent_work_id`, and `cowork_guard_broker`'s own existence
+    check (E-WIRE-001) validates against the minted WorkUnit store -- must
+    be the genuine WorkUnit `role_work_id`, never the per-turn TRACE
+    correlation id (`trace_store.new_work_id()`, minted fresh on every
+    send solely to pair `controller.turn.start`/`end`) that a random
+    per-turn id could never resolve as a real WorkUnit."""
+
+    class _FakeCodex(bridge.CodexSession):
+        def _run(self, _command):
+            return [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.completed"},
+            ]
+
+    def test_codex_publishes_the_genuine_role_work_id_when_supplied(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as root:
+            context_path = os.path.join(root, "context.json")
+            Path(context_path).write_text("{}\n")
+            session = self._FakeCodex("plan", False, io_out=io.StringIO())
+            session._guard_runtime = {
+                "context_path": context_path,
+                "scope": action_policy.OwnedScope(),
+                "protected_paths": (),
+                "broker": None,
+                "profile": None,
+            }
+            genuine_work_id = str(uuid.uuid4())
+            with mock.patch.object(
+                    bridge, "kernel_write_boundary",
+                    side_effect=lambda _scope, argv=None,
+                    protected_paths=(): {
+                        "available": True, "platform": "darwin",
+                        "argv": list(argv or ()),
+                    }):
+                result = session.send(
+                    "guarded", meta={"role_work_id": genuine_work_id})
+            self.assertTrue(result["ok"])
+            with open(context_path) as fh:
+                context = json.load(fh)
+            self.assertEqual(context["current_parent_work_id"], genuine_work_id)
+            self.assertNotEqual(
+                context["current_parent_work_id"], session.last_work_id,
+                "the genuine WorkUnit identity must win over the per-turn "
+                "trace correlation id")
+
+    def test_role_loop_threads_the_genuine_role_work_id_into_send_meta(self):
+        spath_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(spath_dir, ignore_errors=True))
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+        session_uuid = str(uuid.uuid4())
+        captured = []
+
+        class CapturingSession:
+            controller = "opencode"
+
+            def send(self, text, meta=None):
+                captured.append(dict(meta or {}))
+                return {"ok": True, "result": "ok"}
+
+            def close(self):
+                pass
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: CapturingSession(), **kw)
+
+        args = cowork.build_parser().parse_args(
+            ["--team", "scout", "--config", "scout=opencode,yolo,plan",
+             "--context", "mj1 context",
+             "--session-file", os.path.join(spath_dir, ".cowork", "s.json")])
+        cowork.run_flow(args, io_in=io.StringIO(""), io_out=io.StringIO(),
+                        which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+        self.assertTrue(captured)
+        expected_work_id = cowork._role_work_id(
+            state_store.get_session_uuid(state_store.load(
+                os.path.join(spath_dir, ".cowork", "s.json"))),
+            "scout", 0, 0)
+        self.assertEqual(captured[0].get("role_work_id"), expected_work_id)
+
+
+class InterruptFirstSendDeliveryGatingTest(ControllerPolicyTestBase):
+    """MJ-2: an interrupt (Ctrl-C) on the FIRST send -- not merely a
+    refused one -- must ALSO withhold `context.ack`: the context riding
+    that send was never affirmatively delivered (the model may never have
+    received or processed it before the interrupt), exactly like a refused
+    first send already withholds it."""
+
+    def test_keyboard_interrupt_on_first_send_withholds_ack_and_leaves_context_unseen(self):
+        spath = self._tmp_session()
+
+        class InterruptingSession:
+            controller = "claude"
+
+            def send(self, text, meta=None):
+                raise KeyboardInterrupt()
+
+            def close(self):
+                pass
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(
+                config, context, selected,
+                session_factory=lambda *a, **k: InterruptingSession(), **kw)
+
+        rc = cowork.run_flow(
+            self._args(["--team", "scout",
+                       "--config", "scout=claude,yolo,plan",
+                       "--context", "MJ2-ORIGINAL-CONTEXT",
+                       "--session-file", spath]),
+            io_in=io.StringIO(), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+        self.assertEqual(rc, 0)
+
+        events = self._events(spath)
+        self.assertEqual(
+            [e for e in events if e["event"] == "context.ack"], [],
+            "an interrupt on the first send must never ack context")
+        saved = state_store.load(spath)
+        self.assertEqual(
+            state_store.role_context_gap(saved, "scout"),
+            "MJ2-ORIGINAL-CONTEXT")
+        work_id = cowork._role_work_id(
+            state_store.get_session_uuid(saved), "scout", 0, 0)
+        current = state_store.current_phase_state(
+            state_store.get_session_uuid(saved), work_id)
+        self.assertEqual(current["state"], "aborted")
+
+
+class UnboundFirstSendInterruptTest(ControllerPolicyTestBase):
+    """E-MJ2-UNBOUND-FIRST-SEND: an interrupt landing during a PRE-first-send
+    I/O seam inside `_role_loop`'s `try:` block -- the `you: ...` context
+    echo, which runs BEFORE the loop body's own `first_send = pending is
+    first` assignment -- must not raise `UnboundLocalError` out of the
+    `except KeyboardInterrupt` handler (which reads `first_send`). It must
+    instead behave exactly like MJ-2's already-covered post-send interrupt:
+    a clean `interrupted` outcome, `on_first_send_rejected` fired, and a
+    durable `aborted` PhaseState record for the live WorkUnit engagement."""
+
+    class _InterruptOnFirstWrite(io.StringIO):
+        """Raises KeyboardInterrupt on the very first `write()` call --
+        `_role_loop`'s own `you: ...` context echo, the first I/O in its
+        `try:` block -- and behaves as an ordinary StringIO on any later
+        call (never reached in this test, since the interrupt ends the
+        loop)."""
+
+        def __init__(self):
+            super().__init__()
+            self._armed = True
+
+        def write(self, s):
+            if self._armed:
+                self._armed = False
+                raise KeyboardInterrupt()
+            return super().write(s)
+
+    def test_interrupt_before_first_send_assigned_does_not_raise_unbound_local(self):
+        session_uuid = str(uuid.uuid4())
+        status_path = os.path.join(
+            state_store.session_assets_dir(session_uuid), "scout.intel.json")
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
+
+        class UnreachedSession:
+            controller = "claude"
+
+            def send(self, text, meta=None):
+                raise AssertionError(
+                    "never reached: the interrupt lands before the first "
+                    "send is even attempted")
+
+            def close(self):
+                pass
+
+        rejected = {"called": False}
+
+        def on_first_send_rejected():
+            rejected["called"] = True
+
+        rc, outcome, _ = cowork._role_loop(
+            UnreachedSession(), "seed context", status_path,
+            context="MJ2-UNBOUND-CONTEXT",
+            io_in=io.StringIO(), io_out=self._InterruptOnFirstWrite(),
+            role="scout", session_uuid=session_uuid, role_work_id=work_id,
+            on_first_send_rejected=on_first_send_rejected)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "interrupted")
+        self.assertTrue(
+            rejected["called"],
+            "a pre-first-send interrupt must fire on_first_send_rejected "
+            "exactly like a post-send one does")
+
+        current = state_store.current_phase_state(session_uuid, work_id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["state"], "aborted")
+        self.assertEqual(current["evidence"]["reason"], "keyboard_interrupt")

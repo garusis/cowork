@@ -2775,6 +2775,11 @@ def review_skip_eligible(state, reviewer_role, current_epoch,
 # — which may run while this process already holds the PhaseState lock for   #
 # the very same (session_id, work_id) — MUST call it, never the locked        #
 # `append_phase_state_entry`, to record a terminal PhaseState.                #
+# `append_work_unit_transition_unlocked` (below, narrowly scoped) is the      #
+# identical reentrant twin for the WorkUnit lock, for the SAME handler        #
+# mirroring that terminal PhaseState onto the WorkUnit's own                  #
+# `lifecycle_state` (MJ-4) — never the locked `append_work_unit_transition`   #
+# for that call.                                                              #
 #                                                                              #
 # TERMINAL-DOMINANT RECONSTRUCTION (B-14-R1 correction, replaces the earlier  #
 # thread-count precondition): there is NO precondition on this process's      #
@@ -3106,6 +3111,51 @@ def append_work_unit_transition(record):
         return entry
 
     return _locked_jsonl_append(path, build)
+
+
+def append_work_unit_transition_unlocked(record):
+    """Reentrant twin of `append_work_unit_transition`, for a caller that
+    may run while this SAME process already holds this (session_id,
+    work_id)'s WorkUnit lock -- narrowly, M2 Package E's external-kill
+    signal handler mirroring a just-written terminal PhaseState onto the
+    SAME WorkUnit join key while the main flow's own locked
+    `append_work_unit_transition`/`mint_work_unit` call for the same
+    work_id may still be in its locked critical section. See the
+    module-level SELF-DEADLOCK banner above this section --the same hazard
+    `append_phase_state_entry_unlocked` exists for applies identically to
+    this file's WorkUnit lock: a second `open()` + `flock()` in this same
+    process for the same `<path>.lock` is a distinct lock owner and blocks
+    forever, not merely waits.
+
+    Identical validation and identical durable-record shape to the locked
+    twin -- the only difference is `_jsonl_append_unlocked` in place of
+    `_locked_jsonl_append`, exactly mirroring
+    `append_phase_state_entry_unlocked`'s relationship to
+    `append_phase_state_entry` (including that function's freshness-checked
+    stale-build retry, so a record built here against a since-superseded
+    `existing` read is rebuilt against the current file rather than
+    corrupting append order). Raises ValueError -- writing nothing -- when
+    work_id has no minted history yet, exactly like the locked twin.
+
+    Offers no additional concurrency safety beyond reentrancy: a genuinely
+    concurrent (different-process, or different-thread NOT caused by signal
+    re-entry) caller must still go through the locked
+    `append_work_unit_transition`.
+    """
+    validated = _import_workunit().validate_work_unit(record)
+    path = work_unit_history_path_for(validated["session_id"], validated["work_id"])
+
+    def build(existing):
+        if not existing:
+            raise ValueError(
+                "work_id %r has no minted history; call mint_work_unit first"
+                % validated["work_id"])
+        entry = dict(validated)
+        entry["transition_index"] = len(existing)
+        entry["recorded_at"] = _utc_now()
+        return entry
+
+    return _jsonl_append_unlocked(path, build)
 
 
 def read_work_unit_history(session_id, work_id):

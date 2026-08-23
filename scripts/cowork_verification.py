@@ -428,7 +428,8 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
                   final_suite_label, worker_source_hash=None,
                   command_timeout_s=None, term_grace_s=None,
                   overall_deadline_s=None, evidence_poll_attempts=None,
-                  evidence_poll_delay_s=None, output_cap_bytes=None):
+                  evidence_poll_delay_s=None, output_cap_bytes=None,
+                  work_id=None):
     """Build the versioned JSON request document persisted before the worker
     is spawned (see `cowork_state.verification_request_path_for`).
 
@@ -437,7 +438,14 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
     single-flight request key so a configuration change always mints a new
     key. Nothing here performs I/O; the caller writes the returned dict with
     `cowork_state.write_json_atomic`.
-    """
+
+    `work_id` (M2 Package E, additive): the WorkUnit identity of the role
+    engagement this verification transaction is bound to, when the caller
+    has one (see `cowork.py`'s `_role_work_id`). Purely a join-key
+    correlation field on the persisted request document — never consulted
+    by `request_key`, dedup, or any decision this module makes — so an
+    absent `work_id` (every pre-M2 caller) changes nothing about existing
+    behavior."""
     entries, reused = deduplicate_inventory(entries)
     inventory_key = normalized_inventory_key(schema, entries)
     config_blob = json.dumps(configuration or {}, sort_keys=True)
@@ -449,6 +457,7 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
         "protocol_version": PROTOCOL_VERSION,
         "transaction_id": transaction_id,
         "session_uuid": session_uuid,
+        "work_id": work_id,
         "request_key": request_key,
         "repo": repo,
         "snapshot": {
@@ -2062,7 +2071,7 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
                     python_executable=None, command_timeout_s=None,
                     term_grace_s=None, waiter_deadline_s=None,
                     evidence_poll_attempts=None, evidence_poll_delay_s=None,
-                    cancel_event=None):
+                    cancel_event=None, work_id=None):
     """Build the snapshot, acquire single-flight, spawn+verify the worker,
     drive it through the approved inventory, tear everything down on
     completion/cancel/timeout, and return a `TransactionResult`.
@@ -2078,6 +2087,9 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
     `cancel_event` is an optional `threading.Event`-like object (any object
     with `.is_set()`); when set during the run, the transaction tears down
     the worker/command exactly as on a deadline and returns `unverified`.
+
+    `work_id` (M2 Package E, additive): threaded straight through to
+    `build_request`'s own `work_id` — see that function's docstring.
     """
     python_executable = python_executable or sys.executable or "python3"
     transaction_id = new_transaction_id()
@@ -2101,7 +2113,7 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
         final_suite_label, command_timeout_s=command_timeout_s,
         term_grace_s=term_grace_s,
         evidence_poll_attempts=evidence_poll_attempts,
-        evidence_poll_delay_s=evidence_poll_delay_s)
+        evidence_poll_delay_s=evidence_poll_delay_s, work_id=work_id)
     request_key = request["request_key"]
 
     lock_state, reused_result, lock_fd = acquire_single_flight(
