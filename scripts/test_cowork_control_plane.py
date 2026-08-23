@@ -26,6 +26,74 @@ _VALID_GATE_EVIDENCE = {
     },
 }
 
+# M3 Package A additions: well-shaped evidence for the three new
+# evidence-gated events, mirroring _VALID_GATE_EVIDENCE above so the
+# pre-existing exhaustive-matrix test can supply matching evidence per
+# event exactly as it already does for gate_validated (see
+# test_every_state_event_pair_is_legal_or_explicitly_rejected's evidence
+# selection below).
+_VALID_CAPACITY_EVIDENCE = {
+    "capacity_evidence": {
+        "controller_outcome": "quota_limited",
+        "role": "builder",
+        "provider_session_id": "sess-1",
+        "controller_policy_digest": "a" * 64,
+        "candidate_manifest_digest": "b" * 64,
+        "candidate_index": 0,
+        "resume_mode": "scheduled",
+        "model": "claude-x",
+        "effort": "high",
+        "artifact_hashes": {"manifest": "c" * 64},
+        "automation_ref": "scheduler-ref-1",
+    },
+}
+_VALID_CAPACITY_WAKE_EVIDENCE = {
+    "capacity_wake_evidence": {
+        "kind": "trustworthy_reset",
+        "lease_id": "lease-1",
+        "role": "builder",
+        "provider_session_id": "sess-1",
+        "controller_policy_digest": "a" * 64,
+        "candidate_manifest_digest": "b" * 64,
+        "candidate_index": 0,
+        "consumption_state": "consumed",
+        "not_before": "2026-08-23T00:00:00Z",
+        "current_clock": "2026-08-23T01:00:00Z",
+    },
+}
+_VALID_CAPACITY_WAKE_PREFLIGHT_FAILURE_EVIDENCE = {
+    "capacity_wake_preflight_failure": {
+        "lease_id": "lease-1",
+        "role": "builder",
+        "provider_session_id": "sess-1",
+        "controller_policy_digest": "a" * 64,
+        "candidate_manifest_digest": "b" * 64,
+        "candidate_index": 0,
+        "failure_kind": "stale_lease",
+    },
+}
+
+# Maps each evidence-gated M3/M2 event to well-shaped evidence for it; every
+# other event supplies no evidence (None), matching the pre-M3 ternary this
+# extends.
+_VALID_EVIDENCE_BY_EVENT = {
+    "gate_validated": _VALID_GATE_EVIDENCE,
+    "capacity_reserved": _VALID_CAPACITY_EVIDENCE,
+    "capacity_wake_claimed": _VALID_CAPACITY_WAKE_EVIDENCE,
+    "capacity_wake_preflight_failed": _VALID_CAPACITY_WAKE_PREFLIGHT_FAILURE_EVIDENCE,
+}
+
+# M3A-REV-001-RESIDUAL: the three M3 capacity events REQUIRE a genuine,
+# well-formed expected_candidate (unlike gate_validated, which honors an
+# omitted one as a deliberate skip) — the candidate identity every
+# _VALID_CAPACITY_*_EVIDENCE block above already names ("b" * 64, index 0).
+_VALID_EXPECTED_CANDIDATE = {"candidate_manifest_digest": "b" * 64, "candidate_index": 0}
+_VALID_EXPECTED_CANDIDATE_BY_EVENT = {
+    "capacity_reserved": _VALID_EXPECTED_CANDIDATE,
+    "capacity_wake_claimed": _VALID_EXPECTED_CANDIDATE,
+    "capacity_wake_preflight_failed": _VALID_EXPECTED_CANDIDATE,
+}
+
 # Runtime modules the reviewer_focus/import-boundary gate names explicitly.
 _FORBIDDEN_RUNTIME_MODULES = frozenset({
     "cowork", "cowork_bridge", "cowork_state", "cowork_ledger",
@@ -77,6 +145,9 @@ class ReducerExhaustiveMatrixTest(unittest.TestCase):
         ("preflighting", "capability_missing"): ("needs_authority", "capability_missing"),
         ("preflighting", "cancelled"): ("cancelled", "cancelled"),
         ("preflighting", "aborted"): ("aborted", "aborted"),
+        ("preflighting", "capacity_reserved"): ("awaiting_capacity", "capacity_reserved"),
+        ("preflighting", "capacity_wake_preflight_failed"): (
+            "awaiting_capacity", "capacity_wake_preflight_failed"),
 
         ("running", "turn_completed"): ("awaiting_gate", "turn_completed"),
         ("running", "dependency_blocked"): ("blocked", "dependency_blocked"),
@@ -84,6 +155,7 @@ class ReducerExhaustiveMatrixTest(unittest.TestCase):
         ("running", "execution_failed"): ("failed", "execution_failed"),
         ("running", "cancelled"): ("cancelled", "cancelled"),
         ("running", "aborted"): ("aborted", "aborted"),
+        ("running", "capacity_reserved"): ("awaiting_capacity", "capacity_reserved"),
 
         ("awaiting_gate", "gate_validated"): ("completed", "gate_validated"),
         ("awaiting_gate", "gate_rejected"): ("failed", "gate_rejected"),
@@ -96,6 +168,10 @@ class ReducerExhaustiveMatrixTest(unittest.TestCase):
 
         ("needs_authority", "cancelled"): ("cancelled", "cancelled"),
         ("needs_authority", "aborted"): ("aborted", "aborted"),
+
+        ("awaiting_capacity", "capacity_wake_claimed"): ("preflighting", "capacity_wake_claimed"),
+        ("awaiting_capacity", "cancelled"): ("cancelled", "cancelled"),
+        ("awaiting_capacity", "aborted"): ("aborted", "aborted"),
     }
 
     def test_legal_transitions_match_spec_exactly(self):
@@ -110,8 +186,18 @@ class ReducerExhaustiveMatrixTest(unittest.TestCase):
         illegal_count = 0
         for state, event in all_pairs:
             with self.subTest(state=state, event=event):
-                evidence = _VALID_GATE_EVIDENCE if event == "gate_validated" else None
-                new_state, reason_code = cp.advance(state, event, evidence)
+                # M3 note: this line was extended (beyond the frozen brief's
+                # named LEGAL-table/reachability-test edits) from
+                # `_VALID_GATE_EVIDENCE if event == "gate_validated" else
+                # None` to `_VALID_EVIDENCE_BY_EVENT.get(event)`, purely
+                # additively (new evidence branches only) — required so this
+                # pre-existing exhaustive matrix test still supplies
+                # matching evidence for the three new evidence-gated events,
+                # exactly as it already did for gate_validated.
+                evidence = _VALID_EVIDENCE_BY_EVENT.get(event)
+                expected_candidate = _VALID_EXPECTED_CANDIDATE_BY_EVENT.get(event)
+                new_state, reason_code = cp.advance(
+                    state, event, evidence, expected_candidate=expected_candidate)
                 if (state, event) in self.LEGAL:
                     legal_count += 1
                     expected_state, expected_reason = self.LEGAL[(state, event)]
@@ -218,24 +304,50 @@ class ReducerExhaustiveMatrixTest(unittest.TestCase):
                 self.assertEqual(event, "capability_missing",
                                   "only capability_missing may target needs_authority")
 
-    def test_awaiting_capacity_unreachable_m2(self):
-        """Named per the frozen brief: zero (state, event) pairs target
-        awaiting_capacity. It is enum/table-present for future M3 activation
-        but has no legal inbound M2 transition."""
+    def test_awaiting_capacity_m3_narrowly_reachable(self):
+        """Named per the frozen brief (replacing test_awaiting_capacity_
+        unreachable_m2): asserts the ONLY (state, event) pairs whose target
+        is awaiting_capacity are exactly (running, capacity_reserved),
+        (preflighting, capacity_reserved), and (preflighting,
+        capacity_wake_preflight_failed); every other (state, event) pair in
+        the full PHASE_STATE_SET x EVENT_SET product still never targets
+        awaiting_capacity."""
         self.assertIn("awaiting_capacity", cp.PHASE_STATES)
         self.assertIn("capacity_reserved", cp.EVENTS)
+        self.assertIn("capacity_wake_claimed", cp.EVENTS)
+        self.assertIn("capacity_wake_preflight_failed", cp.EVENTS)
 
-        targets = {new_state for new_state, _ in cp.TRANSITIONS.values()}
-        self.assertNotIn("awaiting_capacity", targets)
+        expected_inbound_pairs = frozenset({
+            ("running", "capacity_reserved"),
+            ("preflighting", "capacity_reserved"),
+            ("preflighting", "capacity_wake_preflight_failed"),
+        })
 
+        # Table-level check: exactly these three keys target awaiting_capacity.
+        actual_inbound_pairs = frozenset(
+            pair for pair, (new_state, _reason) in cp.TRANSITIONS.items()
+            if new_state == "awaiting_capacity"
+        )
+        self.assertEqual(actual_inbound_pairs, expected_inbound_pairs)
+
+        # Behavioral check over the full PHASE_STATE_SET x EVENT_SET product,
+        # with well-shaped evidence supplied per event so a genuinely legal
+        # transition is not miscounted as unreachable merely for lacking
+        # evidence.
         for state, event in itertools.product(cp.PHASE_STATES, cp.EVENTS):
-            if state == "awaiting_capacity":
+            if state == "awaiting_capacity" and (state, event) not in expected_inbound_pairs:
                 continue  # staying put on an illegal event is not "reaching" it
-            evidence = _VALID_GATE_EVIDENCE if event == "gate_validated" else None
-            new_state, _ = cp.advance(state, event, evidence)
-            self.assertNotEqual(
-                new_state, "awaiting_capacity",
-                "no (state, event) pair may transition into awaiting_capacity in M2")
+            with self.subTest(state=state, event=event):
+                evidence = _VALID_EVIDENCE_BY_EVENT.get(event)
+                expected_candidate = _VALID_EXPECTED_CANDIDATE_BY_EVENT.get(event)
+                new_state, _ = cp.advance(
+                    state, event, evidence, expected_candidate=expected_candidate)
+                if (state, event) in expected_inbound_pairs:
+                    self.assertEqual(new_state, "awaiting_capacity")
+                else:
+                    self.assertNotEqual(
+                        new_state, "awaiting_capacity",
+                        "(%r, %r) must never transition into awaiting_capacity" % (state, event))
 
     def test_unknown_state_raises(self):
         with self.assertRaises(ValueError):
