@@ -3983,3 +3983,1743 @@ def read_m2_state(state, work_id=None):
     except (ValueError, ImportError):
         return absent
     return result
+
+
+# =========================================================================== #
+# M3 Package B: durable, crash-safe, genuinely cross-process-safe persistence #
+# for ProviderHealth, CapacityPacket, PauseLease, manual-capacity signals,    #
+# InvalidationRecord history, and pending-turn-before-pause-ack. Every        #
+# schema below that Package A (`cowork_capacity.py`, frozen/read-only)        #
+# already defines is validated through IT before anything is durably         #
+# written; this section never invents its own shape for a record Package A   #
+# already owns. ProviderHealth has no Package A schema of its own -- this    #
+# section defines and validates that one shape itself (see the banner        #
+# immediately above `PROVIDER_HEALTH_STATUSES` below for why, and note this  #
+# worker's returned `assumptions` flags that shape as this package's own     #
+# interpretation, since the frozen plan object itself was not an accessible  #
+# file inside this isolated worktree).                                      #
+#                                                                              #
+# LAZY DEPENDENCY: `cowork_capacity` is imported LOCALLY (`_import_capacity`  #
+# below), for the identical isolated-snapshot reason as the M2 LAZY          #
+# DEPENDENCY banner above -- importing THIS file must never require Package  #
+# A's siblings to be present. The Ed25519 constant/arithmetic definitions    #
+# further below are likewise never RUN (only DEFINED) at import time except  #
+# for the cheap constant derivations; the expensive self-test is deferred to #
+# first actual use -- see `_ed25519_ensure_selftested`'s own docstring.      #
+# =========================================================================== #
+
+
+def _import_capacity():
+    """Lazily import `cowork_capacity` (M3 Package A). See the module-level
+    LAZY DEPENDENCY note above this M3 section for why this is a local, not
+    top-level, import."""
+    import cowork_capacity
+    return cowork_capacity
+
+
+def capacity_dir_for(session_uuid):
+    """Root directory for every M3 Package B durable capacity artifact
+    belonging to one session. Rejects unsafe session_uuid values, exactly
+    like every other per-session directory helper in this module. The root
+    is overridable via COWORK_SESSIONS_ROOT (inherited from
+    `session_assets_dir`), so tests never write to the real home dir."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid), "capacity")
+
+
+class PauseLeaseConflict(Exception):
+    """Raised by every PauseLease state-transition function
+    (`claim_pause_lease`/`cancel_pause_lease`/`mark_pause_lease_consumed`/
+    `replace_pause_lease`) when the lease named does not exist, or its
+    CURRENT durable `consumption_state` does not permit the requested
+    transition. Carries the structured `lease_id`/`reason`/`state` a caller
+    needs to report a truthful conflict rather than a bare string message.
+    Never raised for the exact idempotent-retry case `mark_pause_lease_
+    consumed` documents as success -- that case returns normally instead.
+
+    `blocking_lease_id` (optional) additively names the OTHER lease_id
+    responsible for a `'binding_already_live'` conflict from
+    `create_pause_lease` -- the still-live lease for this binding that
+    must be claimed/cancelled/replaced before a fresh one can be minted."""
+
+    def __init__(self, lease_id, reason, state=None, blocking_lease_id=None):
+        self.lease_id = lease_id
+        self.reason = reason
+        self.state = state
+        self.blocking_lease_id = blocking_lease_id
+        super().__init__(
+            "PauseLease %r: %s (state=%r, blocking_lease_id=%r)"
+            % (lease_id, reason, state, blocking_lease_id))
+
+
+class CrossBindingReplacementError(ValueError):
+    """Raised by `replace_pause_lease` when the new lease's binding identity
+    (role, provider_session_id, controller_policy_digest, candidate_digest)
+    does not exactly match the OLD lease's current, durable binding --
+    closing Package A's residual binding requirement that every replacement
+    path reject cross-binding replacement. Writes nothing."""
+
+
+class ManualSignalSignatureError(ValueError):
+    """Raised by `verify_manual_capacity_signal`/`write_manual_capacity_
+    signal` when the detached signature does not cryptographically verify
+    against the pinned public key material for the record's
+    `signer_public_key_id` -- a genuine cryptographic rejection, never a
+    shape-only check (Package A's `validate_manual_capacity_signal` already
+    covers shape; see that function's own docstring for why it explicitly
+    stops short of this). Writes nothing on failure."""
+
+
+class CorruptRecordError(ValueError):
+    """Raised by every M3 Package B locked read-check-write path (never by
+    a bare public `read_*` accessor -- those stay tolerant, matching every
+    M1/M2 `read_*` in this module) when a durable record's file EXISTS but
+    fails to parse as a JSON object -- damaged state must conflict
+    EXPLICITLY, never silently collapse to "absent" and let a caller
+    overwrite, reset, or discard what a damaged file was actually still
+    holding (M3B-REV-M03). Distinguishing "genuinely never written"
+    (`None`) from "written, then damaged" (this exception) is exactly the
+    fix: a genuinely absent record still lets create/write proceed; a
+    corrupt one never does."""
+
+
+def _read_json_or_raise_if_corrupt(path):
+    """Read one JSON object from `path`, or return `None` when `path` does
+    not exist AT ALL. Unlike `read_json_tolerant` (which collapses both
+    "missing" and "present-but-malformed" to `None`), a path that EXISTS
+    but is not valid, well-formed JSON naming an object raises
+    `CorruptRecordError` instead (M3B-REV-M03) -- every M3 Package B locked
+    mutate closure below reads its `existing` state through this, never
+    through the tolerant reader, so corruption can never be silently
+    mistaken for a fresh, never-written record."""
+    if not path:
+        return None
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise CorruptRecordError(
+            "%s: exists but is unreadable or malformed JSON (%s)" % (path, exc))
+    if not isinstance(data, dict):
+        raise CorruptRecordError(
+            "%s: exists but its JSON content is not an object (got %s)"
+            % (path, type(data).__name__))
+    return data
+
+
+_M3_LOCK_TIMEOUT_SECONDS = 30
+
+
+def _flock_exclusive_with_timeout(fh, timeout_seconds=None):
+    """Acquire `fh`'s `fcntl.flock(LOCK_EX)`, bounded by `timeout_seconds`
+    (default: the CURRENT value of module-level `_M3_LOCK_TIMEOUT_SECONDS`,
+    looked up fresh on every call -- deliberately NOT bound as an ordinary
+    Python default-argument value, which is captured once at function-
+    definition time and would then be immune to a test or caller
+    reconfiguring the module-level constant afterward) via a short
+    exponential-backoff poll using `LOCK_EX | LOCK_NB` -- every M3 Package
+    B lock acquisition below goes through this (never a bare, unbounded
+    `fcntl.flock(LOCK_EX)`) so a genuinely stuck holder (a hung or
+    deadlocked peer process) fails LOUD with `TimeoutError` (a built-in
+    `OSError` subclass in Python 3, so it composes with every `except
+    OSError` in this module) after a bounded wait, instead of blocking
+    this caller forever (M3B-REV-N03). This is a NEW primitive for M3
+    Package B's own new lock sites ONLY -- M1/M2's pre-existing
+    `_locked_jsonl_append`'s bare, unbounded `flock` (used by the M2
+    WorkUnit/PhaseState/graph-revision stores, and by this package's own
+    append-only InvalidationRecord history) is UNMODIFIED by this
+    addition; see that function's own docstring for its own contract."""
+    if timeout_seconds is None:
+        timeout_seconds = _M3_LOCK_TIMEOUT_SECONDS
+    deadline = time.time() + timeout_seconds
+    delay = 0.001
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    "timed out after %ss waiting for an M3 Package B lock (%r)"
+                    % (timeout_seconds, getattr(fh, "name", fh)))
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
+
+
+def write_json_atomic_durable(path, data):
+    """Crash-safe, DURABLE variant of `write_json_atomic` (M1/M2, left
+    completely UNMODIFIED by this addition -- every pre-existing caller of
+    `write_json_atomic` keeps its exact prior behavior) for M3 Package B's
+    own write boundaries: identical temp-write-then-`os.replace` shape,
+    but ALSO `fsync`s the written file's own bytes AND the parent
+    directory (reusing `_fsync_parent_dir` above, UNCHANGED) before ever
+    returning True.
+
+    This closes M3B-REV-B03: `write_json_atomic` alone only guarantees the
+    bytes reached the page cache and the rename landed in the directory's
+    in-memory state -- neither survives a real OS crash or power loss
+    without an explicit `fsync`, exactly the B-CRASH-ATOMICITY-1 defect
+    this module's jsonl path (`append_jsonl_atomic`) already corrected;
+    this brings the SAME correction to the single-record JSON path every
+    M3 Package B store depends on. The parent-directory `fsync` runs after
+    EVERY successful `os.replace` (not merely when this call newly
+    CREATES `path`, unlike `append_jsonl_atomic`'s narrower case) because
+    `os.replace` mutates the parent directory's dirent EVERY time --
+    retargeting an existing name's inode is exactly as much a directory
+    mutation as creating a brand new one, and needs the identical
+    durability proof.
+
+    Returns True only once the file's bytes AND its directory entry are
+    verified durable; False on any OSError/ValueError/TypeError anywhere
+    along the way (never raises) -- identical tolerant contract to
+    `write_json_atomic`."""
+    if not path:
+        return False
+    tmp = None
+    try:
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = path + ".tmp.%d.%d" % (os.getpid(), int(time.time() * 1e6))
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        _fsync_parent_dir(path)
+    except (OSError, ValueError, TypeError):
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+    return True
+
+
+def _locked_json_transaction(path, mutate):
+    """Serialize a read-check-write sequence against `path` behind a real
+    OS-level `fcntl.flock` exclusive lock on `<path>.lock` (bounded by
+    `_flock_exclusive_with_timeout`) -- the M3 Package B twin of
+    `_locked_jsonl_append` above, for records that are a single CURRENT
+    JSON object (mutated in place) rather than an append-only line log.
+    `flock` is a genuine cross-PROCESS lock (not merely a Python-level
+    `threading.Lock`), so two truly separate OS processes racing the same
+    `path` are still serialized -- exactly the "real macOS OS-level
+    exclusive lock around the whole lease read/check/write sequence"
+    invariant this exists to satisfy, generalized to every other
+    single-record M3 store below (ProviderHealth, CapacityPacket,
+    manual-capacity signals, pending-turn-before-pause-ack) so there is one
+    locking primitive, not several bespoke ones.
+
+    `mutate(existing)` receives the CURRENT durable record, read FRESH
+    under the lock via `_read_json_or_raise_if_corrupt` -- never a stale
+    snapshot taken before acquiring it, and never a silent `None` for a
+    record that exists but is corrupt (M3B-REV-M03: that raises
+    `CorruptRecordError` before `mutate` is even called). It must do
+    exactly one of:
+      - return a `dict`: the new durable record, atomically AND DURABLY
+        written via `write_json_atomic_durable` before this function
+        returns it;
+      - return `None`: no write happens, and this function returns
+        `existing` UNCHANGED -- captured from the SAME lock-protected read
+        `mutate` itself was called with, NEVER a re-read taken after the
+        lock is released (M3B-REV-M02: a caller relying on this
+        "idempotent, return the current value" outcome must never observe
+        a DIFFERENT, later value a concurrent writer produced after this
+        call's own lock was already released -- the value returned here is
+        decided, and captured, entirely inside the held lock);
+      - raise: no write happens, and the exception propagates to the
+        caller (e.g. `PauseLeaseConflict`) -- the record on disk is left
+        byte-identical to before this call.
+
+    Raises `OSError` if `write_json_atomic_durable` itself reports failure
+    (a genuine write/fsync failure), leaving the prior durable record
+    untouched -- crash-safe at this boundary exactly like every M2 write
+    boundary above. Raises `TimeoutError` if the lock cannot be acquired
+    within `_M3_LOCK_TIMEOUT_SECONDS`.
+
+    MUST NOT be called reentrantly for the SAME path from a signal handler
+    already holding this same lock -- identical hazard to `_locked_jsonl_
+    append`'s own documented restriction; M3 Package B has no reentrant
+    signal-handler caller, so no unlocked twin is provided here."""
+    lock_path = path + ".lock"
+    dirname = os.path.dirname(lock_path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    lock_fh = open(lock_path, "a+")
+    try:
+        _flock_exclusive_with_timeout(lock_fh)
+        try:
+            existing = _read_json_or_raise_if_corrupt(path)
+            result = mutate(existing)
+            if result is None:
+                return existing
+            if not write_json_atomic_durable(path, result):
+                raise OSError("write failed for %s" % path)
+            return result
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fh.close()
+
+
+# --------------------------------------------------------------------------- #
+# PauseLease store: create / claim / cancel / consume / replace, each        #
+# serialized against every other writer of the SAME lease_id via a real      #
+# OS-level `fcntl.flock`.                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def pause_lease_path_for(session_uuid, lease_id):
+    """Path of one durably persisted PauseLease, keyed by its own
+    `lease_id`. Rejects unsafe session_uuid/lease_id values."""
+    _assert_safe_identifier(lease_id, "lease_id")
+    return os.path.join(capacity_dir_for(session_uuid), "pause_leases",
+                        "%s.json" % lease_id)
+
+
+_PAUSE_LEASE_BOOKKEEPING_KEYS = (
+    "claimant_ref", "claimed_at", "cancelled_at", "consumed_at",
+    "expired_at", "replaced_at", "replaced_by", "replaced_from",
+)
+
+
+def pause_lease_from_stored_record(record):
+    """Project one persisted PauseLease store record back to the exact
+    canonical PauseLease shape `cowork_capacity.validate_pause_lease`
+    accepts, dropping this store's own bookkeeping fields (`claimant_ref`,
+    `claimed_at`, `cancelled_at`, `consumed_at`, `replaced_at`,
+    `replaced_by`, `replaced_from`) -- mirrors `work_unit_from_history_
+    record`'s identical role for the M2 WorkUnit store, and for the
+    identical reason: `validate_pause_lease` enforces an EXACT key set via
+    `_check_exact_keys`, so a persisted record carrying this store's own
+    storage metadata fails it verbatim unless those fields are dropped
+    first. Returns None when `record` is None. A pure dict projection:
+    never mutates `record`, performs no I/O, and does not itself
+    validate."""
+    if record is None:
+        return None
+    projected = dict(record)
+    for key in _PAUSE_LEASE_BOOKKEEPING_KEYS:
+        projected.pop(key, None)
+    return projected
+
+
+_PAUSE_LEASE_BOOKKEEPING_DEFAULTS = {
+    "claimant_ref": None, "claimed_at": None, "cancelled_at": None,
+    "consumed_at": None, "expired_at": None, "replaced_at": None,
+    "replaced_by": None, "replaced_from": None,
+}
+
+_PAUSE_LEASE_BINDING_FIELDS = ("role", "provider_session_id",
+                              "controller_policy_digest", "candidate_digest")
+
+
+def _pause_lease_binding_key(binding):
+    """Deterministic, collision-resistant key for one PauseLease BINDING
+    identity (role, provider_session_id, controller_policy_digest,
+    candidate_digest) -- sha256 of a `\\x1f`-delimited join (mirrors
+    `manual_capacity_signal_path_for`'s identical hashing convention).
+    None of the four fields can themselves contain a literal `\\x1f` byte:
+    `role` is constrained by `_assert_safe_identifier`'s charset (checked
+    by every caller below before this is reached), and the other three are
+    constrained by `cowork_capacity`'s own hex64/nonempty-str shape checks
+    -- so this join is unambiguous, never a collision between two distinct
+    bindings."""
+    raw = "\x1f".join(str(binding[f]) for f in _PAUSE_LEASE_BINDING_FIELDS)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def pause_lease_binding_index_path_for(session_uuid, binding):
+    """Path of the durable binding-to-current-lease index entry for one
+    PauseLease binding identity -- the single source of truth this module
+    consults to answer "is there already a live (non-terminal) PauseLease
+    for this binding" (M3B-REV-B02/M01: without this, `create_pause_lease`
+    could always mint a fresh, zero-attempt lease for an already-live or
+    already-ceiling-exhausted binding, silently resetting/bypassing the
+    M3R-N06 wake-attempt accounting, and two genuinely live leases for one
+    binding would be durably indistinguishable -- reconstruction could
+    never say which one is "current"). `binding` is a dict carrying at
+    least `_PAUSE_LEASE_BINDING_FIELDS`."""
+    key = _pause_lease_binding_key(binding)
+    return os.path.join(capacity_dir_for(session_uuid), "pause_lease_bindings",
+                        "%s.json" % key)
+
+
+_MAX_PAUSE_LEASE_REPLACEMENT_CHAIN_HOPS = 64
+
+
+def _resolve_current_pause_lease(session_uuid, start_lease_id):
+    """Starting from `start_lease_id` (the binding index's own pointer),
+    follow `replaced_by` pointers until reaching a lease whose
+    `consumption_state` is NOT `'replaced'` -- the durable, self-healing
+    resolution of "which lease is CURRENT for a binding" that tolerates a
+    crash landing between `replace_pause_lease` durably writing the new
+    lease and durably updating the binding index to point directly at it
+    (the index may still name the OLD, now-`replaced` lease; this walks
+    forward to the true current one instead of trusting a possibly
+    one-hop-stale pointer).
+
+    Returns `(lease_id, stored_record)` for the resolved current lease.
+    Raises `CorruptRecordError` if any lease in the chain is missing (an
+    index/chain pointing at a lease_id that was never durably written is
+    inconsistent state, not a legitimate "absent" outcome) or unparseable,
+    and `PauseLeaseConflict(start_lease_id, 'binding_index_cycle')` if the
+    chain exceeds `_MAX_PAUSE_LEASE_REPLACEMENT_CHAIN_HOPS` (a genuine
+    replacement chain is always strictly finite and short in practice; a
+    cycle can only mean corrupted `replaced_by` data)."""
+    lease_id = start_lease_id
+    for _ in range(_MAX_PAUSE_LEASE_REPLACEMENT_CHAIN_HOPS):
+        path = pause_lease_path_for(session_uuid, lease_id)
+        record = _read_json_or_raise_if_corrupt(path)
+        if record is None:
+            raise CorruptRecordError(
+                "pause lease binding index names lease_id %r, which does "
+                "not exist on disk" % lease_id)
+        if record.get("consumption_state") != "replaced":
+            return lease_id, record
+        next_lease_id = record.get("replaced_by")
+        if not next_lease_id:
+            raise CorruptRecordError(
+                "pause lease %r is 'replaced' but names no replaced_by "
+                "successor" % lease_id)
+        lease_id = next_lease_id
+    raise PauseLeaseConflict(start_lease_id, "binding_index_cycle")
+
+
+def _open_locked(lock_path):
+    """Open (creating parent dirs as needed) and exclusively `flock` (with
+    `_flock_exclusive_with_timeout`) the lock file at `lock_path`. Returns
+    the open file handle; caller is responsible for unlocking (`fcntl.
+    flock(..., LOCK_UN)`) and closing it, exactly like every other bespoke
+    lock acquisition in this module. Shared by `create_pause_lease` and
+    `replace_pause_lease` for their outer BINDING-index lock, so both use
+    identical lock-file setup."""
+    dirname = os.path.dirname(lock_path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    fh = open(lock_path, "a+")
+    _flock_exclusive_with_timeout(fh)
+    return fh
+
+
+def create_pause_lease(session_uuid, pause_lease):
+    """Durably persist a NEWLY MINTED PauseLease -- the crash-safe creation
+    boundary. `pause_lease` is validated via `cowork_capacity.validate_
+    pause_lease` (Package A) BEFORE anything is written; an invalid record
+    raises ValueError and writes nothing. Requires `consumption_state ==
+    'unclaimed'` and `failed_wake_attempts == 0` -- a lease is always born
+    fresh; a caller minting one already claimed/consumed/etc., or already
+    carrying wake attempts, is not creating a genuinely new lease (raises
+    ValueError, writes nothing) -- a REPLACEMENT lease with carried-forward
+    attempts goes through `replace_pause_lease` instead, never this
+    function.
+
+    BINDING-LIVE CHECK (M3B-REV-B02/M01): serialized against every other
+    create/replace for the SAME BINDING (role, provider_session_id,
+    controller_policy_digest, candidate_digest) via that binding's own
+    durable index lock (`pause_lease_binding_index_path_for`), acquired
+    BEFORE this lease's own per-lease_id lock -- a single, deterministic
+    lock-acquisition order (binding, then lease) that also closes
+    M3B-REV-N03 for this path. If the index already names a lease for this
+    binding that resolves (`_resolve_current_pause_lease`, following any
+    `replaced_by` chain) to a currently `unclaimed` or `claimed` state,
+    this raises `PauseLeaseConflict(..., 'binding_already_live', ...,
+    blocking_lease_id=<that lease_id>)` and writes nothing -- a fresh
+    mint can never silently reset or duplicate an already-live binding's
+    wake-attempt accounting; only `replace_pause_lease` may supersede a
+    live lease, and it always carries the counter forward. A binding whose
+    resolved current lease is genuinely terminal (`consumed`/`cancelled`/
+    `expired`) may start a brand new, independent pause episode at
+    `failed_wake_attempts=0` via this function.
+
+    Also raises `PauseLeaseConflict` -- writing nothing -- if a lease
+    already exists at this exact `lease_id` (creation is one-time per
+    lease_id; a genuine replacement mints its own fresh lease_id via
+    `replace_pause_lease`).
+
+    Returns the durably stored, normalized record (the validated PauseLease
+    fields plus this store's own bookkeeping fields, all initialized to
+    None -- see `pause_lease_from_stored_record` to project back to the
+    exact canonical PauseLease shape)."""
+    capacity = _import_capacity()
+    validated = capacity.validate_pause_lease(pause_lease)
+    if validated["consumption_state"] != "unclaimed":
+        raise ValueError(
+            "a newly created PauseLease must have consumption_state="
+            "'unclaimed', got %r" % validated["consumption_state"])
+    if validated["failed_wake_attempts"] != 0:
+        raise ValueError(
+            "a newly created PauseLease must have failed_wake_attempts=0, "
+            "got %r" % validated["failed_wake_attempts"])
+
+    binding_lock_path = pause_lease_binding_index_path_for(session_uuid, validated) + ".lock"
+    binding_lock_fh = _open_locked(binding_lock_path)
+    try:
+        index_path = pause_lease_binding_index_path_for(session_uuid, validated)
+        index = _read_json_or_raise_if_corrupt(index_path)
+        if index is not None:
+            blocking_lease_id, blocking_record = _resolve_current_pause_lease(
+                session_uuid, index["current_lease_id"])
+            if blocking_record.get("consumption_state") in ("unclaimed", "claimed"):
+                raise PauseLeaseConflict(
+                    validated["lease_id"], "binding_already_live",
+                    blocking_record.get("consumption_state"),
+                    blocking_lease_id=blocking_lease_id)
+
+        path = pause_lease_path_for(session_uuid, validated["lease_id"])
+
+        def mutate(existing):
+            if existing is not None:
+                raise PauseLeaseConflict(
+                    validated["lease_id"], "already_exists",
+                    existing.get("consumption_state"))
+            stored = dict(validated)
+            stored.update(_PAUSE_LEASE_BOOKKEEPING_DEFAULTS)
+            return stored
+
+        stored = _locked_json_transaction(path, mutate)
+
+        # Written directly (never via `_locked_json_transaction`, which
+        # would re-open-and-re-flock this SAME `index_path` -- a genuine
+        # self-deadlock, since `binding_lock_fh` above already holds this
+        # exact lock on a different fd and flock attaches to the open file
+        # DESCRIPTION, not the process; verified empirically that a
+        # second same-process open+LOCK_EX on the identical path conflicts
+        # with the first). This call already holds the index's lock, so a
+        # plain durable write is all that is needed.
+        if not write_json_atomic_durable(index_path, {"current_lease_id": validated["lease_id"]}):
+            raise OSError("write failed for %s" % index_path)
+        return stored
+    finally:
+        try:
+            fcntl.flock(binding_lock_fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        binding_lock_fh.close()
+
+
+def read_pause_lease(session_uuid, lease_id):
+    """Read of one durable PauseLease store record (the enriched shape
+    `create_pause_lease` et al. persist -- see `pause_lease_from_stored_
+    record` to project it back to the canonical schema): returns the
+    record, or None if missing/unreadable/no-longer-schema-valid
+    (M3B-REV-N05: re-validates the projected canonical shape before
+    returning, so a tampered-but-parseable record is never handed back as
+    truth -- mirrors `read_provider_health`'s identical precedent). Never
+    raises -- mirrors every other `read_*` accessor in this module."""
+    try:
+        path = pause_lease_path_for(session_uuid, lease_id)
+    except ValueError:
+        return None
+    raw = read_json_tolerant(path)
+    if raw is None:
+        return None
+    try:
+        _import_capacity().validate_pause_lease(pause_lease_from_stored_record(raw))
+    except (ValueError, ImportError):
+        return None
+    return raw
+
+
+def claim_pause_lease(session_uuid, lease_id, claimant_ref):
+    """Atomically claim an `unclaimed` PauseLease for `claimant_ref` (an
+    opaque caller-supplied identity string naming who/what is claiming it),
+    under a real OS-level exclusive lock spanning the WHOLE read-check-
+    write sequence, so two genuinely separate OS processes racing to claim
+    the SAME lease_id are truthfully serialized: exactly one call durably
+    wins (returns the newly `claimed` record) and the other raises
+    `PauseLeaseConflict` -- writing nothing -- never a silent double-claim
+    and never an ambiguous partial state.
+
+    Raises `PauseLeaseConflict` when: the lease does not exist
+    (`reason='not_found'`), or its current `consumption_state` is anything
+    other than `'unclaimed'` (`reason='not_unclaimed'`) -- including a
+    second claim attempt for a lease this exact call itself just claimed.
+    Not idempotent by design (unlike `mark_pause_lease_consumed`): a caller
+    retrying its OWN successful claim must not silently "win" again.
+
+    Re-validates the stored record's projected canonical shape before
+    mutating it (an integrity check against on-disk corruption, not merely
+    a business-rule check) -- a malformed on-disk record raises ValueError
+    from `cowork_capacity.validate_pause_lease` rather than silently having
+    its `consumption_state` flipped."""
+    if not isinstance(claimant_ref, str) or not claimant_ref:
+        raise ValueError("claimant_ref must be a nonempty string")
+    capacity = _import_capacity()
+    path = pause_lease_path_for(session_uuid, lease_id)
+
+    def mutate(existing):
+        if existing is None:
+            raise PauseLeaseConflict(lease_id, "not_found")
+        validated = capacity.validate_pause_lease(
+            pause_lease_from_stored_record(existing))
+        if validated["consumption_state"] != "unclaimed":
+            raise PauseLeaseConflict(
+                lease_id, "not_unclaimed", validated["consumption_state"])
+        claimed = dict(existing)
+        claimed["consumption_state"] = "claimed"
+        claimed["claimant_ref"] = claimant_ref
+        claimed["claimed_at"] = _utc_now()
+        return claimed
+
+    return _locked_json_transaction(path, mutate)
+
+
+def cancel_pause_lease(session_uuid, lease_id):
+    """Atomically cancel a PauseLease that is still `unclaimed` or
+    `claimed`, under the same real OS-level exclusive lock as
+    `claim_pause_lease`. Raises `PauseLeaseConflict` when the lease does
+    not exist (`reason='not_found'`) or its current `consumption_state` is
+    already terminal -- `consumed`/`cancelled`/`replaced`/`expired`
+    (`reason='not_cancellable'`) -- writing nothing; cancellation is not
+    idempotent (a second cancel of an already-cancelled lease is a
+    conflict, matching `claim_pause_lease`'s non-idempotent design, and
+    unlike `mark_pause_lease_consumed`'s documented idempotency)."""
+    capacity = _import_capacity()
+    path = pause_lease_path_for(session_uuid, lease_id)
+
+    def mutate(existing):
+        if existing is None:
+            raise PauseLeaseConflict(lease_id, "not_found")
+        validated = capacity.validate_pause_lease(
+            pause_lease_from_stored_record(existing))
+        if validated["consumption_state"] not in ("unclaimed", "claimed"):
+            raise PauseLeaseConflict(
+                lease_id, "not_cancellable", validated["consumption_state"])
+        cancelled = dict(existing)
+        cancelled["consumption_state"] = "cancelled"
+        cancelled["cancelled_at"] = _utc_now()
+        return cancelled
+
+    return _locked_json_transaction(path, mutate)
+
+
+def mark_pause_lease_consumed(session_uuid, lease_id):
+    """Atomically mark a `claimed` PauseLease `consumed`, under the same
+    real OS-level exclusive lock as `claim_pause_lease`/
+    `cancel_pause_lease`.
+
+    IDEMPOTENT (unlike claim/cancel): calling this again on a lease already
+    `consumed` is a harmless no-op that returns the SAME durable record
+    unchanged -- a caller retrying after its own successful consume (e.g.
+    because it crashed before observing the first call's return value)
+    must never see a conflict for repeating its own already-successful
+    action.
+
+    Raises `PauseLeaseConflict` -- writing nothing -- when: the lease does
+    not exist (`reason='never_claimed'`), the lease exists but was never
+    claimed (`consumption_state == 'unclaimed'`, `reason='never_claimed'`),
+    or the lease is in a DIFFERENT terminal state --
+    `cancelled`/`replaced`/`expired` (`reason='terminal'`). Only a
+    currently-`claimed` lease may transition to `consumed`."""
+    capacity = _import_capacity()
+    path = pause_lease_path_for(session_uuid, lease_id)
+
+    def mutate(existing):
+        if existing is None:
+            raise PauseLeaseConflict(lease_id, "never_claimed")
+        state = existing.get("consumption_state")
+        if state == "consumed":
+            return None  # idempotent no-op
+        if state == "unclaimed":
+            raise PauseLeaseConflict(lease_id, "never_claimed", state)
+        if state != "claimed":
+            raise PauseLeaseConflict(lease_id, "terminal", state)
+        capacity.validate_pause_lease(pause_lease_from_stored_record(existing))
+        consumed = dict(existing)
+        consumed["consumption_state"] = "consumed"
+        consumed["consumed_at"] = _utc_now()
+        return consumed
+
+    return _locked_json_transaction(path, mutate)
+
+
+def record_pause_lease_failed_wake_attempt(session_uuid, lease_id):
+    """Durably increment `failed_wake_attempts` on an `unclaimed` PauseLease
+    by exactly 1, under the SAME real OS-level exclusive lock as
+    `claim_pause_lease` -- the durable, lock-protected increment path
+    M3B-REV-B01 requires so `cowork_capacity.FAILED_WAKE_ATTEMPT_CEILING`
+    is actually REACHABLE through this package's own API (before this
+    function existed, every lease reachable through this module held
+    `failed_wake_attempts == 0` permanently, since `create_pause_lease`
+    requires 0 on input and nothing else ever touched the field).
+
+    Delegates the actual increment arithmetic to `cowork_capacity.record_
+    failed_wake_attempt` (Package A) -- the exact same function `replace_
+    pause_lease` uses (via `next_pause_lease_after_replacement`) for the
+    carried-forward monotonic count, so both paths cite one shared, single
+    source of truth for the counter/ceiling contract, never a locally
+    re-derived increment.
+
+    Raises `PauseLeaseConflict` when: the lease does not exist
+    (`reason='not_found'`), is not currently `unclaimed`
+    (`reason='not_unclaimed'` -- only a lease still awaiting an automatic
+    wake attempt can accrue one), or has already reached
+    `FAILED_WAKE_ATTEMPT_CEILING` (`reason='ceiling_exhausted'` -- callers
+    must consult `pause_lease_wake_decision`/`cowork_capacity.
+    wake_attempts_exhausted` BEFORE calling this again, then
+    `replace_pause_lease` for a fresh lease, exactly like Package A's own
+    `record_failed_wake_attempt` docstring already requires of every
+    caller of that pure function)."""
+    capacity = _import_capacity()
+    path = pause_lease_path_for(session_uuid, lease_id)
+
+    def mutate(existing):
+        if existing is None:
+            raise PauseLeaseConflict(lease_id, "not_found")
+        validated = capacity.validate_pause_lease(
+            pause_lease_from_stored_record(existing))
+        if validated["consumption_state"] != "unclaimed":
+            raise PauseLeaseConflict(
+                lease_id, "not_unclaimed", validated["consumption_state"])
+        if capacity.wake_attempts_exhausted(validated):
+            raise PauseLeaseConflict(
+                lease_id, "ceiling_exhausted", validated["consumption_state"])
+        incremented = capacity.record_failed_wake_attempt(validated)
+        stored = dict(existing)
+        stored["failed_wake_attempts"] = incremented["failed_wake_attempts"]
+        return stored
+
+    return _locked_json_transaction(path, mutate)
+
+
+def pause_lease_wake_decision(session_uuid, lease_id):
+    """Read-side convenience: `cowork_capacity.capacity_wake_decision`
+    (Package A) applied to the CURRENT durable state of `lease_id` --
+    `'wake_retry_eligible'` or `'wake_attempts_exhausted'`. Raises
+    ValueError (via `cowork_capacity.validate_pause_lease`) when the lease
+    does not exist or is no longer schema-valid; this is a pure read
+    projection, not a locked transaction -- no state is mutated."""
+    capacity = _import_capacity()
+    stored = read_pause_lease(session_uuid, lease_id)
+    if stored is None:
+        raise ValueError("no PauseLease found for lease_id %r" % lease_id)
+    validated = capacity.validate_pause_lease(pause_lease_from_stored_record(stored))
+    return capacity.capacity_wake_decision(validated)
+
+
+def mark_pause_lease_expired(session_uuid, lease_id):
+    """Atomically transition a PauseLease that is still `unclaimed` or
+    `claimed` to `expired` -- the durable transition
+    `_PAUSE_LEASE_REPLACEABLE_STATES` already named as replaceable but
+    which, before this function, no code could ever durably reach
+    (M3B-REV-N04). Expiry is a CALLER-DECIDED fact: this module reads no
+    wall clock and makes no time-based decision of its own (consistent
+    with Package A's own no-wall-clock-access design, and with every
+    other PauseLease transition in this module) -- the caller determines
+    a lease's `not_before` window has passed with no claim, and this
+    function durably records that decision. Same conflict semantics as
+    `cancel_pause_lease`: raises `PauseLeaseConflict` when the lease does
+    not exist (`reason='not_found'`) or is already terminal
+    (`reason='not_expirable'`); not idempotent, matching `cancel_pause_
+    lease`'s design."""
+    capacity = _import_capacity()
+    path = pause_lease_path_for(session_uuid, lease_id)
+
+    def mutate(existing):
+        if existing is None:
+            raise PauseLeaseConflict(lease_id, "not_found")
+        validated = capacity.validate_pause_lease(
+            pause_lease_from_stored_record(existing))
+        if validated["consumption_state"] not in ("unclaimed", "claimed"):
+            raise PauseLeaseConflict(
+                lease_id, "not_expirable", validated["consumption_state"])
+        expired = dict(existing)
+        expired["consumption_state"] = "expired"
+        expired["expired_at"] = _utc_now()
+        return expired
+
+    return _locked_json_transaction(path, mutate)
+
+
+_PAUSE_LEASE_REPLACEABLE_STATES = ("unclaimed", "claimed", "expired")
+
+
+def replace_pause_lease(session_uuid, old_lease_id, new_pause_lease):
+    """M3 Package A residual-binding closure: replace an existing PauseLease
+    with a fresh one for the SAME binding, computing the fresh lease's
+    `failed_wake_attempts` EXCLUSIVELY via `cowork_capacity.next_pause_
+    lease_after_replacement` -- never accepting the caller's own
+    `new_pause_lease['failed_wake_attempts']` verbatim (this function
+    requires it to be exactly 0 on input and always recomputes the stored
+    value itself), so a direct counter reset/mint bypass is structurally
+    impossible: the durable result always carries forward
+    `max(old.failed_wake_attempts, new.failed_wake_attempts)`, raising
+    (via `next_pause_lease_after_replacement`) if that would exceed
+    `FAILED_WAKE_ATTEMPT_CEILING`.
+
+    Rejects (`CrossBindingReplacementError`, writing nothing) a
+    `new_pause_lease` naming a different role/provider_session_id/
+    controller_policy_digest/candidate_digest than the OLD lease currently,
+    durably, carries -- a replacement can only ever renew the SAME binding
+    it is replacing, never silently rebind to a different one.
+
+    LOCK ORDERING (M3B-REV-N03): acquires exactly THREE locks, always in
+    the SAME global order -- the binding index (keyed by the NEW lease's
+    own binding; the cross-binding check below proves it equals the OLD
+    lease's binding whenever this function can actually succeed), then the
+    OLD lease, then the NEW lease -- identical order to `create_pause_
+    lease`'s (binding, then lease). Because every create/replace for a
+    given binding must acquire that SAME single binding lock FIRST, two
+    concurrent `replace_pause_lease` calls for the same binding (even
+    naming DIFFERENT old_lease_ids, e.g. a stale caller replacing an
+    already-superseded lease) can never each hold one of the other's
+    needed locks while waiting for the other -- there is only ever ONE
+    lock two concurrent calls for the same binding could both be
+    contending on at any moment, never a cross-held pair, so no deadlock
+    is reachable. Every acquisition is additionally bounded by
+    `_flock_exclusive_with_timeout` (`_M3_LOCK_TIMEOUT_SECONDS`), so even a
+    genuinely stuck peer (a different binding's holder that never
+    releases) fails loud with `TimeoutError` rather than blocking forever.
+
+    Raises `PauseLeaseConflict` when the old lease does not exist
+    (`reason='not_found'`), its current `consumption_state` is not one of
+    `{'unclaimed', 'claimed', 'expired'}` (`reason='not_replaceable'` --
+    an already-`consumed`/`cancelled`/`replaced` lease can never be
+    replaced again), or a record already exists at the new lease_id
+    (`reason='lease_id_collision'`). Raises `CorruptRecordError` (never
+    silently treats a corrupt file as "not found") if either lease file
+    exists but fails to parse.
+
+    DURABILITY ORDERING (M3B-REV-B03): both writes go through `write_
+    json_atomic_durable` (fsyncs the file AND its parent directory before
+    returning True), and the NEW lease's write fully completes -- fsync
+    included -- strictly BEFORE the OLD lease's write is even attempted.
+    On real stable storage this is not merely program-order, it is a
+    genuine HAPPENS-BEFORE relationship: a crash can therefore never leave
+    the OLD lease durably `replaced` while the NEW lease was lost, only
+    the reverse (new durable, old not yet updated) or neither. On success,
+    the binding index (held locked this whole call) is updated to point at
+    the new lease_id, closing the loop for `_resolve_current_pause_lease`.
+    A crash strictly between the two lease writes leaves the new lease
+    durable and unclaimed with the old lease still in its pre-replacement
+    state and the binding index still (or already) pointing at the OLD
+    lease_id -- `_resolve_current_pause_lease` self-heals this: a caller
+    resolving the binding sees the old, still-live lease as current (since
+    the new one, though durable, is not yet linked) and may legitimately
+    retry replacement; this function is not itself idempotent, so a retry
+    mints yet another new lease -- a caller-visible, non-silent outcome,
+    never data loss or a permanently, undetectably stuck binding.
+
+    Returns the durably stored new lease record (enriched shape, matching
+    every other PauseLease store function)."""
+    capacity = _import_capacity()
+    new_validated = capacity.validate_pause_lease(new_pause_lease)
+    if new_validated["failed_wake_attempts"] != 0:
+        raise ValueError(
+            "new_pause_lease.failed_wake_attempts is computed by this "
+            "function via next_pause_lease_after_replacement, never "
+            "accepted from the caller; pass a fresh lease with "
+            "failed_wake_attempts=0")
+    if new_validated["consumption_state"] != "unclaimed":
+        raise ValueError(
+            "new_pause_lease must be a freshly minted, unclaimed lease, "
+            "got consumption_state=%r" % new_validated["consumption_state"])
+    if new_validated["lease_id"] == old_lease_id:
+        raise ValueError(
+            "new_pause_lease.lease_id must differ from old_lease_id")
+
+    old_path = pause_lease_path_for(session_uuid, old_lease_id)
+    new_path = pause_lease_path_for(session_uuid, new_validated["lease_id"])
+    index_path = pause_lease_binding_index_path_for(session_uuid, new_validated)
+
+    binding_lock_fh = _open_locked(index_path + ".lock")
+    try:
+        old_lock_fh = _open_locked(old_path + ".lock")
+        try:
+            new_lock_fh = _open_locked(new_path + ".lock")
+            try:
+                existing_old = _read_json_or_raise_if_corrupt(old_path)
+                if existing_old is None:
+                    raise PauseLeaseConflict(old_lease_id, "not_found")
+                old_validated = capacity.validate_pause_lease(
+                    pause_lease_from_stored_record(existing_old))
+                if (old_validated["consumption_state"]
+                        not in _PAUSE_LEASE_REPLACEABLE_STATES):
+                    raise PauseLeaseConflict(
+                        old_lease_id, "not_replaceable",
+                        old_validated["consumption_state"])
+                for field in _PAUSE_LEASE_BINDING_FIELDS:
+                    if old_validated[field] != new_validated[field]:
+                        raise CrossBindingReplacementError(
+                            "replace_pause_lease: new lease binding %s=%r "
+                            "does not match old lease's %r -- "
+                            "cross-binding replacement is refused"
+                            % (field, new_validated[field], old_validated[field]))
+                merged_new = capacity.next_pause_lease_after_replacement(
+                    old_validated, new_validated)
+                if _read_json_or_raise_if_corrupt(new_path) is not None:
+                    raise PauseLeaseConflict(
+                        merged_new["lease_id"], "lease_id_collision")
+                stored_new = dict(merged_new)
+                stored_new.update(_PAUSE_LEASE_BOOKKEEPING_DEFAULTS)
+                stored_new["replaced_from"] = old_lease_id
+                if not write_json_atomic_durable(new_path, stored_new):
+                    raise OSError("write failed for %s" % new_path)
+                stored_old = dict(existing_old)
+                stored_old["consumption_state"] = "replaced"
+                stored_old["replaced_at"] = _utc_now()
+                stored_old["replaced_by"] = merged_new["lease_id"]
+                if not write_json_atomic_durable(old_path, stored_old):
+                    raise OSError("write failed for %s" % old_path)
+                if not write_json_atomic_durable(
+                        index_path, {"current_lease_id": merged_new["lease_id"]}):
+                    raise OSError("write failed for %s" % index_path)
+                return stored_new
+            finally:
+                try:
+                    fcntl.flock(new_lock_fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                new_lock_fh.close()
+        finally:
+            try:
+                fcntl.flock(old_lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            old_lock_fh.close()
+    finally:
+        try:
+            fcntl.flock(binding_lock_fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        binding_lock_fh.close()
+
+
+# --------------------------------------------------------------------------- #
+# CapacityPacket store: write-once-per-package_id, immutable.                #
+# --------------------------------------------------------------------------- #
+
+
+def capacity_packet_path_for(session_uuid, package_id):
+    """Path of one durably persisted CapacityPacket, keyed by its own
+    `package_id`. Rejects unsafe session_uuid/package_id values."""
+    _assert_safe_identifier(package_id, "package_id")
+    return os.path.join(capacity_dir_for(session_uuid), "capacity_packets",
+                        "%s.json" % package_id)
+
+
+def write_capacity_packet(session_uuid, capacity_packet):
+    """Durably, atomically persist an IMMUTABLE CapacityPacket, keyed by its
+    own `package_id`. Validated via `cowork_capacity.validate_capacity_
+    packet` (Package A) BEFORE anything is written. Serialized via
+    `fcntl.flock` against every other write to the SAME package_id.
+
+    Write-once: a second call for the SAME package_id whose validated,
+    normalized content is BYTE-IDENTICAL to what is already durably stored
+    is a harmless idempotent no-op (returns the existing record unchanged,
+    writing nothing new); one with DIFFERENT content raises ValueError,
+    writing nothing -- a packet is immutable once durably recorded, never
+    silently overwritten."""
+    capacity = _import_capacity()
+    validated = capacity.validate_capacity_packet(capacity_packet)
+    path = capacity_packet_path_for(session_uuid, validated["package_id"])
+
+    def mutate(existing):
+        if existing is not None:
+            if existing == validated:
+                return None  # idempotent no-op; _locked_json_transaction returns `existing`
+            raise ValueError(
+                "CapacityPacket package_id %r already recorded with "
+                "different content" % validated["package_id"])
+        return validated
+
+    return _locked_json_transaction(path, mutate)
+
+
+def read_capacity_packet(session_uuid, package_id):
+    """Read of one durable CapacityPacket, or None if
+    missing/unreadable/no-longer-schema-valid (M3B-REV-N05: re-validates
+    before returning, mirroring `read_provider_health`'s precedent, so a
+    tampered-but-parseable record is never handed back as truth)."""
+    try:
+        path = capacity_packet_path_for(session_uuid, package_id)
+    except ValueError:
+        return None
+    raw = read_json_tolerant(path)
+    if raw is None:
+        return None
+    try:
+        _import_capacity().validate_capacity_packet(raw)
+    except (ValueError, ImportError):
+        return None
+    return raw
+
+
+# --------------------------------------------------------------------------- #
+# InvalidationRecord (issue #34): append-only, ordered history.              #
+# --------------------------------------------------------------------------- #
+
+
+def invalidation_history_path_for(session_uuid):
+    """Path of one session's append-only InvalidationRecord history."""
+    return os.path.join(capacity_dir_for(session_uuid), "invalidations.jsonl")
+
+
+def append_invalidation_record(session_uuid, invalidation_record):
+    """Durably append one InvalidationRecord to this session's append-only,
+    ORDERED history -- validated via `cowork_capacity.validate_
+    invalidation_record` (Package A) BEFORE anything is written. Serialized
+    against every other appender to this session's history via `fcntl.
+    flock` (`_locked_jsonl_append`, the same crash-safe primitive the M2
+    WorkUnit/PhaseState/graph-revision stores above use), so two racing
+    invalidations for the same session are always durably ordered, never
+    interleaved or corrupted.
+
+    Stamps `sequence` (this record's true, lock-serialized position in the
+    file, zero-based) and `recorded_at` (persistence timestamp) on top of
+    the validated InvalidationRecord shape -- the ORDERING PROOF this
+    append-only history exists to carry: `sequence` is assigned strictly
+    INSIDE the lock, from the file's actual prior length at that instant,
+    so it can never collide or go out of order even under genuinely
+    concurrent writers.
+
+    This module provides no function that edits or deletes a prior
+    InvalidationRecord -- append-only is structural here, not merely
+    documented: the only way to add to this history is this function, and
+    it only ever appends.
+
+    Returns the durably stored record."""
+    capacity = _import_capacity()
+    validated = capacity.validate_invalidation_record(invalidation_record)
+    path = invalidation_history_path_for(session_uuid)
+
+    def build(existing):
+        entry = dict(validated)
+        entry["sequence"] = len(existing)
+        entry["recorded_at"] = _utc_now()
+        return entry
+
+    return _locked_jsonl_append(path, build)
+
+
+def read_invalidation_history(session_uuid):
+    """Every persisted InvalidationRecord for this session, oldest first
+    (append order == `sequence` order). Tolerant: `[]` when none have ever
+    been recorded."""
+    return read_jsonl_tolerant(invalidation_history_path_for(session_uuid))
+
+
+# --------------------------------------------------------------------------- #
+# ProviderHealth: a durable, atomically-written CURRENT-health summary per   #
+# (role, provider) pair -- distinct from the append-only stores above,       #
+# because health is a rolling/mutable current-state signal (like            #
+# PauseLease.consumption_state), not an immutable event history.            #
+#                                                                              #
+# Package A (`cowork_capacity.py`) defines no ProviderHealth schema of its   #
+# own, so this section defines and validates its own minimal shape here --   #
+# the smallest durable record later packages need to answer "is this (role, #
+# provider) currently healthy, and why not if not": a closed status, a       #
+# bounded consecutive-failure counter, the last observed ControllerOutcome   #
+# (or None), and when it was last updated. THIS SHAPE IS THIS WORKER'S OWN   #
+# DESIGN CHOICE, not transcribed from the frozen plan text -- the plan       #
+# object itself was not an accessible file inside this isolated worktree;   #
+# see this worker's returned `assumptions` field, which flags it explicitly #
+# for controller/reviewer confirmation.                                     #
+# --------------------------------------------------------------------------- #
+
+PROVIDER_HEALTH_STATUSES = ("healthy", "degraded", "unavailable")
+PROVIDER_HEALTH_STATUS_SET = frozenset(PROVIDER_HEALTH_STATUSES)
+_PROVIDER_HEALTH_KEYS = frozenset({
+    "role", "provider", "status", "consecutive_failures", "last_outcome",
+    "last_updated_at",
+})
+
+
+def validate_provider_health(record):
+    """Return a normalized copy of a ProviderHealth record, or raise
+    ValueError. See the module-level ProviderHealth banner above for why
+    this module defines and validates this shape itself rather than
+    importing it from Package A."""
+    if not isinstance(record, dict):
+        raise ValueError("ProviderHealth must be a dict, got %r" % type(record))
+    extra = set(record) - _PROVIDER_HEALTH_KEYS
+    missing = _PROVIDER_HEALTH_KEYS - set(record)
+    if missing:
+        raise ValueError("ProviderHealth missing keys: %s" % sorted(missing))
+    if extra:
+        raise ValueError("ProviderHealth has extra keys: %s" % sorted(extra))
+    if not isinstance(record["role"], str) or not record["role"]:
+        raise ValueError("ProviderHealth.role must be a nonempty string")
+    if not isinstance(record["provider"], str) or not record["provider"]:
+        raise ValueError("ProviderHealth.provider must be a nonempty string")
+    if record["status"] not in PROVIDER_HEALTH_STATUS_SET:
+        raise ValueError(
+            "ProviderHealth.status must be one of %s, got %r"
+            % (sorted(PROVIDER_HEALTH_STATUS_SET), record["status"]))
+    failures = record["consecutive_failures"]
+    if isinstance(failures, bool) or not isinstance(failures, int) or failures < 0:
+        raise ValueError(
+            "ProviderHealth.consecutive_failures must be a nonnegative "
+            "integer, got %r" % failures)
+    capacity = _import_capacity()
+    outcome = record["last_outcome"]
+    if outcome is not None and not capacity.validate_controller_outcome(outcome):
+        raise ValueError(
+            "ProviderHealth.last_outcome must be null or a member of "
+            "CONTROLLER_OUTCOME_SET, got %r" % outcome)
+    last_updated_at = record["last_updated_at"]
+    if (not isinstance(last_updated_at, str)
+            or capacity.rfc3339_to_epoch_seconds(last_updated_at) is None):
+        raise ValueError(
+            "ProviderHealth.last_updated_at must be an RFC3339-shaped "
+            "timestamp string, got %r" % last_updated_at)
+    return dict(record)
+
+
+def provider_health_path_for(session_uuid, role, provider):
+    """Path of one (role, provider) pair's durable current ProviderHealth
+    record. Rejects unsafe session_uuid/role/provider values.
+
+    Keyed by a sha256 of a `\\x1f`-delimited join of the two, never a plain
+    `"%s__%s"` join (M3B-REV-N01): `_SAFE_IDENTIFIER_RE` permits `_` inside
+    either component, so a literal `"__"` join let e.g. `("a", "b__c")` and
+    `("a__b", "c")` collide on the identical filename, silently letting two
+    DISTINCT (role, provider) pairs overwrite each other's health record.
+    `\\x1f` cannot appear in either component (both are constrained to
+    `_SAFE_IDENTIFIER_RE`'s `[A-Za-z0-9_\\-.]` charset), so this join is
+    unambiguous -- mirrors `_pause_lease_binding_key`'s identical fix."""
+    _assert_safe_identifier(role, "role")
+    _assert_safe_identifier(provider, "provider")
+    key = hashlib.sha256(("%s\x1f%s" % (role, provider)).encode("utf-8")).hexdigest()
+    return os.path.join(capacity_dir_for(session_uuid), "provider_health",
+                        "%s.json" % key)
+
+
+def write_provider_health(session_uuid, record):
+    """Durably, atomically persist a ProviderHealth record (validated via
+    `validate_provider_health` above) for its own `(role, provider)` key,
+    OVERWRITING any prior record for that same key -- ProviderHealth is a
+    rolling CURRENT-state signal, not an append-only history, so the latest
+    durable write is always simply the new current truth. Serialized
+    against every other write to the SAME `(role, provider)` key via
+    `fcntl.flock`. Crash-safe: any write failure raises OSError and leaves
+    the prior durable record untouched."""
+    validated = validate_provider_health(record)
+    path = provider_health_path_for(
+        session_uuid, validated["role"], validated["provider"])
+
+    def mutate(existing):
+        return validated
+
+    return _locked_json_transaction(path, mutate)
+
+
+def read_provider_health(session_uuid, role, provider):
+    """Tolerant read of one (role, provider)'s current ProviderHealth
+    record, or None if missing/unreadable/no-longer-schema-valid."""
+    try:
+        path = provider_health_path_for(session_uuid, role, provider)
+    except ValueError:
+        return None
+    raw = read_json_tolerant(path)
+    if raw is None:
+        return None
+    try:
+        return validate_provider_health(raw)
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Pure-Python Ed25519 signature VERIFICATION (stdlib only -- this module's   #
+# own top-of-file docstring requires "Python 3.9+, stdlib only", and no      #
+# `cryptography`/PyNaCl package is available in this deployment; see         #
+# `requirements.txt`, unmodified by this package). VERIFY-ONLY: this module  #
+# never signs anything (only a legitimate holder of a private key -- never   #
+# this persistence layer -- ever produces a `detached_signature`), so only   #
+# the arithmetic `write_manual_capacity_signal`'s write-time verification    #
+# boundary needs is implemented here.                                       #
+#                                                                              #
+# The field/curve constants and point arithmetic below are the standard      #
+# Ed25519 (RFC 8032 / ed25519.cr.yp.to) construction over the twisted        #
+# Edwards curve `-x^2 + y^2 = 1 + d*x^2*y^2` on the prime field GF(2^255-19), #
+# with base-point order `l`. The cheap constants (`_ED25519_D`, the base     #
+# point) are derived eagerly at import time (microseconds); the EXPENSIVE    #
+# self-test (~0.1-0.3s of full 255-bit scalar multiplications, measured) is  #
+# deliberately deferred to first actual use -- see                          #
+# `_ed25519_ensure_selftested`'s own docstring for why running it            #
+# unconditionally at import time would be wrong for this specific module.    #
+# --------------------------------------------------------------------------- #
+
+_ED25519_B = 256
+_ED25519_Q = 2 ** 255 - 19
+_ED25519_L = 2 ** 252 + 27742317777372353535851937790883648493
+
+
+def _ed25519_expmod(base, e, m):
+    return pow(base, e, m)
+
+
+def _ed25519_inv(x):
+    return _ed25519_expmod(x, _ED25519_Q - 2, _ED25519_Q)
+
+
+_ED25519_D = -121665 * _ed25519_inv(121666) % _ED25519_Q
+_ED25519_I = _ed25519_expmod(2, (_ED25519_Q - 1) // 4, _ED25519_Q)
+
+
+def _ed25519_xrecover(y):
+    xx = (y * y - 1) * _ed25519_inv(_ED25519_D * y * y + 1)
+    x = _ed25519_expmod(xx, (_ED25519_Q + 3) // 8, _ED25519_Q)
+    if (x * x - xx) % _ED25519_Q != 0:
+        x = (x * _ED25519_I) % _ED25519_Q
+    if x % 2 != 0:
+        x = _ED25519_Q - x
+    return x
+
+
+_ED25519_BY = 4 * _ed25519_inv(5)
+_ED25519_BX = _ed25519_xrecover(_ED25519_BY)
+_ED25519_BASE = (_ED25519_BX % _ED25519_Q, _ED25519_BY % _ED25519_Q)
+
+
+def _ed25519_edwards(p, q):
+    x1, y1 = p
+    x2, y2 = q
+    x3 = (x1 * y2 + x2 * y1) * _ed25519_inv(1 + _ED25519_D * x1 * x2 * y1 * y2)
+    y3 = (y1 * y2 + x1 * x2) * _ed25519_inv(1 - _ED25519_D * x1 * x2 * y1 * y2)
+    return (x3 % _ED25519_Q, y3 % _ED25519_Q)
+
+
+def _ed25519_scalarmult(p, e):
+    """Right-to-left double-and-add scalar multiplication -- ITERATIVE, not
+    recursive (M3B-REV-N02): `e` is the unreduced Ed25519 "Hint" output for
+    verification's second scalar (`h` in `_ed25519_verify`), up to
+    `2*_ED25519_B` = 512 bits, which a naive halve-and-recurse
+    implementation would walk as ~512 nested Python call frames -- on top
+    of whatever depth the caller's own stack already has, that can exceed
+    `sys.getrecursionlimit()` and raise `RecursionError` from deep inside
+    this function, escaping `_ed25519_verify`'s documented 'never raises'
+    contract. This iterative form is mathematically identical (same
+    double-and-add sequence, same result) but uses O(1) Python stack
+    frames regardless of `e`'s magnitude."""
+    result = (0, 1)
+    addend = p
+    while e > 0:
+        if e & 1:
+            result = _ed25519_edwards(result, addend)
+        addend = _ed25519_edwards(addend, addend)
+        e >>= 1
+    return result
+
+
+def _ed25519_isoncurve(p):
+    x, y = p
+    return (-x * x + y * y - 1 - _ED25519_D * x * x * y * y) % _ED25519_Q == 0
+
+
+def _ed25519_bit(h, i):
+    return (h[i // 8] >> (i % 8)) & 1
+
+
+def _ed25519_encodeint(y):
+    bits = [(y >> i) & 1 for i in range(_ED25519_B)]
+    return bytes([sum([bits[i * 8 + j] << j for j in range(8)])
+                  for i in range(_ED25519_B // 8)])
+
+
+def _ed25519_encodepoint(p):
+    x, y = p
+    bits = [(y >> i) & 1 for i in range(_ED25519_B - 1)] + [x & 1]
+    return bytes([sum([bits[i * 8 + j] << j for j in range(8)])
+                  for i in range(_ED25519_B // 8)])
+
+
+def _ed25519_decodeint(s):
+    return sum(2 ** i * _ed25519_bit(s, i) for i in range(_ED25519_B))
+
+
+def _ed25519_decodepoint(s):
+    y = sum(2 ** i * _ed25519_bit(s, i) for i in range(_ED25519_B - 1))
+    x = _ed25519_xrecover(y)
+    if x & 1 != _ed25519_bit(s, _ED25519_B - 1):
+        x = _ED25519_Q - x
+    p = (x, y)
+    if not _ed25519_isoncurve(p):
+        raise ValueError("ed25519: decoded point is not on the curve")
+    return p
+
+
+def _ed25519_hint(m):
+    h = hashlib.sha512(m).digest()
+    return sum(2 ** i * _ed25519_bit(h, i) for i in range(2 * _ED25519_B))
+
+
+def _ed25519_selftest_sign(message, secret_key, public_key):
+    """A minimal, self-contained Ed25519 SIGNER confined entirely to the
+    self-test below -- production code (`_ed25519_verify`/
+    `verify_manual_capacity_signal`) never signs anything; see the section
+    banner above. Exists only so the self-test can prove a genuine, fresh
+    sign-then-verify(-then-tamper) round trip rather than merely checking
+    static constants."""
+    h = hashlib.sha512(secret_key).digest()
+    a = 2 ** (_ED25519_B - 2) + sum(
+        2 ** i * _ed25519_bit(h, i) for i in range(3, _ED25519_B - 2))
+    r = _ed25519_hint(
+        bytes(h[i] for i in range(_ED25519_B // 8, _ED25519_B // 4)) + message)
+    big_r = _ed25519_scalarmult(_ED25519_BASE, r)
+    s = (r + _ed25519_hint(_ed25519_encodepoint(big_r) + public_key + message) * a
+        ) % _ED25519_L
+    return _ed25519_encodepoint(big_r) + _ed25519_encodeint(s)
+
+
+def _ed25519_selftest_publickey(secret_key):
+    h = hashlib.sha512(secret_key).digest()
+    a = 2 ** (_ED25519_B - 2) + sum(
+        2 ** i * _ed25519_bit(h, i) for i in range(3, _ED25519_B - 2))
+    return _ed25519_encodepoint(_ed25519_scalarmult(_ED25519_BASE, a))
+
+
+def _ed25519_verify(signature, message, public_key):
+    """True iff `signature` (64 bytes: R || S) is a valid Ed25519 signature
+    of `message` under `public_key` (32 bytes). Never raises: any malformed
+    input (wrong length, wrong TYPE, an off-curve encoded point, an
+    out-of-range scalar) classifies as False, exactly like a genuinely
+    wrong signature -- a caller must not be able to distinguish
+    'malformed' from 'wrong' via an exception, only via this single
+    boolean. `except` deliberately also catches `TypeError` (M3B-REV-N02:
+    a non-bytes/non-sized argument raises `TypeError` from `len()`/
+    indexing, not `ValueError`/`IndexError`) -- `_ed25519_scalarmult`
+    itself was additionally made ITERATIVE (see its own docstring) so a
+    large scalar can no longer raise `RecursionError` here in the first
+    place, closing that half of the same finding at its root cause rather
+    than merely widening this `except`.
+
+    Runs `_ed25519_ensure_selftested` first (memoized after the first
+    call): a genuinely wrong verification result here would silently admit
+    a forged manual-capacity signal or reject a genuine one, so this
+    primitive itself is proven correct before ever being trusted."""
+    _ed25519_ensure_selftested()
+    try:
+        if len(signature) != _ED25519_B // 4 or len(public_key) != _ED25519_B // 8:
+            return False
+        r = _ed25519_decodepoint(signature[:_ED25519_B // 8])
+        a = _ed25519_decodepoint(public_key)
+        s = _ed25519_decodeint(signature[_ED25519_B // 8:_ED25519_B // 4])
+        if s >= _ED25519_L:
+            return False
+        h = _ed25519_hint(_ed25519_encodepoint(r) + public_key + message)
+        return _ed25519_scalarmult(_ED25519_BASE, s) == _ed25519_edwards(
+            r, _ed25519_scalarmult(a, h))
+    except (ValueError, IndexError, TypeError):
+        return False
+
+
+_ED25519_SELFTEST_DONE = False
+
+
+def _ed25519_ensure_selftested():
+    """Lazily run the Ed25519 arithmetic self-test on FIRST actual use,
+    memoized thereafter -- running it unconditionally at module IMPORT time
+    would cost real wall-clock time (measured ~0.1-0.3s: the self-test
+    performs several full 255-bit-scalar point multiplications) on EVERY
+    `import cowork_state`, even for the overwhelming majority of callers
+    that never touch a manual capacity signal at all. This module is
+    imported by every cowork CLI invocation (see its own top-of-file
+    docstring), so that cost must never be paid unconditionally -- it is
+    paid exactly once, the first time `_ed25519_verify` is ever actually
+    called in this process.
+
+    Cross-checks the module-level constants/arithmetic against independent,
+    well-known Ed25519 invariants (the standard `_ED25519_D` constant's
+    exact decimal value, and the base point's order being exactly
+    `_ED25519_L`), an RFC 8032 Section 7.1 KNOWN-ANSWER TEST VECTOR
+    (M3B-REV-N07: TEST 1, the empty-message vector -- an EXTERNALLY
+    published secret/public key and signature, independent of this
+    module's own signer, so an encoding bug shared consistently between
+    THIS module's `_ed25519_selftest_sign` and `_ed25519_verify` -- which a
+    self-signed-only round trip could never catch, since both sides of a
+    self-consistent pair would agree on a shared mistake -- is still
+    caught: this module's OWN `_ed25519_selftest_publickey`/`_ed25519_
+    selftest_sign`, applied to the RFC's published secret key, must
+    reproduce the RFC's published public key and signature EXACTLY), then
+    a live sign-then-verify(-then-tamper) round trip via `_ed25519_
+    selftest_sign` -- so a transcription error in any constant or in the
+    point arithmetic fails LOUD (raises AssertionError) the first time
+    signature verification is ever needed, instead of silently verifying
+    forged signatures or rejecting genuine ones."""
+    global _ED25519_SELFTEST_DONE
+    if _ED25519_SELFTEST_DONE:
+        return
+    known_d = 37095705934669439343138083508754565189542113879843219016388785533085940283555
+    if _ED25519_D != known_d:
+        raise AssertionError(
+            "ed25519 self-test: _ED25519_D does not match the known "
+            "RFC 8032 constant")
+    if not _ed25519_isoncurve(_ED25519_BASE):
+        raise AssertionError("ed25519 self-test: base point is not on the curve")
+    if _ed25519_scalarmult(_ED25519_BASE, _ED25519_L) != (0, 1):
+        raise AssertionError("ed25519 self-test: base point order is not L")
+
+    # RFC 8032 Section 7.1, TEST 1 (empty message) -- published, external
+    # known-answer vector; verified during this package's own development
+    # to be mutually self-consistent (the published secret key, run through
+    # THIS module's own from-scratch signer, reproduces the published
+    # public key and signature bit-for-bit) before being hardcoded here.
+    rfc8032_secret_key = bytes.fromhex(
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    rfc8032_expected_public_key = bytes.fromhex(
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    rfc8032_expected_signature = bytes.fromhex(
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901"
+        "555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+    rfc8032_public_key = _ed25519_selftest_publickey(rfc8032_secret_key)
+    if rfc8032_public_key != rfc8032_expected_public_key:
+        raise AssertionError(
+            "ed25519 self-test: RFC 8032 TEST 1 public-key derivation "
+            "mismatch -- this implementation does not match the published "
+            "known-answer vector")
+    rfc8032_signature = _ed25519_selftest_sign(b"", rfc8032_secret_key, rfc8032_public_key)
+    if rfc8032_signature != rfc8032_expected_signature:
+        raise AssertionError(
+            "ed25519 self-test: RFC 8032 TEST 1 signature mismatch -- this "
+            "implementation does not match the published known-answer "
+            "vector")
+
+    secret_key = hashlib.sha256(b"cowork-ed25519-selftest-seed").digest()
+    public_key = _ed25519_selftest_publickey(secret_key)
+    message = b"cowork-ed25519-selftest-message"
+    signature = _ed25519_selftest_sign(message, secret_key, public_key)
+
+    def _raw_verify(sig, msg, pk):
+        # Bypasses the memoization guard (this IS the self-test proving the
+        # guarded function correct) but shares its exact arithmetic path.
+        try:
+            r = _ed25519_decodepoint(sig[:_ED25519_B // 8])
+            a = _ed25519_decodepoint(pk)
+            s = _ed25519_decodeint(sig[_ED25519_B // 8:_ED25519_B // 4])
+            if s >= _ED25519_L:
+                return False
+            h = _ed25519_hint(_ed25519_encodepoint(r) + pk + msg)
+            return _ed25519_scalarmult(_ED25519_BASE, s) == _ed25519_edwards(
+                r, _ed25519_scalarmult(a, h))
+        except (ValueError, IndexError, TypeError):
+            return False
+
+    if not _raw_verify(rfc8032_signature, b"", rfc8032_public_key):
+        raise AssertionError(
+            "ed25519 self-test: RFC 8032 TEST 1 vector failed to verify")
+    if not _raw_verify(signature, message, public_key):
+        raise AssertionError("ed25519 self-test: genuine round trip failed to verify")
+    if _raw_verify(signature, b"tampered", public_key):
+        raise AssertionError("ed25519 self-test: accepted a tampered message")
+    tampered_signature = bytes([signature[0] ^ 1]) + signature[1:]
+    if _raw_verify(tampered_signature, message, public_key):
+        raise AssertionError("ed25519 self-test: accepted a tampered signature")
+    _ED25519_SELFTEST_DONE = True
+
+
+# --------------------------------------------------------------------------- #
+# Signed manual-capacity-signal store: write-time cryptographic             #
+# verification against a caller-pinned public-key registry.                  #
+# --------------------------------------------------------------------------- #
+
+_PINNED_PUBLIC_KEY_HEX_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+# Fixed domain-separation prefix (M3B-REV-N06): without this, a signature
+# genuinely valid for some OTHER message format under the same Ed25519 key
+# (any future signed record type this key is ever reused for) would also
+# happen to be bytes-valid input to THIS scheme if the two payloads ever
+# coincided -- a cross-context replay hazard standard practice avoids by
+# always including a fixed, scheme-specific prefix no other signed message
+# type in this codebase uses. Versioned (`v1`) so a future incompatible
+# change to the payload shape can bump this prefix rather than silently
+# reinterpreting an old signature under a new schema.
+_MANUAL_CAPACITY_SIGNAL_DOMAIN = b"cowork.manual_capacity_signal.v1\x00"
+
+
+def canonical_manual_capacity_signal_message(record):
+    """The exact byte sequence a manual-capacity-signal's `detached_
+    signature` authenticates: the fixed `_MANUAL_CAPACITY_SIGNAL_DOMAIN`
+    prefix (M3B-REV-N06 domain separation), followed by canonical
+    (sorted-key, minimal-whitespace) JSON of every field EXCEPT
+    `detached_signature` itself -- signing the signature's own bytes would
+    be circular. Encoded UTF-8. Pure; no I/O; never mutates `record`.
+
+    PUBLISHED TEST VECTOR for external signature producers (also asserted
+    verbatim by `scripts/test_cowork_state_m3.py`'s
+    `test_published_signing_test_vector_for_external_producers`, which
+    additionally proves `verify_manual_capacity_signal` accepts it): for
+    the Ed25519 secret key `hashlib.sha256(b"cowork-manual-signal-kat-
+    seed").digest()` (public key
+    `88e2b4a9e6680afcb550dbdc799c2f9a1e3b45b821c0eb506023fe0a4f1488d8`) and
+    the record
+
+        {"schema_version": 1, "package_id": "pkg-1",
+         "candidate_digest": "b"*64, "role": "builder",
+         "provider_session_id": "sess-1",
+         "controller_policy_digest": "a"*64,
+         "signal_journal_ref": "journal-1", "signer_public_key_id": "key-1",
+         "issued_at": "2024-01-01T00:00:00Z"}
+
+    (`detached_signature` omitted -- it is never part of the signed
+    payload), this function's message, signed with that secret key,
+    produces the exact 64-byte `detached_signature`
+    `81d5c3764ffb964508999152492fb8b2ccff5312296dda76253a3215fbbd5b0b329bb`
+    `42f1d3470e992618e6df18e56925931654480eb921c690b854621537b0d` -- this
+    docstring exists so a signature-producing implementation OUTSIDE this
+    repository has something concrete to conform to, per the reviewer
+    finding that no such published vector previously existed."""
+    payload = {k: v for k, v in record.items() if k != "detached_signature"}
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _MANUAL_CAPACITY_SIGNAL_DOMAIN + body
+
+
+def verify_manual_capacity_signal(record, pinned_public_keys):
+    """Validate `record`'s SHAPE via `cowork_capacity.validate_manual_
+    capacity_signal` (Package A), then perform the REAL asymmetric
+    cryptographic verification that function's own docstring explicitly
+    defers to "a later, non-pure runtime-wiring package" -- this one.
+
+    `pinned_public_keys` is a caller-supplied `{signer_public_key_id: <64
+    lowercase hex chars>}` PIN REGISTRY -- the trust anchor. This function
+    NEVER trusts any key material embedded in `record` itself (the schema
+    does not even carry one, only a `signer_public_key_id` REFERENCE); it
+    looks up that id in the caller's own pinned registry, so an attacker
+    who controls the untrusted record cannot smuggle in their own key
+    merely by naming it -- only a key the caller has independently pinned
+    ahead of time is ever consulted.
+
+    Raises `ManualSignalSignatureError` (never returns a falsy value) when:
+    the `signer_public_key_id` is not in `pinned_public_keys`
+    (unpinned/unknown signer), the pinned key material is not exactly 64
+    lowercase hex characters (a 32-byte Ed25519 public key), the
+    `detached_signature` does not decode to exactly 64 bytes, or the
+    Ed25519 verification of `detached_signature` over
+    `canonical_manual_capacity_signal_message(validated_record)` genuinely
+    fails. Returns the normalized, validated, VERIFIED record on success."""
+    capacity = _import_capacity()
+    validated = capacity.validate_manual_capacity_signal(record)
+    key_id = validated["signer_public_key_id"]
+    pinned_hex = (pinned_public_keys or {}).get(key_id)
+    if not isinstance(pinned_hex, str) or not _PINNED_PUBLIC_KEY_HEX_RE.match(pinned_hex):
+        raise ManualSignalSignatureError(
+            "signer_public_key_id %r is not pinned (no 32-byte Ed25519 "
+            "public key registered for it)" % key_id)
+    try:
+        public_key_bytes = bytes.fromhex(pinned_hex)
+        signature_bytes = bytes.fromhex(validated["detached_signature"])
+    except ValueError:
+        raise ManualSignalSignatureError(
+            "malformed hex in pinned public key or detached_signature")
+    if len(signature_bytes) != 64:
+        raise ManualSignalSignatureError(
+            "detached_signature must decode to exactly 64 bytes for "
+            "Ed25519, got %d" % len(signature_bytes))
+    message = canonical_manual_capacity_signal_message(validated)
+    if not _ed25519_verify(signature_bytes, message, public_key_bytes):
+        raise ManualSignalSignatureError(
+            "Ed25519 signature verification failed for "
+            "signer_public_key_id %r" % key_id)
+    return validated
+
+
+def manual_capacity_signal_path_for(session_uuid, signal_journal_ref):
+    """Path of one durably persisted, VERIFIED manual-capacity-signal
+    record, keyed by a sha256 of its own `signal_journal_ref` -- the
+    schema's own field (`cowork_capacity._check_nonempty_str`) has no
+    charset constraint, so hashing it avoids ever trusting an arbitrary
+    caller-controlled string as a raw path component."""
+    if not isinstance(signal_journal_ref, str) or not signal_journal_ref:
+        raise ValueError("signal_journal_ref must be a nonempty string")
+    digest = hashlib.sha256(signal_journal_ref.encode("utf-8")).hexdigest()
+    return os.path.join(capacity_dir_for(session_uuid), "manual_signals",
+                        "%s.json" % digest)
+
+
+def write_manual_capacity_signal(session_uuid, record, pinned_public_keys):
+    """WRITE-TIME cryptographic verification boundary (the invariant this
+    exists for): verifies `record`'s detached Ed25519 signature against the
+    caller's pinned public-key registry via `verify_manual_capacity_signal`
+    BEFORE anything is written -- a record whose signature does not verify
+    raises `ManualSignalSignatureError` and is durably rejected; nothing is
+    ever written for it. Only a genuinely verified record is ever
+    persisted.
+
+    Write-once (like `write_capacity_packet`): a second call for the SAME
+    `signal_journal_ref` whose verified, normalized content is
+    byte-identical to what is already durably stored is a harmless
+    idempotent no-op; one with DIFFERENT content raises ValueError, writing
+    nothing -- a verified manual signal is immutable once durably recorded.
+    Serialized via `fcntl.flock` against every other write to the same
+    journal ref.
+
+    Returns the durably stored, normalized, VERIFIED record."""
+    verified = verify_manual_capacity_signal(record, pinned_public_keys)
+    path = manual_capacity_signal_path_for(
+        session_uuid, verified["signal_journal_ref"])
+
+    def mutate(existing):
+        if existing is not None:
+            if existing == verified:
+                return None
+            raise ValueError(
+                "manual capacity signal for signal_journal_ref %r already "
+                "recorded with different content"
+                % verified["signal_journal_ref"])
+        return verified
+
+    result = _locked_json_transaction(path, mutate)
+    return result if result is not None else verified
+
+
+def read_manual_capacity_signal(session_uuid, signal_journal_ref):
+    """Read of one durably stored, verified manual-capacity-signal record,
+    or None if missing/unreadable/no-longer-shape-valid (M3B-REV-N05:
+    re-validates SHAPE via `cowork_capacity.validate_manual_capacity_
+    signal` before returning, mirroring `read_provider_health`'s
+    precedent, so a tampered-but-parseable record is never handed back as
+    truth without at least a shape check -- note this re-checks shape
+    only, not the cryptographic signature itself, which needs a pinned-key
+    registry this read-only accessor is not given; a caller needing full
+    cryptographic re-confirmation calls `verify_manual_capacity_signal`
+    explicitly on the returned record)."""
+    try:
+        path = manual_capacity_signal_path_for(session_uuid, signal_journal_ref)
+    except ValueError:
+        return None
+    raw = read_json_tolerant(path)
+    if raw is None:
+        return None
+    try:
+        _import_capacity().validate_manual_capacity_signal(raw)
+    except (ValueError, ImportError):
+        return None
+    return raw
+
+
+# --------------------------------------------------------------------------- #
+# Pending-turn-before-pause-ack: an in-flight turn's exact bytes AND their   #
+# sha256 digest, durable BEFORE the resulting pause is acknowledged.         #
+# --------------------------------------------------------------------------- #
+
+
+def pending_turn_before_pause_path_for(session_uuid, role):
+    """Path of one role's durable pending-turn-before-pause record. Rejects
+    unsafe session_uuid/role values."""
+    _assert_safe_identifier(role, "role")
+    return os.path.join(capacity_dir_for(session_uuid),
+                        "pending_turn_before_pause", "%s.json" % role)
+
+
+def write_pending_turn_before_pause(session_uuid, role, turn_text, lease_id=None):
+    """Durably persist an in-flight turn's EXACT bytes and their sha256
+    digest for `role` BEFORE this pause is acknowledged -- the crash-safe
+    boundary this invariant names: a crash strictly between sending a turn
+    and acknowledging the resulting pause must never lose the turn's own
+    bytes, and recovery must be able to prove (via the stored digest)
+    exactly which bytes were durably captured. `acknowledged` starts
+    `False`; only `acknowledge_pending_turn_before_pause` (below) may ever
+    flip it. Serialized via `fcntl.flock` around the whole check-and-write.
+
+    Overwrites any PRIOR unacknowledged pending turn for this role only
+    when it is BYTE-IDENTICAL (same sha256) to the one being written -- the
+    idempotent-retry case (a caller re-recording the exact same turn after
+    a crash before it could observe this call's first return value).
+    Raises ValueError -- writing nothing -- if a DIFFERENT, still
+    unacknowledged prior record exists for this role: silently discarding
+    an unacknowledged turn's bytes for a genuinely different one would be
+    exactly the loss this function exists to prevent. An
+    already-acknowledged prior record for this role is fair game to
+    overwrite with a new one.
+
+    Returns the durably stored record: `{"role", "turn_text", "sha256",
+    "lease_id", "recorded_at", "acknowledged"}`."""
+    if not isinstance(turn_text, str) or not turn_text:
+        raise ValueError("turn_text must be a nonempty string")
+    digest = hashlib.sha256(turn_text.encode("utf-8")).hexdigest()
+    path = pending_turn_before_pause_path_for(session_uuid, role)
+
+    def mutate(existing):
+        if existing is not None and existing.get("acknowledged") is False:
+            if existing.get("sha256") == digest:
+                return None  # idempotent retry of the exact same turn
+            raise ValueError(
+                "role %r already has a DIFFERENT unacknowledged pending "
+                "turn before pause -- acknowledge or clear it first" % role)
+        return {
+            "role": role,
+            "turn_text": turn_text,
+            "sha256": digest,
+            "lease_id": lease_id,
+            "recorded_at": _utc_now(),
+            "acknowledged": False,
+        }
+
+    result = _locked_json_transaction(path, mutate)
+    return result if result is not None else read_pending_turn_before_pause(
+        session_uuid, role)
+
+
+def read_pending_turn_before_pause(session_uuid, role):
+    """Tolerant read of one role's durable pending-turn-before-pause
+    record, or None if missing/unreadable/never written."""
+    try:
+        path = pending_turn_before_pause_path_for(session_uuid, role)
+    except ValueError:
+        return None
+    return read_json_tolerant(path)
+
+
+def acknowledge_pending_turn_before_pause(session_uuid, role, expected_sha256):
+    """Atomically flip the durable pending-turn record's `acknowledged` to
+    True -- but ONLY after confirming `expected_sha256` matches the digest
+    that was durably recorded at write time; a mismatch means the caller is
+    about to acknowledge a pause for turn bytes that are not the ones
+    actually captured (a bug, or the record having been replaced
+    underneath the caller since), so this raises ValueError and leaves the
+    record untouched rather than silently acknowledging the wrong bytes.
+
+    Raises ValueError -- writing nothing -- when no pending-turn record
+    exists for `role` at all, or `expected_sha256` does not match. Fully
+    IDEMPOTENT: acknowledging an already-`acknowledged=True` record with a
+    matching digest is a harmless no-op that returns the record unchanged
+    -- a caller retrying after its own successful ack (e.g. because it
+    crashed before observing the first call's return value) must never
+    fail for repeating its own already-successful action."""
+    path = pending_turn_before_pause_path_for(session_uuid, role)
+
+    def mutate(existing):
+        if existing is None:
+            raise ValueError(
+                "no pending turn before pause recorded for role %r" % role)
+        if existing.get("sha256") != expected_sha256:
+            raise ValueError(
+                "expected_sha256 %r does not match the durably recorded "
+                "digest %r for role %r -- refusing to acknowledge"
+                % (expected_sha256, existing.get("sha256"), role))
+        if existing.get("acknowledged") is True:
+            return None  # idempotent no-op
+        acked = dict(existing)
+        acked["acknowledged"] = True
+        acked["acknowledged_at"] = _utc_now()
+        return acked
+
+    result = _locked_json_transaction(path, mutate)
+    return result if result is not None else read_pending_turn_before_pause(
+        session_uuid, role)
+
+
+def clear_pending_turn_before_pause(session_uuid, role):
+    """Remove a role's pending-turn-before-pause record entirely (post-ack
+    cleanup, once the turn has been fully replayed/consumed downstream).
+    Tolerant: never raises for a missing file/path."""
+    try:
+        path = pending_turn_before_pause_path_for(session_uuid, role)
+    except ValueError:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
