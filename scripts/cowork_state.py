@@ -5723,3 +5723,417 @@ def clear_pending_turn_before_pause(session_uuid, role):
         os.remove(path)
     except OSError:
         pass
+
+
+# =========================================================================== #
+# M4 Package B: durable, crash-safe activity journal + scheduled-review      #
+# store for the truthful-liveness surface Package A (`cowork_activity.py`,   #
+# frozen/read-only) defines. Every ActivityRecord/ActivityReconciliationRecord#
+# /ScheduledReviewRecord this section ever writes is validated through       #
+# Package A's own `validate_*` functions BEFORE anything reaches disk --     #
+# this section never invents its own shape for a record Package A already   #
+# owns.                                                                       #
+#                                                                              #
+# LAZY DEPENDENCY: `cowork_activity` is imported LOCALLY (`_import_activity` #
+# below), for the identical isolated-snapshot reason as the M2/M3 LAZY       #
+# DEPENDENCY banners above -- importing THIS file must never require         #
+# Package A's siblings to be present.                                       #
+#                                                                              #
+# TWO DISTINCT READ CONTRACTS, DELIBERATELY: `append_activity_record` reuses #
+# `_locked_jsonl_append`/`append_jsonl_atomic` completely UNCHANGED -- so a   #
+# torn tail left by an earlier, unrelated crash is TRANSPARENTLY REPAIRED    #
+# before the new record lands, exactly like every M1/M2 jsonl history in     #
+# this module (`mint_work_unit`, `append_work_unit_transition`). But a       #
+# DECISION surface that reads EXISTING activity evidence to determine or     #
+# report a truthful current classification -- `read_activity_history`,      #
+# `latest_activity`, and `reread_before_gate`'s own locked read -- must      #
+# never silently base a truthful-liveness verdict on an incomplete tail:     #
+# unlike a resumable execution ledger (where "skip the garbled line and      #
+# move on" is safe because the next write self-heals it), a classification   #
+# decided from a torn read here could misreport genuine silence as           #
+# evidenced work, or vice versa. So these three read through a STRICT jsonl  #
+# reader (`_read_activity_jsonl_strict`) that REFUSES (`CorruptRecordError`) #
+# a torn/unparseable trailing fragment instead of dropping it.               #
+# =========================================================================== #
+
+
+def _import_activity():
+    """Lazily import `cowork_activity` (M4 Package A). See the module-level
+    LAZY DEPENDENCY note above this M4 section for why this is a local, not
+    top-level, import."""
+    import cowork_activity
+    return cowork_activity
+
+
+def activity_dir_for(session_uuid):
+    """Root directory for every M4 Package B durable activity artifact
+    belonging to one session. Rejects unsafe session_uuid values; lowered
+    exactly like `work_unit_history_path_for` lowers `session_id` (UUIDs are
+    case-insensitive, so every caller naming the same session in different
+    casing must address the exact same directory). The root is overridable
+    via COWORK_SESSIONS_ROOT (inherited from `session_assets_dir`), so tests
+    never write to the real home dir."""
+    session_uuid = _lower_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid), "activity")
+
+
+def activity_history_path_for(session_uuid, work_id):
+    """Path of one work_id's append-only ActivityRecord/ActivityReconciliation
+    Record history within its session. Rejects unsafe session_uuid/work_id
+    values; `work_id` is lowered exactly like `work_unit_history_path_for`."""
+    work_id = _lower_safe_identifier(work_id, "work_id")
+    return os.path.join(activity_dir_for(session_uuid), "history",
+                        "%s.jsonl" % work_id)
+
+
+def scheduled_review_path_for(session_uuid, work_id):
+    """Path of one work_id's sole durable ScheduledReviewRecord -- issue
+    #58's durable next-inspection source of truth. A single CURRENT record,
+    not an append-only history: there is only ever one next-inspection due
+    time per work_id."""
+    work_id = _lower_safe_identifier(work_id, "work_id")
+    return os.path.join(activity_dir_for(session_uuid), "scheduled_review",
+                        "%s.json" % work_id)
+
+
+def _read_activity_jsonl_strict(path):
+    """Strict twin of `read_jsonl_tolerant`, for the M4 Package B read
+    surfaces that must never silently decide a truthful-liveness verdict
+    from an incomplete tail (see the module-level banner above this
+    section): a torn/unparseable trailing fragment left by an interrupted
+    append (`_torn_tail_length`) is REFUSED via `CorruptRecordError`, never
+    silently dropped. Every OTHER line must also be a well-formed JSON
+    object; a manually-corrupted line anywhere else in the file is refused
+    identically. A missing file reads as `[]` -- "never written yet" is not
+    corruption."""
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    torn = _torn_tail_length(raw)
+    if torn:
+        raise CorruptRecordError(
+            "%s: torn or unparseable trailing record (%d byte(s)) -- "
+            "refusing to read a possibly-incomplete activity history rather "
+            "than silently reporting a truncated truth" % (path, torn))
+    records = []
+    for line in raw.split(b"\n"):
+        if not line:
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise CorruptRecordError("%s: unparseable line (%s)" % (path, exc))
+        if not isinstance(obj, dict):
+            raise CorruptRecordError(
+                "%s: a history line is not a JSON object (got %s)"
+                % (path, type(obj).__name__))
+        records.append(obj)
+    return records
+
+
+def _validate_activity_history_entries(raw_entries):
+    """Revalidate every raw activity-history entry through the exact Package
+    A validator its own `record` field names -- never trusted by shape
+    alone, mirroring `cowork_activity.project_compact_state`'s own full-
+    revalidation discipline. An entry naming neither known kind is refused
+    (`CorruptRecordError`): this history's only two legitimate shapes are
+    fixed by Package A."""
+    activity = _import_activity()
+    validated = []
+    for entry in raw_entries:
+        kind = entry.get("record") if isinstance(entry, dict) else None
+        if kind == "ActivityRecord":
+            validated.append(activity.validate_activity_record(entry))
+        elif kind == "ActivityReconciliationRecord":
+            validated.append(activity.validate_activity_reconciliation_record(entry))
+        else:
+            raise CorruptRecordError(
+                "activity history entry has unrecognized record kind %r" % (kind,))
+    return validated
+
+
+def _effective_activity(validated_entries):
+    """Combine a validated, oldest-first activity history into the single
+    CURRENT (activity_record, reconciliation_record) pair `latest_activity`
+    and `reread_before_gate` both need: the most recently appended raw
+    ActivityRecord, and the most recent ActivityReconciliationRecord
+    appended AFTER it (or None if none has reconciled it yet). A fresh raw
+    ActivityRecord landing AFTER a reconciliation resets the pending
+    reconciliation to None -- a new raw observation always starts as its
+    own un-reconciled truth again, which is exactly the "only the NEXT gate
+    reconciles" invariant: a late write never rewrites the reconciliation a
+    prior gate already durably presented (append-only; this never mutates
+    that record), it only changes what the FOLLOWING `reread_before_gate`
+    call sees as the current baseline to reconcile FROM.
+
+    Returns None when `validated_entries` contains no ActivityRecord at
+    all (nothing has ever been observed for this work_id yet)."""
+    activity_record = None
+    reconciliation_record = None
+    for entry in validated_entries:
+        if entry["record"] == "ActivityRecord":
+            activity_record = entry
+            reconciliation_record = None
+        else:
+            reconciliation_record = entry
+    if activity_record is None:
+        return None
+    effective_classification = (
+        reconciliation_record["reconciled_classification"]
+        if reconciliation_record is not None
+        else activity_record["activity_class"])
+    return {
+        "activity_record": activity_record,
+        "reconciliation_record": reconciliation_record,
+        "effective_classification": effective_classification,
+    }
+
+
+def append_activity_record(session_uuid, record):
+    """Durably append one freshly-observed ActivityRecord to work_id's
+    append-only history. Validated via `cowork_activity.validate_activity_
+    record` (Package A) BEFORE anything is written -- an invalid record
+    raises ValueError and writes nothing.
+
+    Serialized against every other appender (a raw ActivityRecord append,
+    or a `reread_before_gate` reconciliation) for the SAME work_id via
+    `_locked_jsonl_append` -- the exact same per-path `fcntl.flock`
+    discipline `mint_work_unit`/`append_work_unit_transition` already use,
+    reused here verbatim, never reimplemented. A torn tail left by an
+    earlier, unrelated crash is transparently repaired (by `append_jsonl_
+    atomic`'s own existing, unmodified repair-before-append step) before
+    this call's own record lands -- fresh evidence is always appendable,
+    even over stale wreckage; see the module-level banner above this
+    section for why the READ surfaces below make the opposite choice.
+
+    Returns the durably stored, normalized record."""
+    validated = _import_activity().validate_activity_record(record)
+    path = activity_history_path_for(session_uuid, validated["work_id"])
+
+    def build(existing):
+        return dict(validated)
+
+    return _locked_jsonl_append(path, build)
+
+
+def read_activity_history(session_uuid, work_id):
+    """Return every durable ActivityRecord/ActivityReconciliationRecord for
+    one work_id, oldest first, each freshly revalidated through Package A's
+    own validators (see `_validate_activity_history_entries`). A missing
+    history reads as `[]`. A torn/unparseable trailing fragment, or any
+    line that fails Package A validation, is REFUSED (`CorruptRecordError`)
+    rather than silently skipped -- see the module-level banner above this
+    section."""
+    path = activity_history_path_for(session_uuid, work_id)
+    return _validate_activity_history_entries(_read_activity_jsonl_strict(path))
+
+
+def latest_activity(session_uuid, work_id):
+    """Return the current effective activity state for one work_id:
+    `{"activity_record", "reconciliation_record", "effective_classification"}`
+    (see `_effective_activity`), or `None` if nothing has ever been recorded
+    for this work_id. `effective_classification` is taken directly from the
+    reconciliation's `reconciled_classification` when one applies, else
+    directly from the raw record's own `activity_class` -- never fabricated
+    or inferred, mirroring `cowork_activity.project_compact_state`'s own
+    false-productive-attribution guard."""
+    return _effective_activity(read_activity_history(session_uuid, work_id))
+
+
+def _locked_jsonl_transaction(path, decide):
+    """Read-then-MAYBE-append twin of `_locked_jsonl_append`, for a caller
+    (`reread_before_gate`) that must decide, from the CURRENT durable
+    history and under the SAME per-path `fcntl.flock` exclusion, whether
+    anything needs to be durably appended at all -- `_locked_jsonl_append`
+    itself has no such branch: its `build_record` callback always returns a
+    record to append. Reuses the identical `<path>.lock` naming and bare,
+    unbounded `fcntl.flock(LOCK_EX)` acquisition `_locked_jsonl_append`
+    already uses (never `_flock_exclusive_with_timeout`'s M3 Package B
+    bounded variant -- this is jsonl-append-only history, not a single-
+    current-record store), so a genuinely concurrent `append_activity_
+    record`/`reread_before_gate` pair for the SAME work_id is still fully
+    serialized against each other.
+
+    `decide(existing)` receives the STRICTLY read, oldest-first, already
+    Package-A-revalidated history (`_read_activity_jsonl_strict` +
+    `_validate_activity_history_entries` -- a torn/corrupt tail is refused
+    before `decide` is ever called, never silently handed to it). It must
+    return either `None` (nothing durable needs to change; this function
+    writes nothing and returns `None`) or the exact, already Package-A-
+    validated record to durably append; a raised exception propagates
+    immediately, writing nothing.
+
+    MUST NOT be called reentrantly for the SAME path from a signal handler
+    already holding this same lock -- identical restriction to
+    `_locked_jsonl_append`'s own documented hazard."""
+    lock_path = path + ".lock"
+    dirname = os.path.dirname(lock_path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    lock_fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            existing = _validate_activity_history_entries(
+                _read_activity_jsonl_strict(path))
+            record = decide(existing)
+            if record is None:
+                return None
+            if not append_jsonl_atomic(path, record):
+                raise OSError("append failed for %s" % path)
+            return record
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fh.close()
+
+
+def reread_before_gate(session_uuid, work_id, observed_at,
+                       reconciled_classification, revision_digest,
+                       quiescence_marker):
+    """Before presenting a status/watchdog gate for `work_id`, durably
+    reconcile a freshly re-read classification against the CURRENT
+    effective one -- writing an ActivityReconciliationRecord only when the
+    fresh read genuinely disagrees with what is already effective.
+
+    IDENTICAL RE-READ WRITES NO PHANTOM RECONCILIATION: when
+    `reconciled_classification` equals the current effective classification
+    (whether that baseline came from a raw ActivityRecord or an earlier
+    reconciliation), this writes nothing and returns `None` -- calling this
+    twice with the same fresh evidence is a harmless no-op, never a second,
+    redundant reconciliation record.
+
+    LATE WRITE NEVER REWRITES AN ALREADY-PRESENTED GATE: every reconciliation
+    this function ever writes is a brand new, append-only record naming the
+    CURRENT effective classification as `original_classification` -- it
+    never edits or removes a prior reconciliation. If a raw ActivityRecord
+    lands (via `append_activity_record`) after this call already reconciled
+    one gate, that new raw record becomes the fresh baseline `latest_
+    activity`/the next `reread_before_gate` call sees (see `_effective_
+    activity`); THIS call's own already-returned/already-presented result is
+    never retroactively altered. Only the NEXT call to this function
+    reconciles again, against whatever is effective at that time.
+
+    Raises ValueError -- writing nothing -- if `work_id` has no recorded
+    ActivityRecord at all yet (there is nothing to reconcile against). The
+    candidate reconciliation record is built and validated via `cowork_
+    activity.validate_activity_reconciliation_record` (Package A) BEFORE it
+    is ever handed to the durable append. The whole read-decide-append
+    sequence runs under one lock acquisition (`_locked_jsonl_transaction`),
+    so a concurrent `append_activity_record`/`reread_before_gate` racing for
+    the SAME work_id can never interleave with this decision.
+
+    Returns the durably stored reconciliation record, or `None` if the
+    fresh read was identical to what was already effective (no write)."""
+    activity = _import_activity()
+    path = activity_history_path_for(session_uuid, work_id)
+
+    def decide(existing):
+        current = _effective_activity(existing)
+        if current is None:
+            raise ValueError(
+                "reread_before_gate: work_id %r has no recorded "
+                "ActivityRecord yet -- nothing to reconcile against"
+                % (work_id,))
+        if reconciled_classification == current["effective_classification"]:
+            return None
+        candidate = {
+            "schema_version": activity.SCHEMA_VERSION,
+            "record": "ActivityReconciliationRecord",
+            "work_id": work_id,
+            "time": observed_at,
+            "original_classification": current["effective_classification"],
+            "reconciled_classification": reconciled_classification,
+            "revision_digest": revision_digest,
+            "quiescence_marker": quiescence_marker,
+        }
+        return activity.validate_activity_reconciliation_record(candidate)
+
+    return _locked_jsonl_transaction(path, decide)
+
+
+def write_scheduled_review(session_uuid, record):
+    """Durably persist the sole ScheduledReviewRecord for one work_id --
+    issue #58's durable next-inspection source of truth. Validated via
+    `cowork_activity.validate_scheduled_review_record` (Package A) BEFORE
+    anything is written. A single CURRENT record, overwritten wholesale on
+    every call (there is only ever one next-inspection due time per
+    work_id, never an append-only history of them) -- serialized against
+    every other writer of the SAME work_id via `_locked_json_transaction`,
+    the identical `fcntl.flock`-backed single-record transaction M3 Package
+    B's own ProviderHealth/CapacityPacket/PauseLease stores already use,
+    reused here verbatim. A corrupt-but-present existing record raises
+    `CorruptRecordError` -- writing nothing -- exactly like every other M3
+    Package B locked single-record write (`write_provider_health` et al.):
+    damaged state must conflict explicitly, never be silently overwritten.
+
+    Returns the durably stored, normalized record."""
+    validated = _import_activity().validate_scheduled_review_record(record)
+    path = scheduled_review_path_for(session_uuid, validated["work_id"])
+
+    def mutate(existing):
+        return dict(validated)
+
+    return _locked_json_transaction(path, mutate)
+
+
+def read_next_inspection(session_uuid, work_id):
+    """Tolerant read of one work_id's current durable ScheduledReviewRecord,
+    or `None` if missing/unreadable/no-longer-schema-valid -- mirrors
+    `read_provider_health`'s own tolerant bare-read precedent (every public
+    M1/M2/M3 `read_*` accessor in this module stays tolerant; only the
+    LOCKED write-side transaction distinguishes corrupt from absent)."""
+    try:
+        path = scheduled_review_path_for(session_uuid, work_id)
+    except ValueError:
+        return None
+    raw = read_json_tolerant(path)
+    if raw is None:
+        return None
+    try:
+        return _import_activity().validate_scheduled_review_record(raw)
+    except ValueError:
+        return None
+
+
+def _parse_activity_timestamp(value):
+    """Parse one RFC3339-shaped timestamp string into an aware `datetime`,
+    for `activity_status_age_seconds`'s own use only. Accepts a trailing
+    `Z` (translated to `+00:00`, since `datetime.fromisoformat` on Python
+    3.9/3.10 does not itself accept a literal `Z`); a value with no explicit
+    offset at all is treated as UTC. Raises ValueError -- never any other
+    exception type -- on anything unparseable."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("timestamp must be a nonempty string, got %r" % (value,))
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            "timestamp %r is not a parseable RFC3339 string (%s)" % (value, exc))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
+def activity_status_age_seconds(since, now):
+    """Pure helper: seconds elapsed from RFC3339 timestamp `since` to
+    RFC3339 timestamp `now`, both explicit caller-supplied strings -- this
+    function itself never reads a wall clock, mirroring `cowork_activity`'s
+    own law that `ActivityRecord.age_seconds` is a pure recorded fact, never
+    something a validator or store computes from `time.time()` (see
+    `cowork_activity.validate_activity_record`'s docstring). Raises
+    ValueError if either timestamp fails to parse as RFC3339. A negative
+    delta (`now` earlier than `since` -- clock skew, or a caller passing the
+    two out of order) is clamped to `0.0` rather than raised, since
+    `age_seconds` itself must always be nonnegative (`cowork_activity.
+    _check_nonneg_number`) and a caller building an ActivityRecord from this
+    value must never receive a value the record's own validator would then
+    reject."""
+    since_dt = _parse_activity_timestamp(since)
+    now_dt = _parse_activity_timestamp(now)
+    return max(0.0, (now_dt - since_dt).total_seconds())
