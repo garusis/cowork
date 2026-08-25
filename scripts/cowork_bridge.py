@@ -1208,6 +1208,37 @@ def _usage_from_result(obj):
     return out or None
 
 
+def _claude_provider_retry_evidence(error):
+    """Structural, narrow extraction of a genuinely provider-attested
+    retry-after value from a claude `system`/`api_error` event's own
+    `error` dict -- the ONLY claude error shape with room to carry one
+    (the `assistant`/`isApiErrorMessage` shape carries just the CLI's own
+    already-classified token; see `classify_claude_failure`'s docstring).
+
+    Recognizes ONLY an optional `error["retry_after"]` nonempty string --
+    the literal Retry-After-shaped value a provider response can attach
+    beside its `type`/`status` discriminants -- and returns Package C's
+    canonical `{"source": "provider_header", "value": <str>}` shape
+    unchanged (never itself parsed/normalized further; `extract_retry_
+    evidence`/`parse_retry_after_text` do that later). Any other shape
+    (missing field, wrong type, empty string) returns None: never
+    inferred from `formatted`/`message` text, never guessed. Like the
+    rest of this module's closed token/status tables (see the provenance
+    note above `classify_claude_failure`), this is the package's own
+    documented extraction contract, not a verified transcription of a
+    captured real provider payload -- and it degrades to None (which
+    `extract_retry_evidence` -> `classify_trust_source` correctly grades
+    "untrustworthy") for the two shapes this repository DOES have
+    attested (`test_parse_claude_synthetic_api_error`), neither of which
+    carries this field."""
+    if not isinstance(error, dict):
+        return None
+    value = error.get("retry_after")
+    if not isinstance(value, str) or not value:
+        return None
+    return {"source": "provider_header", "value": value}
+
+
 def parse_claude_event(obj):
     """Classify one claude stream-json output event.
 
@@ -1278,8 +1309,26 @@ def parse_claude_event(obj):
             error = obj.get("error") or {}
             text = (error.get("formatted") or error.get("message")
                     if isinstance(error, dict) else str(error))
-            return {"kind": "error", "text": text,
-                    "error_type": "api_error"}
+            # The SAME machine-readable token `classify_claude_failure`
+            # itself keys on for this exact shape (its own `error["type"]`
+            # discriminant) -- reused here so `error_type` survives
+            # `send()`'s single-string flattening as something more
+            # specific than the generic "api_error" bucket whenever the
+            # raw event actually carries one, letting a genuine quota/
+            # overload signal (and any `retry_evidence` riding beside it)
+            # reach Package E's classification through the real send()
+            # result. Falls back to the literal "api_error" bucket when
+            # `error` carries no such token -- e.g. the repository's own
+            # attested "401 OAuth token expired" fixture, which names no
+            # `type` field at all and is unaffected by this change.
+            token = error.get("type") if isinstance(error, dict) else None
+            error_type = token if isinstance(token, str) and token else "api_error"
+            parsed = {"kind": "error", "text": text,
+                      "error_type": error_type}
+            retry_evidence = _claude_provider_retry_evidence(error)
+            if retry_evidence is not None:
+                parsed["retry_evidence"] = retry_evidence
+            return parsed
         # The init system event names the live model (traceability: which
         # model actually served this session, not just which was requested).
         return {"kind": "system", "subtype": obj.get("subtype", ""),
@@ -2054,6 +2103,11 @@ class ClaudeSession:
                     controller_error = {
                         "error_type": parsed.get("error_type") or "api_error",
                         "text": parsed.get("text") or "controller API error",
+                        # Genuinely provider-attested only (see
+                        # `_claude_provider_retry_evidence`) -- absent for
+                        # every shape that carries no such field, never
+                        # synthesized here.
+                        "retry_evidence": parsed.get("retry_evidence"),
                     }
                     if spinner:
                         spinner.stop()
@@ -2075,6 +2129,11 @@ class ClaudeSession:
                 if parsed.get("is_error") or controller_error is not None:
                     error_type = ((controller_error or {}).get("error_type")
                                   or parsed.get("subtype") or "controller_error")
+                    # Genuinely provider-attested only -- absent (None,
+                    # dropped by `turn_result`) whenever `controller_error`
+                    # itself is absent or carries no such evidence.
+                    retry_evidence = (controller_error or {}).get(
+                        "retry_evidence")
                     _end(result="error", work_class="failed",
                          subtype=parsed.get("subtype"),
                          error_type=error_type,
@@ -2087,7 +2146,7 @@ class ClaudeSession:
                     self.io_out.flush()
                     return turn_result(
                         False, "error", subtype=parsed.get("subtype"),
-                        error_type=error_type,
+                        error_type=error_type, retry_evidence=retry_evidence,
                         session_id=sid or self.session_id,
                         model=self.live_model or self.model, duration_ms=_elapsed_ms())
                 else:

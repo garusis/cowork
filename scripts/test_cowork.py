@@ -54,6 +54,10 @@ import cowork_report as report  # noqa: E402
 import cowork_eval as evaluation  # noqa: E402
 import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 import cowork_workunit as workunit  # noqa: E402
+import cowork_control_plane as control_plane  # noqa: E402
+import cowork_capacity as capacity_contracts  # noqa: E402
+import cowork_capacity_scheduler as capacity_scheduler  # noqa: E402
+import cowork_wake_macos as wake_macos  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
 # that exercise the real libraries skip when they are absent — same pattern as the
@@ -15010,7 +15014,11 @@ class TransportChokePointTests(unittest.TestCase):
         self.assertEqual(actual, wrapper_callers)
 
         boundary_callers = {
-            "_initial_user_delivery": {"_role_seed_delivery", "_role_loop"},
+            "_initial_user_delivery": {
+                "_role_seed_delivery", "_role_loop",
+                # M3 Package E: the headless resume-trigger's typed seed
+                # wrapper (issue #57 -- never an untyped seed).
+                "_resume_seed_delivery"},
             "_user_lead_delivery": {"_role_loop"},
             "_role_seed_delivery": {
                 "assemble_codex_prompt", "run_scout", "run_planner",
@@ -15038,7 +15046,7 @@ class TransportChokePointTests(unittest.TestCase):
         known_wrappers = set(wrapper_callers) | {
             "_initial_user_delivery", "_user_lead_delivery",
             "_cross_delivery", "_eval_delivery", "_lead_turn_delivery",
-            "_role_seed_delivery",
+            "_role_seed_delivery", "_resume_seed_delivery",
         }
 
         def rogue_delivery_calls(candidate_tree):
@@ -15789,7 +15797,13 @@ sys.exit(rc)
             controller = "claude"
             def send(self, text, meta=None):
                 sends.append(text)
-                return {"ok": False, "result": "error", "error_type": "rate_limit"}
+                # M3 Package E: a token outside every Package C classifier
+                # table (never quota/overload/authentication) -- this test
+                # exercises retry MECHANICS, not capacity classification, so
+                # it must not accidentally collide with the new
+                # same-provider-retry-blocked invariant.
+                return {"ok": False, "result": "error",
+                        "error_type": "flaky_stream"}
             def close(self): pass
 
         rc, outcome, payload = cowork._role_loop(
@@ -15837,8 +15851,12 @@ sys.exit(rc)
                     # Send 1: Initial turn succeeds
                     return {"ok": True, "result": "ok"}
                 elif self.count == 2:
-                    # Send 2: Later direct turn fails
-                    return {"ok": False, "result": "error", "error_type": "rate_limit"}
+                    # Send 2: Later direct turn fails. M3 Package E: a token
+                    # outside every Package C classifier table (never
+                    # quota/overload/authentication) -- retry MECHANICS, not
+                    # capacity classification, are under test here.
+                    return {"ok": False, "result": "error",
+                            "error_type": "flaky_stream"}
                 else:
                     # Send 3: Retry send succeeds and writes ready_for_review
                     with open(build_status, "w") as fh:
@@ -15920,8 +15938,12 @@ sys.exit(rc)
                 sends.append(text)
                 self.count += 1
                 if self.count == 1:
-                    # Send 1: Fails
-                    return {"ok": False, "result": "error", "error_type": "rate_limit"}
+                    # Send 1: Fails. M3 Package E: a token outside every
+                    # Package C classifier table (never quota/overload/
+                    # authentication) -- retry MECHANICS, not capacity
+                    # classification, are under test here.
+                    return {"ok": False, "result": "error",
+                            "error_type": "flaky_stream"}
                 else:
                     # Send 2: Retry send succeeds (status file remains needs_input)
                     return {"ok": True, "result": "ok"}
@@ -38693,3 +38715,1672 @@ class GraphDeclarationPreLaunchAndSwitchSeamTest(ControllerPolicyTestBase):
             any(e.get("result") == "graph_declaration_rejected"
                for e in switch_ends),
             "switch rejection must not be a vacuous absence of trace events")
+
+
+# =========================================================================== #
+# M3 Package E — orchestration-resume wiring: focused named tests.            #
+#                                                                             #
+# Covers the frozen brief's non-vacuous live-fault list: trustworthy         #
+# scheduled resume exact binding; unknown reset manual signed-only;          #
+# persist-before-ack and exactly-once consumption; post-wake send failure    #
+# retains pending turn; both headless resume forms; InvalidationRecord      #
+# no-replay; wrong-role supervision stop; malformed classification writes   #
+# unknown ProviderHealth; zero same-provider auto-retry for quota/overload/  #
+# authentication; and issue #57 (typed-seed TypeError avoidance).           #
+# =========================================================================== #
+
+
+def _m3e_bind_capacity_candidate(session_uuid, role, controller="claude",
+                                 model=None, effort=None):
+    """Compile a REAL dispatch manifest for (session_uuid, role) and bind
+    it as the role's WorkUnit candidate -- mirrors production's own
+    preflighting -> running -> candidate-bound sequence
+    (`_ensure_work_unit` + `_advance_phase('preflight_started')` +
+    `_advance_phase('preflight_passed')` + `_bind_candidate`, matching
+    run_scout/run_planner/run_builder's own BL-2 ordering: a role's turns
+    only ever send while its WorkUnit is `running`), giving M3 Package E's
+    capacity-entry/resume-trigger seams a genuine, candidate-bound identity
+    to key off. Returns (work_id, manifest, binding)."""
+    work_id = cowork._role_work_id(session_uuid, role, 0, 0)
+    manifest, _ = cowork._compile_role_manifest(
+        role=role, session_uuid=session_uuid, work_id=role,
+        controller=controller, mode="implement", model=model, effort=effort,
+        sessions_dir=state_store.session_assets_dir(session_uuid))
+    cowork._ensure_work_unit(session_uuid, work_id, role, controller,
+                            model=model, effort=effort)
+    cowork._advance_phase(session_uuid, work_id, "preflight_started")
+    cowork._advance_phase(session_uuid, work_id, "preflight_passed")
+    cowork._bind_candidate(session_uuid, work_id, manifest["digest"])
+    binding = cowork._capacity_candidate_binding(session_uuid, work_id, role)
+    return work_id, manifest, binding
+
+
+class M3PackageECapacityWiringTests(unittest.TestCase):
+    """Send-failure-seam wiring: C's classification, ProviderHealth, and the
+    durable capacity-entry seam (`_role_loop`'s retain-on-send-failure
+    block)."""
+
+    def _session_dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        prior_cwd = os.getcwd()
+        self.addCleanup(lambda: os.chdir(prior_cwd))
+        os.chdir(d)
+        return d
+
+    def _fixture(self, role="builder", controller="claude"):
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        work_id, manifest, binding = _m3e_bind_capacity_candidate(
+            suid, role, controller=controller)
+        status_path = os.path.join(
+            state_store.session_assets_dir(suid), "%s.status.json" % role)
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+        return d, suid, work_id, binding, status_path
+
+    class _FailingSession:
+        def __init__(self, controller, error_type, session_id="prov-sess-1"):
+            self.controller = controller
+            self.error_type = error_type
+            self.session_id = session_id
+            self.model = None
+            self.effort = None
+            self.sends = []
+
+        def send(self, text, meta=None):
+            self.sends.append(text)
+            return {"ok": False, "result": "error",
+                    "error_type": self.error_type}
+
+        def close(self):
+            pass
+
+    def test_provider_health_recorded_for_every_c_classification_including_unknown(self):
+        cases = [
+            ("rate_limit_error", "quota_limited"),
+            ("overloaded_error", "overloaded"),
+            ("authentication_failed", "authentication_failed"),
+            ("policy_violation", "policy_blocked"),
+            ("connection_error", "transport_failed"),
+            ("a-token-nobody-recognizes", "unknown_provider_failure"),
+        ]
+        for error_type, expected_outcome in cases:
+            with self.subTest(error_type=error_type):
+                d, suid, work_id, binding, status_path = self._fixture()
+                sess = self._FailingSession("claude", error_type)
+                rc, outcome, payload = cowork._role_loop(
+                    sess, "do the thing", status_path, context="",
+                    io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                    role="builder", session_uuid=suid, role_work_id=work_id)
+                self.assertEqual(rc, 0)
+                health = state_store.read_provider_health(
+                    suid, "builder", "claude")
+                self.assertIsNotNone(health)
+                self.assertEqual(health["last_outcome"], expected_outcome)
+                self.assertEqual(health["consecutive_failures"], 1)
+                self.assertIn(health["status"], ("degraded", "unavailable"))
+
+    def test_malformed_unrecognized_token_writes_unknown_provider_health(self):
+        d, suid, work_id, binding, status_path = self._fixture()
+        sess = self._FailingSession("claude", "totally-made-up-shape")
+        cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        health = state_store.read_provider_health(suid, "builder", "claude")
+        self.assertEqual(health["last_outcome"], "unknown_provider_failure")
+        self.assertEqual(health["status"], "degraded")
+
+    def test_guard_denied_local_signal_classifies_local_guard_exhausted_never_capacity(self):
+        # Fail closed for local guards: a local budget-exhausted denial must
+        # never be treated as provider capacity evidence.
+        d, suid, work_id, binding, status_path = self._fixture()
+
+        class DeniedSession:
+            controller = "claude"
+            session_id = "prov-sess-1"
+            model = None
+            effort = None
+
+            def send(self, text, meta=None):
+                return {"ok": False, "result": "denied", "denied": True}
+
+            def close(self):
+                pass
+
+        rc, outcome, payload = cowork._role_loop(
+            DeniedSession(), "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertNotEqual(outcome, "awaiting_capacity")
+        health = state_store.read_provider_health(suid, "builder", "claude")
+        self.assertEqual(health["last_outcome"], "local_guard_exhausted")
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertNotEqual(ps["state"], "awaiting_capacity")
+
+    def test_quota_failure_enters_awaiting_capacity_with_exact_binding_persist_before_ack(self):
+        d, suid, work_id, binding, status_path = self._fixture()
+        sess = self._FailingSession("claude", "rate_limit_error")
+        rc, outcome, payload = cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome, "awaiting_capacity")
+        # Exact role/provider-session/candidate/controller-policy/model/effort
+        # binding is carried on the payload.
+        self.assertEqual(payload["role"], "builder")
+        self.assertEqual(payload["provider"], "claude")
+        self.assertEqual(payload["provider_session_id"], "prov-sess-1")
+        self.assertEqual(payload["candidate_manifest_digest"],
+                         binding["candidate_manifest_digest"])
+        self.assertEqual(payload["controller_policy_digest"],
+                         binding["controller_policy_digest"])
+        self.assertIsNotNone(payload["pending_turn_digest"])
+
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertEqual(ps["state"], "awaiting_capacity")
+        self.assertEqual(ps["reason_code"], "capacity_reserved")
+
+        packet = state_store.read_capacity_packet(suid, payload["package_id"])
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet["binding"]["candidate_digest"],
+                         binding["candidate_manifest_digest"])
+
+        lease = state_store.read_pause_lease(suid, payload["lease_id"])
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease["consumption_state"], "unclaimed")
+
+        # Persist-before-ack: the durable pending-turn record exists and is
+        # ALREADY acknowledged by the time capacity entry succeeds (the
+        # persist happened first, the ack only after the durable
+        # CapacityPacket/PauseLease/PhaseState all landed).
+        pending = state_store.read_pending_turn_before_pause(suid, "builder")
+        self.assertIsNotNone(pending)
+        self.assertTrue(pending["acknowledged"])
+        self.assertEqual(pending["sha256"], payload["pending_turn_digest"])
+        self.assertEqual(pending["lease_id"], payload["lease_id"])
+
+    def test_overload_failure_also_enters_awaiting_capacity(self):
+        d, suid, work_id, binding, status_path = self._fixture()
+        sess = self._FailingSession("claude", "overloaded_error")
+        rc, outcome, payload = cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "awaiting_capacity")
+        self.assertEqual(payload["controller_outcome"], "overloaded")
+
+    def test_capacity_entry_requires_candidate_bound_workunit_fails_closed(self):
+        # No manifest/candidate binding minted at all: capacity entry must
+        # refuse (candidate transitions only from candidate-bound evidence),
+        # falling back to the ordinary interactive controller-failure gate.
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        status_path = os.path.join(
+            state_store.session_assets_dir(suid), "builder.status.json")
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+        sess = self._FailingSession("claude", "rate_limit_error")
+        rc, outcome, payload = cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=None)
+        self.assertNotEqual(outcome, "awaiting_capacity")
+        self.assertEqual(outcome, "ended")
+
+    def test_authentication_failure_never_auto_retries_same_provider(self):
+        d, suid, work_id, binding, status_path = self._fixture()
+        sess = self._FailingSession("claude", "authentication_failed")
+        rc, outcome, payload = cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO("retry\nend\n"), io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "ended")
+        # A forced "retry" choice at the gate must never actually resend.
+        self.assertEqual(len(sess.sends), 1)
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertEqual(ps["state"], "failed")
+        self.assertEqual(ps["evidence"].get("reason"),
+                         "same_provider_retry_blocked")
+
+    def test_quota_overload_bypass_interactive_gate_entirely(self):
+        # A capacity-eligible outcome never even reaches the interactive
+        # retry/switch/end gate -- it durably pauses instead.
+        d, suid, work_id, binding, status_path = self._fixture()
+        sess = self._FailingSession("claude", "rate_limit_error")
+        out = io.StringIO()
+        rc, outcome, payload = cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO(""), io_out=out,
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "awaiting_capacity")
+        self.assertNotIn("choose: retry", out.getvalue())
+
+
+def _m3e_signed_manual_signal(payload, role, key_id="authority-key-1",
+                              tamper=False):
+    """A GENUINE Ed25519-signed manual-capacity-signal record bound to
+    `payload`'s exact candidate/session/policy identity, mirroring
+    test_cowork_state_m3.py's own `_signed_manual_signal` convention.
+    Returns (record, pinned_public_keys)."""
+    secret_key = hashlib.sha256(os.urandom(32)).digest()
+    public_key = state_store._ed25519_selftest_publickey(secret_key)
+    record = dict(
+        schema_version=1, package_id=payload["package_id"],
+        candidate_digest=payload["candidate_manifest_digest"], role=role,
+        provider_session_id=payload["provider_session_id"],
+        controller_policy_digest=payload["controller_policy_digest"],
+        signal_journal_ref="journal-" + str(uuid.uuid4()),
+        signer_public_key_id=key_id, detached_signature="00" * 64,
+        issued_at="2026-01-01T00:00:00Z")
+    message = state_store.canonical_manual_capacity_signal_message(record)
+    signature = state_store._ed25519_selftest_sign(
+        message, secret_key, public_key)
+    sig_hex = signature.hex()
+    if tamper:
+        sig_hex = ("f" if sig_hex[0] != "f" else "0") + sig_hex[1:]
+    record["detached_signature"] = sig_hex
+    return record, {key_id: public_key.hex()}
+
+
+class M3PackageEResumeTriggerTests(unittest.TestCase):
+    """The headless resume-trigger CLI: both resume forms, binding-preserving
+    wake preflight, InvalidationRecord no-replay, wrong-role supervision
+    stop, and post-wake send-failure retention."""
+
+    def _session_dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        prior_cwd = os.getcwd()
+        self.addCleanup(lambda: os.chdir(prior_cwd))
+        os.chdir(d)
+        return d
+
+    def _enter_capacity(self, role="builder", controller="claude",
+                        error_type="rate_limit_error"):
+        """Drive a REAL quota-classified send failure all the way into a
+        durable `awaiting_capacity` pause (persist-before-ack, exactly-once
+        pending-turn contract already proven by
+        M3PackageECapacityWiringTests), then save the role's config/session
+        id so a later resume-trigger call can reconstruct a session.
+        Returns (d, suid, work_id, payload)."""
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        work_id, manifest, binding = _m3e_bind_capacity_candidate(
+            suid, role, controller=controller)
+        status_path = os.path.join(
+            state_store.session_assets_dir(suid), "%s.status.json" % role)
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+
+        sess = M3PackageECapacityWiringTests._FailingSession(
+            controller, error_type)
+        rc, outcome, payload = cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role=role, session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "awaiting_capacity")
+
+        state = state_store.load(spath)
+        state.setdefault("config", {})[role] = {
+            "controller": controller, "model": None, "effort": None,
+            "mode": "implement", "yolo": True}
+        state.setdefault("sessions", {})[role] = {
+            "controller": controller, "id": "prov-sess-1"}
+        state_store.save(spath, state)
+        return d, suid, work_id, payload
+
+    def _write_json(self, d, name, obj):
+        path = os.path.join(d, name)
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
+        return path
+
+    def _fake_factory(self, sent, ok=True, error_type="connection_error"):
+        def factory(controller, role, provider_session_id, model, effort):
+            class FakeResumeSession:
+                def send(self, text, meta=None):
+                    sent.append(text)
+                    if ok:
+                        return {"ok": True, "result": "ok"}
+                    return {"ok": False, "result": "error",
+                            "error_type": error_type}
+
+                def close(self):
+                    pass
+            return FakeResumeSession()
+        return factory
+
+    def test_exit_codes_match_d_contract_naming(self):
+        # Package F consults RESUME_TRIGGER_EXIT_CODES by name, matching D's
+        # own WAKE_TRIGGER_EXIT_CODES naming for the shared subset.
+        for name in ("success", "internal_error", "invalid_arguments",
+                    "not_due", "conflict", "attempts_exhausted"):
+            self.assertEqual(
+                cowork.RESUME_TRIGGER_EXIT_CODES[name],
+                capacity_scheduler.WAKE_TRIGGER_EXIT_CODES[name])
+        for name in ("binding_mismatch", "invalidated", "no_pending_turn",
+                    "send_failed"):
+            self.assertIn(name, cowork.RESUME_TRIGGER_EXIT_CODES)
+
+    def test_manual_signal_form_success_exactly_once_consumption(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual(sent, ["do the thing"])
+        self.assertIsNone(
+            state_store.read_pending_turn_before_pause(suid, "builder"))
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertEqual(ps["state"], "running")
+        lease = state_store.read_pause_lease(suid, payload["lease_id"])
+        self.assertEqual(lease["consumption_state"], "consumed")
+
+        # A SECOND resume-trigger call against the same, now-consumed lease
+        # is refused outright -- never a second replay. The pending-turn
+        # preflight check runs BEFORE any state-mutating claim (never
+        # re-consumes the single-use manual signal for a doomed request),
+        # so the refusal is the precise "nothing left to replay" reason,
+        # never even reaching D's own claim/"not_claimable" conflict.
+        sent2 = []
+        out2 = []
+        rc2 = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:06:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out2.append, session_factory=self._fake_factory(sent2))
+        self.assertEqual(rc2, cowork.RESUME_TRIGGER_EXIT_NO_PENDING_TURN)
+        self.assertEqual(sent2, [])
+        # The already-consumed lease is left untouched -- never re-claimed.
+        lease2 = state_store.read_pause_lease(suid, payload["lease_id"])
+        self.assertEqual(lease2["consumption_state"], "consumed")
+
+    def test_scheduled_form_exact_binding_early_refusal_then_success(self):
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        work_id, manifest, binding = _m3e_bind_capacity_candidate(suid, "builder")
+
+        issued_at = "2025-12-31T00:00:00Z"
+        not_before = "2025-12-31T01:00:00Z"
+        lease_id = str(uuid.uuid4())
+        automation_ref = "cowork.orchestration_resume/v%d" % (
+            capacity_scheduler.SCHEDULER_DECISION_LAYER_VERSION)
+        pause_lease = {
+            "schema_version": capacity_contracts.SCHEMA_VERSION,
+            "package_id": str(uuid.uuid4()), "lease_id": lease_id,
+            "role": "builder", "provider_session_id": "prov-sess-1",
+            "controller_policy_digest": binding["controller_policy_digest"],
+            "candidate_digest": binding["candidate_manifest_digest"],
+            "resume_mode": "scheduled", "not_before": not_before,
+            "automation_ref": automation_ref,
+            "artifact_hashes": {"manifest": binding["candidate_manifest_digest"]},
+            "consumption_state": "unclaimed", "failed_wake_attempts": 0,
+            "issued_at": issued_at,
+        }
+        capacity_scheduler.start_new_episode(suid, pause_lease)
+        turn_text = "scheduled turn text"
+        state_store.write_pending_turn_before_pause(
+            suid, "builder", turn_text, lease_id=lease_id)
+        state_store.acknowledge_pending_turn_before_pause(
+            suid, "builder", hashlib.sha256(turn_text.encode()).hexdigest())
+        cowork._advance_phase(
+            suid, work_id, "capacity_reserved",
+            evidence={"capacity_evidence": {
+                "controller_outcome": "overloaded", "role": "builder",
+                "provider_session_id": "prov-sess-1",
+                "controller_policy_digest": binding["controller_policy_digest"],
+                "candidate_manifest_digest": binding["candidate_manifest_digest"],
+                "candidate_index": binding["candidate_index"],
+                "resume_mode": "scheduled", "model": None, "effort": None,
+                "artifact_hashes": {"manifest": binding["candidate_manifest_digest"]},
+                "automation_ref": automation_ref}},
+            source="test", expected_candidate={
+                "candidate_manifest_digest": binding["candidate_manifest_digest"],
+                "candidate_index": binding["candidate_index"]})
+
+        state = state_store.load(spath)
+        state.setdefault("config", {})["builder"] = {
+            "controller": "claude", "model": None, "effort": None,
+            "mode": "implement", "yolo": True}
+        state.setdefault("sessions", {})["builder"] = {
+            "controller": "claude", "id": "prov-sess-1"}
+        state_store.save(spath, state)
+
+        sent = []
+        out = []
+        rc_early = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", lease_id, "--claimant-ref", "wake-1",
+            "--automation-ref", automation_ref,
+            "--now", "2025-12-31T00:30:00Z", "--cwd", d,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc_early, cowork.RESUME_TRIGGER_EXIT_NOT_DUE)
+        self.assertEqual(sent, [])
+
+        out2 = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", lease_id, "--claimant-ref", "wake-1",
+            "--automation-ref", automation_ref,
+            "--now", "2026-01-02T00:00:00Z", "--cwd", d,
+        ], output=out2.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual(sent, [turn_text])
+
+    def test_manual_signal_form_rejects_tampered_signature(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(
+            payload, "builder", tamper=True)
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_CONFLICT)
+        self.assertEqual(sent, [])
+        self.assertIn("override_evidence_invalid", out[0])
+
+    def test_manual_signal_form_requires_pinned_public_keys_argument(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS)
+        self.assertEqual(sent, [])
+
+    def test_ordinary_claim_refuses_manual_signal_mode_lease_unsigned(self):
+        # Package E rejects an unsigned/self-claimed reset: the ORDINARY
+        # (trustworthy-scheduled) claim path can never resume our
+        # manual_signal-mode capacity entry -- only a genuinely verified
+        # signal may.
+        d, suid, work_id, payload = self._enter_capacity()
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_CONFLICT)
+        self.assertEqual(sent, [])
+        self.assertIn("manual_signal_requires_verified_evidence", out[0])
+
+    def test_wrong_first_role_after_resume_stops_durably_for_supervision(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "planner",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+        self.assertEqual(sent, [])
+        self.assertIn("role_mismatch", out[0])
+        # The pending turn is untouched -- a wrong-role attempt never
+        # consumes it.
+        pending = state_store.read_pending_turn_before_pause(suid, "builder")
+        self.assertIsNotNone(pending)
+        self.assertTrue(pending["acknowledged"])
+
+    def test_binding_mismatch_after_candidate_changes_returns_to_awaiting_capacity(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        # The dispatch identity changed AFTER the pause (a different model
+        # recompiled and rebound) -- the resume must refuse, never silently
+        # resuming a stale binding.
+        new_manifest, _ = cowork._compile_role_manifest(
+            role="builder", session_uuid=suid, work_id="builder",
+            controller="claude", mode="implement", model="claude-opus-5",
+            effort=None, sessions_dir=state_store.session_assets_dir(suid),
+            force_recompile=True)
+        cowork._bind_candidate(suid, work_id, new_manifest["digest"])
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+        self.assertEqual(sent, [])
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertEqual(ps["state"], "awaiting_capacity")
+
+    def test_invalidation_record_blocks_replay_of_completed_paired_work(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        state_store.append_invalidation_record(suid, {
+            "schema_version": 1, "package_id": "pkg-invalidate",
+            "invalidated_candidate_digest":
+                payload["candidate_manifest_digest"],
+            "invalidated_session_id": suid, "invalidated_work_id": work_id,
+            "invalidating_principal": "test-authority",
+            "reason": "superseded_by_newer_plan",
+            "evidence_refs": [{"path": "a.txt", "sha256": "c" * 64}],
+            "issued_at": "2026-01-01T00:00:00Z"})
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_INVALIDATED)
+        self.assertEqual(sent, [])
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertEqual(ps["state"], "rejected_preflight")
+
+    def test_post_wake_send_failure_retains_pending_turn(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append,
+            session_factory=self._fake_factory(
+                sent, ok=False, error_type="connection_error"))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SEND_FAILED)
+        self.assertEqual(sent, ["do the thing"])
+        pending = state_store.read_pending_turn_before_pause(suid, "builder")
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["turn_text"], "do the thing")
+        health = state_store.read_provider_health(suid, "builder", "claude")
+        self.assertEqual(health["last_outcome"], "transport_failed")
+
+    def test_resume_seed_delivery_avoids_issue_57_untyped_seed_typeerror(self):
+        # No-new-context resume: the exact persisted turn replays verbatim.
+        no_new_context = cowork._resume_seed_delivery("persisted turn", None)
+        self.assertIsInstance(no_new_context, handoff.DeliveryEnvelope)
+        self.assertEqual(str(no_new_context), "persisted turn")
+        # Redirected-context resume: a fresh context string substitutes.
+        redirected = cowork._resume_seed_delivery(
+            "persisted turn", "fresh redirected context")
+        self.assertIsInstance(redirected, handoff.DeliveryEnvelope)
+        self.assertEqual(str(redirected), "fresh redirected context")
+        # An untyped (non-string) seed is refused with a TypeError -- never
+        # silently coerced or handed to a transport call.
+        with self.assertRaises(TypeError):
+            cowork._resume_seed_delivery(None, None)
+        with self.assertRaises(TypeError):
+            cowork._resume_seed_delivery({"not": "a string"}, None)
+
+
+class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
+    """Non-vacuous, focused proofs for the bounded E/D/F resume-seam
+    successor's own named blockers/majors: E-BLK-01/02, E-MAJ-01..05, and
+    F-MJ-02 (the D/F seam) -- each test pins EXACTLY one closed gap, with a
+    genuine durable-state assertion, not merely a return-code check."""
+
+    def _session_dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        prior_cwd = os.getcwd()
+        self.addCleanup(lambda: os.chdir(prior_cwd))
+        os.chdir(d)
+        return d
+
+    def _fixture(self, role="builder", controller="claude"):
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        work_id, manifest, binding = _m3e_bind_capacity_candidate(
+            suid, role, controller=controller)
+        status_path = os.path.join(
+            state_store.session_assets_dir(suid), "%s.status.json" % role)
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+        return d, suid, work_id, binding, status_path
+
+    def _write_json(self, d, name, obj):
+        path = os.path.join(d, name)
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
+        return path
+
+    def _fake_factory(self, sent, ok=True, error_type="connection_error"):
+        def factory(controller, role, provider_session_id, model, effort):
+            class FakeResumeSession:
+                def send(self, text, meta=None):
+                    sent.append(text)
+                    if ok:
+                        return {"ok": True, "result": "ok"}
+                    return {"ok": False, "result": "error",
+                            "error_type": error_type}
+
+                def close(self):
+                    pass
+            return FakeResumeSession()
+        return factory
+
+    def _enter_capacity(self, role="builder", controller="claude",
+                        error_type="rate_limit_error"):
+        d, suid, work_id, binding, status_path = self._fixture(
+            role=role, controller=controller)
+        sess = M3PackageECapacityWiringTests._FailingSession(
+            controller, error_type)
+        rc, outcome, payload = cowork._role_loop(
+            sess, "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role=role, session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "awaiting_capacity")
+        state = state_store.load(
+            os.path.join(d, ".cowork", "session.json"))
+        state.setdefault("config", {})[role] = {
+            "controller": controller, "model": None, "effort": None,
+            "mode": "implement", "yolo": True}
+        state.setdefault("sessions", {})[role] = {
+            "controller": controller, "id": "prov-sess-1"}
+        state_store.save(os.path.join(d, ".cowork", "session.json"), state)
+        return d, suid, work_id, payload
+
+    # -- E-BLK-01/F-MJ-02: the failed-wake ceiling is reachable and durable
+    # -- across post-claim-SHAPED resume-trigger failures, and this session's
+    # -- own wake_decision is consulted BEFORE any state-mutating claim.
+    def test_wake_ceiling_reachable_deterministically_via_repeated_preflight_failures(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        lease_id = payload["lease_id"]
+        for i in range(capacity_contracts.FAILED_WAKE_ATTEMPT_CEILING):
+            out = []
+            rc = cowork.run_resume_trigger([
+                "--session-uuid", suid, "--role", "planner",
+                "--lease-id", lease_id, "--claimant-ref", "wake-1",
+                "--automation-ref", payload["automation_ref"],
+                "--now", "2026-01-01T00:0%d:00Z" % (i + 1), "--cwd", d,
+            ], output=out.append)
+            self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+            lease = state_store.read_pause_lease(suid, lease_id)
+            self.assertEqual(lease["failed_wake_attempts"], i + 1)
+            # A pre-claim-detected refusal never claims the lease.
+            self.assertEqual(lease["consumption_state"], "unclaimed")
+
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "planner",
+            "--lease-id", lease_id, "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:09:00Z", "--cwd", d,
+        ], output=out.append)
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_ATTEMPTS_EXHAUSTED)
+        self.assertIn("attempts_exhausted", out[0])
+        # Deterministic: the ceiling never regresses past its own bound.
+        lease = state_store.read_pause_lease(suid, lease_id)
+        self.assertEqual(lease["failed_wake_attempts"],
+                         capacity_contracts.FAILED_WAKE_ATTEMPT_CEILING)
+
+    # -- E-MAJ (same-binding replacement, never a fresh episode): a genuine
+    # -- post-wake send failure that re-enters awaiting_capacity carries the
+    # -- per-binding failed_wake_attempts count FORWARD -- it never resets.
+    def test_post_wake_send_failure_replacement_preserves_failed_wake_attempts(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        lease_id = payload["lease_id"]
+        for i in range(2):
+            cowork.run_resume_trigger([
+                "--session-uuid", suid, "--role", "planner",
+                "--lease-id", lease_id, "--claimant-ref", "wake-1",
+                "--automation-ref", payload["automation_ref"],
+                "--now", "2026-01-01T00:0%d:00Z" % (i + 1), "--cwd", d,
+            ], output=lambda s: None)
+        lease_before = state_store.read_pause_lease(suid, lease_id)
+        self.assertEqual(lease_before["failed_wake_attempts"], 2)
+
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", lease_id, "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append,
+            session_factory=self._fake_factory(
+                sent, ok=False, error_type="rate_limit_error"))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SEND_FAILED)
+        self.assertIn('"re_entered_capacity": true', out[0])
+
+        # E-BLK-02/E-MAJ (lease-consumption ordering): the ORIGINAL claimed
+        # lease is same-binding REPLACED, never marked "consumed" for a
+        # failed send.
+        old_lease = state_store.read_pause_lease(suid, lease_id)
+        self.assertEqual(old_lease["consumption_state"], "replaced")
+
+        binding = {
+            "role": "builder",
+            "provider_session_id": payload["provider_session_id"],
+            "controller_policy_digest": payload["controller_policy_digest"],
+            "candidate_digest": payload["candidate_manifest_digest"],
+        }
+        current = capacity_scheduler.resolve_current_lease_for_binding(
+            suid, binding)
+        self.assertIsNotNone(current)
+        self.assertNotEqual(current["lease_id"], lease_id)
+        # Carried FORWARD (2, never reset to 0 by a fresh episode) PLUS one
+        # genuine increment for THIS repeat quota/overload signal itself
+        # (REV-MAJ-01: a repeat capacity signal on resume is itself one
+        # more genuine failed wake attempt).
+        self.assertEqual(current["failed_wake_attempts"], 3)
+        self.assertEqual(current["consumption_state"], "unclaimed")
+
+    # -- E-MAJ (durable provider_session_id sourcing): capacity entry must
+    # -- source provider_session_id from durable resume state, never a
+    # -- stale/never-updated in-process session-object attribute (the
+    # -- production `bridge.ClaudeSession` shape this pins).
+    def test_provider_session_id_sourced_from_durable_state_overrides_stale_object_attribute(self):
+        d, suid, work_id, binding, status_path = self._fixture()
+        spath = os.path.join(d, ".cowork", "session.json")
+        state = state_store.load(spath)
+        state.setdefault("sessions", {})["builder"] = {
+            "controller": "claude", "id": "durable-real-session-id"}
+        state_store.save(spath, state)
+
+        class StaleAttrSession:
+            controller = "claude"
+            session_id = "stale-in-process-id"
+            model = None
+            effort = None
+
+            def send(self, text, meta=None):
+                return {"ok": False, "result": "error",
+                        "error_type": "rate_limit_error"}
+
+            def close(self):
+                pass
+
+        rc, outcome, payload = cowork._role_loop(
+            StaleAttrSession(), "do the thing", status_path, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "awaiting_capacity")
+        self.assertEqual(payload["provider_session_id"],
+                         "durable-real-session-id")
+
+    # -- E-MAJ (atomicity/rollback): an injected failure AFTER the
+    # -- pending-turn write must roll back rather than durably block every
+    # -- later, correctly-evidenced capacity-entry attempt for this role.
+    def test_enter_awaiting_capacity_rolls_back_pending_turn_on_injected_lease_failure(self):
+        # Exercises `_enter_awaiting_capacity` directly -- isolating the
+        # atomicity/rollback contract itself from `_role_loop`'s own
+        # ordinary-failure-gate side effects (which would otherwise
+        # terminally fail the WorkUnit on the injected attempt, confounding
+        # whether a SECOND attempt's own failure comes from that or from an
+        # un-rolled-back pending-turn record).
+        d, suid, work_id, binding, status_path = self._fixture()
+        raw_evidence = {"type": "assistant", "error": "rate_limit_error"}
+        real_start_new_episode = cowork.capacity_scheduler.start_new_episode
+
+        def _boom(*a, **kw):
+            raise cowork.capacity_scheduler.SchedulerError("injected failure")
+
+        cowork.capacity_scheduler.start_new_episode = _boom
+        try:
+            payload = cowork._enter_awaiting_capacity(
+                suid, work_id, "builder", "claude", "prov-sess-1",
+                "quota_limited", "do the thing", None, None,
+                raw_evidence=raw_evidence)
+        finally:
+            cowork.capacity_scheduler.start_new_episode = real_start_new_episode
+        self.assertIsNone(payload)
+        self.assertIsNone(
+            state_store.read_pending_turn_before_pause(suid, "builder"))
+
+        # A later, correctly-evidenced attempt (no injected failure) for the
+        # SAME role now succeeds -- the rollback never durably blocked it.
+        payload2 = cowork._enter_awaiting_capacity(
+            suid, work_id, "builder", "claude", "prov-sess-1",
+            "quota_limited", "do the thing", None, None,
+            raw_evidence=raw_evidence)
+        self.assertIsNotNone(payload2)
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertEqual(ps["state"], "awaiting_capacity")
+
+    # -- E-MAJ (real evidence wiring): genuine reset/retry evidence carried
+    # -- on the raw failure shape produces a `scheduled` resume mode and a
+    # -- genuinely-sourced (never "unverified") capacity_source -- Package
+    # -- C's own `capacity_packet_candidate` seam, not synthesized bytes.
+    def test_real_retry_evidence_produces_scheduled_resume_mode_and_trustworthy_source(self):
+        d, suid, work_id, binding, status_path = self._fixture()
+
+        class RetryEvidenceSession:
+            controller = "claude"
+            session_id = "prov-sess-1"
+            model = None
+            effort = None
+
+            def send(self, text, meta=None):
+                return {"ok": False, "result": "error",
+                        "error_type": "rate_limit_error"}
+
+            def close(self):
+                pass
+
+        real_synth = cowork._synthesize_raw_failure_evidence
+
+        def _synth_with_retry_evidence(controller, send_result):
+            raw = real_synth(controller, send_result)
+            raw["retry_evidence"] = {
+                "source": "provider_header", "value": "30s"}
+            return raw
+
+        cowork._synthesize_raw_failure_evidence = _synth_with_retry_evidence
+        try:
+            rc, outcome, payload = cowork._role_loop(
+                RetryEvidenceSession(), "do the thing", status_path,
+                context="", io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                role="builder", session_uuid=suid, role_work_id=work_id)
+        finally:
+            cowork._synthesize_raw_failure_evidence = real_synth
+        self.assertEqual(outcome, "awaiting_capacity")
+        packet = state_store.read_capacity_packet(suid, payload["package_id"])
+        self.assertEqual(packet["resume_mode"], "scheduled")
+        self.assertEqual(packet["retry_after"], "30s")
+        self.assertEqual(packet["capacity_source"]["kind"], "provider_header")
+        self.assertNotEqual(packet["capacity_source"]["kind"], "unverified")
+        lease = state_store.read_pause_lease(suid, payload["lease_id"])
+        self.assertEqual(lease["resume_mode"], "scheduled")
+        self.assertIsNotNone(lease["not_before"])
+
+    # -- REV-MAJ-01 (genuine trusted retry/reset evidence through the
+    # -- PRODUCTION bridge seam, live): exercises the REAL
+    # -- `bridge.ClaudeSession`/`parse_claude_event`/`send()` machinery
+    # -- (only the OS-level subprocess boundary is faked, the same
+    # -- convention `ClaudeSessionTtyTest` already uses -- never a
+    # -- monkeypatch of E's own evidence-synthesis seam) against a
+    # -- genuine claude rate-limit event shape, proving the full C->E
+    # -- evidence chain runs on REAL production code end to end. This
+    # -- ONE claude shape (`assistant`/`isApiErrorMessage`) structurally
+    # -- carries only the CLI's own already-classified token, never room
+    # -- for a retry-after value (see `classify_claude_failure`'s
+    # -- docstring) -- so this seam HONESTLY classifies `quota_limited`
+    # -- from the token that DOES survive, and HONESTLY degrades
+    # -- `capacity_source` to "unverified" rather than fabricating a
+    # -- trustworthy grade for evidence that was never actually
+    # -- available. REV-BLK-01's positive counterpart -- the richer
+    # -- `system`/`api_error` shape, which DOES carry a genuine
+    # -- provider-attested `retry_after` -- is
+    # -- `test_live_claude_bridge_genuine_retry_header_survives_through_real_send`
+    # -- immediately below.
+    def test_live_claude_bridge_quota_signal_classifies_honestly_through_real_send(self):
+        import unittest.mock as mock
+
+        class _Stdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = _Stdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        # A genuine claude stream-json rate-limit shape: an `assistant`/
+        # `isApiErrorMessage` event naming the CLI's own already-classified
+        # token, followed by the terminal `result` event.
+        lines = [
+            json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "error": "rate_limit_error",
+                "message": {"content": [
+                    {"type": "text", "text": "Rate limited"}]}}),
+            json.dumps({"type": "result", "subtype": "error_rate_limit",
+                       "result": "", "session_id": "S1"}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_Proc(lines)):
+            session = bridge.ClaudeSession(
+                cowork.SCOUT_PROMPT_PATH, "implement", True,
+                io_out=io.StringIO())
+            send_result = session.send("hello")
+
+        self.assertFalse(send_result.get("ok", True))
+        self.assertEqual(send_result["error_type"], "rate_limit_error")
+
+        # The REAL (non-monkeypatched) production seam, exercised on
+        # `send_result` as it genuinely came back from the real bridge.
+        raw_evidence = cowork._synthesize_raw_failure_evidence(
+            "claude", send_result)
+        controller_outcome = cowork._classify_raw_failure(
+            "claude", raw_evidence)
+        self.assertEqual(controller_outcome, "quota_limited")
+        self.assertIn(controller_outcome, capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES)
+
+        resume_mode, retry_after, capacity_source = cowork._capacity_evidence_fields(
+            "claude", controller_outcome, raw_evidence, "2026-01-01T00:00:00Z")
+        # Honest degradation: no genuine retry-after evidence exists in
+        # what the current bridge contract actually returns -- never
+        # fabricated as trustworthy.
+        self.assertEqual(resume_mode, "manual_signal")
+        self.assertIsNone(retry_after)
+        self.assertEqual(capacity_source["kind"], "unverified")
+        self.assertEqual(
+            capacity_contracts.classify_trust_source(capacity_source["kind"]),
+            "untrustworthy")
+
+    # -- REV-BLK-01 (genuine trusted retry/reset evidence PRESERVED through
+    # -- the PRODUCTION bridge seam, live, positive counterpart to the
+    # -- honest-degradation proof directly above): a real `system`/
+    # -- `api_error` claude event genuinely carrying a provider-attested
+    # -- `retry_after` field survives, unmodified and un-monkeypatched,
+    # -- through `bridge.ClaudeSession.send()` -> `_synthesize_raw_failure_
+    # -- evidence` -> `_classify_raw_failure` -> `_capacity_evidence_fields`
+    # -- to a genuinely trustworthy, `scheduled` result -- never fabricated,
+    # -- never dropped.
+    def test_live_claude_bridge_genuine_retry_header_survives_through_real_send(self):
+        import unittest.mock as mock
+
+        class _Stdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = _Stdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        # A genuine claude stream-json overload shape carrying a real,
+        # provider-attested `retry_after` value alongside its machine-
+        # readable `type`/`status` discriminants.
+        lines = [
+            json.dumps({
+                "type": "system", "subtype": "api_error",
+                "error": {"type": "overloaded_error", "status": 529,
+                          "formatted": "529 Overloaded",
+                          "retry_after": "30s"}}),
+            json.dumps({"type": "result", "subtype": "error_overloaded",
+                       "result": "", "session_id": "S1"}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_Proc(lines)):
+            session = bridge.ClaudeSession(
+                cowork.SCOUT_PROMPT_PATH, "implement", True,
+                io_out=io.StringIO())
+            send_result = session.send("hello")
+
+        self.assertFalse(send_result.get("ok", True))
+        # The real `error.type` token survives `send()`'s flattening
+        # (rather than degrading to the generic "api_error" bucket) --
+        # the precondition for this genuine `overloaded` signal (and its
+        # riding `retry_evidence`) to reach classification at all.
+        self.assertEqual(send_result["error_type"], "overloaded_error")
+        self.assertEqual(send_result["retry_evidence"],
+                         {"source": "provider_header", "value": "30s"})
+
+        # The REAL (non-monkeypatched) production seam, exercised on
+        # `send_result` as it genuinely came back from the real bridge.
+        raw_evidence = cowork._synthesize_raw_failure_evidence(
+            "claude", send_result)
+        controller_outcome = cowork._classify_raw_failure(
+            "claude", raw_evidence)
+        self.assertEqual(controller_outcome, "overloaded")
+
+        resume_mode, retry_after, capacity_source = cowork._capacity_evidence_fields(
+            "claude", controller_outcome, raw_evidence, "2026-01-01T00:00:00Z")
+        self.assertEqual(resume_mode, "scheduled")
+        self.assertEqual(retry_after, "30s")
+        self.assertEqual(capacity_source["kind"], "provider_header")
+        self.assertNotEqual(capacity_source["kind"], "unverified")
+        self.assertEqual(
+            capacity_contracts.classify_trust_source(capacity_source["kind"]),
+            "trustworthy")
+
+    # -- REV-BLK-01 (full LIVE chain, genuine evidence, unmodified
+    # -- production seams end to end): a real `bridge.ClaudeSession` send
+    # -- failure genuinely carrying a provider-attested `retry_after`
+    # -- drives `_role_loop` into a durable `awaiting_capacity` scheduled
+    # -- pause with a real `not_before` -- never a monkeypatched evidence
+    # -- seam, never a hand-built CapacityPacket/PauseLease.
+    def test_live_claude_bridge_genuine_retry_header_creates_scheduled_pause(self):
+        import unittest.mock as mock
+
+        class _Stdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = _Stdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        d, suid, work_id, binding, status_path = self._fixture()
+        lines = [
+            json.dumps({
+                "type": "system", "subtype": "api_error",
+                "error": {"type": "rate_limit_error", "status": 429,
+                          "formatted": "429 Rate limited",
+                          "retry_after": "30s"}}),
+            json.dumps({"type": "result", "subtype": "error_rate_limit",
+                       "result": "", "session_id": "S1"}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_Proc(lines)):
+            session = bridge.ClaudeSession(
+                cowork.SCOUT_PROMPT_PATH, "implement", True,
+                io_out=io.StringIO(), session_id="prov-sess-1")
+            rc, outcome, payload = cowork._role_loop(
+                session, "do the thing", status_path, context="",
+                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                role="builder", session_uuid=suid, role_work_id=work_id)
+
+        self.assertEqual(outcome, "awaiting_capacity")
+        packet = state_store.read_capacity_packet(suid, payload["package_id"])
+        self.assertEqual(packet["resume_mode"], "scheduled")
+        self.assertEqual(packet["retry_after"], "30s")
+        self.assertEqual(packet["capacity_source"]["kind"], "provider_header")
+        self.assertNotEqual(packet["capacity_source"]["kind"], "unverified")
+        lease = state_store.read_pause_lease(suid, payload["lease_id"])
+        self.assertEqual(lease["resume_mode"], "scheduled")
+        self.assertIsNotNone(lease["not_before"])
+
+    # -- REV-BLK-01 (stale genuine evidence stays fail-closed, live): a
+    # -- real, provider-attested `retry_after` TIMESTAMP that is
+    # -- well-shaped but beyond `MAX_RETRY_HORIZON_SECONDS` is honestly
+    # -- extracted and classified `scheduled` up through C's own seam
+    # -- (timestamp-kind values are never horizon-checked at parse time),
+    # -- but Package E's `validate_capacity_packet` refuses it at entry --
+    # -- never a durable capacity pause on an implausible far-future
+    # -- claim, genuinely-sourced or not.
+    def test_live_claude_bridge_stale_genuine_retry_timestamp_refuses_capacity_entry(self):
+        import datetime
+        import unittest.mock as mock
+
+        class _Stdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = _Stdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        d, suid, work_id, binding, status_path = self._fixture()
+        # Well beyond MAX_RETRY_HORIZON_SECONDS (7 days) from "now".
+        far_future = (
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(days=30)).isoformat().replace("+00:00", "Z")
+        lines = [
+            json.dumps({
+                "type": "system", "subtype": "api_error",
+                "error": {"type": "rate_limit_error", "status": 429,
+                          "formatted": "429 Rate limited",
+                          "retry_after": far_future}}),
+            json.dumps({"type": "result", "subtype": "error_rate_limit",
+                       "result": "", "session_id": "S1"}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_Proc(lines)):
+            session = bridge.ClaudeSession(
+                cowork.SCOUT_PROMPT_PATH, "implement", True,
+                io_out=io.StringIO(), session_id="prov-sess-1")
+            rc, outcome, payload = cowork._role_loop(
+                session, "do the thing", status_path, context="",
+                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                role="builder", session_uuid=suid, role_work_id=work_id)
+
+        # Genuinely refused -- never a durable, out-of-horizon pause, and
+        # never silently downgraded to a fabricated in-horizon one either.
+        self.assertNotEqual(outcome, "awaiting_capacity")
+        ps = state_store.current_phase_state(suid, work_id)
+        self.assertNotEqual(ps["state"], "awaiting_capacity")
+
+    # -- E-MAJ (no stranded lease / no consumed manual signal): a
+    # -- pre-claim-detected wrong-role resume never claims the lease and
+    # -- never verifies/consumes the single-use manual signal.
+    def test_wrong_role_preflight_never_claims_lease_or_consumes_manual_signal(self):
+        d, suid, work_id, payload = self._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        rc = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "planner",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=lambda s: None)
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+        lease = state_store.read_pause_lease(suid, payload["lease_id"])
+        self.assertEqual(lease["consumption_state"], "unclaimed")
+        # The manual signal was never verified/persisted or journaled --
+        # the SAME signal is still fully usable for a later, correctly
+        # role-bound attempt.
+        journal = capacity_scheduler.read_manual_signal_journal(suid)
+        self.assertEqual(journal, [])
+        sent = []
+        out = []
+        rc2 = cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:06:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ], output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc2, cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual(sent, ["do the thing"])
+
+
+class M3LiveFToEToDChainTests(unittest.TestCase):
+    """Non-vacuous LIVE proofs of the full Package F -> D -> E chain, using
+    Package F's OWN public argv builders VERBATIM (never a hand-rolled
+    approximation of what F would pass) -- pins the argv-compatibility and
+    claim-then-invoke failed-wake-accounting fixes against F's REAL,
+    unchangeable invocation shape, not merely against a standalone/manual
+    E-only invocation."""
+
+    def _session_dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        prior_cwd = os.getcwd()
+        self.addCleanup(lambda: os.chdir(prior_cwd))
+        os.chdir(d)
+        return d
+
+    def _resume_trigger_argv_from_f(self, session_uuid, lease_id, claimant_ref,
+                                    automation_ref):
+        """The EXACT argv Package F's own `fire()` would pass to Package
+        E's resume-trigger CLI subprocess -- built via F's own PUBLIC
+        `build_resume_trigger_argv`, never approximated by hand, with only
+        the one leading opaque-executable token sliced off (mirroring
+        `cowork.main()`'s own `argv[1:]` after popping the `resume-trigger`
+        dispatch token)."""
+        full = wake_macos.build_resume_trigger_argv(
+            ["resume-trigger"], session_uuid, lease_id, claimant_ref,
+            automation_ref)
+        return full[1:]
+
+    def _fake_factory(self, sent, ok=True, error_type="connection_error"):
+        def factory(controller, role, provider_session_id, model, effort):
+            class FakeResumeSession:
+                def send(self, text, meta=None):
+                    sent.append(text)
+                    if ok:
+                        return {"ok": True, "result": "ok"}
+                    return {"ok": False, "result": "error",
+                            "error_type": error_type}
+
+                def close(self):
+                    pass
+            return FakeResumeSession()
+        return factory
+
+    def _build_scheduled_capacity_fixture(self, not_before, issued_at):
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        work_id, manifest, binding = _m3e_bind_capacity_candidate(suid, "builder")
+        lease_id = str(uuid.uuid4())
+        automation_ref = "cowork.orchestration_resume/v%d" % (
+            capacity_scheduler.SCHEDULER_DECISION_LAYER_VERSION)
+        pause_lease = {
+            "schema_version": capacity_contracts.SCHEMA_VERSION,
+            "package_id": str(uuid.uuid4()), "lease_id": lease_id,
+            "role": "builder", "provider_session_id": "prov-sess-1",
+            "controller_policy_digest": binding["controller_policy_digest"],
+            "candidate_digest": binding["candidate_manifest_digest"],
+            "resume_mode": "scheduled", "not_before": not_before,
+            "automation_ref": automation_ref,
+            "artifact_hashes": {"manifest": binding["candidate_manifest_digest"]},
+            "consumption_state": "unclaimed", "failed_wake_attempts": 0,
+            "issued_at": issued_at,
+        }
+        capacity_scheduler.start_new_episode(suid, pause_lease)
+        turn_text = "resume this turn"
+        state_store.write_pending_turn_before_pause(
+            suid, "builder", turn_text, lease_id=lease_id)
+        state_store.acknowledge_pending_turn_before_pause(
+            suid, "builder", hashlib.sha256(turn_text.encode()).hexdigest())
+        cowork._advance_phase(
+            suid, work_id, "capacity_reserved",
+            evidence={"capacity_evidence": {
+                "controller_outcome": "overloaded", "role": "builder",
+                "provider_session_id": "prov-sess-1",
+                "controller_policy_digest": binding["controller_policy_digest"],
+                "candidate_manifest_digest": binding["candidate_manifest_digest"],
+                "candidate_index": binding["candidate_index"],
+                "resume_mode": "scheduled", "model": None, "effort": None,
+                "artifact_hashes": {"manifest": binding["candidate_manifest_digest"]},
+                "automation_ref": automation_ref}},
+            source="test", expected_candidate={
+                "candidate_manifest_digest": binding["candidate_manifest_digest"],
+                "candidate_index": binding["candidate_index"]})
+        state = state_store.load(spath)
+        state.setdefault("config", {})["builder"] = {
+            "controller": "claude", "model": None, "effort": None,
+            "mode": "implement", "yolo": True}
+        state.setdefault("sessions", {})["builder"] = {
+            "controller": "claude", "id": "prov-sess-1"}
+        state_store.save(spath, state)
+        return d, suid, work_id, lease_id, automation_ref, turn_text, binding
+
+    def test_live_f_argv_claim_then_resume_succeeds_without_role_or_now(self):
+        # REV-BLK: Package F's own fixed argv never supplies --role/--now.
+        d, suid, work_id, lease_id, automation_ref, turn_text, binding = (
+            self._build_scheduled_capacity_fixture(
+                "2025-12-31T01:00:00Z", "2025-12-31T00:00:00Z"))
+        claimant_ref = automation_ref  # F's own default when unset
+
+        d_argv = wake_macos.build_d_wake_trigger_argv(
+            suid, lease_id, claimant_ref, automation_ref, "2026-01-02T00:00:00Z")
+        d_lines = []
+        d_exit = capacity_scheduler.run_wake_trigger(d_argv, output=d_lines.append)
+        self.assertEqual(d_exit, capacity_scheduler.WAKE_TRIGGER_EXIT_CODES["success"])
+        self.assertEqual(
+            state_store.read_pause_lease(suid, lease_id)["consumption_state"],
+            "claimed")
+
+        e_argv = self._resume_trigger_argv_from_f(
+            suid, lease_id, claimant_ref, automation_ref)
+        self.assertNotIn("--role", e_argv)
+        self.assertNotIn("--now", e_argv)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger(
+            e_argv, output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual(sent, [turn_text])
+        lease_final = state_store.read_pause_lease(suid, lease_id)
+        self.assertEqual(lease_final["consumption_state"], "consumed")
+
+    def test_live_f_argv_binding_mismatch_under_already_claimed_lease_accounts_failed_attempt(self):
+        # REV-BLK: failed-wake accounting must work truthfully even though
+        # Package F/D already claimed the lease BEFORE Package E's own
+        # preflight ever ran.
+        d, suid, work_id, lease_id, automation_ref, turn_text, binding = (
+            self._build_scheduled_capacity_fixture(
+                "2025-12-31T01:00:00Z", "2025-12-31T00:00:00Z"))
+        claimant_ref = automation_ref
+
+        d_argv = wake_macos.build_d_wake_trigger_argv(
+            suid, lease_id, claimant_ref, automation_ref, "2026-01-02T00:00:00Z")
+        d_exit = capacity_scheduler.run_wake_trigger(d_argv, output=lambda s: None)
+        self.assertEqual(d_exit, capacity_scheduler.WAKE_TRIGGER_EXIT_CODES["success"])
+        # Confirm the precondition this whole test exists to exercise:
+        # the lease is ALREADY `claimed` before Package E's CLI even starts.
+        self.assertEqual(
+            state_store.read_pause_lease(suid, lease_id)["consumption_state"],
+            "claimed")
+
+        # The dispatch identity changed AFTER the pause -- the resume must
+        # refuse, never silently resuming a stale binding.
+        new_manifest, _ = cowork._compile_role_manifest(
+            role="builder", session_uuid=suid, work_id="builder",
+            controller="claude", mode="implement", model="claude-opus-5",
+            effort=None, sessions_dir=state_store.session_assets_dir(suid),
+            force_recompile=True)
+        cowork._bind_candidate(suid, work_id, new_manifest["digest"])
+
+        e_argv = self._resume_trigger_argv_from_f(
+            suid, lease_id, claimant_ref, automation_ref)
+        sent = []
+        out = []
+        rc = cowork.run_resume_trigger(
+            e_argv, output=out.append, session_factory=self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+        self.assertEqual(sent, [])
+
+        # The originally-claimed lease is released via same-binding
+        # replacement (never stranded `claimed` forever), and the fresh
+        # replacement lease durably carries ONE genuine failed wake
+        # attempt -- REACHABLE even though Package F/D claimed the lease
+        # BEFORE Package E's own preflight ever ran.
+        old_lease = state_store.read_pause_lease(suid, lease_id)
+        self.assertEqual(old_lease["consumption_state"], "replaced")
+        current_binding = {
+            "role": "builder", "provider_session_id": "prov-sess-1",
+            "controller_policy_digest": binding["controller_policy_digest"],
+            "candidate_digest": binding["candidate_manifest_digest"],
+        }
+        current = capacity_scheduler.resolve_current_lease_for_binding(
+            suid, current_binding)
+        self.assertIsNotNone(current)
+        self.assertNotEqual(current["lease_id"], lease_id)
+        self.assertEqual(current["failed_wake_attempts"], 1)
+        self.assertEqual(current["consumption_state"], "unclaimed")
+
+    def test_live_f_argv_repeated_failures_reach_attempts_exhausted_deterministically(self):
+        # F-MJ-02 closure, live: repeated genuine failures reached via the
+        # EXACT Package F claim-then-invoke chain converge to D's own
+        # `attempts_exhausted` -- Package F's NEXT fire never even reaches
+        # Package E again once the ceiling is hit.
+        d, suid, work_id, lease_id, automation_ref, turn_text, binding = (
+            self._build_scheduled_capacity_fixture(
+                "2025-12-31T01:00:00Z", "2025-12-31T00:00:00Z"))
+        claimant_ref = automation_ref
+        current_lease_id = lease_id
+        current_binding = {
+            "role": "builder", "provider_session_id": "prov-sess-1",
+            "controller_policy_digest": binding["controller_policy_digest"],
+            "candidate_digest": binding["candidate_manifest_digest"],
+        }
+
+        for i in range(capacity_contracts.FAILED_WAKE_ATTEMPT_CEILING):
+            d_argv = wake_macos.build_d_wake_trigger_argv(
+                suid, current_lease_id, claimant_ref, automation_ref,
+                "2026-01-0%dT00:00:00Z" % (2 + i))
+            d_exit = capacity_scheduler.run_wake_trigger(
+                d_argv, output=lambda s: None)
+            self.assertEqual(
+                d_exit, capacity_scheduler.WAKE_TRIGGER_EXIT_CODES["success"])
+            # Re-bind the WorkUnit's candidate away from the lease's own
+            # binding EVERY round, so each resume-trigger invocation hits
+            # the SAME genuine, real binding-mismatch refusal.
+            new_manifest, _ = cowork._compile_role_manifest(
+                role="builder", session_uuid=suid, work_id="builder",
+                controller="claude", mode="implement",
+                model="claude-opus-5-round-%d" % i, effort=None,
+                sessions_dir=state_store.session_assets_dir(suid),
+                force_recompile=True)
+            cowork._bind_candidate(suid, work_id, new_manifest["digest"])
+            e_argv = self._resume_trigger_argv_from_f(
+                suid, current_lease_id, claimant_ref, automation_ref)
+            rc = cowork.run_resume_trigger(
+                e_argv, output=lambda s: None,
+                session_factory=self._fake_factory([]))
+            self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+            current = capacity_scheduler.resolve_current_lease_for_binding(
+                suid, current_binding)
+            self.assertEqual(current["failed_wake_attempts"], i + 1)
+            current_lease_id = current["lease_id"]
+
+        # Deterministic stop: the NEXT fire's own D-level wake_decision
+        # (consulted first by D's own `run_wake_trigger`, before Package E
+        # is ever invoked again) now reports the ceiling exhausted.
+        d_argv = wake_macos.build_d_wake_trigger_argv(
+            suid, current_lease_id, claimant_ref, automation_ref,
+            "2026-01-09T00:00:00Z")
+        d_lines = []
+        d_exit = capacity_scheduler.run_wake_trigger(d_argv, output=d_lines.append)
+        self.assertEqual(
+            d_exit, capacity_scheduler.WAKE_TRIGGER_EXIT_CODES["attempts_exhausted"])
+        self.assertIn("attempts_exhausted", d_lines[0])
+
+    # -- REV-BLK-01 (full LIVE C -> E -> F -> D chain, genuine evidence,
+    # -- unmodified production seams end to end): the scheduled pause this
+    # -- chain drives to `attempts_exhausted` originates from a REAL
+    # -- `bridge.ClaudeSession` send failure genuinely carrying a
+    # -- provider-attested `retry_after` -- never a hand-built
+    # -- PauseLease/CapacityPacket, never a monkeypatched evidence seam.
+    def test_live_chain_from_genuine_c_evidence_reaches_attempts_exhausted(self):
+        import datetime
+        import unittest.mock as mock
+
+        class _Stdin:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+                self.stdin = _Stdin()
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state_store.ensure_session(spath, None, suid)
+        work_id, manifest, binding = _m3e_bind_capacity_candidate(suid, "builder")
+        status_path = os.path.join(
+            state_store.session_assets_dir(suid), "builder.status.json")
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+
+        lines = [
+            json.dumps({
+                "type": "system", "subtype": "api_error",
+                "error": {"type": "rate_limit_error", "status": 429,
+                          "formatted": "429 Rate limited",
+                          "retry_after": "30s"}}),
+            json.dumps({"type": "result", "subtype": "error_rate_limit",
+                       "result": "", "session_id": "S1"}),
+        ]
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_Proc(lines)):
+            session = bridge.ClaudeSession(
+                cowork.SCOUT_PROMPT_PATH, "implement", True,
+                io_out=io.StringIO(), session_id="prov-sess-1")
+            rc, outcome, payload = cowork._role_loop(
+                session, "do the thing", status_path, context="",
+                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "awaiting_capacity")
+
+        # Genuinely scheduled -- a durable `not_before`, never manual_signal.
+        lease_id = payload["lease_id"]
+        lease = state_store.read_pause_lease(suid, lease_id)
+        self.assertEqual(lease["resume_mode"], "scheduled")
+        self.assertIsNotNone(lease["not_before"])
+        packet = state_store.read_capacity_packet(suid, payload["package_id"])
+        self.assertEqual(packet["capacity_source"]["kind"], "provider_header")
+
+        state = state_store.load(spath)
+        state.setdefault("config", {})["builder"] = {
+            "controller": "claude", "model": None, "effort": None,
+            "mode": "implement", "yolo": True}
+        state.setdefault("sessions", {})["builder"] = {
+            "controller": "claude", "id": "prov-sess-1"}
+        state_store.save(spath, state)
+
+        automation_ref = payload["automation_ref"]
+        claimant_ref = automation_ref
+        current_lease_id = lease_id
+        current_binding = {
+            "role": "builder", "provider_session_id": "prov-sess-1",
+            "controller_policy_digest": binding["controller_policy_digest"],
+            "candidate_digest": binding["candidate_manifest_digest"],
+        }
+
+        # `not_before` was minted from the REAL wall clock (`retry_after`
+        # = "30s" past the real `_capacity_now()` reading at entry), so
+        # every wake-trigger `--now` below is likewise a real-clock
+        # reading, comfortably past it -- never a fixed past-dated
+        # literal that would misfire `not_due` against genuine evidence.
+        def _now_iso(offset_seconds):
+            return (datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(seconds=offset_seconds)
+                    ).isoformat().replace("+00:00", "Z")
+
+        # F fire invokes E: each round claims via D's real wake-trigger CLI
+        # (a genuine, real not_before-eligible lease), then Package E's
+        # real resume-trigger CLI refuses on a genuine, real re-bound
+        # candidate mismatch -- a truthful, reachable failed-wake attempt,
+        # never a fabricated one.
+        for i in range(capacity_contracts.FAILED_WAKE_ATTEMPT_CEILING):
+            d_argv = wake_macos.build_d_wake_trigger_argv(
+                suid, current_lease_id, claimant_ref, automation_ref,
+                _now_iso(60 + i * 60))
+            d_exit = capacity_scheduler.run_wake_trigger(
+                d_argv, output=lambda s: None)
+            self.assertEqual(
+                d_exit, capacity_scheduler.WAKE_TRIGGER_EXIT_CODES["success"])
+            new_manifest, _ = cowork._compile_role_manifest(
+                role="builder", session_uuid=suid, work_id="builder",
+                controller="claude", mode="implement",
+                model="claude-opus-5-round-%d" % i, effort=None,
+                sessions_dir=state_store.session_assets_dir(suid),
+                force_recompile=True)
+            cowork._bind_candidate(suid, work_id, new_manifest["digest"])
+            e_argv = self._resume_trigger_argv_from_f(
+                suid, current_lease_id, claimant_ref, automation_ref)
+            rc2 = cowork.run_resume_trigger(
+                e_argv, output=lambda s: None,
+                session_factory=self._fake_factory([]))
+            self.assertEqual(rc2, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+            current = capacity_scheduler.resolve_current_lease_for_binding(
+                suid, current_binding)
+            self.assertEqual(current["failed_wake_attempts"], i + 1)
+            current_lease_id = current["lease_id"]
+
+        # The per-binding failed-wake counter genuinely progressed to the
+        # ceiling: D's own wake_decision (consulted BEFORE Package E is
+        # ever invoked again) now reports it exhausted.
+        d_argv = wake_macos.build_d_wake_trigger_argv(
+            suid, current_lease_id, claimant_ref, automation_ref,
+            _now_iso(60 + capacity_contracts.FAILED_WAKE_ATTEMPT_CEILING * 60))
+        d_lines = []
+        d_exit = capacity_scheduler.run_wake_trigger(d_argv, output=d_lines.append)
+        self.assertEqual(
+            d_exit, capacity_scheduler.WAKE_TRIGGER_EXIT_CODES["attempts_exhausted"])
+        self.assertIn("attempts_exhausted", d_lines[0])

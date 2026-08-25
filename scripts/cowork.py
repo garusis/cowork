@@ -59,6 +59,8 @@ import cowork_guard_broker as guard_broker  # noqa: E402
 import cowork_workunit as workunit  # noqa: E402
 import cowork_control_plane as control_plane  # noqa: E402
 import cowork_recovery_breaker as recovery_breaker  # noqa: E402
+import cowork_capacity as capacity_contracts  # noqa: E402
+import cowork_capacity_scheduler as capacity_scheduler  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -7041,6 +7043,14 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
         user CONFIRMED the gate; `payload` carries the handoff note.
       - "switch_controller": a recovery gate asked the caller to switch the
         active role; `payload` carries role/reason/pending-turn metadata.
+      - "awaiting_capacity" (M3 Package E): a genuine quota/overload send
+        failure durably entered `awaiting_capacity` (CapacityPacket +
+        PauseLease persisted, pending turn persisted-then-acknowledged);
+        `payload` carries the role/provider/candidate/controller-policy/
+        model/effort binding. The caller (`run_flow`) treats this like any
+        other unrecognized outcome -- it ends this run cleanly; resumption
+        happens out-of-process via the headless resume-trigger CLI once the
+        lease is genuinely eligible.
 
     A blank line re-prompts. When `review_fn` is provided (the paired reviewer
     is on the team), each `ready_for_review` first runs the reviewer (topology
@@ -7289,6 +7299,58 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 error_type=send_result.get("error_type"),
                                 subtype=send_result.get("subtype"),
                                 artifact_progress=False)
+                # M3 Package E: classify this send failure via C's pure
+                # taxonomy and durably record ProviderHealth for EVERY
+                # classification, including the explicit
+                # `unknown_provider_failure` member -- never skipped just
+                # because it is unclassifiable.
+                controller_name = getattr(session, "controller", None)
+                raw_evidence = _synthesize_raw_failure_evidence(
+                    controller_name, send_result)
+                controller_outcome = _classify_raw_failure(
+                    controller_name, raw_evidence)
+                _record_provider_health(
+                    session_uuid, role, controller_name, controller_outcome,
+                    _capacity_now())
+                if controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES:
+                    # quota_limited/overloaded: a genuine provider-capacity
+                    # signal must never auto-retry the SAME provider (the
+                    # frozen brief's invariant) -- attempt a durable
+                    # awaiting-capacity entry BEFORE falling through to the
+                    # ordinary headless/interactive controller-failure
+                    # handling below, in either mode. `provider_session_id`
+                    # is sourced from THIS session's own durable resume
+                    # state (`_durable_provider_session_id`), never an
+                    # in-process session object attribute -- works
+                    # identically for a fresh dispatch and a resumed one.
+                    capacity_payload = _enter_awaiting_capacity(
+                        session_uuid, role_work_id, role, controller_name,
+                        (_durable_provider_session_id(
+                            session_uuid, role, controller_name)
+                         or getattr(session, "session_id", None)
+                         or getattr(session, "thread_id", None)),
+                        controller_outcome, str(pending),
+                        getattr(session, "model", None),
+                        getattr(session, "effort", None),
+                        raw_evidence=raw_evidence)
+                    if capacity_payload is not None:
+                        if trace:
+                            trace.event(
+                                "capacity.awaiting", role=role, phase=phase,
+                                controller_outcome=controller_outcome,
+                                package_id=capacity_payload.get("package_id"),
+                                lease_id=capacity_payload.get("lease_id"))
+                        io_out.write(
+                            "cowork: %s is awaiting provider capacity (%s) "
+                            "-- durably paused; resume via the capacity "
+                            "resume-trigger once eligible.\n"
+                            % (role, controller_outcome))
+                        io_out.flush()
+                        if first_send and on_first_send_rejected:
+                            on_first_send_rejected()
+                        outcome_kind = "awaiting_capacity"
+                        payload = capacity_payload
+                        break
                 if headless:
                     # No human to choose retry/switch/end: a controller failure
                     # is an environment problem, so end the phase cleanly rather
@@ -7322,6 +7384,28 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         on_discard=gate_discard,
                         on_drain_fail=gate_drain_fail)
                     if action is _CTRL_RETRY:
+                        if controller_outcome in _RETRY_BLOCKED_OUTCOMES:
+                            # M3 Package E: quota/overload/authentication
+                            # outcomes may NEVER auto-retry the SAME
+                            # provider -- a user-forced retry choice is
+                            # refused exactly like a tripped breaker, never
+                            # silently honored.
+                            if trace:
+                                trace.event(
+                                    "user.action", role=role,
+                                    action="controller_failure_retry_blocked",
+                                    reason="same_provider_retry_blocked",
+                                    controller_outcome=controller_outcome)
+                            _advance_phase(
+                                session_uuid, role_work_id, "execution_failed",
+                                evidence={
+                                    "reason": "same_provider_retry_blocked",
+                                    "controller_outcome": controller_outcome},
+                                source="recovery_breaker")
+                            if first_send and on_first_send_rejected:
+                                on_first_send_rejected()
+                            outcome_kind = _OUTCOME_ENDED
+                            break
                         breaker = _breaker_decision("controller_failure")
                         if breaker and breaker["tripped"]:
                             if trace:
@@ -8891,10 +8975,22 @@ def _bind_candidate(session_uuid, work_id, candidate_manifest_digest,
 
 
 def _advance_phase(session_uuid, work_id, event, evidence=None, source=None,
-                   unlocked=False):
+                   unlocked=False, expected_candidate=None):
     """The one seam every production phase advance in this file passes
     through: A's closed reducer decides the next PhaseState from the durable
     current one, and B's public persistence contract makes it durable.
+
+    `expected_candidate` (M3 Package E) is forwarded to `control_plane.
+    advance` unchanged: every pre-existing caller omits it (None, the
+    historical default -- byte-identical behavior for every M2 event and
+    for `gate_validated`, which itself treats an omitted value as a
+    deliberate opt-out). The three M3 capacity events
+    (`capacity_reserved`/`capacity_wake_claimed`/
+    `capacity_wake_preflight_failed`) instead REQUIRE a genuine one
+    (M3A-REV-001-RESIDUAL) -- callers advancing one of those pass the
+    WorkUnit's own `{"candidate_manifest_digest", "candidate_index"}` here
+    so the reducer can enforce that the evidence names the SAME candidate,
+    never a caller-asserted one.
 
     `unlocked=True` routes the durable append through B's reentrant twin
     (`cowork_state.append_phase_state_entry_unlocked`) instead of the
@@ -8922,10 +9018,23 @@ def _advance_phase(session_uuid, work_id, event, evidence=None, source=None,
         return None
     current = state_store.current_phase_state(session_uuid, work_id)
     state = (current or {}).get("state", "pending")
-    new_state, reason_code = control_plane.advance(state, event, evidence=evidence)
+    new_state, reason_code = control_plane.advance(
+        state, event, evidence=evidence, expected_candidate=expected_candidate)
     if new_state == state and reason_code in (
             "illegal_transition", "gate_evidence_missing",
-            "gate_evidence_candidate_mismatch"):
+            "gate_evidence_candidate_mismatch",
+            # M3 Package E: the same "refusal writes nothing" contract,
+            # extended to the three M3A-REV-001-RESIDUAL capacity events'
+            # own refusal reason codes.
+            "capacity_evidence_missing",
+            "capacity_evidence_expected_candidate_required",
+            "capacity_evidence_candidate_mismatch",
+            "capacity_wake_evidence_missing",
+            "capacity_wake_evidence_expected_candidate_required",
+            "capacity_wake_evidence_candidate_mismatch",
+            "capacity_wake_preflight_evidence_missing",
+            "capacity_wake_preflight_evidence_expected_candidate_required",
+            "capacity_wake_preflight_evidence_candidate_mismatch"):
         return current
     append = (state_store.append_phase_state_entry_unlocked if unlocked
              else state_store.append_phase_state_entry)
@@ -8939,6 +9048,536 @@ def _advance_phase(session_uuid, work_id, event, evidence=None, source=None,
              else _mirror_work_unit_lifecycle)
     mirror(session_uuid, work_id, new_state, reason_code)
     return record
+
+
+# --------------------------------------------------------------------------- #
+# M3 Package E: orchestration-resume wiring.                                  #
+#                                                                              #
+# Wires C's pure outcome classification (`cowork_bridge.classify_<ctrl>_      #
+# failure`) and D's lease decisions (`cowork_capacity_scheduler`) into the    #
+# live retain-on-send-failure seam (`_role_loop`'s send-failure block) and    #
+# its retry/switch/end recovery gate. Quota/overload/authentication outcomes  #
+# never auto-retry the SAME provider (quota/overload durably enter           #
+# `awaiting_capacity`; authentication_failed is refused at the interactive    #
+# gate's retry choice, see `_RETRY_BLOCKED_OUTCOMES`). Every classification   #
+# -- including the explicit `unknown_provider_failure` member -- is recorded #
+# as a durable ProviderHealth fact (`_record_provider_health`).              #
+#                                                                              #
+# `cowork_bridge.py`'s own `send()` methods return an already-flattened      #
+# `{error_type, subtype, result, retry_evidence}` summary, not the raw       #
+# provider event C's classifiers expect -- `_synthesize_raw_failure_         #
+# evidence` reconstructs the smallest raw shape that summary still honestly  #
+# supports, never inventing a discriminant that was not actually present     #
+# (an unrecoverable case, e.g. a claude `system`/`api_error` shape whose     #
+# `error` dict names neither a `type` token nor -- for `retry_evidence` --   #
+# a `retry_after` value, degrades to `unknown_provider_failure`/"unverified" #
+# respectively -- fail-closed, never a guess). REV-BLK-01: when `send()`     #
+# DID genuinely observe a provider-attested `retry_after` (currently only    #
+# `bridge.ClaudeSession`'s `system`/`api_error` path, see                    #
+# `cowork_bridge._claude_provider_retry_evidence`), that `retry_evidence`    #
+# sub-object rides through this same reconstruction UNCHANGED, letting a     #
+# real send failure carrying genuine evidence reach `_capacity_evidence_     #
+# fields`/`bridge.capacity_packet_candidate` as trustworthy -- never         #
+# fabricated for evidence `send()` never actually observed.                  #
+# --------------------------------------------------------------------------- #
+
+_CONTROLLER_FAILURE_CLASSIFIERS = {
+    "claude": bridge.classify_claude_failure,
+    "codex": bridge.classify_codex_failure,
+    "opencode": bridge.classify_opencode_failure,
+}
+
+# Named per the frozen brief: these three ControllerOutcome members may never
+# justify a same-provider auto-retry. `quota_limited`/`overloaded` bypass the
+# interactive gate entirely (durable `awaiting_capacity` entry, below);
+# `authentication_failed` is not capacity-eligible, so it still reaches the
+# interactive gate -- where a user-chosen "retry" is refused exactly like a
+# tripped recovery breaker (see the gate wiring in `_role_loop`).
+_RETRY_BLOCKED_OUTCOMES = frozenset({
+    "quota_limited", "overloaded", "authentication_failed"})
+
+# This worker's own design choice (like ProviderHealth's schema itself,
+# `cowork_state.py`'s M3B banner) for mapping a ControllerOutcome onto
+# ProviderHealth's closed `status` enum -- not transcribed from the frozen
+# plan text, which defines no such mapping. `authentication_failed`/
+# `policy_blocked`/`local_guard_exhausted` are "unavailable" (never
+# auto-retried / requires local operator action); every other member,
+# INCLUDING the explicit `unknown_provider_failure` (never silently
+# dropped), is "degraded" (a transient or unclassified signal, not yet
+# proven permanently broken).
+_PROVIDER_HEALTH_STATUS_FOR_OUTCOME = {
+    "quota_limited": "degraded",
+    "overloaded": "degraded",
+    "authentication_failed": "unavailable",
+    "policy_blocked": "unavailable",
+    "guard_unavailable": "degraded",
+    "transport_failed": "degraded",
+    "malformed_output": "degraded",
+    "local_guard_exhausted": "unavailable",
+    "unknown_provider_failure": "degraded",
+}
+
+
+def _capacity_now():
+    """RFC3339 wall-clock reading, minted at the ONE call site each capacity
+    seam below reads `now` from -- never read a second time mid-seam, so a
+    single capacity-entry/wake attempt is internally consistent."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+
+
+def _synthesize_raw_failure_evidence(controller, send_result):
+    """Reconstruct the smallest raw-evidence dict `cowork_bridge.classify_
+    <controller>_failure` recognizes from `send_result`'s own flattened
+    `result`/`error_type` fields -- see the module-banner note above for why
+    this reconstruction (rather than a raw provider event) is all E can
+    honestly base a classification on. Never fabricates a discriminant
+    `send_result` does not itself carry.
+
+    When `send_result` itself carries a `retry_evidence` sub-object (a
+    controller's `send()` -- currently only `bridge.ClaudeSession`, see
+    `_claude_provider_retry_evidence` -- attaches this ONLY when the raw
+    provider event genuinely carried one), it is copied onto the
+    reconstructed raw dict UNCHANGED as `raw["retry_evidence"]`, the exact
+    key `bridge.extract_retry_evidence` reads. `send_result` never
+    carrying the key (every shape this repository has attested, and
+    every non-provider local_guard/transport failure) leaves it absent,
+    which `extract_retry_evidence` itself correctly degrades to the
+    "unverified" sentinel -- this function neither invents evidence nor
+    strips genuine evidence it was actually handed."""
+    retry_evidence = send_result.get("retry_evidence")
+
+    def _with_evidence(raw):
+        if retry_evidence is not None:
+            raw["retry_evidence"] = retry_evidence
+        return raw
+
+    if send_result.get("result") == "denied":
+        status = ("unreachable" if send_result.get("error_type")
+                  == "guard_unavailable" else "denied")
+        return {"type": "local_guard", "status": status}
+    error_type = send_result.get("error_type")
+    if error_type == "guard_unavailable":
+        return {"type": "local_guard", "status": "unreachable"}
+    if error_type == "eof":
+        return {"type": "transport_error", "exception_type": "eof"}
+    if not isinstance(error_type, str) or not error_type:
+        return {"type": "__unrecognized__"}
+    if controller == "codex":
+        return _with_evidence({"type": "error", "code": error_type})
+    if controller == "opencode":
+        return _with_evidence({"type": "error", "error": {"name": error_type}})
+    return _with_evidence({"type": "assistant", "error": error_type})
+
+
+def _classify_raw_failure(controller, raw_evidence):
+    """Package C classification of one failed send's already-synthesized
+    raw evidence (see `_synthesize_raw_failure_evidence`), or
+    `unknown_provider_failure` for an unrecognized controller / raw shape --
+    this seam is total: it never raises and never leaves a failed send
+    unclassified. Callers needing both the classification AND the raw
+    evidence itself (M3 Package E's real capacity_packet_candidate wiring,
+    `_capacity_evidence_fields`) compute `raw_evidence` once via
+    `_synthesize_raw_failure_evidence` and pass it to both."""
+    classify = _CONTROLLER_FAILURE_CLASSIFIERS.get(controller)
+    if classify is None:
+        return "unknown_provider_failure"
+    try:
+        return classify(raw_evidence)
+    except ValueError:
+        return "unknown_provider_failure"
+
+
+def _record_provider_health(session_uuid, role, provider, controller_outcome,
+                            now):
+    """Durably record ProviderHealth for every C classification reached at
+    the send-failure seam -- including the explicit `unknown_provider_
+    failure` member (the frozen brief's named case): a classification this
+    worker cannot act on is still truthfully recorded, never silently
+    dropped. Best-effort: a missing session_uuid/provider, or any storage
+    failure, never blocks the caller's own recovery-gate flow -- ProviderHealth
+    is an observability fact, not a gate itself."""
+    if not session_uuid or not provider:
+        return
+    try:
+        prior = state_store.read_provider_health(session_uuid, role, provider)
+        consecutive_failures = min(
+            (prior or {}).get("consecutive_failures", 0) + 1, 1000000)
+        state_store.write_provider_health(session_uuid, {
+            "role": role, "provider": provider,
+            "status": _PROVIDER_HEALTH_STATUS_FOR_OUTCOME.get(
+                controller_outcome, "degraded"),
+            "consecutive_failures": consecutive_failures,
+            "last_outcome": controller_outcome,
+            "last_updated_at": now,
+        })
+    except (ValueError, OSError):
+        pass
+
+
+def _durable_provider_session_id(session_uuid, role, controller):
+    """The durable, resume-surviving `provider_session_id` for (role,
+    controller) -- read from THIS session's own persisted state via the
+    IDENTICAL lookup (`_find_session_state` + `state_store.
+    get_role_session`) the headless resume-trigger CLI already uses to
+    reconstruct a resume session. Never an in-process session object's own
+    attribute: e.g. `bridge.ClaudeSession` never updates its own
+    `self.session_id` once the provider's real id is observed mid-turn --
+    only the `on_session_id` callback that persists it durably (via
+    `role_saver` -> `state_store.save_role_session`) does, and that
+    callback fires (updating durable state) BEFORE `send()` can return a
+    failure for THIS SAME turn. Sourcing from durable state therefore works
+    identically for a fresh dispatch (the id observed and persisted this
+    run, before the failing send) and a resumed one (already persisted
+    from a prior run) -- the exact fresh/resumed-role parity the frozen
+    brief requires. Returns None when unresolvable (session persistence
+    disabled, or no provider session observed yet)."""
+    if not session_uuid or not role:
+        return None
+    state = _find_session_state(os.getcwd(), session_uuid)
+    if state is None:
+        return None
+    return state_store.get_role_session(state, role, controller)
+
+
+def _capacity_candidate_binding(session_uuid, work_id, role):
+    """The genuine, PROVEN candidate identity this WorkUnit's own dispatch
+    manifest already bound -- `(candidate_manifest_digest, candidate_index,
+    controller_policy_digest)` -- or None when the WorkUnit is not yet
+    candidate-bound (M3A-REV-001-RESIDUAL: a capacity transition can never
+    be produced without one, so this is the fail-closed precondition every
+    capacity-entry/wake-preflight caller below checks first).
+
+    `controller_policy_digest` reuses the dispatch manifest's own
+    `binding.config_digest` -- the same reuse `_breaker_decision` already
+    relies on for its causal fingerprint -- since that digest already names
+    the exact controller/model/effort/mode/instruction-set policy governing
+    this dispatch; E defines no separate, competing policy-digest concept."""
+    if not session_uuid or not work_id:
+        return None
+    current = state_store.current_work_unit_state(session_uuid, work_id)
+    projected = state_store.work_unit_from_history_record(current)
+    if projected is None:
+        return None
+    digest = projected.get("candidate_manifest_digest")
+    if not digest:
+        return None
+    try:
+        manifest = dispatch_manifest.load_manifest(
+            state_store.manifest_path_for(session_uuid, role))
+    except Exception:  # noqa: BLE001 - a corrupt manifest fails closed below
+        manifest = None
+    controller_policy_digest = ((manifest or {}).get("binding") or {}).get(
+        "config_digest")
+    if not controller_policy_digest:
+        return None
+    return {
+        "candidate_manifest_digest": digest,
+        "candidate_index": projected.get("candidate_index"),
+        "controller_policy_digest": controller_policy_digest,
+    }
+
+
+def _capacity_evidence_fields(controller, controller_outcome, raw_evidence, now):
+    """Real `(resume_mode, retry_after, capacity_source)`, derived from C's
+    own production evidence-extraction seam -- NEVER synthesized from the
+    `controller_outcome` label alone (the exact E v1 review gap this
+    replaces `_capacity_source_for`'s old fabricated-hash approach).
+
+    `quota_limited` uses `cowork_bridge.capacity_packet_candidate` EXACTLY
+    -- its own re-classification cross-check (requiring `raw_evidence` to
+    independently classify `quota_limited` again) and all. `overloaded`
+    sits outside that seam's own accepted classification (its docstring:
+    quota_limited only) -- `extract_retry_evidence`/`classify_trust_source`/
+    `parse_retry_after_text` are the SAME public, lower-level primitives
+    `capacity_packet_candidate` itself is built from; reused directly here
+    for `overloaded`'s otherwise-identical shape, never a separately
+    synthesized value.
+
+    Total: `raw_evidence` that is absent, malformed, or fails
+    `capacity_packet_candidate`'s own re-classification cross-check
+    degrades to the generic extraction path (which itself degrades to C's
+    documented "unverified"/untrustworthy sentinel for anything not
+    honestly extractable) rather than raising -- a caller reaching this
+    helper has already committed to a capacity-eligible outcome and must
+    always get a shape-valid, honestly-sourced result back."""
+    if controller_outcome == "quota_limited":
+        try:
+            candidate = bridge.capacity_packet_candidate(
+                controller, controller, raw_evidence, now)
+        except ValueError:
+            candidate = None
+        if candidate is not None:
+            return (candidate["resume_mode"], candidate["retry_after"],
+                    candidate["capacity_source"])
+    retry_evidence = bridge.extract_retry_evidence(raw_evidence)
+    evidence_source = retry_evidence["source"]
+    retry_after = retry_evidence["value"]
+    parsed_retry = capacity_contracts.parse_retry_after_text(retry_after)
+    resume_mode = "scheduled" if parsed_retry is not None else "manual_signal"
+    try:
+        evidence_bytes = json.dumps(raw_evidence, sort_keys=True).encode("utf-8")
+    except TypeError:
+        evidence_bytes = json.dumps(
+            {"controller_outcome": controller_outcome, "issued_at": now},
+            sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(evidence_bytes).hexdigest()
+    return (resume_mode, retry_after if resume_mode == "scheduled" else None,
+           {"kind": evidence_source, "sha256": digest})
+
+
+def _enter_awaiting_capacity(session_uuid, work_id, role, provider,
+                             provider_session_id, controller_outcome,
+                             pending_text, model, effort, raw_evidence=None,
+                             replace_lease_id=None,
+                             replace_automation_ref=None):
+    """Durable capacity-entry seam: on a genuine `quota_limited`/`overloaded`
+    classification, persist the in-flight pending turn BEFORE
+    acknowledgment (`cowork_state.write_pending_turn_before_pause`), mint
+    and persist a CapacityPacket + PauseLease bound EXACTLY to this
+    engagement's candidate/role/provider-session/controller-policy/model/
+    effort identity, advance the control-plane reducer's `capacity_reserved`
+    event with matching candidate-bound evidence, and only THEN acknowledge
+    the pending turn (`cowork_state.acknowledge_pending_turn_before_pause`)
+    -- the persist-before-ack, exactly-once-consumption contract the frozen
+    brief names.
+
+    `raw_evidence` (the same raw shape `_classify_raw_failure` classified)
+    feeds `_capacity_evidence_fields` so `capacity_source`/`resume_mode`/
+    `retry_after` derive from C's real evidence-extraction seam, never a
+    synthesized value.
+
+    `replace_lease_id`, when given, is a PRIOR lease for this EXACT SAME
+    binding that a genuine post-claim resume-trigger failure just left
+    claimed/terminal -- the fresh lease is minted via D's same-binding
+    `capacity_scheduler.replace` (carrying `failed_wake_attempts` forward
+    monotonically) instead of `start_new_episode` (which would silently
+    reset the per-binding automatic-recovery chain back to 0). Omitted
+    (None, the default) for every FRESH live-seam entry, which always
+    starts a brand new episode.
+
+    ATOMICITY (rolls back on any failure after the pending-turn write, so a
+    failed attempt never durably blocks a later, correctly-evidenced one):
+    an unacknowledged pending-turn record THIS call itself minted is
+    cleared via `_rollback_pending` on every failure path below; a
+    just-(re)created live PauseLease is additionally cancelled if the
+    control-plane transition itself is refused, so a failed entry never
+    leaves a live, unclaimed lease that nothing durably shows as paused.
+
+    Returns a payload dict (role, provider, provider_session_id,
+    pending_turn_digest, controller_outcome, candidate/controller-policy
+    binding, model, effort, package_id, lease_id, automation_ref) on
+    success, or None when any precondition (missing candidate binding,
+    missing provider_session_id/pending text, an outcome outside
+    `cowork_capacity.CAPACITY_ELIGIBLE_OUTCOMES`, or a storage/validation
+    failure) means this failure cannot be honestly entered as capacity --
+    the caller falls back to its ordinary interactive/headless/resume-
+    trigger failure handling instead of fabricating a transition."""
+    if not (session_uuid and work_id and provider_session_id and pending_text
+           and controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES):
+        return None
+    binding = _capacity_candidate_binding(session_uuid, work_id, role)
+    if binding is None:
+        return None
+    now = _capacity_now()
+    # Minted BEFORE the pending-turn write so the durable record can name
+    # the exact lease it will be consumed under (the resume-trigger's own
+    # exactly-once check binds a replay to THIS lease_id, never merely to
+    # the role).
+    lease_id = str(uuid.uuid4())
+    try:
+        pending_record = state_store.write_pending_turn_before_pause(
+            session_uuid, role, pending_text, lease_id=lease_id)
+    except ValueError:
+        return None
+
+    def _rollback_pending():
+        # Best-effort: an unacknowledged pending-turn record THIS attempt
+        # itself minted must never survive a failed capacity entry, else it
+        # durably blocks every later genuine attempt for this role
+        # (`write_pending_turn_before_pause` refuses a DIFFERENT
+        # unacknowledged record for the same role). Only ever clears a
+        # record still unacknowledged AND naming THIS attempt's own
+        # lease_id -- never a different, unrelated in-flight attempt's.
+        current = state_store.read_pending_turn_before_pause(session_uuid, role)
+        if (current and current.get("acknowledged") is False
+                and current.get("lease_id") == lease_id):
+            state_store.clear_pending_turn_before_pause(session_uuid, role)
+
+    artifact_hashes = {"manifest": binding["candidate_manifest_digest"]}
+    package_id = str(uuid.uuid4())
+    automation_ref = "cowork.orchestration_resume/v%d" % (
+        capacity_scheduler.SCHEDULER_DECISION_LAYER_VERSION)
+
+    try:
+        resume_mode, retry_after, capacity_source = _capacity_evidence_fields(
+            provider, controller_outcome, raw_evidence, now)
+    except ValueError:
+        _rollback_pending()
+        return None
+
+    not_before = None
+    if resume_mode == "scheduled":
+        # Mirrors `validate_capacity_packet`'s own `retry_after` epoch
+        # resolution exactly (a raw RFC3339 timestamp value used verbatim,
+        # or a bare/`s`-suffixed duration resolved relative to `now`) so
+        # `wakeup.not_before`/`PauseLease.not_before` always name the SAME
+        # target wake time `retry_after` itself encodes -- never a value
+        # this seam re-derives differently.
+        parsed_retry = capacity_contracts.parse_retry_after_text(retry_after)
+        if parsed_retry["kind"] == "timestamp":
+            not_before = parsed_retry["value"]
+        else:
+            issued_epoch = capacity_contracts.rfc3339_to_epoch_seconds(now)
+            not_before = datetime.datetime.fromtimestamp(
+                issued_epoch + parsed_retry["value"], tz=datetime.timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+
+    capacity_packet = {
+        "schema_version": capacity_contracts.SCHEMA_VERSION,
+        "package_id": package_id,
+        "provider_capacity_class": "subscription_quota_exhausted",
+        "provider": provider,
+        "resume_mode": resume_mode,
+        "retry_after": retry_after,
+        "capacity_source": capacity_source,
+        "binding": {
+            "role": role,
+            "provider_session_id": provider_session_id,
+            "controller_policy_digest": binding["controller_policy_digest"],
+            "candidate_digest": binding["candidate_manifest_digest"],
+            "artifact_hashes": artifact_hashes,
+        },
+        "wakeup": {
+            "lease_id": lease_id if resume_mode == "scheduled" else None,
+            "automation_ref": automation_ref,
+            "not_before": not_before,
+        },
+        "manual_resume": {
+            "condition": ("verified manual-capacity-signal required -- E "
+                         "holds no private signing key"),
+            # Package A requires a non-null `accepted_source` for every
+            # resume_mode='manual_signal' packet (a POLICY declaration of
+            # WHO may legitimately authorize the eventual resume, not a
+            # historical fact about one that already happened -- no resume
+            # has happened yet at entry time). E always declares the
+            # strictest of the two: only a genuinely verified signal routed
+            # through the top-level authority adapter may ever accept this
+            # pause's resume -- never a bare external application, and never
+            # a self-claimed signal E itself could fabricate (E holds no
+            # private signing key). Populated unconditionally (Package A
+            # permits this for `resume_mode='scheduled'` too -- only
+            # `manual_signal` REQUIRES it).
+            "accepted_source": "top_level_authority_adapter",
+            "signal_journal_ref": None,
+        },
+        "issued_at": now,
+    }
+    try:
+        capacity_packet = capacity_contracts.validate_capacity_packet(
+            capacity_packet)
+    except ValueError:
+        _rollback_pending()
+        return None
+
+    pause_lease = {
+        "schema_version": capacity_contracts.SCHEMA_VERSION,
+        "package_id": package_id,
+        "lease_id": lease_id,
+        "role": role,
+        "provider_session_id": provider_session_id,
+        "controller_policy_digest": binding["controller_policy_digest"],
+        "candidate_digest": binding["candidate_manifest_digest"],
+        "resume_mode": resume_mode,
+        "not_before": not_before,
+        "automation_ref": automation_ref,
+        "artifact_hashes": artifact_hashes,
+        "consumption_state": "unclaimed",
+        "failed_wake_attempts": 0,
+        "issued_at": now,
+    }
+    try:
+        pause_lease = capacity_contracts.validate_pause_lease(pause_lease)
+    except ValueError:
+        _rollback_pending()
+        return None
+
+    try:
+        state_store.write_capacity_packet(session_uuid, capacity_packet)
+        if replace_lease_id is not None:
+            capacity_scheduler.replace(
+                session_uuid, replace_lease_id, pause_lease,
+                replace_automation_ref or automation_ref)
+        else:
+            capacity_scheduler.start_new_episode(session_uuid, pause_lease)
+    except (ValueError, OSError, capacity_scheduler.SchedulerError):
+        _rollback_pending()
+        return None
+
+    if replace_lease_id is not None:
+        # A repeat quota/overload signal on resume is ITSELF one more
+        # genuine failed wake attempt -- account it on the freshly
+        # replaced (still-unclaimed) lease, same-binding, never resetting
+        # the per-binding chain. Best-effort and best-attempted AFTER the
+        # durable replace above already landed: a failure here only means
+        # this one repeat signal is not separately counted toward the
+        # ceiling, never a reason to roll back the capacity entry itself
+        # (the lease/packet are already genuinely, durably paused).
+        try:
+            capacity_scheduler.record_failed_wake_attempt(
+                session_uuid, lease_id, replace_automation_ref or automation_ref)
+        except Exception:  # noqa: BLE001 - best-effort, never masks capacity entry
+            pass
+
+    expected_candidate = {
+        "candidate_manifest_digest": binding["candidate_manifest_digest"],
+        "candidate_index": binding["candidate_index"],
+    }
+    evidence = {"capacity_evidence": {
+        "controller_outcome": controller_outcome,
+        "role": role, "provider_session_id": provider_session_id,
+        "controller_policy_digest": binding["controller_policy_digest"],
+        "candidate_manifest_digest": binding["candidate_manifest_digest"],
+        "candidate_index": binding["candidate_index"],
+        "resume_mode": resume_mode,
+        "model": model, "effort": effort,
+        "artifact_hashes": artifact_hashes,
+        "automation_ref": automation_ref,
+    }}
+    record = _advance_phase(
+        session_uuid, work_id, "capacity_reserved", evidence=evidence,
+        source="send_failure_capacity", expected_candidate=expected_candidate)
+    if record is None or record.get("state") != "awaiting_capacity":
+        # The control-plane refused this transition (e.g. a race against
+        # this exact candidate binding): never leave a live, unclaimed
+        # lease/packet that nothing durably shows as paused -- cancel the
+        # just-(re)created lease and roll back the pending-turn write so a
+        # later, correctly-evidenced attempt is never blocked by either.
+        try:
+            capacity_scheduler.cancel(session_uuid, lease_id, automation_ref)
+        except capacity_scheduler.SchedulerLeaseConflict:
+            pass
+        _rollback_pending()
+        return None
+
+    try:
+        state_store.acknowledge_pending_turn_before_pause(
+            session_uuid, role, pending_record["sha256"])
+    except ValueError:
+        pass
+
+    return {
+        "role": role, "provider": provider,
+        "provider_session_id": provider_session_id,
+        "pending_turn_digest": pending_record["sha256"],
+        "controller_outcome": controller_outcome,
+        "candidate_manifest_digest": binding["candidate_manifest_digest"],
+        "candidate_index": binding["candidate_index"],
+        "controller_policy_digest": binding["controller_policy_digest"],
+        "model": model, "effort": effort,
+        "package_id": package_id, "lease_id": lease_id,
+        "automation_ref": automation_ref,
+    }
 
 
 def _reject_graph_declaration(session_uuid, role_work_id, role, controller,
@@ -13016,7 +13655,750 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     return rc
 
 
+# --------------------------------------------------------------------------- #
+# M3 Package E: headless resume-trigger CLI, consumed externally by          #
+# Package F's wake adapters -- a versioned contract deliberately narrow, in  #
+# the same spirit as D's own `cowork_capacity_scheduler.run_wake_trigger`:   #
+# claim, binding-preflight, InvalidationRecord no-replay, and the ONE        #
+# exactly-once replay of the persisted pending turn. It never drives the     #
+# rest of the role's interactive loop -- once the accepted send lands, an    #
+# ordinary `cowork.py --resume` continues the conversation normally.         #
+# --------------------------------------------------------------------------- #
+
+RESUME_TRIGGER_CONTRACT_VERSION = 1
+
+RESUME_TRIGGER_EXIT_SUCCESS = capacity_scheduler.WAKE_TRIGGER_EXIT_SUCCESS
+RESUME_TRIGGER_EXIT_INTERNAL_ERROR = capacity_scheduler.WAKE_TRIGGER_EXIT_INTERNAL_ERROR
+RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS = (
+    capacity_scheduler.WAKE_TRIGGER_EXIT_INVALID_ARGUMENTS)
+RESUME_TRIGGER_EXIT_NOT_DUE = capacity_scheduler.WAKE_TRIGGER_EXIT_NOT_DUE
+RESUME_TRIGGER_EXIT_CONFLICT = capacity_scheduler.WAKE_TRIGGER_EXIT_CONFLICT
+RESUME_TRIGGER_EXIT_ATTEMPTS_EXHAUSTED = (
+    capacity_scheduler.WAKE_TRIGGER_EXIT_ATTEMPTS_EXHAUSTED)
+# E-specific outcomes additive beyond D's own WAKE_TRIGGER_EXIT_CODES.
+RESUME_TRIGGER_EXIT_BINDING_MISMATCH = 6
+RESUME_TRIGGER_EXIT_INVALIDATED = 7
+RESUME_TRIGGER_EXIT_NO_PENDING_TURN = 8
+RESUME_TRIGGER_EXIT_SEND_FAILED = 9
+
+# The concrete, versioned outcome-name -> exit-code contract Package F must
+# consult by name (never a bare literal integer) -- matching D's own
+# `WAKE_TRIGGER_EXIT_CODES` naming/versioning discipline exactly, extended
+# additively rather than renumbered.
+RESUME_TRIGGER_EXIT_CODES = dict(capacity_scheduler.WAKE_TRIGGER_EXIT_CODES)
+RESUME_TRIGGER_EXIT_CODES.update({
+    "binding_mismatch": RESUME_TRIGGER_EXIT_BINDING_MISMATCH,
+    "invalidated": RESUME_TRIGGER_EXIT_INVALIDATED,
+    "no_pending_turn": RESUME_TRIGGER_EXIT_NO_PENDING_TURN,
+    "send_failed": RESUME_TRIGGER_EXIT_SEND_FAILED,
+})
+
+_EPOCH_GETTER_FOR_ROLE = {
+    "scout": state_store.get_scouting_epoch,
+    "planner": state_store.get_planning_epoch,
+    "builder": state_store.get_building_epoch,
+}
+
+
+def build_resume_trigger_arg_parser():
+    """Build the versioned resume-trigger argument parser (see
+    RESUME_TRIGGER_CONTRACT_VERSION).
+
+    `--role` and `--now` are BOTH optional (never `required=True`), unlike
+    D's own pure decision-layer wake-trigger contract: Package F's own
+    fixed, unchangeable `build_resume_trigger_argv` argv shape supplies
+    ONLY `--session-uuid --lease-id --claimant-ref --automation-ref` --
+    E's CLI must stay compatible with that EXACT argv, never require a flag
+    F itself can never supply.
+
+    `--role`, when omitted, is derived from the CLAIMED PauseLease's own
+    bound `role` field (the only genuinely available source at THIS
+    external entrypoint when the caller supplies none) -- when explicitly
+    given (every non-F/manual/test invocation), the wrong-first-role
+    cross-check still applies exactly as before.
+
+    `--now`, when omitted, is read from the real wall clock (this is a
+    genuine external CLI process boundary, unlike D's in-process pure
+    decision layer, which never touches the wall clock for fake-clock
+    testability) -- when explicitly given (every test invocation), that
+    exact value is used, preserving full fake-clock determinism for tests."""
+    parser = argparse.ArgumentParser(
+        prog="cowork.py resume-trigger", add_help=True,
+        description=(
+            "M3 Package E versioned headless resume-trigger contract (v%d), "
+            "consumed externally by Package F's wake adapters: claim a due "
+            "PauseLease (D's scheduler contract), prove the claimed binding "
+            "is still exactly the one this engagement paused on, and replay "
+            "the exactly-once persisted pending turn." %
+            RESUME_TRIGGER_CONTRACT_VERSION))
+    parser.add_argument("--session-uuid", required=True)
+    parser.add_argument(
+        "--role", default=None,
+        help="expected bound role; when omitted (Package F's own fixed "
+             "argv never supplies it) the role is derived from the "
+             "claimed lease's own bound role instead")
+    parser.add_argument("--lease-id", required=True)
+    parser.add_argument("--claimant-ref", required=True)
+    parser.add_argument("--automation-ref", required=True)
+    parser.add_argument(
+        "--now", default=None,
+        help="explicit RFC3339 clock reading; when omitted (Package F's "
+             "own fixed argv never supplies it) the real wall clock is "
+             "read instead")
+    parser.add_argument(
+        "--cwd", default=None,
+        help="working directory the target session lives under; defaults "
+             "to the current directory")
+    parser.add_argument("--reference-now", default=None)
+    parser.add_argument(
+        "--max-clock-skew-seconds", type=float,
+        default=capacity_scheduler.DEFAULT_MAX_CLOCK_SKEW_SECONDS)
+    parser.add_argument(
+        "--manual-signal-record", default=None,
+        help="path to a JSON manual-capacity-signal record -- the ONLY way "
+             "to authorize an early/manual_signal-mode claim (E holds no "
+             "private signing key and mints no signature itself); omit for "
+             "the ordinary trustworthy-scheduled form")
+    parser.add_argument(
+        "--pinned-public-keys", default=None,
+        help="path to a JSON {signer_public_key_id: hex_public_key} "
+             "registry, required together with --manual-signal-record")
+    parser.add_argument(
+        "--redirected-context", default=None,
+        help="optional replacement context text for the resumed turn "
+             "(redirected-context resume); omitted means a no-new-context "
+             "resume that replays the persisted pending turn verbatim")
+    return parser
+
+
+def _load_json_file(path):
+    with open(path, "r") as fh:
+        return json.load(fh)
+
+
+def _find_session_state(cwd, session_uuid):
+    """Locate and load the durable session state for `session_uuid` under
+    `cwd` -- tries the modern per-uuid filename first (the fast, common
+    path) and falls back to scanning every discovered session file
+    (`state_store.discover_session_files`, which also covers a legacy
+    single-session `.cowork/session.json`) for the one whose OWN persisted
+    `session_uuid` field matches -- never guesses a different session's
+    state merely because a file happened to be present. None when nothing
+    matches."""
+    state = state_store.load(state_store.new_session_path(cwd, session_uuid))
+    if state is not None:
+        return state
+    for path in state_store.discover_session_files(cwd):
+        candidate = state_store.load(path)
+        if candidate is not None and state_store.get_session_uuid(
+                candidate) == session_uuid:
+            return candidate
+    return None
+
+
+def _current_role_work_id_for_session(cwd, session_uuid, role):
+    """Deterministically re-derive the LIVE WorkUnit identity for (session,
+    role) from durable state alone -- the same identity scheme
+    `_role_work_id`/`_resolve_attempt_start` already use for an in-process
+    resume, re-derived here for a standalone resume-trigger CLI invocation
+    that starts with no in-memory epoch/attempt counters of its own. None
+    when `role` has no known epoch family or the session state is
+    unreadable."""
+    getter = _EPOCH_GETTER_FOR_ROLE.get(role)
+    if getter is None:
+        return None
+    state = _find_session_state(cwd, session_uuid)
+    if state is None:
+        return None
+    epoch = getter(state)
+    attempt = _resolve_attempt_start(session_uuid, role, epoch)
+    return _role_work_id(session_uuid, role, epoch, attempt)
+
+
+def _resume_seed_delivery(pending_text, redirected_context):
+    """Typed seed for a headless resume turn -- issue #57: `pending_text`
+    and any `redirected_context` override MUST pass through the closed
+    boundary constructors before reaching any transport call, never a bare/
+    untyped string handed straight to a session's send(). Covers both
+    resume forms the frozen brief names: a no-new-context resume
+    (`redirected_context` is None -- the exact persisted turn replays
+    verbatim) and a redirected-context resume (a fresh context string
+    substitutes for it). Raises TypeError -- never lets an untyped value
+    reach `_send` -- for anything that is not genuinely a string."""
+    text = pending_text if redirected_context is None else redirected_context
+    if not isinstance(text, str):
+        raise TypeError(
+            "resume seed text must be a string, got %r" % (type(text),))
+    return _initial_user_delivery(text)
+
+
+def _resume_wake_failure_kind(lease, current_binding, provider_session_id):
+    """The genuine `cowork_control_plane._BINDING_WAKE_FAILURE_KINDS` member
+    naming why a claimed lease's binding no longer matches this
+    engagement's CURRENT durable identity, checked in a fixed,
+    most-specific-first order -- or None when the binding still matches."""
+    if current_binding is None:
+        return "candidate_mismatch"
+    if lease["provider_session_id"] != provider_session_id:
+        return "session_mismatch"
+    if (lease["controller_policy_digest"]
+            != current_binding["controller_policy_digest"]):
+        return "controller_policy_mismatch"
+    if lease["candidate_digest"] != current_binding["candidate_manifest_digest"]:
+        return "candidate_mismatch"
+    return None
+
+
+def _construct_resume_session(role, controller, cfg, resume_provider_session_id,
+                              sessions_dir, trace):
+    """Reconstruct a live bridge session for the exactly-once resumed send,
+    from the SAME durable (controller, model, effort, mode, yolo) config the
+    original dispatch used (`state["config"][role]`) -- never guessed or
+    defaulted differently from the engagement's own genuine identity.
+    Returns None for an unrecognized controller."""
+    prompt_path = ROLE_PROMPT_PATHS.get(role) or SCOUT_PROMPT_PATH
+    mode = cfg.get("mode", "implement")
+    yolo = cfg.get("yolo", True)
+    model = cfg.get("model")
+    effort = cfg.get("effort")
+    devnull = open(os.devnull, "w")
+    if controller == "claude":
+        return bridge.ClaudeSession(
+            prompt_path, mode, yolo, io_out=devnull, speaker=role,
+            resume_id=resume_provider_session_id, trace=trace,
+            extra_writable_dir=sessions_dir, model=model, effort=effort)
+    if controller == "codex":
+        return bridge.CodexSession(
+            mode, yolo, io_out=devnull, speaker=role,
+            resume_thread_id=resume_provider_session_id, trace=trace,
+            extra_writable_dir=sessions_dir, model=model, effort=effort)
+    if controller == "opencode":
+        return bridge.OpencodeSession(
+            prompt_path, mode, yolo, io_out=devnull, speaker=role,
+            resume_session_id=resume_provider_session_id, trace=trace,
+            extra_writable_dir=sessions_dir, model=model, effort=effort)
+    return None
+
+
+def _account_failed_wake_attempt(session_uuid, lease, automation_ref):
+    """Durably account ONE genuine failed wake/resume attempt against
+    `lease`'s own per-binding `failed_wake_attempts` counter -- TRUTHFULLY,
+    regardless of whether `lease` is still `unclaimed` (a standalone/manual
+    resume-trigger invocation that never itself claimed) or already
+    `claimed` (Package F's OWN real claim-then-invoke ordering: F's
+    `fire()` claims the lease via D's `run_wake_trigger` BEFORE ever
+    invoking this CLI as a subprocess, so by the time E's own preflight
+    runs, the lease is typically already `claimed` under the SAME
+    claimant_ref/automation_ref this function receives).
+
+    `capacity_scheduler.record_failed_wake_attempt` (D, wrapping B) can
+    only ever increment an `unclaimed` lease. For an already-`claimed`
+    lease this SAME-BINDING REPLACES it first
+    (`capacity_scheduler.replace`, which durably carries
+    `failed_wake_attempts` FORWARD, never resets it -- M3R-N06/D-MJ-01) to
+    obtain a fresh `unclaimed` record for the SAME binding, and only THEN
+    records the genuine failed attempt on THAT record -- net effect: the
+    counter genuinely increments by exactly 1, the binding is left with a
+    fresh `unclaimed` lease available for a future wake attempt (up to the
+    ceiling), and the per-binding chain is never reset. Composes ONLY D's/
+    B's own existing atomic accessors -- no new storage, no new lock,
+    exactly the frozen brief's own constraint.
+
+    The replacement's `resume_mode`/`not_before`/`issued_at` are carried
+    forward VERBATIM from `lease` itself (never re-derived, never set to
+    "now") -- this is a bookkeeping continuation of the SAME pause
+    episode, not a new capacity signal: a `scheduled`-mode binding stays
+    automatically re-claimable by Package F's own ordinary wake trigger
+    across every accounted failure (an already-validated `not_before`
+    paired with its OWN original `issued_at` is trivially still within
+    Package A's retry horizon), while a `manual_signal`-mode binding
+    correctly keeps requiring a genuinely authorized signal every time.
+
+    Best-effort throughout (never raises): a lease already moved on (a
+    genuine race, or an already-ceiling-exhausted binding refusing the
+    increment) is truthfully left exactly as it durably is -- this
+    helper's own failure is never mistaken for, and never masks, the
+    caller's own refusal reason."""
+    try:
+        current = state_store.read_pause_lease(session_uuid, lease["lease_id"])
+        if current is None:
+            return
+        state = current.get("consumption_state")
+        target_lease_id = lease["lease_id"]
+        if state == "claimed":
+            new_lease_id = str(uuid.uuid4())
+            new_lease = {
+                "schema_version": lease["schema_version"],
+                "package_id": lease["package_id"],
+                "lease_id": new_lease_id,
+                "role": lease["role"],
+                "provider_session_id": lease["provider_session_id"],
+                "controller_policy_digest": lease["controller_policy_digest"],
+                "candidate_digest": lease["candidate_digest"],
+                "resume_mode": lease["resume_mode"],
+                "not_before": lease["not_before"],
+                "automation_ref": automation_ref,
+                "artifact_hashes": dict(lease["artifact_hashes"]),
+                "consumption_state": "unclaimed",
+                "failed_wake_attempts": 0,
+                "issued_at": lease["issued_at"],
+            }
+            capacity_scheduler.replace(
+                session_uuid, target_lease_id, new_lease, automation_ref)
+            target_lease_id = new_lease_id
+        elif state != "unclaimed":
+            return
+        capacity_scheduler.record_failed_wake_attempt(
+            session_uuid, target_lease_id, automation_ref)
+    except Exception:  # noqa: BLE001 - best-effort accounting, never masks the caller's refusal
+        pass
+
+
+def run_resume_trigger(argv, output=None, session_factory=None):
+    """Versioned headless resume-trigger entrypoint (see
+    RESUME_TRIGGER_CONTRACT_VERSION), consumed externally by Package F's
+    wake adapters -- writes exactly one JSON result line to `output`
+    (defaults to `sys.stdout.write`) and returns one of
+    RESUME_TRIGGER_EXIT_CODES; NEVER calls `sys.exit` itself, so it is safe
+    to call repeatedly, including from tests.
+
+    `--role`/`--now` argv compatibility: Package F's own fixed
+    `build_resume_trigger_argv` NEVER supplies `--role` or `--now` (only
+    `--session-uuid --lease-id --claimant-ref --automation-ref`) -- both
+    default to None and are resolved here: `effective_role` from the
+    lease's own bound role when `--role` is omitted (the wrong-first-role
+    cross-check still applies whenever `--role` IS explicitly given), and
+    `effective_now` from the real wall clock when `--now` is omitted (a
+    genuine external CLI process boundary, unlike D's pure decision layer).
+
+    Order of operations, each fail-closed:
+      0. Consult D's own `wake_decision` BEFORE ever attempting the
+         state-mutating claim (matching D's own `run_wake_trigger`
+         ordering) -- an already-ceiling-exhausted binding refuses outright
+         (`attempts_exhausted`), never attempting another claim.
+      1. Read-only PRE-CLAIM snapshot of the stored lease, then
+         wrong-first-role and ALL binding/evidence preflight checks
+         (candidate binding, provider-session/policy binding, the
+         persisted-pending-turn precondition) against THAT snapshot --
+         entirely BEFORE this CLI's OWN state-mutating claim attempt. A
+         refusal here never itself claims the lease (so, for the
+         manual-signal form, never consumes the single-use signal either)
+         and durably accounts ONE genuine failed wake attempt
+         (`_account_failed_wake_attempt` -- truthful whether the lease is
+         still unclaimed, as in a standalone invocation, or ALREADY
+         claimed by Package F/D before this CLI even started, per F's own
+         claim-then-invoke ordering) -- the mechanism that makes
+         `FAILED_WAKE_ATTEMPT_CEILING` genuinely reachable across repeated
+         resume-trigger failures under BOTH invocation shapes (closes
+         F-MJ-02).
+      2. Claim the named PauseLease -- via D's ordinary `claim` (the
+         trustworthy-scheduled form) or, when `--manual-signal-record` is
+         given, D's `claim_with_authorized_early_override` (the ONLY path
+         that may claim a manual_signal-mode/early lease, and only after
+         genuine Ed25519 verification against the caller-pinned public-key
+         registry -- E holds no private key and mints no signature itself,
+         so D/B refuse an unsigned or self-claimed signal before this
+         function ever observes a "claimed" outcome). Under Package F's own
+         invocation this is IDEMPOTENT (D's own same-owner "already_claimed"
+         outcome, since F already claimed this lease under the SAME
+         claimant_ref before invoking this CLI) -- never a second, distinct
+         claim. A genuine operational claim failure (OSError) ALSO durably
+         accounts one failed wake attempt, exactly like D's own
+         `run_wake_trigger`.
+      3. A race-safety re-check against the just-claimed lease (the
+         pre-claim snapshot could in principle be stale by the time the
+         claim itself lands) -- refused truthfully via `_release_and_
+         conflict` (same-binding replace-and-increment; never stranded).
+      4. Advance `capacity_wake_claimed` (awaiting_capacity -> preflighting)
+         with `expected_candidate` drawn from THIS engagement's CURRENT
+         durable WorkUnit+manifest binding and evidence citing the LEASE's
+         own candidate digest: the reducer's own M3A-REV-001-RESIDUAL
+         candidate check refuses (leaving the state at `awaiting_capacity`,
+         unchanged) when they disagree -- the candidate half of
+         binding-preservation is enforced by Package A itself, never
+         re-derived here. A refusal here releases the just-claimed lease
+         (`_release_and_conflict`).
+      5. Binding-preserving wake preflight, re-checked post-claim as
+         defense-in-depth against the same TOCTOU race -- refused
+         (`capacity_wake_preflight_failed`, back to `awaiting_capacity`)
+         with the lease released, never stranded.
+      6. InvalidationRecord no-replay: refuses outright (advancing
+         `preflight_rejected`, a terminal state, lease CANCELLED -- this
+         exact candidate can never legally resume again, so no further
+         wake-ceiling accounting is meaningful) when this exact candidate
+         has an InvalidationRecord on file -- never replays completed
+         paired work without one.
+      7. Only once 0-6 all hold: advance `preflight_passed` (preflighting
+         -> running) and attempt the accepted send using a typed seed
+         (`_resume_seed_delivery` -- issue #57: never an untyped seed). The
+         lease is NOT yet marked consumed -- consumption must reflect the
+         TRUE outcome (see step 8).
+      8. On a successful send: mark the lease consumed FIRST, then consume
+         the pending turn exactly once (`clear_pending_turn_before_pause`)
+         -- an accepted send consumes exactly once. On a failed send: the
+         pending turn is RETAINED (never cleared) and the lease is NEVER
+         marked consumed for a failed send -- classify + record
+         ProviderHealth exactly like the live seam, and either re-enter
+         `awaiting_capacity` via a SAME-BINDING REPLACEMENT of this exact
+         claimed lease (`_enter_awaiting_capacity(..., replace_lease_id=
+         ...)` -- preserves `failed_wake_attempts` monotonically AND
+         accounts this repeat signal as one more genuine failed attempt,
+         never resets the per-binding automatic-recovery chain via a fresh
+         episode) for a genuine repeat quota/overload, or CANCELS the
+         lease and advances `execution_failed` (a terminal WorkUnit outcome
+         -- no further wake-ceiling accounting is meaningful; no
+         interactive gate exists in a headless trigger)."""
+    write = output if output is not None else sys.stdout.write
+    parser = build_resume_trigger_arg_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS
+
+    if args.manual_signal_record and not args.pinned_public_keys:
+        write(json.dumps({
+            "outcome": "invalid_arguments",
+            "detail": "--pinned-public-keys is required with "
+                      "--manual-signal-record"}) + "\n")
+        return RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS
+
+    session_uuid = args.session_uuid
+    cwd = args.cwd or os.getcwd()
+    effective_now = args.now if args.now is not None else _capacity_now()
+
+    # Step 0 (D-MJ-02 parity, F-MJ-02 seam): consult wake eligibility BEFORE
+    # any state-mutating claim.
+    try:
+        decision = capacity_scheduler.wake_decision(session_uuid, args.lease_id)
+    except ValueError:
+        write(json.dumps({"outcome": "conflict", "lease_id": args.lease_id,
+                          "reason": "not_found"}) + "\n")
+        return RESUME_TRIGGER_EXIT_CONFLICT
+    if decision == "wake_attempts_exhausted":
+        write(json.dumps({"outcome": "attempts_exhausted",
+                          "lease_id": args.lease_id}) + "\n")
+        return RESUME_TRIGGER_EXIT_ATTEMPTS_EXHAUSTED
+
+    # Step 1: read-only pre-claim snapshot. Every wrong-first-role/binding/
+    # evidence preflight check below runs against THIS snapshot.
+    stored_lease = state_store.read_pause_lease(session_uuid, args.lease_id)
+    if stored_lease is None:
+        write(json.dumps({"outcome": "conflict", "lease_id": args.lease_id,
+                          "reason": "not_found"}) + "\n")
+        return RESUME_TRIGGER_EXIT_CONFLICT
+    try:
+        precheck_lease = capacity_contracts.validate_pause_lease(
+            state_store.pause_lease_from_stored_record(stored_lease))
+    except ValueError as exc:
+        write(json.dumps({"outcome": "internal_error",
+                          "detail": str(exc)}) + "\n")
+        return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+
+    effective_role = args.role if args.role is not None else precheck_lease["role"]
+
+    def _preflight_conflict(reason, code):
+        _account_failed_wake_attempt(
+            session_uuid, precheck_lease, args.automation_ref)
+        write(json.dumps({"outcome": "conflict",
+                          "lease_id": precheck_lease["lease_id"],
+                          "reason": reason}) + "\n")
+        return code
+
+    if args.role is not None and args.role != precheck_lease["role"]:
+        # Wrong first role after resume: stop durably for supervision --
+        # refused before any claim/phase-advance is even attempted under
+        # the wrong identity. (Never checked when `--role` is omitted --
+        # Package F's own fixed argv never supplies one to cross-check.)
+        return _preflight_conflict("role_mismatch", RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+
+    work_id = _current_role_work_id_for_session(cwd, session_uuid, effective_role)
+    current_binding = (
+        _capacity_candidate_binding(session_uuid, work_id, effective_role)
+        if work_id else None)
+    state = _find_session_state(cwd, session_uuid)
+    cfg = ((state or {}).get("config") or {}).get(effective_role) or {}
+    controller = cfg.get("controller")
+    provider_session_id = (
+        state_store.get_role_session(state, effective_role, controller)
+        if state else None)
+
+    if not work_id or current_binding is None:
+        return _preflight_conflict(
+            "candidate_mismatch", RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+
+    mismatch = _resume_wake_failure_kind(
+        precheck_lease, current_binding, provider_session_id)
+    if mismatch:
+        return _preflight_conflict(mismatch, RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+
+    pending_record = state_store.read_pending_turn_before_pause(
+        session_uuid, effective_role)
+    if (not pending_record or not pending_record.get("acknowledged")
+           or pending_record.get("lease_id") != precheck_lease["lease_id"]):
+        return _preflight_conflict(
+            "no_pending_turn", RESUME_TRIGGER_EXIT_NO_PENDING_TURN)
+
+    # Step 2: every read-only preflight check above passed -- only NOW
+    # attempt this CLI's OWN state-mutating claim (idempotent under
+    # Package F's own claim-then-invoke ordering -- see the docstring).
+    manual_signal_record = None
+    try:
+        if args.manual_signal_record:
+            manual_signal_record = _load_json_file(args.manual_signal_record)
+            pinned_public_keys = _load_json_file(args.pinned_public_keys)
+            result = capacity_scheduler.claim_with_authorized_early_override(
+                session_uuid, args.lease_id, args.claimant_ref, effective_now,
+                manual_signal_record, pinned_public_keys, args.automation_ref)
+        else:
+            result = capacity_scheduler.claim(
+                session_uuid, args.lease_id, args.claimant_ref, effective_now,
+                args.automation_ref, reference_now=args.reference_now,
+                max_clock_skew_seconds=args.max_clock_skew_seconds)
+    except capacity_scheduler.SchedulerLeaseConflict as exc:
+        write(json.dumps({"outcome": "conflict", "lease_id": exc.lease_id,
+                          "reason": exc.reason}) + "\n")
+        return (RESUME_TRIGGER_EXIT_NOT_DUE if exc.reason == "early_refusal"
+               else RESUME_TRIGGER_EXIT_CONFLICT)
+    except capacity_scheduler.SchedulerOverrideRecordingFailed as exc:
+        write(json.dumps({"outcome": "internal_error",
+                          "detail": str(exc)}) + "\n")
+        return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+    except ValueError as exc:
+        write(json.dumps({"outcome": "invalid_arguments",
+                          "detail": str(exc)}) + "\n")
+        return RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        # D-MJ-02 parity: a genuine operational claim failure durably
+        # accounts one failed wake attempt too.
+        _account_failed_wake_attempt(
+            session_uuid, precheck_lease, args.automation_ref)
+        write(json.dumps({"outcome": "internal_error",
+                          "detail": str(exc)}) + "\n")
+        return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+
+    try:
+        canonical_lease = capacity_contracts.validate_pause_lease(
+            state_store.pause_lease_from_stored_record(result["lease"]))
+    except ValueError as exc:
+        write(json.dumps({"outcome": "internal_error",
+                          "detail": str(exc)}) + "\n")
+        return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+
+    def _release_and_conflict(reason, code):
+        # Every RETRIABLE post-claim refusal below releases the
+        # just-claimed lease truthfully via a same-binding
+        # replace-and-increment (never stranded, never silently reset) --
+        # this is what makes the ceiling genuinely reachable under
+        # Package F's real claim-then-invoke ordering too.
+        _account_failed_wake_attempt(
+            session_uuid, canonical_lease, args.automation_ref)
+        write(json.dumps({"outcome": "conflict",
+                          "lease_id": canonical_lease["lease_id"],
+                          "reason": reason}) + "\n")
+        return code
+
+    def _release_and_conflict_terminal(reason, code):
+        # A genuinely TERMINAL post-claim refusal (the candidate itself is
+        # permanently done, e.g. invalidated): cancels rather than
+        # replaces -- retrying is never meaningful again for this exact
+        # candidate, so no ceiling accounting applies.
+        try:
+            capacity_scheduler.cancel(
+                session_uuid, canonical_lease["lease_id"], args.automation_ref)
+        except capacity_scheduler.SchedulerLeaseConflict:
+            pass
+        write(json.dumps({"outcome": "conflict",
+                          "lease_id": canonical_lease["lease_id"],
+                          "reason": reason}) + "\n")
+        return code
+
+    # Step 3: race-safety re-check -- the pre-claim snapshot could in
+    # principle be stale by the time the claim itself landed.
+    if (effective_role != canonical_lease["role"]
+            or _resume_wake_failure_kind(
+                canonical_lease, current_binding, provider_session_id)):
+        return _release_and_conflict(
+            "candidate_mismatch", RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+
+    expected_candidate = {
+        "candidate_manifest_digest": current_binding["candidate_manifest_digest"],
+        "candidate_index": current_binding["candidate_index"],
+    }
+    if manual_signal_record is not None:
+        wake_kind_evidence = {
+            "kind": "manual_signal",
+            "signal_journal_ref": manual_signal_record["signal_journal_ref"],
+            "signer_public_key_id": manual_signal_record["signer_public_key_id"],
+            "detached_signature": manual_signal_record["detached_signature"],
+        }
+    else:
+        wake_kind_evidence = {
+            "kind": "trustworthy_reset",
+            "consumption_state": "consumed",
+            "not_before": canonical_lease["not_before"],
+            "current_clock": effective_now,
+        }
+    capacity_wake_evidence = {
+        "lease_id": canonical_lease["lease_id"],
+        "role": canonical_lease["role"],
+        "provider_session_id": canonical_lease["provider_session_id"],
+        "controller_policy_digest": canonical_lease["controller_policy_digest"],
+        "candidate_manifest_digest": canonical_lease["candidate_digest"],
+        "candidate_index": current_binding["candidate_index"],
+    }
+    capacity_wake_evidence.update(wake_kind_evidence)
+    claimed_record = _advance_phase(
+        session_uuid, work_id, "capacity_wake_claimed",
+        evidence={"capacity_wake_evidence": capacity_wake_evidence},
+        source="resume_trigger", expected_candidate=expected_candidate)
+    if (claimed_record or {}).get("state") != "preflighting":
+        # Package A's own candidate-identity gate refused (the lease names
+        # a different candidate than this engagement's current one) --
+        # never silently resumed a stale binding.
+        return _release_and_conflict(
+            "candidate_mismatch", RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+
+    def _refuse_wake_preflight(failure_kind):
+        evidence = {"capacity_wake_preflight_failure": {
+            "lease_id": canonical_lease["lease_id"],
+            "role": canonical_lease["role"],
+            "provider_session_id": canonical_lease["provider_session_id"],
+            "controller_policy_digest": canonical_lease["controller_policy_digest"],
+            "candidate_manifest_digest": canonical_lease["candidate_digest"],
+            "candidate_index": current_binding["candidate_index"],
+            "failure_kind": failure_kind}}
+        _advance_phase(
+            session_uuid, work_id, "capacity_wake_preflight_failed",
+            evidence=evidence, source="resume_trigger",
+            expected_candidate=expected_candidate)
+        return _release_and_conflict(
+            failure_kind, RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+
+    mismatch = _resume_wake_failure_kind(
+        canonical_lease, current_binding, provider_session_id)
+    if mismatch:
+        return _refuse_wake_preflight(mismatch)
+
+    for invalidation in state_store.read_invalidation_history(session_uuid):
+        if (invalidation.get("invalidated_candidate_digest")
+                == canonical_lease["candidate_digest"]
+                and invalidation.get("invalidated_session_id") == session_uuid):
+            _advance_phase(
+                session_uuid, work_id, "preflight_rejected",
+                evidence={"reason": "invalidation_record_on_file",
+                         "candidate_manifest_digest":
+                             canonical_lease["candidate_digest"]},
+                source="resume_trigger")
+            return _release_and_conflict_terminal(
+                "invalidated", RESUME_TRIGGER_EXIT_INVALIDATED)
+
+    # The pending-turn precondition was already proven true on the
+    # pre-claim snapshot (step 1); re-read fresh (never trust a value this
+    # stale) since it is what actually seeds the send below.
+    pending_record = state_store.read_pending_turn_before_pause(
+        session_uuid, effective_role)
+    if (not pending_record or not pending_record.get("acknowledged")
+           or pending_record.get("lease_id") != canonical_lease["lease_id"]):
+        return _release_and_conflict(
+            "no_pending_turn", RESUME_TRIGGER_EXIT_NO_PENDING_TURN)
+
+    _advance_phase(session_uuid, work_id, "preflight_passed",
+                   source="resume_trigger")
+
+    seed_text = pending_record.get("turn_text")
+    try:
+        delivery = _resume_seed_delivery(seed_text, args.redirected_context)
+    except TypeError as exc:
+        write(json.dumps({"outcome": "internal_error",
+                          "detail": str(exc)}) + "\n")
+        return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+
+    sessions_dir = state_store.session_assets_dir(session_uuid)
+    if session_factory is not None:
+        session = session_factory(controller, effective_role, provider_session_id,
+                                  cfg.get("model"), cfg.get("effort"))
+    else:
+        session = _construct_resume_session(
+            effective_role, controller, cfg, provider_session_id, sessions_dir,
+            trace=None)
+    if session is None:
+        write(json.dumps({"outcome": "internal_error",
+                          "detail": "unrecognized controller %r" % controller}
+                        ) + "\n")
+        return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+
+    send_result = _send(session, delivery, meta={"prompt_kind": "resume_wake"})
+    if send_result.get("ok", True):
+        # Step 8, accepted send: mark the durable lease consumed FIRST --
+        # only THEN is `consumption_state=consumed` asserted anywhere
+        # (the pending turn is cleared after) -- an accepted send consumes
+        # exactly once.
+        try:
+            capacity_scheduler.mark_consumed(
+                session_uuid, canonical_lease["lease_id"], args.automation_ref)
+        except capacity_scheduler.SchedulerLeaseConflict as exc:
+            write(json.dumps({"outcome": "internal_error",
+                              "detail": "post-send consume conflict: %s"
+                              % exc.reason}) + "\n")
+            return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+        state_store.clear_pending_turn_before_pause(session_uuid, effective_role)
+        write(json.dumps({
+            "outcome": "success", "lease_id": canonical_lease["lease_id"]}) + "\n")
+        return RESUME_TRIGGER_EXIT_SUCCESS
+
+    # Post-wake send failure: the lease is NEVER marked consumed for a
+    # failed send (it is still `claimed`), and the pending turn is RETAINED
+    # (never cleared).
+    raw_evidence = _synthesize_raw_failure_evidence(controller, send_result)
+    controller_outcome = _classify_raw_failure(controller, raw_evidence)
+    _record_provider_health(
+        session_uuid, effective_role, controller, controller_outcome,
+        _capacity_now())
+    if controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES:
+        # Re-entry via SAME-BINDING REPLACEMENT of this exact claimed
+        # lease -- never a fresh `start_new_episode`, which would silently
+        # reset the per-binding automatic-recovery chain back to 0.
+        capacity_payload = _enter_awaiting_capacity(
+            session_uuid, work_id, effective_role, controller, provider_session_id,
+            controller_outcome, seed_text, cfg.get("model"), cfg.get("effort"),
+            raw_evidence=raw_evidence, replace_lease_id=canonical_lease["lease_id"],
+            replace_automation_ref=args.automation_ref)
+        if capacity_payload is not None:
+            write(json.dumps({
+                "outcome": "send_failed", "lease_id": canonical_lease["lease_id"],
+                "controller_outcome": controller_outcome,
+                "re_entered_capacity": True}) + "\n")
+            return RESUME_TRIGGER_EXIT_SEND_FAILED
+    # Not capacity-eligible, or the replacement attempt itself failed: the
+    # claimed lease is released (never stranded) and this candidate's
+    # execution is terminally marked failed -- no further wake-ceiling
+    # accounting is meaningful for it, so a plain cancel (not a replace).
+    try:
+        capacity_scheduler.cancel(
+            session_uuid, canonical_lease["lease_id"], args.automation_ref)
+    except capacity_scheduler.SchedulerLeaseConflict:
+        pass
+    _advance_phase(
+        session_uuid, work_id, "execution_failed",
+        evidence={"reason": "send_failed", "headless": True,
+                 "controller_outcome": controller_outcome},
+        source="resume_trigger")
+    write(json.dumps({
+        "outcome": "send_failed", "lease_id": canonical_lease["lease_id"],
+        "controller_outcome": controller_outcome,
+        "re_entered_capacity": False}) + "\n")
+    return RESUME_TRIGGER_EXIT_SEND_FAILED
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["resume-trigger"]:
+        # M3 Package E: the headless resume-trigger CLI is a wholly separate,
+        # independently-versioned contract (RESUME_TRIGGER_CONTRACT_VERSION)
+        # -- dispatched here, before the main flat argparse, exactly like D's
+        # own standalone `cowork_capacity_scheduler.run_wake_trigger` never
+        # shares a parser with anything else.
+        return run_resume_trigger(argv[1:])
     try:
         args = build_parser().parse_args(argv)
         # --check / --report are read-only and short-circuit BELOW, before

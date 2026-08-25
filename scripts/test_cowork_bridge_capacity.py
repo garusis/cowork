@@ -573,6 +573,115 @@ class CapacityPacketCandidateTest(unittest.TestCase):
                                  "subscription_quota_exhausted")
 
 
+class ClaudeProviderRetryEvidenceExtractionTest(unittest.TestCase):
+    """`_claude_provider_retry_evidence` -- the ONE structural, closed-
+    grammar extraction point where a genuinely provider-attested retry-
+    after value can survive out of a claude `system`/`api_error` event's
+    own `error` dict (REV-BLK-01). Never inferred from message text,
+    never fabricated for a shape that does not carry it."""
+
+    def test_extracts_well_shaped_retry_after(self):
+        error = {"type": "rate_limit_error", "status": 429,
+                 "formatted": "429 Rate limited", "retry_after": "30s"}
+        self.assertEqual(bridge._claude_provider_retry_evidence(error),
+                         {"source": "provider_header", "value": "30s"})
+
+    def test_extracts_rfc3339_timestamp_shaped_retry_after(self):
+        error = {"type": "overloaded_error", "status": 529,
+                 "retry_after": "2026-08-24T00:05:00Z"}
+        self.assertEqual(bridge._claude_provider_retry_evidence(error),
+                         {"source": "provider_header",
+                          "value": "2026-08-24T00:05:00Z"})
+
+    def test_missing_retry_after_field_is_none(self):
+        error = {"type": "rate_limit_error", "status": 429,
+                 "formatted": "429 Rate limited"}
+        self.assertIsNone(bridge._claude_provider_retry_evidence(error))
+
+    def test_two_attested_repo_shapes_carry_no_retry_after(self):
+        # The repository's own only two ATTESTED raw claude failure shapes
+        # (scripts/test_cowork.py:3079-3096) genuinely carry no such field
+        # -- must degrade to None, never a guessed/fabricated value.
+        self.assertIsNone(bridge._claude_provider_retry_evidence(
+            {"formatted": "401 OAuth token expired"}))
+
+    def test_wrong_type_value_is_none_not_coerced(self):
+        for bad in (None, 30, 30.0, ["30s"], {"seconds": 30}, True):
+            with self.subTest(bad=bad):
+                self.assertIsNone(bridge._claude_provider_retry_evidence(
+                    {"retry_after": bad}))
+
+    def test_empty_string_value_is_none(self):
+        self.assertIsNone(
+            bridge._claude_provider_retry_evidence({"retry_after": ""}))
+
+    def test_non_dict_error_is_none_not_an_exception(self):
+        for bad in (None, "text", 42, ["a"]):
+            with self.subTest(bad=bad):
+                self.assertIsNone(bridge._claude_provider_retry_evidence(bad))
+
+    def test_never_inferred_from_formatted_or_message_text(self):
+        # A message that textually mentions a retry hint must NOT leak into
+        # the extracted value -- only the structural `retry_after` field is
+        # ever read.
+        error = {"formatted": "429 Rate limited, retry_after=45s",
+                 "message": "Please retry after 45 seconds"}
+        self.assertIsNone(bridge._claude_provider_retry_evidence(error))
+
+    def test_deterministic_pure_transform(self):
+        error = {"type": "rate_limit_error", "retry_after": "30s"}
+        self.assertEqual(bridge._claude_provider_retry_evidence(dict(error)),
+                         bridge._claude_provider_retry_evidence(dict(error)))
+
+    def test_extracted_shape_is_extract_retry_evidence_compatible(self):
+        # The exact shape `_claude_provider_retry_evidence` returns, once
+        # placed at raw["retry_evidence"], round-trips through Package C's
+        # own `extract_retry_evidence` unchanged and classifies trustworthy.
+        error = {"type": "rate_limit_error", "retry_after": "30s"}
+        evidence = bridge._claude_provider_retry_evidence(error)
+        raw = {"type": "assistant", "error": "rate_limit_error",
+              "retry_evidence": evidence}
+        self.assertEqual(bridge.extract_retry_evidence(raw), evidence)
+        self.assertEqual(capacity.classify_trust_source(evidence["source"]),
+                         "trustworthy")
+
+
+class ParseClaudeEventRetryEvidenceTest(unittest.TestCase):
+    """`parse_claude_event`'s `system`/`api_error` branch surfaces genuine
+    retry evidence (when present) as `parsed["retry_evidence"]`, and stays
+    silent (no key at all) when the raw event carries none -- proving the
+    real event-reduction seam, not just the pure helper in isolation."""
+
+    def test_system_api_error_with_retry_after_carries_retry_evidence(self):
+        parsed = bridge.parse_claude_event({
+            "type": "system", "subtype": "api_error",
+            "error": {"type": "rate_limit_error", "status": 429,
+                      "formatted": "429 Rate limited",
+                      "retry_after": "30s"},
+        })
+        self.assertEqual(parsed["kind"], "error")
+        self.assertEqual(parsed["retry_evidence"],
+                         {"source": "provider_header", "value": "30s"})
+
+    def test_system_api_error_without_retry_after_has_no_key(self):
+        parsed = bridge.parse_claude_event({
+            "type": "system", "subtype": "api_error",
+            "error": {"formatted": "401 OAuth token expired"},
+        })
+        self.assertEqual(parsed["kind"], "error")
+        self.assertNotIn("retry_evidence", parsed)
+
+    def test_assistant_isapierrormessage_shape_never_carries_retry_evidence(self):
+        # This shape structurally has no room for it (only the CLI's own
+        # already-classified token) -- never fabricated here either.
+        parsed = bridge.parse_claude_event({
+            "type": "assistant", "isApiErrorMessage": True,
+            "error": "rate_limit_error",
+            "message": {"content": [{"type": "text", "text": "Rate limited"}]},
+        })
+        self.assertNotIn("retry_evidence", parsed)
+
+
 class PurityAndImportBoundaryTest(unittest.TestCase):
     """Package C invariant: the new classification functions are pure --
     zero file writes, zero cowork_state.py calls, zero cowork.py imports."""
@@ -590,6 +699,7 @@ class PurityAndImportBoundaryTest(unittest.TestCase):
         "classify_role_reply_outcome",
         "extract_retry_evidence",
         "capacity_packet_candidate",
+        "_claude_provider_retry_evidence",
     )
 
     _FORBIDDEN_GLOBAL_NAMES = frozenset({
@@ -671,6 +781,8 @@ class PurityAndImportBoundaryTest(unittest.TestCase):
             controller="claude", provider="anthropic",
             raw_evidence=CONTROLLER_FIXTURES["claude"]["quota_limited"],
             issued_at="2026-08-23T12:00:00Z")
+        bridge._claude_provider_retry_evidence(
+            {"type": "rate_limit_error", "retry_after": "30s"})
         after = set(os.listdir(_HERE))
         self.assertEqual(before, after)
 
