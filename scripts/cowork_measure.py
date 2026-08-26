@@ -1659,6 +1659,114 @@ def orchestrator_evaluations_view(path):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# M4 Package D: durable activity/watchdog raw-source consumption.             #
+#                                                                              #
+# Reads Package B's durable activity store (`cowork_state.activity_dir_for`'s #
+# own `history/*.jsonl` per-work_id files, plus `read_next_inspection`)       #
+# DIRECTLY -- the sole additional raw source this module consumes for the     #
+# `record["activity"]` field, exactly like every other raw source above.      #
+# No live process/controller-health probe exists once a session has ended, so #
+# a populated snapshot's `watchdog_verdict` is always the honest `"no_action"`#
+# with null evidence refs -- never a fabricated post-hoc stall/progress claim.#
+# --------------------------------------------------------------------------- #
+
+# The exact compact-fact key set `cowork_activity.project_compact_state` (and #
+# therefore both cross-surface renderers) uses, minus `schema_version` --     #
+# plus `work_id`, since (unlike a renderer already scoped to one caller-      #
+# selected work_id) this module must itself name WHICH work engagement a      #
+# populated snapshot describes. Every field is set to `UNKNOWN` uniformly     #
+# when no durable activity exists at all, so `record["activity"]` NEVER goes  #
+# missing -- `build_record` sets this key unconditionally.
+_ACTIVITY_UNKNOWN_SHAPE = {
+    "work_id": UNKNOWN, "activity_class": UNKNOWN,
+    "original_classification": UNKNOWN, "reconciled": UNKNOWN,
+    "source": UNKNOWN, "age_seconds": UNKNOWN, "artifact_delta": UNKNOWN,
+    "provider_health": UNKNOWN, "watchdog_verdict": UNKNOWN,
+    "durable_evidence_ref": UNKNOWN, "process_probe_ref": UNKNOWN,
+    "next_inspection_at": UNKNOWN, "interval_seconds": UNKNOWN,
+}
+
+
+def _activity_snapshot(session_uuid, work_id):
+    """Best-effort compact activity facts for one work_id, built PURELY from
+    durable evidence (`cowork_state.latest_activity`/`read_next_inspection`).
+    Returns `None` when no valid ActivityRecord exists for this work_id at
+    all -- including a torn/corrupt history, which degrades to `None`
+    exactly like a genuinely missing one (this function never raises,
+    matching `build_record`'s own "never raises" law)."""
+    try:
+        current = state_store.latest_activity(session_uuid, work_id)
+    except Exception:  # noqa: BLE001 -- a corrupt/torn history reads unknown.
+        return None
+    if current is None:
+        return None
+    activity_record = current["activity_record"]
+    reconciliation_record = current["reconciliation_record"]
+    try:
+        schedule_record = state_store.read_next_inspection(
+            session_uuid, work_id)
+    except Exception:  # noqa: BLE001
+        schedule_record = None
+    sort_time = (reconciliation_record["time"]
+                if reconciliation_record is not None
+                else activity_record["time"])
+    return {
+        "work_id": work_id,
+        "activity_class": current["effective_classification"],
+        "original_classification": (
+            reconciliation_record["original_classification"]
+            if reconciliation_record is not None else None),
+        "reconciled": reconciliation_record is not None,
+        "source": activity_record["source"],
+        "age_seconds": activity_record["age_seconds"],
+        "artifact_delta": list(activity_record["artifact_delta"]),
+        "provider_health": activity_record["provider_health"],
+        # No live process probe exists once a session has ended -- a
+        # populated post-hoc verdict would fabricate a stall/progress claim
+        # this module has no live evidence for; always "no_action" with
+        # null evidence refs, honestly naming what was never (and could
+        # never be) checked here.
+        "watchdog_verdict": "no_action",
+        "durable_evidence_ref": None,
+        "process_probe_ref": None,
+        "next_inspection_at": (schedule_record["next_inspection_at"]
+                               if schedule_record else None),
+        "interval_seconds": (schedule_record["interval_seconds"]
+                             if schedule_record else None),
+        "_sort_time": sort_time,
+    }
+
+
+def _activity_view(session_uuid):
+    """The unconditional `record.activity` field: the most recently
+    classified durable activity snapshot across every work_id this session
+    has ever durably recorded, or the fixed all-`UNKNOWN` shape
+    (`_ACTIVITY_UNKNOWN_SHAPE`) when none exists. Never raises: any
+    OSError/glob failure degrades to the UNKNOWN shape, exactly like every
+    other raw source this module reads."""
+    if not session_uuid:
+        return dict(_ACTIVITY_UNKNOWN_SHAPE)
+    try:
+        history_dir = os.path.join(
+            state_store.activity_dir_for(session_uuid), "history")
+        paths = glob.glob(os.path.join(history_dir, "*.jsonl"))
+    except (OSError, ValueError):
+        return dict(_ACTIVITY_UNKNOWN_SHAPE)
+    snapshots = []
+    for path in paths:
+        work_id = os.path.splitext(os.path.basename(path))[0]
+        snapshot = _activity_snapshot(session_uuid, work_id)
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    if not snapshots:
+        return dict(_ACTIVITY_UNKNOWN_SHAPE)
+    snapshots.sort(key=lambda s: s["_sort_time"])
+    latest = dict(snapshots[-1])
+    del latest["_sort_time"]
+    return latest
+
+
 def build_record(session_uuid, cwd=None, ingest_results=None):
     """Build the authoritative record from every raw source. Never raises.
 
@@ -2044,6 +2152,11 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
     record["replay"] = replay_rounds(record)
     record["completion"] = completion_account(
         record, session_uuid, seeds=_completion_seeds(session_uuid))
+    # M4 Package D: unconditional -- always set, real snapshot or the fixed
+    # UNKNOWN shape (`_activity_view`) -- so `record["activity"]` never goes
+    # missing, and D's report section (`cowork_report._section_activity`)
+    # and every cross-surface consumer always resolves it.
+    record["activity"] = _activity_view(session_uuid)
     return record
 
 

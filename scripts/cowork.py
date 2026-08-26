@@ -61,6 +61,8 @@ import cowork_control_plane as control_plane  # noqa: E402
 import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 import cowork_capacity as capacity_contracts  # noqa: E402
 import cowork_capacity_scheduler as capacity_scheduler  # noqa: E402
+import cowork_activity as activity_contracts  # noqa: E402
+import cowork_watchdog as watchdog  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -6188,6 +6190,28 @@ SkipBaseline = collections.namedtuple(
 # longer ambiguous. See `_advance_phase`/`_role_work_id` below.
 _OUTCOME_ENDED = "ended"
 
+# M4 Package D: the shared shutdown event `_handle_external_kill` (run_flow's
+# real SIGTERM handler) sets FIRST, before its own durable `aborted` write --
+# checked by every in-turn activity tick BEFORE it fires or appends, so a
+# tick can never race a genuine external-kill's terminal durable write with
+# a stale "still productive" append landing after it.
+_ACTIVITY_SHUTDOWN_EVENT = threading.Event()
+
+# M4 Package D: headless refusal/no-first-token, no-fallback termination
+# (see `_role_loop`'s send-failure seam). One literal nonzero code, outside
+# {0,1,2,130} (this file's own pre-existing rc/KeyboardInterrupt/EOFError
+# literals) and outside 128..255 (every signal-exit range this file's own
+# SIGTERM handler -- `128 + signum` -- and every real POSIX signal number
+# already occupy).
+HEADLESS_REFUSAL_EXIT_CODE = 17
+
+# `_role_loop` outcome naming a headless run that terminated the WHOLE
+# process (never merely ended one phase) because a send failure was a
+# typed provider refusal or a first-token-deadline expiry, with no fallback
+# available -- distinct from the ordinary `_OUTCOME_ENDED` (which leaves the
+# process exit code at 0).
+_OUTCOME_HEADLESS_TERMINATED = "headless_terminated"
+
 
 # Returned by the turn readers to mean "end the conversation" (EOF / Ctrl-D /
 # explicit /quit), distinct from a blank line (which re-prompts).
@@ -7010,6 +7034,308 @@ def _read_handoff_confirm(io_in, io_out, prompt="Hand the work back to the scout
     return line.strip().lower() in ("", "y", "yes")
 
 
+# =========================================================================== #
+# M4 Package D: the activity-emission seam.                                   #
+#                                                                              #
+# This block is the ONLY production owner of WHEN a `cowork_activity.         #
+# ActivityRecord` is appended: at a role's real turn boundary (see            #
+# `_role_loop`'s retained `_send` call), and at bounded, scheduled in-turn    #
+# ticks while that same send is still blocking. It invokes Package C's        #
+# `classify_<controller>_activity` (never reclassifies independently),        #
+# Package C's pinned `live_child_handle` (via `cowork_watchdog.process_       #
+# probe`, never re-derived here), and Package B's `append_activity_record`.   #
+#                                                                              #
+# A tick durably records visibility ONLY -- it performs zero `io_out`         #
+# writes, launches no controller turn/subprocess, and is not M5.5 fan-out:    #
+# `_run_activity_tick_loop` calls nothing but the caller-supplied `fire()`,   #
+# which itself only classifies already-observed process-liveness evidence    #
+# and appends. Tick lifecycle is `try/finally`: `_role_loop` creates the      #
+# daemon thread immediately before its retained `_send` call and closes it    #
+# (`tick_stop_event.set()` + a BOUNDED `join`) in the `finally` clause         #
+# wrapping that same call, regardless of how the call returns. The shared     #
+# `_ACTIVITY_SHUTDOWN_EVENT` (set FIRST by `_handle_external_kill` on a real  #
+# SIGTERM) is checked immediately before every tick fire AND immediately      #
+# before the durable append itself, closing the post-SIGTERM append race.    #
+# =========================================================================== #
+
+_ACTIVITY_TICK_INTERVAL_SECONDS = 5.0
+
+_ACTIVITY_CLASSIFIERS = {
+    "claude": bridge.classify_claude_activity,
+    "codex": bridge.classify_codex_activity,
+    "opencode": bridge.classify_opencode_activity,
+}
+
+# The best HONEST evidence-kind label a genuinely successful turn's
+# flattened `send_result` supports from OUTSIDE the streaming loop (no
+# per-event/tool-call granularity is visible at this layer -- see
+# `_turn_boundary_activity_evidence`'s own docstring): each controller's
+# OWN real text-carrying kind, so `classify_<controller>_activity` maps it
+# to `productive_model_work` through its real, unmodified kind table
+# rather than degrading to `provider_wait` for want of a recognized kind.
+_ACTIVITY_SUCCESS_KIND_BY_CONTROLLER = {
+    "claude": "assistant", "codex": "message", "opencode": "message",
+}
+
+
+def _run_activity_tick_loop(stop_event, fire, interval_seconds=None):
+    """The bounded in-turn activity-visibility daemon tick loop.
+
+    Fires `fire()` every `interval_seconds` until `stop_event` is set (the
+    per-turn signal `_role_loop`'s own `finally` clause sets once the send
+    it is ticking for returns) OR the shared `_ACTIVITY_SHUTDOWN_EVENT` is
+    set (a real external kill) -- whichever comes first. `stop_event.wait`
+    IS the sleep: a set event returns immediately (`True`) rather than
+    blocking the full interval, so teardown is prompt, not merely bounded
+    by the next tick's timeout. Performs no I/O itself beyond calling
+    `fire()` -- see its own docstring for why `fire()`, too, never touches
+    `io_out` or launches anything."""
+    interval = (_ACTIVITY_TICK_INTERVAL_SECONDS if interval_seconds is None
+               else interval_seconds)
+    while True:
+        if stop_event.wait(timeout=interval):
+            return
+        if _ACTIVITY_SHUTDOWN_EVENT.is_set():
+            return
+        fire()
+
+
+def _turn_boundary_activity_evidence(controller, send_result):
+    """Reconstruct the smallest real evidence dict `cowork_bridge.classify_
+    <controller>_activity` recognizes from `send_result`'s own flattened
+    fields -- the identical honest-reconstruction discipline `_synthesize_
+    raw_failure_evidence` already uses for M3's own failure classification
+    (see its docstring): this never fabricates a discriminant `send_result`
+    does not itself carry. A genuinely successful turn's evidence kind is
+    the best HONEST label available from outside the streaming loop (see
+    `_ACTIVITY_SUCCESS_KIND_BY_CONTROLLER`'s own note) -- never a claim of
+    tool-call-level granularity this layer does not have."""
+    if not isinstance(send_result, dict):
+        return {"kind": None}
+    if send_result.get("result") == "no_first_token":
+        return {"kind": "no_first_token"}
+    if send_result.get("denied") is True:
+        return {"kind": "denied"}
+    if not send_result.get("ok", True):
+        return {"kind": "error", "is_error": True}
+    kind = _ACTIVITY_SUCCESS_KIND_BY_CONTROLLER.get(controller, "assistant")
+    return {"kind": kind, "text": str(send_result.get("result") or "ok")}
+
+
+def _emit_activity_record(session_uuid, work_id, session, evidence,
+                          turn_started_monotonic, trace=None, role=None):
+    """The activity-emission seam's sole append point: classify `evidence`
+    via Package C's `classify_<controller>_activity`, durably append the
+    resulting ActivityRecord via Package B's `append_activity_record`.
+    Returns the durably stored, normalized record, or `None` when nothing
+    was appended (no session/work identity, an unrecognized controller, the
+    shared shutdown event is set, or any append failure).
+
+    Best-effort: any `ValueError`/`OSError` is swallowed, exactly like
+    `_record_provider_health`'s own best-effort discipline -- observability
+    must never block or break the turn it is observing. Checks the shared
+    `_ACTIVITY_SHUTDOWN_EVENT` immediately before appending, so a
+    post-SIGTERM append can never race the external-kill handler's own
+    durable `aborted` write."""
+    if not session_uuid or not work_id:
+        return None
+    controller = getattr(session, "controller", None)
+    classify = _ACTIVITY_CLASSIFIERS.get(controller)
+    if classify is None:
+        return None
+    try:
+        activity_class = classify(evidence)
+        age_seconds = max(0.0, time.monotonic() - turn_started_monotonic)
+        record = {
+            "schema_version": activity_contracts.SCHEMA_VERSION,
+            "record": "ActivityRecord", "work_id": work_id,
+            "time": _capacity_now(),
+            "activity_class": activity_class, "source": controller,
+            "artifact_fingerprint": None, "artifact_delta": [],
+            "provider_health": None, "age_seconds": age_seconds,
+        }
+        if _ACTIVITY_SHUTDOWN_EVENT.is_set():
+            return None
+        stored = state_store.append_activity_record(session_uuid, record)
+    except (ValueError, OSError):
+        return None
+    if trace:
+        trace.event("activity.recorded", role=role, work_id=work_id,
+                    activity_class=activity_class, source=controller)
+    return stored
+
+
+_ACTIVITY_REVIEW_INTERVAL_SECONDS = 300
+
+
+def _ensure_scheduled_review(session_uuid, work_id, now_iso,
+                             activity_class=None):
+    """Durably (re)establish issue #58's authoritative `next_inspection_at`
+    for `work_id` -- Package B owns the STORE (`write_scheduled_review`);
+    this activity-emission seam owns the cadence POLICY. Best-effort: any
+    failure returns `None` rather than raising.
+
+    M4D-MAJ-02: the PRIOR schedule is read and evaluated BEFORE any
+    refresh decision -- unconditionally pushing `next_inspection_at`
+    further into the future on every single turn (including a terminal
+    one) would make an overdue review structurally unreachable, silently
+    defeating issue #58's hard-stall detection. The policy:
+      - `activity_class` is a NON-terminal, real/positive class (
+        `productive_model_work`/`local_tool_work`/`owned_verification`/
+        `provider_wait`/`policy_denial`) -> genuine progress legitimately
+        defers the next check; refresh/extend to `now + interval`, exactly
+        as before.
+      - `activity_class` is TERMINAL (`process_crash`/`hung_descendant`/
+        `no_evidence_silence`) and a prior schedule already exists -> NEVER
+        extend it; the existing (possibly already-overdue) schedule stands
+        unchanged, so `review_due` can go True on its own timing.
+      - `activity_class` is TERMINAL and NO prior schedule exists yet (the
+        very first turn recorded for this work_id was itself terminal) ->
+        due for review IMMEDIATELY (`next_inspection_at = now`), never
+        deferred a full interval -- the first sign of trouble is due for a
+        watchdog look at once, not after an arbitrary wait.
+    """
+    if not session_uuid or not work_id:
+        return None
+    try:
+        prior = state_store.read_next_inspection(session_uuid, work_id)
+        terminal = activity_class in watchdog.TERMINAL_ACTIVITY_CLASSES
+        if terminal and prior is not None:
+            return prior
+        if terminal:
+            next_at = now_iso
+        else:
+            now_dt = datetime.datetime.fromisoformat(
+                now_iso.replace("Z", "+00:00"))
+            next_at = (now_dt + datetime.timedelta(
+                seconds=_ACTIVITY_REVIEW_INTERVAL_SECONDS)).isoformat(
+                ).replace("+00:00", "Z")
+        record = {
+            "schema_version": activity_contracts.SCHEMA_VERSION,
+            "record": "ScheduledReviewRecord", "work_id": work_id,
+            "next_inspection_at": next_at,
+            "interval_seconds": _ACTIVITY_REVIEW_INTERVAL_SECONDS,
+            "last_inspection_result_ref": None,
+        }
+        return state_store.write_scheduled_review(session_uuid, record)
+    except (ValueError, OSError):
+        return None
+
+
+def _reconcile_before_presentation(session_uuid, work_id,
+                                   reconciled_classification, trace=None):
+    """Call Package B's `reread_before_gate` immediately before an actual
+    stall/retry/invalidation presentation, retaining ORIGINAL plus
+    RECONCILED classification durably whenever the two genuinely disagree
+    (a no-op, by `reread_before_gate`'s own law, when they do not). Best-
+    effort/non-blocking: any failure never blocks the presentation itself,
+    and a missing prior ActivityRecord (`ValueError`) is exactly as
+    harmless a no-op as an identical re-read."""
+    if not session_uuid or not work_id:
+        return None
+    now = _capacity_now()
+    digest = hashlib.sha256(
+        ("%s:%s:%s" % (work_id, reconciled_classification, now))
+        .encode("utf-8")).hexdigest()
+    try:
+        reconciliation = state_store.reread_before_gate(
+            session_uuid, work_id, now, reconciled_classification,
+            revision_digest=digest, quiescence_marker="gate_presentation")
+    except (ValueError, OSError):
+        return None
+    if reconciliation is not None and trace:
+        trace.event("activity.reconciled", work_id=work_id,
+                    original=reconciliation["original_classification"],
+                    reconciled=reconciliation["reconciled_classification"])
+    return reconciliation
+
+
+def _hung_descendant_ps_evidence(session, effective_classification):
+    """M4D-MAJ-02: wire REAL independent `ps`/orphan evidence -- never
+    fabricated -- when the CURRENT effective classification is
+    `hung_descendant`. Uses Package C's own pinned `live_child_handle`
+    (never re-derived): a pid genuinely still referenced by the session
+    object is checked via `cowork_watchdog.independent_hung_descendant_
+    evidence`'s real, bounded `ps` invocation; the common same-turn
+    `no_first_token` case (where Package C's own bounded first-token
+    deadline mechanism already terminated AND REAPED the child before this
+    seam ever runs) correctly yields no pid and therefore no evidence --
+    honest either way, never a guess. Returns `None` for every other
+    classification (no ps check is even attempted)."""
+    if effective_classification != "hung_descendant":
+        return None
+    proc = bridge.live_child_handle(session)
+    pid = getattr(proc, "pid", None) if proc is not None else None
+    if pid is None:
+        return None
+    return watchdog.independent_hung_descendant_evidence(pid)
+
+
+def _watchdog_decision_for_presentation(session_uuid, work_id, session,
+                                        trace=None, role=None):
+    """M4 Package D's sole `cowork_watchdog.decide` call site consumed by
+    `_role_loop`'s gate presentations: reads the CURRENT durable
+    (activity_record, reconciliation_record) pair and the CURRENT
+    `ScheduledReviewRecord` (both Package B reads), then combines them with
+    a genuine live process probe (`session`) via `cowork_watchdog.decide` --
+    dual evidence, never elapsed time or the durable record alone. Also
+    attempts REAL independent hung-descendant `ps` evidence (see
+    `_hung_descendant_ps_evidence`) whenever the effective classification
+    is `hung_descendant`, so `hard_stall_eligible` is genuinely reachable
+    through that path when the evidence actually supports it. Returns
+    `None` when there is no durable activity to decide from yet (nothing to
+    warn about) or on any read/validation failure -- never raises, and
+    never blocks the presentation it precedes."""
+    if not session_uuid or not work_id:
+        return None
+    try:
+        current = state_store.latest_activity(session_uuid, work_id)
+        if current is None:
+            return None
+        schedule_record = state_store.read_next_inspection(
+            session_uuid, work_id)
+        effective_class = (
+            current["reconciliation_record"]["reconciled_classification"]
+            if current["reconciliation_record"] is not None
+            else current["activity_record"]["activity_class"])
+        hung_ps_evidence = _hung_descendant_ps_evidence(
+            session, effective_class)
+        decision = watchdog.decide(
+            work_id, _capacity_now(), current["activity_record"],
+            current["reconciliation_record"], schedule_record,
+            session=session, hung_ps_evidence=hung_ps_evidence)
+    except (ValueError, OSError):
+        return None
+    if trace:
+        trace.event("watchdog.decision", role=role, work_id=work_id,
+                    verdict=decision["verdict"],
+                    durable_evidence_ref=decision["durable_evidence_ref"],
+                    process_probe_ref=decision["process_probe_ref"])
+    return decision
+
+
+def _render_activity_snapshot(io_out, activity_record, decision,
+                              schedule_record, headless):
+    """D's sole output-arbitration call site: Package E's real `render_
+    compact_activity`/`render_headless_activity`, called ONLY here -- at
+    the retained turn boundary, after Package C's per-turn foreground
+    spinner has already closed (this function runs strictly after
+    `_send()` has returned). Never called from an in-turn tick. Best-
+    effort: a malformed/incomplete input never raises past this point --
+    a broken activity snapshot must never break the turn it decorates."""
+    if activity_record is None or decision is None or schedule_record is None:
+        return
+    try:
+        compact_state = activity_contracts.project_compact_state(
+            activity_record, decision, schedule_record)
+        if headless:
+            ui.render_headless_activity(io_out, compact_state)
+        else:
+            ui.render_compact_activity(io_out, compact_state)
+    except (ValueError, TypeError):
+        pass
+
+
 def _role_loop(session, first, status_path, context, io_in, io_out,
                role="scout", review_fn=None, trace=None,
                reviewer_role=SCOUT_REVIEWER,
@@ -7271,14 +7597,60 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 send_start_event_id = None
             last_send_source_ref = _build_pending_source_ref(
                 session, send_start_event_id, str(pending))
-            send_result = _send(
-                session, delivery, meta=lead_meta)
+            # M4 Package D: the activity-emission seam's bounded in-turn
+            # daemon tick, ticking ONLY while this real turn-boundary send
+            # is in flight -- created/closed in try/finally, bounded join.
+            turn_started_monotonic = time.monotonic()
+            tick_stop_event = threading.Event()
+            tick_thread = None
+            if session_uuid and role_work_id and getattr(
+                    session, "controller", None) in _ACTIVITY_CLASSIFIERS:
+                def _fire_tick(_session=session, _work_id=role_work_id,
+                              _started=turn_started_monotonic):
+                    if (_ACTIVITY_SHUTDOWN_EVENT.is_set()
+                            or tick_stop_event.is_set()):
+                        return
+                    _emit_activity_record(
+                        session_uuid, _work_id, _session, {"kind": "tick"},
+                        _started, trace=trace, role=role)
+                tick_thread = threading.Thread(
+                    target=_run_activity_tick_loop,
+                    args=(tick_stop_event, _fire_tick), daemon=True)
+                tick_thread.start()
+            try:
+                send_result = _send(
+                    session, delivery, meta=lead_meta)
+            finally:
+                tick_stop_event.set()
+                if tick_thread is not None:
+                    tick_thread.join(timeout=2.0)
             if trace:
                 trace.event("role.send.end", role=role,
                             ok=bool(send_result.get("ok", True)),
                             result=send_result.get("result"),
                             error_type=send_result.get("error_type"),
                             subtype=send_result.get("subtype"))
+            # M4 Package D: the activity-emission seam's real turn-boundary
+            # append (Package C's classify_<controller>_activity on this
+            # turn's real, flattened evidence, durably appended via Package
+            # B) and D's sole output-arbitration call site: the retained
+            # renderer fires ONLY here, strictly after C's per-turn
+            # foreground spinner has already closed.
+            turn_activity_record = _emit_activity_record(
+                session_uuid, role_work_id, session,
+                _turn_boundary_activity_evidence(
+                    getattr(session, "controller", None), send_result),
+                turn_started_monotonic, trace=trace, role=role)
+            if turn_activity_record is not None:
+                turn_schedule_record = _ensure_scheduled_review(
+                    session_uuid, role_work_id, turn_activity_record["time"],
+                    activity_class=turn_activity_record["activity_class"])
+                turn_watchdog_decision = _watchdog_decision_for_presentation(
+                    session_uuid, role_work_id, session, trace=trace,
+                    role=role)
+                _render_activity_snapshot(
+                    io_out, turn_activity_record, turn_watchdog_decision,
+                    turn_schedule_record, headless)
             fp_after = state_store.fingerprint_status(status_path)
             if trace:
                 trace.event("role.fingerprint.after", role=role,
@@ -7312,6 +7684,25 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 _record_provider_health(
                     session_uuid, role, controller_name, controller_outcome,
                     _capacity_now())
+                # M4 Package D: reconcile + decide immediately before the
+                # actual stall/retry/invalidation presentation below (the
+                # capacity-entry write, the headless auto-end/termination,
+                # or the interactive controller-failure gate) -- retains
+                # original plus reconciled classification durably, and
+                # combines durable evidence with a live process probe
+                # before any terminal-leaning watchdog verdict.
+                _classify_for_reconcile = _ACTIVITY_CLASSIFIERS.get(
+                    controller_name)
+                if _classify_for_reconcile is not None:
+                    _reconcile_before_presentation(
+                        session_uuid, role_work_id,
+                        _classify_for_reconcile(
+                            _turn_boundary_activity_evidence(
+                                controller_name, send_result)),
+                        trace=trace)
+                _watchdog_decision_for_presentation(
+                    session_uuid, role_work_id, session, trace=trace,
+                    role=role)
                 if controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES:
                     # quota_limited/overloaded: a genuine provider-capacity
                     # signal must never auto-retry the SAME provider (the
@@ -7355,6 +7746,53 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     # No human to choose retry/switch/end: a controller failure
                     # is an environment problem, so end the phase cleanly rather
                     # than show an interactive gate (F2: never block headless).
+                    #
+                    # M4 Package D: a headless run has no fallback at all (in
+                    # scope or otherwise) -- so a TYPED provider refusal or a
+                    # first-token-deadline expiry (never mere elapsed time or
+                    # an event tail: `no_first_token` is real, positive
+                    # evidence the deadline mechanism itself observed and
+                    # reaped) terminates the WHOLE PROCESS nonzero, naming
+                    # the provider reason, rather than quietly ending only
+                    # this phase at exit code 0. Every other headless send
+                    # failure keeps the pre-existing clean-end-at-0 behavior
+                    # below, unchanged.
+                    _turn_outcome = send_result.get("controller_turn_outcome")
+                    _no_fallback_terminal = (
+                        send_result.get("result") == "no_first_token"
+                        or (isinstance(_turn_outcome, dict)
+                            and _turn_outcome.get("outcome") == "refused"))
+                    if _no_fallback_terminal:
+                        _termination_reason = (
+                            (_turn_outcome or {}).get("failure_class")
+                            or send_result.get("result") or "no_first_token")
+                        io_out.write(
+                            "cowork: headless run terminating -- %s (%s), "
+                            "no fallback available.\n"
+                            % (controller_name or "controller",
+                               _termination_reason))
+                        io_out.flush()
+                        if trace:
+                            trace.event(
+                                "headless.auto", role=role,
+                                gate="controller_failure",
+                                action="terminate_process",
+                                reason=_termination_reason)
+                        _advance_phase(
+                            session_uuid, role_work_id, "execution_failed",
+                            evidence={
+                                "reason": "send_failed", "headless": True,
+                                "headless_termination": True,
+                                "termination_reason": _termination_reason},
+                            source="headless.auto")
+                        if first_send and on_first_send_rejected:
+                            on_first_send_rejected()
+                        outcome_kind = _OUTCOME_HEADLESS_TERMINATED
+                        payload = {
+                            "exit_code": HEADLESS_REFUSAL_EXIT_CODE,
+                            "role": role, "controller": controller_name,
+                            "reason": _termination_reason}
+                        break
                     if trace:
                         trace.event("headless.auto", role=role,
                                     gate="controller_failure", action="end")
@@ -13273,10 +13711,27 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # of (session_uuid, role, epoch), so it recomputes the SAME identity
     # `run_scout`/`run_planner`/`run_builder` mint internally, rather than
     # threading a second, competing identity back out of them.
+    # M4D-MAJ-03: reset the shared, process-global shutdown event at THIS
+    # run's own boundary -- before the real SIGTERM handler below is
+    # installed, and before any activity tick this run creates can ever
+    # observe it. Without this, a SIGTERM (real, or -- as `test_cowork.
+    # py`'s own frozen `os.kill(os.getpid(), signal.SIGTERM)` regressions
+    # exercise -- simulated within an earlier `run_flow` call in the SAME
+    # process) leaves `_ACTIVITY_SHUTDOWN_EVENT` set, silently suppressing
+    # every tick/turn-boundary append for every LATER, otherwise-healthy
+    # run_flow invocation in that process: a genuinely per-run signal
+    # leaking process-wide scope. Cleared, never set, here -- only a real
+    # SIGTERM inside THIS run's own `_handle_external_kill` may set it.
+    _ACTIVITY_SHUTDOWN_EVENT.clear()
+
     active_work_box = {"session_uuid": session_uuid, "work_id": None}
     _prior_sigterm_handler = None
 
     def _handle_external_kill(signum, frame):
+        # M4 Package D: set FIRST, before the durable `aborted` write below
+        # -- see `_ACTIVITY_SHUTDOWN_EVENT`'s own module-level docstring for
+        # why this ordering is what closes the post-SIGTERM append race.
+        _ACTIVITY_SHUTDOWN_EVENT.set()
         _advance_phase(
             active_work_box["session_uuid"], active_work_box["work_id"],
             "aborted", evidence={"reason": "sigterm"}, source="signal",
@@ -13381,6 +13836,13 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         scout_seed = prepare_fresh_seed_after_switch("scout")
                         continue
                     break
+                if rc == 0 and outcome_box["outcome"] == _OUTCOME_HEADLESS_TERMINATED:
+                    # M4 Package D: headless refusal/no-first-token, no
+                    # fallback -- terminate the WHOLE process nonzero rather
+                    # than falling through to the ordinary rc==0 end.
+                    rc = (outcome_box["payload"] or {}).get(
+                        "exit_code", HEADLESS_REFUSAL_EXIT_CODE)
+                    break
                 if (rc == 0 and outcome_box["outcome"] == "switch_controller"):
                     payload = outcome_box["payload"] or {}
                     if payload.get("pending"):
@@ -13478,6 +13940,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         planner_attempt_box["attempt"] += 1
                         planner_seed = prepare_fresh_seed_after_switch("planner")
                         continue
+                    break
+                if rc == 0 and planner_box["outcome"] == _OUTCOME_HEADLESS_TERMINATED:
+                    rc = (planner_box["payload"] or {}).get(
+                        "exit_code", HEADLESS_REFUSAL_EXIT_CODE)
                     break
                 if (rc == 0 and planner_box["outcome"] == "switch_controller"):
                     payload = planner_box["payload"] or {}
@@ -13606,6 +14072,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     builder_attempt_box["attempt"] += 1
                     builder_seed = prepare_fresh_seed_after_switch("builder")
                     continue
+                break
+            if rc == 0 and builder_box["outcome"] == _OUTCOME_HEADLESS_TERMINATED:
+                rc = (builder_box["payload"] or {}).get(
+                    "exit_code", HEADLESS_REFUSAL_EXIT_CODE)
                 break
             if (rc == 0 and builder_box["outcome"] == "switch_controller"):
                 payload = builder_box["payload"] or {}

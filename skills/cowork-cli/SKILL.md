@@ -315,27 +315,103 @@ the dead turn and redispatches the role onto its resumed session with
 history intact. Two stalls of the same model in one phase is a signal to
 step down the model/provider ladder rather than retry a third time.
 
-Alongside the active loop, keep two mechanical watchers, because an event
-tail alone cannot see the two worst failure modes — **silence** (a
-45-minute healthy builder turn and a dead run look identical) and **process
-death** (a killed run emits no event at all).
+### Durable, dual-evidence activity — the real check, not the event tail
 
-1. **Event tail** on `trace.jsonl`. Filter for the full lifecycle set — the
-   easy mistake is matching only happy-path events. Include at least:
-   `phase.`, `gate.`, `role.start|end|milestone`, `controller.turn.start|end`,
-   `controller.error|exit`, `review.verdict|run`, `status.invalidated`,
-   `stale_noop` (lead turn changed nothing on disk), `headless.auto`,
-   `run.end` (note: the terminal event is `run.end`, not `session.end`),
-   `run.resume`, `handoff`, `fallback`, `rate_limit`.
+cowork durably records a truthful activity classification for the live lead
+role at every turn boundary and at bounded in-turn ticks, under
+`~/.cowork/sessions/<uuid>/activity/`: an append-only `history/<work_id
+>.jsonl` of `ActivityRecord`/`ActivityReconciliationRecord` entries, and a
+single current `scheduled_review/<work_id>.json` naming
+`next_inspection_at`. cowork's own internal watchdog decision (`no_action` /
+`soft_warning` / `hard_stall_eligible`) is never made from either the
+durable record or elapsed time alone — it always combines that durable
+evidence with a genuine live-process/controller-health probe (real for
+Claude, Codex, *and* OpenCode alike; a quiet-but-alive turn is never
+reported as hung merely because it is quiet). **M4R-G01 and the inherited
+minor dispositions this section documents:**
+
+- **Event tail is supplemental, not primary truth (M4R-G01).** `trace.jsonl`
+  is useful for *narrative* (what the role tried, in order) and remains
+  worth tailing for that reason (see the filter list below), but it is
+  never the authority on whether a turn is stalled — a killed run, or a
+  turn silently parked waiting on a provider, can each leave `trace.jsonl`
+  looking identical for a long stretch. The durable activity/watchdog
+  records above are the authority; treat the event tail as color, not proof.
+- **`next_inspection_at` is durable authority.** Whether a scheduled review
+  is due is read from the current `scheduled_review/<work_id>.json` record
+  verbatim — never recomputed as "elapsed time since the last event I saw".
+  If that file is missing, whether a review is due is genuinely unknown,
+  not "no" and not "yes".
+- **Classify calls are positional-compatible.** The per-controller
+  `classify_<controller>_activity(evidence)` functions cowork's watchdog
+  calls take one positional evidence argument each; nothing about this
+  wiring depends on keyword-only call conventions.
+- **Artifact digests originate at the measurement owner.** Any file-content
+  digest surfacing in an activity/measurement record is computed by
+  `cowork_measure.py` (or a caller that already computed one for its own
+  purpose); the activity/watchdog layer itself never opens or hashes a file
+  — it only carries a digest mapping through if one was already supplied.
+- **Unknown-provider and hung-child evidence is disclosed accurately, never
+  overclaimed.** A controller failure that does not match a recognized
+  provider error shape durably records as `unknown_provider_failure` —
+  never silently folded into a more specific class it was not actually
+  observed to be. A `hung_descendant` classification from the controller
+  adapter's own reap evidence is only escalated to a hard-stall verdict
+  once an *independent* `ps` check corroborates it (a genuine orphan/zombie
+  process); absent that independent confirmation it stays a soft warning,
+  not a certified stall.
+- **Stale candidate-local path guards are disclosed accurately.** A
+  durable activity/schedule read that hits a torn or unreadable local file
+  is treated as "unknown for this read", never silently coerced into
+  either "the schedule is now due" or "nothing is wrong" — a stale or
+  corrupt local artifact is a guard condition to surface, not to paper
+  over.
+
+### Mapping each failure mode to an evidence-based check
+
+An event tail alone cannot see the three worst failure modes reliably —
+**process death without a terminal event**, **silent parking** (a healthy
+45-minute builder turn and a dead run can look identical in the trace
+alone), and **orphaned children**. Check each against real evidence, not
+absence-of-event:
+
+1. **Crash without a terminal event.** Don't infer a crash from "the trace
+   just stops" — read the durable activity history
+   (`activity/history/<work_id>.jsonl`) for the work_id's latest entry. A
+   `process_crash` classification there, combined with no live controller
+   child (`ps` shows the pid gone), is the real evidence; a trace that
+   merely stopped emitting with a live child still running is not a crash.
+2. **Silent park.** Combine the durable classification with a live-process
+   check: `provider_wait`/`productive_model_work` plus a genuinely alive
+   controller child (`ps -p <pid>`) is a healthy quiet turn, not a stall —
+   never kill it on elapsed time alone. Only a *dead* probe combined with a
+   terminal durable classification (`process_crash` /
+   `hung_descendant` / `no_evidence_silence`) plus an overdue
+   `next_inspection_at` is real stall evidence.
+3. **Orphaned children.** Check `ps` for the controller child's pid: a
+   parent of `1` (reparented) or a zombie/stopped state independently
+   confirms an orphan — cross-reference this against the durable
+   `hung_descendant` classification rather than trusting either signal
+   alone. An externally killed cowork can leave its `opencode`/`claude`/
+   `codex` child alive and detached indefinitely — invisible to the trace
+   and to every artifact until you actually run `ps`.
+
+Alongside the active loop, keep two mechanical watchers:
+
+1. **Event tail** on `trace.jsonl`, for narrative context (see above — never
+   the primary evidence for a stall/crash decision). Filter for the full
+   lifecycle set — the easy mistake is matching only happy-path events.
+   Include at least: `phase.`, `gate.`, `role.start|end|milestone`,
+   `controller.turn.start|end`, `controller.error|exit`,
+   `review.verdict|run`, `status.invalidated`, `stale_noop` (lead turn
+   changed nothing on disk), `headless.auto`, `activity.recorded`,
+   `activity.reconciled`, `watchdog.decision`, `run.end` (note: the
+   terminal event is `run.end`, not `session.end`), `run.resume`,
+   `handoff`, `fallback`, `rate_limit`.
 2. **Watchdog loop** (every ~10 min): if the cowork process is gone, report
    whether the trace ends with `run.end` (clean finish) or not (external
-   kill); if the trace has been silent >25 min while the process lives, flag
-   a long turn or hang.
-
-Also check `ps` occasionally for **orphaned controller children**: an
-externally killed cowork can leave its `opencode`/`claude`/`codex` child
-alive and detached (ppid 1) indefinitely — invisible to the trace and to
-every artifact.
+   kill); then check the durable activity record and `ps` per the mapping
+   above before concluding a hang — never off the trace alone.
 
 ## Status values a lead role writes
 
@@ -367,6 +443,7 @@ blocked may have delivered a complete artifact to a fallback location such as
 | 0 | ran to completion, or cancelled cleanly / nothing to do |
 | 1 | preflight failed (missing dep or controller CLI) — the message lists what |
 | 2 | usage error: bad `--team`/`--config`, `--headless` without context, `--worktree` outside a git tree, controller-policy violation or unreadable policy, worktree creation failure |
+| 17 | `--headless` only: a lead role's send was a typed provider refusal or hit the first-token deadline (real evidence, not silence), with no fallback available — the run terminates naming the provider/reason instead of ending the phase at exit 0 |
 | 130 | interrupted (Ctrl-C) or stdin closed at a prompt — **usually means an agent ran an interactive path** |
 
 Exit 130 from a non-interactive invocation is the signature of a missing

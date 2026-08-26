@@ -176,6 +176,20 @@ LINEAGE = (
     ("incomplete", "incomplete"),
     ("built_at", "built_at"),
     ("schema_version", "schema_version"),
+    # M4 Package D: durable activity/watchdog facts -- see `_section_activity`.
+    ("activity.work_id", "activity.work_id"),
+    ("activity.class", "activity.activity_class"),
+    ("activity.original_classification", "activity.original_classification"),
+    ("activity.reconciled", "activity.reconciled"),
+    ("activity.source", "activity.source"),
+    ("activity.age_seconds", "activity.age_seconds"),
+    ("activity.artifact_delta", "activity.artifact_delta"),
+    ("activity.provider_health", "activity.provider_health"),
+    ("activity.watchdog_verdict", "activity.watchdog_verdict"),
+    ("activity.durable_evidence_ref", "activity.durable_evidence_ref"),
+    ("activity.process_probe_ref", "activity.process_probe_ref"),
+    ("activity.next_inspection_at", "activity.next_inspection_at"),
+    ("activity.interval_seconds", "activity.interval_seconds"),
 )
 
 
@@ -240,6 +254,7 @@ def render_report(record):
     lines.extend(_section_evaluation_queue(record))
     lines.extend(_section_completion(record))
     lines.extend(_section_incomplete(record))
+    lines.extend(_section_activity(record))
     return "\n".join(lines) + "\n"
 
 
@@ -1198,5 +1213,54 @@ def _section_scores_legacy(record):
             lines.append("    %-12s %-7s x%s"
                          % (verdict, _fmt(bucket.get("average")),
                             _fmt(bucket.get("count"))))
+    lines.append("")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# M4 Package D: durable activity/watchdog facts (`record.activity`).          #
+#                                                                              #
+# `cowork_measure.build_record` (Package D's own additive grant there) always #
+# sets `record["activity"]` -- either real, durably-sourced compact facts, or #
+# a fixed all-UNKNOWN shape when no durable ActivityRecord exists for this    #
+# session -- so this section, and every figure it prints, ALWAYS resolves     #
+# (never a missing-key report line): the fixed-shape guarantee on the BUILD   #
+# side is exactly what keeps this PURE lookup section total. Every value is   #
+# read verbatim via `_at`, same as every other section in this module; this   #
+# function computes nothing and reclassifies nothing.                        #
+# --------------------------------------------------------------------------- #
+
+def _section_activity(record):
+    """The durable activity/watchdog facts for this session's most recently
+    classified work engagement (`record.activity`) -- the SAME compact-fact
+    vocabulary the interactive/headless renderers show (`cowork_ui.
+    render_compact_activity`/`render_headless_activity`), built here purely
+    from durable evidence: no live process probe exists once a session has
+    ended, so a populated `watchdog_verdict` here is always `no_action` with
+    null evidence refs -- never a fabricated post-hoc stall/progress claim.
+    """
+    lines = ["Activity (durable, cross-surface)", "-" * 56]
+    activity = _at(record, "activity", {})
+    if not isinstance(activity, dict) or not activity:
+        lines.extend(["  (no durable activity recorded for this session)", ""])
+        return lines
+    lines.append("  work_id            %s" % _fmt(_at(record, "activity.work_id")))
+    lines.append("  activity_class     %s" % _fmt(_at(record, "activity.activity_class")))
+    lines.append("  original_class     %s" % _fmt(
+        _at(record, "activity.original_classification")))
+    lines.append("  reconciled         %s" % _fmt(_at(record, "activity.reconciled")))
+    lines.append("  source             %s" % _fmt(_at(record, "activity.source")))
+    lines.append("  age_seconds        %s" % _fmt(_at(record, "activity.age_seconds")))
+    lines.append("  artifact_delta     %s" % _fmt(_at(record, "activity.artifact_delta")))
+    lines.append("  provider_health    %s" % _fmt(_at(record, "activity.provider_health")))
+    lines.append("  watchdog_verdict   %s" % _fmt(_at(record, "activity.watchdog_verdict")))
+    lines.append("  durable_evidence   %s" % _fmt(
+        _at(record, "activity.durable_evidence_ref")))
+    lines.append("  process_probe      %s" % _fmt(
+        _at(record, "activity.process_probe_ref")))
+    lines.append("  next_inspection_at %s" % _fmt(
+        _at(record, "activity.next_inspection_at")))
+    lines.append("  interval_seconds   %s" % _fmt(
+        _at(record, "activity.interval_seconds")))
     lines.append("")
     return lines
