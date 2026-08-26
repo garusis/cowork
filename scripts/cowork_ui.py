@@ -1507,3 +1507,201 @@ def multiselect(prompt, choices, selected=(), ask_fn=None):
                                         checked=key in checked)
                      for key, label in choices]).ask()
     return ask_fn()
+
+
+# --------------------------------------------------------------------------- #
+# Cross-surface activity rendering (M4 Package E).                            #
+#                                                                              #
+# Both renderers below consume ONLY an already-produced Package A            #
+# `cowork_activity.project_compact_state()` dict — the sole source of fact    #
+# for either surface. Neither reads persistence, inspects a process or        #
+# controller, computes an age from a wall clock, or independently             #
+# reclassifies/recomputes any fact: every value printed here is read          #
+# verbatim off `compact_state` by the shared `_activity_facts()` extraction   #
+# point, so the SAME `compact_state` fixture is structurally guaranteed to    #
+# produce identical activity class/age/next-inspection/evidence facts on      #
+# both surfaces — presentation and cadence may differ, the facts cannot.      #
+#                                                                              #
+# `render_compact_activity` is the real TTY-aware turn-boundary/gate-time     #
+# interactive snapshot: it follows this module's existing `banner`-style      #
+# `enabled` convention (Rich-panel on a TTY, plain text otherwise, explicitly #
+# overridable either way). `render_headless_activity` is the separately      #
+# named, truthful unattended/headless surface: it never calls `is_tty()` /    #
+# `is_real_terminal()` and never imports Rich, so its output is byte-for-byte #
+# identical whether `io_out` is a PTY-like stream or a plain `StringIO` —     #
+# `--headless` is a policy selection Package D performs, never a TTY          #
+# inference made here. Neither surface claims continuous updates; Package     #
+# C's per-turn spinner remains the only continuously updating in-turn         #
+# surface.                                                                    #
+# --------------------------------------------------------------------------- #
+
+_ACTIVITY_CLASS_LABELS = {
+    "productive_model_work": "productive model work",
+    "local_tool_work": "local tool work",
+    "owned_verification": "owned verification",
+    "provider_wait": "waiting on provider",
+    "policy_denial": "policy denial",
+    "process_crash": "process crash",
+    "hung_descendant": "hung descendant",
+    "no_evidence_silence": "no evidence (silence)",
+}
+
+_WATCHDOG_VERDICT_LABELS = {
+    "no_action": "no action",
+    "soft_warning": "soft warning",
+    "hard_stall_eligible": "hard-stall eligible",
+}
+
+# Rich border-style name per watchdog verdict, read only by
+# `render_compact_activity`'s TTY branch; `render_headless_activity` never
+# imports Rich and never reads this mapping.
+_ACTIVITY_VERDICT_RICH_STYLE = {
+    "no_action": "green",
+    "soft_warning": "yellow",
+    "hard_stall_eligible": "red",
+}
+
+# Returned by `_activity_fact` for a key genuinely absent from a
+# `compact_state` dict (never true of `project_compact_state`'s own output,
+# which always sets all fourteen of its keys, but reachable if a caller hands
+# a partial/malformed dict) — an honest, literal "no such fact" marker, never
+# a guessed or defaulted value that could pass for a real one.
+_ACTIVITY_UNREPORTED = "(not reported)"
+
+# The exact, closed set of facts either surface may print, read one at a time
+# by `_activity_facts()`. Any OTHER key a caller's `compact_state` dict
+# happens to carry — an unknown/future field, or a test's deliberately
+# injected fabricated field — is never read by either renderer, so it can
+# never surface as invented user-facing status.
+_ACTIVITY_FACT_KEYS = (
+    "activity_class", "original_classification", "reconciled", "source",
+    "age_seconds", "artifact_delta", "provider_health", "watchdog_verdict",
+    "durable_evidence_ref", "process_probe_ref", "next_inspection_at",
+    "interval_seconds",
+)
+
+
+def _activity_fact(compact_state, key):
+    """Read `key` verbatim off `compact_state`; a key genuinely absent from
+    the dict renders as the literal `_ACTIVITY_UNREPORTED` marker rather than
+    raising or defaulting to a value that could be mistaken for a fact."""
+    if key not in compact_state:
+        return _ACTIVITY_UNREPORTED
+    return compact_state[key]
+
+
+def _activity_facts(compact_state):
+    """The pure, ordered fact set both renderers print — extracted from
+    `compact_state` one field at a time, from the exact `_ACTIVITY_FACT_KEYS`
+    allowlist above and nothing else. This is the SOLE extraction point both
+    `render_compact_activity` and `render_headless_activity` call, which is
+    what structurally guarantees the two surfaces agree on every fact for the
+    same fixture."""
+    return {key: _activity_fact(compact_state, key) for key in _ACTIVITY_FACT_KEYS}
+
+
+def _activity_class_label(value):
+    if not isinstance(value, str):
+        return _ACTIVITY_UNREPORTED
+    return _ACTIVITY_CLASS_LABELS.get(value, value)
+
+
+def _watchdog_verdict_label(value):
+    if not isinstance(value, str):
+        return _ACTIVITY_UNREPORTED
+    return _WATCHDOG_VERDICT_LABELS.get(value, value)
+
+
+def _activity_display(value, none_text):
+    """`value` verbatim unless it is the unreported marker (passed through
+    unchanged) or `None` (rendered as the caller-supplied truthful `none_text`,
+    e.g. 'none' or 'not scheduled' — never a fabricated claim)."""
+    if value is _ACTIVITY_UNREPORTED:
+        return _ACTIVITY_UNREPORTED
+    if value is None:
+        return none_text
+    return value
+
+
+def _activity_text_lines(facts):
+    """The exact plain-text fact lines both surfaces render: verbatim in
+    `render_headless_activity`, and reused undecorated inside
+    `render_compact_activity`'s Rich panel body / non-TTY plain branch. Every
+    line states only a fact already present in `facts`; a `None` or absent
+    value renders truthfully ('none', 'not scheduled', `_ACTIVITY_UNREPORTED`),
+    never an invented claim."""
+    class_text = _activity_class_label(facts["activity_class"])
+    if facts["reconciled"] is True:
+        original_text = _activity_class_label(facts["original_classification"])
+        activity_line = "activity: %s (reconciled from %s)" % (class_text, original_text)
+    else:
+        activity_line = "activity: %s" % class_text
+
+    age = facts["age_seconds"]
+    if isinstance(age, (int, float)) and not isinstance(age, bool):
+        age_line = "age: %ss" % age
+    else:
+        age_line = "age: %s" % _activity_display(age, "not reported")
+
+    source_line = "source: %s" % _activity_display(facts["source"], "not reported")
+    provider_line = "provider health: %s" % _activity_display(
+        facts["provider_health"], "not reported")
+
+    verdict_text = _watchdog_verdict_label(facts["watchdog_verdict"])
+    watchdog_line = "watchdog: %s" % verdict_text
+    evidence_line = "  evidence: durable=%s process=%s" % (
+        _activity_display(facts["durable_evidence_ref"], "none"),
+        _activity_display(facts["process_probe_ref"], "none"))
+
+    next_line = "next inspection: %s (every %ss)" % (
+        _activity_display(facts["next_inspection_at"], "not scheduled"),
+        _activity_display(facts["interval_seconds"], "?"))
+
+    delta = facts["artifact_delta"]
+    if delta is _ACTIVITY_UNREPORTED:
+        delta_text = _ACTIVITY_UNREPORTED
+    elif not delta:
+        delta_text = "none"
+    else:
+        delta_text = ", ".join(delta)
+    artifact_line = "artifact changes: %s" % delta_text
+
+    return [activity_line, source_line, age_line, provider_line,
+            watchdog_line, evidence_line, next_line, artifact_line]
+
+
+def render_compact_activity(io_out, compact_state, enabled=None):
+    """The real TTY-aware turn-boundary/gate-time interactive activity
+    snapshot: a colored, bordered Rich panel on a TTY, plain text otherwise —
+    exactly `banner`'s existing `enabled` convention (`is_tty(io_out)` when
+    `enabled` is None, an explicit True/False override otherwise). Every fact
+    is read off `compact_state` through `_activity_facts()`/
+    `_activity_text_lines()`, never recomputed independently. Makes no claim
+    of continuous updates — this is a snapshot, not a spinner."""
+    enabled = is_tty(io_out) if enabled is None else enabled
+    facts = _activity_facts(compact_state)
+    lines = _activity_text_lines(facts)
+    if not enabled:
+        io_out.write("\n".join(lines) + "\n")
+        io_out.flush()
+        return
+    from rich.panel import Panel
+    verdict = facts["watchdog_verdict"]
+    style = _ACTIVITY_VERDICT_RICH_STYLE.get(verdict, "white")
+    _rich_console(io_out).print(
+        Panel("\n".join(lines), title="activity", border_style=style, expand=False))
+
+
+def render_headless_activity(io_out, compact_state):
+    """The truthful unattended/headless activity surface: plain text lines,
+    written the SAME way regardless of whether `io_out` is a PTY-like stream
+    or a `StringIO` — this function never calls `is_tty()`/`is_real_terminal()`
+    and never imports Rich, so it cannot branch on the stream's TTY-ness.
+    Facts come from the same `_activity_facts()`/`_activity_text_lines()`
+    pipeline `render_compact_activity` uses, so the two surfaces are
+    fact-identical for the same `compact_state`. Makes no claim of continuous
+    updates."""
+    facts = _activity_facts(compact_state)
+    lines = _activity_text_lines(facts)
+    io_out.write("\n".join(lines) + "\n")
+    io_out.flush()
