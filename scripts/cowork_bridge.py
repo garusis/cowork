@@ -1918,6 +1918,81 @@ class ClaudeSession:
                 identity=self._identity()))
             self.trace.event("controller.turn.end", **fields)
 
+        # Bounded first-token deadline (M4 Package C): a single background
+        # reader thread, lazily started on this session's FIRST turn and
+        # reused for the session's whole lifetime, continuously forwards
+        # `self.proc.stdout` lines into `self._line_queue` -- so a per-turn
+        # bounded `queue.get(timeout=...)` can detect a genuinely
+        # unresponsive child without requiring `self.proc.stdout` to be a
+        # real, select()-able OS pipe (a plain fake iterator works exactly
+        # as before). The thread is NEVER stopped/restarted per turn: it is
+        # the SAME persistent duplex process across every send() on this
+        # session (live_child_handle's pinned semantics: torn down only in
+        # close()), so a fresh thread per turn would race the old one over
+        # the same underlying stdout.
+        import queue as queue_module
+        line_queue = getattr(self, "_line_queue", None)
+        if line_queue is None:
+            line_queue = queue_module.Queue()
+            self._line_queue = line_queue
+
+            def _read_stdout():
+                try:
+                    for raw_line in self.proc.stdout:
+                        line_queue.put(raw_line)
+                except Exception:  # noqa: BLE001 - a dead pipe ends the reader, not the turn
+                    pass
+                line_queue.put(None)  # EOF sentinel
+
+            self._reader_thread = threading.Thread(
+                target=_read_stdout, name="claude-stdout-reader", daemon=True)
+            self._reader_thread.start()
+        else:
+            # PROVENANCE-based drain of abandoned turns (post-review fix
+            # for C-BLOCK-01): a one-shot get_nowait() snapshot can only
+            # discard residue that has ALREADY landed in the queue by the
+            # time this turn starts -- it cannot see residue that is still
+            # in flight (the overwhelmingly likely case, since the prior
+            # turn was by definition unresponsive for its whole deadline).
+            # `self._pending_abandoned_results` counts how many PRIOR
+            # turns' bounded first-token deadlines expired without tearing
+            # down this persistent process (Claude's live handle stays
+            # non-null across turns; only close() tears it down) and so
+            # still owe this session exactly one unconsumed terminal
+            # `result` event apiece. Every abandoned turn's own `result`
+            # event is its unambiguous provenance boundary -- Claude's
+            # stream-json protocol guarantees exactly one per turn, always
+            # last -- so this drain BLOCKS (bounded by the same first-token
+            # deadline, to never hang this turn indefinitely on a truly
+            # dead process) consuming and discarding every line until that
+            # many `result` events have been observed. Only output that
+            # arrives strictly AFTER every abandoned turn's own `result`
+            # can ever reach this turn's own read loop below.
+            pending = getattr(self, "_pending_abandoned_results", 0)
+            if pending > 0:
+                drain_deadline = time.monotonic() + getattr(
+                    self, "_first_token_deadline_seconds", 30.0)
+                while pending > 0:
+                    remaining = drain_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break  # still unresolved; retried on a later turn
+                    try:
+                        raw = line_queue.get(timeout=remaining)
+                    except queue_module.Empty:
+                        break
+                    if raw is None:
+                        break  # EOF: the persistent process itself died
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        obj = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") == "result":
+                        pending -= 1
+                self._pending_abandoned_results = pending
+
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
         tty = ui.is_tty(self.io_out)
@@ -1972,8 +2047,73 @@ class ClaudeSession:
                 _clear_status()  # text resumed: drop the tool-activity row
             region.feed(chunk)
 
-        for line in self.proc.stdout:
-            line = line.strip()
+        first_token_seen = False
+        first_token_deadline = time.monotonic() + getattr(
+            self, "_first_token_deadline_seconds", 30.0)
+        while True:
+            if first_token_seen:
+                raw_line = line_queue.get()
+            else:
+                remaining = first_token_deadline - time.monotonic()
+                if remaining <= 0:
+                    # Bounded first-token deadline expired: real, typed
+                    # evidence (never silence), and -- per Claude's pinned
+                    # live-handle semantics -- NOT a SIGTERM/SIGKILL/reap of
+                    # this session-lifetime process; only close() does that.
+                    # This turn now OWES the session exactly one unconsumed
+                    # `result` event -- recorded so the NEXT turn's
+                    # provenance-based drain (see above) knows to consume
+                    # and discard it before accepting any line as its own.
+                    self._pending_abandoned_results = getattr(
+                        self, "_pending_abandoned_results", 0) + 1
+                    if spinner:
+                        spinner.stop()
+                    _clear_status()
+                    if region is not None:
+                        region.__exit__(None, None, None)
+                        region = None
+                    _end(result="no_first_token", work_class="failed",
+                         error_type="no_first_token",
+                         duration_ms=_elapsed_ms())
+                    return turn_result(
+                        False, "no_first_token", error_type="no_first_token",
+                        session_id=self.session_id,
+                        controller_turn_outcome=controller_turn_outcome_no_first_token(),
+                        duration_ms=_elapsed_ms())
+                try:
+                    raw_line = line_queue.get(timeout=remaining)
+                except queue_module.Empty:
+                    continue
+            if raw_line is None:
+                break  # EOF: the persistent process itself has exited.
+            # Post-pre-send-turn provenance drain (post-review fix for
+            # C-BLOCK-03): the pre-send drain above is itself bounded and can
+            # expire while an abandoned turn's own `result` is still in
+            # flight -- landing here, in THIS turn's read window, instead.
+            # Any residual `self._pending_abandoned_results` must therefore
+            # keep being honored inside this very loop, not just before
+            # stdin was written: every line is consumed and discarded (never
+            # armed as this turn's first token, fed to `io_out`, or allowed
+            # to attribute session/result state) until as many `result`
+            # events have been crossed as are still owed, at which point
+            # ordinary processing resumes for this turn's genuine output.
+            # Bounded by the same `first_token_deadline` already governing
+            # this loop -- no additional waiting is introduced.
+            pending_abandoned = getattr(self, "_pending_abandoned_results", 0)
+            if pending_abandoned > 0:
+                stripped = raw_line.strip()
+                if stripped:
+                    try:
+                        drained_obj = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        drained_obj = None
+                    if drained_obj is not None and drained_obj.get(
+                            "type") == "result":
+                        self._pending_abandoned_results = (
+                            pending_abandoned - 1)
+                continue
+            first_token_seen = True
+            line = raw_line.strip()
             if not line:
                 continue
             try:
@@ -2367,56 +2507,115 @@ class CodexSession:
             stderr=subprocess.DEVNULL, text=True,
             env=self._controller_env,
         )
+        # live_child_handle's truthful per-turn handle (M4 Package C):
+        # non-null for exactly the duration of this one-shot child, cleared
+        # in the `finally` below on EVERY exit path -- a normal exit, a
+        # KeyboardInterrupt, or a first-token-deadline SIGTERM/SIGKILL/reap
+        # -- so it becomes null again after reap, never left dangling.
+        self._live_proc = proc
         events = []
         tty = ui.is_tty(self.io_out)
         wrote_label = {"done": False}
+        no_first_token = False
+        # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple):
+        # several pre-existing tests subclass CodexSession and override
+        # `_run` to return a plain events list, pinning that literal
+        # contract. The deadline outcome is instead threaded through this
+        # instance attribute -- reset every call, so an overridden `_run`
+        # that never touches it correctly reads back as "no timeout" below
+        # in send().
+        self._last_turn_no_first_token = False
+        # Bounded first-token deadline (M4 Package C): a background reader
+        # thread forwards `proc.stdout` lines into a queue so a bounded
+        # `queue.get(timeout=...)` can detect a genuinely unresponsive
+        # child without requiring `proc.stdout` to be a real, select()-able
+        # OS pipe (a plain fake iterator still works exactly as before).
+        import queue as queue_module
+        line_queue = queue_module.Queue()
+
+        def _read_stdout():
+            try:
+                for raw_line in proc.stdout:
+                    line_queue.put(raw_line)
+            except Exception:  # noqa: BLE001 - a dead pipe ends the reader, not the turn
+                pass
+            line_queue.put(None)  # EOF sentinel
+
+        reader_thread = threading.Thread(
+            target=_read_stdout, name="codex-stdout-reader", daemon=True)
+        reader_thread.start()
+        first_token_seen = False
+        first_token_deadline = time.monotonic() + getattr(
+            self, "_first_token_deadline_seconds", 30.0)
         try:
-            with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    events.append(obj)
-                    parsed = parse_codex_event(obj)
-
-                    def _emit(text, render=True):
-                        spin.stop()
-                        if not wrote_label["done"]:
-                            # A surfaced internal block (reviewer/advisor) gets a
-                            # faint lead-in gap above its label so it doesn't
-                            # crowd the agent text before it (no-op off a TTY).
-                            if self.internal:
-                                ui.internal_lead_in(self.io_out, tty)
-                            self.io_out.write(ui.label(self.speaker, tty))
-                            wrote_label["done"] = True
-                        if render:
-                            ui.render_markdown(self.io_out, text, enabled=tty,
-                                               internal=self.internal)
+            try:
+                with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
+                    while True:
+                        if first_token_seen:
+                            raw_line = line_queue.get()
                         else:
-                            self.io_out.write(text + "\n")
-                        self.io_out.flush()
+                            remaining = first_token_deadline - time.monotonic()
+                            if remaining <= 0:
+                                spin.stop()
+                                no_first_token = True
+                                break
+                            try:
+                                raw_line = line_queue.get(timeout=remaining)
+                            except queue_module.Empty:
+                                continue
+                        if raw_line is None:
+                            break  # EOF
+                        first_token_seen = True
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        events.append(obj)
+                        parsed = parse_codex_event(obj)
 
-                    if parsed["kind"] == "message" and parsed.get("text"):
-                        _emit(parsed["text"])
-                    elif parsed["kind"] == "denied":
-                        _emit(denial_message(), render=False)
-                    elif parsed["kind"] == "error":
-                        _emit("[error] " + (parsed.get("text") or ""), render=False)
-                    elif parsed["kind"] == "tool" and not wrote_label["done"]:
-                        # Reflect tool activity in the spinner while it's live
-                        # (it stops on the first emitted message and never
-                        # restarts — codex emits its message at turn end).
-                        spin.set_label("%s %s" % (self.speaker, parsed["label"]))
-                    elif parsed["kind"] == "tool_done" and not wrote_label["done"]:
-                        spin.set_label("%s working" % self.speaker)
-            proc.wait()
-        except KeyboardInterrupt:
-            _terminate(proc)
-            raise
+                        def _emit(text, render=True):
+                            spin.stop()
+                            if not wrote_label["done"]:
+                                # A surfaced internal block (reviewer/advisor) gets a
+                                # faint lead-in gap above its label so it doesn't
+                                # crowd the agent text before it (no-op off a TTY).
+                                if self.internal:
+                                    ui.internal_lead_in(self.io_out, tty)
+                                self.io_out.write(ui.label(self.speaker, tty))
+                                wrote_label["done"] = True
+                            if render:
+                                ui.render_markdown(self.io_out, text, enabled=tty,
+                                                   internal=self.internal)
+                            else:
+                                self.io_out.write(text + "\n")
+                            self.io_out.flush()
+
+                        if parsed["kind"] == "message" and parsed.get("text"):
+                            _emit(parsed["text"])
+                        elif parsed["kind"] == "denied":
+                            _emit(denial_message(), render=False)
+                        elif parsed["kind"] == "error":
+                            _emit("[error] " + (parsed.get("text") or ""), render=False)
+                        elif parsed["kind"] == "tool" and not wrote_label["done"]:
+                            # Reflect tool activity in the spinner while it's live
+                            # (it stops on the first emitted message and never
+                            # restarts — codex emits its message at turn end).
+                            spin.set_label("%s %s" % (self.speaker, parsed["label"]))
+                        elif parsed["kind"] == "tool_done" and not wrote_label["done"]:
+                            spin.set_label("%s working" % self.speaker)
+                if no_first_token:
+                    _terminate(proc)
+                else:
+                    proc.wait()
+            except KeyboardInterrupt:
+                _terminate(proc)
+                raise
+        finally:
+            self._live_proc = None
+            self._last_turn_no_first_token = no_first_token
         return events
 
     def send(self, text, meta=None):
@@ -2521,6 +2720,31 @@ class CodexSession:
             return turn_result(False, "error", error_type=type(exc).__name__,
                                duration_ms=failed_ms)
         duration_ms = int((time.monotonic() - turn_started) * 1000)
+        # `_run` communicates a first-token-deadline expiry through this
+        # instance attribute rather than its return value (see `_run`'s own
+        # comment): a pre-existing test that subclasses CodexSession and
+        # overrides `_run` to return a plain events list never sets it, so
+        # `getattr(..., False)` correctly reads back "no timeout" for that
+        # override, leaving its pinned literal contract untouched.
+        no_first_token = getattr(self, "_last_turn_no_first_token", False)
+        if no_first_token:
+            # Bounded first-token deadline expired (M4 Package C): typed,
+            # never conflated with an ordinary provider `error` -- "a
+            # first-token timeout is never silence."
+            if self.trace:
+                self.trace.event(
+                    "controller.turn.end", controller="codex",
+                    role=self.speaker, result="no_first_token",
+                    error_type="no_first_token", thread_id=self.thread_id,
+                    event_count=len(events),
+                    **trace_store.work_meta(
+                        work_id, "failed", usage_scope="unknown",
+                        identity=self._identity(), duration_ms=duration_ms))
+            return turn_result(
+                False, "no_first_token", error_type="no_first_token",
+                thread_id=self.thread_id,
+                controller_turn_outcome=controller_turn_outcome_no_first_token(),
+                duration_ms=duration_ms)
         tid = capture_thread_id(events)
         if tid and not self.thread_id:
             self.thread_id = tid
@@ -2707,52 +2931,108 @@ class OpencodeSession:
             stderr=subprocess.DEVNULL, text=True,
             env=self._controller_env,
         )
+        # live_child_handle's truthful per-turn handle (M4 Package C):
+        # non-null for exactly the duration of this one-shot child, cleared
+        # in the `finally` below on EVERY exit path -- a normal exit, a
+        # KeyboardInterrupt, or a first-token-deadline SIGTERM/SIGKILL/reap
+        # -- so it becomes null again after reap, never left dangling.
+        self._live_proc = proc
         events = []
         tty = ui.is_tty(self.io_out)
         wrote_label = {"done": False}
+        no_first_token = False
+        # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple),
+        # matching CodexSession._run's identical contract-preservation
+        # note: the deadline outcome is threaded through this instance
+        # attribute instead, reset every call.
+        self._last_turn_no_first_token = False
+        # Bounded first-token deadline (M4 Package C): a background reader
+        # thread forwards `proc.stdout` lines into a queue so a bounded
+        # `queue.get(timeout=...)` can detect a genuinely unresponsive
+        # child without requiring `proc.stdout` to be a real, select()-able
+        # OS pipe (a plain fake iterator still works exactly as before).
+        import queue as queue_module
+        line_queue = queue_module.Queue()
+
+        def _read_stdout():
+            try:
+                for raw_line in proc.stdout:
+                    line_queue.put(raw_line)
+            except Exception:  # noqa: BLE001 - a dead pipe ends the reader, not the turn
+                pass
+            line_queue.put(None)  # EOF sentinel
+
+        reader_thread = threading.Thread(
+            target=_read_stdout, name="opencode-stdout-reader", daemon=True)
+        reader_thread.start()
+        first_token_seen = False
+        first_token_deadline = time.monotonic() + getattr(
+            self, "_first_token_deadline_seconds", 30.0)
         try:
-            with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    events.append(obj)
-                    parsed = parse_opencode_event(obj)
-
-                    def _emit(text, render=True):
-                        spin.stop()
-                        if not wrote_label["done"]:
-                            if self.internal:
-                                ui.internal_lead_in(self.io_out, tty)
-                            self.io_out.write(ui.label(self.speaker, tty))
-                            wrote_label["done"] = True
-                        if render:
-                            ui.render_markdown(self.io_out, text, enabled=tty,
-                                               internal=self.internal)
+            try:
+                with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
+                    while True:
+                        if first_token_seen:
+                            raw_line = line_queue.get()
                         else:
-                            self.io_out.write(text + "\n")
-                        self.io_out.flush()
+                            remaining = first_token_deadline - time.monotonic()
+                            if remaining <= 0:
+                                spin.stop()
+                                no_first_token = True
+                                break
+                            try:
+                                raw_line = line_queue.get(timeout=remaining)
+                            except queue_module.Empty:
+                                continue
+                        if raw_line is None:
+                            break  # EOF
+                        first_token_seen = True
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        events.append(obj)
+                        parsed = parse_opencode_event(obj)
 
-                    if parsed["kind"] == "message" and parsed.get("text"):
-                        _emit(parsed["text"])
-                    elif parsed["kind"] == "denied":
-                        _emit(denial_message(), render=False)
-                    elif parsed["kind"] == "error":
-                        _emit("[error] " + (parsed.get("text") or ""),
-                              render=False)
-                    elif parsed["kind"] == "tool" and not wrote_label["done"]:
-                        spin.set_label("%s %s" % (self.speaker, parsed["label"]))
-                    elif (parsed["kind"] == "tool_done"
-                          and not wrote_label["done"]):
-                        spin.set_label("%s working" % self.speaker)
-            proc.wait()
-        except KeyboardInterrupt:
-            _terminate(proc)
-            raise
+                        def _emit(text, render=True):
+                            spin.stop()
+                            if not wrote_label["done"]:
+                                if self.internal:
+                                    ui.internal_lead_in(self.io_out, tty)
+                                self.io_out.write(ui.label(self.speaker, tty))
+                                wrote_label["done"] = True
+                            if render:
+                                ui.render_markdown(self.io_out, text, enabled=tty,
+                                                   internal=self.internal)
+                            else:
+                                self.io_out.write(text + "\n")
+                            self.io_out.flush()
+
+                        if parsed["kind"] == "message" and parsed.get("text"):
+                            _emit(parsed["text"])
+                        elif parsed["kind"] == "denied":
+                            _emit(denial_message(), render=False)
+                        elif parsed["kind"] == "error":
+                            _emit("[error] " + (parsed.get("text") or ""),
+                                  render=False)
+                        elif parsed["kind"] == "tool" and not wrote_label["done"]:
+                            spin.set_label("%s %s" % (self.speaker, parsed["label"]))
+                        elif (parsed["kind"] == "tool_done"
+                              and not wrote_label["done"]):
+                            spin.set_label("%s working" % self.speaker)
+                if no_first_token:
+                    _terminate(proc)
+                else:
+                    proc.wait()
+            except KeyboardInterrupt:
+                _terminate(proc)
+                raise
+        finally:
+            self._live_proc = None
+            self._last_turn_no_first_token = no_first_token
         return events
 
     def _write_global_agent(self):
@@ -2842,6 +3122,26 @@ class OpencodeSession:
                                session_id=self.session_id,
                                duration_ms=failed_ms)
 
+        def _no_first_token_end():
+            # A POST-START bounded first-token deadline expiry (M4 Package
+            # C): a JOINED controller.turn.end (the SAME shape _error_end
+            # uses), typed distinctly from an ordinary error -- "a
+            # first-token timeout is never silence."
+            timeout_ms = _elapsed_ms()
+            if self.trace:
+                self.trace.event(
+                    "controller.turn.end", controller="opencode",
+                    role=self.speaker, result="no_first_token",
+                    error_type="no_first_token", session_id=self.session_id,
+                    **trace_store.work_meta(
+                        work_id, "failed", usage_scope="unknown",
+                        identity=self._identity(), duration_ms=timeout_ms))
+            return turn_result(
+                False, "no_first_token", error_type="no_first_token",
+                session_id=self.session_id,
+                controller_turn_outcome=controller_turn_outcome_no_first_token(),
+                duration_ms=timeout_ms)
+
         def _prepare(resume_id, use_global):
             # Build the opencode command (redelivering the global agent first
             # when required). EVERY step that can fail — the global-agent write,
@@ -2921,6 +3221,11 @@ class OpencodeSession:
             raise
         except Exception as exc:  # noqa: BLE001
             return _error_end(type(exc).__name__)
+        # See CodexSession.send's identical comment: `_run` communicates a
+        # first-token-deadline expiry through this instance attribute, not
+        # its return value.
+        if getattr(self, "_last_turn_no_first_token", False):
+            return _no_first_token_end()
         parsed_events = [parse_opencode_event(obj) for obj in events]
         fallback = False
         if is_opencode_delivery_failure(parsed_events):
@@ -2959,6 +3264,8 @@ class OpencodeSession:
                     return _error_end(type(exc).__name__)
             finally:
                 _remove_agent_file_quiet(global_path)
+            if getattr(self, "_last_turn_no_first_token", False):
+                return _no_first_token_end()
             parsed_events = [parse_opencode_event(obj) for obj in events]
             retry_dead = (not events
                           or is_opencode_delivery_failure(parsed_events))
@@ -2992,6 +3299,28 @@ class OpencodeSession:
         if result == "ok" and not events:
             result = "error"
         usage = opencode_usage(events)
+        # Typed OpenCode refusal/error extraction, wired to a REAL
+        # production emission (M4 Package C post-review fix): the first
+        # raw `error`-kind event in this turn's real structured output, if
+        # any, is classified via `classify_opencode_refusal` and surfaced
+        # as its own `controller.error` trace event -- distinct from the
+        # generic `controller.turn.end` bookkeeping below, and typed over
+        # FAILURE_CLASS_SET rather than left as free-text. A `result` of
+        # "error" with no matching raw error-kind event (e.g. the
+        # zero-events `no_events` case) emits no `controller.error`, since
+        # `classify_opencode_refusal` requires a genuine `event` to type.
+        if result == "error" and self.trace:
+            raw_error_event = next(
+                (obj for obj in events
+                 if parse_opencode_event(obj).get("kind") == "error"), None)
+            if raw_error_event is not None:
+                refusal = classify_opencode_refusal(event=raw_error_event)
+                if refusal is not None:
+                    self.trace.event(
+                        "controller.error", controller="opencode",
+                        role=self.speaker, session_id=self.session_id,
+                        outcome=refusal["outcome"],
+                        failure_class=refusal["failure_class"])
         # A failed turn is terminal-classed `failed`; ok/denied keep the start's
         # purpose class. opencode reports usage per turn, so the scope is native.
         end_class = work_class if result != "error" else "failed"
@@ -3547,3 +3876,381 @@ def capacity_packet_candidate(controller, provider, raw_evidence, issued_at):
         "issued_at": issued_at,
         "trust": capacity_contracts.classify_trust_source(evidence_source),
     }
+
+
+# ===========================================================================
+# M4 Package C -- real-evidence activity classification, typed OpenCode
+# refusal/error extraction, and live_child_handle
+# ===========================================================================
+#
+# Everything below is additive: new, pure, stateless functions layered on
+# top of the SAME real controller-event evidence `parse_claude_event`/
+# `parse_codex_event`/`parse_opencode_event` already produce, plus two
+# synthetic evidence kinds the bounded first-token deadline mechanism in
+# ClaudeSession._send_turn/CodexSession._run/OpencodeSession._run
+# introduces: "no_first_token" (the deadline expired; the child was
+# SIGTERM'd, then SIGKILL'd if still alive, then reaped) and
+# "transport_error" (the SAME local, controller-agnostic shape
+# `classify_<controller>_failure` above already recognizes). No function
+# here does file/network I/O, imports cowork_state, or persists anything --
+# classification is a pure, stateless mapping from one real evidence sample
+# to Package A's closed eight-value ActivityClass taxonomy
+# (`cowork_activity.ACTIVITY_CLASSES`); WHEN to append a classified record,
+# and productive-time measurement itself, belong to Package D, never here.
+#
+# Unknown provider TEXT (an unrecognized error token/status) is a raw-
+# failure concern handled entirely by `classify_<controller>_failure` above
+# (-> `unknown_provider_failure`, in the SEPARATE ControllerOutcome
+# taxonomy); it never reaches these ActivityClass functions at all. Missing
+# evidence -- a non-dict, or a dict with no nonempty `kind` -- is the
+# genuine absence of any evidence and is the ONLY path to
+# `no_evidence_silence`. A first-token timeout is real, positive evidence
+# (the deadline mechanism observed and reaped a genuinely unresponsive
+# child) and is therefore never classified as silence -- it carries its
+# own distinct synthetic "no_first_token" kind, mapped to `hung_descendant`.
+
+# The bucket for real-but-not-yet-substantive evidence: a meta/bookkeeping
+# event (session/thread/turn lifecycle, a tool-result echo, a step-finish
+# marker) or text-carrying evidence whose text is still blank. Distinct
+# from `no_evidence_silence` (see above) -- SOME evidence was observed, the
+# controller is alive and communicating, it just has not yet produced
+# model output or local tool activity. Distinct from `productive_model_
+# work` for the same reason `cowork_activity`'s own docstring gives (issue
+# #41 criterion 4): time spent waiting on the provider round trip is never
+# attributable as productive role work.
+_LIVE_EVIDENCE_ACTIVITY_CLASS = "provider_wait"
+
+# Kinds that carry real output text (`parse_claude_event`'s "assistant"/
+# "partial"/"result", `parse_codex_event`'s and `parse_opencode_event`'s
+# "message") -- checked for a genuinely nonblank `text` field before
+# falling through to the per-controller kind map, so an event of the
+# right SHAPE but with no actual content yet degrades to
+# `_LIVE_EVIDENCE_ACTIVITY_CLASS` rather than a fabricated
+# `productive_model_work`. "result" is claude's OWN turn-terminal
+# bookkeeping event (`parse_claude_event`'s `{"kind": "result", ...,
+# "text": obj.get("result", "")}`) -- included here so a successful turn
+# that produced no accompanying model text (`text` blank) is never
+# certified productive purely because a `result` event exists.
+_TEXT_CARRYING_ACTIVITY_KINDS = frozenset({
+    "assistant", "partial", "message", "result"})
+
+_CLAUDE_ACTIVITY_KIND_MAP = {
+    "assistant": "productive_model_work",
+    "partial": "productive_model_work",
+    "result": "productive_model_work",
+    "tool": "local_tool_work",
+    "denied": "policy_denial",
+    "error": "process_crash",
+    "transport_error": "process_crash",
+    "no_first_token": "hung_descendant",
+}
+
+_CODEX_ACTIVITY_KIND_MAP = {
+    "message": "productive_model_work",
+    "tool": "local_tool_work",
+    "tool_done": "local_tool_work",
+    "denied": "policy_denial",
+    "error": "process_crash",
+    "transport_error": "process_crash",
+    "no_first_token": "hung_descendant",
+}
+
+_OPENCODE_ACTIVITY_KIND_MAP = {
+    "message": "productive_model_work",
+    "tool": "local_tool_work",
+    "tool_done": "local_tool_work",
+    "denied": "policy_denial",
+    "error": "process_crash",
+    "transport_error": "process_crash",
+    "no_first_token": "hung_descendant",
+}
+
+
+def _classify_controller_activity(evidence, kind_map):
+    """Shared, closed decision table behind every `classify_<controller>_
+    activity` function below. `evidence` must be a dict carrying a
+    nonempty string `kind` -- the SAME vocabulary `parse_<controller>_
+    event` already produces, plus the "no_first_token"/"transport_error"
+    synthetic kinds the deadline/reap mechanism introduces. Anything else
+    (a non-dict, or a dict with a missing/empty/non-string `kind`) is the
+    genuine absence of any evidence at all and classifies
+    `no_evidence_silence` -- never a raised exception.
+
+    A turn-level failure -- `evidence["is_error"] is True`, exactly the
+    flag `parse_claude_event`'s "result" kind carries verbatim off the
+    CLI's own `result.subtype` (e.g. "error_max_turns",
+    "error_during_execution") -- is ALWAYS `process_crash`, checked before
+    any kind-specific rule and regardless of which kind carries it: a
+    failed turn is never certified productive merely because a `result`
+    (or any other) event exists.
+
+    A text-carrying kind (`assistant`/`partial`/`message`/`result`) whose
+    `text` is missing, non-string, or blank has not yet produced any REAL
+    output -- exactly the ordinary pre-first-token wait, or a successful-
+    but-textless turn-terminal bookkeeping event -- and classifies
+    `provider_wait`, not `productive_model_work`. A first-token TIMEOUT is
+    never confused with this ordinary pre-content wait: it carries its own
+    distinct `no_first_token` kind, which `kind_map` maps to
+    `hung_descendant`, never reaching this text-blank branch at all.
+
+    Every other recognized kind not named in `kind_map` (a meta/
+    bookkeeping event such as `system`/`thread_started`/`turn_started`/
+    `user_replay`/`child_usage`/`other`/`step_finish`) is real, observed
+    evidence that the controller is alive and communicating -- never
+    silence -- and classifies `provider_wait`."""
+    if not isinstance(evidence, dict):
+        return "no_evidence_silence"
+    kind = evidence.get("kind")
+    if not isinstance(kind, str) or not kind:
+        return "no_evidence_silence"
+    if evidence.get("is_error") is True:
+        return "process_crash"
+    if kind in _TEXT_CARRYING_ACTIVITY_KINDS:
+        text = evidence.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return _LIVE_EVIDENCE_ACTIVITY_CLASS
+    return kind_map.get(kind, _LIVE_EVIDENCE_ACTIVITY_CLASS)
+
+
+def classify_claude_activity(evidence):
+    """Classify one real claude evidence sample -- a `parse_claude_event`
+    -shaped dict, or the synthetic `{"kind": "no_first_token"}`/
+    `{"kind": "transport_error"}` shapes the bounded first-token deadline
+    mechanism produces -- into Package A's closed ActivityClass taxonomy
+    (`cowork_activity.ACTIVITY_CLASSES`). See `_classify_controller_
+    activity` for the shared decision rule. Total: never raises."""
+    return _classify_controller_activity(evidence, _CLAUDE_ACTIVITY_KIND_MAP)
+
+
+def classify_codex_activity(evidence):
+    """Classify one real codex evidence sample -- a `parse_codex_event`
+    -shaped dict, or the synthetic no_first_token/transport_error shapes --
+    into Package A's closed ActivityClass taxonomy. See
+    `_classify_controller_activity`. Total: never raises."""
+    return _classify_controller_activity(evidence, _CODEX_ACTIVITY_KIND_MAP)
+
+
+def classify_opencode_activity(evidence):
+    """Classify one real opencode evidence sample -- a `parse_opencode_
+    event`-shaped dict, or the synthetic no_first_token/transport_error
+    shapes -- into Package A's closed ActivityClass taxonomy. See
+    `_classify_controller_activity`. Total: never raises."""
+    return _classify_controller_activity(evidence, _OPENCODE_ACTIVITY_KIND_MAP)
+
+
+# ---------------------------------------------------------------------------
+# Typed OpenCode refusal/error extraction
+# ---------------------------------------------------------------------------
+
+# A "balance" depletion signal is new to this extension (no M3
+# ControllerOutcome counterpart; see cowork_activity.py's FAILURE_CLASSES
+# correspondence note): a closed, narrow set of subscription-balance-shaped
+# machine tokens, checked BEFORE falling back to the shared
+# `_classify_error_token` table -- never a generic substring search over
+# arbitrary free text.
+_OPENCODE_BALANCE_TOKENS = frozenset({
+    "insufficient_balance", "balance_depleted", "credit_balance_exhausted",
+    "balance_exhausted",
+})
+
+# The M3-owned ControllerOutcome -> M4-owned FAILURE_CLASS correspondence
+# cowork_activity.py's own module docstring pins verbatim (see the
+# provenance note above `FAILURE_CLASSES`). Every outcome NOT named here
+# (policy_blocked, guard_unavailable, local_guard_exhausted, and any
+# further-unrecognized shape `_classify_error_token` itself already
+# degrades to unknown_provider_failure) shares the same closed
+# "unknown_provider_failure" bucket -- never a fabricated dedicated class.
+_OUTCOME_TO_FAILURE_CLASS = {
+    "quota_limited": "quota",
+    "overloaded": "overload",
+    "authentication_failed": "auth",
+    "transport_failed": "transport",
+    "unknown_provider_failure": "unknown_provider_failure",
+}
+
+
+def _opencode_balance_depletion_token(name, text):
+    """Closed, narrow balance-depletion recognition: an exact `name` token
+    match, OR the token's space-joined form as a literal substring of
+    `text` (mirroring how a provider message embeds a machine-readable
+    phrase in human-readable text) -- never a generic free-text search
+    for anything outside this one closed vocabulary."""
+    if isinstance(name, str) and name in _OPENCODE_BALANCE_TOKENS:
+        return True
+    if isinstance(text, str):
+        low = text.lower()
+        return any(" ".join(tok.split("_")) in low
+                   for tok in _OPENCODE_BALANCE_TOKENS)
+    return False
+
+
+def _controller_turn_outcome(outcome, failure_class):
+    """The exact `cowork_activity.validate_controller_turn_outcome`-shaped
+    dict -- {schema_version, record, outcome, failure_class} -- every
+    typed extraction below returns. This module never imports
+    cowork_activity (see the module-level purity note); a caller that
+    needs real schema validation calls `cowork_activity.validate_
+    controller_turn_outcome` on the returned dict itself."""
+    return {"schema_version": 1, "record": "ControllerTurnOutcome",
+            "outcome": outcome, "failure_class": failure_class}
+
+
+def classify_opencode_refusal(event=None, log_tail=None):
+    """Typed extraction of one OpenCode provider-level refusal into a
+    `cowork_activity.ControllerTurnOutcome`-shaped dict
+    (`outcome="refused"`, `failure_class` a member of
+    `cowork_activity.FAILURE_CLASS_SET`).
+
+    `event`, when given, is the SAME structured `{"type": "error", "error":
+    {"name": ..., "data": {...}}}` envelope `classify_opencode_failure`
+    already consumes -- checked FIRST, since OpenCode's structured
+    `--format json` stream is normally sufficient. `log_tail`, a plain
+    string (e.g. the last lines of stderr a caller captured separately), is
+    consulted ONLY when `event` carries no recognizable error evidence at
+    all -- OpenCode's structured stream dying before any JSON line is ever
+    written is the one case a log tail matters.
+
+    Returns None when neither source carries recognizable refusal/error
+    evidence -- a genuinely successful turn, or a wholly silent one, names
+    no refusal record at all."""
+    if isinstance(event, dict) and event.get("type") == "error":
+        error = event.get("error")
+        error = error if isinstance(error, dict) else {}
+        name = _as_str_or_none(error.get("name"))
+        data = error.get("data")
+        data = data if isinstance(data, dict) else {}
+        message = _as_str_or_none(data.get("message"))
+        if _opencode_balance_depletion_token(name, message):
+            return _controller_turn_outcome("refused", "balance")
+        outcome = _classify_error_token(
+            name, _as_int_status_or_none(data.get("status")))
+        return _controller_turn_outcome(
+            "refused",
+            _OUTCOME_TO_FAILURE_CLASS.get(outcome, "unknown_provider_failure"))
+    if isinstance(log_tail, str) and log_tail.strip():
+        stripped = log_tail.strip()
+        if _opencode_balance_depletion_token(None, stripped):
+            return _controller_turn_outcome("refused", "balance")
+        status = _extract_leading_http_status(stripped)
+        if status is not None:
+            outcome = _classify_error_token(None, status)
+            return _controller_turn_outcome(
+                "refused",
+                _OUTCOME_TO_FAILURE_CLASS.get(outcome, "unknown_provider_failure"))
+        return None
+    return None
+
+
+def controller_turn_outcome_no_first_token():
+    """The typed `ControllerTurnOutcome` extension record every bounded
+    first-token deadline path (`ClaudeSession._send_turn`, `CodexSession.
+    _run`, `OpencodeSession._run`) produces on expiry: `outcome=
+    "no_first_token"`, `failure_class=None` (a deadline expiry carries no
+    provider failure reason -- see `cowork_activity.validate_controller_
+    turn_outcome`)."""
+    return _controller_turn_outcome("no_first_token", None)
+
+
+# ---------------------------------------------------------------------------
+# Artifact fingerprint/delta computation
+# ---------------------------------------------------------------------------
+#
+# `cowork_activity.ActivityRecord`'s `artifact_fingerprint` field is a
+# caller-supplied `{path: 64-hex-char sha256 digest}` mapping (or null);
+# `artifact_delta` names the subset of that mapping's keys that changed
+# since the PREVIOUS classified record. Reading real file bytes and
+# hashing them is I/O -- outside this package's pure-classification
+# boundary (Package C never performs file I/O; see the module-level purity
+# note above) -- so these two functions take an already-computed digest
+# mapping as input (the actual read/hash step is the caller's, e.g.
+# Package D's activity-emission seam) and perform the PURE, stateless
+# halves of the deliverable: normalizing that mapping into the exact
+# ActivityRecord `artifact_fingerprint` shape (the "path set"), and
+# computing the `artifact_delta` -- which paths' digests changed, or are
+# newly present -- against the previous record's fingerprint (the "digest
+# delta since the last classified record").
+
+def compute_artifact_fingerprint(path_digests):
+    """Pure normalization of a caller-supplied `{path: sha256-hex-digest}`
+    mapping into the exact `ActivityRecord.artifact_fingerprint` shape
+    Package A validates: None when `path_digests` is empty/falsy (no
+    artifacts observed), else a nonempty dict COPY (never the caller's own
+    mutable object) preserving every path/digest pair verbatim -- this
+    function never recomputes, drops, or reshapes a single entry.
+
+    Raises ValueError when `path_digests` is truthy but not a dict --
+    a malformed caller-supplied mapping is a caller-contract violation,
+    never silently coerced."""
+    if not path_digests:
+        return None
+    if not isinstance(path_digests, dict):
+        raise ValueError(
+            "path_digests must be a dict, got %r" % (type(path_digests),))
+    return dict(path_digests)
+
+
+def compute_artifact_delta(previous_fingerprint, current_fingerprint):
+    """Pure digest-delta computation: given the PREVIOUS classified
+    record's `artifact_fingerprint` (None or `{path: digest}`) and the
+    CURRENT one (same shape, e.g. `compute_artifact_fingerprint`'s own
+    return value), return the tuple of paths in `current_fingerprint`
+    whose digest is new or changed relative to `previous_fingerprint` --
+    exactly `ActivityRecord.artifact_delta`'s own shape (a subset of
+    `current_fingerprint`'s keys, each named once, sorted for a
+    deterministic pure result regardless of the input dicts' own
+    iteration order).
+
+    Empty when `current_fingerprint` is null/empty (nothing to report a
+    delta against, matching Package A's own null-fingerprint-implies-
+    empty-delta rule) -- `previous_fingerprint` being null/empty/malformed
+    is never an error: every path in `current_fingerprint` is then treated
+    as newly observed (a maximal delta), never raising. A path whose
+    digest is UNCHANGED between the two mappings is never included; a path
+    present only in `previous_fingerprint` (no longer observed) is never
+    included either, since it cannot be a member of `current_fingerprint`'s
+    own key set (Package A's own schema constraint)."""
+    if not current_fingerprint:
+        return ()
+    previous_fingerprint = (
+        previous_fingerprint if isinstance(previous_fingerprint, dict) else {})
+    changed = sorted(
+        path for path, digest in current_fingerprint.items()
+        if previous_fingerprint.get(path) != digest)
+    return tuple(changed)
+
+
+# ---------------------------------------------------------------------------
+# live_child_handle -- pinned by cowork_activity.PINNED_SIGNATURES
+# ---------------------------------------------------------------------------
+
+def live_child_handle(session):
+    """Truthful process-health probe for any controller session object.
+
+    `session.controller == "claude"`: returns the session-lifetime `proc`
+    (spawned in `ClaudeSession.__init__`, non-null whenever it is alive --
+    a per-turn `no_first_token` deadline never tears it down; only
+    `close()` does) when it is still alive, else None.
+
+    `session.controller in ("codex", "opencode")`: returns the current
+    turn's `_live_proc` (set for the duration of one `_run()` call, cleared
+    to None once that turn's child is reaped -- on a normal exit, a
+    KeyboardInterrupt, OR a first-token-deadline SIGTERM/SIGKILL/reap) when
+    it is still alive, else None -- including before the session's first
+    `send()` and between turns, when no child currently exists at all.
+
+    Never raises for a well-formed session lacking either attribute
+    (returns None). A session whose `controller` names neither branch above
+    falls back to whichever of `proc`/`_live_proc` it happens to carry, so
+    a future controller adapter using either shape is still read
+    truthfully without requiring an edit here."""
+    controller = getattr(session, "controller", None)
+    if controller == "claude":
+        proc = getattr(session, "proc", None)
+    elif controller in ("codex", "opencode"):
+        proc = getattr(session, "_live_proc", None)
+    else:
+        proc = getattr(session, "proc", None) or getattr(
+            session, "_live_proc", None)
+    if proc is None:
+        return None
+    return proc if proc.poll() is None else None
