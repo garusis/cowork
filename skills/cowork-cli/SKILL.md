@@ -276,6 +276,8 @@ Per-session artifacts, keyed by that UUID (override root with
   identities.json                        # tool + model + session id per role
   measurement.json                       # what --report renders
   trace.jsonl                            # orchestration trace (metadata only)
+  activity/history/<work_id>.jsonl       # append-only activity/reconciliation history
+  activity/scheduled_review/<work_id>.json  # current durable next inspection
 ```
 
 To check on a run in flight or explain what happened, read `trace.jsonl` and the
@@ -309,11 +311,12 @@ Run an **active review pass every ~5–10 minutes** while a phase is live:
    issue tracker/backlog immediately — observations not written down are
    lost when the session ends.
 
-A lead role's stream going quiet for 15+ minutes with near-zero process CPU
-is a stalled model turn: kill the controller child process — cowork detects
-the dead turn and redispatches the role onto its resumed session with
-history intact. Two stalls of the same model in one phase is a signal to
-step down the model/provider ladder rather than retry a third time.
+Do not kill a lead role merely because its stream is quiet or CPU is low.
+Investigate with the durable activity record, its exact
+`next_inspection_at`, and a real controller-process probe; only the
+dual-evidence conditions below can establish a stall. If they establish a
+recovery is authorized, preserve the session and completed evidence before
+resuming it; do not invent a retry or provider switch.
 
 ### Durable, dual-evidence activity — the real check, not the event tail
 
@@ -445,6 +448,11 @@ blocked may have delivered a complete artifact to a fallback location such as
 | 2 | usage error: bad `--team`/`--config`, `--headless` without context, `--worktree` outside a git tree, controller-policy violation or unreadable policy, worktree creation failure |
 | 17 | `--headless` only: a lead role's send was a typed provider refusal or hit the first-token deadline (real evidence, not silence), with no fallback available — the run terminates naming the provider/reason instead of ending the phase at exit 0 |
 | 130 | interrupted (Ctrl-C) or stdin closed at a prompt — **usually means an agent ran an interactive path** |
+
+For exit `17`, read the typed provider reason and durable activity/session
+state first. Do not blindly retry: resume only when the recorded recovery path
+and authority permit it; otherwise report the refusal/deadline to the user for
+an explicit controller, policy, or scope decision.
 
 Exit 130 from a non-interactive invocation is the signature of a missing
 `--headless` or a gate waiting on a human. Do not retry the same command;

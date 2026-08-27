@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cowork Orchestrate"
+  short_description: "Route bounded work to Cowork or direct Claude safely"
+  default_prompt: "Turn this request into a bounded work package, select the eligible backend fail-closed, and supervise its lifecycle."
