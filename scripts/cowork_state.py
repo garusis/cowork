@@ -1418,6 +1418,177 @@ def verification_lock_path_for(session_uuid, request_key):
 
 
 # --------------------------------------------------------------------------- #
+# M5 Package A: checkpoint request/result/receipt + claim/lease persistence   #
+# (garusis/cowork-internal#60). Every path below is additive: no existing     #
+# path helper above is touched or reused for a different shape. A checkpoint  #
+# is a single orchestrator-owned command handed to a deterministic, non-model #
+# executor (the shell-blocked builder's baseline/RED/generator-check/focused/ #
+# final-suite steps) -- keyed by its own `checkpoint_id`, distinct from an    #
+# owned-verification-transaction's `transaction_id` above, and consumed by    #
+# later packages (D's reviewer overlay, E's dispatch/phase-gate wiring)       #
+# without any edit to this file.                                             #
+# --------------------------------------------------------------------------- #
+
+
+def checkpoint_root_for(session_uuid):
+    """Root directory for all checkpoint artifacts of one session --
+    requests, claims, results, and receipts -- sibling to
+    `verification_root_for` but keyed by `checkpoint_id`, not
+    `transaction_id`."""
+    return os.path.join(session_assets_dir(session_uuid), "checkpoints")
+
+
+def checkpoint_dir_for(session_uuid, checkpoint_id):
+    """Directory holding one checkpoint's request, claim, result, and
+    receipt. `checkpoint_id` is caller-minted (e.g. a uuid4 hex) and is the
+    sole key, mirroring `verification_transaction_dir`."""
+    return os.path.join(checkpoint_root_for(session_uuid), checkpoint_id)
+
+
+def checkpoint_request_path_for(session_uuid, checkpoint_id):
+    """Path of the orchestrator-authored, versioned CheckpointRequest: phase,
+    work id, candidate digest, exact argv, orchestrator-owned cwd, bounded
+    environment exceptions, expected evidence, timeout, mutation_class, and
+    required/optional status. Written once, before any claim is issued."""
+    return os.path.join(checkpoint_dir_for(session_uuid, checkpoint_id),
+                        "request.json")
+
+
+def checkpoint_claim_path_for(session_uuid, checkpoint_id):
+    """Path of the once-only claim/lease record: executor identity, lease
+    acquisition, and (once the checkpoint reaches a terminal receipt) the
+    once-only terminal publication marker -- mirrors
+    `verification_lock_path_for`'s owner-metadata `.meta` sidecar, but for a
+    single checkpoint's non-model executor instead of a whole transaction's
+    worker. Consumed by Package E's dispatch wiring and by a resume-time
+    reconciliation entry point for the crash-between-claim-and-publish
+    negative control."""
+    return os.path.join(checkpoint_dir_for(session_uuid, checkpoint_id),
+                        "claim.json")
+
+
+def checkpoint_result_path_for(session_uuid, checkpoint_id):
+    """Path of the executor-submitted, versioned CheckpointResult: bounded
+    stdout/stderr digests, exit facts, timestamps, generated paths,
+    candidate-after identity, mutation detection, and evidence state."""
+    return os.path.join(checkpoint_dir_for(session_uuid, checkpoint_id),
+                        "result.json")
+
+
+def checkpoint_receipt_path_for(session_uuid, checkpoint_id):
+    """Path of the terminal, immutable CheckpointReceipt the orchestrator
+    publishes exactly once (the once-only terminal publication marker on
+    `checkpoint_claim_path_for` guards this): the accepted/rejected verdict
+    and the bound request and result -- consumed by the waiting role,
+    reviewer handoff, authority chain, and resume state (Package E, built on
+    Package D's reviewer-overlay extension)."""
+    return os.path.join(checkpoint_dir_for(session_uuid, checkpoint_id),
+                        "receipt.json")
+
+
+def list_checkpoint_ids(session_uuid):
+    """Every checkpoint id that has at least a request persisted for this
+    session. Tolerant: an unreadable/absent checkpoint root yields an empty
+    list, never an exception -- this is the enumeration primitive a
+    resume-time reconciliation entry point or a crash/resume audit uses to
+    reconstruct every pending, claimed, and terminal checkpoint from
+    artifacts alone, without a separate index file that could itself drift
+    out of sync with the directories it is supposed to describe."""
+    root = checkpoint_root_for(session_uuid)
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return []
+    return sorted(
+        name for name in entries
+        if os.path.isfile(os.path.join(root, name, "request.json")))
+
+
+def current_checkpoint_pointer_path_for(session_uuid, work_id):
+    """Path of the CURRENT-checkpoint pointer for one role engagement
+    (`work_id`): the binding between the waiting role/phase and the
+    checkpoint id it is blocked on, mirroring
+    `current_receipt_pointer_path_for`'s one-pointer shape but keyed
+    additionally by `work_id`, since a session can have more than one
+    concurrent role engagement each waiting on its own checkpoint.
+    Orchestrator-written only, never agent-writable."""
+    return os.path.join(checkpoint_root_for(session_uuid),
+                        "current.%s.json" % work_id)
+
+
+# --------------------------------------------------------------------------- #
+# M5 Package A: worker-identity tool-snapshot persistence, additive for       #
+# Package B (garusis/cowork-internal#44). `verification_snapshot_*` above     #
+# stays the TARGET-REPO snapshot every command runs against; these paths are  #
+# a SEPARATE, parallel content-addressed store for the Cowork INSTALLATION'S  #
+# own tool source (the running orchestrator's own scripts/), so a worker      #
+# spawned into a target repo that lacks scripts/cowork_verification.py        #
+# entirely can still be captured, launched, and identity-verified against a   #
+# manifest of the orchestrator's own code -- never the target repo's.         #
+# --------------------------------------------------------------------------- #
+
+
+def verification_tool_snapshot_root_for(session_uuid):
+    """Root of the content-addressed Cowork-installation tool-snapshot store,
+    parallel to (never shared with) `verification_snapshot_root_for`'s
+    target-repo store."""
+    return os.path.join(verification_root_for(session_uuid), "tool_snapshot")
+
+
+def verification_tool_snapshot_objects_dir(session_uuid):
+    """Directory of content-addressed blobs
+    (`objects/<sha256[:2]>/<sha256>`) copied out of the Cowork installation
+    root, sharded exactly like `verification_snapshot_objects_dir`."""
+    return os.path.join(verification_tool_snapshot_root_for(session_uuid),
+                        "objects")
+
+
+def verification_tool_snapshot_object_path(session_uuid, sha256):
+    """Path of one content-addressed tool-snapshot object blob for
+    `sha256`."""
+    return os.path.join(
+        verification_tool_snapshot_objects_dir(session_uuid),
+        sha256[:2], sha256)
+
+
+def verification_tool_snapshot_manifest_path_for(session_uuid, transaction_id):
+    """Path of one transaction's captured Cowork-installation tool-snapshot
+    manifest: `path -> {type, sha256, mode, symlink_target}` for the
+    orchestrator's own scripts/ tree -- the manifest a relocated
+    worker-identity verification checks the worker's self-report against
+    instead of `verification_snapshot_manifest_path_for`'s target-repo
+    manifest."""
+    return os.path.join(
+        verification_tool_snapshot_root_for(session_uuid),
+        "manifests", "%s.json" % transaction_id)
+
+
+# --------------------------------------------------------------------------- #
+# M5 Package A: deferred-teardown reconciliation tracking, additive for       #
+# Package C (garusis/cowork-internal#51). `should_defer_teardown` (frozen by  #
+# Package A to always return False; Package C implements the truthful        #
+# predicate) needs a durable, crash-safe record of WHICH transactions have a  #
+# reconciliation-pending attempt still tracked as possibly alive, so a        #
+# resume-time reconciliation entry point can find every one of them after a   #
+# supervisor crash -- not just the in-memory ones a still-running process     #
+# happens to remember.                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def verification_deferred_reconciliation_path_for(session_uuid,
+                                                   transaction_id):
+    """Path of one transaction's deferred-reconciliation marker: `{
+    transaction_id, active_label, deferred_at}` while a reconciliation-
+    pending attempt's teardown is deferred; removed (or revised to a
+    terminal outcome) once reconciliation confirms the process is
+    genuinely terminal. Absent means nothing is deferred for this
+    transaction."""
+    return os.path.join(
+        verification_transaction_dir(session_uuid, transaction_id),
+        "deferred_reconciliation.json")
+
+
+# --------------------------------------------------------------------------- #
 # Current-receipt pointer + review dispositions (ORCH-050 / CV-050 / UX-021). #
 #                                                                              #
 # The pointer binds a builder promotion to the OWNED transaction receipt the   #
