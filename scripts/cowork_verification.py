@@ -224,6 +224,7 @@ try:
     from cowork_verification_worker import (  # noqa: E402
         spawn_worker, verify_worker_identity, _read_worker_startup_log,
         _capture_startup_log, MAX_STARTUP_LOG_BYTES, WorkerStartupResult,
+        reclaim_tool_snapshot_checkout,
     )
     from cowork_verification_evidence import (  # noqa: E402
         bounded_evidence_wait, _poll_attempt_events, _revise_attempt_ledger,
@@ -255,6 +256,7 @@ except ModuleNotFoundError as _seam_import_error:
     verify_worker_identity = _seam_unavailable
     _read_worker_startup_log = _seam_unavailable
     _capture_startup_log = _seam_unavailable
+    reclaim_tool_snapshot_checkout = _seam_unavailable
     bounded_evidence_wait = _seam_unavailable
     _poll_attempt_events = _seam_unavailable
     _revise_attempt_ledger = _seam_unavailable
@@ -2127,6 +2129,18 @@ def _run_transaction_body(repo, session_uuid, transaction_id, request,
         # even starts), so the backstop runs here too — otherwise every one
         # of these ids would be left "pending" forever, exactly the
         # "worker-start failure leaves attempts pending" gap.
+        #
+        # M5B-R-M2: `spawn_worker` raising OSError here means the exception
+        # fired at (or after) `resolve_worker_source`'s own `Popen` call,
+        # AFTER a tool-snapshot checkout may already have been materialized
+        # on disk but BEFORE `_run_owned_transaction`'s own try/finally
+        # (the checkout's only other reclaim site, below) was ever entered
+        # -- so this startup-failure path is the one parent-side terminal
+        # path that finally block can never cover, and must reclaim the
+        # checkout itself. Idempotent no-op when nothing was ever
+        # materialized (`resolve_worker_source` returned `None`, or failed
+        # before reaching `Popen` at all).
+        reclaim_tool_snapshot_checkout(session_uuid, transaction_id)
         backstop_failed_labels = []
         for entry in deduped_entries:
             revised = ledger.revise_owned_attempt(
@@ -2535,6 +2549,22 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         # the transaction on a stuck capture); idempotent to join twice.
         if startup_capture_thread is not None:
             startup_capture_thread.join(timeout=5)
+        # M5B-R-M2: reclaim THIS transaction's captured tool-snapshot
+        # checkout now that the worker has terminated (`terminate_worker`,
+        # above) and every piece of evidence the parent still needs from it
+        # -- `identity`/`startup_failure` (read into `classification`
+        # before `spawn_worker` even returned) and the startup log tail
+        # (already folded into `startup_failure["log_tail"]`, and the
+        # capture thread that wrote it is now joined, immediately above)
+        # -- has already been read into this function's own local
+        # variables. Reaches every parent-side terminal path this
+        # `finally` already covers: normal completion, cancellation, a
+        # deadline hit, and any exception raised inside the `try` block
+        # above. `reclaim_tool_snapshot_checkout` is scoped to exactly this
+        # `transaction_id`'s own checkout, is idempotent, and never raises,
+        # so calling it here can never mask an earlier exception this
+        # `finally` is propagating.
+        reclaim_tool_snapshot_checkout(session_uuid, transaction_id)
 
     return TransactionResult({
         "transaction_id": transaction_id,

@@ -23647,16 +23647,24 @@ class OwnedVerificationWorkerBoundaryTests(_OwnedVerificationTestBase):
         # disk, distinct from both the live candidate's and this test
         # process's `cowork_verification.py` — stands in for "a parent
         # process that started on version A". It drives a transaction whose
-        # snapshot captures a DIFFERENT, NEWER worker file ("version B",
-        # distinguishable by a source-level marker the old parent's own
-        # module does not have). The command run against the snapshot
-        # imports `cowork_verification` FROM THE SNAPSHOT CHECKOUT (not
-        # from the old parent's sys.path) and reports which marker it
+        # worker SOURCE is captured (`resolve_worker_source`) from a
+        # DIFFERENT, NEWER installation tree ("version B", distinguishable
+        # by a source-level marker the old parent's own module does not
+        # have) — never from the old parent's own bytes, and never from the
+        # target repo's checkout (Package B (#44): the captured RUNNING
+        # Cowork installation is the only source `resolve_worker_source`
+        # ever reads). A command run by the worker imports
+        # `cowork_verification` FROM THE CAPTURED TOOL-SNAPSHOT CHECKOUT
+        # (its path is deterministic and independently computed here, via
+        # the now-public `tool_snapshot_checkout_dir`, exactly like
+        # `resolve_worker_source` computes it) and reports which marker it
         # sees — proving the actually-executed code, and the worker's own
         # self-reported identity hash, are the NEWER captured version, not
         # whatever the long-running parent process happened to import at
         # its own startup.
         import importlib.util
+        import unittest.mock as mock
+        import cowork_verification_worker as worker_mod
 
         with open(os.path.join(_HERE, "cowork_verification.py")) as fh:
             original_src = fh.read()
@@ -23682,33 +23690,58 @@ class OwnedVerificationWorkerBoundaryTests(_OwnedVerificationTestBase):
                             "the old-parent module must be genuinely "
                             "distinct bytes from the live module")
 
-        # The candidate repo's worker file is "version B": same real
-        # implementation, plus its OWN distinguishing marker.
-        newer_worker_path = os.path.join(self.repo, "scripts",
+        # The CAPTURED INSTALLATION's worker file is "version B": same real
+        # implementation, plus its OWN distinguishing marker. Lives in a
+        # throwaway directory `_installation_scripts_dir` is made to
+        # resolve to — mutating `self.repo`'s own copy no longer has
+        # anything to do with what source `resolve_worker_source` captures.
+        installation_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(installation_dir,
+                                              ignore_errors=True))
+        newer_worker_path = os.path.join(installation_dir,
                                          "cowork_verification.py")
         with open(newer_worker_path, "w") as fh:
             fh.write(original_src + "\nWORKER_VERSION_MARKER = 'B'\n")
-        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
-        subprocess.run(["git", "-C", self.repo, "commit", "-qm",
-                       "worker version B"], check=True)
+        for name in ("cowork_state.py", "cowork_policy.py",
+                    "cowork_ledger.py"):
+            shutil.copyfile(os.path.join(_HERE, name),
+                            os.path.join(installation_dir, name))
         with open(newer_worker_path, "rb") as fh:
             expected_newer_hash = hashlib.sha256(fh.read()).hexdigest()
+
+        # A fixed transaction id lets this test independently precompute
+        # the exact captured tool-snapshot checkout path `resolve_worker_
+        # source` will materialize "version B" into, BEFORE the transaction
+        # ever runs, so the observing command below can read straight from
+        # it rather than from the old parent's own sys.path or the target
+        # repo (neither of which the worker's source is captured from any
+        # more).
+        fixed_txn_id = "T-older-parent-newer-worker"
+        worker_checkout_dir = worker_mod.tool_snapshot_checkout_dir(
+            self.session_uuid, fixed_txn_id)
 
         marker = self._marker_path()
         observe_marker_cmd = [
             "python3", "-c",
             "import sys, os\n"
-            "sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))\n"
+            "sys.path.insert(0, os.path.join(%r, 'scripts'))\n"
             "import cowork_verification as v\n"
-            "open(%r, 'w').write(v.WORKER_VERSION_MARKER)\n" % marker]
+            "open(%r, 'w').write(v.WORKER_VERSION_MARKER)\n"
+            % (worker_checkout_dir, marker)]
         entries = self._inventory(self._entry(
             "observe-version", observe_marker_cmd,
             kind=verification.KIND_FINAL_SUITE))
 
         # Driven by the OLD PARENT module's own `run_transaction` — not
-        # this test process's `verification` import.
-        result = old_parent.run_transaction(self.repo, self.session_uuid,
-                                            entries)
+        # this test process's `verification` import — while the CAPTURED
+        # installation (never the old parent's own bytes, never the target
+        # repo) resolves to the throwaway "version B" directory.
+        with mock.patch.object(old_parent, "new_transaction_id",
+                               return_value=fixed_txn_id), \
+            mock.patch.object(worker_mod, "_installation_scripts_dir",
+                              return_value=installation_dir):
+            result = old_parent.run_transaction(self.repo, self.session_uuid,
+                                                entries)
 
         self.assertEqual(result["verdict"], "green")
         self.assertTrue(result["worker_identity_verified"])
@@ -23720,7 +23753,9 @@ class OwnedVerificationWorkerBoundaryTests(_OwnedVerificationTestBase):
         self.assertNotEqual(result["worker_identity"]["source_hash"],
                             old_parent.self_source_hash())
         # And the command that actually EXECUTED observed marker "B" —
-        # proof of behavior, not just a hash coincidence.
+        # proof of behavior, not just a hash coincidence — reading straight
+        # from the exact captured tool-snapshot checkout the worker itself
+        # was launched from.
         with open(marker) as fh:
             self.assertEqual(fh.read(), "B")
 
@@ -24720,23 +24755,44 @@ class OwnedVerificationLedgerIntegrationTests(_OwnedVerificationTestBase):
         self.assertEqual(set(latest_state.values()), {"not_reached"})
 
     def test_worker_crash_before_identity_completes_promptly_with_evidence(self):
-        # ORCH-030: a worker that is successfully SPAWNED but crashes before
-        # reporting identity (a missing snapshotted dependency) must not
-        # burn the whole startup allowance — this reseeds the throwaway
-        # repo WITHOUT cowork_ledger.py so the worker's own top-level
-        # `import cowork_ledger` fails immediately at process start.
-        worker_path = os.path.join(self.repo, "scripts", "cowork_ledger.py")
-        os.remove(worker_path)
-        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
-        subprocess.run(["git", "-C", self.repo, "commit", "-qm",
-                       "remove a worker dependency"], check=True)
+        # ORCH-030 / M5B-R-M1: a worker that is successfully SPAWNED but
+        # crashes before reporting identity (a missing dependency) must not
+        # burn the whole startup allowance. Package B (#44) launches the
+        # worker from a captured snapshot of the running Cowork
+        # INSTALLATION's own scripts/ tree (`cowork_verification_worker.
+        # resolve_worker_source`), never from the target repo's checkout —
+        # so the base commit's original fixture (deleting cowork_ledger.py
+        # from the TARGET repo) no longer exercises anything: that copy is
+        # not what gets executed. This reproduces the same missing-
+        # dependency crash truthfully, against the actually-captured
+        # source, by making `_installation_scripts_dir` — the one function
+        # `resolve_worker_source` calls to locate what it captures — resolve
+        # to a throwaway directory containing a real `cowork_verification.
+        # py`/`cowork_state.py`/`cowork_policy.py` but deliberately no
+        # `cowork_ledger.py`, so the worker's own top-level `import
+        # cowork_ledger` (cowork_verification.py's second import
+        # statement) fails immediately once THAT captured copy is spawned.
+        # The target repo itself is left exactly as `_OwnedVerificationTest
+        # Base.setUp` seeded it — this failure mode no longer has anything
+        # to do with the target repo's own tree.
+        import unittest.mock as mock
+        import cowork_verification_worker as worker_mod
+        installation_dir = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: shutil.rmtree(installation_dir, ignore_errors=True))
+        for name in ("cowork_verification.py", "cowork_state.py",
+                    "cowork_policy.py"):
+            shutil.copyfile(os.path.join(_HERE, name),
+                            os.path.join(installation_dir, name))
         entries = self._inventory(
             self._entry("noop", ["python3", "-c", "pass"],
                        kind=verification.KIND_FINAL_SUITE))
         started = time.time()
-        result = verification.run_transaction(
-            self.repo, self.session_uuid, entries,
-            command_timeout_s=5)
+        with mock.patch.object(worker_mod, "_installation_scripts_dir",
+                               return_value=installation_dir):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries,
+                command_timeout_s=5)
         elapsed = time.time() - started
         self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
         self.assertLess(elapsed, 15,
@@ -24954,8 +25010,31 @@ class OwnedVerificationLedgerIntegrationTests(_OwnedVerificationTestBase):
         # bounded join, AND `_read_worker_startup_log`'s own bounded read
         # — the complete chain `result['startup_failure']['log_tail']`
         # actually goes through.
+        #
+        # Package B (#44): the worker's dependency (`cowork_ledger.py`, its
+        # own second import statement) is captured from the running Cowork
+        # INSTALLATION's own scripts/ tree (`resolve_worker_source`), never
+        # from the target repo's checkout — so breaking `self.repo`'s own
+        # copy no longer exercises anything, exactly like the sibling
+        # `test_worker_crash_before_identity_completes_promptly_with_
+        # evidence` fixture above. The junk-then-crash dependency is placed
+        # in a throwaway installation directory `_installation_scripts_dir`
+        # is made to resolve to instead, alongside a real
+        # `cowork_verification.py`/`cowork_state.py`/`cowork_policy.py`, so
+        # the worker's own top-level `import cowork_ledger` fails against
+        # THAT captured copy once it is spawned. The target repo itself is
+        # left exactly as `_OwnedVerificationTestBase.setUp` seeded it.
+        import unittest.mock as mock
+        import cowork_verification_worker as worker_mod
         cap = verification.MAX_STARTUP_LOG_BYTES
-        broken_ledger_path = os.path.join(self.repo, "scripts",
+        installation_dir = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: shutil.rmtree(installation_dir, ignore_errors=True))
+        for name in ("cowork_verification.py", "cowork_state.py",
+                    "cowork_policy.py"):
+            shutil.copyfile(os.path.join(_HERE, name),
+                            os.path.join(installation_dir, name))
+        broken_ledger_path = os.path.join(installation_dir,
                                           "cowork_ledger.py")
         with open(broken_ledger_path, "w") as fh:
             fh.write(
@@ -24964,15 +25043,13 @@ class OwnedVerificationLedgerIntegrationTests(_OwnedVerificationTestBase):
                 "sys.stderr.write('\\nWORKER_CRASH_SENTINEL_9f3a\\n')\n"
                 "raise ImportError('intentional test failure')\n"
                 % ((cap * 3) // len("JUNK_BEFORE_CRASH")))
-        subprocess.run(["git", "-C", self.repo, "add", "-A"], check=True)
-        subprocess.run(["git", "-C", self.repo, "commit", "-qm",
-                       "worker dependency writes junk then crashes"],
-                      check=True)
         entries = self._inventory(
             self._entry("noop", ["python3", "-c", "pass"],
                        kind=verification.KIND_FINAL_SUITE))
-        result = verification.run_transaction(
-            self.repo, self.session_uuid, entries, command_timeout_s=5)
+        with mock.patch.object(worker_mod, "_installation_scripts_dir",
+                               return_value=installation_dir):
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries, command_timeout_s=5)
         self.assertEqual(result["verdict"], verification.VERDICT_UNVERIFIED)
         self.assertIsNotNone(result["startup_failure"])
         log_tail = result["startup_failure"].get("log_tail") or ""
