@@ -3183,3 +3183,74 @@ def summarize_trace(source):
         "usage_by_controller": usage_by_controller,
         "usage_by_role_model": usage_by_role_model,
     }
+
+
+# --------------------------------------------------------------------------- #
+# M5 Package E: checkpoint-scoped attempt reconciliation                      #
+# (garusis/cowork-internal#60). Additive only -- every function above this    #
+# section is unchanged.                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def checkpoint_reconciled_attempts(session_uuid):
+    """Every terminal checkpoint receipt for one session (M5 Package E),
+    reconciled into ATTEMPT-shaped records: `{"kind": "attempt",
+    "checkpoint_id", "work_id", "command", "command_identity",
+    "command_fingerprint", "claim_state", "evidence_state", "exit_code",
+    "candidate_digest", "published_at"}`.
+
+    A checkpoint's terminal receipt is ALREADY orchestrator-corroborated
+    evidence -- unlike an ordinary builder claim, it needs no controller-log
+    fingerprint join to be trusted (`join_claims_and_attempts` exists
+    precisely because a plain claim's own say-so is not evidence; a
+    checkpoint's receipt, published only after `cowork_verification.
+    submit_checkpoint_result`'s own cross-checks, already IS). This function
+    is therefore purely a NEW PRODUCER feeding the SAME shapes/vocabulary the
+    existing measurement path already consumes -- `command_fingerprint`/
+    `command_identity` via `cowork_ingest`'s own helpers, `claim_state` in
+    `join_claims_and_attempts`'s own `"corroborated"`/`"contradicted"`
+    vocabulary, `evidence_state` in `cowork_verification`'s own
+    `EVIDENCE_PRESENT`/`EVIDENCE_UNRESOLVED`/`EVIDENCE_ABSENT` vocabulary.
+
+    WHICH EXISTING EVIDENCE COUNTERS NEED NO CHANGE, and why: a caller that
+    feeds this function's output into `join_claims_and_attempts` (alongside
+    ordinary log-ingested attempts) or `verification_claim_summary` needs no
+    new branch in either -- both already tally by `claim_state`/
+    `evidence_state` alone, fields this function populates in their EXACT
+    existing vocabulary, not a parallel checkpoint-only one.
+    `owned_transaction_cost_summary`/`_owned_cost_rollups` are UNCHANGED and
+    untouched: those cost the OWNED-TRANSACTION worker's own attempts
+    (`kind` in `verification.KIND_*`), a distinct accounting axis a
+    checkpoint (a non-model, deterministic command with no worker-capture
+    cost model of its own) never populates or competes with.
+    `environment_recurrences` needs no change either: it already keys on
+    `command_identity` alone, which this function derives the SAME way
+    (`ingest.sanitize_command`) every other attempt already does.
+
+    Never raises; a session with no terminal checkpoints yields `[]`."""
+    out = []
+    for checkpoint_id in state_store.list_checkpoint_ids(session_uuid):
+        receipt = state_store.read_json_tolerant(
+            state_store.checkpoint_receipt_path_for(session_uuid,
+                                                     checkpoint_id))
+        if not isinstance(receipt, dict) or receipt.get(
+                "verdict") not in ("accepted", "rejected"):
+            continue
+        result = receipt.get("result") or {}
+        command = " ".join(str(a) for a in (result.get("argv") or []))
+        out.append({
+            "kind": "attempt",
+            "checkpoint_id": checkpoint_id,
+            "work_id": receipt.get("work_id"),
+            "command": command,
+            "command_identity": ingest.sanitize_command(command),
+            "command_fingerprint": ingest.command_fingerprint(command),
+            "claim_state": ("corroborated"
+                            if receipt["verdict"] == "accepted"
+                            else "contradicted"),
+            "evidence_state": result.get("evidence_state"),
+            "exit_code": result.get("exit_code"),
+            "candidate_digest": receipt.get("candidate_digest"),
+            "published_at": receipt.get("published_at"),
+        })
+    return out

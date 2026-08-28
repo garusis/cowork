@@ -3871,6 +3871,189 @@ def checkpoint_superseded_ids(session_uuid, work_id, current_checkpoint_id):
     return sorted(superseded)
 
 
+def checkpoint_handoff_facts(session_uuid, work_id):
+    """The builder->build-reviewer edge's five `checkpoint_*` facts (M5
+    Package E, garusis/cowork-internal#60) — the producer D's own
+    `checkpoint_current_overlay`/`checkpoint_superseded_ids` primitives never
+    got wired to. Maps `checkpoint_current_overlay`'s unprefixed overlay
+    fields onto the edge's declared `checkpoint_id`/`checkpoint_phase`/
+    `checkpoint_verdict`/`checkpoint_disposition` fact keys (see
+    `cowork_handoff._FACT_SCHEMAS`, which now validates all five closed-shape
+    — M5D-R-m1) and reports `checkpoint_superseded_count`.
+
+    M5D-R-m2 disposition: D's own frozen rendering block (`cowork_handoff.
+    _render_owned_verification_block`, never edited here) describes suppressed
+    claims as "earlier ... superseded" — this producer makes that wording
+    TRUTHFUL rather than merely softening it: `checkpoint_superseded_count`
+    counts ONLY superseded checkpoints whose own request `created_at`
+    genuinely precedes the current checkpoint's — never a same-or-later one
+    that happens to share the count bucket. Returns `{}` when nothing is
+    bound yet."""
+    overlay, _pointer = checkpoint_current_overlay(session_uuid, work_id)
+    if not overlay:
+        return {}
+    checkpoint_id = overlay["checkpoint_id"]
+    facts = {
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_phase": overlay.get("phase"),
+        "checkpoint_verdict": overlay.get("verdict"),
+        "checkpoint_disposition": overlay.get("disposition"),
+    }
+    current_request = state_store.read_json_tolerant(
+        state_store.checkpoint_request_path_for(session_uuid, checkpoint_id))
+    current_created_at = (current_request or {}).get("created_at") or ""
+    earlier_count = 0
+    for other_id in checkpoint_superseded_ids(session_uuid, work_id,
+                                              checkpoint_id):
+        other_request = state_store.read_json_tolerant(
+            state_store.checkpoint_request_path_for(session_uuid, other_id))
+        other_created_at = (other_request or {}).get("created_at") or ""
+        if other_created_at and current_created_at and (
+                other_created_at < current_created_at):
+            earlier_count += 1
+    if earlier_count:
+        facts["checkpoint_superseded_count"] = earlier_count
+    return facts
+
+
+def dispatch_role_checkpoint(session_uuid, work_id, phase, candidate_digest,
+                             argv, cwd, mutation_class,
+                             status=verification.CHECKPOINT_STATUS_REQUIRED,
+                             declared_output_paths=None,
+                             expected_evidence=None, timeout_s=None,
+                             env=None, run=True):
+    """THE central checkpoint gateway (M5 Package E, garusis/cowork-internal
+    #60): the ONE place a role-loop/dispatch point mints a typed
+    CheckpointRequest, binds it as the CURRENT checkpoint for `work_id`
+    (`state_store.current_checkpoint_pointer_path_for`, the same pointer
+    `checkpoint_current_overlay`/`checkpoint_handoff_facts` already read),
+    and — unless `run=False` (a caller that hands execution to a separate
+    process) — runs it to a terminal receipt via
+    `cowork_verification.run_checkpoint`.
+
+    A FRESH checkpoint_id is minted per call (`verification.
+    mint_checkpoint_id`): dispatching again for the SAME `work_id` naturally
+    supersedes the prior checkpoint the instant this call rebinds the
+    current-checkpoint pointer — `checkpoint_superseded_ids` picks up every
+    OTHER checkpoint ever requested for this `work_id`, and
+    `checkpoint_gate_evidence` below only ever reads the pointer's CURRENT
+    id, so a stale/superseded checkpoint's own (possibly still-accepted)
+    receipt can never be consulted as gate evidence for this `work_id` again.
+
+    Returns `(checkpoint_id, receipt_or_None)` — `receipt_or_None` is the
+    terminal CheckpointReceipt when `run=True`, else `None` (the caller is
+    responsible for eventually calling `verification.run_checkpoint` or
+    `verification.submit_checkpoint_result` itself)."""
+    checkpoint_id = verification.mint_checkpoint_id(work_id)
+    verification.build_and_persist_checkpoint_request(
+        session_uuid, checkpoint_id, work_id, phase, candidate_digest, argv,
+        cwd, mutation_class, status=status, env=env,
+        expected_evidence=expected_evidence, timeout_s=timeout_s,
+        declared_output_paths=declared_output_paths)
+    state_store.write_json_atomic_durable(
+        state_store.current_checkpoint_pointer_path_for(session_uuid,
+                                                         work_id),
+        {"checkpoint_id": checkpoint_id, "work_id": work_id, "phase": phase})
+    receipt = None
+    if run:
+        receipt = verification.run_checkpoint(session_uuid, checkpoint_id)
+    return checkpoint_id, receipt
+
+
+def checkpoint_gate_evidence(session_uuid, work_id, expected_candidate_digest,
+                             candidate_index=None):
+    """The fail-closed pre-check a checkpoint-gated dispatch point consults
+    BEFORE ever attempting `cowork_control_plane.advance(..., "gate_
+    validated", ...)`: `(evidence, reason_code)`, where `evidence` is
+    `advance()`-ready gate evidence (`cowork_control_plane.
+    checkpoint_receipt_to_gate_evidence`) only when the work's CURRENT bound
+    checkpoint (never a stale/superseded one — the pointer is the sole
+    source of "current") has a terminal, `verdict="accepted"` receipt bound
+    to EXACTLY `expected_candidate_digest`. Otherwise returns `(None,
+    reason_code)` and the caller must never call `advance()` with fabricated
+    evidence — `reason_code` is one of `"checkpoint_missing"`,
+    `"checkpoint_not_terminal"`, `"checkpoint_rejected"`, or
+    `"checkpoint_cross_candidate"`.
+
+    This function is a caller-side convenience; the REAL enforcement that a
+    stale/cross-candidate checkpoint can never advance the live control
+    plane is `advance()`'s own, unmodified `_gate_evidence_matches_candidate`
+    check — see `cowork_control_plane.checkpoint_receipt_to_gate_evidence`'s
+    own docstring and `scripts/test_m5_package_e_integration.py`'s direct
+    proof against the real reducer."""
+    _overlay, pointer = checkpoint_current_overlay(session_uuid, work_id)
+    if not isinstance(pointer, dict) or not pointer.get("checkpoint_id"):
+        return None, "checkpoint_missing"
+    checkpoint_id = pointer["checkpoint_id"]
+    receipt = state_store.read_json_tolerant(
+        state_store.checkpoint_receipt_path_for(session_uuid, checkpoint_id))
+    if not isinstance(receipt, dict) or receipt.get("terminal") is not True:
+        return None, "checkpoint_not_terminal"
+    if receipt.get("verdict") != verification.CHECKPOINT_ACCEPTED:
+        return None, "checkpoint_rejected"
+    if receipt.get("candidate_digest") != expected_candidate_digest:
+        return None, "checkpoint_cross_candidate"
+    evidence = control_plane.checkpoint_receipt_to_gate_evidence(
+        receipt, candidate_index=candidate_index)
+    if evidence is None:
+        return None, "checkpoint_not_accepted"
+    return evidence, None
+
+
+def checkpoint_wake_block(session_uuid, work_id, role):
+    """Render route 14 (`cowork_handoff`'s `cowork->role:checkpoint_wake`,
+    M5 Package E) for the WAITING role's own currently-bound checkpoint —
+    distinct from D's reviewer-facing `checkpoint_receipt` import
+    (`checkpoint_handoff_facts`/`assemble_build_reviewer_context` above):
+    this imports a checkpoint's status into the role that DISPATCHED it,
+    whatever its current lifecycle state (pending/claimed/terminal), by
+    pointing straight at that state's own already-durable artifact (no new
+    file is ever written for this — the request/claim/receipt already on
+    disk from `verification.build_and_persist_checkpoint_request`/
+    `claim_checkpoint`/`publish_checkpoint_receipt` is the wake payload).
+
+    Returns `None` — no wake needed — when nothing is bound for `work_id`."""
+    binding = state_store.read_json_tolerant(
+        state_store.current_checkpoint_pointer_path_for(session_uuid,
+                                                         work_id))
+    checkpoint_id = (binding or {}).get("checkpoint_id")
+    if not checkpoint_id:
+        return None
+    reconstructed = verification.reconstruct_checkpoint_state(
+        session_uuid, checkpoint_id)
+    state = reconstructed["state"]
+    if state == "unknown":
+        return None
+    status_path_fn = {
+        "pending": state_store.checkpoint_request_path_for,
+        "claimed": state_store.checkpoint_claim_path_for,
+        "terminal": state_store.checkpoint_receipt_path_for,
+    }[state]
+    receipt = reconstructed.get("receipt") or {}
+    request = reconstructed.get("request") or {}
+    # The label below is cosmetic only: render_handoff's own SLOT_LABELS
+    # registry is what actually decides the descriptor line's label (never
+    # a caller-supplied one) -- this module reaches into handoff internals
+    # only through render_handoff's own artifact/facts contract, never by
+    # reading handoff.SLOT_LABELS directly.
+    artifacts = [{"label": "checkpoint status",
+                 "path": status_path_fn(session_uuid, checkpoint_id),
+                 "kind": "json", "source": "checkpoint_status"}]
+    facts = {"role": role, "checkpoint_id": checkpoint_id,
+            "checkpoint_state": state}
+    if request.get("phase"):
+        facts["checkpoint_phase"] = request["phase"]
+    if receipt.get("verdict"):
+        # Only a TERMINAL checkpoint has a verdict at all — a pending/
+        # claimed checkpoint's fact stays omitted rather than a fabricated
+        # None (cowork_handoff._FACT_SCHEMAS["checkpoint_verdict"] is a
+        # closed enum with no null member).
+        facts["checkpoint_verdict"] = receipt["verdict"]
+    return handoff.render_handoff(
+        "cowork->role:checkpoint_wake", artifacts=artifacts, facts=facts,
+        ctx={})
+
+
 def _latest_verification_disposition(session_uuid, transaction_id,
                                      checkpoint_id=None):
     """The latest sidecar disposition value for one transaction id, or None.
@@ -5635,7 +5818,8 @@ def _git_build_baseline(cwd=None):
         return None, None
 
 
-def write_build_baseline_manifest(session_uuid, cwd=None):
+def write_build_baseline_manifest(session_uuid, cwd=None, checkpoint_id=None,
+                                  artifact_kind=None):
     """Persist the PER-FILE build baseline (`build_baseline.json`).
 
     The prose baseline records a HEAD sha and a dirty flag, which is enough for a
@@ -5647,7 +5831,11 @@ def write_build_baseline_manifest(session_uuid, cwd=None):
     The manifest hashes every tracked file instead, so build and review metrics
     are computed against the tree as it actually was. Tolerant: any failure
     returns None and the run continues.
-    """
+
+    `checkpoint_id`/`artifact_kind` (M5 Package E, additive, both default
+    `None`): when a caller captures this baseline as part of a checkpoint's
+    own before/after scope, stamping them onto the manifest correlates the
+    two records — never changes this function's path/return contract."""
     import subprocess
     try:
         listed = subprocess.run(
@@ -5660,6 +5848,9 @@ def write_build_baseline_manifest(session_uuid, cwd=None):
         return None
     manifest = state_store.build_manifest(cwd or os.getcwd(), paths)
     manifest["digest"] = state_store.manifest_digest(manifest)
+    if checkpoint_id:
+        manifest["checkpoint_id"] = checkpoint_id
+        manifest["artifact_kind"] = artifact_kind
     path = state_store.build_manifest_path_for(session_uuid)
     return path if state_store.write_build_manifest(path, manifest) else None
 
@@ -5717,7 +5908,8 @@ def _build_diff_recipe(repos=None, baseline_note=""):
 
 def _build_reviewer_artifacts(plan_json_path, plan_md_path, build_status_path,
                               build_summary_path=None,
-                              verification_receipt_path=None):
+                              verification_receipt_path=None,
+                              checkpoint_receipt_path=None):
     arts = [
         {"label": "approved plan JSON (machine source of truth)",
          "path": plan_json_path, "kind": "json", "source": "plan_json"},
@@ -5737,6 +5929,14 @@ def _build_reviewer_artifacts(plan_json_path, plan_md_path, build_status_path,
         arts.append({"label": "owned verification receipt (orchestrator-run "
                      "transaction result)", "path": verification_receipt_path,
                      "kind": "json", "source": "verification_receipt"})
+    if checkpoint_receipt_path:
+        # M5 Package E: populates D's already-declared, previously-unwired
+        # `checkpoint_receipt` artifact slot (see `checkpoint_handoff_facts`
+        # for the matching facts producer) — additive, D's own slot label in
+        # cowork_handoff.SLOT_LABELS is untouched.
+        arts.append({"label": "owned checkpoint receipt (orchestrator-run "
+                     "checkpoint result)", "path": checkpoint_receipt_path,
+                     "kind": "json", "source": "checkpoint_receipt"})
     return arts
 
 
@@ -5746,7 +5946,9 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
                                     build_summary_path=None, assets_dir=None,
                                     context_revision=None,
                                     verification_receipt_path=None,
-                                    verification_overlay=None):
+                                    verification_overlay=None,
+                                    checkpoint_receipt_path=None,
+                                    checkpoint_facts=None):
     """The build-reviewer's situational context (route 7), delivered FILE-ONLY
     via the shared transport: the shared session context, BOTH plan artifacts,
     the builder's status JSON, the builder's markdown summary (when wired), and
@@ -5757,15 +5959,22 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
     ``{path, has_head}``) that drives the per-root capture recipe.
     `verification_receipt_path` + `verification_overlay` carry the owned
     verification receipt (ORCH-050): the receipt file by absolute path and the
-    derived owned-facts overlay as closed-schema edge facts."""
+    derived owned-facts overlay as closed-schema edge facts. `checkpoint_
+    receipt_path` + `checkpoint_facts` (M5 Package E — see
+    `checkpoint_handoff_facts`) carry the bound checkpoint's terminal receipt
+    the same way; both default to nothing bound, so a caller that never
+    supplies them sees no change at all."""
     artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
     artifacts.extend(_build_reviewer_artifacts(
         plan_json_path, plan_md_path, build_status_path, build_summary_path,
-        verification_receipt_path=verification_receipt_path))
+        verification_receipt_path=verification_receipt_path,
+        checkpoint_receipt_path=checkpoint_receipt_path))
     artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
     facts = {"team": list(selected or [])}
     if verification_overlay:
         facts.update(verification_overlay)
+    if checkpoint_facts:
+        facts.update(checkpoint_facts)
     return handoff.render_handoff(
         "builder->build-reviewer:review_ctx",
         artifacts=artifacts, facts=facts,
@@ -5795,17 +6004,22 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
                                            assets_dir=None,
                                            context_revision=None,
                                            verification_receipt_path=None,
-                                           verification_overlay=None):
+                                           verification_overlay=None,
+                                           checkpoint_receipt_path=None,
+                                           checkpoint_facts=None):
     """Lighter context for a RESUMED build-reviewer session, delivered FILE-ONLY
     via the shared transport: only the updated artifacts are sent by PATH (plan,
     status, summary, build-baseline) — plus a context-update wake block
     referencing the persisted context FILE when the session context changed. The
     full delta is still read live via the diff recipe; no body is inlined. The
     owned verification receipt + overlay ride exactly as on the fresh edge
-    (ORCH-050), so a resumed reviewer never loses the receipt mid-loop."""
+    (ORCH-050), so a resumed reviewer never loses the receipt mid-loop. The
+    bound checkpoint's receipt + facts (M5 Package E) ride the same way via
+    `checkpoint_receipt_path`/`checkpoint_facts`."""
     artifacts = list(_build_reviewer_artifacts(
         plan_json_path, plan_md_path, build_status_path, build_summary_path,
-        verification_receipt_path=verification_receipt_path))
+        verification_receipt_path=verification_receipt_path,
+        checkpoint_receipt_path=checkpoint_receipt_path))
     artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
     ctx = {"repos": list(baseline_repos or [])}
     if context_update:
@@ -5814,6 +6028,8 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
     facts = {"team": []}
     if verification_overlay:
         facts.update(verification_overlay)
+    if checkpoint_facts:
+        facts.update(checkpoint_facts)
     return handoff.render_handoff(
         "builder->build-reviewer:review_resume",
         artifacts=artifacts, facts=facts, ctx=ctx)
@@ -5822,7 +6038,7 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
 def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                                baseline_repos=None, trace=None,
                                extra_writable_dir=None, build_summary_path=None,
-                               session_uuid=None):
+                               session_uuid=None, role_work_id=None):
     """Build the real (non-test) reviewer runner for the building phase: a
     `run_reviewer_once` closure carrying the build-reviewer role, prompt, and
     the full-delta context assemblers. The reviewed artifact passed to the
@@ -5834,15 +6050,26 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
     assembly looks up the CURRENT owned-receipt pointer from state at render
     time (ORCH-050), so both the fresh and the resumed reviewer edge carry the
     receipt file by absolute path plus the derived overlay facts with the
-    disposition current as of that render (D-0002)."""
+    disposition current as of that render (D-0002). `role_work_id` (M5
+    Package E) additionally wires the CURRENT bound checkpoint, if any, the
+    same way via `checkpoint_handoff_facts`."""
     def receipt_kwargs():
         overlay, pointer = _current_verification_overlay(session_uuid)
-        return {
+        kwargs = {
             "verification_overlay": overlay,
             "verification_receipt_path": (
                 pointer.get("receipt_path")
                 if isinstance(pointer, dict) else None),
         }
+        if session_uuid and role_work_id:
+            checkpoint_facts = checkpoint_handoff_facts(
+                session_uuid, role_work_id)
+            if checkpoint_facts:
+                kwargs["checkpoint_facts"] = checkpoint_facts
+                kwargs["checkpoint_receipt_path"] = (
+                    state_store.checkpoint_receipt_path_for(
+                        session_uuid, checkpoint_facts["checkpoint_id"]))
+        return kwargs
 
     def runner(config, context, selected, build_status_path, review_path,
                resume_id=None, on_session=None, context_update=None,
@@ -7536,7 +7763,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                   require_pending_question=False, review_path=None,
                   save_pending_turn_fn=None, clear_pending_turn_fn=None,
                   spath=None, session_uuid=None, build_summary_path=None,
-                  role_work_id=None):
+                  role_work_id=None, checkpoint_id=None, artifact_kind=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -7579,7 +7806,18 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     user confirmation gate: confirmed → the loop returns the "handoff" outcome;
     declined → the status is downgraded and the role continues with a declined
     note. A `handoff_back` without a payload degrades to the needs-input gate
-    (never an implicit hand-back)."""
+    (never an implicit hand-back).
+
+    `checkpoint_id`/`artifact_kind` (M5 Package E, additive, both default
+    `None`): when the caller has already dispatched a deterministic
+    checkpoint for this role engagement (`dispatch_role_checkpoint`), this
+    traces the binding so a resume/audit trail can correlate this loop
+    invocation with the checkpoint that gates it -- never changes this
+    function's own control flow or return value; a caller that never
+    supplies them sees no change at all."""
+    if checkpoint_id and trace:
+        trace.event("checkpoint.role_loop_bound", role=role,
+                    checkpoint_id=checkpoint_id, artifact_kind=artifact_kind)
     # `_role_loop` is the actual initial lead boundary. Production callers
     # already pass a typed seed; direct/test callers enter through this one
     # closed initial-user constructor rather than a generic lead fallback.
@@ -11219,7 +11457,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 on_first_send_accepted=None, on_first_send_rejected=None,
                 reviewer_controller_check_fn=None, headless=False,
                 gate_preview=None, save_pending_turn_fn=None,
-                clear_pending_turn_fn=None, worktree=None, worktree_base=None):
+                clear_pending_turn_fn=None, worktree=None, worktree_base=None,
+                checkpoint_id=None, artifact_kind=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -11316,7 +11555,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         plan_json_path, plan_md_path, baseline_note=baseline_note,
         baseline_repos=baseline_repos, trace=trace,
         extra_writable_dir=sessions_dir, build_summary_path=build_summary_path,
-        session_uuid=session_uuid)
+        session_uuid=session_uuid, role_work_id=role_work_id)
     consumed = plan_consumed_upstream(plan_json_path, plan_md_path,
                                       building_epoch)
     review_fn = make_review_fn(
@@ -11518,7 +11757,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             session, first, build_status_path, context, io_in, io_out,
             on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
-                session_uuid=session_uuid, role_work_id=role_work_id)
+                session_uuid=session_uuid, role_work_id=role_work_id,
+                checkpoint_id=checkpoint_id, artifact_kind=artifact_kind)
         report(outcome, payload)
         return rc
 
@@ -11573,7 +11813,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             session, first, build_status_path, context, io_in, io_out,
             on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
-                session_uuid=session_uuid, role_work_id=role_work_id)
+                session_uuid=session_uuid, role_work_id=role_work_id,
+                checkpoint_id=checkpoint_id, artifact_kind=artifact_kind)
         report(outcome, payload)
         return rc
 
@@ -11614,7 +11855,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         session, prompt, build_status_path, context, io_in, io_out,
         on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
-            session_uuid=session_uuid, role_work_id=role_work_id)
+            session_uuid=session_uuid, role_work_id=role_work_id,
+            checkpoint_id=checkpoint_id, artifact_kind=artifact_kind)
     report(outcome, payload)
     return rc
 

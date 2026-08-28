@@ -69,6 +69,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cowork_state as state_store  # noqa: E402
 import cowork_ledger as ledger  # noqa: E402
+import socket  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Protocol version and schema constants.                                      #
@@ -2213,6 +2214,18 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
                            entries, final_suite_label, snapshot,
                            checkout_root, python_executable,
                            cancel_event=None):
+    # M5E-GATE-CUMULATIVE-01 (v2 repair): NOT a request-overridable timeout
+    # -- an internal heuristic (below) for telling an ordinary, healthy
+    # `spawn_worker` call (dominated by the identity read's own single
+    # minimum poll cycle plus real subprocess-launch overhead -- well under
+    # a second in practice) apart from one where identity verification
+    # genuinely BLOCKED (e.g. a stalled or slow-to-report worker). See the
+    # comment at its use site, below, for why this -- not a fresh,
+    # unconditional re-read of `cancel_event` -- is what closes the
+    # identity-wait cancellation gap without racing Package C's own
+    # mid-flight disposition.
+    identity_wait_blocked_threshold_s = 0.4
+
     # `manifest_files` is still needed here for `detect_mutation` below (an
     # unrelated purpose: has the target repo's tracked+untracked-non-ignored
     # tree changed during the transaction) — it just no longer feeds a
@@ -2240,11 +2253,23 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
     overall_deadline = time.time() + _overall_deadline_s(
         entries, timeout_policy)
 
+    # M5E-GATE-CUMULATIVE-01 (v2 repair): snapshot cancel_event's state HERE,
+    # immediately before the clock-consuming `spawn_worker` call below --
+    # this is the ONLY thing a cancellation genuinely requested before this
+    # transaction ever began dispatching can rely on (entry 0's own
+    # `not (worker) verified yet` gate, unchanged from the base's own
+    # pre-Package-C shape). It is deliberately NOT, by itself, the whole
+    # story for entry 0 any more -- see `_spawn_worker_duration_s` below.
+    cancel_requested_before_spawn = bool(
+        cancel_event is not None and cancel_event.is_set())
+
     request_path = state_store.verification_request_path_for(
         session_uuid, transaction_id)
+    _spawn_worker_started_at = time.time()
     worker_result = spawn_worker(
         python_executable, checkout_root, request_path,
         session_uuid=session_uuid, transaction_id=transaction_id)
+    _spawn_worker_duration_s = time.time() - _spawn_worker_started_at
     # `worker_result` unpacks as the base commit's original three-item
     # handle bundle (`WorkerStartupResult.__iter__` yields exactly those
     # three — see that class's own docstring for why). `classification` —
@@ -2271,6 +2296,58 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
     identity = classification.get("identity")
     worker_verified = classification.get("worker_verified", False)
     startup_failure = classification.get("startup_failure")
+
+    # M5E-GATE-CUMULATIVE-01 (v2 repair): entry 0's own "was this cancelled
+    # before it ever got a chance to start" gate is now the OR of two
+    # independent, non-competing facts, neither of which is a stale
+    # single-point-in-time read:
+    #
+    #   1. `cancel_requested_before_spawn` -- cancellation already requested
+    #      before `spawn_worker` was even called. Exactly the v1 candidate's
+    #      own snapshot, unchanged: this alone is what
+    #      `test_cancel_set_before_launch_still_completes_bounded_and_
+    #      unverified` (Package A) and `test_cancel_set_before_the_worker_
+    #      even_starts_stays_unverified` (Package C) rely on, and it costs
+    #      nothing to preserve verbatim.
+    #
+    #   2. `_spawn_worker_duration_s >= identity_wait_blocked_threshold_s`
+    #      -- `spawn_worker` itself blocks, internally, for up to
+    #      `timeout_policy.startup_allowance_s` while it reads the worker's
+    #      identity report (worker_capture_seam). The v1 candidate's own
+    #      snapshot (fact 1 alone, sampled once before that blocking call)
+    #      is invisible to a cancellation that lands DURING that wait: entry
+    #      0 still dispatches into a worker the `_cancel_watcher` thread
+    #      below is concurrently tearing down, and the transaction is left
+    #      waiting on evidence that can never arrive until the entry's own
+    #      (unrelated, often much longer) command timeout expires --
+    #      unbounded, not the "bounded and torn down" the identity read's
+    #      own timeout_s promises.
+    #
+    #      Checking `cancel_event.is_set()` freshly the instant `spawn_
+    #      worker` returns would close that gap, but at the cost of racing
+    #      Package C's OWN mid-flight disposition: an UNCANCELLED,
+    #      ORDINARILY-paced `spawn_worker` call (no artificial delay) can
+    #      itself take a comparable fraction of a second (the identity
+    #      read's own minimum poll cycle plus real subprocess-launch
+    #      overhead), so a cancel_event that a caller sets shortly after
+    #      launching a transaction (Package C's own test fires one from a
+    #      background thread, timed to land once the FIRST command is
+    #      already running) can coincidentally already be visible by the
+    #      time `spawn_worker` returns even though it was never meant to
+    #      preempt entry 0 at all -- that must still resolve to Package C's
+    #      RED, not this gate's UNVERIFIED. Gating on `spawn_worker`'s own
+    #      observed DURATION instead of on cancel_event's coincidental
+    #      timing sidesteps that race entirely: an ordinary, healthy
+    #      identity read is never mistaken for one that genuinely blocked,
+    #      regardless of exactly when an unrelated cancel_event happened to
+    #      fire, because the duration check does not depend on cancel_
+    #      event's timing at all -- only on how long `spawn_worker` itself
+    #      actually ran.
+    cancel_requested_before_dispatch = bool(
+        cancel_requested_before_spawn
+        or (cancel_event is not None and cancel_event.is_set()
+            and _spawn_worker_duration_s
+            >= identity_wait_blocked_threshold_s))
 
     # A `cancel_event` set WHILE a command is mid-flight must not wait for
     # the between-commands check below (which could be minutes away on a
@@ -2333,7 +2410,15 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         if worker_verified:
             for index, entry in enumerate(entries):
                 label = entry["label"]
-                if cancel_event is not None and cancel_event.is_set():
+                # M5E-GATE-CUMULATIVE-01: entry 0 alone consults the
+                # PRE-DISPATCH snapshot (see its own comment above,
+                # `cancel_requested_before_dispatch`); every later entry
+                # still consults cancel_event live, exactly as before --
+                # unchanged for index >= 1.
+                cancelled_now = (
+                    cancel_requested_before_dispatch if index == 0
+                    else cancel_event is not None and cancel_event.is_set())
+                if cancelled_now:
                     deadline_hit = True
                     break
                 if time.time() > overall_deadline:
@@ -2525,9 +2610,16 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         # cleanup_active_command_group/terminate_worker calls (M5R-C2).
         # Only Package C's later implementation may return True — leaving
         # eventual teardown to its own resume-time reconciliation entry
-        # point instead of tearing the worker down here.
-        if not should_defer_teardown(session_uuid, transaction_id,
-                                     active_label):
+        # point instead of tearing the worker down here. Computed ONCE and
+        # reused below (M5B-V4-RV-m6): `should_defer_teardown` is safe to
+        # call twice (a second call just re-reads the now-durable deferred
+        # marker this same call may have just written), but the checkout
+        # reclaim decision below must agree with THIS decision, not a
+        # separately-recomputed one that could theoretically observe a
+        # different in-flight liveness snapshot.
+        _defer_teardown = should_defer_teardown(
+            session_uuid, transaction_id, active_label)
+        if not _defer_teardown:
             cleanup_active_command_group(session_uuid, transaction_id,
                                          term_grace_s=timeout_policy.get(
                                              "term_grace_s")
@@ -3245,6 +3337,482 @@ def reconstruct_checkpoint_state(session_uuid, checkpoint_id):
     return {"checkpoint_id": checkpoint_id, "request": request,
            "claim": claim, "result": result, "receipt": receipt,
            "state": state}
+
+
+# --------------------------------------------------------------------------- #
+# M5 Package E: central checkpoint gateway -- dispatch, run, submit, publish  #
+# (garusis/cowork-internal#60). Everything above this section (CheckpointError#
+# through reconstruct_checkpoint_state) is Package A's frozen contract layer  #
+# and is never edited here. This section is the "final seam wiring" this     #
+# module's writable authority names: it is the ONE place a CheckpointRequest #
+# actually gets executed by a deterministic, non-model executor and the ONE  #
+# place a CheckpointResult is cross-checked and turned into a published,     #
+# once-only CheckpointReceipt.                                               #
+# --------------------------------------------------------------------------- #
+
+# Hard cap on the bytes of one stream (stdout or stderr) hashed into a
+# CheckpointResult's `stdout_digest`/`stderr_digest` -- mirrors
+# `cowork_verification_worker.MAX_STARTUP_LOG_BYTES`'s bounded-capture
+# discipline (that module is not imported here: it owns a different,
+# unrelated worker-identity capture; this is an independent, purpose-built
+# bound for an arbitrary checkpoint command's own output).
+CHECKPOINT_MAX_CAPTURE_BYTES = 256 * 1024
+
+
+def _checkpoint_executor_identity():
+    """This process's own persisted executor identity: hostname + pid. Never
+    random -- the SAME process claiming and running a checkpoint reports the
+    SAME identity a submitted result is cross-checked against
+    (`_checkpoint_result_matches_claim_executor`), so a result genuinely
+    submitted by a different process/host can never be silently accepted as
+    this claim's own."""
+    return "%s:%d" % (socket.gethostname(), os.getpid())
+
+
+def _checkpoint_digest(data):
+    """Sha256 hex digest of AT MOST `CHECKPOINT_MAX_CAPTURE_BYTES` of `data`
+    (bytes) -- the bounded stdout/stderr digest a CheckpointResult carries.
+    `None` for empty/absent output, never an empty-string digest standing in
+    for "no output"."""
+    if not data:
+        return None
+    return hashlib.sha256(data[:CHECKPOINT_MAX_CAPTURE_BYTES]).hexdigest()
+
+
+def mint_checkpoint_id(work_id=None):
+    """A fresh, caller-opaque checkpoint id: `ckpt-<uuid4 hex>`, optionally
+    prefixed by a sanitized `work_id` fragment purely for human log
+    readability -- never parsed back out of the id by any reader (the id's
+    only load-bearing property is uniqueness, exactly like a transaction
+    id)."""
+    token = uuid.uuid4().hex
+    if work_id:
+        safe = "".join(c if c.isalnum() else "-" for c in str(work_id))[:24]
+        return "ckpt-%s-%s" % (safe, token)
+    return "ckpt-%s" % token
+
+
+def build_and_persist_checkpoint_request(
+        session_uuid, checkpoint_id, work_id, phase, candidate_digest, argv,
+        cwd, mutation_class, status=CHECKPOINT_STATUS_REQUIRED, env=None,
+        expected_evidence=None, timeout_s=None, declared_output_paths=None):
+    """Author, normalize, and durably persist ONE CheckpointRequest -- the
+    orchestrator-owned, typed replacement for a prose "please run the tests"
+    turn. Pure orchestration data in, a normalized dict out (see
+    `normalize_checkpoint_request`); raises `CheckpointError` on a
+    caller-contract violation (a central-dispatch call site building a
+    malformed request is a bug to fail closed on, not to silently coerce).
+
+    Writing is durable (`state_store.write_json_atomic_durable`) and
+    idempotent by content: called twice for the SAME `checkpoint_id` with the
+    SAME fields, this simply re-writes the identical bytes -- the request is
+    authored exactly once per checkpoint_id in practice (a fresh id is
+    minted per dispatch via `mint_checkpoint_id`), but resume/retry paths
+    that recompute the same request from the same durable inputs never
+    corrupt an already-persisted one."""
+    raw = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_id": checkpoint_id,
+        "session_uuid": session_uuid,
+        "work_id": work_id,
+        "phase": phase,
+        "candidate_digest": candidate_digest,
+        "argv": list(argv or []),
+        "cwd": cwd,
+        "env": dict(env or {}),
+        "expected_evidence": list(expected_evidence or []),
+        "timeout_s": timeout_s,
+        "mutation_class": mutation_class,
+        "declared_output_paths": list(declared_output_paths or []),
+        "status": status,
+    }
+    normalized = normalize_checkpoint_request(raw)
+    path = state_store.checkpoint_request_path_for(session_uuid, checkpoint_id)
+    if not state_store.write_json_atomic_durable(path, normalized):
+        raise CheckpointError(
+            "checkpoint_request_persist_failed",
+            "could not durably persist checkpoint request %r" % checkpoint_id)
+    return normalized
+
+
+def _git_status_entries(cwd):
+    """`{relative_path: two_char_status_code}` from `git status --porcelain`
+    at `cwd`, or `None` when `cwd` is not inside a git worktree / git is
+    unavailable -- the caller falls back to watching only the request's own
+    `declared_output_paths` in that case. A rename's entry keys on its
+    DESTINATION path only (`"R  old -> new"` -> `new`), matching how a
+    checkpoint's own declared/reported output paths are named."""
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=cwd, capture_output=True,
+            text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    entries = {}
+    for line in completed.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        code, path = line[:2], line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        entries[path.strip('"')] = code
+    return entries
+
+
+def _snapshot_mutation_watch(cwd, declared_output_paths):
+    """The BEFORE/AFTER snapshot `run_checkpoint` diffs to derive
+    `mutation_detected`/`output_paths`/`generated_paths` without trusting the
+    executed command's own say-so.
+
+    Prefers a WHOLE-TREE `git status --porcelain` snapshot (`_git_status_
+    entries`) when `cwd` is a git worktree -- this catches an UNDECLARED
+    mutated/new path too (never silently missed just because a live_candidate
+    request never named it -- that path still fails `_authorize_live_
+    candidate_mutations`'s declared-output check below, and still trips
+    `validate_checkpoint_result_against_request`'s `checkpoint_result_
+    unauthorized_mutation` for `read_only`/`isolated`). Falls back to a
+    `state_store.build_manifest` over `declared_output_paths` ALONE only when
+    `cwd` is not a git worktree / git is unavailable -- narrower, but the
+    only signal available without git."""
+    entries = _git_status_entries(cwd)
+    if entries is not None:
+        return {"kind": "git", "entries": entries}
+    return {"kind": "manifest",
+           "manifest": state_store.build_manifest(
+               cwd, declared_output_paths or [])}
+
+
+def _diff_mutation_watch(before, after):
+    """`(mutated, generated)` sorted-list pair from a `_snapshot_mutation_
+    watch` BEFORE/AFTER pair -- `generated` (a subset of `mutated`) is every
+    path that is BRAND NEW (did not exist before). GIT snapshots: `mutated`
+    is every path whose status entry changed (including appearing fresh);
+    `generated` is every freshly-appeared path git reports untracked
+    (`"??"`). MANIFEST-fallback snapshots: a hash-changed-or-newly-readable
+    diff, matching the pre-git-fallback behavior exactly."""
+    if before.get("kind") == "git":
+        before_entries = before.get("entries") or {}
+        after_entries = after.get("entries") or {}
+        mutated = sorted(p for p, code in after_entries.items()
+                         if before_entries.get(p) != code)
+        generated = sorted(p for p in mutated
+                           if p not in before_entries
+                           and after_entries.get(p) == "??")
+        return mutated, generated
+    before_by_path = {e["path"]: e
+                      for e in (before.get("manifest") or {}).get("files", [])}
+    mutated, generated = [], []
+    for entry in (after.get("manifest") or {}).get("files", []):
+        path = entry["path"]
+        prior = before_by_path.get(path)
+        prior_ok = bool(prior) and prior.get("state") == "ok"
+        if entry.get("state") == "ok" and (
+                not prior_ok or prior.get("sha256") != entry.get("sha256")):
+            mutated.append(path)
+            if not prior_ok:
+                generated.append(path)
+    return sorted(mutated), sorted(generated)
+
+
+def _authorize_live_candidate_mutations(cwd, declared_output_paths,
+                                         mutated_paths):
+    """For `mutation_class=live_candidate` ONLY: every mutated path must be
+    BOTH a declared output (`OwnedScope.is_declared_output`, unmodified) AND
+    an owned, recoverable write per `cowork_action_policy.decide(...)`,
+    unmodified -- the exact reuse the frozen brief requires, never a
+    re-derived ownership rule of this module's own invention. Returns the
+    sorted list of mutated paths that FAILED either check (empty when every
+    mutation is authorized).
+
+    `cowork_action_policy` is imported LAZILY, here, rather than at module
+    level: Package A's own isolated-import-boundary test fixtures copy only
+    THIS module (plus its known `cowork_state`/`cowork_ledger` siblings) into
+    a standalone directory to prove this module's own seam-unavailable/
+    import-error propagation semantics in isolation (see
+    `scripts/test_m5_package_a_contracts.py`'s `WorkerSubprocessMissingSeam
+    SiblingsTests`/`NarrowedImportErrorHandlingTests`) -- a module-level
+    import of a dependency those fixtures never copy would break that
+    isolation for every caller, not just the one live_candidate mutation
+    path that actually needs it."""
+    import cowork_action_policy as action_policy
+    # `repo_roots` is deliberately LEFT EMPTY: `OwnedScope.owns()` treats
+    # every path under any `repo_roots` entry as owned regardless of
+    # `declared_outputs` (the same broad "the whole repo is recoverable via
+    # git" rule an agent's own writes are checked against) -- passing
+    # `cwd` as a repo root here would make EVERY path inside the checkout
+    # pass `decide()`, silently defeating the declared-output restriction
+    # this function exists to enforce. `declared_outputs` alone is the
+    # checkpoint's entire authorized-write surface.
+    scope = action_policy.OwnedScope(
+        declared_outputs=tuple(
+            os.path.join(cwd, p) for p in (declared_output_paths or [])))
+    unauthorized = []
+    for rel in mutated_paths:
+        abs_path = os.path.join(cwd, rel)
+        if not scope.is_declared_output(abs_path):
+            unauthorized.append(rel)
+            continue
+        action = {"class": "write", "targets": [abs_path],
+                  "resolution_complete": True}
+        decision = action_policy.decide(action, scope)
+        if not decision.get("allow"):
+            unauthorized.append(rel)
+    return sorted(unauthorized)
+
+
+def _checkpoint_evidence_state(expected_evidence, cwd, exit_code, timed_out):
+    """Reuse this module's own `EVIDENCE_PRESENT`/`EVIDENCE_UNRESOLVED`/
+    `EVIDENCE_ABSENT` vocabulary for a checkpoint's result, exactly as an
+    owned verification attempt already does -- never a parallel one. A timed
+    out run is always unresolved; named `expected_evidence` paths (relative
+    to `cwd`) must ALL exist on disk for evidence to be present; with no
+    `expected_evidence` declared, a zero exit code alone counts as
+    present."""
+    if timed_out:
+        return EVIDENCE_UNRESOLVED
+    if expected_evidence:
+        if all(os.path.exists(os.path.join(cwd, p)) for p in
+              expected_evidence):
+            return EVIDENCE_PRESENT
+        return EVIDENCE_ABSENT
+    return EVIDENCE_PRESENT if exit_code == 0 else EVIDENCE_ABSENT
+
+
+def submit_checkpoint_result(session_uuid, checkpoint_id, raw_result):
+    """THE seam: cross-check one submitted CheckpointResult against its own
+    CheckpointRequest and claim, then publish the terminal CheckpointReceipt
+    exactly once. This is the SOLE path a CheckpointResult -- however
+    produced, by `run_checkpoint` below or by a genuinely separate executor
+    process submitting one out of band -- can ever become a receipt.
+
+    Fail-closed rejection categories, each caught and turned into a
+    `verdict=rejected` receipt (never a raised exception the caller has to
+    separately handle -- a bad result is not a caller bug, it is exactly the
+    thing this seam exists to catch and record):
+
+      - missing request (`checkpoint_request_missing`);
+      - malformed result shape (`normalize_checkpoint_result`'s own codes);
+      - wrong `executor_identity` -- does not match the checkpoint's own
+        claim (`checkpoint_result_wrong_executor`);
+      - wrong `argv`/`cwd`, over-broad output, or unauthorized mutation for
+        `read_only`/`isolated` (`validate_checkpoint_result_against_request`'s
+        own codes);
+      - for `mutation_class=live_candidate`, a mutated path that is not both
+        a declared output AND action-policy-authorized
+        (`checkpoint_result_unauthorized_mutation`).
+
+    Once-only, claim-gated: a checkpoint with no claim at all refuses
+    (`checkpoint_not_claimed` -- a result may never be accepted for a
+    checkpoint nothing ever claimed to execute); a checkpoint whose claim is
+    ALREADY terminal returns the existing receipt UNCHANGED (a stale/
+    duplicate resubmission is a no-op, never a second publish or a
+    re-execution) -- delegated entirely to `publish_checkpoint_receipt`'s own
+    durable, receipt-first once-only guard.
+
+    Returns the published (or already-terminal, unchanged) CheckpointReceipt
+    dict."""
+    request = state_store.read_json_tolerant(
+        state_store.checkpoint_request_path_for(session_uuid, checkpoint_id))
+    if request is None:
+        raise CheckpointError(
+            "checkpoint_request_missing",
+            "no CheckpointRequest persisted for checkpoint_id=%r"
+            % (checkpoint_id,))
+    claim = state_store.read_json_tolerant(
+        state_store.checkpoint_claim_path_for(session_uuid, checkpoint_id))
+    if not isinstance(claim, dict) or not claim.get("state"):
+        raise CheckpointError(
+            "checkpoint_not_claimed",
+            "checkpoint_id=%r has no claim -- a result may only be "
+            "submitted for a claimed checkpoint" % (checkpoint_id,))
+    if claim.get("state") == CHECKPOINT_CLAIM_TERMINAL:
+        return state_store.read_json_tolerant(
+            state_store.checkpoint_receipt_path_for(session_uuid,
+                                                     checkpoint_id))
+
+    verdict = CHECKPOINT_ACCEPTED
+    rejection_reason = None
+    normalized_result = None
+    try:
+        normalized_result = normalize_checkpoint_result(raw_result)
+        if normalized_result.get("executor_identity") != claim.get(
+                "executor_identity"):
+            raise CheckpointError(
+                "checkpoint_result_wrong_executor",
+                "result executor_identity %r does not match the claim's "
+                "own executor_identity %r"
+                % (normalized_result.get("executor_identity"),
+                   claim.get("executor_identity")))
+        validate_checkpoint_result_against_request(normalized_result, request)
+        if request.get("mutation_class") == MUTATION_CLASS_LIVE_CANDIDATE:
+            reported = sorted(
+                set(normalized_result.get("output_paths") or [])
+                | set(normalized_result.get("generated_paths") or []))
+            unauthorized = _authorize_live_candidate_mutations(
+                request["cwd"], request.get("declared_output_paths"),
+                reported)
+            if unauthorized:
+                raise CheckpointError(
+                    "checkpoint_result_unauthorized_mutation",
+                    "mutated path(s) %s are not both a declared output and "
+                    "action-policy-authorized" % (unauthorized,))
+        if normalized_result.get("timed_out"):
+            raise CheckpointError(
+                "checkpoint_result_timed_out",
+                "checkpoint_id=%r timed out" % (checkpoint_id,))
+        if normalized_result.get("exit_code") != 0:
+            raise CheckpointError(
+                "checkpoint_result_nonzero_exit",
+                "checkpoint_id=%r exited %r"
+                % (checkpoint_id, normalized_result.get("exit_code")))
+        if normalized_result.get("evidence_state") != EVIDENCE_PRESENT:
+            raise CheckpointError(
+                "checkpoint_result_evidence_not_present",
+                "checkpoint_id=%r evidence_state=%r"
+                % (checkpoint_id, normalized_result.get("evidence_state")))
+    except CheckpointError as exc:
+        verdict = CHECKPOINT_REJECTED
+        rejection_reason = exc.code
+        if normalized_result is None:
+            # Malformed beyond normalization -- persist nothing not already
+            # durable; the receipt below still binds by checkpoint_id/phase/
+            # candidate straight from the (trustworthy) request.
+            normalized_result = None
+
+    if normalized_result is not None:
+        state_store.write_json_atomic_durable(
+            state_store.checkpoint_result_path_for(session_uuid,
+                                                    checkpoint_id),
+            normalized_result)
+
+    receipt = normalize_checkpoint_receipt({
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_id": checkpoint_id,
+        "session_uuid": session_uuid,
+        "work_id": request.get("work_id"),
+        "phase": request["phase"],
+        "candidate_digest": request["candidate_digest"],
+        "verdict": verdict,
+        "rejection_reason": rejection_reason,
+        "result": normalized_result,
+        "claim": claim,
+        "terminal": True,
+    })
+    published, stored = publish_checkpoint_receipt(
+        session_uuid, checkpoint_id, receipt)
+    return stored if stored is not None else receipt
+
+
+def run_checkpoint(session_uuid, checkpoint_id, executor_identity=None):
+    """THE deterministic, non-model runner (frozen brief: "a deterministic
+    non-model runner with exclusive once-only claim/lease, persisted
+    executor identity, bounded stdout/stderr digests, terminal publication,
+    and exact candidate binding"): claim the checkpoint exclusively, execute
+    its own orchestrator-authored `argv`/`cwd` -- never a plan- or
+    agent-supplied value -- as a real subprocess, and hand the observed
+    result to `submit_checkpoint_result` for cross-checking and once-only
+    publication.
+
+    `executor_identity` defaults to this process's own persisted identity
+    (`_checkpoint_executor_identity`) -- ONLY a caller simulating a distinct
+    executor (tests) overrides it.
+
+    ONCE-ONLY: if the exclusive claim is already held (by this or any other
+    executor), NOTHING is executed -- the checkpoint may not be run twice.
+    An already-terminal checkpoint returns its existing receipt unchanged; a
+    checkpoint claimed but not yet terminal raises `CheckpointError`
+    (`checkpoint_already_claimed`) rather than silently re-running someone
+    else's in-flight command.
+
+    Returns the published CheckpointReceipt dict."""
+    request = state_store.read_json_tolerant(
+        state_store.checkpoint_request_path_for(session_uuid, checkpoint_id))
+    if request is None:
+        raise CheckpointError(
+            "checkpoint_request_missing",
+            "no CheckpointRequest persisted for checkpoint_id=%r"
+            % (checkpoint_id,))
+    executor_identity = executor_identity or _checkpoint_executor_identity()
+    claimed, claim_record = claim_checkpoint(
+        session_uuid, checkpoint_id, executor_identity)
+    if not claimed:
+        if isinstance(claim_record, dict) and claim_record.get(
+                "state") == CHECKPOINT_CLAIM_TERMINAL:
+            return state_store.read_json_tolerant(
+                state_store.checkpoint_receipt_path_for(session_uuid,
+                                                         checkpoint_id))
+        raise CheckpointError(
+            "checkpoint_already_claimed",
+            "checkpoint_id=%r is already claimed by executor_identity=%r"
+            % (checkpoint_id, (claim_record or {}).get("executor_identity")))
+
+    before = _snapshot_mutation_watch(
+        request["cwd"], request.get("declared_output_paths"))
+    started_at = _utc_now()
+    timed_out = False
+    try:
+        completed = subprocess.run(
+            request["argv"], cwd=request["cwd"],
+            env=dict(os.environ, **(request.get("env") or {})),
+            capture_output=True, timeout=request.get("timeout_s"),
+            check=False)
+        exit_code = completed.returncode
+        stdout_bytes, stderr_bytes = completed.stdout, completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        exit_code = None
+        stdout_bytes, stderr_bytes = exc.stdout or b"", exc.stderr or b""
+    except OSError as exc:
+        exit_code = None
+        stdout_bytes, stderr_bytes = str(exc).encode("utf-8", "replace"), b""
+    finished_at = _utc_now()
+    after = _snapshot_mutation_watch(
+        request["cwd"], request.get("declared_output_paths"))
+    mutated_paths, generated_paths = _diff_mutation_watch(before, after)
+
+    candidate_digest_after = request["candidate_digest"]
+    if mutated_paths:
+        candidate_digest_after = state_store.manifest_digest(
+            state_store.build_manifest(request["cwd"], mutated_paths))
+
+    raw_result = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_id": checkpoint_id,
+        "executor_identity": executor_identity,
+        "argv": list(request["argv"]),
+        "cwd": request["cwd"],
+        "exit_code": exit_code,
+        "evidence_state": _checkpoint_evidence_state(
+            request.get("expected_evidence"), request["cwd"], exit_code,
+            timed_out),
+        "candidate_digest_after": candidate_digest_after,
+        "stdout_digest": _checkpoint_digest(stdout_bytes),
+        "stderr_digest": _checkpoint_digest(stderr_bytes),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "generated_paths": generated_paths,
+        "output_paths": mutated_paths,
+        "mutation_detected": bool(mutated_paths),
+        "timed_out": timed_out,
+    }
+    return submit_checkpoint_result(session_uuid, checkpoint_id, raw_result)
+
+
+def reconstruct_all_checkpoints(session_uuid):
+    """Every checkpoint's full reconstructed state for one session, from
+    artifacts alone -- `{checkpoint_id: reconstruct_checkpoint_state(...)}`
+    -- built by enumerating `state_store.list_checkpoint_ids` and calling
+    Package A's own per-id `reconstruct_checkpoint_state` for each. This is
+    the crash/resume entry point: pending, claimed, and terminal checkpoints
+    are all reconstructed the same way, with no separate index file to drift
+    out of sync. Never raises; a session with no checkpoints yields `{}`."""
+    return {
+        checkpoint_id: reconstruct_checkpoint_state(session_uuid,
+                                                     checkpoint_id)
+        for checkpoint_id in state_store.list_checkpoint_ids(session_uuid)
+    }
 
 
 if __name__ == "__main__":

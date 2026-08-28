@@ -788,6 +788,49 @@ downstream is the receipt — never the builder's prose about verification:
   **avoided cost** attributed to the reused transaction — with no second
   incurred transaction.
 
+#### Checkpoints: typed, candidate-bound, deterministically-executed
+
+Beyond the whole-inventory owned transaction above, individual dispatch/
+role-loop points can require a **checkpoint**: a typed `CheckpointRequest`
+Cowork itself authors — never the plan, never the agent — and runs through a
+deterministic, non-model executor, exactly once:
+
+- **Typed and closed-schema.** `CheckpointRequest`/`CheckpointResult`/
+  `CheckpointReceipt` are versioned, closed-key JSON documents (unknown keys
+  rejected), never free-form prose relay. A request names an exact `argv` and
+  an orchestrator-owned `cwd`, a `mutation_class` (`read_only` / `isolated` /
+  `live_candidate`), and — for `live_candidate` only — a non-empty
+  `declared_output_paths`.
+- **Exclusive, once-only claim/lease.** A checkpoint is claimed by kernel-
+  exclusive file creation (`O_CREAT|O_EXCL`): two racing claimants can never
+  both win, and a checkpoint already claimed — by this or any other executor
+  — is never re-run. The terminal receipt is published exactly once,
+  receipt-first (durable before the claim is marked terminal), so a crash
+  between the two never leaves a false terminal marker with no receipt
+  behind it.
+- **Fail-closed cross-checks, not the result's own say-so.** A submitted
+  result is rejected — never silently accepted — for: a missing request, a
+  malformed/unversioned document, a mismatched `executor_identity`, wrong
+  `argv`/`cwd`, a reported output path outside the request's own declared
+  set (over-broad), or any reported mutation for a `read_only`/`isolated`
+  request (which must run genuinely unmutating). A `live_candidate`
+  checkpoint's mutated paths are additionally authorized through the SAME,
+  unmodified `cowork_action_policy` ownership/recoverability rule every other
+  agent-side mutation is checked against — never a parallel rule of the
+  checkpoint gateway's own invention.
+- **Exact candidate binding, never stale/superseded.** A checkpoint's receipt
+  binds one `candidate_digest`; advancing the real phase gate on it requires
+  that digest to equal the candidate actually being advanced (the same,
+  unmodified `gate_validated` evidence-matching the owned transaction's own
+  candidate binding already uses) — a stale or superseded checkpoint (any
+  checkpoint id other than the CURRENT one bound to that role's work) is
+  structurally never consulted, so it can never advance the real control
+  plane even if its own receipt were still `accepted`.
+- **Reconstructed from artifacts alone.** A checkpoint's pending, claimed, or
+  terminal state after a crash/resume is read back entirely from its own
+  request/claim/result/receipt files on disk — no separate index that could
+  itself drift out of sync.
+
 ### Evidence comes from the controllers' logs
 
 For everything **outside** an owned verification transaction — tool use,

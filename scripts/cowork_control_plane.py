@@ -744,3 +744,79 @@ def fingerprint(role, config_digest, provider, candidate, reason):
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# M5 Package E: checkpoint validators (garusis/cowork-internal#60)
+# ---------------------------------------------------------------------------
+#
+# PHASE_STATES/EVENTS/TRANSITIONS above are frozen -- `test_cowork_control_
+# plane.py::ReducerExhaustiveMatrixTest.test_legal_transitions_match_spec_
+# exactly` asserts `dict(TRANSITIONS)` equals an exact, hand-frozen table
+# this candidate is not authorized to edit, and that same module's
+# `test_taxonomy_is_closed_and_matches_spec` pins PHASE_STATES exactly. A
+# checkpoint is therefore never modeled as a new PHASE_STATE or a new
+# TRANSITIONS entry -- doing either would break both frozen assertions.
+#
+# Instead, an accepted, candidate-bound CheckpointReceipt is translated into
+# exactly the SAME `gate_validation` evidence shape `_gate_evidence_valid`/
+# `_gate_evidence_matches_candidate` already validate, so a checkpoint gates
+# the REAL, unmodified `advance()` entry point through its EXISTING
+# `gate_validated` event -- never a parallel, uninspected pathway. A stale or
+# cross-candidate checkpoint receipt fails `_gate_evidence_matches_candidate`
+# exactly like any other wrong-candidate gate evidence would: the frozen
+# reducer itself is the proof a stale/superseded claim cannot advance.
+_CHECKPOINT_ACCEPTED = "accepted"
+
+
+def checkpoint_receipt_to_gate_evidence(receipt, candidate_index=None):
+    """Translate one terminal, `verdict="accepted"` CheckpointReceipt (see
+    `cowork_verification.normalize_checkpoint_receipt`) into `advance()`'s
+    own `gate_validated` evidence shape: `{"gate_validation": {
+    "candidate_manifest_digest": <receipt's own candidate_digest>,
+    "candidate_index": candidate_index, "verdict": "pass"}}`.
+
+    Returns `None` -- never fabricated evidence -- for anything short of a
+    genuine, terminal, accepted receipt: `None`/non-dict input, `terminal`
+    not `True`, or `verdict` != `"accepted"`. The caller is still required
+    to pass the WorkUnit's own `expected_candidate` to `advance()`: THAT is
+    what makes a stale/cross-candidate receipt (naming a DIFFERENT
+    `candidate_manifest_digest` than the candidate actually being advanced)
+    fail `_gate_evidence_matches_candidate` and refuse to complete, exactly
+    like any other candidate mismatch -- this function only shapes the
+    evidence, it never itself compares candidates."""
+    if not isinstance(receipt, dict):
+        return None
+    if receipt.get("terminal") is not True:
+        return None
+    if receipt.get("verdict") != _CHECKPOINT_ACCEPTED:
+        return None
+    digest = receipt.get("candidate_digest")
+    if not isinstance(digest, str) or not digest:
+        return None
+    return {"gate_validation": {
+        "candidate_manifest_digest": digest,
+        "candidate_index": candidate_index,
+        "verdict": "pass",
+    }}
+
+
+def checkpoint_blocks_advance(checkpoint_status, receipt=None):
+    """True when a REQUIRED checkpoint must block a `gate_validated`/
+    `turn_completed` advance attempt because it has no usable, accepted
+    receipt yet -- the pure predicate a caller consults BEFORE ever building
+    `advance()` evidence, so a missing/pending/claimed/rejected checkpoint
+    never even reaches the reducer as a fabricated pass.
+
+    `checkpoint_status` is one of `"pending"`, `"claimed"`, `"terminal"`, or
+    `"unknown"` (see `cowork_verification.reconstruct_checkpoint_state`'s own
+    `state` field). Blocks (`True`) for every status except `"terminal"` with
+    an accepted `receipt`; a `"terminal"` status with a REJECTED receipt
+    still blocks (a rejected checkpoint is resolved, not passing) -- only a
+    `"terminal"` + `verdict="accepted"` receipt clears the block."""
+    if checkpoint_status != "terminal":
+        return True
+    if not isinstance(receipt, dict) or receipt.get("verdict") != (
+            _CHECKPOINT_ACCEPTED):
+        return True
+    return False

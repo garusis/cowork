@@ -6308,3 +6308,57 @@ def activity_status_age_seconds(since, now):
     since_dt = _parse_activity_timestamp(since)
     now_dt = _parse_activity_timestamp(now)
     return max(0.0, (now_dt - since_dt).total_seconds())
+
+
+# --------------------------------------------------------------------------- #
+# M5 Package E: additive resume reconstruction for checkpoints                #
+# (garusis/cowork-internal#60). `cowork_verification.py` already owns a      #
+# per-checkpoint reconstruction primitive (`reconstruct_checkpoint_state`),  #
+# but that module imports THIS one as `state_store` -- a module-level import #
+# back from here to there would be circular. The tiny pending/claimed/       #
+# terminal classification is therefore intentionally duplicated here (never  #
+# imported), exactly like `cowork_control_plane.py` already independently    #
+# duplicates constants/logic it needs from `cowork_capacity.py` for the same #
+# stdlib-only/no-back-import reason (see that module's own docstring notes). #
+# --------------------------------------------------------------------------- #
+
+# Duplicated verbatim from `cowork_verification.CHECKPOINT_CLAIM_CLAIMED`/
+# `CHECKPOINT_CLAIM_TERMINAL` -- see this section's own docstring for why
+# this is an intentional, independent copy rather than an import.
+_CHECKPOINT_CLAIM_CLAIMED = "claimed"
+_CHECKPOINT_CLAIM_TERMINAL = "terminal"
+
+
+def reconstruct_session_checkpoints(session_uuid):
+    """Every checkpoint's raw artifacts and coarse lifecycle state for one
+    session, reconstructed from disk alone -- `{checkpoint_id: {"request",
+    "claim", "result", "receipt", "state"}}`, `state` one of `"pending"` (a
+    request exists, no claim yet), `"claimed"` (claimed, not yet terminal),
+    or `"terminal"` (a receipt was published). The crash/resume entry point
+    a caller uses to rebuild every pending/claimed/terminal checkpoint's
+    current-pointer bindings after a restart, with no separate index file
+    that could itself drift out of sync with the checkpoint directories it
+    describes. Never raises: every read is tolerant of a missing or
+    concurrently-written file; a session with no checkpoints yields `{}`."""
+    out = {}
+    for checkpoint_id in list_checkpoint_ids(session_uuid):
+        request = read_json_tolerant(
+            checkpoint_request_path_for(session_uuid, checkpoint_id))
+        claim = read_json_tolerant(
+            checkpoint_claim_path_for(session_uuid, checkpoint_id))
+        result = read_json_tolerant(
+            checkpoint_result_path_for(session_uuid, checkpoint_id))
+        receipt = read_json_tolerant(
+            checkpoint_receipt_path_for(session_uuid, checkpoint_id))
+        if isinstance(claim, dict) and claim.get(
+                "state") == _CHECKPOINT_CLAIM_TERMINAL:
+            state = "terminal"
+        elif isinstance(claim, dict) and claim.get(
+                "state") == _CHECKPOINT_CLAIM_CLAIMED:
+            state = "claimed"
+        else:
+            state = "pending"
+        out[checkpoint_id] = {"request": request, "claim": claim,
+                              "result": result, "receipt": receipt,
+                              "state": state}
+    return out

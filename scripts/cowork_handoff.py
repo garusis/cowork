@@ -106,6 +106,14 @@ SLOT_LABELS = {
                             "transaction result)",
     "checkpoint_receipt": "owned checkpoint receipt (orchestrator-run "
                           "checkpoint result)",
+    # M5 Package E (garusis/cowork-internal#60): the WAITING role's own
+    # import of its checkpoint's current status on wake/resume — distinct
+    # from D's `checkpoint_receipt` slot above, which is the REVIEWER's
+    # terminal-only receipt import. This slot's document may describe a
+    # pending/claimed checkpoint (no terminal receipt yet at all), which
+    # `checkpoint_receipt` never carries.
+    "checkpoint_status": "checkpoint status for your own pending dispatch "
+                         "(orchestrator-derived)",
     "review": "reviewer verdict + findings (JSON)",
     "payload": "hand-back note",
     "artifacts": "session artifact",
@@ -546,6 +554,32 @@ _FACT_SCHEMAS = {
     "disposition": _in({"pending_review", "accepted", "superseded_by_finding",
                         "rejected"}),
     "contradiction": lambda v: isinstance(v, bool),
+    # M5 Package D's five checkpoint facts (garusis/cowork-internal#60
+    # extension) were declared on the builder->build-reviewer edges but never
+    # given a closed per-key schema of their own here — M5D-R-m1 disposition
+    # (M5 Package E): each now validates against its OWN closed shape rather
+    # than silently falling back to the generic normalized-token check every
+    # other undeclared key gets. `checkpoint_phase` reuses the SAME closed
+    # `PHASES` enum every other `phase` fact already validates against (a
+    # checkpoint's `phase` field names the same scouting/planning/building
+    # vocabulary); `checkpoint_verdict`/`checkpoint_disposition` are local,
+    # independent closed-enum duplicates of `cowork_verification.
+    # CHECKPOINT_VERDICTS`/`DISPOSITIONS` (this module stays stdlib-only and
+    # does not import that runtime module — see this file's own "Pure
+    # stdlib." docstring line).
+    "checkpoint_id": is_content_free_token,
+    "checkpoint_phase": _in(PHASES),
+    "checkpoint_verdict": _in({"accepted", "rejected"}),
+    "checkpoint_disposition": _in({"pending_review", "accepted",
+                                  "superseded_by_finding", "rejected"}),
+    "checkpoint_superseded_count": lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0),
+    # Route 14's own fact (distinct from the five checkpoint_* facts above,
+    # which are D's reviewer-facing overlay tokens): the waiting role's own
+    # coarse lifecycle read, mirroring `cowork_state.reconstruct_session_
+    # checkpoints`'s `state` vocabulary minus `"unknown"` (this edge is never
+    # rendered for a checkpoint with no request at all).
+    "checkpoint_state": _in({"pending", "claimed", "terminal"}),
 }
 
 
@@ -925,6 +959,32 @@ def _render_eval_upstream(descriptor_lines, facts, ctx):
         % (descriptor_lines, FULL_REREAD_INSTRUCTION))
 
 
+# ---- route 14: checkpoint wake (M5 Package E, garusis/cowork-internal#60) -- #
+#
+# The WAITING role's own import of ITS checkpoint's status on wake/resume —
+# distinct from D's "builder->build-reviewer:review_ctx"/"review_resume"
+# edges above (the REVIEWER's terminal-only receipt import via the
+# `checkpoint_receipt` slot): this edge's `checkpoint_status` slot may
+# describe a PENDING or CLAIMED checkpoint (no terminal receipt at all yet),
+# which the reviewer edges never carry, and never restates D's own
+# `checkpoint_receipt`/`_render_owned_verification_block` region.
+
+def _render_checkpoint_wake(descriptor_lines, facts, ctx):
+    state = facts.get("checkpoint_state") or "pending"
+    if state == "terminal":
+        lede = ("Your dispatched checkpoint has reached a terminal verdict "
+                "(%s)." % (facts.get("checkpoint_verdict") or "unknown"))
+    elif state == "claimed":
+        lede = "Your dispatched checkpoint is claimed and running."
+    else:
+        lede = "Your dispatched checkpoint is pending execution."
+    return (
+        "%s Read its current status from disk:\n%s\n\n"
+        "This is an orchestrator-run, deterministic checkpoint result — "
+        "never agent prose. Continue once you have read it."
+        % (lede, descriptor_lines))
+
+
 # Each edge declares the artifact SOURCE SLOTS it may carry and, of those, which
 # are REQUIRED. render_handoff fails closed (SC1/SC2) when: an artifact is
 # untagged, an artifact's source is not declared for the edge, or a required slot
@@ -1084,6 +1144,16 @@ EDGES = {
         "from_role": "orchestrator", "to_role": "evaluator", "kind": "eval",
         "sources": ["upstream"], "required": ["upstream"], "facts": (),
         "render": _render_eval_upstream,
+    },
+    # route 14 (M5 Package E): the waiting role's own checkpoint-status
+    # import — distinct from D's `checkpoint_receipt` slot/routes above (see
+    # this edge's own section header for the full rationale).
+    "cowork->role:checkpoint_wake": {
+        "from_role": "orchestrator", "to_role": "role", "kind": "resume",
+        "sources": ["checkpoint_status"], "required": ["checkpoint_status"],
+        "facts": ("role", "checkpoint_id", "checkpoint_phase",
+                  "checkpoint_verdict", "checkpoint_state"),
+        "render": _render_checkpoint_wake,
     },
 }
 

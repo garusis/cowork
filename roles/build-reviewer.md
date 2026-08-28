@@ -107,6 +107,16 @@ With those files and the live delta, check:
    or one citing a transaction the owned state contradicts, is recorded as
    **superseded** and does NOT reopen the builder — only a non-verification
    blocking finding, or a validly-cited verification challenge, reopens.
+
+   **Checkpoints.** When the candidate is also gated by an orchestrator-run
+   checkpoint (a typed, claimed, deterministically-executed command — never
+   the builder's own turn), its **receipt** reaches you the same way: by
+   absolute path, plus a checkpoint overlay (checkpoint id, phase, verdict,
+   disposition) in your handoff facts. Trust the receipt's `verdict`, never
+   builder prose about it; a `rejected` receipt or one bound to a candidate
+   digest other than the one under review is a `revise`. Superseded/stale
+   checkpoint claims for the same work are mechanically suppressed from your
+   handoff (only a count, never their content) — do not go looking for them.
 7. **Hygiene.** No secrets, debug leftovers, stray scaffolding, or stray files;
    no git commit/PR side effects (the builder must not commit).
 

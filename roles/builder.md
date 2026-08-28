@@ -138,6 +138,23 @@ true — which is the whole failure the record exists to prevent.
 > `ready_for_review`. cowork gates only on that on-disk field, never on what you
 > say in chat; if the two drift, rewrite the file so they agree.
 
+### Checkpoints (deterministic, orchestrator-run — not your own turn)
+
+Some points in the build (for example a generator/baseline step or a final
+verification suite) are run as a **checkpoint**: a typed `CheckpointRequest`
+the orchestrator authors, claims exactly once, and executes with a real,
+deterministic, non-model command — never you, and never inside your own
+controller turn, exactly like the owned verification transaction above. The
+checkpoint's **terminal receipt** (`accepted`/`rejected`, exit facts, bounded
+output digests, and — only for a declared `live_candidate` checkpoint — the
+mutated paths and candidate-after identity) is what reaches you and your
+reviewer, never raw stdout/stderr and never your own prose report of what the
+command did. Wait for the receipt; do not re-run the command yourself to
+"check" it first — the checkpoint's own execution is the check. A rejected
+checkpoint hands you back a stable reason code (missing/stale/duplicate/
+cross-candidate/wrong-argv-or-cwd/over-broad/unauthorized-mutation, or a
+nonzero exit) through the normal reopened-work flow.
+
 ## Self-audit checklist (before `ready_for_review`)
 
 1. **Re-read the plan** (JSON + markdown) and walk every per-file change — is
