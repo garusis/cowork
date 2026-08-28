@@ -104,6 +104,8 @@ SLOT_LABELS = {
     "build_baseline": "build-baseline metadata (per-root start commit + dirty)",
     "verification_receipt": "owned verification receipt (orchestrator-run "
                             "transaction result)",
+    "checkpoint_receipt": "owned checkpoint receipt (orchestrator-run "
+                          "checkpoint result)",
     "review": "reviewer verdict + findings (JSON)",
     "payload": "hand-back note",
     "artifacts": "session artifact",
@@ -736,29 +738,68 @@ def _render_owned_verification_block(facts):
     closed-schema fact tokens (derived from Cowork-owned records — never from
     agent prose). Empty string when no owned receipt binds (legacy sessions
     render exactly as before). A set `contradiction` flag renders the marked
-    CONTRADICTION line."""
-    if not facts.get("txn_id"):
-        return ""
-    lines = [
-        "Owned verification receipt (orchestrator-derived — the authoritative",
-        "verification fact base for this review; the builder's own verification",
-        "prose is secondary to it):",
-        "  transaction=%s  verdict=%s  final_suite=%s (%s)"
-        % (facts.get("txn_id"), facts.get("verdict"),
-           facts.get("final_suite_label"), facts.get("final_suite_binding")),
-        "  manifest=%s  index=%s  commands=%s"
-        % (str(facts.get("manifest_digest"))[:12],
-           str(facts.get("index_digest"))[:12], facts.get("command_count")),
-        "  disposition=%s" % facts.get("disposition"),
-        "  The receipt file itself (result.json) reaches you by absolute path",
-        "  among the artifacts above (the verification_receipt slot).",
-    ]
-    if facts.get("contradiction"):
+    CONTRADICTION line.
+
+    Checkpoint scope (additive, M5 Package D, garusis/cowork-internal#24
+    extension): when the edge ALSO carries checkpoint-receipt facts
+    (`checkpoint_id` present), the SAME owned-facts discipline appends a
+    second, path-only block for that single checkpoint claim — rendered even
+    when no whole-transaction facts bind, never restating the checkpoint
+    receipt's own content (only the orchestrator-derived tokens; the receipt
+    file itself rides by path in the `checkpoint_receipt` artifact slot).
+    Stale/superseded checkpoint claims are never described here at all —
+    the caller mechanically excludes their facts and instead supplies only
+    `checkpoint_superseded_count`, rendered as a count-only suppression
+    note."""
+    lines = []
+    if facts.get("txn_id"):
+        lines = [
+            "Owned verification receipt (orchestrator-derived — the "
+            "authoritative",
+            "verification fact base for this review; the builder's own "
+            "verification",
+            "prose is secondary to it):",
+            "  transaction=%s  verdict=%s  final_suite=%s (%s)"
+            % (facts.get("txn_id"), facts.get("verdict"),
+               facts.get("final_suite_label"), facts.get("final_suite_binding")),
+            "  manifest=%s  index=%s  commands=%s"
+            % (str(facts.get("manifest_digest"))[:12],
+               str(facts.get("index_digest"))[:12], facts.get("command_count")),
+            "  disposition=%s" % facts.get("disposition"),
+            "  The receipt file itself (result.json) reaches you by absolute "
+            "path",
+            "  among the artifacts above (the verification_receipt slot).",
+        ]
+        if facts.get("contradiction"):
+            lines.append(
+                "  CONTRADICTION: the builder's own verification prose is "
+                "missing")
+            lines.append(
+                "  or disagrees with this receipt — trust the receipt, not "
+                "the prose.")
+    if facts.get("checkpoint_id"):
+        if lines:
+            lines.append("")
+        lines.extend([
+            "Owned checkpoint receipt (orchestrator-derived — a single "
+            "checkpoint's",
+            "terminal verdict; the receipt file itself reaches you by "
+            "absolute path",
+            "among the artifacts above, the checkpoint_receipt slot — never "
+            "restated",
+            "in prose here):",
+            "  checkpoint=%s  phase=%s  verdict=%s  disposition=%s"
+            % (facts.get("checkpoint_id"), facts.get("checkpoint_phase"),
+               facts.get("checkpoint_verdict"),
+               facts.get("checkpoint_disposition")),
+        ])
+    if facts.get("checkpoint_superseded_count"):
+        if lines:
+            lines.append("")
         lines.append(
-            "  CONTRADICTION: the builder's own verification prose is missing")
-        lines.append(
-            "  or disagrees with this receipt — trust the receipt, not the"
-            " prose.")
+            "  %d earlier checkpoint claim(s) for this work were superseded "
+            "and are suppressed here — see their receipts on disk only if "
+            "needed." % facts.get("checkpoint_superseded_count"))
     return "\n".join(lines)
 
 
@@ -959,31 +1000,39 @@ EDGES = {
         "sources": ["plan_json", "plan_md"], "required": ["plan_json", "plan_md"],
         "facts": (), "render": _render_plan_updated,
     },
-    # route 7 (build_summary + verification_receipt optional;
-    # build_status + build_baseline required). The ORCH-050 overlay facts are
-    # declared on BOTH edges; they ride only when an owned receipt binds.
+    # route 7 (build_summary + verification_receipt + checkpoint_receipt all
+    # optional; build_status + build_baseline required). The ORCH-050 overlay
+    # facts are declared on BOTH edges; they ride only when an owned receipt
+    # binds. `checkpoint_receipt` (M5 Package D, garusis/cowork-internal#24
+    # extension) is additive: a caller that never supplies checkpoint facts
+    # or the checkpoint_receipt artifact sees no change at all.
     "builder->build-reviewer:review_ctx": {
         "from_role": "builder", "to_role": "build-reviewer",
         "kind": "review_ctx",
         "sources": ["context", "plan_json", "plan_md", "build_status",
                     "build_summary", "build_baseline",
-                    "verification_receipt"],
+                    "verification_receipt", "checkpoint_receipt"],
         "required": ["context", "plan_json", "plan_md", "build_status",
                      "build_baseline"],
         "facts": ("team", "txn_id", "manifest_digest", "index_digest",
                   "verdict", "final_suite_label", "final_suite_binding",
-                  "command_count", "disposition", "contradiction"),
+                  "command_count", "disposition", "contradiction",
+                  "checkpoint_id", "checkpoint_phase", "checkpoint_verdict",
+                  "checkpoint_disposition", "checkpoint_superseded_count"),
         "ctx_keys": ("repos",),
         "render": _render_build_reviewer_ctx,
     },
     "builder->build-reviewer:review_resume": {
         "from_role": "builder", "to_role": "build-reviewer", "kind": "resume",
         "sources": ["plan_json", "plan_md", "build_status", "build_summary",
-                    "build_baseline", "verification_receipt"],
+                    "build_baseline", "verification_receipt",
+                    "checkpoint_receipt"],
         "required": ["plan_json", "plan_md", "build_status", "build_baseline"],
         "facts": ("team", "txn_id", "manifest_digest", "index_digest",
                   "verdict", "final_suite_label", "final_suite_binding",
-                  "command_count", "disposition", "contradiction"),
+                  "command_count", "disposition", "contradiction",
+                  "checkpoint_id", "checkpoint_phase", "checkpoint_verdict",
+                  "checkpoint_disposition", "checkpoint_superseded_count"),
         "ctx_keys": ("repos", "context_update_prefix"),
         "render": _render_build_reviewer_resume,
     },

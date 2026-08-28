@@ -3730,11 +3730,161 @@ def _verification_contradiction(session_uuid, txn_result, readiness,
     return False
 
 
-def _latest_verification_disposition(session_uuid, transaction_id):
+def checkpoint_disposition_path_for(session_uuid, checkpoint_id):
+    """Path of one checkpoint's own review-disposition record — sibling to
+    `state_store.checkpoint_receipt_path_for`'s file, inside the SAME
+    per-checkpoint directory (`state_store.checkpoint_dir_for`). A
+    checkpoint_id is already the sole key for its own directory, so no new
+    session-wide sidecar or `cowork_state.py` path helper is needed the way
+    the whole-transaction dispositions sidecar needed one (M5 Package D,
+    garusis/cowork-internal#24 extension)."""
+    return os.path.join(
+        state_store.checkpoint_dir_for(session_uuid, checkpoint_id),
+        "disposition.json")
+
+
+def checkpoint_latest_disposition(session_uuid, checkpoint_id):
+    """The latest recorded disposition for one checkpoint claim, or None —
+    the checkpoint analog of `_latest_verification_disposition` (D-0001),
+    reading the per-checkpoint record instead of the session-wide
+    transaction sidecar."""
+    if not (session_uuid and checkpoint_id):
+        return None
+    entry = state_store.read_json_tolerant(
+        checkpoint_disposition_path_for(session_uuid, checkpoint_id))
+    return (entry or {}).get("disposition")
+
+
+def checkpoint_emit_disposition(session_uuid, trace, checkpoint_id,
+                                disposition, review_round=None, work_id=None):
+    """Record ONE review disposition for a checkpoint claim — the checkpoint
+    analog of `_emit_verification_disposition` (D-0001/D-0002): PRIMARY the
+    `verification.disposition` trace event (carrying `checkpoint_id` rather
+    than `transaction_id`), PLUS the per-checkpoint disposition record
+    beside the checkpoint's own receipt, PLUS an in-place update of the
+    named `work_id`'s current-checkpoint binding when that binding still
+    names this checkpoint (so a same-process render sees the new value
+    without a re-join, mirroring D-0002 for checkpoints)."""
+    if not (session_uuid and checkpoint_id
+            and disposition in verification.DISPOSITIONS):
+        return
+    if trace:
+        trace.event("verification.disposition", checkpoint_id=checkpoint_id,
+                    disposition=disposition, review_round=review_round)
+    state_store.write_json_atomic(
+        checkpoint_disposition_path_for(session_uuid, checkpoint_id),
+        {"checkpoint_id": checkpoint_id, "disposition": disposition,
+         "review_round": review_round})
+    if not work_id:
+        return
+    pointer_path = state_store.current_checkpoint_pointer_path_for(
+        session_uuid, work_id)
+    pointer = state_store.read_json_tolerant(pointer_path)
+    if isinstance(pointer, dict) \
+            and pointer.get("checkpoint_id") == checkpoint_id \
+            and pointer.get("disposition") != disposition:
+        state_store.write_json_atomic(
+            pointer_path, dict(pointer, disposition=disposition))
+
+
+def checkpoint_overlay(pointer, disposition=None):
+    """THE ONE checkpoint overlay renderer — the checkpoint analog of
+    `verification_overlay`: a dict of content-free tokens derived from a
+    checkpoint pointer/binding (never a byte of raw stdout/stderr or agent
+    prose — a checkpoint's executor is a deterministic, non-model command,
+    but its result payload is still delivered by PATH only, never inlined).
+    `disposition` is the render-time join onto the latest disposition known
+    for the checkpoint claim; absent, the pointer's own field is used.
+    Returns None when there is no bound `checkpoint_id`."""
+    if not isinstance(pointer, dict) or not pointer.get("checkpoint_id"):
+        return None
+    return {
+        "checkpoint_id": pointer.get("checkpoint_id"),
+        "work_id": pointer.get("work_id"),
+        "phase": pointer.get("phase"),
+        "candidate_digest": pointer.get("candidate_digest"),
+        "verdict": pointer.get("verdict"),
+        "rejection_reason": pointer.get("rejection_reason"),
+        "disposition": (disposition or pointer.get("disposition")
+                        or verification.DISPOSITION_PENDING_REVIEW),
+    }
+
+
+def checkpoint_current_overlay(session_uuid, work_id):
+    """`(overlay, pointer)` for the CURRENT checkpoint bound to one role
+    engagement (`work_id`) — the checkpoint analog of
+    `_current_verification_overlay`. The binding at
+    `state_store.current_checkpoint_pointer_path_for` names the checkpoint
+    id; every other field is read straight from that checkpoint's own
+    TERMINAL receipt (never from an in-progress request/result, which are
+    not yet reviewer-facing), plus a `receipt_path` for path-only delivery
+    so a reviewer surface never has to touch `state_store.checkpoint_*`
+    paths itself. Returns `(None, None)` when nothing is bound yet or the
+    bound checkpoint has no terminal receipt."""
+    if not (session_uuid and work_id):
+        return None, None
+    binding = state_store.read_json_tolerant(
+        state_store.current_checkpoint_pointer_path_for(session_uuid, work_id))
+    checkpoint_id = (binding or {}).get("checkpoint_id")
+    if not checkpoint_id:
+        return None, None
+    receipt = state_store.read_json_tolerant(
+        state_store.checkpoint_receipt_path_for(session_uuid, checkpoint_id))
+    if not isinstance(receipt, dict):
+        return None, None
+    pointer = {
+        "checkpoint_id": checkpoint_id,
+        "work_id": receipt.get("work_id"),
+        "phase": receipt.get("phase"),
+        "candidate_digest": receipt.get("candidate_digest"),
+        "verdict": receipt.get("verdict"),
+        "rejection_reason": receipt.get("rejection_reason"),
+        "receipt_path": state_store.checkpoint_receipt_path_for(
+            session_uuid, checkpoint_id),
+        "disposition": isinstance(binding, dict) and binding.get(
+            "disposition") or None,
+    }
+    disposition = checkpoint_latest_disposition(session_uuid, checkpoint_id)
+    return checkpoint_overlay(pointer, disposition=disposition), pointer
+
+
+def checkpoint_superseded_ids(session_uuid, work_id, current_checkpoint_id):
+    """Every OTHER checkpoint id ever requested for this `work_id` besides
+    `current_checkpoint_id` — the stale/superseded claims a reviewer handoff
+    must mechanically suppress once a later checkpoint becomes the CURRENT
+    bound claim for the same role engagement. Read-only and count/id-only
+    (never a byte of the superseded claim's own content): derived from
+    `state_store.list_checkpoint_ids` plus each id's own `request.json`
+    `work_id` field, never from a separate index that could itself drift out
+    of sync."""
+    if not (session_uuid and work_id):
+        return []
+    superseded = []
+    for checkpoint_id in state_store.list_checkpoint_ids(session_uuid):
+        if checkpoint_id == current_checkpoint_id:
+            continue
+        request = state_store.read_json_tolerant(
+            state_store.checkpoint_request_path_for(session_uuid,
+                                                     checkpoint_id))
+        if isinstance(request, dict) and request.get("work_id") == work_id:
+            superseded.append(checkpoint_id)
+    return sorted(superseded)
+
+
+def _latest_verification_disposition(session_uuid, transaction_id,
+                                     checkpoint_id=None):
     """The latest sidecar disposition value for one transaction id, or None.
     The sidecar is the reconciled read-through cache of the
     `verification.disposition` trace events (D-0001); render surfaces read it
-    rather than replaying the trace."""
+    rather than replaying the trace.
+
+    Checkpoint scope (additive, M5 Package D): when `checkpoint_id` is given,
+    the SAME lookup is performed for a per-checkpoint claim instead — via
+    `checkpoint_latest_disposition` — and `transaction_id` is ignored;
+    every existing whole-transaction caller is unaffected since
+    `checkpoint_id` defaults to `None`."""
+    if checkpoint_id is not None:
+        return checkpoint_latest_disposition(session_uuid, checkpoint_id)
     if not (session_uuid and transaction_id):
         return None
     entry = state_store.read_verification_dispositions(
@@ -3744,13 +3894,25 @@ def _latest_verification_disposition(session_uuid, transaction_id):
 
 def _emit_verification_disposition(session_uuid, trace, transaction_id,
                                    disposition, review_round=None,
-                                   reviewed_manifest_digest=None):
+                                   reviewed_manifest_digest=None,
+                                   checkpoint_id=None, work_id=None):
     """Record ONE review disposition for an owned transaction (D-0001):
     PRIMARY the `verification.disposition` trace event, PLUS the reconciled
     sidecar entry written at the same moment, PLUS an in-place update of the
     current-receipt pointer's own `disposition` field when the pointer names
     this transaction (so a same-process render sees the new value without a
-    re-join, D-0002)."""
+    re-join, D-0002).
+
+    Checkpoint scope (additive, M5 Package D): when `checkpoint_id` is given,
+    the SAME disposition vocabulary is recorded for a per-checkpoint claim
+    instead — via `checkpoint_emit_disposition` — and `transaction_id`/
+    `reviewed_manifest_digest` are ignored; every existing whole-transaction
+    caller is unaffected since `checkpoint_id` defaults to `None`."""
+    if checkpoint_id is not None:
+        checkpoint_emit_disposition(
+            session_uuid, trace, checkpoint_id, disposition,
+            review_round=review_round, work_id=work_id)
+        return
     if not (session_uuid and transaction_id
             and disposition in verification.DISPOSITIONS):
         return
@@ -3856,7 +4018,17 @@ def verification_overlay(pointer, disposition=None):
     from the current-receipt pointer (which itself carries only owned state —
     never a byte of agent prose). `disposition` is the render-time join onto
     the latest disposition known for the transaction (D-0002); absent, the
-    pointer's own field is used. Returns None when there is no bound receipt."""
+    pointer's own field is used. Returns None when there is no bound receipt.
+
+    Checkpoint scope (additive, M5 Package D): a checkpoint pointer/binding
+    carries `checkpoint_id`, never `transaction_id` — the two key spaces are
+    disjoint by construction (`state_store.checkpoint_dir_for` vs.
+    `state_store.verification_transaction_dir`), so a pointer naming a
+    `checkpoint_id` is unambiguously routed to `checkpoint_overlay` instead,
+    with no new parameter needed and no change to any whole-transaction
+    caller's existing pointer shape or return value."""
+    if isinstance(pointer, dict) and pointer.get("checkpoint_id"):
+        return checkpoint_overlay(pointer, disposition=disposition)
     if not isinstance(pointer, dict) or not pointer.get("transaction_id"):
         return None
     return {
@@ -3873,11 +4045,20 @@ def verification_overlay(pointer, disposition=None):
     }
 
 
-def _current_verification_overlay(session_uuid):
+def _current_verification_overlay(session_uuid, work_id=None):
     """`(overlay, pointer)` for the CURRENT bound receipt, or `(None, None)`.
     The disposition is joined at render time from the sidecar so a resumed
     reviewer edge mid-loop shows the CURRENT value rather than hardcoding
-    `pending_review` (D-0002)."""
+    `pending_review` (D-0002).
+
+    Checkpoint scope (additive, M5 Package D): when `work_id` is given, the
+    CURRENT checkpoint bound to that role engagement is resolved instead —
+    via `checkpoint_current_overlay` — and `session_uuid` alone is used to
+    key the whole-transaction pointer exactly as before whenever `work_id`
+    is absent, so every existing caller (which never passes `work_id`) sees
+    no change at all."""
+    if work_id is not None:
+        return checkpoint_current_overlay(session_uuid, work_id)
     pointer = state_store.read_current_receipt_pointer(session_uuid)
     if not isinstance(pointer, dict) or not pointer.get("transaction_id"):
         return None, None
