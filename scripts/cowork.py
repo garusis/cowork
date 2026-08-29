@@ -4012,14 +4012,34 @@ def checkpoint_wake_block(session_uuid, work_id, role):
     disk from `verification.build_and_persist_checkpoint_request`/
     `claim_checkpoint`/`publish_checkpoint_receipt` is the wake payload).
 
-    Returns `None` — no wake needed — when nothing is bound for `work_id`."""
+    Returns `None` — no wake needed — when nothing is bound for `work_id`.
+
+    LIVENESS (M5 criterion 5, A-C5-CRASH-STRAND). Reconstruction goes
+    through `verification.reconstruct_checkpoint_state_with_liveness`, not
+    the bare `reconstruct_checkpoint_state`, so this production wake path is
+    a real call site for `classify_checkpoint_claim_liveness`. Without it a
+    checkpoint whose claimant crashed past its own persisted lease wakes the
+    role as plain `claimed` forever — the durable claim really does still
+    say `claimed`, and nothing else on this path could tell the role that
+    nobody is behind it any more.
+
+    The verdict is exposed ADDITIVELY, as the returned block's own
+    `checkpoint_claim_liveness` attribute, and deliberately NOT as a handoff
+    fact: `cowork_handoff`'s `cowork->role:checkpoint_wake` edge declares a
+    CLOSED fact vocabulary (`role`, `checkpoint_id`, `checkpoint_phase`,
+    `checkpoint_verdict`, `checkpoint_state`) and rejects any undeclared
+    fact, and widening that edge is not this seam's to do. The `checkpoint_
+    state` fact therefore keeps EXACTLY its existing four-value vocabulary
+    and is never overloaded with a liveness value — the two vocabularies are
+    disjoint and travel in separate, explicitly named channels, so no
+    consumer can read a crash-stranded claim as an ordinary live one."""
     binding = state_store.read_json_tolerant(
         state_store.current_checkpoint_pointer_path_for(session_uuid,
                                                          work_id))
     checkpoint_id = (binding or {}).get("checkpoint_id")
     if not checkpoint_id:
         return None
-    reconstructed = verification.reconstruct_checkpoint_state(
+    reconstructed = verification.reconstruct_checkpoint_state_with_liveness(
         session_uuid, checkpoint_id)
     state = reconstructed["state"]
     if state == "unknown":
@@ -4049,9 +4069,16 @@ def checkpoint_wake_block(session_uuid, work_id, role):
         # None (cowork_handoff._FACT_SCHEMAS["checkpoint_verdict"] is a
         # closed enum with no null member).
         facts["checkpoint_verdict"] = receipt["verdict"]
-    return handoff.render_handoff(
+    block = handoff.render_handoff(
         "cowork->role:checkpoint_wake", artifacts=artifacts, facts=facts,
         ctx={})
+    # Additive channel (see LIVENESS above): always present, always one of
+    # the classifier's own literals, never merged into `checkpoint_state`.
+    # The rendered prose is byte-identical to what this route rendered
+    # before — this attaches a fact the caller may read, and changes nothing
+    # the role is shown.
+    block.checkpoint_claim_liveness = reconstructed["claim_liveness"]
+    return block
 
 
 def _latest_verification_disposition(session_uuid, transaction_id,

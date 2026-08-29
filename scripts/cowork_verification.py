@@ -4077,17 +4077,65 @@ def run_checkpoint(session_uuid, checkpoint_id, executor_identity=None):
     return submit_checkpoint_result(session_uuid, checkpoint_id, raw_result)
 
 
-def reconstruct_all_checkpoints(session_uuid):
+def reconstruct_checkpoint_state_with_liveness(session_uuid, checkpoint_id,
+                                               now=None):
+    """`reconstruct_checkpoint_state` PLUS the durable liveness verdict for
+    the same checkpoint, joined as ONE ADDITIVE field: `claim_liveness`.
+    This is the reconstruction surface production wake/status paths use
+    (`cowork.checkpoint_wake_block`), and it is the reason
+    `classify_checkpoint_claim_liveness` has a real production call site
+    rather than test-only reachability.
+
+    WHY A SEPARATE FIELD, NOT A FIFTH `state`. `state` keeps EXACTLY its
+    four documented values (`"pending"`, `"claimed"`, `"terminal"`,
+    `"unknown"`) and `reconstruct_checkpoint_state` is re-used verbatim --
+    byte-for-byte unmodified -- so every existing consumer of `state` reads
+    precisely what it read before. The liveness verdict rides alongside
+    under its own key, drawn from `classify_checkpoint_claim_liveness`'s own
+    disjoint vocabulary (`"owned_verification"`, `"process_crash"`,
+    `"hung_descendant"`, `"no_evidence_silence"`). The two vocabularies
+    share no member, so no downstream reader can confuse a crash-stranded
+    claim with an ordinary live `claimed` one, and none can silently mistake
+    a liveness value for a lifecycle state.
+
+    THE DEFECT THIS CLOSES. A claimant that dies past its own persisted
+    lease leaves `state="claimed"` on disk forever -- correct as lifecycle
+    (nothing terminal was ever published) but indistinguishable, to every
+    reader, from a healthy claimant still doing the work. Pairing the two
+    fields makes the strand visible without rewriting, reclaiming, or
+    otherwise touching the claim: `{"state": "claimed", "claim_liveness":
+    "process_crash"}` says both true things at once.
+
+    `now` is threaded straight through to the classifier (`None` = current
+    UTC, else a datetime or RFC3339 string), so a caller or test injects a
+    clock instead of sleeping through a real lease. Classification stays
+    derived from DURABLE ARTIFACTS ALONE -- never terminal text, never a
+    live process handle, never in-memory state. Never raises: both halves
+    are individually total and read tolerantly."""
+    reconstructed = reconstruct_checkpoint_state(session_uuid, checkpoint_id)
+    reconstructed["claim_liveness"] = classify_checkpoint_claim_liveness(
+        session_uuid, checkpoint_id, now=now)
+    return reconstructed
+
+
+def reconstruct_all_checkpoints(session_uuid, now=None):
     """Every checkpoint's full reconstructed state for one session, from
-    artifacts alone -- `{checkpoint_id: reconstruct_checkpoint_state(...)}`
-    -- built by enumerating `state_store.list_checkpoint_ids` and calling
-    Package A's own per-id `reconstruct_checkpoint_state` for each. This is
-    the crash/resume entry point: pending, claimed, and terminal checkpoints
-    are all reconstructed the same way, with no separate index file to drift
-    out of sync. Never raises; a session with no checkpoints yields `{}`."""
+    artifacts alone -- `{checkpoint_id:
+    reconstruct_checkpoint_state_with_liveness(...)}` -- built by
+    enumerating `state_store.list_checkpoint_ids`. This is the crash/resume
+    entry point: pending, claimed, and terminal checkpoints are all
+    reconstructed the same way, with no separate index file to drift out of
+    sync. Never raises; a session with no checkpoints yields `{}`.
+
+    Each entry carries Package A's own unmodified `state` PLUS the additive
+    `claim_liveness` field (see
+    `reconstruct_checkpoint_state_with_liveness`), so a session resumed
+    after a claimant crash can tell a stranded `claimed` checkpoint from a
+    live one instead of reporting both identically forever. `now` is
+    threaded through to the classifier for deterministic time input."""
     return {
-        checkpoint_id: reconstruct_checkpoint_state(session_uuid,
-                                                     checkpoint_id)
+        checkpoint_id: reconstruct_checkpoint_state_with_liveness(
+            session_uuid, checkpoint_id, now=now)
         for checkpoint_id in state_store.list_checkpoint_ids(session_uuid)
     }
 
