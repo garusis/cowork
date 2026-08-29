@@ -49,7 +49,19 @@ _REPO_ROOT = os.path.dirname(_HERE)
 import cowork_activity as activity  # noqa: E402
 import cowork_bridge as bridge  # noqa: E402
 
-BASE_SHA = "cdef8067fea3b9b1f4fe1401c9c70ba3082fb9dc"
+BASE_SHA = "90cb8ee3b6969b2554f51e52e4cf3b62c2c2ddac"
+
+# This package's own signed commit (was previously proven only implicitly
+# by the live-working-tree diff below, which stopped being hermetic the
+# moment any later-landed package's edits were also present in the
+# worktree). CANDIDATE_SHA pins the allowlist proof to this package's own
+# committed diff instead. BASE_SHA above was rebound from the stale
+# "cdef8067..." pin (two commits further back, which swept in the
+# unrelated durable-activity-persistence commit's cowork_state.py /
+# test_cowork_state_m4.py changes) to this package's true immediate
+# parent; scripts/cowork_bridge.py is byte-identical between the old and
+# new BASE_SHA, so every AST-region assertion below is unaffected.
+CANDIDATE_SHA = "75892c8dee3985db3adf2cfe38aaace3b5cb9a33"
 
 # The exact six method regions the frozen brief authorizes edits inside.
 # Keyed as "ClassName.method_name" (see NamedRegionDiffProofTest for how
@@ -1606,29 +1618,20 @@ class NamedRegionDiffProofTest(unittest.TestCase):
                 % (BASE_SHA, exc))
 
     def test_only_allowlisted_paths_changed_since_base(self):
-        # HERMETIC against an integration worktree that already carries
-        # prior packages' commits (post-review fix for C-BLOCK-02): diffing
-        # against the raw signed base SHA is only hermetic in a worktree
-        # checked out EXACTLY at that commit -- never in the integration
-        # worktree this gate is meant to protect, once ANY other package
-        # (e.g. Package B's durable-activity-persistence commit) has
-        # landed on top of base. Package C never commits anything, so
-        # whatever is uncommitted right now -- `git diff HEAD` (tracked,
-        # modified) plus untracked files -- IS exactly C's own changeset,
-        # regardless of how many already-integrated packages' commits sit
-        # between the signed base and the current HEAD. See
-        # `test_head_descends_from_the_signed_base` for the separate
+        # Commit-pinned, not live-working-tree: this package's own
+        # authorship claim is a property of ITS OWN committed diff
+        # (BASE_SHA..CANDIDATE_SHA), not of whatever happens to be dirty in
+        # whichever worktree later runs this suite. The prior live-tree
+        # form (`git diff HEAD` + untracked status) was hermetic only until
+        # any OTHER package's own uncommitted test-only edits were also
+        # present in the same worktree, at which point it necessarily
+        # reported every one of those unrelated paths as an "offender".
+        # See `test_head_descends_from_the_signed_base` for the separate
         # binding check that HEAD is still base or a real descendant of it.
-        tracked = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "."],
+        changed = set(subprocess.run(
+            ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
             cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-        ).stdout.splitlines()
-        status = subprocess.run(
-            ["git", "status", "--porcelain=v1"],
-            cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-        ).stdout.splitlines()
-        untracked = [line[3:] for line in status if line.startswith("?? ")]
-        changed = {p.strip() for p in (tracked + untracked) if p.strip()}
+        ).stdout.splitlines())
         offenders = changed - ALLOWED_CHANGED_PATHS
         self.assertFalse(
             offenders,
@@ -1688,8 +1691,15 @@ class NamedRegionDiffProofTest(unittest.TestCase):
             "function/method bodies changed outside the six named "
             "regions: %s" % sorted(offenders))
 
-    def test_base_sha_matches_the_frozen_brief(self):
-        self.assertEqual(BASE_SHA, "cdef8067fea3b9b1f4fe1401c9c70ba3082fb9dc")
+    def test_base_sha_matches_the_rebound_immediate_parent(self):
+        self.assertEqual(BASE_SHA, "90cb8ee3b6969b2554f51e52e4cf3b62c2c2ddac")
+        self.assertEqual(CANDIDATE_SHA, "75892c8dee3985db3adf2cfe38aaace3b5cb9a33")
+        result = subprocess.run(
+            ["git", "rev-parse", "%s^" % CANDIDATE_SHA],
+            cwd=_REPO_ROOT, capture_output=True, text=True, check=True)
+        self.assertEqual(
+            result.stdout.strip(), BASE_SHA,
+            "CANDIDATE_SHA must be exactly one commit on top of BASE_SHA")
 
 
 if __name__ == "__main__":

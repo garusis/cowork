@@ -27370,6 +27370,132 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
                                      doc["hooks"]["PreToolUse"][0])
 
 
+class UngovernedChildBridgeDenialTests(unittest.TestCase):
+    """GC2.5 -- proves the `child_ungoverned` bridge path (cowork_bridge.py's
+    `ClaudeSession._send_turn`, `kind == "child_usage"` with an unresolvable
+    `parent_tool_use_id`) BLOCKS before any child usage is admitted or
+    recorded, not merely that it logs the denial. Reuses the
+    `bridge._guard_runtime`-adjacent FakeProc/ClaudeSession harness already
+    established above (`NestedGuardSettingsAssemblyTests`,
+    `test_codex_publishes_parent_work_before_guarded_turn`) -- a real
+    `ClaudeSession` with `_guard_runtime` attached directly, never through a
+    real broker socket."""
+
+    class _FakeProc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+            class _Stdin:
+                def write(self, s):
+                    pass
+
+                def flush(self):
+                    pass
+
+                def close(self):
+                    pass
+
+            self.stdin = _Stdin()
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    class _RecordingTrace:
+        session_uuid = "ungoverned-child"
+
+        def __init__(self):
+            self.events = []
+
+        def event(self, name, **fields):
+            self.events.append(dict(fields, event=name))
+
+    class _FakeBroker:
+        def __init__(self, resolvable):
+            self._resolvable = resolvable
+            self.recorded = []
+
+        def work_id_for_tool(self, parent_tool_use_id):
+            return self._resolvable.get(parent_tool_use_id)
+
+        def record_child_usage(self, child_work_id, usage, event_id=None,
+                               replayed=None):
+            self.recorded.append((child_work_id, usage, event_id, replayed))
+
+    @staticmethod
+    def _child_usage_line(parent_tool_use_id):
+        return json.dumps({
+            "type": "assistant", "parent_tool_use_id": parent_tool_use_id,
+            "message": {"usage": {"input_tokens": 1}, "content": []},
+        })
+
+    class _AliveThread:
+        def is_alive(self):
+            return True
+
+    def _session(self, lines, broker, trace):
+        import unittest.mock as mock
+        with mock.patch.object(
+                bridge.subprocess, "Popen",
+                return_value=self._FakeProc(lines)):
+            session = bridge.ClaudeSession(
+                "roles/scout.md", "implement", True, io_out=io.StringIO(),
+                trace=trace)
+        session._guard_runtime = {"broker": broker, "thread": self._AliveThread()}
+        return session
+
+    def test_unknown_parent_tool_use_id_denies_the_turn_with_child_ungoverned(
+            self):
+        broker = self._FakeBroker({})
+        session = self._session(
+            [self._child_usage_line("ungoverned")], broker,
+            self._RecordingTrace())
+        result = session.send("go")
+        self.assertTrue(result["denied"])
+        self.assertEqual(result["error_type"], "child_ungoverned")
+
+    def test_ungoverned_child_usage_is_never_recorded_by_the_broker(self):
+        broker = self._FakeBroker({})
+        session = self._session(
+            [self._child_usage_line("ungoverned")], broker,
+            self._RecordingTrace())
+        session.send("go")
+        self.assertEqual(broker.recorded, [])
+
+    def test_ungoverned_child_terminal_is_persisted_as_denied(self):
+        broker = self._FakeBroker({})
+        trace = self._RecordingTrace()
+        session = self._session(
+            [self._child_usage_line("ungoverned")], broker, trace)
+        session.send("go")
+        end_event = next(
+            event for event in trace.events
+            if event["event"] == "controller.turn.end")
+        self.assertEqual(end_event["result"], "denied")
+        self.assertEqual(end_event["work_class"], "failed")
+
+    def test_governed_child_usage_is_still_recorded(self):
+        broker = self._FakeBroker({"t1": "W-child"})
+        lines = [
+            self._child_usage_line("t1"),
+            json.dumps({"type": "result", "subtype": "success",
+                       "result": "ok", "session_id": "S1"}),
+        ]
+        session = self._session(lines, broker, self._RecordingTrace())
+        result = session.send("go")
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(broker.recorded), 1)
+        self.assertEqual(broker.recorded[0][0], "W-child")
+
+
 class NestedPersistenceRebuildTests(unittest.TestCase):
     def test_replayed_child_rows_are_idempotent(self):
         rows = [{"work_id": "c", "state": "started"},

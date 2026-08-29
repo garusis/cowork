@@ -1318,29 +1318,40 @@ class StructuralGatesTest(unittest.TestCase):
         doc = ast.get_docstring(tree)
         self.assertIn("M3A-REV-014", doc)
 
-    def test_git_status_shows_exactly_the_two_allowed_paths(self):
-        """D-N10: a NON-VACUOUS allowlist gate -- actually inspects `git
-        status` against the repo root, rather than merely asserting the
-        two files exist (which would trivially pass even if unrelated
-        files were also modified, or if it were run somewhere with no git
-        repo at all)."""
+    def test_commit_fa4f342_authorship_is_confined_to_the_two_allowed_paths(self):
+        """T1-REV-M1: a NON-VACUOUS, commit-pinned allowlist gate. The
+        prior live-tree form (`git status` against the repo root) proved
+        nothing the moment this worktree's own changes were committed (or
+        simply never dirtied in whichever environment ran this suite): a
+        clean tree yields zero offenders and the test trivially passes
+        without ever inspecting which paths this package actually
+        touched. Pinning to fa4f342 ("feat: add capacity scheduler lease
+        decisions" -- the exact commit that introduced this module and
+        its test suite) and diffing fa4f342^..fa4f342 instead proves,
+        against fixed git history rather than mutable working-tree state,
+        that authorship of that commit is confined to exactly the
+        original two-path allowlist."""
         repo_root = os.path.dirname(_HERE)
+        commit = "fa4f3423f85a91e4ae73f2e309cb5814c193aaec"
         try:
             result = subprocess.run(
-                ["git", "status", "--porcelain=v1"],
+                ["git", "diff", "--name-only", commit + "^.." + commit],
                 cwd=repo_root, capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             self.skipTest("git unavailable in this environment")
         if result.returncode != 0:
-            self.skipTest("git status failed: %s" % result.stderr)
-        changed = set()
-        for line in result.stdout.splitlines():
-            path = line[3:].strip()
-            if path:
-                changed.add(path)
+            self.skipTest("git diff failed: %s" % result.stderr)
+        changed = {line.strip() for line in result.stdout.splitlines()
+                  if line.strip()}
         allowed = {"scripts/cowork_capacity_scheduler.py",
                   "scripts/test_cowork_capacity_scheduler.py"}
-        self.assertEqual(changed, allowed)
+        # Non-vacuous: assert full equality, not merely "no offenders" --
+        # this must actually prove BOTH allowed paths were touched by this
+        # exact commit, not just that nothing else was.
+        self.assertEqual(
+            changed, allowed,
+            "commit %s changed paths %s, expected exactly the two-path "
+            "allowlist %s" % (commit, sorted(changed), sorted(allowed)))
 
 
 class ABCIntegrityTest(unittest.TestCase):

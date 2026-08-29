@@ -46,6 +46,12 @@ import cowork_verification_evidence as evidence_module  # noqa: E402
 # (m5-supervisor-checkpoints-plan-v2.json's own `base_commit`).
 BASE_SHA = "729c1750907151345c7326e49c2aef2d815bb5e3"
 
+# This package's own signed commit -- pins the changed-paths allowlist
+# proof to Package A's own committed diff (BASE_SHA..CANDIDATE_SHA) rather
+# than to whatever happens to be dirty in a worktree that also carries
+# later, unrelated packages' own uncommitted test-only edits.
+CANDIDATE_SHA = "eae4276d07a887a041177817221bf1b0bcdf99f0"
+
 # The exact, frozen five-path allowlist this package may change.
 ALLOWED_CHANGED_PATHS = frozenset({
     "scripts/cowork_verification.py",
@@ -87,16 +93,10 @@ REGRESSION_MODULES = (
 
 
 def _git_changed_paths():
-    tracked = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--", "."],
+    return set(subprocess.run(
+        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
         cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    untracked = [line[3:] for line in status if line.startswith("?? ")]
-    return {p.strip() for p in (tracked + untracked) if p.strip()}
+    ).stdout.splitlines())
 
 
 def _git_show(rev, rel_path):
@@ -187,6 +187,14 @@ class AllowlistAndHashTests(unittest.TestCase):
             "paths changed outside the frozen five-path allowlist: %s"
             % sorted(offenders))
 
+    def test_candidate_sha_is_exactly_one_commit_on_base_sha(self):
+        result = subprocess.run(
+            ["git", "rev-parse", "%s^" % CANDIDATE_SHA],
+            cwd=_REPO_ROOT, capture_output=True, text=True, check=True)
+        self.assertEqual(
+            result.stdout.strip(), BASE_SHA,
+            "CANDIDATE_SHA must be exactly one commit on top of BASE_SHA")
+
     def test_all_five_owned_paths_py_compile(self):
         for rel in sorted(ALLOWED_CHANGED_PATHS):
             path = os.path.join(_REPO_ROOT, rel)
@@ -215,10 +223,15 @@ class ExcludedPathsUntouchedTests(unittest.TestCase):
     byte-identical to the signed base commit."""
 
     def test_excluded_paths_are_byte_identical_to_base(self):
+        # Commit-pinned, not live-working-tree: this package's own
+        # read-only claim over each excluded path is a property of ITS OWN
+        # committed diff (BASE_SHA..CANDIDATE_SHA) -- the live-tree form is
+        # inherently stale once this package is itself historical and a
+        # LATER, unrelated package's own uncommitted test-only edits share
+        # the same worktree.
         for rel in EXCLUDED_PATHS:
             base_bytes = _git_show(BASE_SHA, rel)
-            with open(os.path.join(_REPO_ROOT, rel), "rb") as fh:
-                current_bytes = fh.read()
+            current_bytes = _git_show(CANDIDATE_SHA, rel)
             self.assertEqual(
                 current_bytes, base_bytes,
                 "%s must be byte-identical to the signed base commit "
@@ -335,10 +348,14 @@ class ExtractionReexportStructuralTests(unittest.TestCase):
                       evidence_module._wait_for_attempt_and_revise_ledger)
 
     def test_test_cowork_py_is_byte_identical_to_base(self):
+        # Commit-pinned, not live-working-tree: this package's own
+        # read-only claim over test_cowork.py is a property of ITS OWN
+        # committed diff (BASE_SHA..CANDIDATE_SHA), exactly like
+        # `test_excluded_paths_are_byte_identical_to_base` above -- never
+        # whatever a later, unrelated package's own uncommitted test-only
+        # edits also happen to add to the same file in the same worktree.
         base_bytes = _git_show(BASE_SHA, "scripts/test_cowork.py")
-        with open(os.path.join(_REPO_ROOT, "scripts", "test_cowork.py"),
-                 "rb") as fh:
-            current_bytes = fh.read()
+        current_bytes = _git_show(CANDIDATE_SHA, "scripts/test_cowork.py")
         self.assertEqual(current_bytes, base_bytes)
 
 

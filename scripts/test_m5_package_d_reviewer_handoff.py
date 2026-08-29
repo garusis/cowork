@@ -60,8 +60,14 @@ import cowork_handoff as handoff  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 
-# The exact signed base this package's brief is bound to.
-BASE_SHA = "eae4276d07a887a041177817221bf1b0bcdf99f0"
+# D's true parent commit (E12: D's authorship claim is about its own commit,
+# whose parent is this SHA, not the superseded pin that swept packages B and
+# C into D's diff).
+BASE_SHA = "6b9f28fef01f9b80e59b4b4701fb13579f29f4af"
+
+# D's own signed commit -- the ownership/identity assertions below measure
+# D's committed diff (BASE_SHA..CANDIDATE_SHA), not the live working tree.
+CANDIDATE_SHA = "f754c8b3dfa11d8cc37287cb0db613e83ba21f20"
 
 # The exact, frozen three-path allowlist this package may change.
 ALLOWED_CHANGED_PATHS = frozenset({
@@ -99,16 +105,11 @@ TOUCHED_HANDOFF_ASSIGNMENTS = frozenset({"SLOT_LABELS", "EDGES"})
 
 
 def _git_changed_paths():
-    tracked = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--", "."],
+    result = subprocess.run(
+        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
         cwd=_REPO_ROOT, capture_output=True, text=True, check=True
     ).stdout.splitlines()
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    untracked = [line[3:] for line in status if line.startswith("?? ")]
-    return {p.strip() for p in (tracked + untracked) if p.strip()}
+    return {p.strip() for p in result if p.strip()}
 
 
 def _git_show_bytes(rev, rel_path):
@@ -213,13 +214,9 @@ class EveryOtherTrackedFileByteIdenticalTests(unittest.TestCase):
 
     def test_every_non_owned_base_tracked_file_is_unchanged(self):
         for rel in sorted(_base_tracked_paths() - ALLOWED_CHANGED_PATHS):
-            local_path = os.path.join(_REPO_ROOT, rel)
-            if not os.path.exists(local_path):
-                self.fail("%s existed at the signed base commit but is "
-                         "missing from the working tree" % rel)
             base_bytes = _git_show_bytes(BASE_SHA, rel)
             self.assertEqual(
-                _read_local(rel), base_bytes,
+                _git_show_bytes(CANDIDATE_SHA, rel), base_bytes,
                 "%s must be byte-identical to the signed base commit "
                 "(outside this package's writable scope)" % rel)
 
@@ -230,7 +227,8 @@ class EveryOtherTrackedFileByteIdenticalTests(unittest.TestCase):
         # assigned to Package E's owned integration surface instead (see the
         # module docstring above).
         for rel in PACKAGE_A_OWNED_PATHS:
-            self.assertEqual(_read_local(rel), _git_show_bytes(BASE_SHA, rel),
+            self.assertEqual(_git_show_bytes(CANDIDATE_SHA, rel),
+                             _git_show_bytes(BASE_SHA, rel),
                              "%s must be byte-identical to the signed base "
                              "commit" % rel)
 
@@ -241,7 +239,7 @@ class ReservedDispatchCallSitesByteIdenticalTests(unittest.TestCase):
 
     def test_reserved_call_sites_survive_verbatim_in_the_candidate(self):
         base_source = _git_show_text(BASE_SHA, "scripts/cowork.py")
-        candidate_source = _read_local("scripts/cowork.py").decode("utf-8")
+        candidate_source = _git_show_text(CANDIDATE_SHA, "scripts/cowork.py")
         for lineno in RESERVED_CALL_SITE_BASE_LINES:
             segment = _statement_source_at_base_line(base_source, lineno)
             self.assertIn(
@@ -265,7 +263,7 @@ class CoworkSymbolOwnershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         base_source = _git_show_text(BASE_SHA, "scripts/cowork.py")
-        candidate_source = _read_local("scripts/cowork.py").decode("utf-8")
+        candidate_source = _git_show_text(CANDIDATE_SHA, "scripts/cowork.py")
         cls.base_symbols = _top_level_symbols(ast.parse(base_source))
         cls.candidate_symbols = _top_level_symbols(ast.parse(candidate_source))
 
@@ -313,8 +311,8 @@ class HandoffSymbolOwnershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         base_source = _git_show_text(BASE_SHA, "scripts/cowork_handoff.py")
-        candidate_source = _read_local(
-            "scripts/cowork_handoff.py").decode("utf-8")
+        candidate_source = _git_show_text(
+            CANDIDATE_SHA, "scripts/cowork_handoff.py")
         cls.base_symbols = _top_level_symbols(ast.parse(base_source))
         cls.candidate_symbols = _top_level_symbols(ast.parse(candidate_source))
 
@@ -357,7 +355,8 @@ class PackageAMinorDispositionTests(unittest.TestCase):
 
     def test_package_a_source_is_untouched_by_this_package(self):
         for rel in PACKAGE_A_OWNED_PATHS:
-            self.assertEqual(_read_local(rel), _git_show_bytes(BASE_SHA, rel))
+            self.assertEqual(_git_show_bytes(CANDIDATE_SHA, rel),
+                             _git_show_bytes(BASE_SHA, rel))
 
 
 # =========================================================================== #

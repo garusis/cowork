@@ -56,6 +56,11 @@ import cowork_verification_worker as worker_module  # noqa: E402
 # The exact signed integrated M5 head this package's brief is bound to.
 BASE_SHA = "f754c8b3dfa11d8cc37287cb0db613e83ba21f20"
 
+# E's own signed commit -- one commit on top of BASE_SHA. The exclusion and
+# HEAD-binding assertions below are measured commit-to-commit against this,
+# not the live working tree, so they are immune to every later commit.
+CANDIDATE_SHA = "290e658e1399a1964032458044b1c23bb2ad83ed"
+
 # The exact, frozen path allowlist this package may change.
 ALLOWED_CHANGED_PATHS = frozenset({
     "scripts/cowork.py",
@@ -81,16 +86,17 @@ EXCLUDED_PATHS = (
 
 
 def _git_changed_paths():
-    tracked = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--", "."],
+    # Commit-pinned (BASE_SHA..CANDIDATE_SHA), not the live working tree --
+    # this allowlist gate measures E's own committed diff, exactly like
+    # T1.C6's analogous fix to Package D's `_git_changed_paths`, so it is
+    # immune to any OTHER T1-scoped file being simultaneously uncommitted
+    # in the same worktree (T1.C2/T1.C4's own writable paths are outside
+    # E's ten-path authority and must never register as E's own offenders).
+    result = subprocess.run(
+        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
         cwd=_REPO_ROOT, capture_output=True, text=True, check=True
     ).stdout.splitlines()
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    untracked = [line[3:] for line in status if line.startswith("?? ")]
-    return {p.strip() for p in (tracked + untracked) if p.strip()}
+    return {p.strip() for p in result if p.strip()}
 
 
 def _git_show_bytes(rev, rel_path):
@@ -98,6 +104,13 @@ def _git_show_bytes(rev, rel_path):
         ["git", "show", "%s:%s" % (rev, rel_path)],
         cwd=_REPO_ROOT, capture_output=True, check=True)
     return result.stdout
+
+
+def _git_merge_base_is_ancestor(ancestor, descendant):
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=_REPO_ROOT)
+    return result.returncode == 0
 
 
 def _read_local(rel_path):
@@ -140,19 +153,23 @@ class AllowlistAndCompileTests(unittest.TestCase):
     def test_excluded_paths_are_byte_identical_to_base(self):
         for rel in EXCLUDED_PATHS:
             self.assertEqual(
-                _read_local(rel), _git_show_bytes(BASE_SHA, rel),
+                _git_show_bytes(CANDIDATE_SHA, rel),
+                _git_show_bytes(BASE_SHA, rel),
                 "%s is excluded from this candidate's writable authority "
                 "and must be byte-identical to the signed base" % rel)
 
     def test_head_is_bound_to_the_signed_integrated_m5_base(self):
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT,
+        self.assertTrue(
+            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
+            "the signed integrated M5 base must be an ancestor of this "
+            "candidate's own signed commit")
+        parent = subprocess.run(
+            ["git", "rev-parse", "%s^" % CANDIDATE_SHA], cwd=_REPO_ROOT,
             capture_output=True, text=True, check=True).stdout.strip()
         self.assertEqual(
-            head, BASE_SHA,
-            "this worktree's HEAD must still be the exact signed "
-            "integrated M5 base -- Package E works uncommitted on top of "
-            "it, never on a different commit")
+            parent, BASE_SHA,
+            "this candidate's own signed commit must sit exactly one "
+            "commit on top of the signed integrated M5 base")
 
 
 # =========================================================================== #

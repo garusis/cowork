@@ -61,13 +61,19 @@ MINOR DISPOSITIONS (M5B-R-m1 through m8, from the v2 review, SHA-256
      plumbing, not a scripts/ path in this candidate's four-path
      allowlist; it is the supervisor's concern, not this candidate's.
 
-  m8 CARRIED, correctly time-scoped -- test_head_is_bound_to_the_signed_
-     post_package_a_base's hardcoded HEAD==BASE_SHA assertion is exactly
-     right for THIS candidate's own gate-time verification (proving the
-     worktree sits at the exact signed base before integration); its
-     self-invalidation once/if ever committed onto a different HEAD is a
-     concern for that later, out-of-scope integration step, not for this
-     bounded candidate.
+  m8 FIXED (T1-REV-M2, later independent-review round) -- the hardcoded
+     HEAD==BASE_SHA equality this note originally defended turned out to
+     be exactly the self-invalidation case flagged above: once this
+     package's own signed base gained later, already-integrated
+     descendant commits (exactly what a later T1 successor worktree's own
+     HEAD legitimately looks like), the equality became the wrong
+     invariant to assert. test_head_is_bound_to_the_signed_post_package_a_
+     base is now test_head_descends_from_the_signed_post_package_a_base,
+     an ancestor/descendant lineage assertion (`git merge-base
+     --is-ancestor BASE_SHA HEAD`) that accepts BASE_SHA itself or any
+     genuine descendant of it -- commit-pinned, consistent with the same
+     remedy applied to Package D's own allowlist gate over the fa4f342
+     lease-decisions commit, never the live working tree.
 
 Never invokes a real Claude, Codex, or OpenCode session; every fixture that
 needs a real subprocess spawns a bare `python3 -c ...` (or the real worker
@@ -108,6 +114,15 @@ import cowork_verification_worker as worker_module  # noqa: E402
 # on top).
 BASE_SHA = "eae4276d07a887a041177817221bf1b0bcdf99f0"
 
+# This package's own signed commit -- used ONLY to pin the
+# scripts/test_cowork.py named-region proof below to Package B's own
+# committed diff, rather than to the live working-tree file, which drifts
+# the moment any LATER, unrelated package also edits test_cowork.py (its
+# own new top-level test class changes the file's top-level statement
+# count, which this positional-zip diff correctly treats as a structural
+# change no matter which package made it).
+CANDIDATE_SHA = "ff6c0e43ef893bffe752e96b55d9e8d73aee1ad2"
+
 # This package's own exact, frozen v3 four-path allowlist (widened from v2's
 # two-path allowlist by the v3 frozen brief, to close M5B-R-M1/M5B-R-M2).
 # Two of these four are only PARTIALLY writable -- see
@@ -139,16 +154,18 @@ EXCLUDED_PATHS = (
 
 
 def _git_changed_paths():
-    tracked = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--", "."],
+    # Commit-pinned, not live-working-tree: this package's own changed-
+    # paths claim is a property of ITS OWN committed diff
+    # (BASE_SHA..CANDIDATE_SHA). The live-tree form was only ever hermetic
+    # while this package's own edits were the sole uncommitted change in
+    # the worktree; it is inherently stale now that this package is itself
+    # historical (already committed as CANDIDATE_SHA) and any LATER,
+    # unrelated package's own uncommitted test-only edits share the same
+    # worktree.
+    return set(subprocess.run(
+        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
         cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    untracked = [line[3:] for line in status if line.startswith("?? ")]
-    return {p.strip() for p in (tracked + untracked) if p.strip()}
+    ).stdout.splitlines())
 
 
 def _git_show(rev, rel_path):
@@ -273,15 +290,25 @@ class AllowlistAndHashTests(unittest.TestCase):
             digest = _sha256_file(rel)
             self.assertRegex(digest, r"^[0-9a-f]{64}$")
 
-    def test_head_is_bound_to_the_signed_post_package_a_base(self):
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT,
-            capture_output=True, text=True, check=True).stdout.strip()
+    def test_head_descends_from_the_signed_post_package_a_base(self):
+        # T1-REV-M2: HEAD must still be exactly BASE_SHA, or a genuine
+        # descendant of it (base plus zero or more later, already-
+        # integrated, independently-reviewed commits) -- never a foreign
+        # or rewritten history. A hardcoded HEAD == BASE_SHA equality is
+        # the wrong invariant once this package's own signed base gains
+        # legitimate descendant commits (exactly what a later T1
+        # successor worktree's own HEAD looks like); lineage, not
+        # identity, is what this gate actually needs to defend.
+        # Commit-pinned via `git merge-base`, consistent with the
+        # fa4f342^..fa4f342 commit-pinned remedy applied to Package D's
+        # own allowlist gate -- never the live working tree.
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", BASE_SHA, "HEAD"],
+            cwd=_REPO_ROOT, capture_output=True)
         self.assertEqual(
-            head, BASE_SHA,
-            "this worktree's HEAD must still be the exact signed "
-            "post-Package-A base -- Package B works uncommitted on top of "
-            "it, never on a different commit")
+            result.returncode, 0,
+            "HEAD is not the signed post-Package-A base %s, nor a "
+            "descendant of it" % BASE_SHA)
 
 
 class ExcludedPathsUntouchedTests(unittest.TestCase):
@@ -291,10 +318,15 @@ class ExcludedPathsUntouchedTests(unittest.TestCase):
     integrity)."""
 
     def test_excluded_paths_are_byte_identical_to_base(self):
+        # Commit-pinned, not live-working-tree: this package's own
+        # read-only claim over each excluded path is a property of ITS OWN
+        # committed diff (BASE_SHA..CANDIDATE_SHA) -- the live-tree form is
+        # inherently stale once this package is itself historical and a
+        # LATER, unrelated package's own uncommitted test-only edits share
+        # the same worktree.
         for rel in EXCLUDED_PATHS:
             base_bytes = _git_show(BASE_SHA, rel)
-            with open(os.path.join(_REPO_ROOT, rel), "rb") as fh:
-                current_bytes = fh.read()
+            current_bytes = _git_show(CANDIDATE_SHA, rel)
             self.assertEqual(
                 current_bytes, base_bytes,
                 "%s must be byte-identical to the signed base commit "
@@ -317,53 +349,37 @@ class ExcludedPathsUntouchedTests(unittest.TestCase):
              "scripts.test_m5_package_a_contracts", "-v"],
             cwd=_REPO_ROOT, capture_output=True, text=True, timeout=300)
         stderr = result.stderr
-        # Exactly the three assertions that file's own comments identify as
-        # describing PACKAGE A's (not Package B's) candidate must now fail --
-        # unchanged, byte-for-byte-adopted from v2 (v2 already made this
-        # exact disposition; v3 does not revisit it).
+        # Exactly the four assertions that file's own comments identify as
+        # describing PACKAGE A's (not Package B's) candidate must now fail:
+        # three unchanged, byte-for-byte-adopted from v2 (v2 already made
+        # this exact disposition; v3 does not revisit it), plus a fourth --
+        # `test_reconcile_pending_evidence_raises_not_implemented` -- staled
+        # not by this candidate but by Package C (#51), which independently
+        # implements `reconcile_pending_evidence` so it no longer raises
+        # `NotImplementedError`. Package A's own gate that pins its
+        # `test_cowork.py`/excluded-path byte-identity checks to ITS OWN
+        # commit (not the live tree) means neither of those two is stale
+        # here: Package A's own candidate never touched either, so both
+        # still pass against Package A's own commit-pinned comparison.
         expected_failures = {
             "test_extension_stubs_are_not_referenced_by_this_candidates_own_flow",
             "test_resolve_worker_source_raises_not_implemented",
             "test_worker_source_missing_and_identity_mismatch_are_absent",
-        }
-        # v3-NEW, disclosed and dispositioned here (not silently green):
-        # Package A's OWN `ExcludedPathsUntouchedTests`/
-        # `ExtractionReexportStructuralTests` assert `scripts/test_cowork.py`
-        # byte-identical to the signed base -- true for Package A's own
-        # candidate, but this v3 candidate's frozen brief explicitly,
-        # narrowly re-authorizes editing exactly one test method in that
-        # file (M5B-R-M1's repair) plus its local fixture. Package A's own
-        # suite has no way to know about that v3-specific re-authorization
-        # (it predates #44's second review round entirely), so both of its
-        # byte-identity assertions on `test_cowork.py` now fail -- correctly
-        # and expectedly, not a regression in either candidate. Touching
-        # `scripts/cowork_verification.py` does NOT trip either of these two
-        # tests: Package A's own `EXCLUDED_PATHS` never listed that file
-        # (Package A owns it too), so no third failure is expected from
-        # that edit.
-        expected_failures |= {
-            "test_excluded_paths_are_byte_identical_to_base",
-            "test_test_cowork_py_is_byte_identical_to_base",
+            "test_reconcile_pending_evidence_raises_not_implemented",
         }
         for name in expected_failures:
             self.assertIn(
                 "FAIL: %s " % name, stderr,
                 "expected exactly this Package-A stub assertion to now "
-                "fail (by that file's own documented design once #44 is "
-                "implemented, or by this v3 candidate's disclosed, "
-                "brief-authorized widening onto test_cowork.py): %s" % name)
-        # `test_changed_paths_are_within_the_five_path_allowlist` may ALSO
-        # now fail, purely as a byproduct of this candidate's own new test
-        # file existing on disk (Package A's five-path allowlist predates
-        # Package B and has no way to know about it) -- not a behavioral
-        # regression. No OTHER test may newly fail.
-        allowed_extra_failures = {
-            "test_changed_paths_are_within_the_five_path_allowlist"}
+                "fail (by that file's own documented design once #44/#51 "
+                "is implemented): %s" % name)
+        # No OTHER test may newly fail -- this is the full, exact known
+        # stale set; no extra allowance is needed or granted.
         for line in stderr.splitlines():
             if line.startswith("FAIL: ") or line.startswith("ERROR: "):
                 name = line.split(" ", 2)[1]
                 self.assertIn(
-                    name, expected_failures | allowed_extra_failures,
+                    name, expected_failures,
                     "an UNEXPECTED Package-A contract test failed/errored: "
                     "%s" % line)
 
@@ -476,11 +492,16 @@ class NamedRegionScopeTests(unittest.TestCase):
         # `reclaim_tool_snapshot_checkout` to the import list and its
         # fallback assignment); the lifecycle/cleanup sites are inside
         # `run_transaction`'s own three-function family.
+        # Commit-pinned, not live-working-tree: this package's own
+        # authorship claim over cowork_verification.py is a property of ITS
+        # OWN committed diff (BASE_SHA..CANDIDATE_SHA), exactly like the
+        # sibling test_cowork.py check just below -- never whatever a
+        # later, unrelated package's own uncommitted edits also happen to
+        # add to the same file in the same worktree.
         base_source = _git_show(
             BASE_SHA, "scripts/cowork_verification.py").decode("utf-8")
-        with open(os.path.join(_REPO_ROOT, "scripts",
-                               "cowork_verification.py")) as fh:
-            current_source = fh.read()
+        current_source = _git_show(
+            CANDIDATE_SHA, "scripts/cowork_verification.py").decode("utf-8")
         diffs = _top_level_diffs(base_source, current_source)
         allowed_functions = {
             "run_transaction", "_run_transaction_body",
@@ -520,10 +541,15 @@ class NamedRegionScopeTests(unittest.TestCase):
         # through_the_real_worker_path` and `test_deliberately_older_
         # parent_executes_captured_newer_worker`, both outside v3's own
         # authority and left broken by it.
+        # Commit-pinned, not live-working-tree: this candidate's own
+        # authorship claim over test_cowork.py is a property of ITS OWN
+        # committed diff (BASE_SHA..CANDIDATE_SHA), not of whatever a
+        # later, unrelated package's own uncommitted test-only edits also
+        # happen to add to the same file in the same worktree.
         base_source = _git_show(
             BASE_SHA, "scripts/test_cowork.py").decode("utf-8")
-        with open(os.path.join(_REPO_ROOT, "scripts", "test_cowork.py")) as fh:
-            current_source = fh.read()
+        current_source = _git_show(
+            CANDIDATE_SHA, "scripts/test_cowork.py").decode("utf-8")
         diffs = _top_level_diffs(base_source, current_source)
         allowed_labels = {
             "OwnedVerificationLedgerIntegrationTests."

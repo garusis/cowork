@@ -48,8 +48,18 @@ import cowork_verification as verification  # noqa: E402
 import cowork_verification_evidence as evidence_module  # noqa: E402
 
 
-# The exact signed post-Package-A base this package's brief closes #51 on.
-BASE_SHA = "eae4276d07a887a041177817221bf1b0bcdf99f0"
+# This package's true immediate parent commit -- rebound from the stale
+# "eae4276..." pin (Package A's own commit, two commits further back),
+# which swept Package B's own changes (scripts/cowork_verification.py,
+# scripts/cowork_verification_worker.py, scripts/test_cowork.py,
+# scripts/test_m5_package_b_worker_capture.py) into this package's
+# allowlist/scope proofs below. scripts/cowork_verification_evidence.py is
+# byte-identical between the old and new BASE_SHA, so this rebind changes
+# no content-based assertion.
+BASE_SHA = "ff6c0e43ef893bffe752e96b55d9e8d73aee1ad2"
+
+# This package's own signed commit.
+CANDIDATE_SHA = "6b9f28fef01f9b80e59b4b4701fb13579f29f4af"
 
 # The exact, frozen TWO-path allowlist THIS package may change -- distinct
 # from (and a strict subset unrelated to) test_m5_package_a_contracts.py's
@@ -61,16 +71,15 @@ ALLOWED_CHANGED_PATHS = frozenset({
 
 
 def _git_changed_paths():
-    tracked = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--", "."],
+    # Commit-pinned, not live-working-tree: this package's own changed-
+    # paths and untouched-scope claims are properties of ITS OWN committed
+    # diff (BASE_SHA..CANDIDATE_SHA), not of whatever a later, unrelated
+    # package's own uncommitted test-only edits also happen to add to the
+    # same worktree.
+    return set(subprocess.run(
+        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
         cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    untracked = [line[3:] for line in status if line.startswith("?? ")]
-    return {p.strip() for p in (tracked + untracked) if p.strip()}
+    ).stdout.splitlines())
 
 
 def _sha256_file(rel_path):
@@ -243,6 +252,12 @@ class AllowlistBaseHashIntegrityTests(unittest.TestCase):
         self.assertEqual(
             ancestor.returncode, 0,
             "HEAD must descend from the exact signed base %s" % BASE_SHA)
+        parent = subprocess.run(
+            ["git", "rev-parse", "%s^" % CANDIDATE_SHA],
+            cwd=_REPO_ROOT, capture_output=True, text=True, check=True)
+        self.assertEqual(
+            parent.stdout.strip(), BASE_SHA,
+            "CANDIDATE_SHA must be exactly one commit on top of BASE_SHA")
 
     def test_main_spine_worker_seam_and_package_a_suite_are_untouched(self):
         changed = _git_changed_paths()
