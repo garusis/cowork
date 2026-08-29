@@ -2811,6 +2811,33 @@ CHECKPOINT_CLAIM_CLAIMED = "claimed"
 CHECKPOINT_CLAIM_TERMINAL = "terminal"
 CHECKPOINT_CLAIM_ABANDONED = "abandoned"
 
+# The bounded startup/publish grace, in seconds, a claim's durable lease
+# deadline adds ON TOP OF the checkpoint's own persisted
+# `CheckpointRequest.timeout_s`. A claimant's total wall-clock obligation is
+# never just its command's timeout: it must also start the command, escalate
+# TERM then KILL if that command overruns, re-snapshot the mutation watch,
+# and durably persist its result and receipt. Charging a claimant only
+# `timeout_s` would classify a HEALTHY claimant -- one that used its full,
+# approved command timeout and is now publishing -- as a crash.
+#
+# Derived from this module's OWN existing worker-deadline policy constants
+# (`_execution_wait_budget_s`/`_overall_deadline_s` above compose the very
+# same allowances for a whole verification transaction), never a fresh magic
+# number: claim-to-spawn startup, the command's own TERM+KILL escalation,
+# post-run cleanup, and terminal-evidence persistence. BOUNDED and
+# module-owned: never caller-supplied, never raised at runtime, and a
+# classification basis only -- nothing reclaims, cancels, or takes over a
+# claim when it elapses.
+#
+# A request that declares NO `timeout_s` is deliberately UNBOUNDED: its
+# command may legitimately run forever, so its claim records no finite
+# expiry at all (`lease_deadline_at: None`) and a healthy live claimant can
+# never be falsely classified as crashed by the passage of time. This grace
+# applies only where the request itself supplied a finite bound.
+CHECKPOINT_CLAIM_LEASE_GRACE_S = float(
+    DEFAULT_STARTUP_ALLOWANCE_S + 2 * DEFAULT_TERM_GRACE_S
+    + DEFAULT_CLEANUP_ALLOWANCE_S + DEFAULT_EVIDENCE_ALLOWANCE_S)
+
 # Required CheckpointRequest keys and the exact, closed key set a raw
 # request may carry -- anything outside this set is rejected
 # (`unknown_key`), the same strict discipline `_normalize_schema2_inventory`
@@ -3230,14 +3257,60 @@ def claim_checkpoint(session_uuid, checkpoint_id, executor_identity):
     loser re-reads the record actually on disk with a brief bounded retry
     (covering the narrow window where the winner's own write is still in
     flight) rather than trusting a locally-built guess, so it never reports
-    a claim that is not really durable yet."""
+    a claim that is not really durable yet.
+
+    DURABLE DEADLINE BASIS (M5F-CLAIM-CRASH-1): the record additionally
+    carries `lease_timeout_s`, `lease_grace_s`, and `lease_deadline_at`,
+    derived from the checkpoint's ALREADY PERSISTED
+    `CheckpointRequest.timeout_s` (read tolerantly here) plus the bounded,
+    module-owned `CHECKPOINT_CLAIM_LEASE_GRACE_S` above -- the claimant's
+    startup, TERM/KILL escalation, cleanup, and result/receipt publication
+    are part of its obligation, so a healthy claimant that used its FULL
+    approved command timeout and is still publishing is never past its
+    lease. Without these fields a claim stranded by a crashed claimant
+    looks byte-for-byte like a claim whose executor is still running, and
+    `classify_checkpoint_claim_liveness` below could not tell the two apart
+    from artifacts alone.
+
+    An UNBOUNDED request -- one that declares no usable `timeout_s`, whose
+    command `run_checkpoint` therefore runs with no timeout at all -- gets
+    `lease_timeout_s: None` and `lease_deadline_at: None`: NO finite expiry
+    is invented for it, so the mere passage of time can never classify a
+    healthy, legitimately long-running claimant as crashed.
+
+    These fields are additive and advisory: they change nothing about
+    acquisition, nothing about duplicate refusal, and nothing reclaims,
+    rewrites, or takes over a claim whose deadline has passed."""
     claim_path = state_store.checkpoint_claim_path_for(
         session_uuid, checkpoint_id)
+    request = state_store.read_json_tolerant(
+        state_store.checkpoint_request_path_for(session_uuid, checkpoint_id))
+    timeout_s = request.get("timeout_s") if isinstance(request, dict) else None
+    if isinstance(timeout_s, bool) or not isinstance(
+            timeout_s, (int, float)) or timeout_s <= 0:
+        timeout_s = None
+    claimed_at = datetime.datetime.now(datetime.timezone.utc)
+    deadline_at = None
+    if timeout_s is not None:
+        try:
+            deadline_at = (claimed_at + datetime.timedelta(
+                seconds=timeout_s + CHECKPOINT_CLAIM_LEASE_GRACE_S)
+                ).isoformat().replace("+00:00", "Z")
+        except (OverflowError, ValueError):
+            # A nominally-valid but absurd `timeout_s` whose deadline is not
+            # representable: record no finite expiry rather than a wrong one.
+            # Never-expiring is the only safe direction -- a false crash
+            # verdict against a healthy claimant is the failure this whole
+            # deadline basis exists to avoid.
+            deadline_at = None
     record = {
         "checkpoint_id": checkpoint_id,
         "executor_identity": executor_identity,
-        "claimed_at": _utc_now(),
+        "claimed_at": claimed_at.isoformat().replace("+00:00", "Z"),
         "state": CHECKPOINT_CLAIM_CLAIMED,
+        "lease_timeout_s": timeout_s,
+        "lease_grace_s": CHECKPOINT_CLAIM_LEASE_GRACE_S,
+        "lease_deadline_at": deadline_at,
     }
     if _create_checkpoint_claim_exclusive(claim_path, record):
         return True, record
@@ -3249,6 +3322,158 @@ def claim_checkpoint(session_uuid, checkpoint_id, executor_identity):
             break
         time.sleep(0.01)
     return False, existing
+
+
+def classify_checkpoint_claim_liveness(session_uuid, checkpoint_id, now=None):
+    """Classify ONE checkpoint claim's liveness from DURABLE ARTIFACTS ALONE
+    -- request, claim, result, receipt -- and return a single literal
+    criterion-5 ActivityClass string (M5F-CLAIM-CRASH-1 /
+    A-C5-CRASH-STRAND). A claim stranded by a claimant that crashed (or
+    whose descendant hung) past its own persisted deadline must be
+    DISTINGUISHABLE from a genuinely live claim without any terminal
+    output, any live process handle, and any in-memory state -- a stranded
+    claim must never read as productive work, as a provider wait, or as
+    no-evidence silence.
+
+    Reads nothing but the four artifact paths (`state_store.checkpoint_*_
+    path_for`) plus the mere EXISTENCE of the claim path. No terminal, no
+    stdout/stderr, no tty, no process table, no subprocess: the answer is
+    identical in a fresh process on a machine where the claimant never ran.
+    `cowork_activity.py` is deliberately NOT imported (this module has no
+    dependency on it, in either direction); the returned values are literal
+    strings that MATCH that module's closed `ACTIVITY_CLASSES` vocabulary
+    without coupling to it.
+
+    `now` may be `None` (current UTC), an aware/naive `datetime`, or an
+    RFC3339 string -- callers and tests inject a clock rather than sleeping
+    through a real lease.
+
+    Returned classes, in decision order:
+
+      - `"no_evidence_silence"` -- no claim artifact exists at all. Nothing
+        ever claimed this checkpoint, so there is genuinely no evidence of
+        any executor to classify. This is the ONLY branch that may return
+        silence, and a stranded claim never reaches it.
+      - `"process_crash"` -- a claim FILE exists but does not read back as a
+        claim record (truncated/corrupt bytes: a claimant that died mid
+        -write), or a claim record carries no usable temporal basis at all.
+        Fail-closed: durable evidence of a claimant exists, so this is never
+        collapsed into silence or into productive work.
+      - `"owned_verification"` -- the claim is terminal, OR a receipt is
+        durably present (a crash between the receipt write and the terminal
+        claim marker still means the verification work itself completed --
+        see `publish_checkpoint_receipt`'s receipt-first ordering), OR the
+        lease is UNBOUNDED (the request declared no `timeout_s`, so its
+        command may legitimately run forever and no elapsed time can ever
+        indict it), OR the claim is still WITHIN its persisted deadline. A
+        live claim is orchestrator-owned verification in progress -- never
+        a crash, and deliberately never `productive_model_work`/
+        `provider_wait`, neither of which a deterministic non-model
+        executor ever performs.
+      - `"hung_descendant"` -- past deadline, no receipt, and a durable
+        result records `timed_out` -- the executed descendant overran its
+        own timeout and the claimant never published a receipt for it.
+      - `"process_crash"` -- past deadline, no receipt, and no such
+        timed-out result: the claimant vanished, leaving its claim stranded
+        with nothing behind it.
+
+    A LEASE IS NOT A COMMAND TIMEOUT. The deadline a claim persists is its
+    command's approved `timeout_s` PLUS `CHECKPOINT_CLAIM_LEASE_GRACE_S`
+    (startup, TERM/KILL escalation, cleanup, and result/receipt
+    publication). A healthy claimant at -- or past -- its raw command
+    timeout but still inside that total lease is `owned_verification`, not
+    a crash: expiry only becomes actionable once the claimant has had every
+    second its own policy allows it.
+
+    CLASSIFICATION ONLY. This function never writes, never deletes, never
+    rewrites a claim, never marks anything `abandoned` (that dead
+    vocabulary is never written into a claim, and
+    `reconstruct_checkpoint_state` has no branch for it), and never
+    reclaims, cancels, or hands over a lease. Availability and recovery are
+    somebody else's problem; distinguishability is this function's whole
+    job. Never raises: every read is tolerant."""
+
+    def _parse_instant(value):
+        """An aware UTC datetime from a datetime/RFC3339 string, else None.
+        `datetime.fromisoformat` does not accept a trailing `Z` on every
+        supported interpreter, so normalize it first."""
+        if isinstance(value, datetime.datetime):
+            parsed = value
+        elif isinstance(value, str) and value:
+            try:
+                parsed = datetime.datetime.fromisoformat(
+                    value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+
+    claim_path = state_store.checkpoint_claim_path_for(
+        session_uuid, checkpoint_id)
+    claim = state_store.read_json_tolerant(claim_path)
+    if not isinstance(claim, dict) or not claim.get("state"):
+        return "process_crash" if os.path.exists(
+            claim_path) else "no_evidence_silence"
+    receipt = state_store.read_json_tolerant(
+        state_store.checkpoint_receipt_path_for(session_uuid, checkpoint_id))
+    if claim.get("state") == CHECKPOINT_CLAIM_TERMINAL or isinstance(
+            receipt, dict):
+        return "owned_verification"
+
+    deadline_at = _parse_instant(claim.get("lease_deadline_at"))
+    if deadline_at is None:
+        # No usable persisted deadline. Either the lease is genuinely
+        # UNBOUNDED (a request that declared no `timeout_s`), or this is a
+        # legacy claim written before the deadline basis existed, whose
+        # basis is rebuilt from `claimed_at` plus the best durable timeout
+        # available. A claim that carries the `lease_timeout_s` key states
+        # its own bound verbatim (`None` MEANS unbounded, and is never
+        # second-guessed against the request); only a legacy claim without
+        # that key falls back to the request's own `timeout_s`.
+        if "lease_timeout_s" in claim:
+            timeout_s = claim.get("lease_timeout_s")
+        else:
+            request = state_store.read_json_tolerant(
+                state_store.checkpoint_request_path_for(session_uuid,
+                                                        checkpoint_id))
+            timeout_s = request.get("timeout_s") if isinstance(
+                request, dict) else None
+        if isinstance(timeout_s, bool) or not isinstance(
+                timeout_s, (int, float)) or timeout_s <= 0:
+            # UNBOUNDED: nothing durable bounds this command's runtime, so
+            # no amount of elapsed time is evidence of anything. Never
+            # invent a finite expiry here -- that would classify a healthy,
+            # legitimately long-running claimant as crashed, which is worse
+            # than leaving a genuinely stranded unbounded claim unflagged.
+            return "owned_verification"
+        claimed_at = _parse_instant(claim.get("claimed_at"))
+        if claimed_at is None:
+            # A finite bound is declared but nothing durable says when the
+            # lease began: fail closed toward the strand (unreachable for
+            # any claim `claim_checkpoint` itself writes).
+            return "process_crash"
+        grace_s = claim.get("lease_grace_s")
+        if isinstance(grace_s, bool) or not isinstance(
+                grace_s, (int, float)) or grace_s < 0:
+            grace_s = CHECKPOINT_CLAIM_LEASE_GRACE_S
+        try:
+            deadline_at = claimed_at + datetime.timedelta(
+                seconds=timeout_s + grace_s)
+        except (OverflowError, ValueError):
+            return "owned_verification"
+
+    now_at = _parse_instant(now) or datetime.datetime.now(
+        datetime.timezone.utc)
+    if now_at <= deadline_at:
+        return "owned_verification"
+    result = state_store.read_json_tolerant(
+        state_store.checkpoint_result_path_for(session_uuid, checkpoint_id))
+    if isinstance(result, dict) and result.get("timed_out"):
+        return "hung_descendant"
+    return "process_crash"
 
 
 def publish_checkpoint_receipt(session_uuid, checkpoint_id, receipt):
