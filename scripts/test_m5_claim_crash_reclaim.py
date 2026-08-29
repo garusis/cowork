@@ -61,6 +61,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -904,6 +905,300 @@ class ArtifactOnlyClassificationTests(_ArtifactFixture):
         self.assertEqual(
             verification.reconstruct_checkpoint_state(
                 self.session_uuid, self.checkpoint_id)["state"], "claimed")
+
+
+# =========================================================================== #
+# M5C5-LEASE-FIDELITY-1: an unreadable request is never an unbounded lease.    #
+# =========================================================================== #
+
+
+class ClaimLeaseFidelityTests(_ArtifactFixture):
+    """`claim_checkpoint` derives the lease by RE-READING the request that
+    `run_checkpoint` already read successfully a moment earlier. That reread
+    goes through `state_store.read_json_tolerant`, which swallows every
+    `OSError`/`ValueError` and answers a single overloaded `None` for both
+    "never persisted" and "persisted but unreadable right now".
+
+    Collapsing those two is durably irreversible: the claim records its own
+    bound verbatim, and `classify_checkpoint_claim_liveness` only consults
+    the request when the `lease_timeout_s` KEY IS ABSENT -- a persisted
+    `null` MEANS unbounded and is never re-checked. So one transient miss
+    against a request that durably declares `timeout_s: 30` would pin that
+    checkpoint in `owned_verification` forever, the one class no elapsed
+    time can indict.
+
+    These tests fix the split: only a definitive `ENOENT` yields an
+    unbounded lease; every other unreadable/malformed outcome fails closed
+    before anything is persisted; and a request that IS read and explicitly
+    declares no timeout keeps its documented unbounded behavior."""
+
+    def _persist_request(self, timeout_s=None, checkpoint_id=None):
+        return verification.build_and_persist_checkpoint_request(
+            self.session_uuid, checkpoint_id or self.checkpoint_id, "W-1",
+            "build", "candidate-digest-0", ["/bin/sh", "-c", "true"],
+            self.workdir, verification.MUTATION_CLASS_READ_ONLY,
+            timeout_s=timeout_s)
+
+    def request_path(self, checkpoint_id=None):
+        return state_store.checkpoint_request_path_for(
+            self.session_uuid, checkpoint_id or self.checkpoint_id)
+
+    def claim_path(self, checkpoint_id=None):
+        return state_store.checkpoint_claim_path_for(
+            self.session_uuid, checkpoint_id or self.checkpoint_id)
+
+    def blind_one_request_read(self):
+        """Patch the tolerant reader to answer `None` for THIS checkpoint's
+        request path only -- the exact value `read_json_tolerant` already
+        returns for any swallowed `OSError`/`ValueError` -- while every
+        other path still reads normally."""
+        real_read = state_store.read_json_tolerant
+        target = self.request_path()
+
+        def blinded(path):
+            if path == target:
+                return None
+            return real_read(path)
+
+        return mock.patch.object(state_store, "read_json_tolerant",
+                                 side_effect=blinded)
+
+    # -- the blocker itself ----------------------------------------------- #
+
+    def test_a_transient_request_reread_failure_never_persists_a_claim(self):
+        self._persist_request(timeout_s=30.0)
+        with self.blind_one_request_read():
+            with self.assertRaises(verification.CheckpointError) as ctx:
+                verification.claim_checkpoint(
+                    self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertEqual(ctx.exception.code, "checkpoint_request_unreadable")
+        # Fail CLOSED, and closed means nothing durable happened at all.
+        self.assertFalse(os.path.exists(self.claim_path()),
+                         "a claim must never be persisted once the lease "
+                         "basis could not be derived")
+        self.assertIsNone(self.claim_artifact(self.checkpoint_id))
+        # The request itself is untouched and still declares its bound.
+        self.assertEqual(state_store.read_json_tolerant(
+            self.request_path())["timeout_s"], 30.0)
+
+    def test_the_declared_bound_survives_a_transient_failure_and_a_retry(self):
+        # The whole point: the bound is not lost. A retry after the blip
+        # produces the correct BOUNDED lease, and the checkpoint remains
+        # indictable once that lease lapses.
+        self._persist_request(timeout_s=30.0)
+        with self.blind_one_request_read():
+            with self.assertRaises(verification.CheckpointError):
+                verification.claim_checkpoint(
+                    self.session_uuid, self.checkpoint_id, "executor-1")
+        claimed, record = verification.claim_checkpoint(
+            self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertTrue(claimed)
+        self.assertEqual(record["lease_timeout_s"], 30.0)
+        self.assertIsNotNone(record["lease_deadline_at"])
+        on_disk = self.claim_artifact(self.checkpoint_id)
+        self.assertEqual(on_disk["lease_timeout_s"], 30.0)
+        self.assertEqual(
+            (_parse_instant(on_disk["lease_deadline_at"])
+             - _parse_instant(on_disk["claimed_at"])).total_seconds(),
+            30.0 + GRACE_S)
+        self.assertEqual(self.classify(self.checkpoint_id,
+                                       now=self.instant(29)),
+                         "owned_verification")
+        self.assertEqual(self.classify(self.checkpoint_id,
+                                       now=self.instant(31 + GRACE_S)),
+                         "process_crash")
+
+    def test_a_bounded_request_can_never_persist_a_null_lease_timeout(self):
+        # The durable invariant stated directly, over every failure mode a
+        # bounded request can encounter at claim time.
+        self._persist_request(timeout_s=30.0)
+        with self.blind_one_request_read():
+            self.assertRaises(verification.CheckpointError,
+                              verification.claim_checkpoint,
+                              self.session_uuid, self.checkpoint_id,
+                              "executor-1")
+        self.assertIsNone(self.claim_artifact(self.checkpoint_id))
+        claimed, _record = verification.claim_checkpoint(
+            self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertTrue(claimed)
+        self.assertIsNotNone(
+            self.claim_artifact(self.checkpoint_id)["lease_timeout_s"],
+            "a request declaring timeout_s=30 must never yield a durable "
+            "claim with lease_timeout_s=null")
+
+    # -- every unreadable/malformed shape fails closed --------------------- #
+
+    def test_a_torn_request_file_fails_closed_deterministically(self):
+        self._persist_request(timeout_s=30.0)
+        with open(self.request_path(), "w") as fh:
+            fh.write('{"checkpoint_id": "cp-')
+        self.assertIsNone(state_store.read_json_tolerant(self.request_path()))
+        codes = []
+        for identity in ("executor-1", "executor-2", "executor-3"):
+            with self.assertRaises(verification.CheckpointError) as ctx:
+                verification.claim_checkpoint(
+                    self.session_uuid, self.checkpoint_id, identity)
+            codes.append(ctx.exception.code)
+        self.assertEqual(codes, ["checkpoint_request_unreadable"] * 3,
+                         "the refusal must be explicit and deterministic, "
+                         "not order- or attempt-dependent")
+        self.assertFalse(os.path.exists(self.claim_path()))
+
+    def test_a_request_that_is_not_a_json_object_fails_closed(self):
+        self._persist_request(timeout_s=30.0)
+        with open(self.request_path(), "w") as fh:
+            fh.write("[1, 2, 3]")
+        with self.assertRaises(verification.CheckpointError) as ctx:
+            verification.claim_checkpoint(
+                self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertEqual(ctx.exception.code, "checkpoint_request_unreadable")
+        self.assertFalse(os.path.exists(self.claim_path()))
+
+    def test_an_unopenable_request_path_fails_closed(self):
+        # A non-ENOENT `OSError` from the read itself (here `IsADirectoryError`
+        # -- no chmod, so the result does not depend on who runs the suite).
+        request_path = self.request_path()
+        os.makedirs(request_path, exist_ok=True)
+        self.assertIsNone(state_store.read_json_tolerant(request_path))
+        with self.assertRaises(verification.CheckpointError) as ctx:
+            verification.claim_checkpoint(
+                self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertEqual(ctx.exception.code, "checkpoint_request_unreadable")
+        self.assertFalse(os.path.exists(self.claim_path()))
+
+    def test_an_unanswerable_existence_check_also_fails_closed(self):
+        # The narrow remaining window: the read failed AND the follow-up
+        # existence question cannot be answered either. Absence is only ever
+        # inferred from a definitive ENOENT, never from a failed probe.
+        self._persist_request(timeout_s=30.0)
+        with self.blind_one_request_read():
+            with mock.patch.object(os, "stat",
+                                   side_effect=OSError(5, "simulated EIO")):
+                with self.assertRaises(verification.CheckpointError) as ctx:
+                    verification.claim_checkpoint(
+                        self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertEqual(ctx.exception.code, "checkpoint_request_unreadable")
+        self.assertFalse(os.path.exists(self.claim_path()))
+
+    def test_a_persisted_but_malformed_timeout_is_refused_not_coerced(self):
+        # `normalize_checkpoint_request` rejects this shape at write time, so
+        # it can only appear via corruption -- and silently coercing it to
+        # `None` would be the same durable downgrade by another route.
+        for bad in ("30", True, -5, 0, [30]):
+            checkpoint_id = "cp-bad-" + uuid.uuid4().hex[:8]
+            state_store.write_json_atomic_durable(
+                self.request_path(checkpoint_id),
+                {"checkpoint_schema_version":
+                     verification.CHECKPOINT_SCHEMA_VERSION,
+                 "checkpoint_id": checkpoint_id,
+                 "session_uuid": self.session_uuid,
+                 "timeout_s": bad})
+            with self.assertRaises(verification.CheckpointError) as ctx:
+                verification.claim_checkpoint(
+                    self.session_uuid, checkpoint_id, "executor-1")
+            self.assertEqual(ctx.exception.code,
+                             "checkpoint_request_bad_timeout_s",
+                             "timeout_s=%r must be refused" % (bad,))
+            self.assertFalse(os.path.exists(self.claim_path(checkpoint_id)))
+
+    # -- explicitly unbounded requests keep their documented behavior ------ #
+
+    def test_an_explicitly_null_timeout_still_yields_an_unbounded_lease(self):
+        # Requirement 3: a request that IS read successfully and explicitly
+        # declares no timeout is unbounded by design -- the fail-closed path
+        # must not have swept this into an error.
+        self._persist_request(timeout_s=None)
+        self.assertIn("timeout_s",
+                      state_store.read_json_tolerant(self.request_path()))
+        self.assertIsNone(state_store.read_json_tolerant(
+            self.request_path())["timeout_s"])
+        claimed, record = verification.claim_checkpoint(
+            self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertTrue(claimed)
+        self.assertIsNone(record["lease_timeout_s"])
+        self.assertIsNone(record["lease_deadline_at"])
+        self.assertEqual(record["lease_grace_s"], GRACE_S)
+        self.assertEqual(self.classify(self.checkpoint_id,
+                                       now=self.instant(86400 * 365 * 100)),
+                         "owned_verification")
+
+    def test_a_request_omitting_timeout_s_entirely_is_still_unbounded(self):
+        checkpoint_id = "cp-nokey-" + uuid.uuid4().hex[:8]
+        state_store.write_json_atomic_durable(
+            self.request_path(checkpoint_id),
+            {"checkpoint_schema_version":
+                 verification.CHECKPOINT_SCHEMA_VERSION,
+             "checkpoint_id": checkpoint_id,
+             "session_uuid": self.session_uuid})
+        claimed, record = verification.claim_checkpoint(
+            self.session_uuid, checkpoint_id, "executor-1")
+        self.assertTrue(claimed)
+        self.assertIsNone(record["lease_timeout_s"])
+        self.assertIsNone(record["lease_deadline_at"])
+
+    def test_no_request_artifact_at_all_is_unbounded_not_a_failure(self):
+        # Package A's own fixtures claim with no request persisted at all.
+        # A definitive ENOENT is the ONLY licence for the unbounded fallback,
+        # and it still grants it.
+        self.assertFalse(os.path.exists(self.request_path()))
+        claimed, record = verification.claim_checkpoint(
+            self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertTrue(claimed)
+        self.assertIsNone(record["lease_timeout_s"])
+        self.assertIsNone(record["lease_deadline_at"])
+        self.assertEqual(self.classify(self.checkpoint_id,
+                                       now=self.instant(86400 * 365)),
+                         "owned_verification")
+
+    # -- every other claim semantic is preserved --------------------------- #
+
+    def test_the_durable_claim_schema_is_unchanged(self):
+        self._persist_request(timeout_s=30.0)
+        verification.claim_checkpoint(self.session_uuid, self.checkpoint_id,
+                                      "executor-1")
+        self.assertEqual(
+            set(self.claim_artifact(self.checkpoint_id)),
+            {"checkpoint_id", "executor_identity", "claimed_at", "state",
+             "lease_timeout_s", "lease_grace_s", "lease_deadline_at"})
+
+    def test_fencing_and_idempotence_survive_the_fail_closed_path(self):
+        self._persist_request(timeout_s=30.0)
+        claimed, first = verification.claim_checkpoint(
+            self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertTrue(claimed)
+        with open(self.claim_path(), "rb") as fh:
+            before = fh.read()
+        # A second claimant hitting the transient read is refused by the
+        # fail-closed path -- and still writes nothing over the winner.
+        with self.blind_one_request_read():
+            with self.assertRaises(verification.CheckpointError):
+                verification.claim_checkpoint(
+                    self.session_uuid, self.checkpoint_id, "executor-2")
+        with open(self.claim_path(), "rb") as fh:
+            self.assertEqual(fh.read(), before,
+                             "a refused claimant must write nothing at all")
+        # And once the read recovers, the duplicate is refused the ordinary
+        # way: the original claimant still owns the fence.
+        again, existing = verification.claim_checkpoint(
+            self.session_uuid, self.checkpoint_id, "executor-2")
+        self.assertFalse(again)
+        self.assertEqual(existing["executor_identity"], "executor-1")
+        self.assertEqual(existing["claimed_at"], first["claimed_at"])
+        self.assertEqual(existing["state"],
+                         verification.CHECKPOINT_CLAIM_CLAIMED)
+
+    def test_the_failure_is_a_checkpoint_error_carrying_a_stable_code(self):
+        # Explicit: a typed `CheckpointError` with a parseable code, the same
+        # discipline `run_checkpoint`'s `checkpoint_request_missing` uses --
+        # never a bare exception and never a silent `(False, None)`.
+        self._persist_request(timeout_s=30.0)
+        with self.blind_one_request_read():
+            with self.assertRaises(verification.CheckpointError) as ctx:
+                verification.claim_checkpoint(
+                    self.session_uuid, self.checkpoint_id, "executor-1")
+        self.assertIsInstance(ctx.exception, ValueError)
+        self.assertEqual(ctx.exception.code, "checkpoint_request_unreadable")
+        self.assertIn(self.checkpoint_id, str(ctx.exception))
 
 
 # =========================================================================== #

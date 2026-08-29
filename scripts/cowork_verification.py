@@ -3276,19 +3276,71 @@ def claim_checkpoint(session_uuid, checkpoint_id, executor_identity):
     command `run_checkpoint` therefore runs with no timeout at all -- gets
     `lease_timeout_s: None` and `lease_deadline_at: None`: NO finite expiry
     is invented for it, so the mere passage of time can never classify a
-    healthy, legitimately long-running claimant as crashed.
+    healthy, legitimately long-running claimant as crashed. So does a
+    checkpoint with NO request artifact at all: nothing durable bounds it.
+
+    UNREADABLE IS NOT UNBOUNDED (M5C5-LEASE-FIDELITY-1). `read_json_
+    tolerant` swallows every `OSError`/`ValueError`, so it answers `None`
+    both for a request that was never persisted AND for one that IS
+    persisted but could not be read right now (fd exhaustion, a transient
+    EIO, a network filesystem blip, torn bytes). Those two are NOT
+    interchangeable here. `run_checkpoint` already read this same request
+    successfully a moment earlier, and the claim this function writes
+    records its own bound VERBATIM -- `classify_checkpoint_claim_liveness`
+    below never second-guesses a present `lease_timeout_s` against the
+    request -- so treating a failed reread as "unbounded" would burn a
+    permanently unbounded lease into durable state for a request that
+    durably declares `timeout_s`, moving it forever into the one class no
+    elapsed time can ever indict. Instead, ONLY a definitive `ENOENT`
+    licenses the unbounded fallback: every other outcome, including a
+    failure to answer the existence question at all and a request whose
+    persisted `timeout_s` is not a positive number, raises
+    `CheckpointError` BEFORE anything is persisted. Failing closed here
+    costs one refused claim that a retry can still win; failing open costs
+    an irrecoverable durable lie.
 
     These fields are additive and advisory: they change nothing about
     acquisition, nothing about duplicate refusal, and nothing reclaims,
     rewrites, or takes over a claim whose deadline has passed."""
     claim_path = state_store.checkpoint_claim_path_for(
         session_uuid, checkpoint_id)
-    request = state_store.read_json_tolerant(
-        state_store.checkpoint_request_path_for(session_uuid, checkpoint_id))
+    request_path = state_store.checkpoint_request_path_for(
+        session_uuid, checkpoint_id)
+    request = state_store.read_json_tolerant(request_path)
+    if request is None:
+        # Disambiguate the tolerant reader's overloaded `None` -- see
+        # UNREADABLE IS NOT UNBOUNDED above. Deterministic and total: the
+        # `ENOENT` arm is the only one that continues.
+        try:
+            os.stat(request_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise CheckpointError(
+                "checkpoint_request_unreadable",
+                "the CheckpointRequest for checkpoint_id=%r could not be "
+                "read or even proven absent, so no lease can be derived "
+                "from it: %s" % (checkpoint_id, exc))
+        else:
+            raise CheckpointError(
+                "checkpoint_request_unreadable",
+                "the CheckpointRequest artifact for checkpoint_id=%r "
+                "exists but did not read back as an object; refusing to "
+                "persist a claim whose lease would be unbounded only "
+                "because that read failed" % (checkpoint_id,))
     timeout_s = request.get("timeout_s") if isinstance(request, dict) else None
-    if isinstance(timeout_s, bool) or not isinstance(
-            timeout_s, (int, float)) or timeout_s <= 0:
-        timeout_s = None
+    if timeout_s is not None and (
+            isinstance(timeout_s, bool) or not isinstance(
+                timeout_s, (int, float)) or timeout_s <= 0):
+        # A persisted request whose declared bound is unusable is malformed,
+        # not unbounded: `normalize_checkpoint_request` rejects exactly this
+        # shape with the same code, so no legitimately authored request can
+        # reach here. Silently coercing it to `None` would be the same
+        # durable downgrade by another route.
+        raise CheckpointError(
+            "checkpoint_request_bad_timeout_s",
+            "timeout_s must be a positive number or absent: %r"
+            % (timeout_s,))
     claimed_at = datetime.datetime.now(datetime.timezone.utc)
     deadline_at = None
     if timeout_s is not None:
