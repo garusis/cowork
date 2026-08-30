@@ -443,13 +443,34 @@ class StartupFailureOwnershipTests(unittest.TestCase):
             inspect.getsource(worker_module))
         self.assertNotIn("worker_spawn_failed", literals)
 
-    def test_worker_source_missing_and_identity_mismatch_are_absent(self):
-        # These are Package B's two NEW reasons (#44) -- explicitly not
-        # this candidate's to produce.
+    def test_worker_source_missing_and_identity_mismatch_are_worker_owned(self):
+        # Package B (#44) has since added its two NEW reasons. They joined
+        # the taxonomy exactly where the two reasons above already live --
+        # inside this module, minted by this module's own code -- so the
+        # ownership boundary this class exists to pin is now stated
+        # positively for all four, at the specific seam that produces each.
         literals = _string_literals_excluding_docstrings(
             inspect.getsource(worker_module))
-        self.assertNotIn("worker_source_missing", literals)
-        self.assertNotIn("worker_identity_mismatch", literals)
+        self.assertIn("worker_source_missing", literals)
+        self.assertIn("worker_identity_mismatch", literals)
+        # `worker_source_missing` is decided BEFORE any identity report can
+        # arrive (spawn_worker, when resolve_worker_source returns None);
+        # `worker_identity_mismatch` only AFTER one did (the startup
+        # classifier). Neither is produced by the other's seam.
+        spawn_literals = _string_literals_excluding_docstrings(
+            inspect.getsource(worker_module.spawn_worker))
+        self.assertIn("worker_source_missing", spawn_literals)
+        self.assertNotIn("worker_identity_mismatch", spawn_literals)
+        classify_literals = _string_literals_excluding_docstrings(
+            inspect.getsource(worker_module._classify_worker_startup))
+        self.assertIn("worker_identity_mismatch", classify_literals)
+        self.assertNotIn("worker_source_missing", classify_literals)
+        # Worker-owned means the spine mints neither -- the same direction
+        # of ownership `worker_spawn_failed` has in reverse below.
+        spine_literals = _string_literals_excluding_docstrings(
+            inspect.getsource(verification))
+        self.assertNotIn("worker_source_missing", spine_literals)
+        self.assertNotIn("worker_identity_mismatch", spine_literals)
 
     def test_worker_spawn_failed_is_produced_only_by_run_transactions_oserror_handler(self):
         spine_literals = _string_literals_excluding_docstrings(
@@ -554,13 +575,149 @@ class DefinitionSiteDependencyAuditTests(unittest.TestCase):
 
 class ExtensionStubTests(unittest.TestCase):
 
-    def test_resolve_worker_source_raises_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            worker_module.resolve_worker_source()
+    def test_resolve_worker_source_captures_the_running_installation(self):
+        # Package B (#44) filled this seam in. Its current contract, all of
+        # it exercised here: no session/transaction identity at all is the
+        # documented `worker_source_missing` condition, returned as `None`
+        # rather than raised; with both identities it captures THIS running
+        # Cowork installation's own `scripts/` tree, records the manifest
+        # durably, and materializes the checkout `spawn_worker` would exec
+        # from. No worker binary is assumed and no process is launched --
+        # only file capture into an isolated, throwaway sessions root.
+        self.assertIsNone(worker_module.resolve_worker_source())
+        self.assertIsNone(worker_module.resolve_worker_source("S-x", None))
+        self.assertIsNone(worker_module.resolve_worker_source(None, "T-x"))
 
-    def test_reconcile_pending_evidence_raises_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            evidence_module.reconcile_pending_evidence("s", "t", None)
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if prior is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = prior
+        self.addCleanup(restore)
+        session_uuid = "S-" + uuid.uuid4().hex[:8]
+        transaction_id = "T-" + uuid.uuid4().hex[:8]
+
+        resolution = worker_module.resolve_worker_source(
+            session_uuid, transaction_id)
+        self.assertEqual(
+            set(resolution),
+            {"checkout_root", "manifest_files", "worker_rel_path",
+             "expected_hash"})
+        worker_rel = os.path.join("scripts", "cowork_verification.py")
+        self.assertEqual(resolution["worker_rel_path"], worker_rel)
+        # The captured source is the RUNNING installation's own, never a
+        # target-repo copy: the expected hash the worker's self-report must
+        # equal is this very process's own `cowork_verification.py` bytes.
+        self.assertEqual(resolution["expected_hash"],
+                         _sha256_file("scripts/cowork_verification.py"))
+        self.assertEqual(
+            resolution["manifest_files"][worker_rel]["sha256"],
+            resolution["expected_hash"])
+        # The checkout is a real, nameable, materialized tree under this
+        # session's own tool-snapshot root -- not merely a computed path.
+        self.assertEqual(
+            resolution["checkout_root"],
+            worker_module.tool_snapshot_checkout_dir(
+                session_uuid, transaction_id))
+        captured = os.path.join(resolution["checkout_root"], worker_rel)
+        self.assertTrue(os.path.isfile(captured))
+        with open(captured, "rb") as fh:
+            self.assertEqual(hashlib.sha256(fh.read()).hexdigest(),
+                             resolution["expected_hash"])
+        # ...and the manifest `_classify_worker_startup` reads back after
+        # the worker reports identity is already durable at this point,
+        # i.e. written BEFORE any process could have been spawned.
+        manifest_doc = state_store.read_json_tolerant(
+            state_store.verification_tool_snapshot_manifest_path_for(
+                session_uuid, transaction_id))
+        self.assertEqual(manifest_doc["files"], resolution["manifest_files"])
+        self.assertEqual(manifest_doc["root"], _HERE)
+
+    def test_reconcile_pending_evidence_resolves_a_deferred_label_durably(self):
+        # Package C (#51) filled this seam in. Exercised here is its actual
+        # durable behavior, not merely that it stopped raising: a deferred
+        # label whose terminal evidence has since landed is revised in the
+        # ledger to its TRUE terminal outcome under the SAME minted id,
+        # dropped from the transaction's durable deferred marker, and its
+        # teardown owned exactly once -- then a second pass finds nothing
+        # left (idempotent, no double teardown). Driven entirely from
+        # bounded local fixtures: an isolated sessions root and one
+        # hand-written terminal event already on disk, so the bounded poll
+        # resolves on its first attempt and nothing real is ever launched.
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if prior is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = prior
+        self.addCleanup(restore)
+        session_uuid = "S-" + uuid.uuid4().hex[:8]
+        transaction_id = "T-" + uuid.uuid4().hex[:8]
+
+        ledger_path = state_store.ledger_path_for(session_uuid)
+        minted = evidence_module.ledger.mint_owned_attempt(
+            ledger_path, transaction_id, "slow",
+            fields={"command": ["python3", "-c", "pass"],
+                   "execution_mode": "isolated_snapshot"})
+        self.assertIsNotNone(minted)
+        evidence_module.ledger.revise_owned_attempt(
+            ledger_path, transaction_id, "slow",
+            fields={"evidence_state": evidence_module.EVIDENCE_UNRESOLVED},
+            attempt_state="unresolved")
+        evidence_module._write_deferred_marker(
+            session_uuid, transaction_id,
+            {"slow": {"pgid": 999999, "deferred_at": "2026-01-01T00:00:00Z"}})
+        state_store.append_jsonl_atomic(
+            state_store.verification_attempt_events_path_for(
+                session_uuid, transaction_id),
+            {"event": "terminal", "label": "slow",
+             "at": "2026-01-01T00:00:00Z",
+             "evidence_state": evidence_module.EVIDENCE_PRESENT,
+             "exit_code": 0, "timed_out": False, "wall_time_s": 0.2})
+
+        with mock.patch.object(
+                verification, "cleanup_active_command_group") as cleanup:
+            result = evidence_module.reconcile_pending_evidence(
+                session_uuid, transaction_id, "slow")
+        self.assertEqual(result["transaction_id"], transaction_id)
+        self.assertEqual(result["still_pending"], [])
+        self.assertEqual(
+            result["reconciled"],
+            [{"label": "slow",
+              "evidence_state": evidence_module.EVIDENCE_PRESENT,
+              "ledger_ok": True}])
+        self.assertEqual(cleanup.call_count, 1)
+
+        key = evidence_module.ledger.owned_attempt_key(transaction_id, "slow")
+        records = [rec for rec in evidence_module.ledger.read_ledger(
+            ledger_path) if rec.get("attempt_key") == key]
+        self.assertEqual({rec["id"] for rec in records}, {minted["id"]})
+        latest = records[-1]
+        self.assertEqual(latest["attempt_state"], "terminal")
+        self.assertEqual(latest["evidence_state"],
+                         evidence_module.EVIDENCE_PRESENT)
+        self.assertEqual(latest["exit_status"], "pass")
+        self.assertEqual(latest["adjudication"], "pass")
+        self.assertEqual(
+            evidence_module._read_deferred_marker(
+                session_uuid, transaction_id)["labels"], {})
+
+        with mock.patch.object(
+                verification, "cleanup_active_command_group") as cleanup_again:
+            second = evidence_module.reconcile_pending_evidence(
+                session_uuid, transaction_id, "slow")
+        self.assertEqual(second["reconciled"], [])
+        self.assertEqual(second["still_pending"], [])
+        self.assertEqual(cleanup_again.call_count, 0)
 
     def test_should_defer_teardown_predicate_itself_never_raises(self):
         # M5R-C2: NotImplementedError is scoped only to the reconciliation
@@ -569,17 +726,39 @@ class ExtensionStubTests(unittest.TestCase):
         self.assertIs(
             evidence_module.should_defer_teardown("s", "t", "label"), False)
 
-    def test_extension_stubs_are_not_referenced_by_this_candidates_own_flow(self):
+    def test_completed_seams_are_referenced_exactly_where_intended(self):
         # Checked against compiled global-name references (co_names), never
         # raw source text -- a prose mention inside a docstring explaining
-        # WHY these stubs exist (as this module's own docstrings do) must
+        # WHY these seams exist (as these modules' own docstrings do) must
         # never be mistaken for an actual call.
-        for func in (worker_module.spawn_worker,
-                    worker_module._classify_worker_startup):
-            self.assertNotIn("resolve_worker_source", func.__code__.co_names)
+        #
+        # Both seams are now implemented, so this states where each one is
+        # reached from. `spawn_worker` is the one caller of
+        # `resolve_worker_source`: source is captured there, before any
+        # pipe or process exists.
+        self.assertIn("resolve_worker_source",
+                      worker_module.spawn_worker.__code__.co_names)
+        # The boundary this test has always drawn is unchanged for
+        # everything else. The startup classifier verifies against the
+        # manifest `resolve_worker_source` already wrote; it never
+        # re-resolves the source itself...
+        self.assertNotIn(
+            "resolve_worker_source",
+            worker_module._classify_worker_startup.__code__.co_names)
+        # ...and `should_defer_teardown` remains a predicate only: it never
+        # reaches into the reconciliation that owns ledger revision and
+        # teardown (M5R-C2's own scoping, still intact after #51).
         self.assertNotIn(
             "reconcile_pending_evidence",
             evidence_module.should_defer_teardown.__code__.co_names)
+        # Neither seam is inlined into the spine's own owned-transaction
+        # flow: it reaches them only through the two relocated entry points
+        # it already calls (`spawn_worker`, `should_defer_teardown`).
+        for forbidden in ("resolve_worker_source",
+                         "reconcile_pending_evidence"):
+            self.assertNotIn(
+                forbidden,
+                verification._run_owned_transaction.__code__.co_names)
 
 
 # =========================================================================== #

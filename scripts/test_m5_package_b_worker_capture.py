@@ -333,55 +333,48 @@ class ExcludedPathsUntouchedTests(unittest.TestCase):
                 "(read-only for this package)" % rel)
 
     def test_package_a_test_suite_still_passes_except_its_now_stale_stub_assertions(self):
-        # `test_m5_package_a_contracts.py` is unmodified (asserted above)
-        # and describes PACKAGE A's OWN candidate -- three of its
-        # assertions are, by that file's own explicit comments, exactly
-        # what Package B (#44) is supposed to change:
-        # `resolve_worker_source` no longer raises NotImplementedError, it
-        # is now referenced by `spawn_worker`'s own flow, and
-        # `worker_source_missing`/`worker_identity_mismatch` are no longer
-        # absent literals. This is run here, not merely asserted, so this
-        # candidate packet carries direct, current evidence of exactly
-        # which (and only which) of Package A's own tests are affected by
-        # completing #44, rather than an unverified claim.
+        # NAME RETAINED DELIBERATELY: the "except its now stale stub
+        # assertions" clause no longer describes any allowance this test
+        # grants -- there is none left -- but rename authority for this
+        # file's coupled method was not granted, so only the contract
+        # below changed. What it now requires is a FULL pass.
+        #
+        # `test_m5_package_a_contracts.py` describes PACKAGE A's OWN
+        # candidate, and four of its assertions were written to become
+        # stale once the extension seams they reserved were filled in:
+        # `resolve_worker_source` no longer raises NotImplementedError and
+        # is now reached from `spawn_worker`'s own flow, `worker_source_
+        # missing`/`worker_identity_mismatch` are no longer absent
+        # literals (#44), and `reconcile_pending_evidence` no longer raises
+        # either (#51). Those four have since been restated to assert the
+        # positive current contracts instead, so NO failure allowance
+        # remains here: the whole suite must pass. This is run, not merely
+        # asserted, so this candidate packet carries direct, current
+        # evidence rather than an unverified claim.
         result = subprocess.run(
             [sys.executable, "-m", "unittest",
              "scripts.test_m5_package_a_contracts", "-v"],
             cwd=_REPO_ROOT, capture_output=True, text=True, timeout=300)
         stderr = result.stderr
-        # Exactly the four assertions that file's own comments identify as
-        # describing PACKAGE A's (not Package B's) candidate must now fail:
-        # three unchanged, byte-for-byte-adopted from v2 (v2 already made
-        # this exact disposition; v3 does not revisit it), plus a fourth --
-        # `test_reconcile_pending_evidence_raises_not_implemented` -- staled
-        # not by this candidate but by Package C (#51), which independently
-        # implements `reconcile_pending_evidence` so it no longer raises
-        # `NotImplementedError`. Package A's own gate that pins its
-        # `test_cowork.py`/excluded-path byte-identity checks to ITS OWN
-        # commit (not the live tree) means neither of those two is stale
-        # here: Package A's own candidate never touched either, so both
-        # still pass against Package A's own commit-pinned comparison.
-        expected_failures = {
-            "test_extension_stubs_are_not_referenced_by_this_candidates_own_flow",
-            "test_resolve_worker_source_raises_not_implemented",
-            "test_worker_source_missing_and_identity_mismatch_are_absent",
-            "test_reconcile_pending_evidence_raises_not_implemented",
-        }
-        for name in expected_failures:
-            self.assertIn(
-                "FAIL: %s " % name, stderr,
-                "expected exactly this Package-A stub assertion to now "
-                "fail (by that file's own documented design once #44/#51 "
-                "is implemented): %s" % name)
-        # No OTHER test may newly fail -- this is the full, exact known
-        # stale set; no extra allowance is needed or granted.
-        for line in stderr.splitlines():
-            if line.startswith("FAIL: ") or line.startswith("ERROR: "):
-                name = line.split(" ", 2)[1]
-                self.assertIn(
-                    name, expected_failures,
-                    "an UNEXPECTED Package-A contract test failed/errored: "
-                    "%s" % line)
+        # Zero FAIL and zero ERROR -- reported by name, so a regression is
+        # diagnosable straight from this test's own output.
+        offenders = [line for line in stderr.splitlines()
+                    if line.startswith("FAIL: ")
+                    or line.startswith("ERROR: ")]
+        self.assertFalse(
+            offenders,
+            "Package A's contract suite must pass in full under the "
+            "restated current contract -- no failure allowance is granted "
+            "here any more; failed/errored: %s\n%s"
+            % ("; ".join(offenders), stderr[-4000:]))
+        # ...and the run itself genuinely succeeded, so an interpreter or
+        # collection error that never emits a FAIL:/ERROR: line at all can
+        # never be mistaken for an empty offender list.
+        self.assertEqual(
+            result.returncode, 0,
+            "Package A's contract suite did not exit 0 (rc=%s)\n%s"
+            % (result.returncode, stderr[-4000:]))
+        self.assertRegex(stderr, r"\nOK\b")
 
 
 # =========================================================================== #
