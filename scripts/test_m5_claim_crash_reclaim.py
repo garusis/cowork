@@ -1381,33 +1381,187 @@ class ProductionScopeConfinementTests(unittest.TestCase):
             self.current_source)
 
     def test_changed_paths_are_within_the_three_path_write_authority(self):
-        offenders = _working_tree_changed_paths() - ALLOWED_CHANGED_PATHS
+        """Commit-pinned path authority, restated cumulatively.
+
+        The claim-crash package's own range -- the signed base through its
+        bounded correction -- changed only paths inside the frozen
+        three-path write authority. That range is now history, so it is
+        compared commit to commit rather than against a live tree that
+        every authorized later commit would otherwise invalidate. The live
+        tree is then held to the signed release: it may differ from it in
+        this suite's own file and in nothing else."""
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
+        this_suite = "scripts/test_m5_claim_crash_reclaim.py"
+
+        def changed(*args):
+            return {p.strip() for p in subprocess.run(
+                ["git", "diff", "--name-only"] + list(args), cwd=_REPO_ROOT,
+                capture_output=True, text=True,
+                check=True).stdout.splitlines() if p.strip()}
+
+        package_changed = changed(BASE_SHA, correction)
+        self.assertTrue(package_changed,
+                        "the claim-crash package must not be an empty range")
+        offenders = package_changed - ALLOWED_CHANGED_PATHS
         self.assertFalse(
             offenders,
             "paths changed outside the frozen three-path write authority: %s"
             % sorted(offenders))
 
-    def test_the_correction_touched_only_its_two_authorized_paths(self):
-        self.assertEqual(
-            _working_tree_changed_paths(),
-            {"scripts/cowork_verification.py",
-             "scripts/test_m5_claim_crash_reclaim.py"})
-
-    def test_the_new_test_module_is_the_only_new_file(self):
+        # The live tree against the signed release: this suite's own file is
+        # the ONLY path this test-only restatement may write.
+        dirty = changed(release)
+        self.assertFalse(
+            dirty - {this_suite},
+            "tracked path(s) dirty outside this suite's own file: %s"
+            % sorted(dirty - {this_suite}))
+        self.assertFalse(dirty - ALLOWED_CHANGED_PATHS)
         untracked = {p.strip() for p in subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
             cwd=_REPO_ROOT, capture_output=True, text=True,
             check=True).stdout.splitlines() if p.strip()}
-        self.assertEqual(untracked,
-                         {"scripts/test_m5_claim_crash_reclaim.py"})
+        stray = {p for p in untracked
+                 if not (p.endswith(".pyc") and "__pycache__/" in p)}
+        self.assertFalse(stray,
+                         "untracked path(s) that are not Python bytecode "
+                         "caches: %s" % sorted(stray))
+
+        # Cumulative view, still measured from the signed base: every path
+        # that differs is one the signed release itself already carries.
+        live_changed = {p for p in _working_tree_changed_paths()
+                        if not (p.endswith(".pyc") and "__pycache__/" in p)}
+        self.assertEqual(
+            live_changed, changed(BASE_SHA, release),
+            "the live tree must change exactly the paths the signed release "
+            "changes relative to the signed base")
+
+    def test_the_correction_touched_only_its_two_authorized_paths(self):
+        """The bounded correction is one named commit sitting directly on
+        the fix commit, and it MODIFIED exactly two paths -- adding and
+        deleting nothing. Pinned to that commit and its parent, so no
+        authorized later commit can dilute the measurement."""
+        fix = "d2e484af75a1959eb21d0e45c1c8c8f34fc4745e"
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        parent = subprocess.run(
+            ["git", "rev-parse", correction + "^"], cwd=_REPO_ROOT,
+            capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(parent, fix,
+                         "the bounded correction must sit directly on the "
+                         "fix commit it corrects")
+        entries = {tuple(line.split("\t")) for line in subprocess.run(
+            ["git", "diff", "--name-status", fix, correction], cwd=_REPO_ROOT,
+            capture_output=True, text=True,
+            check=True).stdout.splitlines() if line.strip()}
+        self.assertEqual(
+            entries,
+            {("M", "scripts/cowork_verification.py"),
+             ("M", "scripts/test_m5_claim_crash_reclaim.py")},
+            "the bounded correction must modify exactly its two authorized "
+            "paths, adding and deleting nothing")
+        self.assertFalse({entry[-1] for entry in entries}
+                         - ALLOWED_CHANGED_PATHS)
+
+    def test_the_new_test_module_is_the_only_new_file(self):
+        """Commit-pinned file creation: across the whole claim-crash
+        package this suite is the only file added and nothing is deleted;
+        the only other file added anywhere between the signed base and the
+        signed release is the claim-liveness wiring package's own new
+        suite, added by that one named commit. In the live tree nothing
+        untracked survives except Python bytecode caches."""
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
+        release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
+
+        def filtered(kind, a, b):
+            return {line.split("\t")[-1].strip() for line in subprocess.run(
+                ["git", "diff", "--name-status", "--diff-filter=" + kind,
+                 a, b], cwd=_REPO_ROOT, capture_output=True, text=True,
+                check=True).stdout.splitlines() if line.strip()}
+
+        self.assertEqual(filtered("A", BASE_SHA, correction),
+                         {"scripts/test_m5_claim_crash_reclaim.py"},
+                         "this suite must be the only file the claim-crash "
+                         "package adds")
+        self.assertEqual(filtered("A", wiring + "^", wiring),
+                         {"scripts/test_m5_claim_liveness_wiring.py"},
+                         "the wiring package's new suite must belong to that "
+                         "one named commit")
+        self.assertEqual(filtered("A", BASE_SHA, release),
+                         {"scripts/test_m5_claim_crash_reclaim.py",
+                          "scripts/test_m5_claim_liveness_wiring.py"},
+                         "no other new file may appear between the signed "
+                         "base and the signed release")
+        self.assertFalse(filtered("D", BASE_SHA, release),
+                         "no file may be deleted between the signed base and "
+                         "the signed release")
+        untracked = {p.strip() for p in subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=_REPO_ROOT, capture_output=True, text=True,
+            check=True).stdout.splitlines() if p.strip()}
+        stray = {p for p in untracked
+                 if not (p.endswith(".pyc") and "__pycache__/" in p)}
+        self.assertFalse(stray,
+                         "no new untracked file may appear beside this "
+                         "suite's own authorized restatement: %s"
+                         % sorted(stray))
 
     def test_excluded_production_paths_are_byte_identical_to_the_base(self):
+        """Commit-pinned negative control, restated cumulatively.
+
+        Across its whole range the claim-crash package left every forbidden
+        production path byte-identical to the signed base. Exactly one
+        excluded path ever changed afterwards -- `scripts/cowork.py`, under
+        the claim-liveness wiring package's own separate authority -- and it
+        is pinned to that single commit: untouched right up to its parent,
+        untouched again after it. Every other excluded path is STILL
+        byte-identical to the signed base at the signed release, and the
+        live tree adds no dirty production edit on top of any of them."""
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
+        release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
         for rel in EXCLUDED_PATHS:
+            base_bytes = _git_show_bytes(BASE_SHA, rel)
             self.assertEqual(
-                _read_local_bytes(rel), _git_show_bytes(BASE_SHA, rel),
-                "%s must be byte-identical to the signed base" % rel)
+                _git_show_bytes(correction, rel), base_bytes,
+                "%s must be byte-identical to the signed base across the "
+                "whole claim-crash package" % rel)
+            if rel == "scripts/cowork.py":
+                self.assertEqual(
+                    _git_show_bytes(wiring + "^", rel), base_bytes,
+                    "%s must be byte-identical to the signed base right up "
+                    "to the wiring package that owns it" % rel)
+                self.assertNotEqual(
+                    _git_show_bytes(wiring, rel), base_bytes,
+                    "the wiring package must be the commit that actually "
+                    "changed %s -- otherwise this control is vacuous" % rel)
+                self.assertEqual(
+                    _git_show_bytes(release, rel),
+                    _git_show_bytes(wiring, rel),
+                    "no commit after the wiring package may touch %s" % rel)
+            else:
+                self.assertEqual(
+                    _git_show_bytes(release, rel), base_bytes,
+                    "%s must still be byte-identical to the signed base at "
+                    "the signed release" % rel)
+            self.assertEqual(
+                _read_local_bytes(rel), _git_show_bytes(release, rel),
+                "%s must match the signed release byte for byte in the live "
+                "tree" % rel)
 
     def test_every_pre_existing_test_file_is_byte_identical_to_the_base(self):
+        """Commit-pinned and cumulative: the claim-crash package and the
+        claim-liveness wiring package each left every pre-existing test file
+        byte-identical to the signed base. At the signed release the only
+        pre-existing test files that differ are the two rewritten by the one
+        named test-only restatement commit -- which touched no production
+        file at all, so a test-only follow-up can never be mistaken for a
+        production change."""
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
+        release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
+        restated = {"scripts/test_m5_package_a_contracts.py",
+                    "scripts/test_m5_package_b_worker_capture.py"}
         listed = subprocess.run(
             ["git", "ls-tree", "-r", "--name-only", BASE_SHA, "scripts/"],
             cwd=_REPO_ROOT, capture_output=True, text=True,
@@ -1416,10 +1570,39 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                       if os.path.basename(p).startswith("test_")
                       and p.endswith(".py")]
         self.assertGreaterEqual(len(test_files), 20)
+        self.assertTrue(restated.issubset(set(test_files)))
         for rel in test_files:
+            base_bytes = _git_show_bytes(BASE_SHA, rel)
             self.assertEqual(
-                _read_local_bytes(rel), _git_show_bytes(BASE_SHA, rel),
+                _git_show_bytes(correction, rel), base_bytes,
                 "existing test file %s must not change" % rel)
+            self.assertEqual(
+                _git_show_bytes(wiring, rel), base_bytes,
+                "existing test file %s must not change through the wiring "
+                "package either" % rel)
+            release_bytes = _git_show_bytes(release, rel)
+            if rel in restated:
+                self.assertNotEqual(
+                    release_bytes, base_bytes,
+                    "%s is claimed as restated, so it must actually differ "
+                    "from the signed base" % rel)
+            else:
+                self.assertEqual(
+                    release_bytes, base_bytes,
+                    "existing test file %s must still be byte-identical to "
+                    "the signed base at the signed release" % rel)
+            self.assertEqual(
+                _read_local_bytes(rel), release_bytes,
+                "existing test file %s must match the signed release byte "
+                "for byte in the live tree" % rel)
+        self.assertEqual(
+            {p.strip() for p in subprocess.run(
+                ["git", "diff", "--name-only", release + "^", release],
+                cwd=_REPO_ROOT, capture_output=True, text=True,
+                check=True).stdout.splitlines() if p.strip()},
+            restated,
+            "the restatement commit must be test-only: it may touch no "
+            "production path at all")
 
     def test_cowork_state_is_byte_identical_to_the_base(self):
         # Writable only "if genuinely necessary" -- it was not: the
@@ -1429,16 +1612,79 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                          _git_show_bytes(BASE_SHA, "scripts/cowork_state.py"))
 
     def test_only_the_authorized_symbols_were_added(self):
-        added = set(self.cur_named) - set(self.base_named)
-        self.assertEqual(added, set(AUTHORIZED_ADDED_SYMBOLS),
+        """Symbol-exact and cumulative. Across its own commit-pinned range
+        the claim-crash package added exactly `AUTHORIZED_ADDED_SYMBOLS` and
+        removed nothing. The only further top-level symbol in the live
+        module is `reconstruct_checkpoint_state_with_liveness`, and it is
+        pinned to the one named claim-liveness wiring commit that added it
+        under that package's own authority."""
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
+        rel = "scripts/cowork_verification.py"
+        package_named, _unnamed = _top_level_index(
+            _git_show_text(correction, rel))
+        self.assertEqual(set(package_named) - set(self.base_named),
+                         set(AUTHORIZED_ADDED_SYMBOLS),
                          "unauthorized top-level symbol(s) added/removed")
+        self.assertFalse(set(self.base_named) - set(package_named),
+                         "the claim-crash package must remove no symbol")
+
+        wiring_before, _unnamed = _top_level_index(
+            _git_show_text(wiring + "^", rel))
+        wiring_after, _unnamed = _top_level_index(_git_show_text(wiring, rel))
+        self.assertEqual(set(wiring_after) - set(wiring_before),
+                         {"reconstruct_checkpoint_state_with_liveness"},
+                         "the only later addition must belong to the one "
+                         "named wiring commit")
+        self.assertFalse(set(wiring_before) - set(wiring_after))
+
+        added = set(self.cur_named) - set(self.base_named)
+        self.assertEqual(added,
+                         set(AUTHORIZED_ADDED_SYMBOLS)
+                         | {"reconstruct_checkpoint_state_with_liveness"},
+                         "unauthorized top-level symbol(s) added/removed")
+        self.assertFalse(set(self.base_named) - set(self.cur_named),
+                         "no top-level symbol may be removed at any point")
 
     def test_only_claim_checkpoint_was_changed(self):
+        """Symbol-exact change control, cumulative and commit-pinned. The
+        claim-crash package changed exactly `claim_checkpoint` and nothing
+        else. The only other pre-existing symbol that differs in the live
+        module is `reconstruct_all_checkpoints`, and it differs solely
+        because of the one named claim-liveness wiring commit -- which is
+        also the last commit to touch the production module at all, so the
+        live file is byte-identical to the signed release."""
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
+        release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
+        rel = "scripts/cowork_verification.py"
+        package_named, _unnamed = _top_level_index(
+            _git_show_text(correction, rel))
+        package_changed = {name for name, text in self.base_named.items()
+                           if package_named.get(name) != text}
+        self.assertEqual(package_changed, set(AUTHORIZED_CHANGED_SYMBOLS),
+                         "production symbol(s) changed outside the authorized "
+                         "region: %s" % sorted(package_changed))
+
+        wiring_before, _unnamed = _top_level_index(
+            _git_show_text(wiring + "^", rel))
+        wiring_after, _unnamed = _top_level_index(_git_show_text(wiring, rel))
+        self.assertEqual({name for name, text in wiring_before.items()
+                          if wiring_after.get(name) != text},
+                         {"reconstruct_all_checkpoints"},
+                         "the only later production edit must be the one the "
+                         "named wiring commit owns")
+
         changed = {name for name, text in self.base_named.items()
                    if self.cur_named.get(name) != text}
-        self.assertEqual(changed, set(AUTHORIZED_CHANGED_SYMBOLS),
+        self.assertEqual(changed,
+                         set(AUTHORIZED_CHANGED_SYMBOLS)
+                         | {"reconstruct_all_checkpoints"},
                          "production symbol(s) changed outside the authorized "
                          "region: %s" % sorted(changed))
+        self.assertEqual(self.current_source, _git_show_text(release, rel),
+                         "the live production module must be byte-identical "
+                         "to the signed release")
 
     def test_no_top_level_symbol_was_removed(self):
         self.assertFalse(set(self.base_named) - set(self.cur_named))
@@ -1510,12 +1756,38 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                          "not be two new module-level constants")
 
     def test_exactly_one_new_sibling_classifier_was_added(self):
+        """Commit-pinned: the claim-crash package added exactly one new
+        top-level `def`, the classifier. The only other new `def` in the
+        live module is the reader the named claim-liveness wiring commit
+        added, so the cumulative count is two and both are real callables."""
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
+        rel = "scripts/cowork_verification.py"
+        package_named, _unnamed = _top_level_index(
+            _git_show_text(correction, rel))
         added_defs = {
+            name for name in set(package_named) - set(self.base_named)
+            if package_named[name].lstrip().startswith("def ")}
+        self.assertEqual(added_defs, {"classify_checkpoint_claim_liveness"})
+
+        wiring_before, _unnamed = _top_level_index(
+            _git_show_text(wiring + "^", rel))
+        wiring_after, _unnamed = _top_level_index(_git_show_text(wiring, rel))
+        self.assertEqual(
+            {name for name in set(wiring_after) - set(wiring_before)
+             if wiring_after[name].lstrip().startswith("def ")},
+            {"reconstruct_checkpoint_state_with_liveness"})
+
+        cumulative_defs = {
             name for name in set(self.cur_named) - set(self.base_named)
             if self.cur_named[name].lstrip().startswith("def ")}
-        self.assertEqual(added_defs, {"classify_checkpoint_claim_liveness"})
+        self.assertEqual(cumulative_defs,
+                         {"classify_checkpoint_claim_liveness",
+                          "reconstruct_checkpoint_state_with_liveness"})
         self.assertTrue(callable(
             verification.classify_checkpoint_claim_liveness))
+        self.assertTrue(callable(
+            verification.reconstruct_checkpoint_state_with_liveness))
 
     def test_the_changed_python_files_compile(self):
         import py_compile
@@ -1523,13 +1795,51 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                     "scripts/test_m5_claim_crash_reclaim.py"):
             py_compile.compile(os.path.join(_REPO_ROOT, rel), doraise=True)
 
-    def test_head_is_the_signed_base_and_nothing_was_committed(self):
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT,
-            capture_output=True, text=True, check=True).stdout.strip()
-        self.assertEqual(head, BASE_SHA,
+    def test_head_is_the_signed_release_and_nothing_was_committed(self):
+        """Restated for the integrated release. HEAD is the signed release
+        commit carrying the signed tree; the signed base, the fix, its
+        bounded correction and the wiring package form its exact
+        first-parent chain; and this test-only restatement commits nothing
+        -- nothing is staged, and the whole working tree differs from that
+        release in at most this suite's own file."""
+        fix = "d2e484af75a1959eb21d0e45c1c8c8f34fc4745e"
+        correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
+        wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
+        release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
+        release_tree = "35fedfdfb9f4c5c3df4a5fd86471882342f01392"
+        this_suite = "scripts/test_m5_claim_crash_reclaim.py"
+
+        def rev(spec):
+            return subprocess.run(
+                ["git", "rev-parse", spec], cwd=_REPO_ROOT,
+                capture_output=True, text=True, check=True).stdout.strip()
+
+        for child, parent in ((fix, BASE_SHA), (correction, fix),
+                              (wiring, correction), (release, wiring)):
+            self.assertEqual(rev(child + "^"), parent,
+                             "%s must sit directly on %s" % (child, parent))
+        self.assertEqual(rev("HEAD"), release,
                          "this package must not commit: HEAD must still be "
-                         "the signed base")
+                         "the signed release")
+        self.assertEqual(rev("HEAD^{tree}"), release_tree,
+                         "HEAD must carry the signed tree")
+        self.assertEqual(rev(release + "^{tree}"), release_tree)
+
+        staged = {p.strip() for p in subprocess.run(
+            ["git", "diff", "--cached", "--name-only"], cwd=_REPO_ROOT,
+            capture_output=True, text=True,
+            check=True).stdout.splitlines() if p.strip()}
+        self.assertFalse(staged - {this_suite},
+                         "nothing but this suite's own file may ever be "
+                         "staged: %s" % sorted(staged - {this_suite}))
+        dirty = {p.strip() for p in subprocess.run(
+            ["git", "diff", "--name-only", release], cwd=_REPO_ROOT,
+            capture_output=True, text=True,
+            check=True).stdout.splitlines() if p.strip()}
+        self.assertFalse(dirty - {this_suite},
+                         "the working tree may differ from the signed "
+                         "release only in this suite's own file: %s"
+                         % sorted(dirty - {this_suite}))
 
 
 if __name__ == "__main__":
