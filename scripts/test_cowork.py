@@ -14634,7 +14634,16 @@ class TransportChokePointTests(unittest.TestCase):
                 "index_digest": "cd" * 32, "verdict": "green",
                 "final_suite_label": "full", "final_suite_binding": "ran_once",
                 "command_count": 1, "disposition": "pending_review",
-                "contradiction": False}
+                "contradiction": False,
+                # M5 checkpoint facts, each already inside its own closed
+                # _FACT_SCHEMAS shape: Package D's reviewer-facing overlay
+                # (both builder->build-reviewer edges) plus route 14's
+                # `cowork->role:checkpoint_wake` (role + the four below).
+                "checkpoint_id": "CP-1", "checkpoint_phase": "building",
+                "checkpoint_verdict": "accepted",
+                "checkpoint_state": "terminal",
+                "checkpoint_disposition": "pending_review",
+                "checkpoint_superseded_count": 0}
         return {k: vals[k] for k in spec["facts"]}
 
     def _edge_ctx(self, spec):
