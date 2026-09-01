@@ -1381,18 +1381,39 @@ class ProductionScopeConfinementTests(unittest.TestCase):
             self.current_source)
 
     def test_changed_paths_are_within_the_three_path_write_authority(self):
-        """Commit-pinned path authority, restated cumulatively.
+        """Commit-pinned path authority, restated cumulatively across the
+        authorized serial repair history.
 
         The claim-crash package's own range -- the signed base through its
         bounded correction -- changed only paths inside the frozen
         three-path write authority. That range is now history, so it is
         compared commit to commit rather than against a live tree that
-        every authorized later commit would otherwise invalidate. The live
-        tree is then held to the signed release: it may differ from it in
-        this suite's own file and in nothing else."""
+        every authorized later commit would otherwise invalidate. That
+        historical authority is unchanged and is still checked in full.
+
+        Past the signed release the user authorized two further, serially
+        integrated, separately reviewed test-only repairs. They are named
+        by commit and pinned to the exact path each one wrote -- the
+        release-pin repair wrote this suite's own file, the handoff-facts
+        repair wrote `scripts/test_cowork.py` -- and together they define a
+        CLOSED two-path set. `scripts/test_cowork.py` is admitted by that
+        separate serial authority, NOT by this package's frozen three-path
+        authority, which is why it is named here rather than folded into
+        `ALLOWED_CHANGED_PATHS`. The live tree is held to the closed set
+        and to nothing wider: any third path fails closed, committed,
+        staged, dirty or untracked. Nothing is blessed for merely
+        differing -- every admitted path is named, and each is proven to be
+        exactly what one named authorized commit actually wrote."""
         correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
         release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
+        scope_gates = "c5bd555ba74db91b162a5d3d470862d29b8e85da"
+        pin_repair = "1645ae22611caa8e333e4c3bdca2bdd62067cef6"
+        handoff = "698cda13a62372c0aef683657b4a9a93837616d5"
         this_suite = "scripts/test_m5_claim_crash_reclaim.py"
+        handoff_suite = "scripts/test_cowork.py"
+        repair_paths = {this_suite, handoff_suite}
+        # A path no M5 repair package may write under either allowance.
+        unrelated = "scripts/cowork.py"
 
         def changed(*args):
             return {p.strip() for p in subprocess.run(
@@ -1409,14 +1430,41 @@ class ProductionScopeConfinementTests(unittest.TestCase):
             "paths changed outside the frozen three-path write authority: %s"
             % sorted(offenders))
 
-        # The live tree against the signed release: this suite's own file is
-        # the ONLY path this test-only restatement may write.
+        # The two authorized serial repairs, pinned commit by commit to the
+        # exact path each one wrote. Their git-measured union -- not the
+        # literals above -- is what defines the closed set.
+        self.assertEqual(changed(release, scope_gates), {this_suite},
+                         "the scope-gate restatement must have written this "
+                         "suite's own file alone")
+        self.assertEqual(changed(scope_gates, pin_repair), {this_suite},
+                         "the release-pin repair must have written this "
+                         "suite's own file alone")
+        self.assertEqual(changed(pin_repair, handoff), {handoff_suite},
+                         "the handoff-facts repair must have written %s "
+                         "alone" % handoff_suite)
+        self.assertEqual(changed(release, handoff), repair_paths,
+                         "the authorized serial repair range must change "
+                         "exactly the closed two-path set")
+
+        # The live tree against the signed release: only the closed
+        # two-path set may differ, and nothing else.
         dirty = changed(release)
         self.assertFalse(
-            dirty - {this_suite},
-            "tracked path(s) dirty outside this suite's own file: %s"
-            % sorted(dirty - {this_suite}))
-        self.assertFalse(dirty - ALLOWED_CHANGED_PATHS)
+            dirty - repair_paths,
+            "tracked path(s) dirty outside the closed two-path serial "
+            "repair set: %s" % sorted(dirty - repair_paths))
+        # ... and against the last authorized repair: this successor may
+        # write this suite's own file and nothing else, staged or unstaged.
+        head_delta = changed("HEAD")
+        self.assertFalse(
+            head_delta - {this_suite},
+            "the index and working tree may differ from HEAD only in this "
+            "suite's own file: %s" % sorted(head_delta - {this_suite}))
+        staged = changed("--cached")
+        self.assertFalse(
+            staged - {this_suite},
+            "nothing but this suite's own file may ever be staged: %s"
+            % sorted(staged - {this_suite}))
         untracked = {p.strip() for p in subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
             cwd=_REPO_ROOT, capture_output=True, text=True,
@@ -1428,13 +1476,35 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                          "caches: %s" % sorted(stray))
 
         # Cumulative view, still measured from the signed base: every path
-        # that differs is one the signed release itself already carries.
+        # that differs is one the signed release itself already carries, or
+        # one of the two paths the authorized serial repairs wrote.
         live_changed = {p for p in _working_tree_changed_paths()
                         if not (p.endswith(".pyc") and "__pycache__/" in p)}
         self.assertEqual(
-            live_changed, changed(BASE_SHA, release),
+            live_changed, changed(BASE_SHA, release) | repair_paths,
             "the live tree must change exactly the paths the signed release "
-            "changes relative to the signed base")
+            "changes relative to the signed base, plus the closed two-path "
+            "set the authorized serial repairs wrote")
+
+        # Real negative control, not a fabrication: a range that genuinely
+        # DID write an unrelated production path must be rejected by the
+        # closed set, and each live set this test guards must fail closed
+        # on that one path -- flagging it and nothing else.
+        real_range = changed(BASE_SHA, release)
+        self.assertIn(unrelated, real_range,
+                      "the real negative-control range must actually have "
+                      "changed %s" % unrelated)
+        self.assertIn(unrelated, real_range - repair_paths,
+                      "the closed two-path set must flag an unrelated "
+                      "production path that a real range actually changed")
+        for label, real, allowed in (("dirty", dirty, repair_paths),
+                                     ("head", head_delta, {this_suite}),
+                                     ("staged", staged, {this_suite}),
+                                     ("untracked", stray, {this_suite})):
+            self.assertEqual(
+                (real | {unrelated}) - allowed, {unrelated},
+                "the %s check must fail closed for an unrelated path, and "
+                "flag nothing else" % label)
 
     def test_the_correction_touched_only_its_two_authorized_paths(self):
         """The bounded correction is one named commit sitting directly on
@@ -1556,12 +1626,40 @@ class ProductionScopeConfinementTests(unittest.TestCase):
         pre-existing test files that differ are the two rewritten by the one
         named test-only restatement commit -- which touched no production
         file at all, so a test-only follow-up can never be mistaken for a
-        production change."""
+        production change. Every one of those historical checks is kept
+        exactly as it was, at exactly the commits it was pinned to.
+
+        The two authorized serial repairs that follow are then modelled
+        EXPLICITLY, commit by commit, rather than by blessing whatever
+        happens to differ in the live tree:
+
+          - the scope-gate restatement and the release-pin repair each
+            wrote this suite's own file, which is not a pre-existing test
+            file at all, so at both of those commits EVERY pre-existing
+            test file must still be byte-identical to the signed release;
+          - the handoff-facts repair wrote exactly `scripts/test_cowork.py`,
+            so that one NAMED file -- and no other -- may differ from the
+            signed release afterwards, and it must actually differ, or the
+            exception would be vacuous;
+          - the live tree is then pinned to that last authorized repair, so
+            any drift in any pre-existing test file, in that named file
+            included, still fails closed.
+
+        Each of the three serial commits is also held to the exact path set
+        it wrote, which is what proves all of them test-only: none touched
+        a production path."""
         correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
         wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
         release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
+        scope_gates = "c5bd555ba74db91b162a5d3d470862d29b8e85da"
+        pin_repair = "1645ae22611caa8e333e4c3bdca2bdd62067cef6"
+        handoff = "698cda13a62372c0aef683657b4a9a93837616d5"
+        this_suite = "scripts/test_m5_claim_crash_reclaim.py"
         restated = {"scripts/test_m5_package_a_contracts.py",
                     "scripts/test_m5_package_b_worker_capture.py"}
+        # The one pre-existing test file the authorized serial repairs
+        # rewrote, named rather than discovered.
+        serial_restated = {"scripts/test_cowork.py"}
         listed = subprocess.run(
             ["git", "ls-tree", "-r", "--name-only", BASE_SHA, "scripts/"],
             cwd=_REPO_ROOT, capture_output=True, text=True,
@@ -1571,6 +1669,13 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                       and p.endswith(".py")]
         self.assertGreaterEqual(len(test_files), 20)
         self.assertTrue(restated.issubset(set(test_files)))
+        self.assertTrue(
+            serial_restated.issubset(set(test_files)),
+            "the serially repaired file must itself be a pre-existing test "
+            "file, or this exception is guarding nothing")
+        self.assertNotIn(this_suite, test_files,
+                         "this suite is new in the claim-crash package, so "
+                         "it is never a pre-existing test file")
         for rel in test_files:
             base_bytes = _git_show_bytes(BASE_SHA, rel)
             self.assertEqual(
@@ -1591,18 +1696,54 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                     release_bytes, base_bytes,
                     "existing test file %s must still be byte-identical to "
                     "the signed base at the signed release" % rel)
+
+            # The two authorized serial repairs, modelled commit by commit.
             self.assertEqual(
-                _read_local_bytes(rel), release_bytes,
-                "existing test file %s must match the signed release byte "
-                "for byte in the live tree" % rel)
+                _git_show_bytes(scope_gates, rel), release_bytes,
+                "the scope-gate restatement must leave pre-existing test "
+                "file %s byte-identical to the signed release" % rel)
+            self.assertEqual(
+                _git_show_bytes(pin_repair, rel), release_bytes,
+                "the release-pin repair must leave pre-existing test file "
+                "%s byte-identical to the signed release" % rel)
+            handoff_bytes = _git_show_bytes(handoff, rel)
+            if rel in serial_restated:
+                self.assertNotEqual(
+                    handoff_bytes, release_bytes,
+                    "%s is claimed as serially repaired, so it must "
+                    "actually differ from the signed release" % rel)
+            else:
+                self.assertEqual(
+                    handoff_bytes, release_bytes,
+                    "existing test file %s must still be byte-identical to "
+                    "the signed release at the last authorized repair" % rel)
+            self.assertEqual(
+                _read_local_bytes(rel), handoff_bytes,
+                "existing test file %s must match the last authorized "
+                "repair byte for byte in the live tree" % rel)
+
+        def changed(a, b):
+            return {p.strip() for p in subprocess.run(
+                ["git", "diff", "--name-only", a, b], cwd=_REPO_ROOT,
+                capture_output=True, text=True,
+                check=True).stdout.splitlines() if p.strip()}
+
         self.assertEqual(
-            {p.strip() for p in subprocess.run(
-                ["git", "diff", "--name-only", release + "^", release],
-                cwd=_REPO_ROOT, capture_output=True, text=True,
-                check=True).stdout.splitlines() if p.strip()},
-            restated,
+            changed(release + "^", release), restated,
             "the restatement commit must be test-only: it may touch no "
             "production path at all")
+        self.assertEqual(
+            changed(release, scope_gates), {this_suite},
+            "the scope-gate restatement must be test-only: it wrote this "
+            "suite's own file alone")
+        self.assertEqual(
+            changed(scope_gates, pin_repair), {this_suite},
+            "the release-pin repair must be test-only: it wrote this "
+            "suite's own file alone")
+        self.assertEqual(
+            changed(pin_repair, handoff), serial_restated,
+            "the handoff-facts repair must be test-only: it wrote exactly "
+            "%s" % sorted(serial_restated))
 
     def test_cowork_state_is_byte_identical_to_the_base(self):
         # Writable only "if genuinely necessary" -- it was not: the
@@ -1797,27 +1938,47 @@ class ProductionScopeConfinementTests(unittest.TestCase):
 
     def test_head_is_a_clean_scoped_successor_of_the_signed_release(self):
         """HEAD descends from the signed release along the exact signed
-        first-parent chain, and adds nothing outside this suite's own file.
+        first-parent chain, and the whole authorized serial repair history
+        stays inside the closed two-path M5 repair set.
 
         A committed test file CANNOT truthfully pin its own containing
         commit: that hash is only determined once the file's bytes are
-        final, so the earlier `HEAD == <literal>` / `HEAD^{tree} ==
-        <literal>` pins were unsatisfiable in the very commit that carried
-        them. They are replaced by everything that is genuinely knowable
-        from inside the candidate:
+        final, so a `HEAD == <literal>` / `HEAD^{tree} == <literal>` pin is
+        unsatisfiable in the very commit that carries it. Nothing below
+        pins this successor's own hash or tree. What it DOES pin is
+        everything the user's authorized serial history has already made
+        knowable and immutable:
 
           - the signed chain is exact, first parent by first parent, from
             the signed base through the fix, the bounded correction and the
-            wiring package to the prior signed release `3f5724ac...`, which
-            still carries its own signed tree;
-          - the prior signed release is a FIRST-PARENT ancestor of HEAD (or
-            HEAD itself): no fork, no rewrite, no merge splicing in a
-            second lineage;
-          - every commit added on top of it is an ordinary single-parent
-            commit that changed this suite's own file and nothing else, and
-            the cumulative committed diff, the index, and the working tree
-            are each held to that same one path -- so an unrelated staged
-            or committed path fails this test closed;
+            wiring package to the test-only restatement `3f5724ac...`,
+            which still carries its own signed tree, and on through the
+            separately authorized, separately reviewed serial repairs
+            `c5bd555...` -> `1645ae2...` -> `698cda1...`, the last of which
+            still carries its own signed tree too;
+          - each known repair is held to the exact path it was authorized
+            to write: the scope-gate restatement and the release-pin repair
+            wrote this suite's own file, the handoff-facts repair wrote
+            `scripts/test_cowork.py`, and none of them wrote anything else.
+            That is the fact the previous revision of this test got wrong:
+            it confined EVERY successor of `3f5724ac...` to this suite
+            alone, so the second authorized repair -- which necessarily
+            changed `scripts/test_cowork.py` -- failed it closed on the
+            exact serial history the user authorized. The admitted set is
+            those two M5 repair paths and nothing else; any third path
+            still fails closed;
+          - past `698cda1...` the history is unknown, so it is held to the
+            narrowest authorized rule rather than to a literal: every such
+            commit must be an ordinary single-parent commit, signed by the
+            same key, changing this suite's own file and nothing else --
+            the release-pin suite is the only path the remaining correction
+            authority covers, so even `scripts/test_cowork.py` is rejected
+            there;
+          - the index, the working tree and every untracked file may differ
+            from HEAD only in this suite's own file, and the working tree
+            may differ from the signed release only within the closed
+            two-path repair set -- so an unrelated committed, staged, dirty
+            or untracked path fails this test closed;
           - every commit in the chain, HEAD included, carries an SSH
             signature whose embedded public key is byte-identical to the
             key that signed the release.
@@ -1825,19 +1986,31 @@ class ProductionScopeConfinementTests(unittest.TestCase):
         SIGNATURE BOUNDARY, stated rather than papered over with a
         tautology: `git verify-commit` needs `gpg.ssh.allowedSignersFile`
         to be configured and present, and this package may not write git
-        configuration, so validating that key against the allowed-signers
-        roster stays with the supervisor-owned release gate. What is proven
-        HERE is structural and still non-vacuous -- the signature exists,
-        is a real SSHSIG blob, and names the same signer as the signed
-        release -- and it is read straight out of the commit objects, so no
-        git configuration is consulted or written to obtain it."""
+        configuration, so CRYPTOGRAPHIC allowed-signers verification stays
+        with the supervisor-owned release gate. Embedded signer-key
+        equality is STRUCTURAL EVIDENCE ONLY -- the signature exists, is a
+        real SSHSIG blob, and names the same signer as the signed release
+        -- read straight out of the commit objects, so no git configuration
+        is consulted or written to obtain it."""
         fix = "d2e484af75a1959eb21d0e45c1c8c8f34fc4745e"
         correction = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
         wiring = "f909122e1cc6d67098e65a443b57a7257c63d3f4"
         release = "3f5724ac24c19b0d8b9243b81d31d4cc0cc906f2"
         release_tree = "35fedfdfb9f4c5c3df4a5fd86471882342f01392"
+        scope_gates = "c5bd555ba74db91b162a5d3d470862d29b8e85da"
+        pin_repair = "1645ae22611caa8e333e4c3bdca2bdd62067cef6"
+        handoff = "698cda13a62372c0aef683657b4a9a93837616d5"
+        handoff_tree = "63aed89ed968925a2ddab704e3f74160ddb554ec"
         this_suite = "scripts/test_m5_claim_crash_reclaim.py"
+        handoff_suite = "scripts/test_cowork.py"
+        # The closed set the authorized serial repair history may write,
+        # and the strictly narrower set the one remaining correction
+        # authority may write.
+        repair_paths = {this_suite, handoff_suite}
         scoped = {this_suite}
+        # A path no M5 repair package may write under either allowance;
+        # the negative controls below are pointed at it.
+        unrelated = "scripts/cowork.py"
 
         def git(*args):
             return subprocess.run(
@@ -1852,12 +2025,17 @@ class ProductionScopeConfinementTests(unittest.TestCase):
                     for p in git("diff", "--name-only", *args).splitlines()
                     if p.strip()}
 
-        def offenders(changed):
-            """THE confinement predicate. Every path outside this suite's
-            own file, applied identically to the committed range, the
-            index and the working tree, so all three fail closed the same
-            way."""
-            return set(changed) - scoped
+        def parents_of(spec):
+            return git("rev-list", "--parents", "-n", "1", spec).split()[1:]
+
+        def offenders(changed, allowed):
+            """THE confinement predicate -- one implementation for every
+            layer: whatever falls outside the closed set handed to it. It
+            is applied identically to the committed successor range, each
+            unknown successor commit, the index, the working tree and the
+            untracked set, so every one of them fails closed on a third
+            path the same way."""
+            return set(changed) - set(allowed)
 
         def signing_key(spec):
             """The public key embedded in a commit's OWN SSH signature,
@@ -1883,91 +2061,186 @@ class ProductionScopeConfinementTests(unittest.TestCase):
             key_len = struct.unpack(">I", blob[10:14])[0]
             return blob[14:14 + key_len]
 
-        # 1. Pure history: the exact signed first-parent chain up to the
-        #    prior signed release, and that release's own signed tree.
-        #    Nothing here can be invalidated by the candidate's own bytes.
+        # 1. Pure history: the exact signed first-parent chain, the prior
+        #    signed release's own tree, and both authorized serial
+        #    repairs. Nothing here can be invalidated by this successor's
+        #    own bytes, because every one of these commits is already
+        #    signed and immutable.
         for child, parent in ((fix, BASE_SHA), (correction, fix),
-                              (wiring, correction), (release, wiring)):
+                              (wiring, correction), (release, wiring),
+                              (scope_gates, release),
+                              (pin_repair, scope_gates),
+                              (handoff, pin_repair)):
             self.assertEqual(rev(child + "^"), parent,
                              "%s must sit directly on %s" % (child, parent))
+            self.assertEqual(len(parents_of(child)), 1,
+                             "%s must be an ordinary single-parent commit, "
+                             "not a merge" % child)
         self.assertEqual(rev(release + "^{tree}"), release_tree,
                          "the signed release must still carry its signed "
                          "tree")
+        self.assertEqual(rev(handoff + "^{tree}"), handoff_tree,
+                         "the last known signed repair must still carry its "
+                         "own signed tree")
 
-        # 2. HEAD is that release, or a first-parent descendant of it.
+        # 2. Each known repair wrote EXACTLY the one path it was
+        #    authorized to write, and their union is exactly the closed M5
+        #    repair path set -- measured from git, not restated from the
+        #    literals above.
+        self.assertEqual(paths(release, scope_gates), scoped,
+                         "the scope-gate restatement must have written this "
+                         "suite's own file alone")
+        self.assertEqual(paths(scope_gates, pin_repair), scoped,
+                         "the release-pin repair must have written this "
+                         "suite's own file alone")
+        self.assertEqual(paths(pin_repair, handoff), {handoff_suite},
+                         "the handoff-facts repair must have written %s "
+                         "alone" % handoff_suite)
+        self.assertEqual(paths(release, scope_gates)
+                         | paths(scope_gates, pin_repair)
+                         | paths(pin_repair, handoff),
+                         repair_paths,
+                         "the authorized serial repair history must write "
+                         "exactly the closed M5 repair path set")
+
+        # 3. HEAD is the last known signed repair, or a first-parent
+        #    descendant of it: no fork, no rewrite, no merge splicing in a
+        #    second lineage.
         first_parents = [line.strip() for line
                          in git("rev-list", "--first-parent", "HEAD")
                          .splitlines() if line.strip()]
         self.assertIn(release, first_parents,
                       "the signed release must be HEAD itself or a "
                       "first-parent ancestor of HEAD")
-        successors = first_parents[:first_parents.index(release)]
+        self.assertIn(handoff, first_parents,
+                      "the last known signed repair must be HEAD itself or "
+                      "a first-parent ancestor of HEAD")
+        successors = first_parents[:first_parents.index(handoff)]
 
-        # 3. Same signer across the whole chain, candidate commits
-        #    included.
+        # 4. Same signer across the whole chain, unknown successors
+        #    included (structural evidence only -- see the boundary above).
         release_key = signing_key(release)
-        for commit in [BASE_SHA, fix, correction, wiring] + successors:
+        for commit in [BASE_SHA, fix, correction, wiring, scope_gates,
+                       pin_repair, handoff] + successors:
             self.assertEqual(
                 signing_key(commit), release_key,
                 "%s must be signed by the same key as the signed release"
                 % commit)
 
-        # 4. Every commit on top of the release is a scoped, ordinary
-        #    single-parent commit touching this suite's own file alone.
+        # 5. Every UNKNOWN commit on top of the last known repair is an
+        #    ordinary single-parent commit confined to this suite's own
+        #    file -- the only path the remaining correction authority
+        #    covers, which is strictly narrower than the closed repair set.
+        successor_paths = set()
         for commit in successors:
-            parents = git("rev-list", "--parents", "-n", "1",
-                          commit).split()[1:]
+            parents = parents_of(commit)
             self.assertEqual(len(parents), 1,
                              "%s must be an ordinary single-parent commit, "
                              "not a merge" % commit)
-            stray = offenders(paths(parents[0], commit))
+            changed = paths(parents[0], commit)
+            successor_paths |= changed
+            stray = offenders(changed, scoped)
             self.assertFalse(
                 stray,
                 "commit %s changed path(s) outside this suite's own file: "
                 "%s" % (commit, sorted(stray)))
 
-        # 5. Cumulative confinement: committed range, index, working tree.
+        # 6. Cumulative confinement, the same predicate at every layer:
+        #    the committed successor range against the closed repair set,
+        #    the index/working tree and the untracked set against HEAD at
+        #    this suite's own file, and the working tree against the signed
+        #    release at the closed repair set.
         committed = paths(release, "HEAD")
         self.assertFalse(
-            offenders(committed),
+            offenders(committed, repair_paths),
             "commits on top of the signed release changed path(s) outside "
-            "this suite's own file: %s" % sorted(offenders(committed)))
+            "the closed M5 repair set: %s"
+            % sorted(offenders(committed, repair_paths)))
+        self.assertEqual(
+            committed, repair_paths,
+            "the committed successor range must change exactly the closed "
+            "M5 repair path set")
         staged = paths("--cached")
         self.assertFalse(
-            offenders(staged),
+            offenders(staged, scoped),
             "nothing but this suite's own file may ever be staged: %s"
-            % sorted(offenders(staged)))
+            % sorted(offenders(staged, scoped)))
+        head_delta = paths("HEAD")
+        self.assertFalse(
+            offenders(head_delta, scoped),
+            "the index and working tree may differ from HEAD only in this "
+            "suite's own file: %s" % sorted(offenders(head_delta, scoped)))
         dirty = paths(release)
         self.assertFalse(
-            offenders(dirty),
-            "the working tree may differ from the signed release only in "
-            "this suite's own file: %s" % sorted(offenders(dirty)))
+            offenders(dirty, repair_paths),
+            "the working tree may differ from the signed release only "
+            "within the closed M5 repair set: %s"
+            % sorted(offenders(dirty, repair_paths)))
+        # Untracked files are part of the working tree too: everything but
+        # Python bytecode caches is held to the same one path.
+        untracked = {p.strip() for p in git(
+            "ls-files", "--others", "--exclude-standard").splitlines()
+            if p.strip() and not (p.strip().endswith(".pyc")
+                                  and "__pycache__/" in p)}
+        self.assertFalse(
+            offenders(untracked, scoped),
+            "untracked path(s) outside this suite's own file that are not "
+            "Python bytecode caches: %s" % sorted(offenders(untracked,
+                                                            scoped)))
 
-        # Non-vacuity: this restatement must actually EXIST somewhere --
-        # as a scoped successor commit or as a dirty file -- otherwise the
+        # Non-vacuity: both known repairs must really be present in the
+        # committed range, and this successor must really EXIST -- as a
+        # scoped successor commit or as a dirty file -- otherwise every
         # confinement above would be measuring an empty change.
-        self.assertIn(this_suite, committed | dirty,
-                      "this suite's own restatement must be present either "
-                      "as a scoped successor commit or in the working tree")
+        self.assertIn(this_suite, committed,
+                      "the release-pin repair must be present in the "
+                      "committed successor range")
+        self.assertIn(handoff_suite, committed,
+                      "the handoff-facts repair must be present in the "
+                      "committed successor range")
+        self.assertIn(this_suite, successor_paths | head_delta,
+                      "this successor must be present either as a scoped "
+                      "successor commit or in the working tree")
 
         # Negative control on REAL history, not a fabrication: the very
         # same predicate, pointed at a range that genuinely DID touch an
         # unrelated path (`scripts/cowork.py`, changed by the wiring
-        # package under its own separate authority), must report it. A
-        # predicate that passed here would be vacuous.
-        unrelated = offenders(paths(BASE_SHA, wiring))
+        # package under its own separate authority), must report it under
+        # BOTH allowances. A predicate that passed here would be vacuous.
+        real_range = paths(BASE_SHA, wiring)
+        self.assertIn(unrelated, real_range,
+                      "the real negative-control range must actually have "
+                      "changed %s" % unrelated)
         self.assertIn(
-            "scripts/cowork.py", unrelated,
-            "the confinement predicate must flag an unrelated path that a "
+            unrelated, offenders(real_range, repair_paths),
+            "the closed M5 repair set must flag an unrelated path that a "
             "real range actually changed")
-        # ... and fail closed for one unrelated path added to each of the
-        # three real sets it guards.
-        for label, real in (("committed", committed), ("staged", staged),
-                            ("dirty", dirty)):
-            self.assertTrue(
-                offenders(real | {"scripts/cowork.py"}),
+        self.assertIn(
+            unrelated, offenders(real_range, scoped),
+            "the release-pin-only rule must flag it too")
+
+        # ... and every real set the predicate guards must fail closed on
+        # one unrelated path added to it, at that layer's own allowance.
+        for label, real, allowed in (("committed", committed, repair_paths),
+                                     ("staged", staged, scoped),
+                                     ("head", head_delta, scoped),
+                                     ("dirty", dirty, repair_paths),
+                                     ("untracked", untracked, scoped)):
+            self.assertEqual(
+                offenders(real | {unrelated}, allowed), {unrelated},
                 "the %s confinement check must fail closed for an "
-                "unrelated path" % label)
+                "unrelated path, and flag nothing else" % label)
+
+        # The unknown-successor rule really is the narrower one: the
+        # handoff repair's path is admitted in the committed range and
+        # REJECTED for any unknown successor, so layer 5 cannot be
+        # silently widened into the closed repair set.
+        self.assertFalse(offenders({handoff_suite}, repair_paths),
+                         "%s belongs to the closed M5 repair set"
+                         % handoff_suite)
+        self.assertEqual(offenders({handoff_suite}, scoped), {handoff_suite},
+                         "an unknown successor may write this suite's own "
+                         "file and nothing else")
 
 
 if __name__ == "__main__":
