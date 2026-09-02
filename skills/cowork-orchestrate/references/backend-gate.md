@@ -21,6 +21,13 @@ milestone/global receipt proves criterion 5 only; it does not claim criteria 3/4
 or the full gate, so M4 evidence alone selects `direct-claude`. A future release
 qualifies only through its own complete, current release-bound receipt.
 
+The compact input below is a selection summary, not a trust root. Before using
+its positive result, validate that it was selected through the stable pointer
+contract, that its file hash matches the pointer, that the pointer binds the
+current repository HEAD/tree and accepted global adjudication, and that all six
+receipt files match their recorded SHA-256 values. If any source is absent or
+cannot be validated, select `direct-claude`.
+
 The machine-readable input accepted by `scripts/select_backend.py` is:
 
 ```json

@@ -19,6 +19,14 @@ digest. Missing, malformed, partial, stale, or conflicting evidence selects
 `direct-claude` with an explicit reason. Never silently fall back or treat an M1
 criterion-1 receipt as full eligibility.
 
+Resolve the compact selector manifest from the stable repository pointer
+described in [backend-gate pointer](references/backend-gate-pointer.md), or use
+an explicitly supplied, independently accepted manifest. The selector checks
+the compact manifest; the supervisor must also validate the pointer, manifest
+hash, current HEAD/tree binding, global adjudication, and referenced receipt
+hashes before accepting Cowork. A plausible JSON object with invented hashes is
+not evidence.
+
 The M4 milestone/global receipt proves criterion 5 only; it does not claim
 criteria 3/4 or the full gate. Treat an M4-only receipt as partial evidence and
 select `direct-claude`. Future releases qualify only through their own complete,
@@ -36,6 +44,10 @@ policy, candidate, configuration, or gate-evidence change.
 - Keep deterministic gates supervisor-owned and candidate-bound. Collect once,
   execute each gate once per candidate, use the authorized reviewer policy, and
   persist the fixed-gate decision.
+- For long-running work, schedule a 15-minute recurring wake unless durable
+  state requests a later inspection. Query each active work once per wake,
+  beginning with compact state/digest; end silently when healthy and
+  non-terminal. Do not add a polling loop or normal-path log tail.
 - On a typed capacity wait, preserve phase, candidate, policy, session identity,
   and completed evidence. Resume only from a trustworthy once-only signal.
 - On failure, preserve evidence and use only the authorized correction/recovery

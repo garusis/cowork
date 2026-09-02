@@ -16,7 +16,7 @@ each with a paired critical reviewer), launches a controller CLI per role
 a working tree.
 
 `cowork` makes **no git commit and opens no PR**. Approved build output is left
-in the working tree for a human to review.
+in the working tree for the invoking supervisor or user to review.
 
 ## The one rule that matters
 
@@ -35,7 +35,7 @@ initial context.
 
 ## Recipes
 
-### Unattended full run (the default agent invocation)
+### Unattended complete six-role run
 
 ```bash
 cowork --headless --context "Add a --dry-run flag to the CLI"
@@ -45,6 +45,10 @@ Runs scout → scout-reviewer → planner → planning-advisor → builder →
 build-reviewer with no human gates. Leads never block (they record an
 assumption and proceed), reviewers review with what they have, each phase ends
 on reviewer consensus or the review-round cap.
+
+For an orchestrated bounded package, do not assume this full topology is the
+default. Let the supervising policy choose the smallest team that supplies the
+required discovery, planning, implementation, and assurance for the risk.
 
 ### Detached launch (agent harnesses that reap child processes)
 
@@ -278,6 +282,10 @@ Per-session artifacts, keyed by that UUID (override root with
   trace.jsonl                            # orchestration trace (metadata only)
   activity/history/<work_id>.jsonl       # append-only activity/reconciliation history
   activity/scheduled_review/<work_id>.json  # current durable next inspection
+  checkpoints/<checkpoint_id>/request.json  # typed supervisor checkpoint request
+  checkpoints/<checkpoint_id>/claim.json    # once-only executor claim/lease
+  checkpoints/<checkpoint_id>/result.json   # bounded executor result
+  checkpoints/<checkpoint_id>/receipt.json  # terminal candidate-bound disposition
 ```
 
 To check on a run in flight or explain what happened, read `trace.jsonl` and the
@@ -290,131 +298,19 @@ uncommitted.
 
 ## Supervising a live run
 
-**Passive monitoring is not supervision.** An agent driving cowork is the
-orchestrator: its job during the run is to catch bugs, wrong turns, harness
-issues, and model-quality signals in the work itself — not merely to notice
-that a phase ended. Event monitors and watchdogs are the crash net, never
-the primary loop.
+Do not keep the agent turn open to poll a long run. Schedule a recurring wake
+every 15 minutes unless the durable `next_inspection_at` requests a later wake.
+At each wake, inspect the active work exactly once, beginning with the compact
+state/digest and the current durable activity/checkpoint records. If the work is
+healthy and non-terminal, end silently and let the next wake handle it.
 
-Run an **active review pass every ~5–10 minutes** while a phase is live:
+Read a targeted diff or process probe only when the compact state makes it
+decision-relevant. Read controller logs only for a material contradiction,
+missing durable evidence, or explicit forensics; never as the normal monitoring
+loop. Do not infer a crash from quiet output or a stopped event tail.
 
-1. Read the new `run.log` narrative delta (the streamed role output) — is the
-   role on-plan? Is it misreading the task? Is it fighting the harness
-   (denied writes, missing files) rather than doing the work?
-2. Read the role's actual tool calls — for opencode roles query
-   `~/.local/share/opencode/opencode.db` (`part` table); for claude/codex
-   read their session logs. Tool errors surface here long before any trace
-   event.
-3. Check the working tree (`git status` / `git diff`) — are edits landing,
-   and do they look like the plan?
-4. File anything noteworthy (bug, friction, improvement) in the project's
-   issue tracker/backlog immediately — observations not written down are
-   lost when the session ends.
-
-Do not kill a lead role merely because its stream is quiet or CPU is low.
-Investigate with the durable activity record, its exact
-`next_inspection_at`, and a real controller-process probe; only the
-dual-evidence conditions below can establish a stall. If they establish a
-recovery is authorized, preserve the session and completed evidence before
-resuming it; do not invent a retry or provider switch.
-
-### Durable, dual-evidence activity — the real check, not the event tail
-
-cowork durably records a truthful activity classification for the live lead
-role at every turn boundary and at bounded in-turn ticks, under
-`~/.cowork/sessions/<uuid>/activity/`: an append-only `history/<work_id
->.jsonl` of `ActivityRecord`/`ActivityReconciliationRecord` entries, and a
-single current `scheduled_review/<work_id>.json` naming
-`next_inspection_at`. cowork's own internal watchdog decision (`no_action` /
-`soft_warning` / `hard_stall_eligible`) is never made from either the
-durable record or elapsed time alone — it always combines that durable
-evidence with a genuine live-process/controller-health probe (real for
-Claude, Codex, *and* OpenCode alike; a quiet-but-alive turn is never
-reported as hung merely because it is quiet). **M4R-G01 and the inherited
-minor dispositions this section documents:**
-
-- **Event tail is supplemental, not primary truth (M4R-G01).** `trace.jsonl`
-  is useful for *narrative* (what the role tried, in order) and remains
-  worth tailing for that reason (see the filter list below), but it is
-  never the authority on whether a turn is stalled — a killed run, or a
-  turn silently parked waiting on a provider, can each leave `trace.jsonl`
-  looking identical for a long stretch. The durable activity/watchdog
-  records above are the authority; treat the event tail as color, not proof.
-- **`next_inspection_at` is durable authority.** Whether a scheduled review
-  is due is read from the current `scheduled_review/<work_id>.json` record
-  verbatim — never recomputed as "elapsed time since the last event I saw".
-  If that file is missing, whether a review is due is genuinely unknown,
-  not "no" and not "yes".
-- **Classify calls are positional-compatible.** The per-controller
-  `classify_<controller>_activity(evidence)` functions cowork's watchdog
-  calls take one positional evidence argument each; nothing about this
-  wiring depends on keyword-only call conventions.
-- **Artifact digests originate at the measurement owner.** Any file-content
-  digest surfacing in an activity/measurement record is computed by
-  `cowork_measure.py` (or a caller that already computed one for its own
-  purpose); the activity/watchdog layer itself never opens or hashes a file
-  — it only carries a digest mapping through if one was already supplied.
-- **Unknown-provider and hung-child evidence is disclosed accurately, never
-  overclaimed.** A controller failure that does not match a recognized
-  provider error shape durably records as `unknown_provider_failure` —
-  never silently folded into a more specific class it was not actually
-  observed to be. A `hung_descendant` classification from the controller
-  adapter's own reap evidence is only escalated to a hard-stall verdict
-  once an *independent* `ps` check corroborates it (a genuine orphan/zombie
-  process); absent that independent confirmation it stays a soft warning,
-  not a certified stall.
-- **Stale candidate-local path guards are disclosed accurately.** A
-  durable activity/schedule read that hits a torn or unreadable local file
-  is treated as "unknown for this read", never silently coerced into
-  either "the schedule is now due" or "nothing is wrong" — a stale or
-  corrupt local artifact is a guard condition to surface, not to paper
-  over.
-
-### Mapping each failure mode to an evidence-based check
-
-An event tail alone cannot see the three worst failure modes reliably —
-**process death without a terminal event**, **silent parking** (a healthy
-45-minute builder turn and a dead run can look identical in the trace
-alone), and **orphaned children**. Check each against real evidence, not
-absence-of-event:
-
-1. **Crash without a terminal event.** Don't infer a crash from "the trace
-   just stops" — read the durable activity history
-   (`activity/history/<work_id>.jsonl`) for the work_id's latest entry. A
-   `process_crash` classification there, combined with no live controller
-   child (`ps` shows the pid gone), is the real evidence; a trace that
-   merely stopped emitting with a live child still running is not a crash.
-2. **Silent park.** Combine the durable classification with a live-process
-   check: `provider_wait`/`productive_model_work` plus a genuinely alive
-   controller child (`ps -p <pid>`) is a healthy quiet turn, not a stall —
-   never kill it on elapsed time alone. Only a *dead* probe combined with a
-   terminal durable classification (`process_crash` /
-   `hung_descendant` / `no_evidence_silence`) plus an overdue
-   `next_inspection_at` is real stall evidence.
-3. **Orphaned children.** Check `ps` for the controller child's pid: a
-   parent of `1` (reparented) or a zombie/stopped state independently
-   confirms an orphan — cross-reference this against the durable
-   `hung_descendant` classification rather than trusting either signal
-   alone. An externally killed cowork can leave its `opencode`/`claude`/
-   `codex` child alive and detached indefinitely — invisible to the trace
-   and to every artifact until you actually run `ps`.
-
-Alongside the active loop, keep two mechanical watchers:
-
-1. **Event tail** on `trace.jsonl`, for narrative context (see above — never
-   the primary evidence for a stall/crash decision). Filter for the full
-   lifecycle set — the easy mistake is matching only happy-path events.
-   Include at least: `phase.`, `gate.`, `role.start|end|milestone`,
-   `controller.turn.start|end`, `controller.error|exit`,
-   `review.verdict|run`, `status.invalidated`, `stale_noop` (lead turn
-   changed nothing on disk), `headless.auto`, `activity.recorded`,
-   `activity.reconciled`, `watchdog.decision`, `run.end` (note: the
-   terminal event is `run.end`, not `session.end`), `run.resume`,
-   `handoff`, `fallback`, `rate_limit`.
-2. **Watchdog loop** (every ~10 min): if the cowork process is gone, report
-   whether the trace ends with `run.end` (clean finish) or not (external
-   kill); then check the durable activity record and `ps` per the mapping
-   above before concluding a hang — never off the trace alone.
+For failure classification, dual-evidence rules, event semantics, and bounded
+recovery, read [live supervision](references/live-supervision.md).
 
 ## Status values a lead role writes
 
@@ -423,7 +319,7 @@ Alongside the active loop, keep two mechanical watchers:
   `result.pending_question`. Under `--headless` this does not happen: leads
   record an assumption and proceed.
 - `ready_for_review` — artifact finished; the paired reviewer runs, then the
-  human gate (or, headless, auto-progression on consensus).
+  configured gate (or, headless, auto-progression on consensus).
 
 Mid-planning the planner can hand back to the scout, and mid-building the
 builder can hand back to the planner, with a handoff note. A killed run resumes
@@ -461,8 +357,8 @@ add `--headless` (with context) or hand the session to the user.
 ## Operating notes
 
 - **Runs are long.** A full headless scout → plan → build spawns real controller
-  CLIs doing real work. Launch it in the background and check artifacts /
-  `trace.jsonl` rather than blocking on it.
+  CLIs doing real work. Launch it detached and use scheduled durable-state
+  wakes rather than blocking or tailing continuously.
 - **Do not nest.** Cowork roles refuse controller-native child agents by design
   (`Agent`/`Task` dispatches are denied and recorded). Never invoke `cowork`
   from inside a cowork role.

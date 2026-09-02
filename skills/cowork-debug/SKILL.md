@@ -9,13 +9,17 @@ description: >-
 
 # Cowork Debug
 
-Reconstruct what happened in a cowork run by joining four evidence sources:
+Reconstruct what happened in a cowork run by joining five evidence sources:
 
 1. `.cowork/session.json` (project-local, the per-directory anchor) for cowork
    session UUID, team/config, role controller IDs, and context revisions.
 2. `~/.cowork/sessions/<session_uuid>/trace.jsonl` for cowork orchestration
    decisions.
-3. `~/.cowork/sessions/<session_uuid>/scout.intel.json` and
+3. Durable control-plane records under the session root: work/phase state,
+   `activity/history/<work_id>.jsonl`,
+   `activity/scheduled_review/<work_id>.json`, and
+   `checkpoints/<checkpoint_id>/{request,claim,result,receipt}.json`.
+4. `~/.cowork/sessions/<session_uuid>/scout.intel.json` and
    `~/.cowork/sessions/<session_uuid>/scout-review.json` for
    current/final artifacts. Also useful in the same directory:
    `identities.json` (per-role tool + resolved model + controller session id —
@@ -26,7 +30,7 @@ Reconstruct what happened in a cowork run by joining four evidence sources:
    the external orchestrator/driver via `cowork --evaluate-role`; the source
    for the per-role/controller/model breakdowns in `--report`, kept separate
    from peer `scores.json` and never read by any phase gate).
-4. Claude/Codex/OpenCode local logs for role conversation and tool history.
+5. Claude/Codex/OpenCode local logs for role conversation and tool history.
 
 Do not rely on terminal transcripts. Do not mutate session artifacts while
 debugging. Terminal transcripts are useful as symptom reports only; verify them
@@ -39,24 +43,31 @@ against trace events, artifacts, and controller logs.
    - If the user gives a session UUID, verify it matches `session_uuid`.
    - Record `sessions.<role>.controller`, `sessions.<role>.id`, team/config,
      context revision, and `last_context_revision_seen`.
-2. Read current artifacts (under `~/.cowork/sessions/<uuid>/`):
+2. Read current durable state (under `~/.cowork/sessions/<uuid>/`):
+   - Work/phase identity and latest terminal or non-terminal outcome.
+   - Latest activity record and scheduled `next_inspection_at`.
+   - Current checkpoint pointer plus request/claim/result/receipt when present.
+3. Read current role artifacts:
    - Intel: `~/.cowork/sessions/<uuid>/scout.intel.json`
    - Review: `~/.cowork/sessions/<uuid>/scout-review.json`
    - Trace: `~/.cowork/sessions/<uuid>/trace.jsonl`
-3. Locate controller logs:
+4. Locate controller logs only when durable state and artifacts do not answer
+   the question:
    - Claude session id: `~/.claude/projects/**/<session_id>.jsonl`
    - Codex thread id: `~/.codex/sessions/**/rollout-*<thread_id>.jsonl`
    - OpenCode session id (`ses_…`): rows in
      `~/.local/share/opencode/opencode.db` (sqlite)
-4. Build a timeline:
-   - First use trace events for cowork decisions: status reads, gates, review
-     rounds, invalidations, session saves, context acks, controller invocations.
+5. Build a timeline:
+   - Start from persisted work/phase transitions, checkpoint receipts, and
+     activity records.
+   - Use trace events for ordering: status reads, gates, review rounds,
+     invalidations, session saves, context acks, controller invocations.
    - For display glitches, also inspect UI trace events:
      `ui.markdown.start`, `ui.markdown.commit`, and `ui.markdown.end`.
    - Then use controller logs for role content: user messages, assistant replies,
      tool calls, artifact edits.
    - Finally compare final artifact state with the trace and controller writes.
-5. Report findings with labels:
+6. Report findings with labels:
    - `evidence`: directly shown by trace, artifact, or controller log.
    - `inference`: likely conclusion from multiple evidence points.
    - `missing evidence`: needed fact is absent from all available logs.
@@ -191,11 +202,12 @@ evidence — always confirm against `$.state.error` and the rule list.
   artifacts, and controller logs. If only the transcript repeats, suspect Rich
   Live rendering/terminal redraw instead of role duplication.
 - Trace ends at `controller.turn.start` with no terminal event (no
-  `controller.turn.end`, no `run.end`): the cowork process was killed
-  externally (host-app/harness process-group reaping is the usual culprit),
-  not hung. Confirm with `ps`; recover by resuming the session — the active
-  role is redispatched onto its persisted state. Launch future runs detached
-  (double-fork + `setsid`; see the cowork-cli skill).
+  `controller.turn.end`, no `run.end`): classify it as incomplete trace
+  evidence, not as a crash. Compare the latest durable activity/checkpoint
+  state and one real process probe. A dead process plus durable crash evidence
+  may establish external termination; a live process may still be productive
+  or waiting on the provider. Resume only when the preserved role/session/
+  candidate state and policy authorize it.
 - `stale_noop` / `stale_noop.unresolved` on a lead: the turn produced no
   artifact-byte change. Before blaming the model, check the controller log
   for **denied writes** (opencode: `part` rows with `$.state.status='error'`)

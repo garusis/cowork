@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cowork Refactor Orchestrator"
+  short_description: "Autonomously supervise bounded Cowork refactor work"
+  default_prompt: "Use $cowork-refactor-orchestrator to autonomously supervise a bounded, policy-delegated Cowork refactor work package."
