@@ -595,6 +595,85 @@ def controller_state_dir_for(session_uuid, role):
                         role)
 
 
+# --------------------------------------------------------------------------- #
+# Session-owner lease paths (issue #64 P1, plan §3.1).                          #
+#                                                                              #
+# The durable single-writer lease is keyed by `session_uuid`, NOT by launch     #
+# directory: the same session is reachable from another directory through      #
+# `--session-file`, and `--worktree` deliberately leaves the anchor in the      #
+# launch directory while chdir-ing elsewhere, so a `.cowork/`-local lock would  #
+# be trivially bypassed by both. Every path below therefore hangs off           #
+# `session_assets_dir` (COWORK_SESSIONS_ROOT-overridable, so tests never touch  #
+# the real home dir), exactly like every other per-session asset helper above.  #
+# --------------------------------------------------------------------------- #
+
+
+def owner_dir_for(session_uuid):
+    """Directory holding one session's owner-lease artifacts (the lease, its
+    flock file, per-owner terminal sidecars, and the append-only history).
+    Rejects unsafe session_uuid values, like every other per-session directory
+    helper in this module."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid), "owner")
+
+
+def owner_lease_path_for(session_uuid):
+    """Path of the ONE durable `SessionOwnerLease` record for a session.
+
+    LOCKED WRITES ONLY: this record is read-modify-written exclusively inside
+    `_locked_json_transaction` (which holds a real `fcntl.flock(LOCK_EX)` on
+    `<path>.lock` and persists through `write_json_atomic_durable`). No signal
+    handler, and no other code path, may open this path for writing -- the
+    signal path writes its own per-owner sidecar instead (see
+    `owner_terminal_mark_path_for`). That single-writer shape is what makes the
+    lease's `epoch` strictly monotonic and its `owner_id` usable as a fencing
+    token."""
+    return os.path.join(owner_dir_for(session_uuid), "lease.json")
+
+
+def owner_terminal_mark_path_for(session_uuid, owner_id):
+    """Path of ONE owner's `OwnerTerminalMark` sidecar -- the signal-safe,
+    non-clobbering path a dying owner marks itself terminal on.
+
+    Deliberately PER OWNER: `owner_id` is minted fresh on every acquisition and
+    never reused, so a predecessor's mark can never overwrite (nor be confused
+    with) a successor's, and the lease record itself is left byte-identical.
+    Rejects unsafe owner_id values."""
+    _assert_safe_identifier(owner_id, "owner_id")
+    return os.path.join(owner_dir_for(session_uuid),
+                        "terminal.%s.json" % owner_id)
+
+
+def owner_history_path_for(session_uuid):
+    """Path of the append-only owner-lease audit log (one JSON record per
+    line: acquisitions, renewals, releases, folded terminal marks, takeovers).
+    Observational only -- no decision is ever taken from it."""
+    return os.path.join(owner_dir_for(session_uuid), "history.jsonl")
+
+
+def provider_session_binding_path_for(controller, provider_session_id):
+    """Path of the GLOBAL `(controller, provider_session_id)` exclusivity
+    record -- deliberately outside any one session's directory so it spans
+    launch directories and session anchors, which is the whole point: the same
+    provider conversation must not be resumed under two different cowork
+    sessions.
+
+    Keyed exactly like `_pause_lease_binding_key`: sha256 over a `\\x1f`-
+    delimited join, unambiguous because `_assert_safe_identifier`'s charset
+    (enforced on both fields here) admits no `\\x1f`. Rejects unsafe
+    controller/provider_session_id values, so a caller can never escape the
+    binding directory."""
+    _assert_safe_identifier(controller, "controller")
+    _assert_safe_identifier(provider_session_id, "provider_session_id")
+    raw = "\x1f".join((controller, provider_session_id))
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    # `session_assets_dir` is the COWORK_SESSIONS_ROOT-honouring join; the
+    # binding index is a sibling of the per-session directories, never inside
+    # one, so it survives (and is visible to) every session on this host.
+    return os.path.join(session_assets_dir("provider-bindings"),
+                        "%s.json" % key)
+
+
 def upsert_role_identity(path, role, identity, work_id=None):
     """Merge one role's identity dict into the registry at `path`.
 
