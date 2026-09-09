@@ -4223,12 +4223,60 @@ def _update_receipt_pointer_for_readiness(session_uuid, role, round_index,
     return pointer
 
 
+# Prefix of the substituted final-suite label code. Whitespace-free and short
+# (19 chars + 16 hex = 35, far under `handoff._MAX_TOKEN`), so the substituted
+# value is always a single content-free token.
+_FINAL_SUITE_LABEL_CODE_PREFIX = "final_suite_sha256_"
+
+
+def _content_free_final_suite_label(label):
+    """The overlay's content-free rendering of a final-suite label
+    (garusis/cowork-internal#45).
+
+    `final_suite_label` is the ONE whole-transaction overlay field whose value
+    is AUTHORED — a planner writes it in the verification inventory — while
+    every other overlay key is a hex id, a closed enum, an int or a bool. An
+    ordinary human phrase like `focused regression suite` is not a single
+    token, so copying it verbatim onto the builder->build-reviewer edges made
+    `handoff._assert_content_free` raise and aborted context assembly before
+    the reviewer ever started. Sanitizing here — inside the ONE overlay
+    renderer (D-0003), which already declares itself content-free — makes that
+    declaration true for every consumer at once, without loosening the gate.
+
+    - A label that ALREADY satisfies `handoff.is_content_free_token` (which
+      covers `None`, and today's `legacy_unknown`) is returned unchanged, so
+      every existing overlay renders byte-identically to before.
+    - Anything else is replaced by a deterministic sha256 digest code of the
+      label's own UTF-8 bytes. sha256 — never the builtin `hash()`, which is
+      per-process salted — so the same label yields the same code in every
+      process and across a resume, and so variants a naive slug would merge
+      (`focused regression suite` vs `focused_regression_suite`) stay distinct.
+
+    The AUTHORED label is never altered where it is reached by PATH: the
+    transaction receipt, the current-receipt pointer, and the run report all
+    keep the planner's own wording. Only the inline overlay fact carries the
+    code. A non-str, non-token value is digested via `repr` rather than raised
+    on — the overlay must never itself crash context assembly, which is the
+    exact failure this function exists to remove."""
+    if handoff.is_content_free_token(label):
+        return label
+    material = label if isinstance(label, str) else repr(label)
+    return _FINAL_SUITE_LABEL_CODE_PREFIX + hashlib.sha256(
+        material.encode("utf-8")).hexdigest()[:16]
+
+
 def verification_overlay(pointer, disposition=None):
     """THE ONE overlay renderer (D-0003): a dict of content-free tokens derived
     from the current-receipt pointer (which itself carries only owned state —
     never a byte of agent prose). `disposition` is the render-time join onto
     the latest disposition known for the transaction (D-0002); absent, the
     pointer's own field is used. Returns None when there is no bound receipt.
+
+    `final_suite_label` is the one authored value the pointer carries, so it
+    goes through `_content_free_final_suite_label` on its way out: already-safe
+    tokens pass through unchanged, and an authored phrase becomes a
+    deterministic code. The authored wording itself stays verbatim in the
+    receipt and the pointer, which reach the reviewer by absolute path.
 
     Checkpoint scope (additive, M5 Package D): a checkpoint pointer/binding
     carries `checkpoint_id`, never `transaction_id` — the two key spaces are
@@ -4246,7 +4294,8 @@ def verification_overlay(pointer, disposition=None):
         "manifest_digest": pointer.get("manifest_digest"),
         "index_digest": pointer.get("index_digest"),
         "verdict": pointer.get("verdict"),
-        "final_suite_label": pointer.get("final_suite_label"),
+        "final_suite_label": _content_free_final_suite_label(
+            pointer.get("final_suite_label")),
         "final_suite_binding": pointer.get("final_suite_binding"),
         "command_count": pointer.get("command_count"),
         "disposition": (disposition or pointer.get("disposition")
