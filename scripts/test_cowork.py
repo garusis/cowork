@@ -37080,8 +37080,32 @@ class PhaseTruthStructuralGateTest(unittest.TestCase):
 
     def test_every_policy_activate_call_lives_in_the_wrapper(self):
         src = self._source()
-        wrapper_start = src.index("    def _activate_policy(kind, raw):")
-        wrapper_end = src.index("\n    def apply_controller_update(proposal):")
+        # Both anchors are located by a NESTING-AGNOSTIC regex rather than by
+        # a literal indent width. The invariant being gated is containment --
+        # every `policy.activate*` call sits between these two sibling
+        # closures of `run_flow` -- not how deeply `run_flow` happens to nest
+        # them; a fixed-width anchor pins the nesting depth instead, and
+        # silently stops matching when a wrapper legitimately re-indents that
+        # body. The three assertions below make this form STRICTER than the
+        # `str.index` one it replaces, which took the first of any number of
+        # matches without ever checking that there was only one.
+        starts = list(re.finditer(
+            r'^([ \t]+)def _activate_policy\(kind, raw\):$', src, re.M))
+        ends = list(re.finditer(
+            r'^([ \t]+)def apply_controller_update\(proposal\):$', src, re.M))
+        self.assertEqual(len(starts), 1,
+                         "_activate_policy must be defined exactly once")
+        self.assertEqual(len(ends), 1,
+                         "apply_controller_update must be defined exactly once")
+        # Both are NESTED (the regex requires a non-empty indent) and both are
+        # siblings at the SAME depth -- the structural fact the old literal
+        # anchor was really asserting, now stated directly instead of encoded
+        # in a magic number of spaces.
+        self.assertEqual(starts[0].group(1), ends[0].group(1),
+                         "_activate_policy and apply_controller_update must "
+                         "stay siblings at one nesting depth")
+        wrapper_start = starts[0].start()
+        wrapper_end = ends[0].start()
         self.assertGreater(wrapper_end, wrapper_start)
         for m in re.finditer(r'policy\.activate(?:_invalid)?\(', src):
             self.assertTrue(

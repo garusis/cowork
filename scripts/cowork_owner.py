@@ -353,6 +353,42 @@ class ProviderBindingUnavailable(OwnerLeaseError):
 
 
 # --------------------------------------------------------------------------- #
+# The typed refusal-reason mapping (plan section 3.5), added by P2.            #
+#                                                                              #
+# TOTAL over the declared hierarchy: every `OwnerLeaseError` subclass has an   #
+# entry, so a refusal reaches an operator and a `run.end` trace event with a   #
+# reason that names WHAT was refused rather than a generic fallback. A         #
+# subclass added later without an entry is a GATE FAILURE (G11a's closure      #
+# assertion plus G13d's totality assertion), never a silent degradation --     #
+# which is the whole reason the mapping lives beside the hierarchy it maps     #
+# instead of inside a caller.                                                  #
+# --------------------------------------------------------------------------- #
+
+
+OWNER_REFUSAL_REASONS = {
+    OwnerLeaseLost: "session_owner_lost",
+    OwnerLeaseConflict: "session_owner_conflict",
+    OwnerLeaseCorrupt: "session_owner_corrupt",
+    ProviderSessionConflict: "provider_session_bound",
+    ProviderBindingUnavailable: "provider_binding_unavailable",
+}
+
+
+def owner_refusal_reason(exc):
+    """The stable, machine-readable `run.end` reason for one owner refusal.
+
+    Resolved along `type(exc)`'s MRO, so a hypothetical further subclass of a
+    mapped class still reports its parent's reason rather than nothing. An
+    exception with no mapped ancestor raises `KeyError` DELIBERATELY: the
+    mapping is total by construction and pinned as total by gate, and a silent
+    generic reason would hide exactly the drift those gates exist to catch."""
+    for klass in type(exc).__mro__:
+        if klass in OWNER_REFUSAL_REASONS:
+            return OWNER_REFUSAL_REASONS[klass]
+    raise KeyError("no refusal reason declared for %s" % type(exc).__name__)
+
+
+# --------------------------------------------------------------------------- #
 # Clock and host identity.                                                     #
 # --------------------------------------------------------------------------- #
 
@@ -1293,6 +1329,97 @@ def owner_status_view(session_uuid, now=None):
     elif view["verdict"] == "live_owner" and view["host_matches"]:
         view["takeover_mode"] = "terminate_prior"
     return view
+
+
+# --------------------------------------------------------------------------- #
+# The operator refusal surface (plan §4, P4 surface 4), added by P2 because    #
+# P2 is where the refusal is first produced.                                   #
+#                                                                              #
+# TOTAL over the declared hierarchy, exactly like `OWNER_REFUSAL_REASONS`: a   #
+# refusal an operator can act on is part of the refusal, not a later polish    #
+# step. Every `reason` line carries the same stable machine-readable string    #
+# the trace does -- one of the five closed `OWNER_VERDICTS`, `foreign_host`,   #
+# `provider_session_bound` or `provider_binding_unavailable` -- never free     #
+# prose. The two provider-binding wordings are deliberately DIFFERENT: a       #
+# proven collision and an unverifiable index are not the same fact, and        #
+# telling an operator a collision was proven when it was not is how a live     #
+# conversation gets killed by hand for no reason.                              #
+# --------------------------------------------------------------------------- #
+
+
+def refusal_message(exc, session_uuid=None, session_file=None):
+    """Render the operator-facing text for one owner refusal.
+
+    Never raises for anything it finds on disk: a status view that cannot be
+    built degrades to the fields the exception itself carries, because a
+    refusal whose explanation crashed is strictly worse than a terse one."""
+    uuid_text = session_uuid or getattr(exc, "session_uuid", None) or "?"
+    inspect_line = ("Stop that process, or inspect with:   "
+                    "cowork --session-owner %s\n" % uuid_text)
+    takeover_line = ("If it is genuinely dead, take over:   cowork%s "
+                     "--take-over\n"
+                     % (" --session-file %s" % session_file
+                        if session_file else ""))
+
+    if isinstance(exc, ProviderSessionConflict):
+        return (
+            "cowork: the %s session %s reported for role %s is already bound "
+            "to a different live cowork session.\n"
+            "  bound to  session %s (live owner)\n"
+            "  reason    provider_session_bound\n"
+            "Inspect the other session with:       cowork --session-owner "
+            "%s\n"
+            % (exc.controller, exc.provider_session_id, exc.role,
+               exc.owner_session_uuid, exc.owner_session_uuid))
+
+    if isinstance(exc, ProviderBindingUnavailable):
+        cause = exc.__cause__
+        return (
+            "cowork: could not verify provider-session exclusivity for the %s "
+            "session %s reported for role %s.\n"
+            "  cause     %s: %s\n"
+            "  effect    the session id WAS recorded durably; this run is "
+            "stopping\n"
+            "  reason    provider_binding_unavailable\n"
+            "This is not a proven collision. Retry, or inspect the binding "
+            "index owner with:\n"
+            "                                      cowork --session-owner "
+            "%s\n"
+            % (exc.controller, exc.provider_session_id, exc.role,
+               type(cause).__name__ if cause is not None else "unknown",
+               exc.detail or (str(cause) if cause is not None else ""),
+               uuid_text))
+
+    if isinstance(exc, OwnerLeaseCorrupt):
+        return (
+            "cowork: session %s has an unreadable owner lease.\n"
+            "  detail   %s\n"
+            "  reason   corrupt\n"
+            "%s"
+            % (uuid_text, exc.detail or "not a readable SessionOwnerLease",
+               inspect_line))
+
+    reason = getattr(exc, "reason", None) or "session_owner_lost"
+    view = owner_status_view(uuid_text) if uuid_text != "?" else None
+    lease = (view or {}).get("lease") or {}
+    heartbeat_age = (view or {}).get("heartbeat_age_s")
+    if isinstance(exc, OwnerLeaseLost):
+        head = ("cowork: session %s is no longer owned by this cowork "
+                "process.\n" % uuid_text)
+    else:
+        head = ("cowork: session %s is already owned by another live cowork "
+                "process.\n" % uuid_text)
+    return (
+        "%s"
+        "  owner    pid %s on %s, epoch %s, launched from %s\n"
+        "  since    %s (heartbeat %s)\n"
+        "  reason   %s\n"
+        "%s%s"
+        % (head, lease.get("pid"), lease.get("host_id"), lease.get("epoch"),
+           lease.get("launch_dir"), lease.get("acquired_at"),
+           ("%ds ago" % int(heartbeat_age)
+            if isinstance(heartbeat_age, (int, float)) else "unknown"),
+           reason, inspect_line, takeover_line))
 
 
 # --------------------------------------------------------------------------- #

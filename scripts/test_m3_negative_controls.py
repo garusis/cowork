@@ -1213,12 +1213,53 @@ class RealCrossProcessDuplicateClaimRaceTest(_M3E2EBase):
             o1 = json.load(fh)
         with open(r2) as fh:
             o2 = json.load(fh)
-        rcs = sorted([o1["rc"], o2["rc"]])
+        # EXACTLY ONE winner -- unchanged, and now identified rather than
+        # inferred from a sorted pair, so the loser can be asserted on
+        # directly.
+        outcomes = [o1, o2]
+        winners = [o for o in outcomes
+                   if o["rc"] == cowork.RESUME_TRIGGER_EXIT_SUCCESS]
+        losers = [o for o in outcomes
+                  if o["rc"] != cowork.RESUME_TRIGGER_EXIT_SUCCESS]
         self.assertEqual(
-            rcs, sorted([cowork.RESUME_TRIGGER_EXIT_SUCCESS,
-                        cowork.RESUME_TRIGGER_EXIT_CONFLICT]),
+            len(winners), 1,
             "exactly one of two genuinely separate racing OS processes "
             "must succeed: %r / %r" % (o1, o2))
+        self.assertEqual(winners[0]["result"]["outcome"], "success")
+
+        # The LOSER is refused by whichever exclusion it reaches first, and
+        # both are legitimate refusals of the same race:
+        #   `owner_conflict` (10) -- issue #64's single-writer owner lease,
+        #       taken before this CLI's own state-mutating claim, so the loser
+        #       is stopped EARLIER than it used to be;
+        #   `conflict` (4) -- D's PauseLease claim, which is what refuses when
+        #       the loser arrives after the winner has already released the
+        #       owner lease.
+        # Which one fires is genuinely timing-dependent, so both are accepted;
+        # what is NOT accepted is any outcome that implies the loser got as
+        # far as a controller dispatch.
+        loser = losers[0]
+        self.assertIn(
+            loser["rc"], (cowork.RESUME_TRIGGER_EXIT_OWNER_CONFLICT,
+                          cowork.RESUME_TRIGGER_EXIT_CONFLICT),
+            "the losing process must be refused by the owner lease or by the "
+            "PauseLease claim: %r" % (loser,))
+        self.assertEqual(
+            loser["result"]["outcome"],
+            {cowork.RESUME_TRIGGER_EXIT_OWNER_CONFLICT: "owner_conflict",
+             cowork.RESUME_TRIGGER_EXIT_CONFLICT: "conflict"}[loser["rc"]],
+            "the refusal's exit code and its outcome name must agree: %r"
+            % (loser,))
+        # NO SECOND CONTROLLER DISPATCH. Both refusal outcomes are emitted
+        # strictly BEFORE the accepted send, so neither can be reported by a
+        # process that dispatched; `success` and `send_failed` are the only
+        # two outcomes a process that reached the controller can produce, and
+        # the loser reports neither.
+        self.assertNotIn(loser["result"]["outcome"], ("success", "send_failed"))
+
+        # NO SECOND SHARED-STATE MUTATION: the durable binding records exactly
+        # one consumption, and the pending turn is consumed exactly once --
+        # the invariant this fixture has always existed to prove.
         lease = state_store.read_pause_lease(suid, payload["lease_id"])
         self.assertEqual(lease["consumption_state"], "consumed")
         pending = state_store.read_pending_turn_before_pause(suid, "builder")
