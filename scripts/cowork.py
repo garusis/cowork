@@ -9896,7 +9896,36 @@ def _owner_gate_fact(controller=None, resume_session_id=None, purpose=None):
 
     Otherwise it is the durable fencing check: `assert_owner` re-reads
     `owner/lease.json` under the lock and the refusal it produces is mapped to
-    the `session_not_owned` / `owner_lease` refusal pair."""
+    the `session_not_owned` / `owner_lease` refusal pair.
+
+    ENFORCEMENT POINT 1 (issue #64 P3), the provider-exclusivity limb, runs
+    LAST and only for a dispatch that names a `resume_session_id` -- there is
+    nothing to be exclusive about when no provider conversation is being
+    resumed. Two orderings are deliberate:
+
+      a. It runs AFTER `assert_owner` succeeds and AFTER `matched` is set
+         True. This session's own lease validity is the prior question, and a
+         FOREIGN provider binding is not a loss of THIS session's ownership --
+         so `matched` must stay True on this path, or the terminal sidecar
+         would misreport why the run ended.
+
+      b. It runs after the evaluator exemption, which returns above: the
+         evaluator session is fresh by design and resumes nothing, so the
+         exemption costs nothing on this limb.
+
+    Exclusivity follows the owning session's LIVENESS, not the record: a
+    binding held by this same session, or by one whose lease no longer
+    classifies `live_owner`, allows. Only a different, currently live owner
+    refuses, with `provider_session_bound` / `owner_lease` -- both already in
+    the frozen dispatch vocabulary.
+
+    `ProviderBindingUnavailable` is deliberately NOT caught here. It is not a
+    collision and proves nothing, and there is no refusal code for it in the
+    frozen dispatch vocabulary, so it cannot be expressed as a refusing fact.
+    Propagating it is fail-closed AND typed: `run_flow`'s catch point 1 maps
+    it to rc 3 with reason `provider_binding_unavailable`. The declared cost
+    is that `dispatch.contract` / `dispatch.decision` are not emitted on that
+    one path, because the raise precedes `decide()`."""
     if purpose == "evaluator":
         return None
     if not _OWNER_CONTEXT["enforced"]:
@@ -9910,6 +9939,21 @@ def _owner_gate_fact(controller=None, resume_session_id=None, purpose=None):
         return {"allowed": False, "refusal_code": "session_not_owned",
                 "refusal_message": str(exc), "source": "owner_lease"}
     _OWNER_CONTEXT["matched"] = True
+    if controller and resume_session_id:
+        record = cowork_owner.read_provider_binding(
+            controller, resume_session_id)
+        bound_to = (record or {}).get("owner_session_uuid")
+        if (bound_to and bound_to != _OWNER_CONTEXT["session_uuid"]
+                and cowork_owner.classify_owner_lease(bound_to)
+                == "live_owner"):
+            # The operator wording comes from the declared exception itself,
+            # so there is exactly one phrasing of this refusal in the tree.
+            return {
+                "allowed": False,
+                "refusal_code": "provider_session_bound",
+                "refusal_message": str(cowork_owner.ProviderSessionConflict(
+                    controller, resume_session_id, bound_to)),
+                "source": "owner_lease"}
     return dict(_ALLOW_FACT)
 
 
@@ -9956,6 +10000,36 @@ def _require_owner(session_uuid=None, advisory=False):
         if advisory:
             return None
         raise
+    return None
+
+
+def _record_provider_conflict(exc):
+    """Hold one provider-binding refusal for `_require_owner` to drain and
+    re-raise at the next governed seam. Returns None and NEVER raises.
+
+    DEFERRAL RATHER THAN AN IMMEDIATE RAISE, for the reason `_require_owner`'s
+    own docstring already records: `bind_provider_session` is called from the
+    session-id callback, which fires during a live send, and letting the
+    exception cross that boundary would route it into the send gateway's own
+    `except Exception` -- converting a typed refusal into an anonymous turn
+    failure. Recording it here keeps the exception OBJECT intact (so its type,
+    its message and its `__cause__` all survive) and re-raises it inside
+    `run_flow`'s own frame, where catch point 1 maps it to a typed `run.end`
+    reason.
+
+    FIRST REFUSAL WINS: an already-pending refusal is never overwritten by a
+    later one. That matters most in the case it was written for -- a later
+    `ProviderBindingUnavailable` must never be able to displace an earlier
+    `ProviderSessionConflict`, because a proven collision outranks an
+    unverifiable index and is the one an operator has to act on. Nothing is
+    lost either way: the run ends at the next governed seam regardless, and
+    the later condition is separately traced at its own seam.
+
+    A no-op when no lease is held, so `--no-session` behaviour is unchanged."""
+    if not _OWNER_CONTEXT["enforced"]:
+        return None
+    if _OWNER_CONTEXT["provider_conflict"] is None:
+        _OWNER_CONTEXT["provider_conflict"] = exc
     return None
 
 
@@ -13081,8 +13155,61 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
         def role_saver(role):
             def on_sess(controller, sid):
+                """Persist the provider session id a controller just reported.
+
+                ENFORCEMENT POINT 3 (issue #64 P3), the durable backstop:
+                BIND BEFORE PERSIST. This is the moment a provider
+                conversation first becomes THIS session's, and it is reached
+                by all three call chains (the bridge's `on_session_id`, the
+                reviewer's and the lead role's fresh mint), so it is the seam
+                that catches a collision no pre-dispatch check could have seen
+                -- an id only observed mid-turn.
+
+                EXACTLY TWO TYPED HANDLERS, in this order, and no broad
+                handler anywhere in this closure. Their obligations are
+                deliberately OPPOSITE, because the facts they carry are:
+
+                  `ProviderSessionConflict` is PROOF that another live session
+                  owns this conversation. It records the refusal for the next
+                  governed seam, traces it, and RETURNS -- persisting nothing,
+                  because writing an id we have just been proven not to own is
+                  the corruption #64 exists to prevent.
+
+                  `ProviderBindingUnavailable` proves NOTHING -- the index
+                  could not be consulted. It records and traces the failure
+                  and then FALLS THROUGH to the persist below on purpose. A
+                  paid provider session id observed alongside an unreadable
+                  index must still be written, or a live conversation is
+                  stranded outside the durable record that names it (and
+                  `_durable_provider_session_id` could no longer resolve it) --
+                  which is the very defect this issue exists to remove.
+
+                Recording rather than raising is what keeps a typed refusal
+                from crossing the callback boundary into the send gateway's
+                own `except Exception`; see `_record_provider_conflict`."""
                 if not sid:
                     return
+                if _OWNER_CONTEXT["enforced"]:
+                    try:
+                        cowork_owner.bind_provider_session(
+                            controller, sid, _current_owner_context(), role)
+                    except cowork_owner.ProviderSessionConflict as exc:
+                        _record_provider_conflict(exc)
+                        trace.event("owner.provider_session_conflict",
+                                    role=role, controller=controller,
+                                    session_id=sid,
+                                    owner_session_uuid=exc.owner_session_uuid)
+                        return
+                    except cowork_owner.ProviderBindingUnavailable as exc:
+                        _record_provider_conflict(exc)
+                        trace.event(
+                            "owner.provider_binding_unavailable", role=role,
+                            controller=controller, session_id=sid,
+                            error_type=type(exc).__name__,
+                            cause_type=(type(exc.__cause__).__name__
+                                        if exc.__cause__ is not None
+                                        else None),
+                            detail=str(exc))
                 if session_enabled:
                     holder["state"] = state_store.save_role_session(
                         spath, role, controller, sid, prior=holder["state"])
@@ -14968,6 +15095,14 @@ RESUME_TRIGGER_EXIT_SEND_FAILED = 9
 # above are fully allocated -- so this is additive, and no pre-existing
 # outcome-name -> integer mapping moves.
 RESUME_TRIGGER_EXIT_OWNER_CONFLICT = 10
+# Issue #64 P3: the provider/controller exclusivity refusals. 11 and 12 are the
+# NEXT FREE INTEGERS -- 0-10 above are fully allocated -- so these are additive
+# too, and no pre-existing outcome-name -> integer mapping moves. The two are
+# deliberately DISTINCT codes because they are distinct facts: 11 is a PROVEN
+# collision (a different live session owns that provider conversation), 12 is
+# an index that could not be consulted at all and proves nothing.
+RESUME_TRIGGER_EXIT_PROVIDER_SESSION_BOUND = 11
+RESUME_TRIGGER_EXIT_PROVIDER_BINDING_UNAVAILABLE = 12
 
 # The concrete, versioned outcome-name -> exit-code contract Package F must
 # consult by name (never a bare literal integer) -- matching D's own
@@ -14980,6 +15115,9 @@ RESUME_TRIGGER_EXIT_CODES.update({
     "no_pending_turn": RESUME_TRIGGER_EXIT_NO_PENDING_TURN,
     "send_failed": RESUME_TRIGGER_EXIT_SEND_FAILED,
     "owner_conflict": RESUME_TRIGGER_EXIT_OWNER_CONFLICT,
+    "provider_session_bound": RESUME_TRIGGER_EXIT_PROVIDER_SESSION_BOUND,
+    "provider_binding_unavailable": (
+        RESUME_TRIGGER_EXIT_PROVIDER_BINDING_UNAVAILABLE),
 })
 
 _EPOCH_GETTER_FOR_ROLE = {
@@ -15280,6 +15418,16 @@ def run_resume_trigger(argv, output=None, session_factory=None):
          `FAILED_WAKE_ATTEMPT_CEILING` genuinely reachable across repeated
          resume-trigger failures under BOTH invocation shapes (closes
          F-MJ-02).
+      1b. Issue #64 P3, provider/controller EXCLUSIVITY, still read-only and
+         still pre-claim: refuse (`provider_session_bound`, exit 11) when the
+         provider conversation this trigger would resume is bound to a
+         DIFFERENT session whose owner lease is still live, and refuse
+         (`provider_binding_unavailable`, exit 12) when the index cannot be
+         consulted at all. Placed AFTER every check above -- so their
+         precedence is unchanged -- and BEFORE the ownership acquire, so a
+         refusal here has claimed nothing, advanced no phase and constructed
+         no controller session. Unlike the refusals above it accounts NO
+         failed wake attempt: nothing was attempted.
       2. Claim the named PauseLease -- via D's ordinary `claim` (the
          trustworthy-scheduled form) or, when `--manual-signal-record` is
          given, D's `claim_with_authorized_early_override` (the ONLY path
@@ -15426,6 +15574,49 @@ def run_resume_trigger(argv, output=None, session_factory=None):
            or pending_record.get("lease_id") != precheck_lease["lease_id"]):
         return _preflight_conflict(
             "no_pending_turn", RESUME_TRIGGER_EXIT_NO_PENDING_TURN)
+
+    # Issue #64 P3, ENFORCEMENT POINT 2: provider/controller exclusivity, one
+    # step BEFORE ownership is even acquired. Placed here, a refusal has
+    # claimed nothing, advanced no phase, constructed no controller session
+    # and sent nothing -- everything below this point either mutates state or
+    # costs money.
+    #
+    # Deliberately NOT routed through `_preflight_conflict`: that helper
+    # accounts a FAILED WAKE ATTEMPT, and an exclusivity refusal must not
+    # consume one. Nothing has been attempted -- the wake was refused, not
+    # tried -- and charging it would silently widen behaviour and erode the
+    # per-binding automatic-recovery chain. It also sits AFTER every
+    # pre-existing preflight refusal, so their precedence is unchanged.
+    #
+    # A proven collision and an unconsultable index are separate outcomes with
+    # separate exit codes, because they oblige an operator to do different
+    # things: 11 means another live session holds this conversation, 12 means
+    # we could not find out.
+    if controller and provider_session_id:
+        try:
+            rt_binding = cowork_owner.read_provider_binding(
+                controller, provider_session_id)
+        except cowork_owner.ProviderBindingUnavailable as exc:
+            write(json.dumps({
+                "outcome": "provider_binding_unavailable",
+                "session_uuid": session_uuid,
+                "lease_id": precheck_lease["lease_id"],
+                "controller": controller,
+                "provider_session_id": provider_session_id,
+                "detail": str(exc)}) + "\n")
+            return RESUME_TRIGGER_EXIT_PROVIDER_BINDING_UNAVAILABLE
+        rt_bound_to = (rt_binding or {}).get("owner_session_uuid")
+        if (rt_bound_to and rt_bound_to != session_uuid
+                and cowork_owner.classify_owner_lease(rt_bound_to)
+                == "live_owner"):
+            write(json.dumps({
+                "outcome": "provider_session_bound",
+                "session_uuid": session_uuid,
+                "lease_id": precheck_lease["lease_id"],
+                "controller": controller,
+                "provider_session_id": provider_session_id,
+                "owner_session_uuid": rt_bound_to}) + "\n")
+            return RESUME_TRIGGER_EXIT_PROVIDER_SESSION_BOUND
 
     # Issue #64: SINGLE-WRITER OWNERSHIP for the headless entry point too.
     # Acquired BEFORE step 2's state-mutating claim -- and therefore before
