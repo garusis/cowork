@@ -95,6 +95,13 @@ import cowork_trace as trace_store  # noqa: E402
 # per-package `<base>` rule -- never the accredited base, for P2 onward.
 BASE_SHA = "239d8d65e7ac32ea20ad5564cfebc6055288d5d6"
 
+# P3's OWN signed candidate commit -- the other end of this package's interval.
+# `ScopeAndBaseConfinementTests` below measures the CLOSED interval
+# BASE_SHA..CANDIDATE_SHA, never the live working tree, so what it asserts is a
+# permanent fact about a finished piece of history that no later commit can
+# enter or turn red.
+CANDIDATE_SHA = "d451f65b0caecb8f04fbbfb257442afff809337c"
+
 # P3's write authority, exactly. `scripts/cowork_owner.py` is deliberately NOT
 # here: every binding primitive P3 needs already exists there, so this package
 # ends at zero delta on that file.
@@ -216,6 +223,52 @@ def _cowork_source():
 
 def _cowork_tree():
     return ast.parse(_cowork_source(), filename="cowork.py")
+
+
+def _candidate_cowork_tree():
+    """`scripts/cowork.py` as it stood at P3's own candidate commit.
+
+    A SEPARATE reader rather than a change to `_cowork_tree`: that helper also
+    feeds classes that assert things about the module running RIGHT NOW, and
+    re-pointing it would silently convert live behavioural gates into
+    historical ones."""
+    return ast.parse(_git_show_bytes(CANDIDATE_SHA, "scripts/cowork.py"),
+                     filename="cowork.py")
+
+
+def _candidate_scripts_names():
+    """Sorted basenames of the `.py` files under `scripts/` AT the candidate
+    commit -- the frozen-interval counterpart of `os.listdir(_HERE)`.
+
+    `git ls-tree --name-only` emits paths carrying the `scripts/` prefix and
+    includes non-`.py` entries, so both are handled here."""
+    out = subprocess.run(
+        ["git", "--no-optional-locks", "ls-tree", "--name-only",
+         CANDIDATE_SHA, "scripts/"],
+        cwd=_REPO_ROOT, capture_output=True, text=True, check=True).stdout
+    names = []
+    for line in out.split():
+        name = line[len("scripts/"):] if line.startswith("scripts/") else line
+        if name.endswith(".py"):
+            names.append(name)
+    return sorted(names)
+
+
+def _git_merge_base_is_ancestor(ancestor, descendant):
+    """True when `ancestor` really is an ancestor of `descendant`.
+
+    Guards the two frozen endpoint literals against a typo: a mistyped hash
+    would otherwise point every claim in `ScopeAndBaseConfinementTests` at an
+    unrelated piece of history and go on reporting green. `merge-base
+    --is-ancestor` only -- deliberately NOT the adjacency half of the
+    precedent at test_m5_package_e_integration.py, since a package need not be
+    exactly one commit above its base. `--no-optional-locks` so this cannot
+    refresh `.git/index` while the suite runs as a live-candidate
+    preflight."""
+    return subprocess.run(
+        ["git", "--no-optional-locks", "merge-base", "--is-ancestor",
+         ancestor, descendant],
+        cwd=_REPO_ROOT, capture_output=True).returncode == 0
 
 
 def _named_top_level(tree):
@@ -1745,15 +1798,35 @@ class ScopeAndBaseConfinementTests(unittest.TestCase):
                 "broken gate, not a snapshot" % BASE_SHA)
 
     def _changed_paths(self):
+        """The change set of the CLOSED interval `BASE_SHA..CANDIDATE_SHA`.
+
+        Two frozen endpoints, named explicitly, so this is neither the
+        working-tree form (`git diff --name-only <BASE>`, which measured
+        whatever happened to be on disk at run time) nor the `<BASE>..` form
+        (which means `<BASE>..HEAD` and follows a moving ref).
+
+        The `git ls-files --others --exclude-standard` branch that used to be
+        unioned in here is GONE, and that is not a loosening: it existed solely
+        to catch files P3 had added but not yet committed while P3 was the live
+        candidate. `CANDIDATE_SHA` is P3's finished commit, so it already
+        CONTAINS every file P3 added -- including this module -- and the
+        commit-to-commit diff reports them anyway.
+        """
         tracked = subprocess.run(
-            ["git", "diff", "--name-only", BASE_SHA],
+            ["git", "--no-optional-locks", "diff", "--name-only",
+             BASE_SHA, CANDIDATE_SHA],
             cwd=_REPO_ROOT, capture_output=True, text=True,
             check=True).stdout.split()
-        untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            cwd=_REPO_ROOT, capture_output=True, text=True,
-            check=True).stdout.split()
-        return {p for p in tracked + untracked if "__pycache__" not in p}
+        return {p for p in tracked if "__pycache__" not in p}
+
+    def test_the_base_is_an_ancestor_of_the_candidate(self):
+        """Both endpoints are frozen literals, so a single mistyped character
+        would silently point every claim in this class at an unrelated piece of
+        history. This fails loudly instead."""
+        self.assertTrue(
+            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
+            "%s is not an ancestor of %s"
+            % (BASE_SHA[:12], CANDIDATE_SHA[:12]))
 
     def test_changed_paths_are_exactly_the_authorized_set(self):
         """`scripts/cowork_owner.py` is permitted ONLY if a genuine
@@ -1768,42 +1841,48 @@ class ScopeAndBaseConfinementTests(unittest.TestCase):
     def test_the_owner_module_ended_at_zero_delta(self):
         """Decision pd-a, as a checked fact rather than a claim in a report."""
         self.assertEqual(
-            _sha256(_read_local_bytes("scripts/cowork_owner.py")),
+            _sha256(_git_show_bytes(CANDIDATE_SHA, "scripts/cowork_owner.py")),
             _sha256(_git_show_bytes(BASE_SHA, "scripts/cowork_owner.py")))
 
     def test_every_frozen_production_path_is_byte_identical(self):
         for rel in FROZEN_PRODUCTION_PATHS:
             with self.subTest(rel):
-                self.assertEqual(_sha256(_read_local_bytes(rel)),
+                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
                                  _sha256(_git_show_bytes(BASE_SHA, rel)), rel)
 
     def test_every_historical_test_module_is_byte_identical(self):
         """The machine-checkable half of "reported, never repaired": the
         package-scope fixtures P3 necessarily breaks were not edited to make
-        them pass."""
+        them pass.
+
+        BOTH halves of the comparison come from the frozen interval: the
+        `test_m5_package_*` LISTING is taken from the candidate commit's own
+        tree, not from a live directory listing. Mixing the two would mean a
+        module added after `CANDIDATE_SHA` made this assertion ERROR on a
+        missing git object instead of reporting a scope breach."""
         rels = list(FROZEN_TEST_PATHS)
         rels += sorted(
-            "scripts/" + name for name in os.listdir(_HERE)
+            "scripts/" + name for name in _candidate_scripts_names()
             if name.startswith("test_m5_package_") and name.endswith(".py"))
         for rel in rels:
             with self.subTest(rel):
-                self.assertEqual(_sha256(_read_local_bytes(rel)),
+                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
                                  _sha256(_git_show_bytes(BASE_SHA, rel)), rel)
 
     def test_every_other_top_level_symbol_is_ast_and_docstring_identical(self):
         base = _named_top_level(ast.parse(_git_show_bytes(
             BASE_SHA, "scripts/cowork.py")))
-        live = _named_top_level(_cowork_tree())
-        self.assertEqual(set(base) - set(live), set(), "a symbol was removed")
-        self.assertEqual(set(live) - set(base), set(ALLOWED_NEW_TOP_LEVEL))
+        cand = _named_top_level(_candidate_cowork_tree())
+        self.assertEqual(set(base) - set(cand), set(), "a symbol was removed")
+        self.assertEqual(set(cand) - set(base), set(ALLOWED_NEW_TOP_LEVEL))
         for name, node in base.items():
             if name in ALLOWED_CHANGED_TOP_LEVEL:
                 continue
             with self.subTest(name):
-                self.assertEqual(_dump(live[name]), _dump(node), name)
+                self.assertEqual(_dump(cand[name]), _dump(node), name)
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
                                      ast.ClassDef)):
-                    self.assertEqual(ast.get_docstring(live[name]),
+                    self.assertEqual(ast.get_docstring(cand[name]),
                                      ast.get_docstring(node), name)
 
     def test_run_flow_is_identical_apart_from_the_role_saver_closure(self):
@@ -1818,19 +1897,19 @@ class ScopeAndBaseConfinementTests(unittest.TestCase):
         it."""
         base = _named_top_level(ast.parse(_git_show_bytes(
             BASE_SHA, "scripts/cowork.py")))["run_flow"]
-        live = _named_top_level(_cowork_tree())["run_flow"]
+        cand = _named_top_level(_candidate_cowork_tree())["run_flow"]
 
-        self.assertEqual(ast.get_docstring(live), ast.get_docstring(base))
+        self.assertEqual(ast.get_docstring(cand), ast.get_docstring(base))
         self.assertEqual(
-            _dump(_without_bodies_of(live, ALLOWED_CHANGED_CLOSURES)),
+            _dump(_without_bodies_of(cand, ALLOWED_CHANGED_CLOSURES)),
             _dump(_without_bodies_of(base, ALLOWED_CHANGED_CLOSURES)))
 
         base_saver = _find_functions(base, "role_saver")
-        live_saver = _find_functions(live, "role_saver")
+        cand_saver = _find_functions(cand, "role_saver")
         self.assertEqual(len(base_saver), 1)
-        self.assertEqual(len(live_saver), 1)
+        self.assertEqual(len(cand_saver), 1)
         self.assertEqual(
-            _dump(_without_bodies_of(live_saver[0], {"on_sess"})),
+            _dump(_without_bodies_of(cand_saver[0], {"on_sess"})),
             _dump(_without_bodies_of(base_saver[0], {"on_sess"})))
 
     def test_the_only_changed_bare_statement_is_the_exit_map_update(self):
@@ -1846,9 +1925,9 @@ class ScopeAndBaseConfinementTests(unittest.TestCase):
                                           ast.ClassDef, ast.Assign))]
 
         base = bare(ast.parse(_git_show_bytes(BASE_SHA, "scripts/cowork.py")))
-        live = bare(_cowork_tree())
-        self.assertEqual(len(base), len(live))
-        differing = [(b, l) for b, l in zip(base, live) if b != l]
+        cand = bare(_candidate_cowork_tree())
+        self.assertEqual(len(base), len(cand))
+        differing = [(b, l) for b, l in zip(base, cand) if b != l]
         self.assertEqual(len(differing), 1, differing)
         self.assertIn("RESUME_TRIGGER_EXIT_CODES.update", differing[0][0])
         self.assertIn("RESUME_TRIGGER_EXIT_CODES.update", differing[0][1])
@@ -1860,17 +1939,18 @@ class ScopeAndBaseConfinementTests(unittest.TestCase):
         would break on a CORRECT candidate."""
         base = _closures_of(_named_top_level(ast.parse(_git_show_bytes(
             BASE_SHA, "scripts/cowork.py")))["run_flow"])
-        live = _closures_of(_named_top_level(_cowork_tree())["run_flow"])
-        self.assertEqual(set(base) - set(live), set())
-        self.assertEqual(set(live) - set(base), set())
+        cand = _closures_of(
+            _named_top_level(_candidate_cowork_tree())["run_flow"])
+        self.assertEqual(set(base) - set(cand), set())
+        self.assertEqual(set(cand) - set(base), set())
         for name, nodes in base.items():
             if name in ALLOWED_CHANGED_CLOSURES:
                 continue
             with self.subTest(name):
                 self.assertEqual(len(nodes), 1, name)
-                self.assertEqual(len(live[name]), 1, name)
-                self.assertEqual(_dump(live[name][0]), _dump(nodes[0]))
-                self.assertEqual(ast.get_docstring(live[name][0]),
+                self.assertEqual(len(cand[name]), 1, name)
+                self.assertEqual(_dump(cand[name][0]), _dump(nodes[0]))
+                self.assertEqual(ast.get_docstring(cand[name][0]),
                                  ast.get_docstring(nodes[0]))
 
     def test_g9_the_frozen_base_literal_matches_the_base_commit(self):

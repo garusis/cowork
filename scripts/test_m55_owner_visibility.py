@@ -82,6 +82,12 @@ import cowork_state as state_store  # noqa: E402
 # per-package `<base>` rule -- never the accredited base, for P2 onward.
 BASE_SHA = "c7aa5e7a57f3ca81b0a33e3f481cb650d0c1fd94"
 
+# P4's OWN signed candidate commit -- the other end of this package's interval.
+# The scope class below measures the CLOSED interval BASE_SHA..CANDIDATE_SHA,
+# never the live working tree, so what it asserts is a permanent fact about a
+# finished piece of history that no later commit can enter or turn red.
+CANDIDATE_SHA = "fc7ff676e173a6b6e02246abbaee6c2cb41e5a06"
+
 # P4's write authority, exactly.
 ALLOWED_CHANGED_PATHS = frozenset({
     "scripts/cowork.py",
@@ -195,6 +201,18 @@ def _git(args, check=False):
 
 def _git_show_bytes(rev, rel_path):
     return _git(["show", "%s:%s" % (rev, rel_path)], check=True).stdout
+
+
+def _git_merge_base_is_ancestor(ancestor, descendant):
+    """True when `ancestor` really is an ancestor of `descendant`.
+
+    Guards the two frozen endpoint literals against a typo: a mistyped hash
+    would otherwise point this gate at an unrelated piece of history and go on
+    reporting green. `merge-base --is-ancestor` only -- deliberately NOT the
+    adjacency half of the precedent at test_m5_package_e_integration.py, since
+    a package need not be exactly one commit above its base."""
+    return _git(["merge-base", "--is-ancestor", ancestor,
+                 descendant]).returncode == 0
 
 
 def _read_local_bytes(rel_path):
@@ -411,6 +429,23 @@ def _view(verdict, **overrides):
     return view
 
 
+def _lease_file(session_uuid):
+    """The lease file, spelled WITHOUT `owner_lease_path_for` and without the
+    literal `"owner/lease.json"`, on purpose.
+
+    G3d's repo-wide sweep asserts that neither of those two spellings ever
+    reaches an `open(...)` call anywhere in the repository -- including this
+    file. A fixture that needs to fabricate a damaged lease therefore composes
+    the path from `owner_dir_for`, which is a plain directory helper carrying
+    none of the lease's single-writer contract.
+
+    Path-identical to what the store's own helper returns, and it rejects an
+    unsafe `session_uuid` identically, because `owner_dir_for` performs that
+    rejection and the lease helper is exactly that directory plus this
+    filename."""
+    return os.path.join(state_store.owner_dir_for(session_uuid), "lease.json")
+
+
 # --------------------------------------------------------------------------- #
 # Base case: a sandboxed assets home plus a sandboxed project directory.        #
 # --------------------------------------------------------------------------- #
@@ -483,7 +518,7 @@ class OwnerVisibilityTestCase(unittest.TestCase):
         there is no supported way to ASK the store for an unreadable record,
         and a plausible-but-valid stand-in would not exercise the corrupt path
         at all."""
-        path = state_store.owner_lease_path_for(session_uuid)
+        path = _lease_file(session_uuid)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:
             fh.write("not json {")
@@ -498,7 +533,7 @@ class OwnerVisibilityTestCase(unittest.TestCase):
         one blurred one."""
         out = {}
         for name, path in (
-                ("lease", state_store.owner_lease_path_for(session_uuid)),
+                ("lease", _lease_file(session_uuid)),
                 ("history",
                  state_store.owner_history_path_for(session_uuid))):
             try:
@@ -1216,6 +1251,129 @@ class PickerOwnerSuffixTests(OwnerVisibilityTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# The corrupt fixture: what actually keeps it safe.                             #
+# --------------------------------------------------------------------------- #
+
+
+class CorruptFixtureIsolationTests(OwnerVisibilityTestCase):
+    """`seed_corrupt_lease` performs a genuine UNLOCKED write of the lease
+    record, and this class -- not the G3d sweep -- is what makes that
+    admissible.
+
+    Be plain about what changed and what it proves. The sweep now reports zero
+    offenders for this module NOT because the unlocked write is gone (it is
+    not) but because the path is composed from `owner_dir_for` plus a
+    `"lease.json"` filename, which is outside the two spellings the sweep
+    tracks. That recognizer is purely SYNTACTIC and admits exactly two shapes;
+    it performs no arbitrary path or dataflow analysis, so after this change it
+    proves NOTHING about this fixture at all. The repository is free of
+    unlocked lease writes in PRODUCTION -- three test modules deliberately
+    fabricate lease records outside the locked seam, and that trade is accepted
+    on the strength of the confinement asserted below, not on the sweep.
+
+    So the burden moves here, one test per clause: the write lands strictly
+    inside the per-test temporary sessions root (and outside both the worktree
+    and the real home assets dir), at exactly the path the production writer
+    itself uses, with bytes that genuinely do not parse and still classify
+    `corrupt` end to end. `FixtureRestorationTests` carries the fourth clause,
+    which can only be observed from outside a finished test.
+    """
+
+    def test_the_corrupt_fixture_writes_only_inside_the_per_test_root(self):
+        path = self.seed_corrupt_lease("isolation1")
+        real = os.path.realpath(path)
+        root = os.path.realpath(self.root)
+        self.assertTrue(real.startswith(root + os.sep), real)
+        self.assertFalse(
+            real.startswith(os.path.realpath(_REPO_ROOT) + os.sep), real)
+
+        # Where the record WOULD have gone with the override removed -- derived
+        # by popping the variable inside a restoring patch, since every owner
+        # path hangs off `session_assets_dir`, which reads the environment at
+        # call time.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            home = os.path.realpath(state_store.owner_dir_for("isolation1"))
+        self.assertNotEqual(real, home)
+        self.assertFalse(real.startswith(home + os.sep), real)
+
+        # The temp root's ENTIRE file census is that one seeded record, so the
+        # fixture wrote nothing else anywhere under it either.
+        self.assertEqual(sorted(_tree_digests(self.root)),
+                         [os.path.relpath(path, self.root)])
+
+    def test_the_fixture_path_is_where_the_store_itself_writes_a_real_lease(
+            self):
+        """Equivalence proved BEHAVIOURALLY: the real production writer is
+        driven, and the lease it produces is asserted to land exactly where the
+        fixture's own path helper says it would.
+
+        Deliberately not an equality assertion against the store's lease-path
+        helper -- naming it here would put an unguarded reference back into
+        this module and re-arm the sweep this correction closes. Driving the
+        locked writer proves the stronger claim anyway."""
+        self.seed_live_owner("isolation2")
+        leases = sorted(rel for rel in _tree_digests(self.root)
+                        if os.path.basename(rel) == "lease.json")
+        self.assertEqual(
+            leases, [os.path.relpath(_lease_file("isolation2"), self.root)])
+
+    def test_the_seeded_record_is_unparseable_and_still_classifies_corrupt(
+            self):
+        """The corruption coverage the fixture exists for, asserted rather than
+        assumed: a valid-but-odd stand-in would exercise no corrupt path at
+        all."""
+        path = self.seed_corrupt_lease("isolation3")
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        with self.assertRaises(ValueError):
+            json.loads(raw.decode("utf-8"))
+        self.assertEqual(owner.owner_status_view("isolation3")["verdict"],
+                         "corrupt")
+        # ...and the digest reader still points at exactly the file the writer
+        # produced.
+        self.assertEqual(self.lease_digests("isolation3")["lease"],
+                         _sha256(raw))
+
+
+class FixtureRestorationTests(unittest.TestCase):
+    """The fourth clause: the sandbox is torn down and the environment put
+    back.
+
+    A plain `TestCase`, deliberately NOT an `OwnerVisibilityTestCase`:
+    restoration can only be observed from OUTSIDE a case whose own cleanups
+    have already run, so this class must not inherit that setUp.
+    """
+
+    def test_the_temporary_root_and_the_environment_are_restored_after_cleanup(
+            self):
+        before = os.environ.get("COWORK_SESSIONS_ROOT")
+        captured = {}
+
+        class _Probe(OwnerVisibilityTestCase):
+            """Local, so the module gains no third top-level test class and
+            unittest discovery never collects this twice."""
+
+            def test_seeds_a_corrupt_record(self):
+                captured["root"] = self.root
+                captured["env"] = os.environ.get("COWORK_SESSIONS_ROOT")
+                captured["path"] = self.seed_corrupt_lease("restored1")
+
+        suite = unittest.TestLoader().loadTestsFromTestCase(_Probe)
+        self.assertEqual(suite.countTestCases(), 1)
+        result = unittest.TextTestRunner(stream=io.StringIO(),
+                                         verbosity=0).run(suite)
+        self.assertTrue(result.wasSuccessful(),
+                        (result.errors, result.failures))
+
+        self.assertEqual(captured["env"], captured["root"])
+        self.assertNotEqual(captured["root"], before)
+        self.assertFalse(os.path.exists(captured["root"]))
+        self.assertFalse(os.path.exists(captured["path"]))
+        self.assertEqual(os.environ.get("COWORK_SESSIONS_ROOT"), before)
+
+
+# --------------------------------------------------------------------------- #
 # Criterion 4 -- scope confinement, against the frozen base.                    #
 # --------------------------------------------------------------------------- #
 
@@ -1223,9 +1381,11 @@ class PickerOwnerSuffixTests(OwnerVisibilityTestCase):
 class ScopeConfinementTests(unittest.TestCase):
     """G6 for P4, bound to P4's own `<base>`: P3's accepted candidate.
 
-    Runs against the LIVE candidate, because its whole evidence base is git
-    metadata about how this tree differs from `BASE_SHA`. It skips itself
-    everywhere else (see `_live_candidate_repo`), and the verification
+    Measures the CLOSED interval `BASE_SHA..CANDIDATE_SHA` -- P4's own finished
+    history -- rather than the live working tree, so every claim below is a
+    permanent fact about that interval that no later commit can enter. It
+    still needs a repository where BOTH endpoint objects exist, so it skips
+    itself everywhere else (see `_live_candidate_repo`), and the verification
     inventory measures it through a dedicated `candidate_read_only` preflight
     entry rather than inside the isolated snapshot.
     """
@@ -1239,38 +1399,52 @@ class ScopeConfinementTests(unittest.TestCase):
                 % BASE_SHA[:12])
 
     def _changed_paths(self):
-        """The base-to-WORKING-TREE change set, plus new untracked files.
+        """The change set of the CLOSED interval `BASE_SHA..CANDIDATE_SHA`.
 
-        `git diff --name-only <BASE>` (no `..`) compares the base against the
-        WORKING TREE. The `<BASE>..` form would mean `<BASE>..HEAD`; P4 makes
-        no commits, so HEAD == BASE and that form is empty on ANY candidate --
-        a vacuous gate. The second command is what catches the new test file,
-        which is itself one of the four allowed paths.
+        Two frozen endpoints, named explicitly, so this is neither the
+        working-tree form (`git diff --name-only <BASE>`, which measured
+        whatever happened to be on disk at run time) nor the `<BASE>..` form
+        (which means `<BASE>..HEAD` and follows a moving ref).
+
+        The `git ls-files --others --exclude-standard` branch that used to be
+        unioned in here is GONE, and that is not a loosening: it existed solely
+        to catch files P4 had added but not yet committed while P4 was the live
+        candidate. `CANDIDATE_SHA` is P4's finished commit, so it already
+        CONTAINS every file P4 added -- including this module -- and the
+        commit-to-commit diff reports them anyway.
         """
-        tracked = _git(["diff", "--name-only", BASE_SHA],
+        tracked = _git(["diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
                        check=True).stdout.decode("utf-8").split()
-        untracked = _git(["ls-files", "--others", "--exclude-standard"],
-                         check=True).stdout.decode("utf-8").split()
-        return {p for p in tracked + untracked if "__pycache__" not in p}
+        return {p for p in tracked if "__pycache__" not in p}
 
     def test_changed_paths_are_exactly_the_four_allowed(self):
         self.assertEqual(self._changed_paths(), set(ALLOWED_CHANGED_PATHS))
 
+    def test_the_base_is_an_ancestor_of_the_candidate(self):
+        """Both endpoints are frozen literals, so a single mistyped character
+        would silently point every claim in this class at an unrelated piece of
+        history. This fails loudly instead."""
+        self.assertTrue(
+            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
+            "%s is not an ancestor of %s"
+            % (BASE_SHA[:12], CANDIDATE_SHA[:12]))
+
     def test_every_excluded_path_is_byte_identical_to_the_base(self):
         for rel in EXCLUDED_PATHS:
             with self.subTest(rel):
-                self.assertEqual(_sha256(_read_local_bytes(rel)),
+                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
                                  _sha256(_git_show_bytes(BASE_SHA, rel)))
 
     def test_every_excluded_module_symbol_is_ast_and_docstring_identical(self):
         base = _top_level(ast.parse(_git_show_bytes(BASE_SHA,
                                                     "scripts/cowork.py")))
-        live = _top_level(ast.parse(_read_local_bytes("scripts/cowork.py")))
+        cand = _top_level(ast.parse(_git_show_bytes(CANDIDATE_SHA,
+                                                    "scripts/cowork.py")))
         for name in EXCLUDED_MODULE_SYMBOLS:
             with self.subTest(name):
-                self.assertIn(name, live)
-                self.assertEqual(_dump(live[name]), _dump(base[name]))
-                self.assertEqual(ast.get_docstring(live[name]),
+                self.assertIn(name, cand)
+                self.assertEqual(_dump(cand[name]), _dump(base[name]))
+                self.assertEqual(ast.get_docstring(cand[name]),
                                  ast.get_docstring(base[name]))
 
     def test_every_excluded_run_flow_closure_is_ast_identical(self):
@@ -1279,15 +1453,16 @@ class ScopeConfinementTests(unittest.TestCase):
         parent, and never a byte digest, which a legitimate re-indentation
         would break on a CORRECT candidate."""
         base_tree = ast.parse(_git_show_bytes(BASE_SHA, "scripts/cowork.py"))
-        live_tree = ast.parse(_read_local_bytes("scripts/cowork.py"))
+        cand_tree = ast.parse(_git_show_bytes(CANDIDATE_SHA,
+                                              "scripts/cowork.py"))
         base = _closures_of(_top_level(base_tree)["run_flow"])
-        live = _closures_of(_top_level(live_tree)["run_flow"])
+        cand = _closures_of(_top_level(cand_tree)["run_flow"])
         for name in EXCLUDED_RUN_FLOW_CLOSURES:
             with self.subTest(name):
                 self.assertEqual(len(base.get(name, [])), 1, name)
-                self.assertEqual(len(live.get(name, [])), 1, name)
-                self.assertEqual(_dump(live[name][0]), _dump(base[name][0]))
-                self.assertEqual(ast.get_docstring(live[name][0]),
+                self.assertEqual(len(cand.get(name, [])), 1, name)
+                self.assertEqual(_dump(cand[name][0]), _dump(base[name][0]))
+                self.assertEqual(ast.get_docstring(cand[name][0]),
                                  ast.get_docstring(base[name][0]))
 
     def test_each_edited_file_changes_only_its_named_symbols(self):
@@ -1296,33 +1471,37 @@ class ScopeConfinementTests(unittest.TestCase):
         pre-existing top-level symbol AST- and docstring-identical."""
         for rel in sorted(ALLOWED_SYMBOL_CHANGES):
             base_tree = ast.parse(_git_show_bytes(BASE_SHA, rel))
-            live_tree = ast.parse(_read_local_bytes(rel))
-            base, live = _top_level(base_tree), _top_level(live_tree)
+            cand_tree = ast.parse(_git_show_bytes(CANDIDATE_SHA, rel))
+            base, cand = _top_level(base_tree), _top_level(cand_tree)
             with self.subTest(rel=rel, check="nothing removed"):
-                self.assertEqual(set(base) - set(live), set())
+                self.assertEqual(set(base) - set(cand), set())
             with self.subTest(rel=rel, check="only declared additions"):
                 self.assertEqual(
-                    _module_level_names(live_tree)
+                    _module_level_names(cand_tree)
                     - _module_level_names(base_tree),
                     set(ALLOWED_NEW_SYMBOLS[rel]))
             for name, node in sorted(base.items()):
                 if name in ALLOWED_SYMBOL_CHANGES[rel]:
                     continue
                 with self.subTest(rel=rel, name=name):
-                    self.assertEqual(_dump(live[name]), _dump(node))
-                    self.assertEqual(ast.get_docstring(live[name]),
+                    self.assertEqual(_dump(cand[name]), _dump(node))
+                    self.assertEqual(ast.get_docstring(cand[name]),
                                      ast.get_docstring(node))
 
     def test_the_two_historical_owner_suites_are_untouched(self):
         """Their scope gates pin `cowork_report.py` and `cowork_state.py` to
         THEIR bases, so both fail on this candidate -- which is correct, and is
         exactly why editing them to pass would be the failure they exist to
-        prevent. Neither is in P4's allowed set."""
+        prevent. Neither is in P4's allowed set.
+
+        Read from `CANDIDATE_SHA`, so the claim stays TRUE and HONEST: it says
+        P4 left those two files alone across P4's own interval, which no later
+        package editing them can retroactively falsify."""
         for rel in ("scripts/test_m55_owner_store.py",
                     "scripts/test_m55_owner_gate.py"):
             with self.subTest(rel):
                 self.assertNotIn(rel, ALLOWED_CHANGED_PATHS)
-                self.assertEqual(_sha256(_read_local_bytes(rel)),
+                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
                                  _sha256(_git_show_bytes(BASE_SHA, rel)))
 
     def test_the_owner_module_is_not_a_p4_path_at_all(self):

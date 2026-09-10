@@ -95,6 +95,13 @@ import cowork_trace as trace_store  # noqa: E402
 # per-package `<base>` rule -- never the accredited base, for P2 onward.
 BASE_SHA = "325d2cf5e6545c1d29e69dbb86c9fe7196868924"
 
+# P2's OWN signed candidate commit -- the other end of this package's interval.
+# `ScopeConfinementTests` below measures the CLOSED interval
+# BASE_SHA..CANDIDATE_SHA, never the live working tree, so what it asserts is a
+# permanent fact about a finished piece of history that no later commit can
+# enter or turn red.
+CANDIDATE_SHA = "239d8d65e7ac32ea20ad5564cfebc6055288d5d6"
+
 # P2's write authority, exactly.
 ALLOWED_CHANGED_PATHS = frozenset({
     "scripts/cowork.py",
@@ -174,6 +181,23 @@ def _git_show_bytes(rev, rel_path):
         cwd=_REPO_ROOT, capture_output=True, check=True).stdout
 
 
+def _git_merge_base_is_ancestor(ancestor, descendant):
+    """True when `ancestor` really is an ancestor of `descendant`.
+
+    Guards the two frozen endpoint literals against a typo: a mistyped hash
+    would otherwise point every claim in `ScopeConfinementTests` at an
+    unrelated piece of history and go on reporting green. `merge-base
+    --is-ancestor` only -- deliberately NOT the adjacency half of the
+    precedent at test_m5_package_e_integration.py, since a package need not be
+    exactly one commit above its base. `--no-optional-locks` so this cannot
+    refresh `.git/index` while the suite runs as a live-candidate
+    preflight."""
+    return subprocess.run(
+        ["git", "--no-optional-locks", "merge-base", "--is-ancestor",
+         ancestor, descendant],
+        cwd=_REPO_ROOT, capture_output=True).returncode == 0
+
+
 def _read_local_bytes(rel_path):
     with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
         return fh.read()
@@ -190,6 +214,48 @@ def _cowork_source():
 
 def _cowork_tree():
     return ast.parse(_cowork_source(), filename="cowork.py")
+
+
+def _candidate_cowork_tree():
+    """`scripts/cowork.py` as it stood at P2's own candidate commit.
+
+    A SEPARATE reader rather than a change to `_cowork_tree`: that helper also
+    feeds `StaticGateTests`, which is a claim about the module running RIGHT
+    NOW, and re-pointing it would silently convert a live behavioural gate into
+    a historical one."""
+    return ast.parse(_git_show_bytes(CANDIDATE_SHA, "scripts/cowork.py"),
+                     filename="cowork.py")
+
+
+def _resume_trigger_update_keys(tree):
+    """The outcome names THIS module adds to `RESUME_TRIGGER_EXIT_CODES`.
+
+    The mapping is deliberately not one literal: it is `dict(...)` seeded from
+    the scheduler's own `WAKE_TRIGGER_EXIT_CODES` and then `.update()`d with
+    cowork's additive outcomes. Only that update literal is read here -- it is
+    the half every owner package touches, and reading it off the AST means
+    neither endpoint has to be imported or executed to answer "which outcomes
+    did this revision add?".
+
+    Raises rather than returning an empty set if the update call is not where
+    it is expected. A silent empty answer would make the additive claim below
+    vacuously true, which is the one failure mode a re-pointed gate must not
+    have."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "update"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "RESUME_TRIGGER_EXIT_CODES"):
+            continue
+        if not (node.args and isinstance(node.args[0], ast.Dict)):
+            break
+        return {key.value for key in node.args[0].keys
+                if isinstance(key, ast.Constant)
+                and isinstance(key.value, str)}
+    raise AssertionError(
+        "RESUME_TRIGGER_EXIT_CODES.update({...}) not found as a dict literal")
 
 
 def _top_level(tree):
@@ -1075,7 +1141,22 @@ class ResumeTriggerExitCodeTests(OwnerGateTestCase):
 
     def test_the_new_code_is_ten_and_additive(self):
         """G9. 10 is the first free integer; every pre-existing mapping is
-        unchanged; and no integer is used twice."""
+        unchanged; and no integer is used twice.
+
+        "Pre-existing" means pre-existing AT P2, which is what this package
+        was ever in a position to claim. The set of outcomes the additive limb
+        quantifies over is therefore pinned by difference against P2's frozen
+        candidate, while every VALUE is still read from the live module -- so
+        "unchanged" stays a live assertion about the mapping running right now,
+        and only the universe it quantifies over is frozen.
+
+        Read the other way, the additive limb quantified over whatever the tip
+        happens to hold, which turned P2's finished and correct claim red the
+        moment P3 added its authorized `provider_session_bound` outcome at 11.
+        No later package could ever make it green again, so it was a lineage
+        claim wearing a live check's clothes. Nothing is weakened: uniqueness,
+        the value of `owner_conflict`, its exclusive hold on 10, and the
+        continued existence of every P2-era constant all remain live below."""
         self.assertEqual(cowork.RESUME_TRIGGER_EXIT_OWNER_CONFLICT, 10)
         codes = cowork.RESUME_TRIGGER_EXIT_CODES
         self.assertEqual(codes["owner_conflict"], 10)
@@ -1099,10 +1180,20 @@ class ResumeTriggerExitCodeTests(OwnerGateTestCase):
             if name == "RESUME_TRIGGER_EXIT_CODES":
                 continue
             self.assertTrue(hasattr(cowork, name), name)
-        # Every pre-existing outcome name keeps its exact integer.
+        # Every outcome that already existed AT P2 still sits below 10. The
+        # outcome set is pinned by DIFFERENCE against P2's frozen candidate --
+        # anything this module has added since is not something P2 was ever in
+        # a position to claim -- while the values are read from the live
+        # mapping, so "no pre-existing mapping moves" stays a live assertion.
+        added_after_p2 = (
+            _resume_trigger_update_keys(_cowork_tree())
+            - _resume_trigger_update_keys(_candidate_cowork_tree()))
+        self.assertNotIn("owner_conflict", added_after_p2)
         prior = {k: v for k, v in codes.items() if k != "owner_conflict"}
-        for name, value in prior.items():
-            self.assertLess(value, 10, name)
+        inherited = sorted(set(prior) - added_after_p2)
+        self.assertTrue(inherited, "P2 inherited no outcome to be additive to")
+        for name in inherited:
+            self.assertLess(prior[name], 10, name)
 
     def test_a_second_resume_trigger_is_refused_with_exit_ten(self):
         """F6. A duplicate resume-trigger against a session another process
@@ -1404,10 +1495,27 @@ class StaticGateTests(unittest.TestCase):
         self.assertNotIn("_owner_handle_box", _cowork_source())
 
     def test_the_module_level_owner_symbol_set_is_exactly_p2s_seven(self):
-        """G3b's closure assertion, in its P2 form. P3 adds the eighth,
-        `_record_provider_conflict`; a P2 candidate must not have it yet."""
+        """G3b's closure assertion, in its P2 form -- measured on P2's OWN
+        frozen candidate rather than on the live tree.
+
+        This is a SCOPE claim about P2's write authority (plan section 3.7,
+        `P2_OWNER_MODULE_SYMBOLS`), not a runtime invariant, and P3
+        legitimately adds the eighth, `_record_provider_conflict`. Read
+        against the live module it asserted that P2 is still the tip -- which
+        stopped being true the moment P3 landed, and which no later package
+        can make true again. Pinned to `CANDIDATE_SHA` it says what it always
+        meant: across P2's own finished interval the module-level owner symbol
+        set was exactly these seven, and the eighth was not there yet. That is
+        a permanent fact no later commit can enter.
+
+        Deliberately narrow: this is the ONE claim in this class that is
+        historical. Every other gate here is a statement about the module
+        running right now -- the handler shapes, the teardown order, the
+        heartbeat placement, the dispatch-site census -- and each keeps reading
+        `self.tree`, which is the live file."""
+        tree = _candidate_cowork_tree()
         present = set()
-        for node in self.tree.body:
+        for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 names = {node.name}
             elif isinstance(node, ast.Assign):
@@ -1423,7 +1531,7 @@ class StaticGateTests(unittest.TestCase):
                 if name.startswith("_") and "owner" in name.lower():
                     present.add(name)
         self.assertEqual(present, set(P2_OWNER_MODULE_SYMBOLS))
-        self.assertNotIn("_record_provider_conflict", self.top)
+        self.assertNotIn("_record_provider_conflict", _top_level(tree))
 
     # -- G3c -------------------------------------------------------------- #
 
@@ -1606,36 +1714,64 @@ class StaticGateTests(unittest.TestCase):
 
 
 class ScopeConfinementTests(unittest.TestCase):
-    """G6 and G14, bound to P2's own `<base>`: P1's accepted candidate."""
+    """G6 and G14, bound to P2's own `<base>`: P1's accepted candidate.
+
+    Measures the CLOSED interval `BASE_SHA..CANDIDATE_SHA` -- P2's own finished
+    history -- rather than the live working tree, so every claim below is a
+    permanent fact about that interval that no later commit can enter. It needs
+    a repository where BOTH endpoint objects exist, which is why the
+    verification inventory measures it through a `candidate_read_only`
+    preflight entry rather than inside the isolated snapshot.
+    """
 
     def _changed_paths(self):
+        """The change set of the CLOSED interval `BASE_SHA..CANDIDATE_SHA`.
+
+        Two frozen endpoints, named explicitly, so this is neither the
+        working-tree form (`git diff --name-only <BASE>`, which measured
+        whatever happened to be on disk at run time) nor the `<BASE>..` form
+        (which means `<BASE>..HEAD` and follows a moving ref).
+
+        The `git ls-files --others --exclude-standard` branch that used to be
+        unioned in here is GONE, and that is not a loosening: it existed solely
+        to catch files P2 had added but not yet committed while P2 was the live
+        candidate. `CANDIDATE_SHA` is P2's finished commit, so it already
+        CONTAINS every file P2 added, and the commit-to-commit diff reports
+        them anyway.
+        """
         tracked = subprocess.run(
-            ["git", "diff", "--name-only", BASE_SHA],
+            ["git", "--no-optional-locks", "diff", "--name-only",
+             BASE_SHA, CANDIDATE_SHA],
             cwd=_REPO_ROOT, capture_output=True, text=True,
             check=True).stdout.split()
-        untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            cwd=_REPO_ROOT, capture_output=True, text=True,
-            check=True).stdout.split()
-        return {p for p in tracked + untracked if "__pycache__" not in p}
+        return {p for p in tracked if "__pycache__" not in p}
 
     def test_changed_paths_are_exactly_the_four_allowed(self):
         self.assertEqual(self._changed_paths(), set(ALLOWED_CHANGED_PATHS))
 
+    def test_the_base_is_an_ancestor_of_the_candidate(self):
+        """Both endpoints are frozen literals, so a single mistyped character
+        would silently point every claim in this class at an unrelated piece of
+        history. This fails loudly instead."""
+        self.assertTrue(
+            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
+            "%s is not an ancestor of %s"
+            % (BASE_SHA[:12], CANDIDATE_SHA[:12]))
+
     def test_every_excluded_production_path_is_byte_identical(self):
         for rel in EXCLUDED_PATHS:
-            self.assertEqual(_sha256(_read_local_bytes(rel)),
+            self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
                              _sha256(_git_show_bytes(BASE_SHA, rel)), rel)
 
     def test_every_excluded_module_symbol_is_ast_and_docstring_identical(self):
         base = _top_level(ast.parse(_git_show_bytes(BASE_SHA,
                                                     "scripts/cowork.py")))
-        live = _top_level(_cowork_tree())
+        cand = _top_level(_candidate_cowork_tree())
         for name in EXCLUDED_MODULE_SYMBOLS:
             with self.subTest(name):
-                self.assertIn(name, live)
-                self.assertEqual(_dump(live[name]), _dump(base[name]))
-                self.assertEqual(ast.get_docstring(live[name]),
+                self.assertIn(name, cand)
+                self.assertEqual(_dump(cand[name]), _dump(base[name]))
+                self.assertEqual(ast.get_docstring(cand[name]),
                                  ast.get_docstring(base[name]))
 
     def test_every_excluded_run_flow_closure_is_ast_identical(self):
@@ -1645,13 +1781,13 @@ class ScopeConfinementTests(unittest.TestCase):
         re-indentation would break on a CORRECT candidate."""
         base_tree = ast.parse(_git_show_bytes(BASE_SHA, "scripts/cowork.py"))
         base = _closures_of(_top_level(base_tree)["run_flow"])
-        live = _closures_of(_top_level(_cowork_tree())["run_flow"])
+        cand = _closures_of(_top_level(_candidate_cowork_tree())["run_flow"])
         for name in EXCLUDED_RUN_FLOW_CLOSURES:
             with self.subTest(name):
                 self.assertEqual(len(base.get(name, [])), 1, name)
-                self.assertEqual(len(live.get(name, [])), 1, name)
-                self.assertEqual(_dump(live[name][0]), _dump(base[name][0]))
-                self.assertEqual(ast.get_docstring(live[name][0]),
+                self.assertEqual(len(cand.get(name, [])), 1, name)
+                self.assertEqual(_dump(cand[name][0]), _dump(base[name][0]))
+                self.assertEqual(ast.get_docstring(cand[name][0]),
                                  ast.get_docstring(base[name][0]))
 
     def test_the_owner_module_never_imports_cowork(self):
@@ -1670,14 +1806,14 @@ class ScopeConfinementTests(unittest.TestCase):
         change, and no P1 signature may move."""
         base = _top_level(ast.parse(_git_show_bytes(
             BASE_SHA, "scripts/cowork_owner.py")))
-        live = _top_level(ast.parse(_read_local_bytes(
-            "scripts/cowork_owner.py")))
-        self.assertEqual(set(base) - set(live), set())
+        cand = _top_level(ast.parse(_git_show_bytes(
+            CANDIDATE_SHA, "scripts/cowork_owner.py")))
+        self.assertEqual(set(base) - set(cand), set())
         for name, node in base.items():
-            self.assertEqual(_dump(live[name]), _dump(node), name)
-            self.assertEqual(ast.get_docstring(live[name]),
+            self.assertEqual(_dump(cand[name]), _dump(node), name)
+            self.assertEqual(ast.get_docstring(cand[name]),
                              ast.get_docstring(node), name)
-        self.assertEqual(set(live) - set(base), {"refusal_message",
+        self.assertEqual(set(cand) - set(base), {"refusal_message",
                                                  "owner_refusal_reason"})
 
     def test_save_role_session_is_frozen(self):
@@ -1699,15 +1835,20 @@ class ScopeConfinementTests(unittest.TestCase):
 
     def test_the_state_characterization_file_is_untouched(self):
         rel = "scripts/test_cowork_state_m3.py"
-        self.assertEqual(_sha256(_read_local_bytes(rel)),
+        self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
                          _sha256(_git_show_bytes(BASE_SHA, rel)))
         self.assertNotIn(rel, ALLOWED_CHANGED_PATHS)
 
     def test_the_eval_module_stays_out_of_scope(self):
         """G11f / rule E4: the declaration is a CHECKED FACT, not a
-        footnote."""
+        footnote.
+
+        The byte-identity half is a lineage claim and is pinned to P2's own
+        interval; the `drain.__doc__` half below is deliberately LEFT LIVE --
+        it is a statement about the module running right now, not about
+        history."""
         self.assertEqual(
-            _sha256(_read_local_bytes("scripts/cowork_eval.py")),
+            _sha256(_git_show_bytes(CANDIDATE_SHA, "scripts/cowork_eval.py")),
             _sha256(_git_show_bytes(BASE_SHA, "scripts/cowork_eval.py")))
         import cowork_eval
         self.assertIn("never raises", cowork_eval.drain.__doc__)
