@@ -1,6 +1,6 @@
 ---
 name: cowork-orchestrate
-description: Route an engineering request into a bounded work package, choose Cowork or direct Claude from current backend-gate evidence, and supervise the package lifecycle. Use for delegated implementation, planning, review, or recovery that needs explicit authority, candidate-bound gates, and fail-closed backend selection; use cowork-cli for ordinary Cowork command mechanics and cowork-debug for session forensics.
+description: Route an engineering request into a bounded work package, decide from integrity-verified backend-gate evidence whether it runs on Cowork or stops with an explicit blocked outcome, and supervise the package lifecycle. Use for delegated implementation, planning, review, or recovery that needs explicit authority, candidate-bound gates, and fail-closed routing; use cowork-cli for ordinary Cowork command mechanics and cowork-debug for session forensics.
 ---
 
 # Cowork Orchestrate
@@ -13,11 +13,14 @@ do not infer permission to publish, merge, spend, or widen scope.
 ## Select the backend first
 
 Read [references/backend-gate.md](references/backend-gate.md), then evaluate the
-current release-bound receipts with `scripts/select_backend.py`. Accept Cowork
-only when all six criteria are present, PASS, unexpired, and bound to one release
-digest. Missing, malformed, partial, stale, or conflicting evidence selects
-`direct-claude` with an explicit reason. Never silently fall back or treat an M1
-criterion-1 receipt as full eligibility.
+release-bound receipts with `scripts/select_backend.py`. Accept Cowork only when
+all six criteria are present, PASS, integrity-verified, carrying a coherent
+validity window, and bound to one release digest. Missing, malformed, partial,
+incoherent, or conflicting evidence yields `blocked` with an explicit reason.
+The selector has no second backend: never silently re-route, and never treat an
+M1 criterion-1 receipt as full eligibility. A validity window that has merely
+elapsed does not by itself disqualify otherwise verified immutable evidence; it
+is reported as `validity_elapsed`.
 
 Resolve the compact selector manifest from the stable repository pointer
 described in [backend-gate pointer](references/backend-gate-pointer.md), or use
@@ -28,17 +31,31 @@ hashes before accepting Cowork. A plausible JSON object with invented hashes is
 not evidence.
 
 The M4 milestone/global receipt proves criterion 5 only; it does not claim
-criteria 3/4 or the full gate. Treat an M4-only receipt as partial evidence and
-select `direct-claude`. Future releases qualify only through their own complete,
-current release-bound receipt passing this selector.
+criteria 3/4 or the full gate. Treat an M4-only receipt as partial evidence,
+which yields `blocked`. Future releases qualify only through their own complete,
+release-bound receipt passing this selector.
 
-Use the selected backend for this package only. Re-evaluate after a release,
+Use the routing outcome for this package only. Re-evaluate after a release,
 policy, candidate, configuration, or gate-evidence change.
+
+## Authorized exception
+
+Cowork is the default and `blocked` is the routing outcome.
+Only a real Cowork blocker (Cowork itself cannot run the package) may be
+repaired through the `invoke-claude-agent` skill — a Claude session run outside
+Cowork. That exception is supervisor-reviewed, is never chosen by the selector
+or by a worker, is bounded to the repair, and returns to Cowork once the
+blocker is repaired.
+An elapsed window, a failed gate, or a self-hosting shape never qualifies.
 
 ## Run and supervise
 
-- For `direct-claude`, create a fresh, scoped controller session and persist the
-  requested and effective model identity before accepting work.
+- Before dispatch, run the real environmental preflight of the runner
+  (`cowork --check`, per the `cowork-cli` skill). A failed environmental
+  preflight yields `blocked` — never a re-route and never an assumed PASS.
+- On `blocked`, stop the package with the named reason and do not dispatch. A
+  blocked package never degrades into another backend; the only way out is the
+  supervisor-reviewed repair route above, and only for a real Cowork blocker.
 - For `cowork`, read and follow the `cowork-cli` skill for non-interactive launch,
   worktree, session, resume, and report mechanics. Do not duplicate those recipes.
 - Keep deterministic gates supervisor-owned and candidate-bound. Collect once,
@@ -55,5 +72,5 @@ policy, candidate, configuration, or gate-evidence change.
 - Use the `cowork-debug` skill only when artifacts, trace, session identity, or
   status conflict; it owns forensic reconstruction.
 
-Report the selected backend and reason, package state, accepted candidate,
+Report the routing outcome and reason, package state, accepted candidate,
 gate/reviewer outcome, and any remaining authority or eligibility gap.

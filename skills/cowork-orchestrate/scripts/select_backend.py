@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select Cowork only from complete, current backend-gate receipts."""
+"""Select Cowork only from complete, integrity-verified backend-gate receipts."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ def _timestamp(value: Any) -> dt.datetime:
 
 def select(evidence: Any, now: dt.datetime) -> dict[str, Any]:
     reasons: list[str] = []
+    elapsed: bool | None = None
     if not isinstance(evidence, dict):
         reasons.append("evidence_not_object")
     else:
@@ -38,8 +39,11 @@ def select(evidence: Any, now: dt.datetime) -> dict[str, Any]:
             expires = _timestamp(evidence.get("expires_at"))
             if issued > now:
                 reasons.append("evidence_issued_in_future")
-            if expires <= now or expires <= issued:
-                reasons.append("evidence_stale")
+            if expires <= issued:
+                reasons.append("incoherent_validity_window")
+            # An elapsed window is reported, never disqualifying: a verified
+            # immutable release does not stop being verified with the calendar.
+            elapsed = expires <= now
         except (TypeError, ValueError):
             reasons.append("invalid_validity_window")
 
@@ -66,10 +70,11 @@ def select(evidence: Any, now: dt.datetime) -> dict[str, Any]:
 
     eligible = not reasons
     return {
-        "schema_version": 1,
-        "backend": "cowork" if eligible else "direct-claude",
+        "schema_version": 2,
+        "backend": "cowork" if eligible else "blocked",
         "cowork_eligible": eligible,
-        "reason": "all_backend_gate_criteria_current" if eligible else reasons[0],
+        "validity_elapsed": elapsed,
+        "reason": "all_backend_gate_criteria_verified" if eligible else reasons[0],
         "failures": reasons,
     }
 
@@ -83,9 +88,10 @@ def main() -> int:
     path = Path(args.evidence)
     if not path.is_file():
         result = {
-            "schema_version": 1,
-            "backend": "direct-claude",
+            "schema_version": 2,
+            "backend": "blocked",
             "cowork_eligible": False,
+            "validity_elapsed": None,
             "reason": "evidence_absent",
             "failures": ["evidence_absent"],
         }
@@ -94,9 +100,10 @@ def main() -> int:
             result = select(json.loads(path.read_text(encoding="utf-8")), now)
         except (OSError, json.JSONDecodeError) as exc:
             result = {
-                "schema_version": 1,
-                "backend": "direct-claude",
+                "schema_version": 2,
+                "backend": "blocked",
                 "cowork_eligible": False,
+                "validity_elapsed": None,
                 "reason": "evidence_unreadable",
                 "failures": [f"evidence_unreadable:{type(exc).__name__}"],
             }

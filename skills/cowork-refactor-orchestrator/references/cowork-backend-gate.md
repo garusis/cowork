@@ -1,8 +1,8 @@
 # Cowork backend gate
 
 Use `cowork-orchestrate` and its stable backend-gate pointer contract before
-dispatch. Cowork is eligible only after current evidence shows that the relevant
-release satisfies all of these conditions:
+dispatch. Cowork is eligible only after integrity-verified evidence shows that
+the relevant release satisfies all of these conditions:
 
 1. Each paid role dispatch has a capability preflight that binds repository
    constraints, effective controller/model/effort identity, artifacts, allowed
@@ -29,6 +29,18 @@ release satisfies all of these conditions:
 
 Prefer also having candidate-bound verification receipts and phase-blocking
 findings before using Cowork for packages whose acceptance depends on them.
+
+The gate yields exactly one of two outcomes: Cowork, or `blocked`. The gate has
+no alternate backend to degrade to, so a package that does not clear it stops
+with its named reason. A failed environmental preflight of the runner
+(`cowork --check`) yields `blocked` on the same terms. A validity window that is
+coherent but has already elapsed does not by itself fail the gate; it is
+recorded as `validity_elapsed`.
+
+Cowork is the default. Only a real Cowork blocker (Cowork itself cannot run the
+package) may be repaired through the `invoke-claude-agent` skill under
+supervisor review, bounded to the repair and returning to Cowork afterwards.
+An elapsed window, a failed gate, or a self-hosting shape never qualifies.
 
 ## Launch policy after the gate
 

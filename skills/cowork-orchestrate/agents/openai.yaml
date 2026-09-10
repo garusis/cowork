@@ -1,4 +1,4 @@
 interface:
   display_name: "Cowork Orchestrate"
-  short_description: "Route bounded work to Cowork or direct Claude safely"
-  default_prompt: "Turn this request into a bounded work package, select the eligible backend fail-closed, and supervise its lifecycle."
+  short_description: "Route bounded work to Cowork or an explicit blocked outcome"
+  default_prompt: "Use $cowork-orchestrate to turn this request into a bounded work package, decide Cowork or blocked fail-closed from integrity-verified gate evidence, and supervise its lifecycle."

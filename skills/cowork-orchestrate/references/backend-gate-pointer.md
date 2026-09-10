@@ -45,7 +45,8 @@ Before selecting Cowork:
    files admitted by the adjudication/accreditation packet.
 6. Run `scripts/select_backend.py` on that verified selector manifest.
 
-Any mismatch, missing pointer, stale receipt window, changed candidate, or
-unverifiable external file selects `direct-claude`. Do not search arbitrary old
+Any mismatch, missing pointer, incoherent or unparseable receipt window, changed
+candidate, or unverifiable external file yields `blocked`. A window that is
+coherent but has already elapsed is not a mismatch. Do not search arbitrary old
 package directories for a convenient PASS and do not update this pointer from a
 worker assertion.

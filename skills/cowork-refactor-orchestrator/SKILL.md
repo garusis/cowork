@@ -1,6 +1,6 @@
 ---
 name: cowork-refactor-orchestrator
-description: Supervise bounded, agent-first engineering work packages for the Cowork workflow-refactor roadmap. Use when asked to orchestrate, prepare, launch, monitor, adjudicate gates, intervene in, collect, cancel, or dogfood a direct-Claude or Cowork-backed worker run for that refactor. Use for evidence packets, delegated-authority decisions, and recovery; do not use for ordinary Cowork CLI invocation, generic session forensics, routine coding, or a generic plan/build task.
+description: Supervise bounded, agent-first engineering work packages for the Cowork workflow-refactor roadmap. Use when asked to orchestrate, prepare, launch, monitor, adjudicate gates, intervene in, collect, cancel, or dogfood a Cowork-backed worker run for that refactor. Use for evidence packets, delegated-authority decisions, and recovery; do not use for ordinary Cowork CLI invocation, generic session forensics, routine coding, or a generic plan/build task.
 ---
 
 # Cowork Refactor Orchestrator
@@ -85,15 +85,22 @@ combine a roadmap milestone with unrelated cleanup.
    records findings or amendments.
 5. Use `cowork-orchestrate` to validate the current release-bound gate and
    select the backend. A previous milestone number is never eligibility proof.
-   Use the [self-hosting fallback](references/bootstrap-backend.md) when the
-   package changes the gate, dispatch, phase-truth, guard, or recovery mechanism
-   being relied on, or when current gate evidence is absent or invalid. Read
+   Use the [Cowork self-hosting runner](references/bootstrap-backend.md) — the
+   frozen stable runner driving an isolated target worktree — when the package
+   changes the gate, dispatch, phase-truth, guard, or recovery mechanism being
+   relied on. Gate evidence that is absent or invalid blocks the package; it
+   does not select an alternate backend. Read
    [Cowork backend gate](references/cowork-backend-gate.md) for an eligible
    Cowork package.
 
 Use a deterministic controller helper for `prepare` when it exists. Until the
 helper exists, perform its filesystem and process steps explicitly and record
 the same artifacts. Never make a worker responsible for controller state.
+
+`scripts/orchestrate.py` is a historical controller. It is retained for reading,
+validating, and reconciling the completed M5 packages' receipts, and must not be
+used to dispatch new work; new work routes through the Cowork CLI per the
+`cowork-cli` skill.
 
 ### Launch
 
@@ -110,7 +117,8 @@ Reject an out-of-scope expansion; create a new or amended package instead.
 
 Use a deterministic controller helper for `launch` when available. It must
 record process lifecycle and must not silently reuse a different role or
-candidate.
+candidate. That helper is not `scripts/orchestrate.py`, which is historical and
+not for new dispatch.
 
 ### Status and inspect
 
@@ -143,11 +151,11 @@ retry/reset metadata, write `awaiting_capacity` and schedule exactly one
 candidate-bound wake instead of consuming a repair turn. Without trustworthy
 reset metadata, persist a durable manual-resume condition and wait for an
 authenticated capacity-available signal from an external application or
-top-level authority adapter. The fallback CLI must not accept a self-asserted
-human identity, principal, or token, and the worker/orchestrator must never
-fabricate or verify that signal. Until such an adapter journals it, remain
-waiting and block generic launch/resume. The signal controls timing only; it
-never changes credits, spending, or provider entitlement.
+top-level authority adapter. An agent-operated CLI must not accept a
+self-asserted human identity, principal, or token, and the worker/orchestrator
+must never fabricate or verify that signal. Until such an adapter journals it,
+remain waiting and block generic launch/resume. The signal controls timing only;
+it never changes credits, spending, or provider entitlement.
 
 ### Collect
 
@@ -171,13 +179,20 @@ Never erase a worktree or session artifacts automatically.
 
 ## Backend selection
 
-Select the backend from current release-bound evidence through
-`cowork-orchestrate`; do not route by roadmap milestone number. Even after a
-global PASS, use `direct-claude` for a self-hosting package whose changes would
-invalidate or circularly rely on Cowork's own dispatch, phase-truth, backend
-gate, guard, or recovery contract. Use separate fresh worker sessions for
-planning, building, and review, and treat their output as advisory until the
-supervisor validates it.
+Route through `cowork-orchestrate` from current release-bound evidence; do not
+route by roadmap milestone number. The outcome is either Cowork or `blocked`; a
+blocked outcome stops the package and is never a re-route. A self-hosting
+package whose changes would invalidate or circularly rely on Cowork's own
+dispatch, phase-truth, backend gate, guard, or recovery contract still runs on
+Cowork: launch it from the frozen stable runner against an isolated target
+worktree, per the Cowork self-hosting runner reference. Use separate fresh
+worker sessions for planning, building, and review, and treat their output as
+advisory until the supervisor validates it.
+
+Cowork is the default. Only a real Cowork blocker (Cowork itself cannot run the
+package) may be repaired through the `invoke-claude-agent` skill under
+supervisor review, bounded to the repair and returning to Cowork afterwards.
+An elapsed window, a failed gate, or a self-hosting shape never qualifies.
 
 Use Cowork only after its backend gate passes for the task. Launch it through
 the established `cowork-cli` skill with an explicit context file and saved
@@ -185,8 +200,8 @@ session anchor. Begin with one package/worktree and the smallest appropriate
 profile; do not make a static six-role topology the default.
 
 Read [Cowork backend gate](references/cowork-backend-gate.md) before using
-Cowork and [self-hosting fallback](references/bootstrap-backend.md) before a
-direct-Claude self-hosting package.
+Cowork and [Cowork self-hosting runner](references/bootstrap-backend.md) before
+a self-hosting package.
 
 ## Wake and escalation rules
 
@@ -214,7 +229,7 @@ local safety guard must not be relabeled as provider capacity. Guard exhaustion
 is neither a capacity signal nor an authority request: do not resume it, raise
 it, or reinterpret it as permission to spend. It is terminal under every
 authority amendment. Finish through an already-authorized alternate
-evidence/backend route as a new attempt, or fail closed.
+evidence route as a new attempt, or fail closed.
 Do not use `awaiting_approval` or human-shaped normal-path states.
 
 ## Context and output limits
