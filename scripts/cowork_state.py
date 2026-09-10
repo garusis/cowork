@@ -156,7 +156,7 @@ def fallback_label(session_uuid, created_or_mtime=None):
 
 def list_sessions(cwd=None):
     """Return the directory's sessions, newest-first, as a list of dicts
-    `{id, path, summary, phase, created, last_active}`.
+    `{id, path, summary, phase, created, last_active, owner}`.
 
     Each discovered file is loaded (unreadable/incompatible files are skipped,
     never raised). `id` is the persisted `session_uuid`, falling back to the
@@ -164,7 +164,20 @@ def list_sessions(cwd=None):
     neither is skipped. `summary` is `derive_summary` (None when no context).
     `last_active` is the file mtime (every atomic save refreshes it); `created`
     is the persisted mint-time epoch (None for legacy files). Ordered
-    newest-first by `last_active or created`, tie-broken by `created`."""
+    newest-first by `last_active or created`, tie-broken by `created`.
+
+    `owner` (issue #64 P4) is the session's `cowork_owner.owner_status_view`
+    projection, or None. It is ALWAYS PRESENT as a key — never absent — so no
+    consumer has to distinguish "missing" from "unowned". Two properties are
+    contractual:
+
+      - it is read ONLY when a lease record already exists, because the read
+        path creates the session's `owner/` directory and a lock file before it
+        reads, and merely LISTING sessions must not write into any of them;
+      - this enrichment can never make this function raise. The picker is the
+        caller, and a picker that crashes on one bad row is strictly worse than
+        one that shows no suffix for it.
+    """
     out = []
     for path in discover_session_files(cwd):
         state = load(path)
@@ -178,6 +191,22 @@ def list_sessions(cwd=None):
         except OSError:
             last_active = None
         created = state.get("created")
+        owner = None
+        try:
+            if os.path.exists(owner_lease_path_for(sid)):
+                # DEFERRED import, not a module-level one: `cowork_owner`
+                # imports this module at its own top level, so importing it up
+                # there would be a cycle.
+                import cowork_owner
+                owner = cowork_owner.owner_status_view(sid)
+        except Exception:  # noqa: BLE001 - the totality rule in the docstring
+            # Deliberately broad, and the alternatives are all real and
+            # differently typed: ImportError from the deferred import,
+            # ValueError from `_assert_safe_identifier` via `owner_dir_for` for
+            # a filename-derived id that is not a safe identifier, and OSError
+            # from the process probe. None of them is worth failing a listing
+            # over.
+            owner = None
         out.append({
             "id": sid,
             "path": path,
@@ -185,6 +214,7 @@ def list_sessions(cwd=None):
             "phase": get_phase(state),
             "created": created,
             "last_active": last_active,
+            "owner": owner,
         })
     out.sort(
         key=lambda s: (s["last_active"] or s["created"] or 0,

@@ -769,11 +769,27 @@ def build_parser():
                         "session) and exit")
     p.add_argument("--json", dest="report_json", action="store_true",
                    help="with --report: print the authoritative measurement "
-                        "record instead of its rendered text form")
+                        "record instead of its rendered text form; with "
+                        "--session-owner: print the raw owner status view")
     p.add_argument("--rebuild", action="store_true",
                    help="with --report: rebuild the measurement record from "
                         "the raw sources before printing (by default a report "
                         "loads the existing record and never rebuilds it)")
+    # Issue #64 P4 surface 1. NOTE, recorded rather than worked around: adding
+    # this flag makes the abbreviation `--session` ambiguous against
+    # `--session-file` under argparse's allow_abbrev — the same tradeoff
+    # `--eval-session` documents below. The flag name is fixed by the plan, and
+    # every full-form flag (`--session-file`, `--no-session`, `--session-owner`)
+    # is unaffected.
+    p.add_argument("--session-owner", dest="session_owner", nargs="?",
+                   const=True, metavar="SESSION_UUID",
+                   help="print a read-only view of a cowork session's "
+                        "single-writer owner lease: who owns it, from where, "
+                        "how fresh its heartbeat is, and the exact recovery "
+                        "command (defaults to this directory's most recent "
+                        "session). Acquires no lease, constructs no "
+                        "controller, and always exits 0 — it reports, it does "
+                        "not gate")
     p.add_argument("--evaluation-policy", dest="evaluation_policy",
                    choices=list(state_store.EVALUATION_POLICIES),
                    help="how much of the run gets scored: all_rounds "
@@ -902,18 +918,24 @@ def _is_non_interactive(args):
 
 
 def run_report(args, io_out=None):
-    """Handle `cowork --report [<session-uuid>]` — THREE ORDERED STEPS with no
-    coupling between them (P2).
+    """Handle `cowork --report [<session-uuid>]` — FOUR ORDERED STEPS with no
+    coupling between them (P2, extended by issue #64 P4).
 
     (a) LOAD `measurement.json`. It is built only when none exists (and the
         report says so) or when `--rebuild` is passed. NEVER implicitly: a
         report that rebuilt every time could not be distinguished from one that
         recomputed its figures, which is the failure D3 exists to prevent.
-    (b) CHECK PROVENANCE and print its banner. It hashes the raw sources to
+    (b) WRITE THE OWNER BLOCK, above the provenance banner (P4 surface 2). It
+        is LIVE state read at print time, not a measured figure: it is handed
+        to `cowork_report.render_owner_status`, never to `render_report`, and
+        never enters the record. The view is read ONLY when a lease record
+        already exists, so a report run against a git-tracked measurement
+        fixture stays a pure read.
+    (c) CHECK PROVENANCE and print its banner. It hashes the raw sources to
         decide whether to warn, and produces no measurement figure — which is
         what keeps "the report computes nothing" literally true. Its result is
         never passed into the renderer.
-    (c) RENDER the record, with the record as the renderer's only argument.
+    (d) RENDER the record, with the record as the renderer's only argument.
 
     A stale record still renders the RECORD's values under the banner. Reporting
     stale-but-authoritative numbers with a warning is honest; silently
@@ -981,6 +1003,28 @@ def run_report(args, io_out=None):
         io_out.flush()
         return 0
 
+    # Issue #64 P4 surface 2 — the live owner block, ABOVE the provenance
+    # banner. Written unconditionally, because `render_provenance_banner`
+    # returns "" for a fresh record: "above the banner" cannot be expressed as
+    # an insertion relative to something that is usually absent.
+    #
+    # The view is read only when a lease record ALREADY EXISTS. That gate is
+    # not an optimisation: `read_owner_lease` goes through
+    # `_locked_json_transaction`, which creates the session's `owner/`
+    # directory and opens `lease.json.lock` BEFORE it reads, and a report run
+    # against a git-tracked measurement fixture must not write into the very
+    # tree it is reporting on.
+    view = None
+    try:
+        if os.path.exists(state_store.owner_lease_path_for(session_uuid)):
+            view = cowork_owner.owner_status_view(session_uuid)
+    except (ValueError, OSError):
+        # NARROW by design. `owner_status_view` never raises for anything it
+        # finds on disk; `owner_lease_path_for` raises ValueError for an unsafe
+        # session id, and the stat can raise OSError. Nothing else is swallowed.
+        view = None
+    io_out.write(cowork_report.render_owner_status(view))
+
     provenance = measure.check_provenance(session_uuid, record)
     banner = cowork_report.render_provenance_banner(provenance)
     if banner:
@@ -989,6 +1033,114 @@ def run_report(args, io_out=None):
     # not travel with it.
     io_out.write(cowork_report.render_report(record))
 
+    io_out.flush()
+    return 0
+
+
+def run_session_owner(args, io_out=None):
+    """Handle `cowork --session-owner [<session-uuid>]` — the read-only owner
+    status surface (issue #64 P4 surface 1).
+
+    FOUR INERTNESS PROPERTIES, and together they are the whole contract:
+
+      - it ACQUIRES NO LEASE — `cowork_owner.owner_status_view` is a
+        projection: it reports, it never gates;
+      - it CONSTRUCTS NO CONTROLLER and creates no session of any kind;
+      - it MAKES NO PROVIDER CALL and spawns no process of its own;
+      - it EXITS 0 for every lease state, including `corrupt`, an unsafe id
+        and a directory with no sessions at all.
+
+    The exit code is deliberate. `--session-owner` on a contested session is
+    how an operator finds out who holds it and what to do next, so a nonzero
+    exit — or worse, a refusal — would make the diagnostic unusable from the
+    very scripts that need it most. `run_report`'s `return 1` for an
+    unresolvable session is NOT copied here for that reason.
+
+    Unlike `run_report`'s owner block, this path is NOT gated on a lease file
+    already existing: `--json` must print the RAW `owner_status_view` for all
+    five verdicts, `unowned` included, rather than a locally synthesised
+    look-alike. The accepted cost is that a never-leased session may be left
+    with an empty `owner/` directory and a zero-byte `lease.json.lock` under
+    the sessions root — never inside a repository tree.
+    """
+    io_out = io_out or sys.stdout
+    as_json = bool(getattr(args, "report_json", False))
+    session_uuid = (args.session_owner
+                    if isinstance(args.session_owner, str) else None)
+    if not session_uuid:
+        sessions = state_store.list_sessions()
+        if not sessions:
+            io_out.write("null\n" if as_json
+                         else "cowork: no sessions found for this "
+                              "directory.\n")
+            io_out.flush()
+            return 0
+        session_uuid = sessions[0]["id"]
+
+    try:
+        view = cowork_owner.owner_status_view(session_uuid)
+    except ValueError:
+        # The ONE documented caller-error path: an unsafe session id typed on
+        # the command line. Everything the projection finds ON DISK — missing,
+        # damaged, unreadable or foreign — comes back as a `verdict` instead.
+        io_out.write("null\n" if as_json
+                     else "cowork: %r is not a usable session id.\n"
+                          % (session_uuid,))
+        io_out.flush()
+        return 0
+
+    if as_json:
+        # The RAW view, with no wrapper envelope: a caller that has to unwrap
+        # a bespoke shape here would be reading a second projection, and two
+        # projections of one fact are two things to keep in sync.
+        json.dump(view, io_out, indent=2, sort_keys=True, default=str)
+        io_out.write("\n")
+        io_out.flush()
+        return 0
+
+    # The exact recovery command needs the owning session's own anchor path.
+    # The lease RECORDS it (`_build_lease` stores the claimant's realpath'd
+    # `session_file`), so prefer that: it is the path the owner actually holds,
+    # not a reconstruction of it. Fall back to discovering it under the
+    # recorded launch directory, and finally to the conventional per-session
+    # name — and to None, a bare `cowork --take-over`, rather than a guess.
+    session_file = None
+    lease = view.get("lease") if isinstance(view.get("lease"), dict) else {}
+    recorded = lease.get("session_file")
+    try:
+        if isinstance(recorded, str) and recorded and os.path.exists(recorded):
+            session_file = recorded
+    except (OSError, ValueError):
+        session_file = None
+    launch_dir = lease.get("launch_dir")
+    if session_file is None and isinstance(launch_dir, str) and launch_dir:
+        try:
+            candidates = (state_store.discover_session_files(launch_dir)
+                          if os.path.isdir(launch_dir) else [])
+        except (OSError, ValueError):
+            candidates = []
+        wanted = "session.%s.json" % session_uuid
+        for candidate in candidates:
+            if os.path.basename(candidate) == wanted:
+                session_file = candidate
+                break
+            try:
+                state = state_store.load(candidate)
+            except (OSError, ValueError):
+                continue
+            if state is None:
+                continue
+            if state_store.get_session_uuid(state) == session_uuid:
+                session_file = candidate
+                break
+        if session_file is None:
+            try:
+                session_file = state_store.new_session_path(launch_dir,
+                                                            session_uuid)
+            except (OSError, ValueError):
+                session_file = None
+
+    io_out.write(cowork_report.render_owner_status(view, session_file))
     io_out.flush()
     return 0
 
@@ -12212,12 +12364,34 @@ SessionChoice.__new__.__defaults__ = (None, None, False, None, None)
 
 
 def _session_picker_label(row, now):
-    """Compose a picker row: '<relative time> · <phase> — <summary|fallback>'."""
+    """Compose a picker row: '<relative time> · <phase> — <summary|fallback>',
+    plus the issue #64 P4 owner suffix.
+
+    The suffix is ` · owned (pid N)` for a live owner and
+    ` · stale owner (<reason>)` for every non-live lease state, so a contested
+    session is visible BEFORE it is picked. `<reason>` is always a member of
+    the closed `cowork_owner.OWNER_VERDICTS` set, never prose.
+
+    An unowned session, a row with no `owner` key (any pre-P4 caller building
+    rows by hand) and a malformed `owner` value all get no suffix and never
+    raise: `list_sessions` is total by contract, and the picker must be too.
+    """
     when = ui.format_relative_time(row.get("last_active") or row.get("created"),
                                    now)
     summary = row.get("summary") or state_store.fallback_label(
         row.get("id"), row.get("created") or row.get("last_active"))
-    return "%s · %s — %s" % (when, row.get("phase") or "scouting", summary)
+    label = "%s · %s — %s" % (when, row.get("phase") or "scouting", summary)
+    owner_view = row.get("owner")
+    if not isinstance(owner_view, dict):
+        return label
+    verdict = owner_view.get("verdict")
+    if verdict == "live_owner":
+        lease = (owner_view.get("lease")
+                 if isinstance(owner_view.get("lease"), dict) else {})
+        return label + " · owned (pid %s)" % lease.get("pid")
+    if verdict in ("stale_dead_owner", "stale_unproven", "corrupt"):
+        return label + " · stale owner (%s)" % verdict
+    return label
 
 
 def select_session(args, io_in, io_out, select_fn=None, now=None):
@@ -15925,10 +16099,10 @@ def main(argv=None):
         return run_resume_trigger(argv[1:])
     try:
         args = build_parser().parse_args(argv)
-        # --check / --report are read-only and short-circuit BELOW, before
-        # run_flow — which is what keeps them working on a session whose saved
-        # policy is unreadable. They stay mutually exclusive with the two
-        # session-mutating controller flags.
+        # --check / --report / --session-owner are read-only and short-circuit
+        # BELOW, before run_flow — which is what keeps them working on a
+        # session whose saved policy is unreadable. They stay mutually
+        # exclusive with the two session-mutating controller flags.
         for flag, supplied in (("--switch-controller",
                                 bool(args.switch_controller)),
                                ("--allow-controllers",
@@ -15941,10 +16115,20 @@ def main(argv=None):
                 sys.stderr.write(
                     "cowork: %s cannot be combined with --report.\n" % flag)
                 return 2
+            if supplied and args.session_owner:
+                sys.stderr.write(
+                    "cowork: %s cannot be combined with --session-owner.\n"
+                    % flag)
+                return 2
         if args.check:
             return preflight.main()
         if args.report:
             return run_report(args)
+        # Issue #64 P4 surface 1: read-only owner status, dispatched here
+        # beside --check/--report and deliberately ABOVE the nested guard
+        # below — a diagnostic query never governs a broker.
+        if args.session_owner:
+            return run_session_owner(args)
         # Targeted orchestrator-owned evaluation: a read-mostly side channel
         # (it writes only orchestrator-evaluations.json, never session state or
         # a phase gate), dispatched here like --check/--report, before run_flow.
