@@ -1714,6 +1714,22 @@ def worker_main(request_path, liveness_fd=None):
     expected_manifest_digest = snapshot_meta.get("manifest_digest")
     expected_index_digest = snapshot_meta.get("index_digest")
     mutated = False
+    # STICKY PERMIT LOSS (blocker79). This is a FAIL-CLOSED POLICY, not a
+    # proof: once one entry's permit wait has timed out, the worker refuses
+    # every remaining entry rather than re-waiting for each. A later permit
+    # is NOT provably impossible -- the parent normally issues entry N+1's
+    # permit only after entry N terminalized on its side, but a permit that
+    # was merely late, or a parent on an unexpected path, could still write
+    # one. Refusing it is the safe direction: the cost of re-waiting is a
+    # full `DEFAULT_PERMIT_WAIT_S` backstop per remaining entry for
+    # authorization that has already been observed not to arrive in time,
+    # and a permit that arrives after its own wait already expired is by
+    # definition no longer timely. Same `mutated` idiom directly above: the
+    # durable `skipped_no_permit` record for every remaining entry is still
+    # written, one per entry, exactly as before -- only the re-waiting is
+    # dropped. This never runs a command without a timely matching permit;
+    # it can only ever skip more promptly.
+    permit_lost = False
 
     for index, entry in enumerate(inventory):
         if should_stop["stop"]:
@@ -1756,8 +1772,10 @@ def worker_main(request_path, liveness_fd=None):
         # also durably succeeded — so a failure the parent discovers
         # while revising entry N's ledger state genuinely stops entry
         # N+1 from ever launching, closing the run-ahead gap.
-        if not _wait_for_permit(session_uuid, transaction_id, index,
-                                attempt_id, should_stop):
+        if permit_lost or not _wait_for_permit(
+                session_uuid, transaction_id, index, attempt_id,
+                should_stop):
+            permit_lost = True
             state_store.append_jsonl_atomic(events_path, {
                 "event": "skipped_no_permit", "label": entry.get("label"),
                 "attempt_id": attempt_id, "at": _utc_now()})
@@ -2386,6 +2404,25 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
     # to the base, just relocated (see cowork_verification_worker.py's
     # `_classify_worker_startup`).
 
+    def _worker_alive():
+        """Whether the spawned worker process is still running, as the
+        parent can OBSERVE it (blocker79). `proc.poll()` is what the
+        evidence waits below consult before spending a further polling
+        cycle on a label: a worker that has exited can never emit another
+        attempt event, so continuing to poll for one is pure stall -- and
+        the same call REAPS the exited child, which is what left a defunct
+        worker behind for the whole of the parent's remaining wait. A
+        handle that cannot be polled at all is reported ALIVE: not being
+        able to observe an exit is never proof of one, and it leaves the
+        pre-existing bounded wait exactly as it was. This never decides
+        anything about the command's OWN process group -- a dead worker
+        does not prove that group is gone, and `bounded_evidence_wait`
+        still resolves that separately from its own durable evidence."""
+        poll = getattr(proc, "poll", None)
+        if not callable(poll):
+            return True
+        return poll() is None
+
     attempts = []
     mutation = None
     verdict = VERDICT_UNVERIFIED
@@ -2481,7 +2518,8 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
                 attempt, ledger_ok = _wait_for_attempt_and_revise_ledger(
                     session_uuid, transaction_id, entry, request,
                     ledger_path, overall_deadline, timeout_policy,
-                    snapshot["manifest_digest"])
+                    snapshot["manifest_digest"],
+                    is_worker_alive=_worker_alive)
                 attempts.append(attempt)
                 if ledger_ok:
                     terminalized_labels.add(label)

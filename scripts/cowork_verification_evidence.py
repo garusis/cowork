@@ -186,8 +186,9 @@ def _label_possibly_alive_pgid(session_uuid, transaction_id, label):
 def bounded_evidence_wait(session_uuid, transaction_id, expected_labels,
                           poll_attempts=DEFAULT_EVIDENCE_POLL_ATTEMPTS,
                           poll_delay_s=DEFAULT_EVIDENCE_POLL_DELAY_S,
-                          sleep=time.sleep):
-    """Poll the worker's attempt-events stream for terminal events for every
+                          sleep=time.sleep, deadline=None,
+                          is_worker_alive=None, now=time.time):
+    """Poll the worker's attempt-events stream for terminal evidence for every
     label in `expected_labels`, for a BOUNDED number of attempts -- the SAME
     command-budget window every caller already sizes (the primary wait, or
     the short `evidence_retry_policy` second pass). Past the bound, this
@@ -201,51 +202,147 @@ def bounded_evidence_wait(session_uuid, transaction_id, expected_labels,
     (reusing the existing constant, never inventing a fourth evidence
     state).
 
+    SKIP EVENTS ARE TERMINAL, NOT SOMETHING TO WAIT FOR (blocker79). The
+    worker already publishes a durable `skipped_no_permit` /
+    `skipped_liveness_lost` / `skipped_mutation_detected` record for an
+    entry it deliberately did NOT execute, and then moves on. Before this,
+    only `event == "terminal"` was matched here, so that record was
+    discarded and the parent kept polling its entire budget for evidence
+    that provably could never arrive. Such a label now resolves AT ONCE as
+    `EVIDENCE_ABSENT` with `exit_code=None`, `skipped=True` and
+    `skip_reason` naming the event -- an UNEXECUTED gate, distinguishable
+    from ran-but-evidence-lost, and unreachable from `pass` (which requires
+    `EVIDENCE_PRESENT`). A genuine `terminal` event for the same label
+    always takes precedence over a skip record: really observed evidence is
+    never overridden by the recorded absence of it.
+
+    `deadline` and `is_worker_alive` are OPTIONAL and default to `None`,
+    which reproduces the previous behavior exactly:
+
+      * `deadline` -- an absolute, `now()`-comparable wall-clock instant
+        (the spine's own `overall_deadline` already is one). Re-checked on
+        every iteration, so a poll whose nominal attempt-count budget was
+        sized against a clock that later JUMPED (a host suspension is the
+        motivating case) still stops at the deadline instead of spending
+        every remaining attempt past it. `now` is injectable purely so a
+        test can drive that clock deterministically.
+      * `is_worker_alive` -- a zero-argument predicate (the spine passes
+        one backed by `proc.poll()`, which also reaps the exited child). An
+        exited worker can emit no further evidence, so there is nothing
+        left to wait for. Liveness is sampled BEFORE the event stream is
+        read and acted on only AFTER it, so everything the worker managed
+        to write before exiting is still read and honored first.
+
+    Neither can turn a missing label into a false PASS, and neither
+    bypasses the liveness-informed fallback below: a dead WORKER does not
+    prove the child command's own process group is gone, so a label whose
+    published command group is still alive stays `EVIDENCE_UNRESOLVED`
+    exactly as before.
+
     Returns `{label: terminal_event_or_synthetic_unresolved_or_absent}`.
     """
+    # The worker's own deliberate-skip events: `worker_main` writes these
+    # three event names, and only these, for an inventory entry it refuses
+    # to execute (no permit, parent liveness lost, candidate mutated). Kept
+    # here as function-local literals, not a module constant: they are
+    # recognition internal to THIS wait, and `cowork_verification` imports
+    # this module at its own top level, so reading them back off the spine
+    # would be a genuine circular import.
+    # `scripts/test_verification_permit_exit.py` reads this tuple out of
+    # this function's own source and asserts it still matches every skip
+    # event the worker actually emits, so drift is caught immediately
+    # rather than silently re-introducing the unbounded wait this
+    # recognition exists to end.
+    skip_events = ("skipped_no_permit", "skipped_liveness_lost",
+                   "skipped_mutation_detected")
     events_path = state_store.verification_attempt_events_path_for(
         session_uuid, transaction_id)
+    expected = list(expected_labels or ())
+    expected_set = set(expected)
+    needed = len(expected)
     terminal_by_label = {}
+    skipped_by_label = {}
+    resolved = set()
+    stopped_by = None
     attempt = 0
-    while attempt < poll_attempts and len(terminal_by_label) < len(
-            expected_labels):
+    while attempt < poll_attempts and len(resolved) < needed:
+        # Sampled BEFORE the read below and acted on only after it: a
+        # worker that exits between these two points still has everything
+        # it wrote observed on this very iteration.
+        worker_gone = (is_worker_alive is not None
+                       and not is_worker_alive())
         events = state_store.read_jsonl_tolerant(events_path)
         for ev in events:
-            if ev.get("event") == "terminal" and ev.get("label") in (
-                    expected_labels or ()):
-                terminal_by_label[ev["label"]] = ev
-        if len(terminal_by_label) >= len(expected_labels):
+            label = ev.get("label")
+            if label not in expected_set:
+                continue
+            if ev.get("event") == "terminal":
+                terminal_by_label[label] = ev
+                resolved.add(label)
+            elif (ev.get("event") in skip_events
+                    and label not in skipped_by_label):
+                skipped_by_label[label] = ev
+                resolved.add(label)
+        if len(resolved) >= needed:
+            break
+        if worker_gone:
+            stopped_by = "worker_exited"
+            break
+        if deadline is not None and now() >= deadline:
+            stopped_by = "deadline_reached"
             break
         attempt += 1
         if attempt < poll_attempts:
             sleep(poll_delay_s)
-    for label in expected_labels or ():
-        if label not in terminal_by_label:
-            pgid = _label_possibly_alive_pgid(
-                session_uuid, transaction_id, label)
-            if pgid is not None:
-                terminal_by_label[label] = {
-                    "event": "terminal", "label": label,
-                    "evidence_state": EVIDENCE_UNRESOLVED,
-                    "exit_code": None,
-                    "note": "evidence not observed within the bounded "
-                    "poll; process group %s is still alive -- the "
-                    "underlying command was never re-launched" % pgid,
-                }
-            else:
-                terminal_by_label[label] = {
-                    "event": "terminal", "label": label,
-                    "evidence_state": EVIDENCE_ABSENT,
-                    "exit_code": None,
-                    "note": "evidence not observed within the bounded "
-                    "poll and no live process/process-group evidence "
-                    "remains for it -- the underlying command was never "
-                    "re-launched",
-                }
+    terminal_by_expected_label = {}
+    for label in expected:
+        observed = terminal_by_label.get(label)
+        if observed is not None:
+            observed.setdefault("evidence_state", EVIDENCE_PRESENT)
+            terminal_by_expected_label[label] = observed
+            continue
+        skip = skipped_by_label.get(label)
+        if skip is not None:
+            terminal_by_expected_label[label] = {
+                "event": "terminal", "label": label,
+                "evidence_state": EVIDENCE_ABSENT,
+                "exit_code": None,
+                "skipped": True,
+                "skip_reason": skip.get("event"),
+                "skipped_at": skip.get("at"),
+                "note": "the worker recorded %r for this label: the "
+                "command was never executed, so no evidence for it can "
+                "ever arrive -- it was never re-launched and is never "
+                "adjudicated pass" % (skip.get("event"),),
+            }
+            continue
+        pgid = _label_possibly_alive_pgid(
+            session_uuid, transaction_id, label)
+        if pgid is not None:
+            terminal_by_expected_label[label] = {
+                "event": "terminal", "label": label,
+                "evidence_state": EVIDENCE_UNRESOLVED,
+                "exit_code": None,
+                "note": "evidence not observed within the bounded "
+                "poll; process group %s is still alive -- the "
+                "underlying command was never re-launched" % pgid,
+            }
         else:
-            terminal_by_label[label].setdefault(
-                "evidence_state", EVIDENCE_PRESENT)
-    return terminal_by_label
+            terminal_by_expected_label[label] = {
+                "event": "terminal", "label": label,
+                "evidence_state": EVIDENCE_ABSENT,
+                "exit_code": None,
+                "note": "evidence not observed within the bounded "
+                "poll and no live process/process-group evidence "
+                "remains for it -- the underlying command was never "
+                "re-launched",
+            }
+        if stopped_by is not None:
+            # Why the poll ended before its attempt budget was spent --
+            # diagnostics only; it never changes WHICH evidence state was
+            # concluded just above.
+            terminal_by_expected_label[label]["wait_stopped_by"] = stopped_by
+    return terminal_by_expected_label
 
 
 def _revise_attempt_ledger(ledger_path, transaction_id, label, fields,
@@ -279,7 +376,7 @@ def _revise_attempt_ledger_with_retry(ledger_path, transaction_id, label,
 def _wait_for_attempt_and_revise_ledger(
         session_uuid, transaction_id, entry, request, ledger_path,
         overall_deadline, timeout_policy, snapshot_manifest_digest,
-        bounded_evidence_wait_fn=None):
+        bounded_evidence_wait_fn=None, is_worker_alive=None):
     """Wait for one entry's terminal evidence, then revise the SAME
     pre-minted ledger id with whatever was observed. Relocated verbatim from
     the base commit -- including its call into `_execution_wait_budget_s`,
@@ -290,9 +387,53 @@ def _wait_for_attempt_and_revise_ledger(
     `bounded_evidence_wait`) so tests can control exactly what each wait
     phase observes without racing a real subprocess's timing.
 
+    The `overall_deadline` this function ALREADY receives (and, when the
+    caller supplies one, the optional `is_worker_alive` predicate) is now
+    forwarded into BOTH wait phases -- the primary wait and the short
+    `evidence_retry_policy` retry -- so neither can outlive the deadline
+    the caller already bounded this transaction by (blocker79: the primary
+    wait's attempt COUNT was sized from the remaining deadline exactly
+    once, up front, and then never re-checked, so a clock that jumped
+    mid-wait spent every remaining attempt past it). Forwarded only to a
+    wait callable that can actually accept them -- decided just below by
+    INSPECTING the resolved callable, never by calling it and catching the
+    failure, which would also swallow a genuine `TypeError` raised from
+    inside a wait that really did run. So a narrower injected double is
+    called with the exact pre-existing argument shape and behaves exactly
+    as it did before.
+
     Returns `(attempt_dict, ledger_ok)`.
     """
+    # Function-local, like `_spine()` above: needed only for the one
+    # signature probe below, and never as a module-level dependency of the
+    # frozen evidence seam.
+    import inspect
+
     wait_fn = bounded_evidence_wait_fn or bounded_evidence_wait
+    bound_kwargs = {"deadline": overall_deadline}
+    if is_worker_alive is not None:
+        bound_kwargs["is_worker_alive"] = is_worker_alive
+    # A `unittest.mock` replacement accepts anything at its own boundary
+    # while forwarding to a target that may not, so the delegate
+    # (`side_effect`, else `_mock_wraps`) is what gets inspected in that
+    # case. A callable that cannot be introspected at all is offered
+    # nothing -- the conservative choice, since it reproduces the exact
+    # pre-existing call shape.
+    probe_target = wait_fn
+    for probe_attr in ("side_effect", "_mock_wraps"):
+        delegate = getattr(probe_target, probe_attr, None)
+        if callable(delegate):
+            probe_target = delegate
+            break
+    try:
+        accepted = inspect.signature(probe_target).parameters
+    except (TypeError, ValueError):
+        bound_kwargs = {}
+    else:
+        if not any(p.kind is p.VAR_KEYWORD for p in accepted.values()):
+            bound_kwargs = {name: value
+                            for name, value in bound_kwargs.items()
+                            if name in accepted}
     label = entry["label"]
     execution_budget_s = _spine()._execution_wait_budget_s(timeout_policy)
     remaining_overall = max(0.0, overall_deadline - time.time())
@@ -304,7 +445,7 @@ def _wait_for_attempt_and_revise_ledger(
     terminal = wait_fn(
         session_uuid, transaction_id, [label],
         poll_attempts=primary_poll_attempts,
-        poll_delay_s=primary_poll_delay_s)
+        poll_delay_s=primary_poll_delay_s, **bound_kwargs)
     attempt = terminal.get(label, {})
     if attempt.get("evidence_state") != EVIDENCE_PRESENT:
         # Execution should have ended by now -- evidence is still missing.
@@ -317,7 +458,8 @@ def _wait_for_attempt_and_revise_ledger(
             poll_attempts=retry_policy.get(
                 "poll_attempts", DEFAULT_EVIDENCE_POLL_ATTEMPTS),
             poll_delay_s=retry_policy.get(
-                "poll_delay_s", DEFAULT_EVIDENCE_POLL_DELAY_S))
+                "poll_delay_s", DEFAULT_EVIDENCE_POLL_DELAY_S),
+            **bound_kwargs)
         attempt = terminal.get(label, {})
     attempt["kind"] = entry.get("kind")
     attempt["ledger_attempt_id"] = entry.get("ledger_attempt_id")
