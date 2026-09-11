@@ -10033,6 +10033,7 @@ _OWNER_CONTEXT = {
     "enforced": False,
     "matched": True,
     "provider_conflict": None,
+    "pending_dispatch_conflict": None,
 }
 
 
@@ -10052,6 +10053,7 @@ def _set_owner_context(session_uuid, owner_id, epoch):
         "enforced": True,
         "matched": True,
         "provider_conflict": None,
+        "pending_dispatch_conflict": None,
     })
     return prior
 
@@ -10075,7 +10077,8 @@ def _current_owner_context():
     return dict(_OWNER_CONTEXT)
 
 
-def _owner_gate_fact(controller=None, resume_session_id=None, purpose=None):
+def _owner_gate_fact(controller=None, resume_session_id=None, purpose=None,
+                     role=None):
     """The `owner_result` reducer fact for `dispatch.decide()`, or None.
 
     None means "no fact": `decide()` then behaves exactly as it did at the
@@ -10126,7 +10129,20 @@ def _owner_gate_fact(controller=None, resume_session_id=None, purpose=None):
     Propagating it is fail-closed AND typed: `run_flow`'s catch point 1 maps
     it to rc 3 with reason `provider_binding_unavailable`. The declared cost
     is that `dispatch.contract` / `dispatch.decision` are not emitted on that
-    one path, because the raise precedes `decide()`."""
+    one path, because the raise precedes `decide()`.
+
+    A proven binding refusal also STASHES the typed `ProviderSessionConflict`
+    it just built on `_OWNER_CONTEXT["pending_dispatch_conflict"]`, so
+    `_decide_and_trace` can raise that exact object instead of a generic lease
+    error -- which is the only thing that decides whether the operator's
+    recovery advice names the OTHER session or their own. `role` is threaded
+    through as a TRAILING keyword purely so the stashed conflict carries the
+    role the refusal message prints; no existing call site changes. The stash
+    is OVERWRITE-on-each-evaluation and is cleared on every non-refusing exit
+    of this limb, so a stale conflict can never be reported for a later
+    refusal -- deliberately the opposite of the `provider_conflict` slot's
+    first-refusal-wins deferral, which holds proof of a refusal that has
+    already happened."""
     if purpose == "evaluator":
         return None
     if not _OWNER_CONTEXT["enforced"]:
@@ -10137,9 +10153,15 @@ def _owner_gate_fact(controller=None, resume_session_id=None, purpose=None):
                                   _OWNER_CONTEXT["epoch"])
     except cowork_owner.OwnerLeaseError as exc:
         _OWNER_CONTEXT["matched"] = False
+        _OWNER_CONTEXT["pending_dispatch_conflict"] = None
         return {"allowed": False, "refusal_code": "session_not_owned",
                 "refusal_message": str(exc), "source": "owner_lease"}
     _OWNER_CONTEXT["matched"] = True
+    # Covers EVERY non-refusing exit below in one place: the allow return, the
+    # `not (controller and resume_session_id)` fall-through, and the inner
+    # non-matching branch. A clear that dominates them all cannot be forgotten
+    # when this branch structure is read again later.
+    _OWNER_CONTEXT["pending_dispatch_conflict"] = None
     if controller and resume_session_id:
         record = cowork_owner.read_provider_binding(
             controller, resume_session_id)
@@ -10147,13 +10169,18 @@ def _owner_gate_fact(controller=None, resume_session_id=None, purpose=None):
         if (bound_to and bound_to != _OWNER_CONTEXT["session_uuid"]
                 and cowork_owner.classify_owner_lease(bound_to)
                 == "live_owner"):
-            # The operator wording comes from the declared exception itself,
-            # so there is exactly one phrasing of this refusal in the tree.
+            # `cowork_owner.refusal_message` is the single renderer for this
+            # refusal, and the conflict stashed here is the SAME object
+            # `_decide_and_trace` raises -- so the trace field and the
+            # operator's screen are two renderings of one fact, not two
+            # independent phrasings that can drift apart.
+            conflict = cowork_owner.ProviderSessionConflict(
+                controller, resume_session_id, bound_to, role)
+            _OWNER_CONTEXT["pending_dispatch_conflict"] = conflict
             return {
                 "allowed": False,
                 "refusal_code": "provider_session_bound",
-                "refusal_message": str(cowork_owner.ProviderSessionConflict(
-                    controller, resume_session_id, bound_to)),
+                "refusal_message": cowork_owner.refusal_message(conflict),
                 "source": "owner_lease"}
     return dict(_ALLOW_FACT)
 
@@ -11152,7 +11179,8 @@ def _decide_and_trace(trace, role, controller, purpose, site, manifest=None,
                                        resume_session_id=resume_session_id,
                                        phase=phase)
     if owner_result is None:
-        owner_result = _owner_gate_fact(controller, resume_session_id, purpose)
+        owner_result = _owner_gate_fact(controller, resume_session_id, purpose,
+                                        role)
     decision = dispatch.decide(
         contract, owner_result=owner_result, policy_result=policy_result,
         preflight_result=preflight_result, probe_result=probe_result,
@@ -11169,6 +11197,20 @@ def _decide_and_trace(trace, role, controller, purpose, site, manifest=None,
                     source=decision["source"])
     if (decision["outcome"] == "refuse"
             and decision["source"] == "owner_lease"):
+        # A PROVEN provider-binding refusal raises the conflict the gate
+        # already built, so catch point 1 renders the block naming the OTHER
+        # session and reports the same typed reason the decision above just
+        # recorded. The drain is unconditional (read-then-None, never `pop`:
+        # the box's declared key set must not change, because
+        # `_current_owner_context` and `_restore_owner_context` copy the whole
+        # dict), and the raise is additionally guarded on the refusal code --
+        # both halves are needed, or a stale conflict could be reported for a
+        # `session_not_owned` refusal or for a later evaluation.
+        pending = _OWNER_CONTEXT["pending_dispatch_conflict"]
+        _OWNER_CONTEXT["pending_dispatch_conflict"] = None
+        if (pending is not None
+                and decision["refusal_code"] == "provider_session_bound"):
+            raise pending
         raise cowork_owner.OwnerLeaseLost(
             _OWNER_CONTEXT["session_uuid"], _OWNER_CONTEXT["owner_id"],
             _OWNER_CONTEXT["epoch"], decision["refusal_code"])

@@ -42,15 +42,16 @@ here is REACHABILITY, ORDERING and COST:
     resolvable HEAD whose base commit is missing is a genuinely broken gate and
     FAILS, so a real failure can never masquerade as a skip.
 
-TWO DECLARED ASYMMETRIES are asserted here as declared behaviour rather than
-treated as defects, because both follow from symbols this package is not
+ONE DECLARED ASYMMETRY remains, asserted here as declared behaviour rather
+than treated as a defect, because it follows from symbols this package is not
 authorized to touch:
 
-  1. A pre-dispatch exclusivity refusal carries `refusal_code
-     "provider_session_bound"` in `dispatch.decision`, but the run ends under
-     `run.end` reason `session_owner_lost` -- `_decide_and_trace` raises
-     `OwnerLeaseLost` for ANY `owner_lease`-sourced refusal and is outside P3's
-     authority.
+  1. RESOLVED by R3, and asserted here in its corrected form. A pre-dispatch
+     exclusivity refusal now raises the `ProviderSessionConflict` the gate
+     already built, so the run ends under `run.end` reason
+     `provider_session_bound` -- the SAME code `dispatch.decision` records --
+     and the operator is shown the block naming the session that actually
+     holds the provider conversation rather than the one they are sitting in.
 
   2. `ProviderBindingUnavailable` raised inside `_owner_gate_fact` PROPAGATES
      rather than becoming a refusing fact (no such code exists in the frozen
@@ -686,6 +687,32 @@ class PreDispatchSeamTests(ExclusivityTestCase):
         self.assertIs(fact["allowed"], False)
         self.assertIs(cowork._OWNER_CONTEXT["matched"], True)
 
+    def test_a_later_allow_drains_the_pending_conflict(self):
+        """The carrier the raise site reads: it must hold the conflict for the
+        refusal being decided RIGHT NOW and nothing else.
+
+        Three properties nothing else in the tree measures. The role reaches
+        the conflict through the new trailing keyword (or the operator block
+        would say "for role None"); the slot is OVERWRITE-on-each-evaluation
+        rather than first-refusal-wins; and a later allow CLEARS it, so a
+        stale conflict can never be reported for a refusal it did not prove.
+        The slot is read by key and never popped, which also pins the box's
+        declared key set that `_restore_owner_context` copies wholesale."""
+        self.own_context()
+        foreign = self.seed_foreign_live_binding("claude", "prov-sid-11")
+        fact = cowork._owner_gate_fact("claude", "prov-sid-11", "launch",
+                                       "scout")
+        self.assertIs(fact["allowed"], False)
+        self.assertEqual(fact["refusal_code"], "provider_session_bound")
+        pending = cowork._OWNER_CONTEXT["pending_dispatch_conflict"]
+        self.assertIsInstance(pending, owner.ProviderSessionConflict)
+        self.assertEqual(pending.owner_session_uuid, foreign)
+        self.assertEqual(pending.role, "scout")
+        self.assertEqual(cowork._owner_gate_fact("claude", "never-bound-11",
+                                                 "launch", "scout"),
+                         dict(_ALLOW))
+        self.assertIsNone(cowork._OWNER_CONTEXT["pending_dispatch_conflict"])
+
     def test_a_same_session_binding_allows(self):
         session_uuid, record = self.own_context()
         owner.bind_provider_session(
@@ -747,15 +774,15 @@ class PreDispatchSeamTests(ExclusivityTestCase):
         not a returned decision -- is what stops each call site from falling
         through to its own `preflight_rejected` branch.
 
-        DECLARED ASYMMETRY 1, asserted here rather than treated as a defect:
-        the decision carries `provider_session_bound`, but the exception is
-        `OwnerLeaseLost` (whose typed reason is `session_owner_lost`), because
-        `_decide_and_trace` raises that class for ANY `owner_lease`-sourced
-        refusal and is outside P3's authority."""
+        Declared asymmetry 1, RESOLVED: the class raised is the
+        `ProviderSessionConflict` the gate already built, so the exception's
+        typed reason is `provider_session_bound` -- the same code the decision
+        carries -- and the object naming the FOREIGN session, carrying the real
+        role, is what reaches catch point 1's renderer."""
         self.own_context()
-        self.seed_foreign_live_binding("claude", "prov-sid-8")
+        foreign = self.seed_foreign_live_binding("claude", "prov-sid-8")
         trace = _Trace()
-        with self.assertRaises(owner.OwnerLeaseLost) as caught:
+        with self.assertRaises(owner.ProviderSessionConflict) as caught:
             cowork._decide_and_trace(trace, "scout", "claude", "launch",
                                      "cowork.py:test",
                                      resume_session_id="prov-sid-8")
@@ -765,10 +792,15 @@ class PreDispatchSeamTests(ExclusivityTestCase):
         self.assertEqual(decision["outcome"], "refuse")
         self.assertEqual(decision["refusal_code"], "provider_session_bound")
         self.assertEqual(decision["source"], "owner_lease")
-        # The asymmetry itself, both halves named.
-        self.assertEqual(caught.exception.reason, "provider_session_bound")
+        # The run-ending reason now matches the decision's own refusal code.
+        # `owner_refusal_reason`, never `exception.reason`: `reason` is a
+        # property of `OwnerLeaseLost` alone.
         self.assertEqual(owner.owner_refusal_reason(caught.exception),
-                         "session_owner_lost")
+                         "provider_session_bound")
+        # And the raised object is the FOREIGN-naming conflict carrying the
+        # real role -- which is what makes the operator's block correct.
+        self.assertEqual(caught.exception.owner_session_uuid, foreign)
+        self.assertEqual(caught.exception.role, "scout")
 
     def test_an_unreadable_index_propagates_without_a_dispatch_decision(self):
         """DECLARED ASYMMETRY 2. `provider_binding_unavailable` is absent from
@@ -805,7 +837,7 @@ class PreDispatchSeamTests(ExclusivityTestCase):
         assertion is kept where it is unambiguous -- no controller process is
         created at any point, and every controller-construction seam is a
         double that raises on call."""
-        self.seed_foreign_live_binding("claude", "prov-sid-10")
+        foreign = self.seed_foreign_live_binding("claude", "prov-sid-10")
         advance = _Counter(cowork._advance_phase)
         spawns = _PopenLog()
         seen = {}
@@ -836,7 +868,13 @@ class PreDispatchSeamTests(ExclusivityTestCase):
                 mock.patch.object(cowork, "_construct_resume_session",
                                   _Raises("_construct_resume_session")), \
                 mock.patch.object(subprocess, "Popen", spawns):
-            rc, session_uuid = self.run_fresh(scout)
+            # `run_flow` rather than `run_fresh`: the operator's refusal text
+            # is what this fixture has to read, and `run_fresh` discards
+            # stdout. Its return contract stays untouched -- three other
+            # fixtures outside this package's authority depend on it -- so the
+            # uuid is taken separately, exactly as `run_fresh` itself takes it.
+            rc, out = self.run_flow(["--new"], scout=scout)
+            session_uuid = self.saved_session_uuid()
 
         self.assertEqual(rc, 3)
         self.assertEqual(seen["fact"]["refusal_code"],
@@ -851,10 +889,28 @@ class PreDispatchSeamTests(ExclusivityTestCase):
         # And no controller process was created anywhere in the run.
         self.assertEqual(
             {"claude", "codex", "opencode"} & set(spawns.calls), set())
-        # Declared asymmetry 1, end to end through a real run.
+        # Declared asymmetry 1 RESOLVED, end to end through a real run: the
+        # run ends under the same code its own dispatch decision recorded.
         end = self.run_end(session_uuid)
         self.assertEqual(end.get("rc"), 3)
-        self.assertEqual(end.get("reason"), "session_owner_lost")
+        self.assertEqual(end.get("reason"), "provider_session_bound")
+        # The operator surface itself. Assertions are scoped to the refusal
+        # BLOCK rather than to raw stdout: `run_flow` returns the WHOLE run's
+        # output, so "this run's own uuid appears nowhere" specified over
+        # stdout would fail for reasons having nothing to do with the refusal.
+        # The ANCHOR is what makes the narrower scope sound -- the text catch
+        # point 1 actually wrote is byte-identical to the renderer's output for
+        # this same conflict.
+        conflict = owner.ProviderSessionConflict("claude", "prov-sid-10",
+                                                 foreign, "scout")
+        block = owner.refusal_message(conflict)
+        self.assertIn(block, out)
+        self.assertNotEqual(foreign, session_uuid)
+        self.assertIn(foreign, block)
+        self.assertNotIn(session_uuid, block)
+        self.assertIn("reason    provider_session_bound", block)
+        self.assertIn("for role scout", block)
+        self.assertNotIn("role None", block)
 
 
 # --------------------------------------------------------------------------- #
