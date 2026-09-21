@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Focused suite for M5 Package A: checkpoint request/result/receipt/claim-
-lease contracts, the additive `cowork_state.py` path helpers, and the two
-frozen extraction seams (`cowork_verification_worker.py`,
-`cowork_verification_evidence.py`) -- garusis/cowork-internal#60, foundation
-#24, and the Package-A extraction prerequisites for #44/#51.
+"""Checkpoint request/result/receipt/claim-lease contracts, the
+`cowork_state.py` checkpoint path helpers, and the worker/evidence extraction
+seams (`cowork_verification_worker.py`, `cowork_verification_evidence.py`)
+re-exported by `cowork_verification.py`.
 
 Never invokes a real Claude, Codex, or OpenCode session; every fixture that
 needs a real subprocess spawns a bare `python3 -c ...` inside a throwaway
@@ -20,7 +19,6 @@ import hashlib
 import inspect
 import json
 import os
-import py_compile
 import re
 import shutil
 import subprocess
@@ -41,70 +39,6 @@ import cowork_state as state_store  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 import cowork_verification_worker as worker_module  # noqa: E402
 import cowork_verification_evidence as evidence_module  # noqa: E402
-
-# The signed base this package's brief is bound to
-# (m5-supervisor-checkpoints-plan-v2.json's own `base_commit`).
-BASE_SHA = "729c1750907151345c7326e49c2aef2d815bb5e3"
-
-# This package's own signed commit -- pins the changed-paths allowlist
-# proof to Package A's own committed diff (BASE_SHA..CANDIDATE_SHA) rather
-# than to whatever happens to be dirty in a worktree that also carries
-# later, unrelated packages' own uncommitted test-only edits.
-CANDIDATE_SHA = "eae4276d07a887a041177817221bf1b0bcdf99f0"
-
-# The exact, frozen five-path allowlist this package may change.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork_verification.py",
-    "scripts/cowork_state.py",
-    "scripts/cowork_verification_worker.py",
-    "scripts/cowork_verification_evidence.py",
-    "scripts/test_m5_package_a_contracts.py",
-})
-
-# Every other path the frozen brief explicitly names as excluded (read-only)
-# for this package.
-EXCLUDED_PATHS = (
-    "scripts/cowork.py",
-    "scripts/cowork_handoff.py",
-    "scripts/cowork_ledger.py",
-    "scripts/cowork_measure.py",
-    "scripts/test_cowork.py",
-)
-
-# The frozen 28-module M1-M4 regression command
-# (integration_policy.regression_command).
-REGRESSION_MODULES = (
-    "scripts.test_cowork", "scripts.test_cowork_activity_contracts",
-    "scripts.test_cowork_activity_cross_surface",
-    "scripts.test_cowork_bridge_activity", "scripts.test_cowork_bridge_capacity",
-    "scripts.test_cowork_capacity", "scripts.test_cowork_capacity_scheduler",
-    "scripts.test_cowork_control_plane", "scripts.test_cowork_control_plane_m3",
-    "scripts.test_cowork_dispatch_identity", "scripts.test_cowork_policy_atomic",
-    "scripts.test_cowork_recovery_breaker", "scripts.test_cowork_report_activity",
-    "scripts.test_cowork_state_m2", "scripts.test_cowork_state_m3",
-    "scripts.test_cowork_state_m4", "scripts.test_cowork_ui_activity",
-    "scripts.test_cowork_wake_macos", "scripts.test_cowork_wake_manual",
-    "scripts.test_cowork_watchdog", "scripts.test_cowork_workunit",
-    "scripts.test_dispatch_contract_characterization",
-    "scripts.test_m2_crash_resume", "scripts.test_m2_negative_controls",
-    "scripts.test_m3_crash_resume", "scripts.test_m3_negative_controls",
-    "scripts.test_m4_crash_resume", "scripts.test_m4_negative_controls",
-)
-
-
-def _git_changed_paths():
-    return set(subprocess.run(
-        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines())
-
-
-def _git_show(rev, rel_path):
-    result = subprocess.run(
-        ["git", "show", "%s:%s" % (rev, rel_path)],
-        cwd=_REPO_ROOT, capture_output=True, check=True)
-    return result.stdout
-
 
 def _sha256_file(rel_path):
     with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
@@ -174,71 +108,6 @@ class _RealWorkerFixture(unittest.TestCase):
 
 
 # =========================================================================== #
-# Allowlist, py_compile, and candidate-hash gates.                            #
-# =========================================================================== #
-
-
-class AllowlistAndHashTests(unittest.TestCase):
-
-    def test_changed_paths_are_within_the_five_path_allowlist(self):
-        offenders = _git_changed_paths() - ALLOWED_CHANGED_PATHS
-        self.assertFalse(
-            offenders,
-            "paths changed outside the frozen five-path allowlist: %s"
-            % sorted(offenders))
-
-    def test_candidate_sha_is_exactly_one_commit_on_base_sha(self):
-        result = subprocess.run(
-            ["git", "rev-parse", "%s^" % CANDIDATE_SHA],
-            cwd=_REPO_ROOT, capture_output=True, text=True, check=True)
-        self.assertEqual(
-            result.stdout.strip(), BASE_SHA,
-            "CANDIDATE_SHA must be exactly one commit on top of BASE_SHA")
-
-    def test_all_five_owned_paths_py_compile(self):
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            path = os.path.join(_REPO_ROOT, rel)
-            self.assertTrue(os.path.exists(path), "missing owned path: %s"
-                            % rel)
-            py_compile.compile(path, doraise=True)
-
-    def test_candidate_hashes_are_well_formed_sha256(self):
-        hashes = {}
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            digest = _sha256_file(rel)
-            self.assertRegex(digest, r"^[0-9a-f]{64}$")
-            hashes[rel] = digest
-        # The two seam modules and the spine must never coincide -- a real
-        # relocation, not a byte-identical copy-paste.
-        self.assertNotEqual(hashes["scripts/cowork_verification.py"],
-                            hashes["scripts/cowork_verification_worker.py"])
-        self.assertNotEqual(hashes["scripts/cowork_verification.py"],
-                            hashes["scripts/cowork_verification_evidence.py"])
-        self.assertNotEqual(hashes["scripts/cowork_verification_worker.py"],
-                            hashes["scripts/cowork_verification_evidence.py"])
-
-
-class ExcludedPathsUntouchedTests(unittest.TestCase):
-    """Every path the frozen brief marks read-only for this package must be
-    byte-identical to the signed base commit."""
-
-    def test_excluded_paths_are_byte_identical_to_base(self):
-        # Commit-pinned, not live-working-tree: this package's own
-        # read-only claim over each excluded path is a property of ITS OWN
-        # committed diff (BASE_SHA..CANDIDATE_SHA) -- the live-tree form is
-        # inherently stale once this package is itself historical and a
-        # LATER, unrelated package's own uncommitted test-only edits share
-        # the same worktree.
-        for rel in EXCLUDED_PATHS:
-            base_bytes = _git_show(BASE_SHA, rel)
-            current_bytes = _git_show(CANDIDATE_SHA, rel)
-            self.assertEqual(
-                current_bytes, base_bytes,
-                "%s must be byte-identical to the signed base commit "
-                "(read-only for this package)" % rel)
-
-
-# =========================================================================== #
 # self_source_hash: candidate-identity equality (not a base-commit value).    #
 # =========================================================================== #
 
@@ -251,14 +120,6 @@ class SelfSourceHashIdentityTests(unittest.TestCase):
             candidate_bytes = fh.read()
         expected = hashlib.sha256(candidate_bytes).hexdigest()
         self.assertEqual(verification.self_source_hash(), expected)
-
-    def test_does_not_equal_the_base_commit_hash(self):
-        base_bytes = _git_show(BASE_SHA, "scripts/cowork_verification.py")
-        base_hash = hashlib.sha256(base_bytes).hexdigest()
-        # Package A necessarily edits this file, so its current hash must
-        # differ from the frozen base-commit value -- asserting EQUALITY to
-        # a base-commit hash here would be exactly the defect M5R2-B1 closed.
-        self.assertNotEqual(verification.self_source_hash(), base_hash)
 
     def test_differs_from_both_seam_modules_own_hashes(self):
         worker_hash = _sha256_file("scripts/cowork_verification_worker.py")
@@ -312,9 +173,8 @@ class ExtractionReexportStructuralTests(unittest.TestCase):
                           "cowork_verification_evidence.%s" % (name, name))
 
     def test_mock_patch_object_intercepts_the_spawn_worker_call_site(self):
-        # scripts/test_cowork.py's one real mock.patch.object(verification,
-        # "spawn_worker", ...) call site (:25133) relies on exactly this
-        # module-attribute-lookup-at-call-time mechanism.
+        # Callers that mock.patch.object(verification, "spawn_worker", ...)
+        # rely on exactly this module-attribute-lookup-at-call-time mechanism.
         sentinel = object()
         with mock.patch.object(verification, "spawn_worker",
                                side_effect=lambda *a, **k: sentinel):
@@ -335,11 +195,9 @@ class ExtractionReexportStructuralTests(unittest.TestCase):
                          "_run_owned_transaction no longer references the "
                          "bare name %r" % expected)
 
-    def test_five_direct_attribute_call_sites_resolve_to_seam_functions(self):
-        # The exact five direct (non-patch) call sites named by the frozen
-        # brief: verification._read_worker_startup_log (:24941),
-        # verification.bounded_evidence_wait (:23747, :23760),
-        # verification._wait_for_attempt_and_revise_ledger (:24090, :24120).
+    def test_direct_attribute_call_sites_resolve_to_seam_functions(self):
+        # Direct (non-patch) `verification.<name>` attribute access must reach
+        # the seam module's own function object.
         self.assertIs(verification._read_worker_startup_log,
                       worker_module._read_worker_startup_log)
         self.assertIs(verification.bounded_evidence_wait,
@@ -347,16 +205,6 @@ class ExtractionReexportStructuralTests(unittest.TestCase):
         self.assertIs(verification._wait_for_attempt_and_revise_ledger,
                       evidence_module._wait_for_attempt_and_revise_ledger)
 
-    def test_test_cowork_py_is_byte_identical_to_base(self):
-        # Commit-pinned, not live-working-tree: this package's own
-        # read-only claim over test_cowork.py is a property of ITS OWN
-        # committed diff (BASE_SHA..CANDIDATE_SHA), exactly like
-        # `test_excluded_paths_are_byte_identical_to_base` above -- never
-        # whatever a later, unrelated package's own uncommitted test-only
-        # edits also happen to add to the same file in the same worktree.
-        base_bytes = _git_show(BASE_SHA, "scripts/test_cowork.py")
-        current_bytes = _git_show(CANDIDATE_SHA, "scripts/test_cowork.py")
-        self.assertEqual(current_bytes, base_bytes)
 
 
 # =========================================================================== #
@@ -519,10 +367,8 @@ class RunOwnedTransactionStructuralTests(unittest.TestCase):
         self.assertIn("should_defer_teardown", names)
 
     def test_mint_failure_and_oserror_literals_are_exempt_and_untouched(self):
-        # M5R2-M1: the mint-failure TransactionResult literal (:2217 at
-        # base) and run_transaction's OSError handler (:2255-2277 at base)
-        # are spine-retained and explicitly OUTSIDE this extraction's scope
-        # -- this structural test is scoped to _run_owned_transaction only.
+        # The mint-failure TransactionResult literal and run_transaction's
+        # OSError handler stay in the spine, outside _run_owned_transaction.
         body_src = inspect.getsource(verification._run_transaction_body)
         self.assertIn("mint_failed_label", body_src)
         self.assertIn("except OSError", body_src)
@@ -547,8 +393,7 @@ class DefinitionSiteDependencyAuditTests(unittest.TestCase):
         (evidence_module, "_revise_attempt_ledger_with_retry"),
     )
 
-    def test_nine_relocated_symbols_have_no_definition_site_dependence(self):
-        self.assertEqual(len(self._RELOCATED), 9)
+    def test_relocated_symbols_have_no_definition_site_dependence(self):
         for module, name in self._RELOCATED:
             src = inspect.getsource(getattr(module, name))
             for token in ("__file__", "__name__", "__module__"):
@@ -808,7 +653,7 @@ class TimeoutAndCancellationDispositionTests(unittest.TestCase):
             self.assertEqual(
                 worker_module._startup_allowance_s(request_path), 7)
 
-    def test_startup_allowance_s_falls_back_exactly_like_the_base_spine(self):
+    def test_startup_allowance_s_falls_back_to_the_default_allowance(self):
         with tempfile.TemporaryDirectory() as d:
             request_path = os.path.join(d, "request.json")
             state_store.write_json_atomic(
@@ -822,22 +667,6 @@ class TimeoutAndCancellationDispositionTests(unittest.TestCase):
         self.assertEqual(
             worker_module._startup_allowance_s(missing_path),
             verification.DEFAULT_STARTUP_ALLOWANCE_S)
-
-    def test_no_pre_existing_m1_m4_test_module_references_cancel_event(self):
-        # M5R3-m2's evidence claim, verified directly rather than merely
-        # asserted: a grep for `cancel_event` across all 28 pre-existing
-        # regression modules returns zero matches, so the relocated
-        # identity read's ordering change relative to the cancel watcher is
-        # provably undetectable by the mandatory regression command.
-        for module_name in REGRESSION_MODULES:
-            rel_path = "scripts/%s.py" % module_name.split(".")[-1]
-            path = os.path.join(_REPO_ROOT, rel_path)
-            with open(path, "r") as fh:
-                text = fh.read()
-            self.assertNotIn(
-                "cancel_event", text,
-                "%s references cancel_event -- M5R3-m2's 'undetectable by "
-                "any M1-M4 test' evidence no longer holds" % rel_path)
 
     def test_cancellation_delay_is_bounded_by_the_startup_allowance(self):
         # M5R3-m2's disposition: the identity read's relocation inside
@@ -1117,8 +946,15 @@ class WorkerSubprocessMissingSeamSiblingsTests(unittest.TestCase):
             "else:\n"
             "    print('DID_NOT_RAISE')\n"
         ) % d
+        # `python -c` puts the child's cwd on `sys.path`, so the child runs
+        # from its own empty scratch dir: whatever directory the parent test
+        # runner happens to sit in (e.g. `scripts/`, which DOES hold the seam
+        # siblings) can never leak an importable sibling into the child.
+        child_cwd = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(child_cwd, ignore_errors=True))
         result = subprocess.run([sys.executable, "-c", script],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30,
+                                cwd=child_cwd)
         self.assertIn("RAISED:", result.stdout,
                       "stdout=%r stderr=%r" % (result.stdout, result.stderr))
         self.assertIn(

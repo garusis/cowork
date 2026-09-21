@@ -156,7 +156,7 @@ def fallback_label(session_uuid, created_or_mtime=None):
 
 def list_sessions(cwd=None):
     """Return the directory's sessions, newest-first, as a list of dicts
-    `{id, path, summary, phase, created, last_active}`.
+    `{id, path, summary, phase, created, last_active, owner}`.
 
     Each discovered file is loaded (unreadable/incompatible files are skipped,
     never raised). `id` is the persisted `session_uuid`, falling back to the
@@ -164,7 +164,20 @@ def list_sessions(cwd=None):
     neither is skipped. `summary` is `derive_summary` (None when no context).
     `last_active` is the file mtime (every atomic save refreshes it); `created`
     is the persisted mint-time epoch (None for legacy files). Ordered
-    newest-first by `last_active or created`, tie-broken by `created`."""
+    newest-first by `last_active or created`, tie-broken by `created`.
+
+    `owner` (issue #64 P4) is the session's `cowork_owner.owner_status_view`
+    projection, or None. It is ALWAYS PRESENT as a key — never absent — so no
+    consumer has to distinguish "missing" from "unowned". Two properties are
+    contractual:
+
+      - it is read ONLY when a lease record already exists, because the read
+        path creates the session's `owner/` directory and a lock file before it
+        reads, and merely LISTING sessions must not write into any of them;
+      - this enrichment can never make this function raise. The picker is the
+        caller, and a picker that crashes on one bad row is strictly worse than
+        one that shows no suffix for it.
+    """
     out = []
     for path in discover_session_files(cwd):
         state = load(path)
@@ -178,6 +191,22 @@ def list_sessions(cwd=None):
         except OSError:
             last_active = None
         created = state.get("created")
+        owner = None
+        try:
+            if os.path.exists(owner_lease_path_for(sid)):
+                # DEFERRED import, not a module-level one: `cowork_owner`
+                # imports this module at its own top level, so importing it up
+                # there would be a cycle.
+                import cowork_owner
+                owner = cowork_owner.owner_status_view(sid)
+        except Exception:  # noqa: BLE001 - the totality rule in the docstring
+            # Deliberately broad, and the alternatives are all real and
+            # differently typed: ImportError from the deferred import,
+            # ValueError from `_assert_safe_identifier` via `owner_dir_for` for
+            # a filename-derived id that is not a safe identifier, and OSError
+            # from the process probe. None of them is worth failing a listing
+            # over.
+            owner = None
         out.append({
             "id": sid,
             "path": path,
@@ -185,6 +214,7 @@ def list_sessions(cwd=None):
             "phase": get_phase(state),
             "created": created,
             "last_active": last_active,
+            "owner": owner,
         })
     out.sort(
         key=lambda s: (s["last_active"] or s["created"] or 0,
@@ -324,7 +354,7 @@ def read_review(review_path):
         return None
     if data.get("verdict") not in VALID_VERDICTS:
         # Present but malformed: degrade to a safe, non-approving verdict so the
-        # plan never reaches the user on an unparseable review.
+        # plan is never approved on an unparseable review.
         return _safe_revise(
             "Reviewer wrote an unparseable or missing verdict; treating as "
             "revise (safe default).", data.get("user_question"))
@@ -366,7 +396,7 @@ def read_handoff(path):
 
 
 def scout_intel_md_path_for(intel_dir, session_uuid):
-    """Path of the scout's human-first markdown intel (the user's review surface
+    """Path of the scout's readable markdown intel (the review surface
     at the scout gate, sibling of the scout intel JSON). The JSON stays the
     machine source of truth + status channel; this MD is the readable rendering
     and is folded into the reviewer hash-gate composite. The per-session folder
@@ -391,7 +421,7 @@ def planner_plan_json_path_for(intel_dir, session_uuid):
 
 
 def planner_plan_md_path_for(intel_dir, session_uuid):
-    """Path of the planner's human-first markdown plan (the user's review
+    """Path of the planner's readable markdown plan (the review
     surface at the plan gate). The per-session folder carries the uuid, so the
     filename does not; `session_uuid` is accepted for call-site stability but
     unused."""
@@ -423,7 +453,7 @@ def build_review_path_for(intel_dir, session_uuid):
 
 
 def build_summary_path_for(intel_dir, session_uuid):
-    """Path of the builder's human-first markdown summary (the user's review
+    """Path of the builder's readable markdown summary (the review
     surface at the build gate, sibling of the builder status file). It is the
     builder's post-build report — emitted at the self-audit when the builder
     marks ready_for_review — NOT a hash-gate baseline (the builder stays out of
@@ -593,6 +623,85 @@ def controller_state_dir_for(session_uuid, role):
     """Stable writable controller-private state root for one role."""
     return os.path.join(session_assets_dir(session_uuid), "controller-state",
                         role)
+
+
+# --------------------------------------------------------------------------- #
+# Session-owner lease paths (issue #64 P1, plan §3.1).                          #
+#                                                                              #
+# The durable single-writer lease is keyed by `session_uuid`, NOT by launch     #
+# directory: the same session is reachable from another directory through      #
+# `--session-file`, and `--worktree` deliberately leaves the anchor in the      #
+# launch directory while chdir-ing elsewhere, so a `.cowork/`-local lock would  #
+# be trivially bypassed by both. Every path below therefore hangs off           #
+# `session_assets_dir` (COWORK_SESSIONS_ROOT-overridable, so tests never touch  #
+# the real home dir), exactly like every other per-session asset helper above.  #
+# --------------------------------------------------------------------------- #
+
+
+def owner_dir_for(session_uuid):
+    """Directory holding one session's owner-lease artifacts (the lease, its
+    flock file, per-owner terminal sidecars, and the append-only history).
+    Rejects unsafe session_uuid values, like every other per-session directory
+    helper in this module."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid), "owner")
+
+
+def owner_lease_path_for(session_uuid):
+    """Path of the ONE durable `SessionOwnerLease` record for a session.
+
+    LOCKED WRITES ONLY: this record is read-modify-written exclusively inside
+    `_locked_json_transaction` (which holds a real `fcntl.flock(LOCK_EX)` on
+    `<path>.lock` and persists through `write_json_atomic_durable`). No signal
+    handler, and no other code path, may open this path for writing -- the
+    signal path writes its own per-owner sidecar instead (see
+    `owner_terminal_mark_path_for`). That single-writer shape is what makes the
+    lease's `epoch` strictly monotonic and its `owner_id` usable as a fencing
+    token."""
+    return os.path.join(owner_dir_for(session_uuid), "lease.json")
+
+
+def owner_terminal_mark_path_for(session_uuid, owner_id):
+    """Path of ONE owner's `OwnerTerminalMark` sidecar -- the signal-safe,
+    non-clobbering path a dying owner marks itself terminal on.
+
+    Deliberately PER OWNER: `owner_id` is minted fresh on every acquisition and
+    never reused, so a predecessor's mark can never overwrite (nor be confused
+    with) a successor's, and the lease record itself is left byte-identical.
+    Rejects unsafe owner_id values."""
+    _assert_safe_identifier(owner_id, "owner_id")
+    return os.path.join(owner_dir_for(session_uuid),
+                        "terminal.%s.json" % owner_id)
+
+
+def owner_history_path_for(session_uuid):
+    """Path of the append-only owner-lease audit log (one JSON record per
+    line: acquisitions, renewals, releases, folded terminal marks, takeovers).
+    Observational only -- no decision is ever taken from it."""
+    return os.path.join(owner_dir_for(session_uuid), "history.jsonl")
+
+
+def provider_session_binding_path_for(controller, provider_session_id):
+    """Path of the GLOBAL `(controller, provider_session_id)` exclusivity
+    record -- deliberately outside any one session's directory so it spans
+    launch directories and session anchors, which is the whole point: the same
+    provider conversation must not be resumed under two different cowork
+    sessions.
+
+    Keyed exactly like `_pause_lease_binding_key`: sha256 over a `\\x1f`-
+    delimited join, unambiguous because `_assert_safe_identifier`'s charset
+    (enforced on both fields here) admits no `\\x1f`. Rejects unsafe
+    controller/provider_session_id values, so a caller can never escape the
+    binding directory."""
+    _assert_safe_identifier(controller, "controller")
+    _assert_safe_identifier(provider_session_id, "provider_session_id")
+    raw = "\x1f".join((controller, provider_session_id))
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    # `session_assets_dir` is the COWORK_SESSIONS_ROOT-honouring join; the
+    # binding index is a sibling of the per-session directories, never inside
+    # one, so it survives (and is visible to) every session on this host.
+    return os.path.join(session_assets_dir("provider-bindings"),
+                        "%s.json" % key)
 
 
 def upsert_role_identity(path, role, identity, work_id=None):
@@ -2956,8 +3065,8 @@ def review_skip_eligible(state, reviewer_role, current_epoch,
 # thread-count precondition): there is NO precondition on this process's      #
 # thread count anywhere below, for either the locked or the unlocked          #
 # PhaseState entry point — a real host that keeps long-lived threads alive    #
-# for the entire span an external kill can land in (a guard thread, a UI      #
-# spinner, a verification watchdog) can always durably record every          #
+# for the entire span an external kill can land in (a guard thread, an       #
+# activity ticker, a verification watchdog) can always durably record every   #
 # PhaseState, including the terminal one, with no OSError refusal. A prior    #
 # version of this module tried to close the handler/interrupted-append final  #
 # window by proving `threading.active_count() == 1` and blocking signals via  #
@@ -4443,6 +4552,437 @@ def _locked_json_transaction(path, mutate):
 
 
 # --------------------------------------------------------------------------- #
+# Decision requests: the one open orchestrator decision a stopped phase is    #
+# waiting on (an answer, or a hand-back authorization/decline), and its       #
+# exactly-once consumption. One current JSON record per session, mutated only #
+# under `_locked_json_transaction`.                                           #
+# --------------------------------------------------------------------------- #
+
+DECISION_REQUEST_SCHEMA = 1
+DECISION_RESPONSES = {
+    # request kind -> the responses that may consume it
+    "needs_input": ("answer",),
+    "reviewer_question": ("answer",),
+    "review_round_cap": ("answer",),
+    "review_not_approved": ("answer",),
+    "handoff_requested": ("authorize_handoff", "decline_handoff"),
+}
+
+
+class DecisionConflict(ValueError):
+    """A decision response that does not bind to the session's one open
+    request: none is open, it names another request, it was already
+    consumed, or the response kind does not fit the request kind.
+    `reason` is a closed code: no_open_request | request_mismatch |
+    response_kind_mismatch."""
+
+    def __init__(self, reason, message, request=None):
+        ValueError.__init__(self, message)
+        self.reason = reason
+        self.request = request
+
+
+def decision_request_path_for(session_uuid):
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid),
+                        "decision_request.json")
+
+
+def read_decision_request(session_uuid):
+    """The session's current decision record (open or consumed), or None."""
+    return read_json_tolerant(decision_request_path_for(session_uuid))
+
+
+def open_decision_request(session_uuid, request):
+    """Durably record `request` as the session's one OPEN decision request.
+
+    The request id is derived here from the request's content plus a
+    monotonically increasing `sequence`, so a later stop that happens to
+    carry identical content never reuses an id that was already consumed.
+    Returns the stored record."""
+    if request.get("kind") not in DECISION_RESPONSES:
+        raise ValueError("not a decision request kind: %r"
+                         % (request.get("kind"),))
+
+    def mutate(existing):
+        existing = existing if isinstance(existing, dict) else {}
+        sequence = int(existing.get("sequence") or 0) + 1
+        body = dict(request, session_uuid=session_uuid, sequence=sequence)
+        digest = hashlib.sha256(json.dumps(
+            body, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        # Earlier consumed decisions stay on record (their answers remain
+        # available to later phases, and an undelivered block is never lost
+        # by a newer request replacing the current one).
+        history = list(existing.get("history") or [])
+        if existing.get("request_id") and existing.get("state") != "open":
+            history.append({key: existing.get(key) for key in (
+                "request_id", "kind", "role", "phase", "question", "handoff",
+                "status_path", "state", "response", "delivery")})
+        return dict(body, schema=DECISION_REQUEST_SCHEMA, request_id=digest,
+                    state="open", created=time.time(), response=None,
+                    delivery=None, history=history)
+
+    return _locked_json_transaction(
+        decision_request_path_for(session_uuid), mutate)
+
+
+def check_decision_response(session_uuid, request_id, response_kind):
+    """Validate a response against the open request WITHOUT consuming it.
+    Returns the open request, or raises DecisionConflict."""
+    current = read_decision_request(session_uuid)
+    return _decision_binding(current, request_id, response_kind)
+
+
+def _decision_binding(current, request_id, response_kind):
+    if not isinstance(current, dict) or current.get("state") != "open":
+        raise DecisionConflict(
+            "no_open_request",
+            "no decision request is open for this session (it was never "
+            "opened, or it was already consumed)", request=current)
+    if current.get("request_id") != request_id:
+        raise DecisionConflict(
+            "request_mismatch",
+            "the response names request %s but the open request is %s"
+            % (request_id, current.get("request_id")), request=current)
+    if response_kind not in DECISION_RESPONSES.get(current.get("kind"), ()):
+        raise DecisionConflict(
+            "response_kind_mismatch",
+            "a %s response cannot resolve a %s request"
+            % (response_kind, current.get("kind")), request=current)
+    return current
+
+
+def consume_decision_request(session_uuid, request_id, response_kind,
+                             response_digest=None, delivery=None):
+    """Consume the open request exactly once, under the lock: the check and
+    the state change are one transaction, so a concurrent or replayed
+    response is refused. Returns the consumed record.
+
+    `delivery` is the durable description of what the decision still owes
+    its roles (target roles, phase transition, answer artifact). It is
+    written in the SAME transaction as the consumption, with `state:
+    "pending"` and one pending entry per target role (`targets`, default the
+    delivery's `role`), so a crash after consumption can never lose it: a
+    later plain resume reads it back with `read_pending_decision_deliveries`
+    and delivers each target once."""
+    def mutate(existing):
+        _decision_binding(existing, request_id, response_kind)
+        record = dict(existing, state="consumed", response={
+            "kind": response_kind, "digest": response_digest,
+            "consumed": time.time()})
+        if delivery is not None:
+            targets = delivery.get("targets") or (
+                [delivery["role"]] if delivery.get("role") else [])
+            record["delivery"] = dict(
+                delivery, state="pending",
+                targets={role: "pending" for role in targets})
+        return record
+
+    return _locked_json_transaction(
+        decision_request_path_for(session_uuid), mutate)
+
+
+def _pending_delivery_entries(record):
+    """Every consumed decision whose delivery is still pending, oldest first
+    (history, then the current record)."""
+    out = []
+    if not isinstance(record, dict):
+        return out
+    for entry in list(record.get("history") or []) + [record]:
+        if (isinstance(entry, dict) and entry.get("state") == "consumed"
+                and isinstance(entry.get("delivery"), dict)
+                and entry["delivery"].get("state") == "pending"):
+            out.append(entry)
+    return out
+
+
+def pending_delivery_targets(entry):
+    """The target roles of one pending delivery that have not yet
+    acknowledged it, in their recorded order."""
+    delivery = (entry or {}).get("delivery") or {}
+    targets = delivery.get("targets")
+    if not isinstance(targets, dict):
+        return [delivery["role"]] if delivery.get("role") else []
+    return [role for role, state in targets.items() if state == "pending"]
+
+
+def read_pending_decision_deliveries(session_uuid, trusted_state=None):
+    """Every consumed decision whose delivery some target has not yet
+    acknowledged, oldest first. With `trusted_state` (the session store),
+    only decisions the orchestrator's response was recorded for there (see
+    `record_trusted_decision_response`) are returned: a delivery record that
+    exists only in the session assets directory is never treated as
+    orchestrator authority. `read_unverified_decision_deliveries` returns
+    the ones left out, so a caller can stop on them instead of dropping
+    them."""
+    entries = _pending_delivery_entries(read_decision_request(session_uuid))
+    if trusted_state is None:
+        return entries
+    return [entry for entry in entries
+            if trusted_decision_response(
+                trusted_state, entry.get("request_id"),
+                ((entry.get("delivery") or {}).get("response_kind")))]
+
+
+def read_unverified_decision_deliveries(session_uuid, trusted_state):
+    """Every pending consumed delivery that the session store `trusted_state`
+    has NO matching response record for (a lost trusted write, or a record
+    forged in the assets directory), oldest first. Such an entry is never
+    delivered and never silently skipped: the run stops on it
+    (`decision_delivery_unverified`)."""
+    return [entry for entry in _pending_delivery_entries(
+                read_decision_request(session_uuid))
+            if not trusted_decision_response(
+                trusted_state, entry.get("request_id"),
+                ((entry.get("delivery") or {}).get("response_kind")))]
+
+
+def read_pending_decision_delivery(session_uuid):
+    """The oldest consumed decision whose delivery has not been acknowledged,
+    or None. The returned dict carries `request_id`, `kind`, `role`, `phase`,
+    `question` and `delivery` (the current record also carries `handoff`)."""
+    pending = _pending_delivery_entries(read_decision_request(session_uuid))
+    return pending[0] if pending else None
+
+
+def _mutate_decision_delivery(session_uuid, request_id, change):
+    """Apply `change(delivery) -> delivery` to consumed decision `request_id`
+    (current record or history), under the lock. Returns the new record, or
+    the unchanged one when `request_id` has no delivery."""
+    def mutate(existing):
+        if not isinstance(existing, dict):
+            return None
+        record = dict(existing)
+        if record.get("request_id") == request_id and isinstance(
+                record.get("delivery"), dict):
+            record["delivery"] = change(dict(record["delivery"]))
+            return record
+        history = []
+        changed = False
+        for entry in record.get("history") or []:
+            if isinstance(entry, dict) and entry.get("request_id") == \
+                    request_id and isinstance(entry.get("delivery"), dict):
+                entry = dict(entry, delivery=change(dict(entry["delivery"])))
+                changed = True
+            history.append(entry)
+        if not changed:
+            return None
+        record["history"] = history
+        return record
+
+    return _locked_json_transaction(
+        decision_request_path_for(session_uuid), mutate)
+
+
+def update_decision_delivery(session_uuid, request_id, **changes):
+    """Merge `changes` into the delivery of consumed decision `request_id`
+    (current record or history), under the lock. Returns the new record."""
+    return _mutate_decision_delivery(
+        session_uuid, request_id, lambda delivery: dict(delivery, **changes))
+
+
+def mark_decision_delivered(session_uuid, request_id, target=None):
+    """Acknowledge that the decision's block reached `target` (an accepted
+    first send to that role; None acknowledges every target). The delivery
+    as a whole becomes `delivered` once no target is pending. Idempotent."""
+    now = time.time()
+
+    def change(delivery):
+        targets = delivery.get("targets")
+        if not isinstance(targets, dict):
+            targets = ({delivery["role"]: "pending"}
+                       if delivery.get("role") else {})
+        targets = dict(targets)
+        for role in list(targets):
+            if target is None or role == target:
+                targets[role] = "delivered"
+        delivered_at = dict(delivery.get("delivered_at_by_target") or {})
+        if target is not None and target in targets:
+            delivered_at.setdefault(target, now)
+        delivery.update(targets=targets,
+                        delivered_at_by_target=delivered_at)
+        if all(state == "delivered" for state in targets.values()):
+            delivery["state"] = "delivered"
+            delivery.setdefault("delivered_at", now)
+        return delivery
+
+    return _mutate_decision_delivery(session_uuid, request_id, change)
+
+
+class DecisionAnswerTampered(ValueError):
+    """A stored orchestrator answer no longer matches the digest recorded
+    for it in the session store when the orchestrator gave it: it is never
+    delivered as orchestrator authority. `answer_path` and
+    `expected_sha256` name exactly what must be restored (None when no
+    digest was recorded)."""
+
+    def __init__(self, request_id, message, answer_path=None,
+                 expected_sha256=None):
+        ValueError.__init__(self, message)
+        self.request_id = request_id
+        self.answer_path = answer_path
+        self.expected_sha256 = expected_sha256
+
+
+def _save_durable(path, state):
+    """`save`, plus an fsync of the written bytes and of the parent
+    directory before returning. Raises OSError on any failure."""
+    state = dict(state)
+    state["version"] = VERSION
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_parent_dir(path)
+
+
+def record_trusted_decision_response(path, request_id, response_kind,
+                                     answer_sha256=None, targets=(),
+                                     prior=None):
+    """Record the orchestrator's response to `request_id` in the session
+    store file itself (`.cowork/session.<uuid>.json`), separate from the
+    session assets directory that holds the request, delivery and answer
+    records: its response kind, target roles and the exact digest of any
+    answer text. Every later use of the decision is checked against this
+    record.
+
+    Scope of the protection: it detects a change to, or a forgery of, the
+    assets-directory records alone, and ordinary failures (a crash, a lost
+    write). It does NOT defend against a writer that can rewrite both the
+    assets directory and the session store; no default protected path covers
+    the session store, so it assumes a supervisor-owned repository.
+
+    Written durably (fsync of the file and its directory) BEFORE the request
+    is consumed, so a crash in between leaves the request open (a record for
+    an unconsumed request is never used), and a consumed request never
+    outlives its record on a power loss. A write failure raises OSError and
+    the request stays open. Returns the new state."""
+    state = dict(prior or load(path) or {})
+    responses = dict(state.get("decision_responses") or {})
+    responses[str(request_id)] = {
+        "response_kind": response_kind, "answer_sha256": answer_sha256,
+        "targets": list(targets or ()), "recorded_at": time.time()}
+    state["decision_responses"] = responses
+    _save_durable(path, state)
+    return state
+
+
+def trusted_decision_response(state, request_id, response_kind=None):
+    """The session store's record of the orchestrator's response to
+    `request_id` (optionally requiring its response kind), or None."""
+    responses = (state or {}).get("decision_responses") or {}
+    entry = responses.get(str(request_id)) if request_id else None
+    if not isinstance(entry, dict):
+        return None
+    if response_kind is not None and entry.get("response_kind") != \
+            response_kind:
+        return None
+    return entry
+
+
+def verified_decision_answer_path(session_uuid, state, request_id):
+    """The answer artifact of `request_id`, after checking its bytes against
+    the digest the session store recorded when the orchestrator answered.
+    The path is derived from the request id, never read from a role-writable
+    record. Raises DecisionAnswerTampered when there is no trusted digest or
+    the bytes differ."""
+    entry = trusted_decision_response(state, request_id)
+    expected = (entry or {}).get("answer_sha256")
+    path = decision_answer_path_for(session_uuid, request_id)
+    if not expected:
+        raise DecisionAnswerTampered(
+            request_id, "no orchestrator answer digest is recorded for "
+            "request %s" % request_id, answer_path=path)
+    try:
+        with open(path, "rb") as fh:
+            actual = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        actual = None
+    if actual != expected:
+        raise DecisionAnswerTampered(
+            request_id, "the answer to request %s (%s) no longer matches the "
+            "sha256 %s recorded when the orchestrator answered" % (
+                request_id, path, expected),
+            answer_path=path, expected_sha256=expected)
+    return path
+
+
+def decision_answers(session_uuid, trusted_state=None):
+    """Every consumed decision that carried an orchestrator answer, oldest
+    first: dicts with `request_id`, `kind`, `role`, `phase` and the durable
+    `answer_path`. Later phases read these beside the original brief. With
+    `trusted_state`, only answers the session store recorded are returned,
+    each verified against its recorded digest (DecisionAnswerTampered)."""
+    record = read_decision_request(session_uuid)
+    if not isinstance(record, dict):
+        return []
+    entries = list(record.get("history") or [])
+    if record.get("state") == "consumed":
+        entries.append(record)
+    out = []
+    for entry in entries:
+        delivery = (entry or {}).get("delivery") or {}
+        if not delivery.get("answer_path"):
+            continue
+        rid = entry.get("request_id")
+        answer_path = delivery["answer_path"]
+        if trusted_state is not None:
+            if not (trusted_decision_response(trusted_state, rid) or {}).get(
+                    "answer_sha256"):
+                continue
+            answer_path = verified_decision_answer_path(
+                session_uuid, trusted_state, rid)
+        out.append({"request_id": rid,
+                    "kind": entry.get("kind"), "role": entry.get("role"),
+                    "phase": entry.get("phase"),
+                    "response": (delivery.get("response_kind")),
+                    "answer_path": answer_path})
+    return out
+
+
+def decision_answer_path_for(session_uuid, request_id):
+    """The one artifact path an answer to `request_id` is written to."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid),
+                        "decision.%s.answer.md" % str(request_id)[:16])
+
+
+def write_decision_answer(session_uuid, request_id, text):
+    """Durably write the orchestrator's answer text for `request_id` to its
+    own content-bound artifact (never the session goal). Returns
+    `(path, sha256)`."""
+    payload = text if text is not None else ""
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    path = decision_answer_path_for(session_uuid, request_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path, digest
+
+
+def retire_decision_request(session_uuid, reason):
+    """Mark an open request superseded (the phase moved on without it, e.g.
+    the role itself rewrote the artifact). No-op when none is open."""
+    def mutate(existing):
+        if not isinstance(existing, dict) or existing.get("state") != "open":
+            return None
+        return dict(existing, state="superseded",
+                    response={"kind": "superseded", "reason": reason,
+                              "consumed": time.time()})
+
+    return _locked_json_transaction(
+        decision_request_path_for(session_uuid), mutate)
+
+
+# --------------------------------------------------------------------------- #
 # PauseLease store: create / claim / cancel / consume / replace, each        #
 # serialized against every other writer of the SAME lease_id via a real      #
 # OS-level `fcntl.flock`.                                                    #
@@ -5784,7 +6324,8 @@ def pending_turn_before_pause_path_for(session_uuid, role):
                         "pending_turn_before_pause", "%s.json" % role)
 
 
-def write_pending_turn_before_pause(session_uuid, role, turn_text, lease_id=None):
+def write_pending_turn_before_pause(session_uuid, role, turn_text, lease_id=None,
+                                    decision_bindings=None):
     """Durably persist an in-flight turn's EXACT bytes and their sha256
     digest for `role` BEFORE this pause is acknowledged -- the crash-safe
     boundary this invariant names: a crash strictly between sending a turn
@@ -5806,7 +6347,10 @@ def write_pending_turn_before_pause(session_uuid, role, turn_text, lease_id=None
     overwrite with a new one.
 
     Returns the durably stored record: `{"role", "turn_text", "sha256",
-    "lease_id", "recorded_at", "acknowledged"}`."""
+    "lease_id", "recorded_at", "acknowledged"}`, plus `decision_bindings`
+    when given: the `{"request_id", "target"}` orchestrator decision
+    deliveries these exact turn bytes carry, written in the SAME record so
+    whoever later sends the turn can acknowledge exactly those deliveries."""
     if not isinstance(turn_text, str) or not turn_text:
         raise ValueError("turn_text must be a nonempty string")
     digest = hashlib.sha256(turn_text.encode("utf-8")).hexdigest()
@@ -5819,7 +6363,7 @@ def write_pending_turn_before_pause(session_uuid, role, turn_text, lease_id=None
             raise ValueError(
                 "role %r already has a DIFFERENT unacknowledged pending "
                 "turn before pause -- acknowledge or clear it first" % role)
-        return {
+        record = {
             "role": role,
             "turn_text": turn_text,
             "sha256": digest,
@@ -5827,6 +6371,12 @@ def write_pending_turn_before_pause(session_uuid, role, turn_text, lease_id=None
             "recorded_at": _utc_now(),
             "acknowledged": False,
         }
+        if decision_bindings:
+            record["decision_bindings"] = [
+                {"request_id": str(b["request_id"]),
+                 "target": str(b.get("target") or role)}
+                for b in decision_bindings]
+        return record
 
     result = _locked_json_transaction(path, mutate)
     return result if result is not None else read_pending_turn_before_pause(

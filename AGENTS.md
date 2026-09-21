@@ -9,6 +9,9 @@ operating in this repo. Keep entries factual and tool-agnostic.
   `skills/`.
 - `cowork` is a thin launcher for `scripts/cowork.py`. When `.venv/bin/python`
   exists, the launcher re-execs into that interpreter.
+- `cowork` is driven agent-to-agent over process arguments. There is no
+  human-interactive product path: no menus, keyboard prompts, terminal
+  approval gates, or interactive recovery. Do not add one.
 - `roles/*.md` are prompt contracts for the `cowork` roles. Behavior changes
   usually need matching updates in the relevant role spec, orchestration code,
   tests, and README.
@@ -16,19 +19,28 @@ operating in this repo. Keep entries factual and tool-agnostic.
 ## Development commands
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m unittest scripts/test_cowork.py
+python3 scripts/cowork_offline_tests.py test_cowork
+python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x
 ./cowork --check
 ```
 
 Notes:
-- The normal unit tests use fakes and should not spawn real
-  Claude/Codex/opencode sessions or make API calls.
+- Run tests through `scripts/cowork_offline_tests.py` with explicit unittest
+  ids, not plain `python3 -m unittest`. The suites use fakes, but a bug can
+  still reach a real provider binary; the harness adds deny stubs, an
+  in-process launch guard, a preflight probe, and a sentinel that fails the
+  gate. It stops accidental launches by ordinary code only: it is not a
+  sandbox against deliberately hostile code, and `HOME` is not redirected.
+  Exit codes: 0 pass, 1 tests failed, 2 usage, 3 provider boundary violation,
+  4 setup/preflight failed, 5 timeout.
+- Run the harness self-tests plain from `scripts/`, never nested inside the
+  harness: `cd scripts && python3 -m unittest test_cowork_offline_guard`.
 - `COWORK_LIVE=1 python3 -m unittest scripts/test_cowork.py` runs live CLI
-  integration tests. Use it only when intentionally verifying installed
+  integration tests that launch real providers and make API calls. It is a
+  separate, explicit validation outside the offline barrier (which strips
+  `COWORK_LIVE`); use it only when intentionally verifying installed
   controller behavior.
-- The interactive UI dependencies are `rich`, `prompt_toolkit`, and
-  `questionary`; the non-interactive args path can run without them.
+- The runtime is standard-library only; `requirements.txt` lists no packages.
 
 ## Session and generated state
 
@@ -41,7 +53,7 @@ Notes:
 - Per-session artifacts live under `~/.cowork/sessions/<session_uuid>/`
   unless `COWORK_SESSIONS_ROOT` overrides the location.
 - `cowork` does not commit or open PRs; approved build output is left in the
-  working tree for the user to review.
+  working tree for the orchestrator to review.
 
 ## Implementation notes
 
@@ -76,6 +88,39 @@ Notes:
   `cowork --report` appends the scores/usage analysis when `scores.json`
   exists (`cowork_report.summarize_scores` / `render_scores_report`).
 
+## Agent command transport
+
+Contract source: `build_parser`, `select_session`, `build_run_result` and
+`main` in `scripts/cowork.py`; the full description is README "Usage".
+
+- Every run writes exactly one JSON run-result line as the last line of stdout
+  (`cowork_result`, `rc`, `outcome`, `approved`, `stop`, `reason`,
+  `session_file`, `resume_argv`, and `decision_argv` for an open decision).
+  The transcript goes to stderr. `rc` equals the exit status; a missing line
+  is a failure. Exit codes: 0 approved, 1 failed, 2 invalid invocation,
+  3 owner conflict, 4 stopped for a decision, 5 awaiting provider capacity,
+  17 provider refusal/no first token, 130 SIGINT, 143 SIGTERM.
+- Session selection is explicit and exclusive: no selector or `--new` starts a
+  new session (requires `--context`/`--context-file`); `--session-file PATH`
+  names one; `--resume` selects this directory's most recent saved session;
+  `--no-session` is ephemeral and also requires `--context`/`--context-file`.
+  A run without a selector never resumes saved work.
+- Decisions are request-bound: `--answer REQUEST_ID` (with context),
+  `--authorize-handoff REQUEST_ID`, `--decline-handoff REQUEST_ID`, one per
+  invocation, each requiring `--session-file` or `--resume`. Approval comes
+  only from the paired reviewer's `approve` verdict; a missing reviewer,
+  answer, or authorization never approves.
+- Capacity pauses (rc 5) are replayed by the separate `cowork resume-trigger`
+  entry point, which requires all four identities (`--session-uuid`,
+  `--lease-id`, `--claimant-ref`, `--automation-ref`) plus `--cwd LAUNCH_DIR`,
+  because the session anchor lives in the launch directory even with
+  `--worktree` (the default is the current directory); the session then
+  continues with a plain `--session-file` run. Decision delivery on that path is at least once, not
+  exactly once. A crashed claimant is retriggered with the same four
+  identities and `--cwd LAUNCH_DIR`; that retrigger can replace the claimed
+  lease, so re-read the current lease from a plain resume before triggering
+  again.
+
 ## Git worktrees
 
 Worktrees may live **inside** the repo under `.worktrees/` (already gitignored),
@@ -94,7 +139,7 @@ Notes:
 - Sibling-outside (`../cowork-worktrees/`) is the cleaner general default;
   inside `.worktrees/` is the chosen approach here.
 
-### `--worktree` / `--headless` (automatic operation)
+### `--worktree`
 
 - `cowork --worktree [name]` runs a small **worktree role** before scouting. It
   reads THIS file to follow the repo's worktree convention — for this repo:
@@ -106,10 +151,6 @@ Notes:
 - Resume-from-launch-dir constraint: with `--worktree`, the cowork session store
   (`.cowork/session.<uuid>.json`) stays in the **launch** directory, not the
   worktree. Resume the session from the launch directory (or via
-  `--session-file`), not from inside the worktree. Per-session assets under
+  `--session-file`), not from inside the worktree, and pass
+  `--cwd LAUNCH_DIR` to `cowork resume-trigger`. Per-session assets under
   `~/.cowork/sessions/<uuid>/` are always found.
-- `cowork --headless` (alias `--auto`) drives the whole flow with no human
-  gates: roles never block (they record assumptions and proceed), reviewers
-  work with what they have, rounds end on reviewer consensus or the review-round
-  cap. It requires `--context`/`--context-file`. The builder contract is
-  unchanged under headless — working-tree edits only, no commit/PR.

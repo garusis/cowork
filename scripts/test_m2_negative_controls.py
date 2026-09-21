@@ -131,23 +131,13 @@ def _uuid():
 
 
 class _M2E2EBase(unittest.TestCase):
-    """Isolated COWORK_SESSIONS_ROOT + unconditional policy reset per test,
-    and `gather_context_interactive` stubbed to fail fast rather than block
-    on real stdin — mirrors the isolation discipline the E suite itself
+    """Isolated COWORK_SESSIONS_ROOT + unconditional policy reset per test —
+    mirrors the isolation discipline the E suite itself
     established, reproduced independently here."""
 
     def setUp(self):
         policy.deactivate()
         self.addCleanup(policy.deactivate)
-
-        def _no_prompt(*a, **kw):
-            raise AssertionError(
-                "reached the interactive goal prompt; pass --context or "
-                "resume a session with a saved lead session id")
-        patcher = mock.patch.object(
-            cowork, "gather_context_interactive", _no_prompt)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
         root = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
@@ -315,9 +305,9 @@ class NonCompletionMatrixTest(_M2E2EBase):
     `run_scout`/`_advance_phase` seam to an explicit terminal PhaseState
     other than `completed`, with no gate-validation evidence bound."""
 
-    def _run_row(self, uuid_str, session, headless, io_in=None):
+    def _run_row(self, uuid_str, session):
         spath = self._session(
-            uuid_str, "scouting", {"scout": "opencode"}, team=["scout"])
+            uuid_str, "scouting", {"scout": "opencode"}, team=["scout", "scout-reviewer"])
 
         def fake_run_scout(config, context, selected, **kw):
             return cowork.run_scout(
@@ -325,12 +315,9 @@ class NonCompletionMatrixTest(_M2E2EBase):
                 session_factory=lambda *a, **k: session, **kw)
 
         argv = ["--session-file", spath, "--context", "f-negctrl context"]
-        if headless:
-            argv += ["--headless"]
         try:
             cowork.run_flow(
-                self._args(argv), io_in=(io_in or io.StringIO()),
-                io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+                self._args(argv), io_out=io.StringIO(), which=lambda c: "/bin/" + c,
                 run_scout_fn=fake_run_scout)
         except SystemExit as exc:
             self.assertEqual(exc.code, 128 + signal.SIGTERM)
@@ -340,7 +327,7 @@ class NonCompletionMatrixTest(_M2E2EBase):
     def test_guard_disappearance_reaches_failed_never_completed(self):
         current = self._run_row(
             "f-negctrl-guard-disappearance",
-            _RefusingSession("guard_unavailable"), True, None)
+            _RefusingSession("guard_unavailable"))
         self.assertIsNotNone(current)
         self.assertEqual(current["state"], "failed")
         self.assertIn(current["state"], control_plane.TERMINAL_STATES)
@@ -349,19 +336,18 @@ class NonCompletionMatrixTest(_M2E2EBase):
 
     def test_controller_abort_reaches_aborted_never_completed(self):
         current = self._run_row(
-            "f-negctrl-controller-abort", _KeyboardInterruptSession(), True,
-            None)
+            "f-negctrl-controller-abort", _KeyboardInterruptSession())
         self.assertIsNotNone(current)
         self.assertEqual(current["state"], "aborted")
         self.assertIn(current["state"], control_plane.TERMINAL_STATES)
         self.assertNotEqual(current["state"], "completed")
         self.assertNotIn("gate_validation", current.get("evidence") or {})
 
-    def test_eof_reaches_cancelled_never_completed(self):
-        current = self._run_row(
-            "f-negctrl-eof", _NoStatusSession(), False, io.StringIO(""))
+    def test_eof_reaches_failed_never_completed(self):
+        # A turn that ends without writing a status is a failed turn.
+        current = self._run_row("f-negctrl-eof", _NoStatusSession())
         self.assertIsNotNone(current)
-        self.assertEqual(current["state"], "cancelled")
+        self.assertEqual(current["state"], "failed")
         self.assertIn(current["state"], control_plane.TERMINAL_STATES)
         self.assertNotEqual(current["state"], "completed")
         self.assertNotIn("gate_validation", current.get("evidence") or {})
@@ -378,7 +364,7 @@ class InvalidPolicyTransitionTest(_M2E2EBase):
 
     def test_rejected_transition_zero_dispatch_byte_identical(self):
         spath = self._session("F-NEGCTRL-POLICY", "planning",
-                              {"planner": "claude"}, team=["scout", "planner"])
+                              {"planner": "claude"}, team=["scout", "scout-reviewer", "planner", "planning-advisor"])
         before_bytes = self._sha(spath)
         before_active = policy.active_meta()
 
@@ -393,7 +379,7 @@ class InvalidPolicyTransitionTest(_M2E2EBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                             "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
 
@@ -412,7 +398,8 @@ class InvalidPolicyTransitionTest(_M2E2EBase):
 # =============================================================================
 
 class ExternalKillPositiveTerminalRecordTest(_M2E2EBase):
-    """A real SIGTERM, delivered at the interactive gate read through the
+    """A real SIGTERM, delivered at the review gate (the paired reviewer's
+    pass) through the
     SAME production `run_flow` handler and the REAL (not bypassed)
     `cowork.run_scout` seam -- so a WorkUnit is genuinely minted -- must
     produce a POSITIVE durable terminal record, not merely the absence of
@@ -434,30 +421,32 @@ class ExternalKillPositiveTerminalRecordTest(_M2E2EBase):
         def close(self):
             pass
 
-    class _KillOnReadline(io.StringIO):
-        def readline(self, *a, **kw):
-            os.kill(os.getpid(), signal.SIGTERM)
-            return super().readline(*a, **kw)
 
     def test_sigterm_at_gate_positive_durable_aborted_record(self):
         session_uuid = _uuid()
         spath = self._session(
-            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "opencode"},
+            team=["scout", "scout-reviewer"])
         intel_path = os.path.join(
             state_store.session_assets_dir(session_uuid), "scout.intel.json")
         os.makedirs(os.path.dirname(intel_path), exist_ok=True)
         session = self._GateSession(intel_path)
 
+        def kill_at_review(*a, **k):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return {"verdict": "approve"}
+
         def fake_run_scout(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: session, **kw)
+                session_factory=lambda *a, **k: session,
+                reviewer_runner=kill_at_review, **kw)
 
         with self.assertRaises(SystemExit) as ctx:
             cowork.run_flow(
                 self._args(["--session-file", spath,
                            "--context", "f-negctrl gate sigterm"]),
-                io_in=self._KillOnReadline(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
         self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
 
@@ -486,15 +475,15 @@ class ExternalKillPositiveTerminalRecordTest(_M2E2EBase):
 # =============================================================================
 
 class RepeatedIdenticalRepairTest(_M2E2EBase):
-    """D's durable recovery breaker, integrated into the live controller-
-    failure retry gate: the (threshold+1)th identical-cause retry request is
-    refused BEFORE another dispatch, with a stable, distinct reason code."""
+    """D's durable recovery breaker, integrated at the machine re-invocation
+    boundary: once the identical cause has spent its budget, the next engagement
+    is refused BEFORE another dispatch, with a stable, distinct reason code."""
 
     def _path(self):
         d = self._dir()
         return os.path.join(d, ".cowork", "scout.intel.X.json")
 
-    def test_fourth_identical_cause_retry_blocked_before_dispatch(self):
+    def test_fourth_identical_cause_is_refused_before_dispatch(self):
         path = self._path()
         session_uuid = _uuid()
         manifest_dir = os.path.dirname(
@@ -515,12 +504,14 @@ class RepeatedIdenticalRepairTest(_M2E2EBase):
         manifest_mod.persist_manifest(
             state_store.manifest_path_for(session_uuid, "scout"), manifest)
 
-        class FailingSession:
+        class CountingSession:
             controller = "claude"
+            sends = 0
 
             def send(self, text, meta=None):
+                CountingSession.sends += 1
                 return {"ok": False, "result": "error",
-                       "error_type": "ProviderError"}
+                        "error_type": "ProviderError"}
 
             def close(self):
                 pass
@@ -533,22 +524,20 @@ class RepeatedIdenticalRepairTest(_M2E2EBase):
                 state_store.ledger_path_for(session_uuid), "scout",
                 "e" * 64, "claude", manifest["digest"], "controller_failure")
 
-        rc, outcome, _ = cowork._role_loop(
-            FailingSession(), "seed", path, context="",
-            io_in=io.StringIO("retry\n"), io_out=io.StringIO(),
-            trace=trace, session_uuid=session_uuid, role_work_id="scout-wu",
-            role="scout", phase="scouting")
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
-        events = self._trace_events(session_uuid)
-        blocked = [e for e in events
-                  if e.get("event") == "user.action"
-                  and e.get("action") == "controller_failure_retry_blocked"]
-        self.assertEqual(len(blocked), 1)
-        tripped_decisions = [e for e in events
-                             if e.get("event") == "recovery.breaker.decision"
-                             and e.get("tripped")]
-        self.assertGreaterEqual(len(tripped_decisions), 1)
+        rc, outcome, payload = cowork._role_loop(
+            CountingSession(), "seed", path, context="",
+            io_out=io.StringIO(), trace=trace, session_uuid=session_uuid,
+            role_work_id="scout-wu", role="scout", phase="scouting")
+        self.assertEqual((rc, outcome), (0, "ended"))
+        self.assertEqual(CountingSession.sends, 0)
+        self.assertEqual(payload["kind"], "recovery_budget_exhausted")
+        self.assertEqual(payload["requires"], "operator")
+        refused = [e for e in self._trace_events(session_uuid)
+                   if e.get("event") == "gate.decision"
+                   and e.get("gate") == "recovery_budget"
+                   and e.get("action") == "refuse"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["decider"], "runtime")
 
     def _trace_events(self, session_uuid):
         tpath = trace_store.trace_path_for(session_uuid)
@@ -679,8 +668,7 @@ class DependencyGraphNegativeControlsTest(_M2E2EBase):
                 "controller session")
 
         rc = cowork.run_scout(
-            config, "goal", ["scout"], io_in=io.StringIO("\n"),
-            io_out=io.StringIO(), session_factory=_never_send,
+            config, "goal", ["scout"], io_out=io.StringIO(), session_factory=_never_send,
             session_uuid=session_uuid)
 
         self.assertEqual(rc, 1, "a rejected graph declaration must stop "
@@ -732,6 +720,44 @@ class ContextAckFailureTest(_M2E2EBase):
         def close(self):
             pass
 
+    def setUp(self):
+        super().setUp()
+        # Per-test cold probe cache: a fresh file, so no hit leaks in or out.
+        probe_cache_dir = self._dir()
+        old_cache = os.environ.get("COWORK_PROBE_CACHE")
+        os.environ["COWORK_PROBE_CACHE"] = os.path.join(
+            probe_cache_dir, "probe_cache.json")
+
+        def restore_cache():
+            if old_cache is None:
+                os.environ.pop("COWORK_PROBE_CACHE", None)
+            else:
+                os.environ["COWORK_PROBE_CACHE"] = old_cache
+        self.addCleanup(restore_cache)
+
+        # Per-test hermetic version resolver: the live launch site probes with
+        # `cache_enabled=True`, whose key would otherwise exec
+        # `claude --version`. A constant keeps the real cache semantics; an
+        # unresolved CLI path still yields no version, like the real resolver.
+        def offline_version(claude_path):
+            return "claude 0.0.0-offline" if claude_path else None
+        patcher = mock.patch.object(
+            bridge.probe_cache, "claude_version", offline_version)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # The stream-json probe itself goes through an injected spawn instead
+        # of the real `claude -p` process; it answers a well-formed reply.
+        self.probe_spawns = []
+
+        def offline_probe_spawn(command, stdin_text):
+            self.probe_spawns.append(list(command))
+            return [{"type": "assistant",
+                     "message": {"content": [{"type": "text",
+                                              "text": "ok"}]}},
+                    {"type": "result"}]
+        self.offline_probe_spawn = offline_probe_spawn
+
     def test_first_send_failure_withholds_ack_resume_redelivers_both(self):
         spath = self._tmp_session()
         failing = self._ScriptedSession(ok=False)
@@ -739,16 +765,17 @@ class ContextAckFailureTest(_M2E2EBase):
         def fake_run_scout_1(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: failing, **kw)
+                session_factory=lambda *a, **k: failing,
+                claude_spawn=self.offline_probe_spawn, **kw)
 
         rc = cowork.run_flow(
-            self._args(["--team", "scout",
+            self._args(["--team", "scout,scout-reviewer",
                        "--config", "scout=claude,yolo,plan",
                        "--context", "F-NEGCTRL-ORIGINAL-CONTEXT",
-                       "--session-file", spath, "--headless"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+                       "--session-file", spath]),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_1)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
 
         events = self._events(spath)
         self.assertEqual(
@@ -767,13 +794,14 @@ class ContextAckFailureTest(_M2E2EBase):
         def fake_run_scout_2(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: succeeding, **kw)
+                session_factory=lambda *a, **k: succeeding,
+                claude_spawn=self.offline_probe_spawn, **kw)
 
         rc2 = cowork.run_flow(
             self._args(["--session-file", spath]),
-            io_in=io.StringIO("\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_2)
-        self.assertEqual(rc2, 0)
+        self.assertEqual(rc2, 1)  # delivered, but the turn wrote no status
 
         first_sent_text = succeeding.sent[0]
         referenced_paths = re.findall(
@@ -806,7 +834,7 @@ class ControllerSwitchInterruptionTest(_M2E2EBase):
     def test_replace_failure_leaves_prior_identity_intact_zero_dispatch(self):
         spath = self._session(
             "F-NEGCTRL-SWITCH-INTERRUPT", "planning", {"planner": "claude"},
-            team=["scout", "planner"])
+            team=["scout", "scout-reviewer", "planner", "planning-advisor"])
         state = state_store.load(spath)
         state["config"]["planner"]["model"] = "opus"
         state["config"]["planner"]["effort"] = "high"
@@ -830,7 +858,7 @@ class ControllerSwitchInterruptionTest(_M2E2EBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                            "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
 
@@ -855,10 +883,10 @@ class ControllerSwitchInterruptionTest(_M2E2EBase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                        "--context", "post-recovery continuation"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c,
             run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

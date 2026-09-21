@@ -495,7 +495,7 @@ class ConcurrentAppendCrashSafetyTest(_M4CrashEnvMixin, unittest.TestCase):
             try:
                 r = state_store.reread_before_gate(
                     suid, work_id, "2026-01-01T00:0%d:00Z" % tag,
-                    "productive_model_work", chr(97 + tag) * 64,
+                    "productive_model_work", format(tag, "064x"),
                     "poll-%d" % tag)
                 with lock:
                     results.append(r)

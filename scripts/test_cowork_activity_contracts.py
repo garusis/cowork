@@ -25,7 +25,7 @@ _TIME_2 = "2026-08-25T10:05:00Z"
 
 # Runtime modules that would break this module's inertness if imported.
 _FORBIDDEN_RUNTIME_MODULES = frozenset({
-    "cowork", "cowork_bridge", "cowork_state", "cowork_ledger", "cowork_ui",
+    "cowork", "cowork_bridge", "cowork_state", "cowork_ledger", "cowork_transcript",
     "cowork_report", "cowork_measure", "cowork_watchdog",
     "cowork_preflight", "cowork_dispatch", "cowork_dispatch_manifest",
     "cowork_policy", "cowork_action_policy", "cowork_guard_broker",
@@ -725,8 +725,8 @@ class SignatureShapeTest(unittest.TestCase):
     Package-C-owned-body split (M4R-F03)."""
 
     _EXPECTED_NAMES = frozenset({
-        "project_compact_state", "render_compact_activity",
-        "render_headless_activity", "_section_activity", "live_child_handle",
+        "project_compact_state", "render_activity", "_section_activity",
+        "live_child_handle",
     })
 
     def test_pinned_signatures_names_exact(self):
@@ -758,18 +758,10 @@ class SignatureShapeTest(unittest.TestCase):
         self.assertNotEqual(spec["owner"], "A-activity-contracts",
                              "Package A pins the signature only, never the body")
 
-    def test_render_functions_owned_by_package_e_in_cowork_ui(self):
-        for name in ("render_compact_activity", "render_headless_activity"):
-            spec = activity.PINNED_SIGNATURES[name]
-            self.assertEqual(spec["owner"], "E-cross-surface-rendering")
-            self.assertEqual(spec["module"], "cowork_ui")
-
-    def test_render_compact_activity_params(self):
-        spec = activity.PINNED_SIGNATURES["render_compact_activity"]
-        self.assertEqual(spec["params"], ("io_out", "compact_state", "enabled=None"))
-
-    def test_render_headless_activity_params(self):
-        spec = activity.PINNED_SIGNATURES["render_headless_activity"]
+    def test_render_activity_owned_by_package_e_in_cowork_transcript(self):
+        spec = activity.PINNED_SIGNATURES["render_activity"]
+        self.assertEqual(spec["owner"], "E-cross-surface-rendering")
+        self.assertEqual(spec["module"], "cowork_transcript")
         self.assertEqual(spec["params"], ("io_out", "compact_state"))
 
     def test_section_activity_owned_by_package_d_in_cowork_report(self):

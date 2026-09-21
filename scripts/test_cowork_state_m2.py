@@ -1604,7 +1604,6 @@ class PhaseStateHistoryTest(_M2EnvMixin, unittest.TestCase):
         exactly the moments PhaseState matters -- `cowork_bridge.py` starts a
         long-lived `cowork-guard-<role>` daemon thread running
         `broker.serve_forever` for the whole dispatched turn,
-        `cowork_ui.py` starts a daemon spinner thread on a TTY, and
         `cowork_verification.py` starts watchdog/capture/cancel-watcher
         threads during verification -- none of which can be stopped while
         the turn an external kill would interrupt is running. This test

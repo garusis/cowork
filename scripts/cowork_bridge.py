@@ -2,7 +2,7 @@
 """cowork controller bridges.
 
 Three controller back-ends spin up a role's CLI and bridge its conversation to
-the user:
+the run transcript:
 
 - claude: a persistent duplex process driven by stream-json on stdin/stdout.
 - codex: one-shot `codex exec --json` plus `codex exec resume <thread_id>` for
@@ -37,7 +37,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import cowork_ui as ui  # noqa: E402
+import cowork_transcript as transcript  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_probe_cache as probe_cache  # noqa: E402
 # The session controller policy. Every entry point below that creates a process
@@ -49,9 +49,7 @@ import cowork_action_policy as action_policy  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_guard_broker as guard_broker  # noqa: E402
 import cowork_profiles as controller_profiles  # noqa: E402
-# Re-exported so existing callers/tests keep using bridge.USER_LABEL /
-# bridge.speaker_label; the canonical definitions live in cowork_ui.
-from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
+from cowork_transcript import speaker_label  # noqa: E402,F401
 
 DEFAULT_ROLE_PROMPT = "roles/scout.md"
 _NESTED_GUARD_ACTIVE = False
@@ -66,11 +64,6 @@ _NESTED_GUARD_ACTIVE = False
 CLAUDE_EMPTY_MCP_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data",
     "claude_empty_mcp.json")
-
-# The spinner moved to cowork_ui (both bridges + the loop share it). Alias kept
-# for back-compat.
-_Spinner = ui.Spinner
-
 
 def set_nested_guard_active(value):
     global _NESTED_GUARD_ACTIVE
@@ -911,8 +904,8 @@ def opencode_plan_declared_outputs(speaker, assets_dir):
 
 def _opencode_bash_permission_lines():
     """`bash:` pattern map allowing exactly the vetted read-only commands
-    (ORCH-053). Catch-all `ask` first (still a hard deny headless, but an
-    interactive run can approve), then one allow per pattern —
+    (ORCH-053). Catch-all `ask` first (a hard deny in a non-interactive
+    provider run: nothing can approve it), then one allow per pattern —
     last-match-wins, same ordering discipline as the `edit:` map.
 
     Glob prefix matching is injectable (`git status; rm -rf` matches
@@ -929,9 +922,9 @@ def opencode_permission_lines(mode, yolo, external_dir=False,
                               bash_readonly=False):
     """Frontmatter `permission:` lines for (mode, yolo).
 
-    opencode has no OS sandbox; permissions are the only guardrail, and in a
-    headless run (stdin is not a TTY) any rule that resolves to `ask` is
-    auto-rejected by opencode — so `ask` acts as a hard deny here:
+    opencode has no OS sandbox; permissions are the only guardrail, and with
+    no interactive stdin any rule that resolves to `ask` is auto-rejected by
+    opencode — so `ask` acts as a hard deny here:
 
     - plan, WITH declared outputs -> an ordered `edit:` object map: catch-all
       denies (`"*"`, `"**"`) first, then one allow key per pattern form per
@@ -1349,9 +1342,8 @@ def parse_claude_event(obj):
     return {"kind": "other", "type": etype}
 
 
-# Codex item types that mean "the agent is using a tool", with the spinner
-# label each one shows. Only these flip the activity label; unknown item types
-# stay "other" so future codex events can't reset the label incorrectly.
+# Codex item types that mean "the agent is using a tool", with the activity
+# label the parser reports for each. Unknown item types stay "other".
 _CODEX_TOOL_LABELS = {
     "command_execution": "running a command",
     "mcp_tool_call": "calling a tool",
@@ -1719,8 +1711,7 @@ class ClaudeSession:
         self.speaker = speaker
         self.controller = "claude"
         self.label = speaker_label(speaker)
-        # internal=True streams this whole session on the dim internal channel
-        # (reviewer/advisor); role sessions stay False and mark inline blocks.
+        # internal=True marks a reviewer/advisor/evaluator session (not a lead).
         self.internal = internal
         self.on_session_id = on_session_id
         self.trace = trace
@@ -1755,9 +1746,8 @@ class ClaudeSession:
         # Distinct from `self.model`, the config-pinned request (None = the
         # CLI's own default).
         self.live_model = None
-        # Markdown render region; injectable for tests. TTY: Rich Live streaming.
-        # Non-TTY: raw passthrough, byte-identical to the historical stream.
-        self._region_factory = region_factory or ui.StreamingMarkdown
+        # Transcript stream for the reply; injectable for tests.
+        self._region_factory = region_factory or transcript.TranscriptStream
         self._seen_session = False
         self.extra_writable_dir = extra_writable_dir
         self.controller_state_dir = (
@@ -1815,12 +1805,8 @@ class ClaudeSession:
                              role=speaker, result="ok")
 
     def send(self, text, meta=None):
-        """Send one user message and surface the labeled reply for one turn.
-
-        On a TTY a `scout working…` spinner fills the gap before the first token
-        (#13), then the reply renders **live** as markdown in a Rich region (#5) —
-        length-independent. Off a TTY the region is a raw passthrough, byte-for-byte
-        the historical token stream (so the streaming/test contract is unchanged).
+        """Send one message and write the labeled reply to the transcript for
+        one turn, streamed as it arrives.
 
         `meta` is an optional per-turn accounting dict (#1/D11) merged into the
         controller.turn.start event (prompt_kind, role, controller, phase,
@@ -1995,56 +1981,27 @@ class ClaudeSession:
 
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
-        tty = ui.is_tty(self.io_out)
         any_text = False
         denied = False
         controller_error = None
         parent_direct_usage = {}
         region = None
-        idle = "%s working" % self.speaker
-        status_active = False  # the region currently shows a tool-activity row
-        spinner = ui.Spinner(self.io_out, idle) if tty else None
-        if spinner:
-            spinner.start()
-
-        def _set_status(text):
-            # Show/refresh the activity row; guarded so injected/custom regions
-            # without status support keep working.
-            nonlocal status_active
-            st = getattr(region, "set_status", None)
-            if st:
-                st(text)
-                status_active = True
-
-        def _clear_status():
-            nonlocal status_active
-            if not status_active:
-                return
-            cs = getattr(region, "clear_status", None)
-            if cs:
-                cs()
-            status_active = False
 
         def _feed(chunk):
-            # Open the render region on the first token (after stopping the
-            # gap-filling spinner), then stream into it.
+            # Open the transcript stream on the first token, then stream into it.
             nonlocal region
             if region is None:
-                if spinner:
-                    spinner.stop()
-                label = ui.label(self.speaker, tty)
-                if self._region_factory is ui.StreamingMarkdown:
+                label = speaker_label(self.speaker)
+                if self._region_factory is transcript.TranscriptStream:
                     region = self._region_factory(
                         self.io_out, label, trace=self.trace,
                         trace_fields={
                             "controller": "claude",
                             "role": self.speaker,
-                        }, internal=self.internal)
+                        })
                 else:
                     region = self._region_factory(self.io_out, label)
                 region.__enter__()
-            else:
-                _clear_status()  # text resumed: drop the tool-activity row
             region.feed(chunk)
 
         first_token_seen = False
@@ -2066,9 +2023,6 @@ class ClaudeSession:
                     # and discard it before accepting any line as its own.
                     self._pending_abandoned_results = getattr(
                         self, "_pending_abandoned_results", 0) + 1
-                    if spinner:
-                        spinner.stop()
-                    _clear_status()
                     if region is not None:
                         region.__exit__(None, None, None)
                         region = None
@@ -2198,26 +2152,7 @@ class ClaudeSession:
             elif kind == "assistant" and parsed.get("text") and not any_text:
                 _feed(parsed["text"])
                 any_text = True
-            elif kind == "tool":
-                # The model is calling a tool — keep the UI alive (#loading-state).
-                busy = "%s using %s" % (self.speaker, parsed.get("name") or "tool")
-                if region is None:
-                    if spinner:
-                        spinner.set_label(busy)
-                else:
-                    _set_status(busy + "…")
-            elif kind == "user_replay":
-                # A tool_result came back; back to plain "working" until the
-                # next text token or tool call.
-                if region is None:
-                    if spinner:
-                        spinner.set_label(idle)
-                elif status_active:
-                    _set_status(idle + "…")
             elif kind == "denied":
-                if spinner:
-                    spinner.stop()
-                _clear_status()  # never leave a tool label over the raw write
                 denied = True
                 if self.trace:
                     self.trace.event("controller.denied", controller="claude",
@@ -2234,7 +2169,8 @@ class ClaudeSession:
                                 controller="claude", role=self.speaker,
                                 guard_attempt_id=attempt_id,
                                 reason="guard_unavailable")
-                self.io_out.write("\n" + ui.label(self.speaker, tty) + denial_message())
+                self.io_out.write("\n" + speaker_label(self.speaker)
+                                  + denial_message())
             elif kind == "error":
                 # Keep reading until the result event so the persistent stream
                 # remains framed, but remember that a later synthetic success
@@ -2249,21 +2185,14 @@ class ClaudeSession:
                         # synthesized here.
                         "retry_evidence": parsed.get("retry_evidence"),
                     }
-                    if spinner:
-                        spinner.stop()
-                    _clear_status()
                     if region is not None:
                         region.__exit__(None, None, None)
                         region = None
                     self.io_out.write(
-                        ui.colorize("[error] " + controller_error["text"],
-                                    ui.RED, tty) + "\n")
+                        "[error] " + controller_error["text"] + "\n")
             elif kind == "result":
-                if spinner:
-                    spinner.stop()
-                _clear_status()
                 if region is not None:
-                    region.__exit__(None, None, None)  # finalize the render
+                    region.__exit__(None, None, None)  # finalize the stream
                 elif denied:
                     self.io_out.write("\n")
                 if parsed.get("is_error") or controller_error is not None:
@@ -2281,8 +2210,7 @@ class ClaudeSession:
                          duration_ms=_elapsed_ms())
                     if controller_error is None:
                         self.io_out.write(
-                            ui.colorize("[error] " + (parsed.get("text") or ""),
-                                        ui.RED, tty) + "\n")
+                            "[error] " + (parsed.get("text") or "") + "\n")
                     self.io_out.flush()
                     return turn_result(
                         False, "error", subtype=parsed.get("subtype"),
@@ -2319,8 +2247,6 @@ class ClaudeSession:
                     usage=parsed.get("usage"), model=self.live_model or self.model,
                     duration_ms=_elapsed_ms())
             self.io_out.flush()
-        if spinner:
-            spinner.stop()
         if region is not None:
             region.__exit__(None, None, None)
         # The loop-exhausted / EOF path: `_elapsed_ms()` was already in scope
@@ -2379,7 +2305,7 @@ def _resumed_usage_baseline(thread_id):
 
 class CodexSession:
     """Turn-based codex bridge: first `codex exec --json`, then
-    `codex exec resume <thread_id>` per send(). A spinner runs during each turn."""
+    `codex exec resume <thread_id>` per send()."""
 
     def __init__(self, mode, yolo, io_out=None, speaker="scout",
                  resume_thread_id=None, on_thread_id=None, trace=None,
@@ -2395,8 +2321,7 @@ class CodexSession:
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
-        # internal=True renders this whole session's turns on the dim internal
-        # channel (reviewer/advisor); role sessions stay False and mark inline.
+        # internal=True marks a reviewer/advisor/evaluator session (not a lead).
         self.internal = internal
         self.thread_id = resume_thread_id
         self.on_thread_id = on_thread_id
@@ -2514,7 +2439,6 @@ class CodexSession:
         # -- so it becomes null again after reap, never left dangling.
         self._live_proc = proc
         events = []
-        tty = ui.is_tty(self.io_out)
         wrote_label = {"done": False}
         no_first_token = False
         # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple):
@@ -2549,63 +2473,47 @@ class CodexSession:
             self, "_first_token_deadline_seconds", 30.0)
         try:
             try:
-                with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
-                    while True:
-                        if first_token_seen:
-                            raw_line = line_queue.get()
-                        else:
-                            remaining = first_token_deadline - time.monotonic()
-                            if remaining <= 0:
-                                spin.stop()
-                                no_first_token = True
-                                break
-                            try:
-                                raw_line = line_queue.get(timeout=remaining)
-                            except queue_module.Empty:
-                                continue
-                        if raw_line is None:
-                            break  # EOF
-                        first_token_seen = True
-                        line = raw_line.strip()
-                        if not line:
-                            continue
+                while True:
+                    if first_token_seen:
+                        raw_line = line_queue.get()
+                    else:
+                        remaining = first_token_deadline - time.monotonic()
+                        if remaining <= 0:
+                            no_first_token = True
+                            break
                         try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
+                            raw_line = line_queue.get(timeout=remaining)
+                        except queue_module.Empty:
                             continue
-                        events.append(obj)
-                        parsed = parse_codex_event(obj)
+                    if raw_line is None:
+                        break  # EOF
+                    first_token_seen = True
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    events.append(obj)
+                    parsed = parse_codex_event(obj)
 
-                        def _emit(text, render=True):
-                            spin.stop()
-                            if not wrote_label["done"]:
-                                # A surfaced internal block (reviewer/advisor) gets a
-                                # faint lead-in gap above its label so it doesn't
-                                # crowd the agent text before it (no-op off a TTY).
-                                if self.internal:
-                                    ui.internal_lead_in(self.io_out, tty)
-                                self.io_out.write(ui.label(self.speaker, tty))
-                                wrote_label["done"] = True
-                            if render:
-                                ui.render_markdown(self.io_out, text, enabled=tty,
-                                                   internal=self.internal)
-                            else:
-                                self.io_out.write(text + "\n")
-                            self.io_out.flush()
+                    def _emit(text, render=True):
+                        if not wrote_label["done"]:
+                            self.io_out.write(speaker_label(self.speaker))
+                            wrote_label["done"] = True
+                        if render:
+                            transcript.write_reply(self.io_out, text)
+                        else:
+                            self.io_out.write(text + "\n")
+                        self.io_out.flush()
 
-                        if parsed["kind"] == "message" and parsed.get("text"):
-                            _emit(parsed["text"])
-                        elif parsed["kind"] == "denied":
-                            _emit(denial_message(), render=False)
-                        elif parsed["kind"] == "error":
-                            _emit("[error] " + (parsed.get("text") or ""), render=False)
-                        elif parsed["kind"] == "tool" and not wrote_label["done"]:
-                            # Reflect tool activity in the spinner while it's live
-                            # (it stops on the first emitted message and never
-                            # restarts — codex emits its message at turn end).
-                            spin.set_label("%s %s" % (self.speaker, parsed["label"]))
-                        elif parsed["kind"] == "tool_done" and not wrote_label["done"]:
-                            spin.set_label("%s working" % self.speaker)
+                    if parsed["kind"] == "message" and parsed.get("text"):
+                        _emit(parsed["text"])
+                    elif parsed["kind"] == "denied":
+                        _emit(denial_message(), render=False)
+                    elif parsed["kind"] == "error":
+                        _emit("[error] " + (parsed.get("text") or ""), render=False)
                 if no_first_token:
                     _terminate(proc)
                 else:
@@ -2938,7 +2846,6 @@ class OpencodeSession:
         # -- so it becomes null again after reap, never left dangling.
         self._live_proc = proc
         events = []
-        tty = ui.is_tty(self.io_out)
         wrote_label = {"done": False}
         no_first_token = False
         # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple),
@@ -2970,59 +2877,48 @@ class OpencodeSession:
             self, "_first_token_deadline_seconds", 30.0)
         try:
             try:
-                with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
-                    while True:
-                        if first_token_seen:
-                            raw_line = line_queue.get()
-                        else:
-                            remaining = first_token_deadline - time.monotonic()
-                            if remaining <= 0:
-                                spin.stop()
-                                no_first_token = True
-                                break
-                            try:
-                                raw_line = line_queue.get(timeout=remaining)
-                            except queue_module.Empty:
-                                continue
-                        if raw_line is None:
-                            break  # EOF
-                        first_token_seen = True
-                        line = raw_line.strip()
-                        if not line:
-                            continue
+                while True:
+                    if first_token_seen:
+                        raw_line = line_queue.get()
+                    else:
+                        remaining = first_token_deadline - time.monotonic()
+                        if remaining <= 0:
+                            no_first_token = True
+                            break
                         try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
+                            raw_line = line_queue.get(timeout=remaining)
+                        except queue_module.Empty:
                             continue
-                        events.append(obj)
-                        parsed = parse_opencode_event(obj)
+                    if raw_line is None:
+                        break  # EOF
+                    first_token_seen = True
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    events.append(obj)
+                    parsed = parse_opencode_event(obj)
 
-                        def _emit(text, render=True):
-                            spin.stop()
-                            if not wrote_label["done"]:
-                                if self.internal:
-                                    ui.internal_lead_in(self.io_out, tty)
-                                self.io_out.write(ui.label(self.speaker, tty))
-                                wrote_label["done"] = True
-                            if render:
-                                ui.render_markdown(self.io_out, text, enabled=tty,
-                                                   internal=self.internal)
-                            else:
-                                self.io_out.write(text + "\n")
-                            self.io_out.flush()
+                    def _emit(text, render=True):
+                        if not wrote_label["done"]:
+                            self.io_out.write(speaker_label(self.speaker))
+                            wrote_label["done"] = True
+                        if render:
+                            transcript.write_reply(self.io_out, text)
+                        else:
+                            self.io_out.write(text + "\n")
+                        self.io_out.flush()
 
-                        if parsed["kind"] == "message" and parsed.get("text"):
-                            _emit(parsed["text"])
-                        elif parsed["kind"] == "denied":
-                            _emit(denial_message(), render=False)
-                        elif parsed["kind"] == "error":
-                            _emit("[error] " + (parsed.get("text") or ""),
-                                  render=False)
-                        elif parsed["kind"] == "tool" and not wrote_label["done"]:
-                            spin.set_label("%s %s" % (self.speaker, parsed["label"]))
-                        elif (parsed["kind"] == "tool_done"
-                              and not wrote_label["done"]):
-                            spin.set_label("%s working" % self.speaker)
+                    if parsed["kind"] == "message" and parsed.get("text"):
+                        _emit(parsed["text"])
+                    elif parsed["kind"] == "denied":
+                        _emit(denial_message(), render=False)
+                    elif parsed["kind"] == "error":
+                        _emit("[error] " + (parsed.get("text") or ""),
+                              render=False)
                 if no_first_token:
                     _terminate(proc)
                 else:

@@ -20,16 +20,16 @@ Use a configurable runtime root outside the target repository by default:
 ```
 
 Keep this directory separate from Cowork's own project-local
-`.cowork/session*.json` anchor and `~/.cowork/sessions/<uuid>/` assets. A
-controller may reference Cowork artifacts, but must not overwrite them.
+`.cowork/session*.json` anchor and `~/.cowork/sessions/<uuid>/` assets. The
+supervisor may reference Cowork artifacts, but must not overwrite them.
 
 ## Ownership
 
-Only the deterministic controller writes `state.json`, `events.jsonl`,
+Only the supervisor writes `state.json`, `events.jsonl`,
 `digest.json`, `escalation.json`, `capacity.json`, and the accepted
 authority/receipt bindings.
 Append events; use atomic replacement for JSON snapshots. The event journal is
-the durable transition record; CLI/UI status is an adapter view, not authority.
+the durable transition record; CLI output is an adapter view, not authority.
 
 Workers may propose `plan.md` and `result.json`. An independent reviewer may
 write `review.json`. Validate every worker artifact before ingesting it into
@@ -44,7 +44,7 @@ Use a `schema_version` and `package_id` in every JSON artifact.
 | --- | --- |
 | `brief.md` | objective; in/out scope; allowed paths; invariants; deterministic gates; delegated judgment/publish policy; `subscription_only` capacity policy; discovery/build/correction package limits |
 | `authority.json` | base and current candidate digest; issue/decision references; immutable finding IDs; amendments; delegated capabilities/policy principal; authority status |
-| `state.json` | backend; actor-neutral phase; role; controller/model identity when available; worktree; process/session ID; timestamps; last artifact hash; pause/recovery count; package-limit counters; verified provider-capacity policy and active capacity packet reference when applicable |
+| `state.json` | backend (`cowork`; a package Cowork cannot run is `blocked` before dispatch); actor-neutral phase; role; controller/model identity when available; worktree; process/session ID; timestamps; last artifact hash; pause/recovery count; package-limit counters; verified provider-capacity policy and active capacity packet reference when applicable |
 | `plan.md` | proposed steps, affected paths, checks, assumptions, risks, and finding mapping |
 | `result.json` | candidate digest; changed paths; commands/checkpoints and exit facts; receipt references; remaining limitations; worker self-assessment |
 | `review.json` | reviewed candidate digest; independent verdict; findings with severity and evidence; required corrections |
@@ -88,10 +88,15 @@ manual-resume condition. Scheduled recovery is `awaiting_capacity ->
 preflighting -> running` after a once-only wake preflight verifies every
 binding. Manual recovery requires a capacity-available signal, bound to the
 same packet and journaled by an authenticated external application or top-level
-authority adapter. The fallback agent-operated CLI must reject self-asserted
+authority adapter. An agent-operated CLI must reject self-asserted
 human principals/tokens; workers and orchestrators may neither fabricate nor
-verify the signal. Until the adapter event exists, generic launch/resume is
-blocked. The signal authorizes timing only, never credit, spend, or overage.
+verify the signal. Only `resume-trigger` replays the turn, and only once the
+signed signal is journaled (see the manual adapter in the
+[self-hosting runner](bootstrap-backend.md#recovery) reference). While the
+capacity lease is live, the supervisor never runs a plain launch or resume of
+that session: the runtime refuses one only when the paused turn holds a pending
+decision (`decision_bindings`), and otherwise a plain resume can resend the
+role despite the live lease. The signal authorizes timing only, never credit, spend, or overage.
 Unknown or untrustworthy metadata must stay in manual mode, never claim a reset
 or schedule a speculative retry.
 
@@ -170,10 +175,12 @@ external application/top-level authority adapter. It must include:
 The wake lease is consumed once only after a binding-preserving preflight.
 `manual_signal` has no wake lease. The authenticated outer adapter journals the
 signal once with source identity and packet/candidate/session/policy bindings
-before preflight. A fallback CLI command that accepts a caller-supplied human
-principal or token is not an accepted source. Workers/orchestrators cannot
+before preflight. An agent-operated CLI command that accepts a caller-supplied
+human principal or token is not an accepted source. Workers/orchestrators cannot
 write or validate this event. Duplicate observers may report the wait but may
-not launch another resume; generic launch/resume must fail while it is absent.
+not launch another resume. While it is absent the supervisor must not use
+generic launch/resume; the runtime refuses that only when the paused turn holds
+a pending decision.
 A failed wake or absent signal stays `awaiting_capacity` or enters a truthful
 non-capacity failure state; it does not become `needs_authority` merely because
 time passed.
@@ -191,7 +198,8 @@ original finding and append a disposition or replacement finding.
 
 Keep `digest.json` below 6,000 characters. Include only:
 
-- package ID, backend, phase, and terminal/non-terminal state;
+- package ID, backend (`cowork`, since a blocked package never dispatches),
+  phase, and terminal/non-terminal state;
 - last meaningful activity and age;
 - worktree and candidate digest;
 - changed-path list or count plus diff statistics;

@@ -38,9 +38,17 @@ _DECISION_KEYS = frozenset({
 _REFUSAL_CODES = frozenset({
     "controller_not_allowed", "controller_tool_missing",
     "probe_failed", "capability_missing",
+    # Issue #64: the single-writer owner gate. `session_not_owned` is the
+    # durable lease refusal; `provider_session_bound` is the proven
+    # provider-conversation collision. Both are additive -- no pre-existing
+    # code is renamed or renumbered.
+    "session_not_owned", "provider_session_bound",
 })
 _REFUSAL_SOURCES = frozenset({
     "policy_guard", "preflight", "probe", "bridge_backstop",
+    # Issue #64: the owner lease is its own refusal source, distinct from the
+    # policy guard it is evaluated AHEAD of.
+    "owner_lease",
 })
 
 _ATTEMPT_LINK_KEYS = frozenset({
@@ -236,14 +244,21 @@ def _validate_fact(fact, name):
 # Reducer
 # ---------------------------------------------------------------------------
 
-def decide(contract, policy_result=None, preflight_result=None, probe_result=None,
-           manifest_id=None):
+def decide(contract, owner_result=None, policy_result=None,
+           preflight_result=None, probe_result=None, manifest_id=None):
     """Validate contract and facts, then produce a DispatchDecision.
 
-    Evaluates facts in strict order: policy_result, preflight_result,
-    probe_result. The first fact with allowed=False maps its three refusal
-    fields verbatim into a normalized refuse decision. With no refused fact,
-    returns a normalized allow decision.
+    Evaluates facts in strict order: owner_result, policy_result,
+    preflight_result, probe_result. The first fact with allowed=False maps its
+    three refusal fields verbatim into a normalized refuse decision. With no
+    refused fact, returns a normalized allow decision.
+
+    `owner_result` (issue #64) is the single-writer ownership fact and is
+    evaluated FIRST, ahead of the policy guard: a process that does not hold
+    the session's owner lease must be refused BEFORE any other fact can allow
+    a paid dispatch. It defaults to None, and None contributes no fact at all
+    -- which is what makes every pre-existing caller, and every run that never
+    acquired a lease (`--no-session`), byte-behaviour-identical.
 
     `manifest_id` is optional traceability: when provided it is copied into
     `trace_event_id` and never changes the decision outcome.
@@ -253,6 +268,7 @@ def decide(contract, policy_result=None, preflight_result=None, probe_result=Non
     normalized = validate_dispatch_contract(contract)
 
     named_facts = [
+        ("owner_result", owner_result),
         ("policy_result", policy_result),
         ("preflight_result", preflight_result),
         ("probe_result", probe_result),

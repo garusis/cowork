@@ -71,21 +71,12 @@ import cowork_bridge as bridge  # noqa: E402
 import cowork_measure as measure  # noqa: E402
 import cowork_report as report  # noqa: E402
 import cowork_state as state_store  # noqa: E402
-import cowork_ui as ui  # noqa: E402
+import cowork_transcript as transcript  # noqa: E402
 import cowork_watchdog as watchdog  # noqa: E402
 
 
 def _uuid():
     return str(uuid.uuid4())
-
-
-class FakeTTY(io.StringIO):
-    """A StringIO that claims to be a terminal -- the repo's own established
-    "real TTY shape" convention, reproduced independently here (matches
-    `cowork_ui.is_tty`'s own docstring)."""
-
-    def isatty(self):
-        return True
 
 
 class RecordingTrace:
@@ -1182,12 +1173,12 @@ class SevenRequiredDeterministicFixturesTest(unittest.TestCase):
             hung_ps_evidence="ps:pid=9,ppid=1,stat=Z")
         self.assertEqual(hard["verdict"], "hard_stall_eligible")
 
-    def test_7_cross_surface_equivalence_interactive_headless_report(self):
-        """Interactive (off-TTY plain text), headless, and report facts,
-        built from the SAME durable evidence via the real Package B/A/D/E
-        production functions -- an independent re-derivation of Package
-        D's own three-way fixture (M4R-C01), fresh fixture data, no shared
-        helper imported from `test_cowork_activity_cross_surface.py`."""
+    def test_7_cross_surface_equivalence_transcript_and_report(self):
+        """Transcript and report facts, built from the SAME durable evidence
+        via the real Package B/A/D/E production functions -- an independent
+        re-derivation of Package D's own fixture (M4R-C01), fresh fixture
+        data, no shared helper imported from
+        `test_cowork_activity_cross_surface.py`."""
         root = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         prior_root = os.environ.get("COWORK_SESSIONS_ROOT")
@@ -1213,41 +1204,21 @@ class SevenRequiredDeterministicFixturesTest(unittest.TestCase):
             current["activity_record"], decision, schedule_record,
             current["reconciliation_record"])
 
-        interactive_out = io.StringIO()
-        ui.render_compact_activity(interactive_out, compact_state,
-                                   enabled=False)
-        headless_out = io.StringIO()
-        ui.render_headless_activity(headless_out, compact_state)
+        transcript_out = io.StringIO()
+        transcript.render_activity(transcript_out, compact_state)
 
         record = measure.build_record(session_uuid)
         report_text = "\n".join(report._section_activity(record))
 
-        for text in (interactive_out.getvalue(), headless_out.getvalue(),
-                    report_text):
+        for text in (transcript_out.getvalue(), report_text):
             self.assertIn("opencode", text)
         self.assertIn("degraded", report_text)
-        self.assertIn("local tool work", interactive_out.getvalue())
-        self.assertIn("local tool work", headless_out.getvalue())
+        self.assertIn("local tool work", transcript_out.getvalue())
         self.assertIn("local_tool_work", report_text)
         self.assertEqual(record["activity"]["source"], "opencode")
         self.assertEqual(record["activity"]["provider_health"], "degraded")
         self.assertEqual(record["activity"]["activity_class"],
                          "local_tool_work")
-
-    def test_7b_ttyness_never_changes_headless_facts(self):
-        """`render_headless_activity` must never branch on `isatty()` --
-        the same compact_state renders identically whether `io_out` is a
-        real-pty-shaped double or a plain StringIO."""
-        work_id = _uuid()
-        compact_state = activity.project_compact_state(
-            _activity_record(work_id, activity_class="owned_verification"),
-            _watchdog_decision(work_id), _schedule_record(work_id))
-        plain_out = io.StringIO()
-        ui.render_headless_activity(plain_out, compact_state)
-        tty_out = FakeTTY()
-        ui.render_headless_activity(tty_out, compact_state)
-        self.assertEqual(plain_out.getvalue(), tty_out.getvalue())
-
 
 # =============================================================================
 # 12. Shutdown-event reuse across two `run_flow` calls in one process.
@@ -1278,10 +1249,10 @@ class ShutdownEventReuseAcrossRunsTest(unittest.TestCase):
         shutil.rmtree(self._root, ignore_errors=True)
 
     @staticmethod
-    def _headless_args(controller="claude"):
+    def _run_args(controller="claude"):
         return cowork.build_parser().parse_args(
-            ["--team", "scout", "--config", "scout=%s,yolo,plan" % controller,
-             "--context", "hi", "--no-session", "--headless"])
+            ["--team", "scout,scout-reviewer", "--config", "scout=%s,yolo,plan" % controller,
+             "--context", "hi", "--no-session"])
 
     def test_leaked_shutdown_event_from_a_prior_run_never_suppresses_a_later_one(self):
         def _kill_mid_run(config, context, selected, on_outcome=None,
@@ -1292,7 +1263,7 @@ class ShutdownEventReuseAcrossRunsTest(unittest.TestCase):
 
         with self.assertRaises(SystemExit) as ctx:
             cowork.run_flow(
-                self._headless_args(), io_out=io.StringIO(),
+                self._run_args(), io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c, run_scout_fn=_kill_mid_run)
         self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
         self.assertTrue(cowork._ACTIVITY_SHUTDOWN_EVENT.is_set())
@@ -1314,21 +1285,20 @@ class ShutdownEventReuseAcrossRunsTest(unittest.TestCase):
         # this closure captures the ACTUAL value `run_flow` supplies, never
         # a pre-guessed/shadowed local, since a same-named kwarg here would
         # otherwise silently shadow an outer variable of the same name.
-        def _second_run(config, context, selected, io_in=None, io_out=None,
+        def _second_run(config, context, selected, io_out=None,
                         on_outcome=None, on_session=None, resume_id=None,
                         session_uuid=None, **kw):
             captured["session_uuid"] = session_uuid
             cowork._role_loop(
                 _AcceptingSession(), "seed",
                 os.path.join(tempfile.mkdtemp(), "status.json"), context="",
-                io_in=io.StringIO(""), io_out=io_out, headless=True,
-                session_uuid=session_uuid, role_work_id=work_id, role="scout")
+                io_out=io_out, session_uuid=session_uuid, role_work_id=work_id, role="scout")
             return 0
 
         rc = cowork.run_flow(
-            self._headless_args(), io_out=io.StringIO(),
+            self._run_args(), io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=_second_run)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertIsNotNone(captured.get("session_uuid"))
         # The second, genuinely healthy run must NOT have had its own
         # turn-boundary activity append suppressed by the first run's
@@ -1359,21 +1329,20 @@ class ShutdownEventReuseAcrossRunsTest(unittest.TestCase):
             def close(self):
                 pass
 
-        def _run_scout(config, context, selected, io_in=None, io_out=None,
+        def _run_scout(config, context, selected, io_out=None,
                        on_outcome=None, on_session=None, resume_id=None,
                        session_uuid=None, **kw):
             captured["session_uuid"] = session_uuid
             cowork._role_loop(
                 _AcceptingSession(), "seed",
                 os.path.join(tempfile.mkdtemp(), "status.json"), context="",
-                io_in=io.StringIO(""), io_out=io_out, headless=True,
-                session_uuid=session_uuid, role_work_id=work_id, role="scout")
+                io_out=io_out, session_uuid=session_uuid, role_work_id=work_id, role="scout")
             return 0
 
         rc = cowork.run_flow(
-            self._headless_args(), io_out=io.StringIO(),
+            self._run_args(), io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=_run_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertIsNotNone(captured.get("session_uuid"))
         history = state_store.read_activity_history(
             captured["session_uuid"], work_id)

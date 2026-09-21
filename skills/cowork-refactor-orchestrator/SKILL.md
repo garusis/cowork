@@ -1,6 +1,6 @@
 ---
 name: cowork-refactor-orchestrator
-description: Supervise bounded, agent-first engineering work packages for the Cowork workflow-refactor roadmap. Use when asked to orchestrate, prepare, launch, monitor, adjudicate gates, intervene in, collect, cancel, or dogfood a direct-Claude or Cowork-backed worker run for that refactor. Use for evidence packets, delegated-authority decisions, and recovery; do not use for ordinary Cowork CLI invocation, generic session forensics, routine coding, or a generic plan/build task.
+description: Supervise bounded, agent-first engineering work packages for the Cowork workflow-refactor roadmap. Use when asked to orchestrate, prepare, launch, monitor, adjudicate gates, intervene in, collect, cancel, or dogfood a Cowork-backed worker run for that refactor. Use for evidence packets, delegated-authority decisions, and recovery; do not use for ordinary Cowork CLI invocation, generic session forensics, routine coding, or a generic plan/build task.
 ---
 
 # Cowork Refactor Orchestrator
@@ -14,9 +14,9 @@ debugging, and first-pass review to bounded workers.
 
 Humans are optional top-level authority principals and emergency overrides,
 never ordinary lifecycle actors. JSON/schema artifacts and the append-only
-event journal are the control-plane interface. CLI and UI surfaces are
-observability and emergency-control adapters; they must not be the only source
-of phase truth or authority.
+event journal are the control-plane interface. Cowork's run-result record and
+durable session state are evidence inputs; CLI output is an observability
+adapter and must not be the only source of phase truth or authority.
 
 The normal path is: deterministic validation → supervisor-agent adjudication
 within delegated authority → `completed`. Collection is evidence ingestion,
@@ -60,9 +60,9 @@ intrinsically forbidden. A package with `no-publish` authority must not commit,
 push, open a pull request, or publish externally; a later package may perform a
 candidate-bound publication action only when its policy explicitly grants it.
 
-Use `cowork-cli` only for an eligible Cowork backend launch or report. Use
-`cowork-debug` only after compact evidence shows an inconsistency that requires
-forensics. Do not duplicate either skill's command recipes or log-reading
+Use `cowork-cli` for Cowork launch, decision, resume, and report mechanics.
+Use `cowork-debug` only after compact evidence shows an inconsistency that
+requires forensics. Do not duplicate either skill's command recipes or log-reading
 workflow.
 
 ## Work-package lifecycle
@@ -83,34 +83,43 @@ combine a roadmap milestone with unrelated cleanup.
    spending, overage, or permission to amend a limit.
 4. Create an authority record that freezes the base/candidate identity and
    records findings or amendments.
-5. Use `cowork-orchestrate` to validate the current release-bound gate and
-   select the backend. A previous milestone number is never eligibility proof.
-   Use the [self-hosting fallback](references/bootstrap-backend.md) when the
-   package changes the gate, dispatch, phase-truth, guard, or recovery mechanism
-   being relied on, or when current gate evidence is absent or invalid. Read
-   [Cowork backend gate](references/cowork-backend-gate.md) for an eligible
-   Cowork package.
+5. Run `cowork --check` on the runner that will execute the package; a failed
+   preflight blocks the package. Use the
+   [Cowork self-hosting runner](references/bootstrap-backend.md) — a frozen
+   stable runner driving an isolated target worktree — when the package changes
+   the dispatch, phase-truth, guard, or recovery mechanism being relied on.
 
-Use a deterministic controller helper for `prepare` when it exists. Until the
-helper exists, perform its filesystem and process steps explicitly and record
-the same artifacts. Never make a worker responsible for controller state.
+Perform these filesystem steps explicitly and record the artifacts. Never
+make a worker responsible for controller state.
 
 ### Launch
 
-Launch one bounded role at a time: investigator or planner, then builder, then
-an independent reviewer. Give each worker the brief, relevant authority,
-targeted artifacts, and a result schema—not previous chat transcripts. The
-supervisor advances an `awaiting_gate` package automatically when all required
-evidence validates and delegated policy permits the next transition.
+Cowork dispatches paired teams, not standalone roles. Every new session begins
+in scouting, so its team includes `scout` and `scout-reviewer`, and each lead
+on the team brings its reviewer. Select one of:
+
+- `scout,scout-reviewer` for investigation (the scout adds a lightweight plan
+  when no planner is on the team);
+- `scout,scout-reviewer,planner,planning-advisor` when the plan is the
+  deliverable;
+- all six roles (the default team) when the package authorizes implementation.
+
+A later phase continues the same session through its saved session file; a
+fresh session starts scouting again. Give the session the brief, relevant
+authority, targeted artifacts, and a result schema—not previous chat
+transcripts. The paired reviewer's approval is the phase gate inside Cowork;
+the supervisor's independent review of the approved candidate sits on top of
+it and is never delegated back to the builder. The supervisor advances an
+`awaiting_gate` package automatically when all required evidence validates and
+delegated policy permits the next transition.
 
 Persist the exact backend, role, model/controller identity when available,
 worktree, process/session identifier, start time, package limit, and
 verified provider capacity policy before dispatch.
 Reject an out-of-scope expansion; create a new or amended package instead.
 
-Use a deterministic controller helper for `launch` when available. It must
-record process lifecycle and must not silently reuse a different role or
-candidate.
+Record the launch process lifecycle yourself, and never silently reuse a
+different session, team, or candidate.
 
 ### Status and inspect
 
@@ -140,14 +149,12 @@ Limit a package to one bounded builder correction before independent review or
 a delegated-policy decision. Do not send a third same-provider retry after a
 provider-health failure. For a verified subscription quota with trustworthy
 retry/reset metadata, write `awaiting_capacity` and schedule exactly one
-candidate-bound wake instead of consuming a repair turn. Without trustworthy
-reset metadata, persist a durable manual-resume condition and wait for an
-authenticated capacity-available signal from an external application or
-top-level authority adapter. The fallback CLI must not accept a self-asserted
-human identity, principal, or token, and the worker/orchestrator must never
-fabricate or verify that signal. Until such an adapter journals it, remain
-waiting and block generic launch/resume. The signal controls timing only; it
-never changes credits, spending, or provider entitlement.
+candidate-bound wake instead of consuming a repair turn; the capacity recovery
+path is described in the [self-hosting runner](references/bootstrap-backend.md#recovery)
+reference. Without trustworthy reset metadata, wait for a signed manual
+capacity signal; never sign, fabricate, or self-assert one. The signal
+controls timing only; it never changes credits, spending, or provider
+entitlement.
 
 ### Collect
 
@@ -169,24 +176,28 @@ worker safely, preserve artifacts/log references, write a terminal reason, and
 leave the worktree unchanged except for the worker's existing uncommitted edits.
 Never erase a worktree or session artifacts automatically.
 
-## Backend selection
+## Backend
 
-Select the backend from current release-bound evidence through
-`cowork-orchestrate`; do not route by roadmap milestone number. Even after a
-global PASS, use `direct-claude` for a self-hosting package whose changes would
-invalidate or circularly rely on Cowork's own dispatch, phase-truth, backend
-gate, guard, or recovery contract. Use separate fresh worker sessions for
-planning, building, and review, and treat their output as advisory until the
-supervisor validates it.
+Cowork is the transport for every package. A package that Cowork cannot run
+(failed preflight, missing controller, unrecoverable runtime failure) stops as
+`blocked` with the named reason; it never re-routes. A direct Claude session is
+used only when the user explicitly asks for it for that work.
 
-Use Cowork only after its backend gate passes for the task. Launch it through
-the established `cowork-cli` skill with an explicit context file and saved
-session anchor. Begin with one package/worktree and the smallest appropriate
-profile; do not make a static six-role topology the default.
+A self-hosting package — one whose changes would circularly rely on Cowork's
+own dispatch, phase-truth, guard, or recovery contract — still runs on Cowork,
+launched from the frozen stable runner against an isolated target worktree.
+Use one paired-team session for the package and treat its approvals as
+advisory until the supervisor validates them and completes its own independent
+review.
 
-Read [Cowork backend gate](references/cowork-backend-gate.md) before using
-Cowork and [self-hosting fallback](references/bootstrap-backend.md) before a
-direct-Claude self-hosting package.
+Launch through `cowork-cli` with an explicit context file and keep the session
+anchor for recovery. Start with the smallest risk-appropriate team; promote
+roles only when risk, ambiguous ownership, failed evidence, scope growth, or an
+explicit assurance requirement warrants it, and never by removing authority,
+candidate binding, or evidence. Turn off nonessential evaluation overhead
+during early dogfooding. Only rc 0 with `approved: true` is an approved phase;
+the supervisor still validates authority, candidate binding, limits, gate
+evidence, and the final collection packet.
 
 ## Wake and escalation rules
 
@@ -214,7 +225,7 @@ local safety guard must not be relabeled as provider capacity. Guard exhaustion
 is neither a capacity signal nor an authority request: do not resume it, raise
 it, or reinterpret it as permission to spend. It is terminal under every
 authority amendment. Finish through an already-authorized alternate
-evidence/backend route as a new attempt, or fail closed.
+evidence route as a new attempt, or fail closed.
 Do not use `awaiting_approval` or human-shaped normal-path states.
 
 ## Context and output limits

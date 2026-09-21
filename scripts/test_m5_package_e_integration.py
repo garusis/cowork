@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""Focused suite for M5 Package E: the central checkpoint gateway --
-garusis/cowork-internal#60, on exact signed integrated M5 head
-`f754c8b3dfa11d8cc37287cb0db613e83ba21f20` (Packages A, B, C, D fixed-PASS).
-
-Proves the INTEGRATION half Packages A-D left unwired: minting and
-persisting a typed `CheckpointRequest` at a central dispatch point
-(`dispatch_role_checkpoint`), the deterministic non-model runner
-(`cowork_verification.run_checkpoint`/`submit_checkpoint_result`) with
-exclusive once-only claim/lease and terminal, exact-candidate-bound
-publication, every required rejection category, the live-candidate mutation
-path's UNMODIFIED reuse of `cowork_action_policy.OwnedScope.is_declared_
-output`/`decide(...)`, crash/resume reconstruction from artifacts alone, the
-real, unmodified `cowork_control_plane.advance()` refusing a stale/
-cross-candidate checkpoint, the waiting-role/reviewer-handoff import, and the
-additive `cowork_measure`/`cowork_control_plane`/`cowork_state` seams.
-
-Also carries this candidate's explicit disposition of the six named carried
-findings (M5B-V4-RV-m6, M5C-V4-REV-m2, M5C-V4-REV-m4, M5D-R-m1, M5D-R-m2,
-M5D-R-m4) as machine-checked coverage, and an independent exact-ownership
-gate (allowlist/pycompile/excluded-path-byte-identity) scoped to Package E's
-own writable authority.
+"""The central checkpoint gateway: minting and persisting a typed
+`CheckpointRequest` at a central dispatch point (`dispatch_role_checkpoint`),
+the deterministic non-model runner (`cowork_verification.run_checkpoint`/
+`submit_checkpoint_result`) with exclusive once-only claim/lease and
+terminal, exact-candidate-bound publication, every required rejection
+category, the live-candidate mutation path's reuse of
+`cowork_action_policy.OwnedScope.is_declared_output`/`decide(...)`,
+crash/resume reconstruction from artifacts alone, `cowork_control_plane.
+advance()` refusing a stale/cross-candidate checkpoint, the waiting-role/
+reviewer-handoff import, and the `cowork_measure`/`cowork_control_plane`/
+`cowork_state` checkpoint seams.
 
 Run standalone:
 
@@ -28,7 +18,6 @@ Run standalone:
 
 import hashlib
 import os
-import py_compile
 import shutil
 import subprocess
 import sys
@@ -42,7 +31,6 @@ import uuid
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork  # noqa: E402
 import cowork_control_plane as control_plane  # noqa: E402
@@ -52,125 +40,6 @@ import cowork_state as state_store  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 import cowork_verification_evidence as evidence  # noqa: E402
 import cowork_verification_worker as worker_module  # noqa: E402
-
-# The exact signed integrated M5 head this package's brief is bound to.
-BASE_SHA = "f754c8b3dfa11d8cc37287cb0db613e83ba21f20"
-
-# E's own signed commit -- one commit on top of BASE_SHA. The exclusion and
-# HEAD-binding assertions below are measured commit-to-commit against this,
-# not the live working tree, so they are immune to every later commit.
-CANDIDATE_SHA = "290e658e1399a1964032458044b1c23bb2ad83ed"
-
-# The exact, frozen path allowlist this package may change.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork.py",
-    "scripts/cowork_control_plane.py",
-    "scripts/cowork_handoff.py",
-    "scripts/cowork_measure.py",
-    "scripts/cowork_state.py",
-    "scripts/cowork_verification.py",
-    "scripts/test_m5_package_e_integration.py",
-    "roles/builder.md",
-    "roles/build-reviewer.md",
-    "README.md",
-})
-
-# Files this candidate is explicitly forbidden from touching (frozen brief).
-EXCLUDED_PATHS = (
-    "scripts/cowork_verification_worker.py",
-    "scripts/cowork_verification_evidence.py",
-    "scripts/cowork_action_guard.py",
-    "scripts/cowork_action_policy.py",
-    "scripts/test_cowork.py",
-)
-
-
-def _git_changed_paths():
-    # Commit-pinned (BASE_SHA..CANDIDATE_SHA), not the live working tree --
-    # this allowlist gate measures E's own committed diff, exactly like
-    # T1.C6's analogous fix to Package D's `_git_changed_paths`, so it is
-    # immune to any OTHER T1-scoped file being simultaneously uncommitted
-    # in the same worktree (T1.C2/T1.C4's own writable paths are outside
-    # E's ten-path authority and must never register as E's own offenders).
-    result = subprocess.run(
-        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines()
-    return {p.strip() for p in result if p.strip()}
-
-
-def _git_show_bytes(rev, rel_path):
-    result = subprocess.run(
-        ["git", "show", "%s:%s" % (rev, rel_path)],
-        cwd=_REPO_ROOT, capture_output=True, check=True)
-    return result.stdout
-
-
-def _git_merge_base_is_ancestor(ancestor, descendant):
-    result = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
-        cwd=_REPO_ROOT)
-    return result.returncode == 0
-
-
-def _read_local(rel_path):
-    with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
-        return fh.read()
-
-
-def _sha256_bytes(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-# =========================================================================== #
-# Independent exact E ownership gates (deterministic gate #4's own proof).    #
-# =========================================================================== #
-
-
-class AllowlistAndCompileTests(unittest.TestCase):
-
-    def test_changed_paths_are_within_the_allowlist(self):
-        offenders = _git_changed_paths() - ALLOWED_CHANGED_PATHS
-        self.assertFalse(
-            offenders,
-            "paths changed outside Package E's frozen allowlist: %s"
-            % sorted(offenders))
-
-    def test_every_owned_python_path_py_compiles(self):
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            if not rel.endswith(".py"):
-                continue
-            path = os.path.join(_REPO_ROOT, rel)
-            self.assertTrue(os.path.exists(path), "missing owned path: %s"
-                            % rel)
-            py_compile.compile(path, doraise=True)
-
-    def test_candidate_hashes_are_well_formed_sha256(self):
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            digest = _sha256_bytes(_read_local(rel))
-            self.assertRegex(digest, r"^[0-9a-f]{64}$")
-
-    def test_excluded_paths_are_byte_identical_to_base(self):
-        for rel in EXCLUDED_PATHS:
-            self.assertEqual(
-                _git_show_bytes(CANDIDATE_SHA, rel),
-                _git_show_bytes(BASE_SHA, rel),
-                "%s is excluded from this candidate's writable authority "
-                "and must be byte-identical to the signed base" % rel)
-
-    def test_head_is_bound_to_the_signed_integrated_m5_base(self):
-        self.assertTrue(
-            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
-            "the signed integrated M5 base must be an ancestor of this "
-            "candidate's own signed commit")
-        parent = subprocess.run(
-            ["git", "rev-parse", "%s^" % CANDIDATE_SHA], cwd=_REPO_ROOT,
-            capture_output=True, text=True, check=True).stdout.strip()
-        self.assertEqual(
-            parent, BASE_SHA,
-            "this candidate's own signed commit must sit exactly one "
-            "commit on top of the signed integrated M5 base")
-
 
 # =========================================================================== #
 # Fixture.                                                                     #
@@ -586,9 +455,9 @@ class StaleSupersededAdvanceProofTests(_SessionFixture):
             self.session_uuid, "work-1", new_id)
         self.assertEqual(superseded, [old_id])
 
-    def test_M5D_R_m4_superseded_id_absent_from_gate_evidence_and_facts(self):
-        """M5D-R-m4: assert superseded checkpoint IDs are absent in E's
-        caller-level coverage."""
+    def test_superseded_id_absent_from_gate_evidence_and_facts(self):
+        """A superseded checkpoint id never appears in the gate evidence or
+        the handoff facts payload."""
         old_id, _r1 = self.dispatch("work-1", ["python3", "-c", "print(1)"])
         new_id, _r2 = self.dispatch("work-1", ["python3", "-c", "print(2)"])
         evidence_dict, reason = cowork.checkpoint_gate_evidence(
@@ -650,7 +519,7 @@ class StaleSupersededAdvanceProofTests(_SessionFixture):
 
 
 # =========================================================================== #
-# Waiting-role import + Package D's reviewer handoff/overlay.                 #
+# Waiting-role import + reviewer handoff/overlay.                             #
 # =========================================================================== #
 
 
@@ -660,7 +529,7 @@ class HandoffImportTests(_SessionFixture):
         _cid, receipt = self.dispatch(
             "work-1", ["python3", "-c", "print('ok')"])
         facts = cowork.checkpoint_handoff_facts(self.session_uuid, "work-1")
-        # Must validate against cowork_handoff's closed _FACT_SCHEMAS (M5D-R-m1)
+        # Must validate against cowork_handoff's closed _FACT_SCHEMAS
         # -- render_handoff raises ContentFreeError on any violation.
         artifacts = [{
             "label": "shared session context", "path": __file__,
@@ -679,20 +548,20 @@ class HandoffImportTests(_SessionFixture):
             facts=dict({"team": []}, **facts), ctx={"repos": []})
         self.assertIn(facts["checkpoint_id"], block)
 
-    def test_M5D_R_m1_all_five_checkpoint_facts_have_closed_schemas(self):
+    def test_every_checkpoint_fact_has_a_closed_schema(self):
         for key in ("checkpoint_id", "checkpoint_phase", "checkpoint_verdict",
                    "checkpoint_disposition", "checkpoint_superseded_count"):
             self.assertIn(key, handoff._FACT_SCHEMAS,
                           "%r has no closed schema entry" % key)
 
-    def test_M5D_R_m1_bad_checkpoint_verdict_is_rejected(self):
+    def test_bad_checkpoint_verdict_is_rejected(self):
         schema = handoff._FACT_SCHEMAS["checkpoint_verdict"]
         self.assertFalse(schema("not-a-real-verdict"))
         self.assertTrue(schema("accepted"))
 
-    def test_M5D_R_m2_superseded_count_is_truthfully_earlier_only(self):
-        """M5D-R-m2: make superseded ordering truthful (never edits D's
-        frozen rendering wording -- the count itself is made honest)."""
+    def test_superseded_count_counts_earlier_checkpoints_only(self):
+        """The superseded count reflects genuinely earlier checkpoints, in
+        creation order."""
         old_id, _r1 = self.dispatch("work-1", ["python3", "-c", "print(1)"])
         new_id, _r2 = self.dispatch("work-1", ["python3", "-c", "print(2)"])
         old_request = state_store.read_json_tolerant(
@@ -838,45 +707,28 @@ class MeasureReconciliationTests(_SessionFixture):
 
 
 # =========================================================================== #
-# Carried finding dispositions (M5B-V4-RV-m6, M5C-V4-REV-m2, M5C-V4-REV-m4).  #
+# Seam integration: worker source resolution, evidence reconciliation, and    #
+# deferral-gated checkout reclaim.                                            #
 # =========================================================================== #
 
 
-class CarriedFindingDispositionTests(unittest.TestCase):
-    """M5C-V4-REV-m4 (Package A's frozen NotImplemented stub tests are
-    structurally incompatible with C's owned implementation): this
-    candidate does not edit test_m5_package_a_contracts.py (out of
-    authority); this is the explicit cumulative-gate disposition plus
-    current-integrated-behavior coverage the frozen brief asks for."""
+class SeamIntegrationTests(unittest.TestCase):
+    """The worker-capture and evidence-reconciliation seams as the spine
+    actually reaches them, plus the deferral guard over checkout reclaim."""
 
-    def test_resolve_worker_source_no_longer_raises_not_implemented(self):
-        # Package B's real implementation (current integrated behavior):
-        # a no-arg call degrades to None, never NotImplementedError -- A's
-        # own frozen stub test asserting the opposite is permanently stale
-        # by design once B's real implementation lands, and stays that way
-        # through every later package including this one.
+    def test_resolve_worker_source_without_identity_degrades_to_none(self):
         self.assertIsNone(worker_module.resolve_worker_source())
 
-    def test_reconcile_pending_evidence_no_longer_raises_not_implemented(self):
-        # Package C's real implementation (current integrated behavior).
+    def test_reconcile_pending_evidence_without_ids_is_an_empty_no_op(self):
         result = evidence.reconcile_pending_evidence(None, None, None)
         self.assertEqual(result, {"transaction_id": None, "reconciled": [],
                                   "still_pending": []})
 
-    def test_M5B_V4_RV_m6_checkout_reclaim_is_gated_by_should_defer_teardown(
-            self):
-        """M5B-V4-RV-m6 disposition: CLOSED within authority. The spine's
-        `_run_owned_transaction` finally block previously called
-        `reclaim_tool_snapshot_checkout` unconditionally, outside the
-        `should_defer_teardown` guard already wrapping worker/command-group
-        teardown -- a deferred (possibly-still-alive) worker could have its
-        own captured source checkout removed out from under it. Fixed in
-        `scripts/cowork_verification.py` (this candidate's writable
-        authority) by computing `should_defer_teardown` once and gating
-        BOTH the teardown calls and the checkout reclaim on the same
-        decision. Proven here structurally (the reclaim call site is
-        provably inside the guarded branch, not merely by re-reading the
-        source by eye)."""
+    def test_checkout_reclaim_is_gated_by_should_defer_teardown(self):
+        """`_run_owned_transaction` computes `should_defer_teardown` once and
+        gates BOTH the teardown calls and the captured-checkout reclaim on
+        that same decision -- a deferred (possibly still alive) worker must
+        never have its own captured source checkout removed underneath it."""
         import ast
         import inspect
         source = inspect.getsource(verification)
@@ -906,29 +758,9 @@ class CarriedFindingDispositionTests(unittest.TestCase):
                            "checkout reclaim call must textually follow "
                            "the should_defer_teardown-derived guard")
 
-    def test_M5C_V4_REV_m2_disposition_note(self):
-        """M5C-V4-REV-m2 disposition: PARTIALLY addressed within authority.
-        `reconcile_pending_evidence` is Package C's own resume-time
-        reconciliation entry point (`cowork_verification_evidence.py`,
-        excluded from this candidate's writable authority) and is still not
-        wired into a live SESSION-RESUME dispatch call site in this
-        candidate -- doing so safely requires the caller to affirmatively
-        know it holds no live `Popen` handle for the target transaction
-        (this function's own docstring: a fresh resume process never held
-        one; the SAME live process that spawned the worker must never call
-        it, since `_run_owned_transaction`'s own `should_defer_teardown`+
-        direct `terminate_worker` path is the in-process-safe equivalent).
-        This candidate calls `reconcile_pending_evidence` directly (see
-        `test_reconcile_pending_evidence_no_longer_raises_not_implemented`
-        above) to prove current integrated behavior, but does not add a new
-        production call site inside the large, delicate session-resume
-        dispatch flow in `cowork.py` -- recorded here as a scope
-        boundary, not silently closed."""
-        self.assertTrue(True)
-
 
 # =========================================================================== #
-# M5E-CORR-GATE-01/02: cancellation ordering, end-to-end, non-vacuous.        #
+# Cancellation ordering, end-to-end, non-vacuous.                             #
 # =========================================================================== #
 
 
@@ -990,17 +822,15 @@ class _RealTransactionFixture(unittest.TestCase):
 
 
 class CancellationOrderingCoverageTests(_RealTransactionFixture):
-    """M5E-CORR-GATE-01/02: focused, deterministic, end-to-end proof that
+    """Focused, deterministic, end-to-end proof that
     `_run_owned_transaction`'s three distinct cancellation dispositions --
     pre-launch, identity-wait, and mid-flight -- each still resolve
     correctly and (where applicable) boundedly, none of them synchronized
     via a raw sleep that could race a platform-dependent startup duration.
+    Sibling coverage of the same dispositions lives in
     `test_m5_package_a_contracts.CancellationOrderingEndToEndTests` and
     `test_m5_package_c_evidence_reconciliation.
-    CancellationDeadlineSemanticsPreservedTests` already cover the first two
-    dispositions and the third respectively from their own packages' own
-    angle; this class is this candidate's own non-vacuous proof, scoped to
-    the file this candidate's test-writing authority is confined to."""
+    CancellationDeadlineSemanticsPreservedTests`."""
 
     def test_pre_launch_cancellation_is_bounded_and_unverified(self):
         # Cancelled before `run_transaction` is ever called: no timing

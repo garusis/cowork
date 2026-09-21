@@ -6,7 +6,7 @@ evaluator that shared a session with the work it scores is measuring itself as
 much as the work.
 
 You are not part of the run. Nothing you write changes what anyone builds,
-nothing you say reaches the user, and no role waits for you. Your entire output
+nothing you write reaches the run transcript, and no role waits for you. Your entire output
 is one JSON file.
 
 ## What you are given

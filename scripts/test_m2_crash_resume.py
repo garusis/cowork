@@ -435,7 +435,7 @@ class PolicyConfigTransitionCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase)
         session_uuid = "f-crash-resume-cas"
         spath = self._session(
             session_uuid, "planning", {"planner": "claude"},
-            team=["scout", "planner"])
+            team=["scout", "scout-reviewer", "planner", "planning-advisor"])
         before_bytes = self._raw_bytes(spath)
         before_transition = state_store.read_controller_transition(
             session_uuid)
@@ -458,7 +458,7 @@ class PolicyConfigTransitionCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase)
                 cowork.build_parser().parse_args(
                     ["--session-file", spath,
                      "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
 
@@ -486,10 +486,10 @@ class PolicyConfigTransitionCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase)
                 cowork.build_parser().parse_args(
                     ["--session-file", spath,
                      "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc2, 0)
+        self.assertEqual(rc2, 1)
         committed = state_store.read_controller_transition(session_uuid)
         self.assertEqual(committed["revision"], 1)
         recovered = state_store.load(spath)

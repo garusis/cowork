@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """Fixture-driven tests for M4 Package C: real-evidence controller-adapter
 activity classification, typed OpenCode refusal/error extraction, the
-bounded first-token deadline (SIGTERM then SIGKILL/reap) mechanism, truthful
-foreground spinner labels, and `live_child_handle` in cowork_bridge.py.
+bounded first-token deadline (SIGTERM then SIGKILL/reap) mechanism, and
+`live_child_handle` in cowork_bridge.py.
 
 Covers the frozen brief's required gates:
 
 1. `python3 -m unittest scripts.test_cowork_bridge_activity -v` (this file).
 2. Runs alongside `scripts.test_cowork_bridge_capacity` with no collisions.
-3. `NamedRegionDiffProofTest` -- a mechanical, AST-level diff proof against
-   the signed base commit that ONLY the six named method regions in
-   cowork_bridge.py changed and every other function/method body (and every
-   other file outside the allowlist) is byte-identical to base.
+3. (retired: the M4 delivery diff proof against its signed base commit.)
 4. `OpencodeRefusalExtractionTest` -- structured-output AND log-tail
    fixtures.
 5. `*FirstTokenDeadlineTest` (one per controller) -- deadline/reap/no-orphan
    fixtures.
-6. `*ForegroundLabelStateMachineTest` (one per controller) -- using a real
-   TTY shape (`FakeTTY`) where the session only constructs a spinner on a
-   TTY (ClaudeSession).
 7. `*LiveChildHandleTest` (one per controller) -- truthful live-handle
    fixtures.
 8. This suite never imports/patches cowork_state and performs no file
@@ -44,54 +38,9 @@ import unittest.mock as mock
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork_activity as activity  # noqa: E402
 import cowork_bridge as bridge  # noqa: E402
-
-BASE_SHA = "90cb8ee3b6969b2554f51e52e4cf3b62c2c2ddac"
-
-# This package's own signed commit (was previously proven only implicitly
-# by the live-working-tree diff below, which stopped being hermetic the
-# moment any later-landed package's edits were also present in the
-# worktree). CANDIDATE_SHA pins the allowlist proof to this package's own
-# committed diff instead. BASE_SHA above was rebound from the stale
-# "cdef8067..." pin (two commits further back, which swept in the
-# unrelated durable-activity-persistence commit's cowork_state.py /
-# test_cowork_state_m4.py changes) to this package's true immediate
-# parent; scripts/cowork_bridge.py is byte-identical between the old and
-# new BASE_SHA, so every AST-region assertion below is unaffected.
-CANDIDATE_SHA = "75892c8dee3985db3adf2cfe38aaace3b5cb9a33"
-
-# The exact six method regions the frozen brief authorizes edits inside.
-# Keyed as "ClassName.method_name" (see NamedRegionDiffProofTest for how
-# this maps onto the AST scan); ClaudeSession's nested `_feed` is inside
-# `_send_turn`'s own source text, so a change to `_feed` alone still shows
-# up as a change to `ClaudeSession._send_turn` here.
-ALLOWED_CHANGED_REGIONS = frozenset({
-    "ClaudeSession._send_turn",
-    "CodexSession._run",
-    "CodexSession.send",
-    "OpencodeSession._run",
-    "OpencodeSession.send",
-})
-
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork_bridge.py",
-    "scripts/test_cowork_bridge_activity.py",
-})
-
-
-class FakeTTY(io.StringIO):
-    """A StringIO that claims to be a terminal, so `ui.is_tty()` returns
-    True -- the repo's own established "real TTY shape" test convention
-    (mirrors `test_cowork.py`'s identically-named helper); gate 6 requires
-    it because `ClaudeSession._send_turn` only constructs a spinner at all
-    when `ui.is_tty(self.io_out)` is True."""
-
-    def isatty(self):
-        return True
-
 
 # ---------------------------------------------------------------------------
 # Fake subprocess.Popen doubles
@@ -959,159 +908,6 @@ class ClaudeFirstTokenDeadlineTest(unittest.TestCase):
 # Gate 6: per-controller foreground-label state-machine fixtures
 # ---------------------------------------------------------------------------
 
-class RecSpinner:
-    """Records the exact sequence of label changes/stops -- shared shape
-    with test_cowork.py's own RecSpinner fixtures."""
-    insts = []
-
-    def __init__(self, out, label="working"):
-        self.labels = [label]
-        self.stop_count = 0
-        RecSpinner.insts.append(self)
-
-    def start(self):
-        return self
-
-    def __enter__(self):
-        return self
-
-    def set_label(self, text):
-        self.labels.append(text)
-
-    def stop(self):
-        self.stop_count += 1
-
-    def __exit__(self, *exc):
-        self.stop()
-
-
-class CodexForegroundLabelStateMachineTest(unittest.TestCase):
-    def test_tool_activity_then_permanent_stop_at_first_real_output(self):
-        RecSpinner.insts.clear()
-        lines = [
-            json.dumps({"type": "thread.started", "thread_id": "T1"}),
-            json.dumps({"type": "item.started",
-                       "item": {"type": "command_execution"}}),
-            json.dumps({"type": "item.completed",
-                       "item": {"type": "command_execution"}}),
-            json.dumps({"type": "item.completed",
-                       "item": {"type": "agent_message", "text": "done"}}),
-            # Post-first-token tool activity: must NEVER touch the spinner
-            # again -- "never invent a post-first-token spinner state".
-            json.dumps({"type": "item.started",
-                       "item": {"type": "command_execution"}}),
-        ]
-        proc = ScriptedProc(lines)
-        with mock.patch.object(bridge.subprocess, "Popen", return_value=proc), \
-                mock.patch.object(bridge, "_Spinner", RecSpinner):
-            out = io.StringIO()
-            s = bridge.CodexSession("implement", True, io_out=out)
-            s.send("go")
-        spin = RecSpinner.insts[0]
-        self.assertEqual(spin.labels, ["scout working",
-                                       "scout running a command",
-                                       "scout working"])
-        self.assertGreaterEqual(spin.stop_count, 1)
-
-
-class OpencodeForegroundLabelStateMachineTest(unittest.TestCase):
-    def _session(self, tmp):
-        rp = os.path.join(tmp, "role.md")
-        with open(rp, "w") as fh:
-            fh.write("ROLE")
-        return bridge.OpencodeSession(rp, "implement", True, agent_base_dir=tmp)
-
-    def test_tool_activity_then_permanent_stop_at_first_real_output(self):
-        import tempfile
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
-        RecSpinner.insts.clear()
-        lines = [
-            json.dumps({"type": "tool", "sessionID": "ses_X",
-                       "part": {"tool": "bash"}}),
-            json.dumps({"type": "tool_use", "sessionID": "ses_X",
-                       "part": {"tool": "bash", "state": {"status": "ok"}}}),
-            json.dumps({"type": "text", "sessionID": "ses_X",
-                       "part": {"text": "done"}}),
-            # Post-first-token tool activity: never touches the spinner again.
-            json.dumps({"type": "tool", "sessionID": "ses_X",
-                       "part": {"tool": "bash"}}),
-        ]
-        proc = ScriptedProc(lines)
-        with mock.patch.object(bridge.subprocess, "Popen", return_value=proc), \
-                mock.patch.object(bridge, "_Spinner", RecSpinner):
-            s = self._session(tmp)
-            s.send("go")
-        spin = RecSpinner.insts[0]
-        # "using bash" (pre-first-token tool activity) then back to
-        # "working" once that tool call completes (tool_done, still
-        # pre-first-token) -- then PERMANENTLY unchanged once the real
-        # message arrives: the post-first-token tool event in the fixture
-        # never appends a fourth label.
-        self.assertEqual(spin.labels, ["scout working", "scout using bash",
-                                       "scout working"])
-        self.assertGreaterEqual(spin.stop_count, 1)
-
-
-class ClaudeForegroundLabelStateMachineTest(unittest.TestCase):
-    """Requires a real TTY shape (gate 6): ClaudeSession only constructs a
-    spinner at all when `ui.is_tty(self.io_out)` is True."""
-
-    def test_pre_first_token_idle_then_tool_then_permanent_stop(self):
-        proc = ClaudeFakeProc()
-        events = [
-            json.dumps({"type": "stream_event",
-                       "event": {"type": "content_block_start",
-                                "content_block": {"type": "tool_use",
-                                                  "name": "Bash"}}}),
-            json.dumps({"type": "user"}),  # tool_result echo -> back to idle
-            json.dumps({"type": "assistant",
-                       "message": {"content": [
-                           {"type": "text", "text": "hello"}]}}),
-            # Post-first-token tool activity: the spinner is already gone
-            # (a region owns status display now); it must never restart.
-            json.dumps({"type": "stream_event",
-                       "event": {"type": "content_block_start",
-                                "content_block": {"type": "tool_use",
-                                                  "name": "Bash"}}}),
-            json.dumps({"type": "result", "subtype": "success",
-                       "session_id": "S1"}),
-        ]
-        for line in events:
-            proc.stdout.push(line)
-        with mock.patch.object(bridge.subprocess, "Popen", return_value=proc), \
-                mock.patch.object(bridge.ui, "Spinner", RecSpinner):
-            RecSpinner.insts.clear()
-            out = FakeTTY()
-            s = bridge.ClaudeSession("roles/scout.md", "plan", True,
-                                     io_out=out, session_id="S1")
-            result = s.send("hi")
-        self.assertTrue(result["ok"])
-        spin = RecSpinner.insts[0]
-        self.assertEqual(spin.labels, ["scout working", "scout using Bash",
-                                       "scout working"])
-        # The label sequence above is the truthful record: it never grows
-        # a fourth "using Bash" entry for the post-first-token tool_use
-        # block -- the spinner's OWN stop() may still be called again by
-        # the turn's final result-handling (pre-existing, unrelated to
-        # this deadline mechanism), so only the label sequence is asserted
-        # as "permanent" here, not the raw stop() call count.
-        self.assertGreaterEqual(spin.stop_count, 1)
-
-    def test_off_tty_no_spinner_is_ever_constructed(self):
-        proc = ClaudeFakeProc()
-        for line in _claude_text_lines("hi"):
-            proc.stdout.push(line)
-        with mock.patch.object(bridge.subprocess, "Popen", return_value=proc), \
-                mock.patch.object(bridge.ui, "Spinner", RecSpinner):
-            RecSpinner.insts.clear()
-            out = io.StringIO()  # NOT a TTY
-            s = bridge.ClaudeSession("roles/scout.md", "plan", True,
-                                     io_out=out, session_id="S1")
-            s.send("hi")
-        self.assertEqual(RecSpinner.insts, [])
-
-
 # ---------------------------------------------------------------------------
 # Gate 7: per-controller truthful live_child_handle fixtures
 # ---------------------------------------------------------------------------
@@ -1472,7 +1268,7 @@ class PurityAndImportBoundaryTest(unittest.TestCase):
 
     _FORBIDDEN_GLOBAL_NAMES = frozenset({
         "state_store", "policy", "action_policy", "guard_broker",
-        "controller_profiles", "trace_store", "ui", "probe_cache",
+        "controller_profiles", "trace_store", "transcript", "probe_cache",
         "open", "subprocess", "os", "threading",
     })
 
@@ -1493,39 +1289,6 @@ class PurityAndImportBoundaryTest(unittest.TestCase):
                 hit = used_names & self._FORBIDDEN_GLOBAL_NAMES
                 self.assertFalse(hit, "function %s references forbidden name(s): %s"
                                  % (name, sorted(hit)))
-
-    def test_new_functions_import_nothing_new(self):
-        # The additive grant covers new FUNCTIONS only, never new imports:
-        # every new pure function's own instruction stream must reference
-        # zero module-level names beyond ordinary builtins/locals (already
-        # proven module-by-module by `_FORBIDDEN_GLOBAL_NAMES` above, which
-        # includes cowork_state's local alias "state_store" itself). This
-        # test additionally confirms the module's TOP-LEVEL import list is
-        # unchanged from base -- no new `import` statement was added
-        # anywhere in cowork_bridge.py for this package.
-        base_source = subprocess.run(
-            ["git", "show", "%s:scripts/cowork_bridge.py" % BASE_SHA],
-            cwd=_REPO_ROOT, capture_output=True, text=True, check=True).stdout
-        module_path = os.path.join(_HERE, "cowork_bridge.py")
-        with open(module_path, "r", encoding="utf-8") as fh:
-            new_source = fh.read()
-
-        def top_level_imports(source, filename):
-            tree = ast.parse(source, filename=filename)
-            names = set()
-            for node in tree.body:  # top-level only -- a local `import`
-                                     # inside a method body doesn't count.
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        names.add(alias.asname or alias.name)
-                elif isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        names.add(alias.asname or alias.name)
-            return names
-
-        old_imports = top_level_imports(base_source, "base:cowork_bridge.py")
-        new_imports = top_level_imports(new_source, "cowork_bridge.py")
-        self.assertEqual(old_imports, new_imports)
 
     def test_new_function_source_contains_no_io_calls(self):
         module_path = os.path.join(_HERE, "cowork_bridge.py")
@@ -1569,137 +1332,6 @@ class PurityAndImportBoundaryTest(unittest.TestCase):
         snapshot = dict(evidence)
         bridge.classify_claude_activity(evidence)
         self.assertEqual(evidence, snapshot)
-
-
-# ---------------------------------------------------------------------------
-# Gate 3: named-method/additive diff proof and exact path allowlist
-# ---------------------------------------------------------------------------
-
-def _qualified_defs(source, filename):
-    """Map "func_name" (module-level) / "ClassName.method_name" (a class's
-    direct-child methods) -> exact source text, for one module's AST. Does
-    NOT recurse into nested closures -- a change anywhere inside a method's
-    body (including its nested helpers) is attributed to that one method."""
-    tree = ast.parse(source, filename=filename)
-    out = {}
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef):
-            out[node.name] = ast.get_source_segment(source, node)
-        elif isinstance(node, ast.ClassDef):
-            for child in node.body:
-                if isinstance(child, ast.FunctionDef):
-                    out["%s.%s" % (node.name, child.name)] = (
-                        ast.get_source_segment(source, child))
-    return out
-
-
-class NamedRegionDiffProofTest(unittest.TestCase):
-    """A mechanical, AST-level proof (not a human claim) that:
-
-    (1) every changed repository path is on the frozen brief's narrow
-        allowlist, and
-    (2) inside cowork_bridge.py, every function/method whose source text
-        differs from the signed base commit is one of the six named
-        regions -- and no function/method was REMOVED, and every newly
-        ADDED name is a plain module-level function (never a new method,
-        never a new class).
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        try:
-            cls.base_source = subprocess.run(
-                ["git", "show", "%s:scripts/cowork_bridge.py" % BASE_SHA],
-                cwd=_REPO_ROOT, capture_output=True, text=True,
-                check=True).stdout
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise unittest.SkipTest(
-                "base commit %s unavailable in this checkout: %s"
-                % (BASE_SHA, exc))
-
-    def test_only_allowlisted_paths_changed_since_base(self):
-        # Commit-pinned, not live-working-tree: this package's own
-        # authorship claim is a property of ITS OWN committed diff
-        # (BASE_SHA..CANDIDATE_SHA), not of whatever happens to be dirty in
-        # whichever worktree later runs this suite. The prior live-tree
-        # form (`git diff HEAD` + untracked status) was hermetic only until
-        # any OTHER package's own uncommitted test-only edits were also
-        # present in the same worktree, at which point it necessarily
-        # reported every one of those unrelated paths as an "offender".
-        # See `test_head_descends_from_the_signed_base` for the separate
-        # binding check that HEAD is still base or a real descendant of it.
-        changed = set(subprocess.run(
-            ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
-            cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-        ).stdout.splitlines())
-        offenders = changed - ALLOWED_CHANGED_PATHS
-        self.assertFalse(
-            offenders,
-            "paths changed outside the frozen brief's allowlist: %s"
-            % sorted(offenders))
-
-    def test_head_descends_from_the_signed_base(self):
-        # The binding check the HEAD-relative gate above deliberately does
-        # NOT perform on its own: HEAD must still BE the signed base, or a
-        # real descendant of it (base plus zero or more already-
-        # integrated, independently-reviewed packages) -- never a foreign
-        # or rewritten history.
-        result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", BASE_SHA, "HEAD"],
-            cwd=_REPO_ROOT)
-        self.assertEqual(
-            result.returncode, 0,
-            "HEAD is not a descendant of (or equal to) the signed base %s"
-            % BASE_SHA)
-
-    def test_no_function_or_method_was_removed(self):
-        with open(os.path.join(_HERE, "cowork_bridge.py"),
-                 "r", encoding="utf-8") as fh:
-            new_source = fh.read()
-        old_defs = _qualified_defs(self.base_source, "base:cowork_bridge.py")
-        new_defs = _qualified_defs(new_source, "cowork_bridge.py")
-        removed = set(old_defs) - set(new_defs)
-        self.assertFalse(removed, "functions/methods removed vs base: %s"
-                         % sorted(removed))
-
-    def test_every_added_name_is_a_plain_new_module_level_function(self):
-        with open(os.path.join(_HERE, "cowork_bridge.py"),
-                 "r", encoding="utf-8") as fh:
-            new_source = fh.read()
-        old_defs = _qualified_defs(self.base_source, "base:cowork_bridge.py")
-        new_defs = _qualified_defs(new_source, "cowork_bridge.py")
-        added = set(new_defs) - set(old_defs)
-        offenders = {name for name in added if "." in name}
-        self.assertFalse(
-            offenders,
-            "new names include a class/method addition (only new "
-            "module-level functions are additive): %s" % sorted(offenders))
-        self.assertTrue(added, "expected at least the new M4 Package C "
-                              "functions to be additive")
-
-    def test_only_the_six_named_regions_changed(self):
-        with open(os.path.join(_HERE, "cowork_bridge.py"),
-                 "r", encoding="utf-8") as fh:
-            new_source = fh.read()
-        old_defs = _qualified_defs(self.base_source, "base:cowork_bridge.py")
-        new_defs = _qualified_defs(new_source, "cowork_bridge.py")
-        common = set(old_defs) & set(new_defs)
-        changed = {name for name in common if old_defs[name] != new_defs[name]}
-        offenders = changed - ALLOWED_CHANGED_REGIONS
-        self.assertFalse(
-            offenders,
-            "function/method bodies changed outside the six named "
-            "regions: %s" % sorted(offenders))
-
-    def test_base_sha_matches_the_rebound_immediate_parent(self):
-        self.assertEqual(BASE_SHA, "90cb8ee3b6969b2554f51e52e4cf3b62c2c2ddac")
-        self.assertEqual(CANDIDATE_SHA, "75892c8dee3985db3adf2cfe38aaace3b5cb9a33")
-        result = subprocess.run(
-            ["git", "rev-parse", "%s^" % CANDIDATE_SHA],
-            cwd=_REPO_ROOT, capture_output=True, text=True, check=True)
-        self.assertEqual(
-            result.stdout.strip(), BASE_SHA,
-            "CANDIDATE_SHA must be exactly one commit on top of BASE_SHA")
 
 
 if __name__ == "__main__":

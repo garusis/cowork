@@ -1,75 +1,61 @@
 # cowork
 
-`cowork` is a terminal command that assembles a team of CLI-driven roles, spins
-up the controller CLI you pick for each role (`claude`, `codex`, or
-`opencode`), and bridges that CLI's conversation straight to you. Every role
+`cowork` is an agent-to-agent orchestration command. An orchestrating agent
+invokes it with arguments; it assembles a team of CLI-driven roles, spins up
+the controller CLI configured for each role (`claude`, `codex`, or
+`opencode`), and reports every run as one structured JSON result. Every role
 can also pin a model and a thinking-effort level (and, with opencode, the
 provider — it is embedded in the `provider/model` id).
 
-This release implements the **foundation** and the **first two phases**:
+Command-line process invocation remains, but only as the transport between
+agents: there is no human-interactive product path — no menus, keyboard
+questions, terminal approval gates, or interactive recovery. Nothing is ever
+approved by omission.
 
-- the entry flow (choose your team, configure each role, give context),
+The phases:
+
 - the **scouting phase** — the **scout** (a context gatherer that explores the
   work and confirms a solid starting point) paired with the **scout-reviewer**
-  (a critical reviewer that checks, before anything reaches you for approval,
-  that the scout's questions, assumptions, and discoveries are actually aligned
-  with the goal), and
+  (a critical reviewer that checks the scout's questions, assumptions, and
+  discoveries are actually aligned with the goal), and
 - the **planning phase** — the **planner** (turns the approved intel into an
   implementation plan, delivered as a machine-readable plan JSON plus a
-  human-first plan markdown) paired with the **planning-advisor** (a critical
+  readable plan markdown) paired with the **planning-advisor** (a critical
   reviewer of the plan with the same verdict semantics as the scout-reviewer),
   and
 - the **building phase** — the **builder** (executes the approved plan by
-  editing the repository, verifies the changes, and leaves them in your working
+  editing the repository, verifies the changes, and leaves them in the working
   tree) paired with the **build-reviewer** (a critical reviewer that checks the
   builder's working-tree diff against the plan, with the same verdict semantics
   as the other reviewers).
 
-Phases form a **loop**, not a one-way chain: approving the scout's intel chains
-straight into planning in the same run, approving the plan chains into building,
-and a user-confirmed hand-back can run either edge backward — the planner back
-to the scout, or the builder back to the planner (see
-[Phases and the hand-back](#phases-and-the-hand-back)). Approving the build ends
+Phases form a **loop**, not a one-way chain: a reviewer-approved intel chains
+straight into planning in the same run, an approved plan chains into building,
+and an orchestrator-authorized hand-back can run either edge backward — the
+planner back to the scout, or the builder back to the planner (see
+[Phases and the hand-back](#phases-and-the-hand-back)). An approved build ends
 the run; cowork makes no git commit and opens no PR.
 
 ## How it works
 
-`cowork` is a standalone executable that owns your terminal. When you run it:
+An orchestrating agent runs `cowork` as a child process. Each invocation:
 
-1. **Choose your team.** A checkbox menu of roles (`scout`, `scout-reviewer`,
-   `planner`, `planning-advisor`, `builder`, `build-reviewer`), all checked by
-   default. Space toggles, Enter confirms.
-2. **Configure each role.** One screen: the current config is shown as a table
-   (controller · model · effort · permissions · mode) and the menu is
-   "✓ start with this config" (the default — one Enter accepts everything),
-   one entry per role, and "← back: change team", which reopens the team
-   checkbox with your current picks checked — role edits survive the round
-   trip (a role dropped and re-added resets to its defaults). Picking a role
-   walks a short edit —
-   controller (`claude`/`codex`/`opencode`) → model → thinking effort →
-   access (`yolo` / `safe` / `read-only`) — and returns to the same screen.
-   Model lists are discovered live (preloaded once when this screen opens):
-   claude from the public [models.dev](https://models.dev) catalog (keyless,
-   full ids newest-first), codex from `codex debug models` (visible models in
-   the CLI's own flagship-first order, with the effort picker narrowed to the
-   chosen model's supported levels). For opencode the model pick is two steps:
-   provider first (discovered live from `opencode models`, so only providers
-   you have credentials for appear), then that provider's models. If discovery
-   fails (offline, CLI missing), the picker silently falls back to the curated
-   presets (claude aliases `opus`/`sonnet`/`haiku`, codex default/custom).
-   Model and effort default to the controller CLI's own settings; every picker
-   has a `custom…` free-text escape hatch.
-3. **Give context.** Type/paste the files/code/intent the work needs.
-
-The interactive UI uses [rich](https://github.com/Textualize/rich) (streaming
-markdown + panels), [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit)
-(multiline input), and [questionary](https://github.com/tmbo/questionary) (menus +
-confirm). For tests and automation there is also a non-interactive **args path**
-(`--team`/`--config`/`--context`) that skips the menus entirely (and needs none of
-those packages) — see [Usage](#usage).
-
-`cowork` then runs a **preflight** check and spins up the first role (`scout`)
-using the controller you chose, bridging its live conversation to your terminal.
+1. **Selects a session from arguments alone** — a new session (the default, or
+   `--new`), a named saved session (`--session-file PATH`), the directory's
+   most recent saved session (`--resume`), or an ephemeral one
+   (`--no-session`). At most one selector; saved work is never picked
+   implicitly.
+2. **Takes team, config and context from arguments** — `--team`, `--config`,
+   `--context`/`--context-file` (a new session requires context), or the saved
+   team/config on a resumed session.
+3. **Runs a preflight** and drives the current phase's lead role and its paired
+   reviewer through the configured controllers. Approval comes only from the
+   paired reviewer's explicit `approve` verdict.
+4. **Ends with one JSON run-result line on stdout** and a matching exit code.
+   The provider transcript goes to stderr. Anything that needs an answer, an
+   authorization, or an unavailable reviewer stops the run unapproved with a
+   structured request; the orchestrator resumes the session with another
+   invocation (see [Usage](#usage)).
 
 ### The bridge
 
@@ -77,9 +63,9 @@ The three controllers are driven differently because their non-interactive
 modes differ:
 
 - **claude** runs as a single persistent duplex process
-  (`claude -p --input-format stream-json --output-format stream-json`). Your
-  typed lines are framed as stream-json user messages on stdin; the assistant's
-  output streams back on stdout. A blank line ends the session.
+  (`claude -p --input-format stream-json --output-format stream-json`). Each
+  orchestrated turn is framed as a stream-json user message on stdin; the
+  assistant's output streams back on stdout.
 - **codex** runs turn-based: the first turn is `codex exec --json`, from which
   `cowork` captures the session's `thread_id`; each follow-up turn is
   `codex exec resume <thread_id>`. (codex `exec` has no persistent stdin, so
@@ -115,11 +101,10 @@ can't ship half), facts are validated against closed per-key enums, and the
 `ctx` composition is restricted to declared, type-checked keys — labels are
 registry-owned, so nothing free-form can ride through a label or ctx field. The
 same handoff object that builds the prompt also feeds the trace/token accounting
-(one source of truth, no re-inference). Reviewer findings and questions reach the
-user in the lead role's **own voice** — the lead reads the review file by path
-and relays it, so the single-voice behavior is unchanged. **Direct user
-messages to the active lead may remain inline**, both for the initial turn and
-later answers/revision feedback. Every cross-role re-delivery of that shared
+(one source of truth, no re-inference). Reviewer findings reach the lead by
+path — the lead reads the review file itself. The **initial context for the
+active lead may remain inline**; orchestrator answers are written to a session
+file and delivered by path. Every cross-role re-delivery of that shared
 context — including the scout→planner and planner→builder seeds — carries it by
 path. Reviewers re-read the current authoritative files each round (there is no
 derived incremental-diff packet — a generated diff could go stale and compete
@@ -137,7 +122,7 @@ transport from those exact blocks plus typed static-role fragments; the factory
 does not accept an independent free-text body. Arbitrary prompt text plus forged
 `prompt_kind`/`artifacts` metadata is rejected before it reaches a controller.
 The only non-handoff envelopes come from closed constructors for the initial
-user turn, static role instructions, and user-facing lead follow-ups. Raw
+user turn, static role instructions, and typed lead continuations. Raw
 controller `.send()` remains private to that gateway.
 
 Roles and reviewer pairs are declared in the same canonical registry that
@@ -177,12 +162,11 @@ Notes:
   into codex by prepending it to the prompt, and into opencode via the
   generated `.opencode/agents/cowork-<role>.md` agent file — `cowork` never
   writes an `AGENTS.md` into your repo.
-- **yolo off has no interactive approval relay** in this release: a tool the
-  permission/sandbox level does not auto-allow is denied and surfaced to you as
-  an error (the run does not hang). `scout`'s defaults are plan + yolo, where
-  this never triggers.
+- **yolo off has no approval relay**: a tool the permission/sandbox level does
+  not auto-allow is denied and surfaced as an error in the transcript (the run
+  does not hang).
 - opencode has **no OS sandbox**; its agent permission rules are the only
-  guardrail, and in a headless run any rule that resolves to `ask` is
+  guardrail, and in its non-interactive `run` mode any rule that resolves to `ask` is
   auto-rejected by opencode (acts as a hard deny — the run never hangs). Its
   plan mode is "no edits, no shell" rather than codex's read-only-commands
   sandbox.
@@ -195,33 +179,22 @@ bypass approval/sandbox guards. Run `cowork` in a trusted/isolated workspace.
 
 ## Requirements
 
-- Python 3.9 or newer.
-- The interactive UX uses three pip packages — **rich** (streaming markdown +
-  panels), **prompt_toolkit** (multiline input), **questionary** (menus + confirm).
-  Install them into the **same interpreter** `./cowork` runs under (its shebang is
-  `#!/usr/bin/env python3`):
-
-  ```bash
-  python3 -m pip install -r requirements.txt
-  ```
-
-  Use `python3 -m pip`, not a bare `pip` (often absent) or a `pip3` from a
-  different Python — installing into the wrong interpreter leaves `./cowork`
-  reporting the packages as missing. Only the interactive flow needs them; the
-  non-interactive args path uses a plain readline/print fallback and needs none.
+- Python 3.9 or newer. The runtime uses only the standard library
+  (`requirements.txt` lists no packages).
 - The controller CLIs you intend to use, on your `PATH`:
   - **Claude Code** — `npm install -g @anthropic-ai/claude-code`
   - **Codex CLI** — `npm install -g @openai/codex` (Node 18+) or
     `brew install --cask codex`
   - **opencode** (optional) — `curl -fsSL https://opencode.ai/install | bash`,
     `npm install -g opencode-ai`, or `brew install sst/tap/opencode`; then
-    authenticate providers with `opencode auth login` (the provider/model
-    picker lists whatever `opencode models` reports)
+    authenticate providers with `opencode auth login` (`opencode models` lists
+    the `provider/model` ids you can pass as `model=`)
 
-`cowork --check` reports exactly which of these is missing. During a normal run,
-Python and interactive UI packages are checked up front, while controller CLIs
-are checked when the role that needs them is about to launch; that lets a saved
-session offer controller switching instead of failing before the phase starts.
+`cowork --check` reports exactly which of these is missing. During a normal run
+the interpreter is checked up front, while controller CLIs are checked when the
+role that needs them is about to launch; a missing controller ends the run with
+a structured failure, and the orchestrator can re-invoke with
+`--switch-controller`.
 
 ## Install
 
@@ -233,149 +206,257 @@ cd ~/.local/share/cowork
 ./install.sh
 ```
 
-`install.sh` creates a dedicated `.venv` for the pip packages (immune to
-PEP 668 / Homebrew "externally-managed-environment"), adds the checkout dir to your
-`PATH` via `~/.zshrc`, makes `cowork` executable, links bundled skills from
-`./skills/` into both `~/.claude/skills` and `~/.codex/skills`, and runs the
-preflight to report any missing controller CLIs. It is idempotent — safe to
-re-run.
+`install.sh` creates a dedicated `.venv` (installing `requirements.txt` into
+it), adds the checkout dir to your `PATH` via `~/.zshrc`, makes `cowork`
+executable, links bundled skills from `./skills/` into both `~/.claude/skills`
+and `~/.codex/skills`, and runs the preflight to report any missing controller
+CLIs. It is idempotent — safe to re-run.
 
-Open a new terminal (or `source ~/.zshrc`) once, then run `cowork` from **any
-folder** — the launcher self-bootstraps the venv, the project-local
-`.cowork/session.json` anchor lands in the current directory, and the session's
-produced artifacts live under `~/.cowork/sessions/<session_uuid>/`. Re-verify
-anytime with `cowork --check`.
+After a new shell (or `source ~/.zshrc`), agents can invoke `cowork` from **any
+folder** — the launcher re-execs into the venv when it exists, the
+project-local `.cowork/session.<uuid>.json` store lands in the current
+directory, and the session's produced artifacts live under
+`~/.cowork/sessions/<session_uuid>/`. Re-verify anytime with `cowork --check`.
 
-> Manual alternative: `python3 -m pip install -r requirements.txt` then run
-> `./cowork` from this directory.
+> Manual alternative: run `./cowork` from this directory with any Python 3.9+.
 
 ## Usage
 
-### Interactive
+`cowork` is invoked by an orchestrating agent. It never reads a terminal or
+prompts; every run is driven by arguments.
+
+### Run result and exit codes
+
+Every run invocation writes **exactly one JSON object as the final line of
+stdout**; the provider transcript and `cowork:` notices go to stderr. The
+record's `rc` equals the process exit status. A consumer binds the record to
+that status and treats a missing line (for example after SIGKILL) as a failure.
+
+Fields: `cowork_result` (schema version, `1`), `rc`, `outcome`, `approved`,
+`session_uuid`, `session_file`, `persisted`, `phase`, `role`, `phase_outcome`,
+`stop` (the structured request or failure details, or `null`), and `reason` (a
+closed refusal/failure code, or `null`). A persisted session also carries
+`resume_argv` (`["--session-file", PATH]`); an open decision request adds
+`decision_argv`, the argument vectors that can consume it. The answer variant
+contains the literal placeholder `<answer>`, which the orchestrator replaces
+with the path of a file holding its answer. `decision_ack_failed` appears when
+an accepted decision delivery could not be acknowledged (it is re-sent later).
+
+| rc | `outcome` | meaning |
+| --- | --- | --- |
+| 0 | `approved` | the last phase that ran was approved by its paired reviewer |
+| 1 | `failed` | controller/preflight/reviewer failure, a failed phase, or an internal error |
+| 2 | `invalid_invocation` | refused before anything was dispatched (`reason` names why) |
+| 3 | `owner_conflict` | another process holds the session's single-writer owner lease |
+| 4 | `stopped` | an open decision request needs an answer or authorization (`stop.request_id`) |
+| 5 | `awaiting_capacity` | durably paused on a provider capacity signal |
+| 17 | `terminated` | provider refusal, or no first token before the deadline |
+| 130 | `interrupted` | SIGINT |
+| 143 | `terminated` | SIGTERM |
+
+Only rc 0 with `approved: true` is success. A stop, a capacity pause, or a
+missing result line is never an approval.
+
+`--help` (exit 0) is not a run and emits no record. The read-only commands
+`--check`, `--report`, and `--session-owner` print their own output and emit no
+run-result record, except that combining one with a session-mutating flag is
+refused with an rc 2 record. `--evaluate-role` also emits no run-result record
+and uses its own exit codes: 0 recorded, 1 could not record, 2 invalid
+arguments.
+
+### Starting and selecting sessions
 
 ```bash
-./cowork            # run the full flow: team -> config -> context -> scout
-./cowork --check    # run the preflight dependency check only
+# new session (the default selector): scouting with its paired reviewer
+cowork --team scout,scout-reviewer --context-file ./brief.md
+
+# per-role controller/model/effort; context from stdin
+cowork --config "scout=codex,model=gpt-5-codex" \
+       --config "builder=opencode,model=anthropic/claude-sonnet-4-5,effort=high" \
+       --context-file - < ./brief.md
+
+# continue a saved session with nothing to decide
+cowork --session-file .cowork/session.<uuid>.json
 ```
 
-- **Team step:** a questionary checkbox menu (all roles preselected). Space
-  toggles, Enter confirms.
-- **Config step:** one screen. The current config is a table
-  (controller · model · effort · permissions · mode); the menu default is
-  "✓ start with this config" (one Enter continues), and picking a role instead
-  walks controller → model → effort → access for that role and returns to the
-  table. Access is a single pick: `yolo` (full access), `safe` (edits only), or
-  `read-only` (plan mode).
-- **Context step:** a multiline prompt_toolkit editor (Enter sends; Ctrl+J /
-  Alt+Enter insert a newline).
-
-### Non-interactive (args path)
-
-Skip the menus entirely — useful for tests and automation. Providing any of
-`--team`, `--config`, or `--context`/`--context-file` switches off the
-interactive UI (and none of the pip packages are required):
-
-```bash
-# scout only, codex controller, no yolo, implement mode, context inline
-./cowork --team scout --config "scout=codex,no-yolo,implement" --context "Refactor the auth module"
-
-# builder on opencode with a pinned provider/model + effort
-./cowork --config "builder=opencode,model=anthropic/claude-sonnet-4-5,effort=max" --context "…"
-
-# pin the claude scout's model and thinking effort
-./cowork --config "scout=claude,model=opus,effort=high" --context "…"
-
-# context from a file (or '-' to read stdin)
-./cowork --team scout --context-file ./brief.md
-echo "the brief" | ./cowork --team scout --context-file -
-```
-
-- `--team` — comma-separated roles (default: all). Unknown roles error out.
-- `--config ROLE=opt,opt` — repeatable; tokens are any of
-  `claude|codex|opencode`, `model=<id>`, `effort=<level>`, `yolo|no-yolo`,
-  `plan|implement`. `model=default`/`effort=default` reset to the controller
-  CLI's own setting; opencode model ids are `provider/model`. E.g.
-  `--config "scout=claude,model=opus" --config "scout-reviewer=codex,model=gpt-5-codex"`
-  runs a scout/reviewer pair on two specific models so their evaluation scores
-  and token consumption can be compared (see
+- **Session selectors — at most one** (`conflicting_session_selectors`
+  otherwise):
+  - none, or `--new` — a new session at `.cowork/session.<uuid>.json`;
+    requires `--context`/`--context-file`.
+  - `--session-file PATH` — resumes that saved session when the file exists,
+    or creates a new session there (with context) when it does not.
+  - `--resume` — explicitly resumes this directory's most recent saved session
+    (an error when there is none). Prefer `--session-file` with the
+    `session_file` from an earlier run result when more than one session may
+    exist.
+  - `--no-session` — ephemeral; nothing is read or written (no trace, no
+    `resume_argv`). Requires `--context`/`--context-file`.
+- A plain invocation without a selector never resumes saved work.
+- `--team ROLES` — comma-separated roles (default: every role, or the saved
+  team on resume). Every lead on the team needs its paired reviewer
+  (`reviewer_not_selected` otherwise), and a run that starts in scouting needs
+  `scout` (`scout_not_selected`).
+- `--config ROLE=opt,opt` — repeatable; tokens are `claude|codex|opencode`,
+  `model=<id>`, `effort=<level>`, `yolo|no-yolo`, `plan|implement`.
+  `model=default`/`effort=default` reset to the controller CLI's own setting;
+  opencode model ids are `provider/model`. Running a pair on two specific
+  models lets their evaluation scores and token use be compared (see
   [Evaluation traceability](#evaluation-traceability)).
-- `--context TEXT` / `--context-file PATH` — initial context (`-` = stdin).
-- `--session-file PATH` — use a specific session store (default
-  `./.cowork/session.json`).
-- `--no-session` — do not read or write the session store.
-- `--switch-controller ROLE=CONTROLLER` — update one current-phase role in an
-  existing saved session to `claude`, `codex`, or `opencode`, then continue
-  that session. **Repeatable**: every switch in one invocation is applied as a
-  single all-or-nothing update. A switch resets the role's model/effort pins
-  (they are controller-specific). Examples:
+- `--context TEXT` / `--context-file PATH` (`-` = stdin) — initial context for
+  a new session. On a plain resume it redirects the session (a new
+  [context revision](#context-revisions)); with `--answer` it is the answer and
+  never replaces the goal. A resume without context continues the current
+  phase.
+- `--evaluation-policy all_rounds|final_round|sampled|off` — see
+  [Scoring stays out of the way](#scoring-stays-out-of-the-way).
+- `--take-over` — take over a saved session's single-writer owner lease from a
+  prior process. Never implicit: a crashed owner is reclaimed only with proof
+  of death, a live same-host owner is terminated first, and an owner that
+  cannot be proved dead (foreign host, unreadable process table) is refused.
+- Saved-session operations (`--switch-controller`, `--allow-controllers`,
+  `--answer`, `--authorize-handoff`, `--decline-handoff`, `--take-over`)
+  require an explicit `--session-file` or `--resume`
+  (`saved_session_selector_required`).
 
-  ```bash
-  ./cowork --switch-controller planner=codex
-  ./cowork --session-file .cowork/session.<uuid>.json --switch-controller builder=claude
-  ```
+### Stops and orchestrator decisions
 
-  The role must be in the effective current phase pair: `scout` or
-  `scout-reviewer` during scouting, `planner` or `planning-advisor` during
-  planning, and `builder` or `build-reviewer` during building. `--session-file`
-  targets one saved session; `--resume` can be used to pick an existing session
-  interactively. `--switch-controller` requires saved team/config state and
-  cannot be combined with `--team`, `--config`, `--new`, `--no-session`,
-  `--check`, or `--report`.
-- `--allow-controllers LIST` — restrict a saved session to the named controllers
-  (`--allow-controllers claude,codex`), or lift an existing restriction with
-  `--allow-controllers all`. Combines with `--switch-controller`; the policy
-  change and every role move are validated and persisted together before
-  anything resumes. Same conflict rules as `--switch-controller`. See
-  [Controller policy](#controller-policy).
-- `--worktree [NAME]` / `--wt [NAME]` — before scouting, spin up a small agent
-  that creates a git **worktree** for the launch repo and runs the rest of the
-  session inside it. The agent follows the repo's documented worktree
-  convention (and any documented setup it states — e.g. a per-worktree venv and
-  dependency install); a repo with no convention gets a sibling
-  `../<repo>-worktrees/<name>` folder. `NAME` is optional (default
-  `cowork-<short session id>`); the branch is the same name off HEAD. Requires
-  launching **inside a git work tree** — otherwise it fails fast (rc 2). One
-  explicit base repo only (no multi-root). cowork validates the created worktree
-  (it must exist and be git-registered) before switching into it. On a name
-  clash, an explicit `NAME` stops (or reuses an exact match) rather than
-  silently renaming; an auto name picks a free numbered variant.
-- `--wt-controller claude|codex|opencode` — controller for the worktree agent
+A phase that needs an answer or an authorization stops unapproved with rc 4
+and a `stop` request. The request is durably recorded as the session's one open
+decision; its `stop.request_id` binds the response, and exactly one decision
+flag is accepted per invocation.
+
+| `stop.kind` | raised when | consumed by |
+| --- | --- | --- |
+| `needs_input` | the lead recorded a question in `result.pending_question` | `--answer` |
+| `reviewer_question` | the reviewer emitted `needs_user` | `--answer` |
+| `review_round_cap` | the reviewer still requests changes after the round cap | `--answer` |
+| `review_not_approved` | the only blocking findings were superseded verification challenges, so the reviewer never approved | `--answer` |
+| `handoff_requested` | the lead signalled `handoff_back` with a payload | `--authorize-handoff` or `--decline-handoff` |
+
+```bash
+cowork --session-file PATH --answer REQUEST_ID --context-file ./answer.md
+cowork --session-file PATH --authorize-handoff REQUEST_ID
+cowork --session-file PATH --decline-handoff REQUEST_ID [--context-file ./why.md]
+```
+
+- `--answer` requires `--context`/`--context-file`
+  (`answer_requires_context`). The answer is stored in the session and
+  delivered to the target role **by path**; the role continues and the paired
+  reviewer still has to approve. An answer never approves anything by itself.
+- `--authorize-handoff` executes the recorded hand-back as is and takes no
+  context. `--decline-handoff` returns the lead to its own phase, with any
+  supplied context delivered alongside.
+- A response that names a different, already-consumed, or mismatched request
+  is refused (`decision_no_open_request`, `decision_request_mismatch`,
+  `decision_response_kind_mismatch`). Consumption happens once, under a lock.
+- A non-approving end that needs no authority is a failure, not a stop: rc 1
+  with `stop.requires` of `reviewer` or `operator` and no `decision_argv` (for
+  example `reviewer_unavailable`, `reviewer_absent`, `review_not_approved`
+  without an approving verdict, `controller_failure`, `stale_noop`,
+  `verification_not_current`). Recovery is a machine re-invocation: a plain
+  resume, or `--switch-controller`.
+
+### Controller updates
+
+- `--switch-controller ROLE=CONTROLLER` — move one current-phase role of a
+  saved session to `claude`, `codex`, or `opencode`, then continue.
+  **Repeatable**; all switches in one invocation are one all-or-nothing update,
+  and a switch resets that role's model/effort pins. See
+  [Controller switching](#controller-switching).
+- `--allow-controllers LIST|all` — set or lift the session's allowed
+  controllers. See [Controller policy](#controller-policy).
+- Both reuse the saved team/config and cannot be combined with `--team` or
+  `--config`.
+
+### Provider capacity pauses (rc 5)
+
+When a controller turn fails with a genuine `quota_limited`/`overloaded`
+classification, cowork does not retry the same provider. It persists the
+pending turn, mints a PauseLease bound to the role, provider session,
+controller policy and candidate, and ends with `outcome: awaiting_capacity`.
+`stop` carries the lease facts (`lease_id`, `automation_ref`, `package_id`,
+role and provider identity).
+
+A paused turn is replayed by the separate, versioned `resume-trigger` entry
+point (its own JSON result line and exit-code table), normally fired by a wake
+adapter such as `scripts/cowork_wake_macos.py`:
+
+```bash
+cowork resume-trigger --session-uuid UUID --lease-id LEASE_ID \
+       --claimant-ref CLAIMANT_REF --automation-ref AUTOMATION_REF \
+       --cwd LAUNCH_DIR
+```
+
+All four identities are required. `--cwd` names the directory whose `.cowork/`
+holds the session anchor (it defaults to the current directory); that is the
+launch directory, even for a `--worktree` run. The trigger claims the due
+lease, re-checks that its binding still matches the session, and sends the
+persisted turn; it does not drive the rest of the phase. After it reports `success`, continue with
+a plain `cowork --session-file PATH`.
+
+- **Delivery is at least once, not exactly once.** Orchestrator decisions
+  carried by the paused turn are acknowledged after the provider accepts it; a
+  failed acknowledgment is reported (`decision_ack_failed`) and a later plain
+  run re-sends the decision block. No phase or epoch transition is applied
+  twice.
+- **Crashed claimant.** If a claimant stopped after claiming, a plain run is
+  refused with `decision_held_by_capacity_pause`, naming the lease, its
+  `claimant_ref`/`automation_ref`, and its retry-horizon release time.
+  Retrigger with those same four identities, verbatim, with `--cwd LAUNCH_DIR`
+  and without `--redirected-context`. That retrigger may replace the claimed
+  lease with a new lease for the same binding (for example when the send fails again with a
+  capacity outcome, reported as `send_failed` with `re_entered_capacity:
+  true`), so the old `lease_id` is no longer the one to trigger. Run a plain
+  `cowork --session-file PATH` afterwards; while a decision is still held, its
+  refusal names the lease that currently holds it. Once the lease is consumed or past its retry
+  horizon, a plain resume delivers the decision.
+
+### Worktrees
+
+- `--worktree [NAME]` / `--wt [NAME]` — before scouting, a small worktree role
+  creates a git worktree following the repo's documented convention (and any
+  documented setup, such as a per-worktree venv); a repo with no convention
+  gets a sibling `../<repo>-worktrees/<name>` folder. `NAME` defaults to
+  `cowork-<short session id>`; the branch has the same name off HEAD. It
+  requires launching inside a git work tree (`worktree_requires_git`, rc 2).
+  cowork validates the created worktree before switching into it. On a name
+  clash, an explicit `NAME` stops (or reuses an exact match); an auto name
+  picks a free numbered variant.
+- `--wt-controller claude|codex|opencode` — controller for the worktree role
   (default `claude`).
-- `--headless` / `--auto` — drive the whole scout → plan → build flow with **no
-  human gates**: leads never block (they record an assumption and proceed
-  instead of asking), reviewers review with what they have (a would-be user
-  question becomes a `revise`), and each phase ends on reviewer consensus or the
-  review-round cap (accept-with-dissent at the cap, never a hard fail).
-  Auto-progression happens **only** with this flag — without it every gate
-  blocks exactly as today. Headless **requires** initial context up front
-  (`--context`/`--context-file`, else a hard error).
+- With `--worktree`, the session store stays in the **launch** directory, not
+  the worktree. Resume from the launch directory or with its `--session-file`,
+  and pass `--cwd LAUNCH_DIR` to `resume-trigger`.
 
-  ```bash
-  # provision a worktree, then run the whole flow headless inside it
-  ./cowork --worktree --headless --context "Add a --dry-run flag to the CLI"
+### Read-only and side-channel commands
 
-  # explicit worktree name + a specific worktree-agent controller
-  ./cowork --worktree my-feature --wt-controller codex --context "…"
-  ```
+- `cowork --check` — preflight dependency check only.
+- `cowork --report [SESSION_UUID] [--json] [--rebuild]` — see
+  [Measurement](#measurement).
+- `cowork --session-owner [SESSION_UUID] [--json]` — read-only owner-lease
+  view (who owns it, heartbeat freshness, recovery command); acquires nothing
+  and always exits 0.
+- `cowork --evaluate-role ROLE --eval-session SESSION_UUID ...` — record one
+  orchestrator-owned evaluation to `orchestrator-evaluations.json`, separate
+  from peer `scores.json` and never read by a phase gate (`--help` lists the
+  score flags). No run-result record; exits 0 recorded, 1 could not record,
+  2 invalid arguments.
 
-  Resume note: with `--worktree`, cowork's own session record stays in the
-  folder you **launched from** (the per-session assets are home-dir keyed and
-  always found). To resume that session later, relaunch from the **same launch
-  folder** (or point at it with `--session-file`) — resuming from *inside* the
-  worktree will not find it.
+`--report` and `--session-owner` without a UUID read this directory's most
+recent session; they never run a phase.
 
 Defaults per role (model/effort default to the controller CLI's own setting):
 
 | Role | Controller | Model | Effort | yolo | Mode |
 | --- | --- | --- | --- | --- | --- |
 | scout | claude | default | default | on | implement |
-| scout-reviewer | codex | default | default | on | implement |
+| scout-reviewer | claude | default | default | on | implement |
 | planner | claude | default | default | on | implement |
-| planning-advisor | codex | default | default | on | implement |
+| planning-advisor | claude | default | default | on | implement |
 | builder | claude | default | default | on | implement |
-| build-reviewer | codex | default | default | on | implement |
+| build-reviewer | claude | default | default | on | implement |
 
-Roles default to **implement** mode (write-enabled). The user-facing roles are
+Roles default to **implement** mode (write-enabled). The lead roles are
 kept in their lane by **role-spec guardrails**, not by plan mode — the scout may
 write only its two intel files (JSON + markdown), the planner only its two plan
 files; the builder edits the repository freely to execute the plan but makes no
@@ -384,14 +465,16 @@ only their own review file (see below). This is instruction-level confinement,
 not an OS sandbox.
 
 All three phases — scouting, planning, building — run in this release. A
-**fresh** team without `scout` exits with a note: every run begins with
-scouting, so the scout has to be on the team (a session already past scouting
-resumes into its saved phase without re-running earlier roles).
+run that starts in scouting without `scout` is refused (`scout_not_selected`):
+every session begins with scouting (a session already past scouting resumes
+into its saved phase without re-running earlier roles).
 
 ## Sessions
 
-`cowork` persists each session in a project-local **`.cowork/session.json`** in
-the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
+`cowork` persists each session in a project-local
+**`.cowork/session.<uuid>.json`** in the directory it runs from (add `.cowork/`
+to your `.gitignore`; a legacy single `.cowork/session.json` is still
+discovered). It stores:
 
 - a **cowork session UUID** (`session_uuid`) — minted once per session, distinct
   from any claude/codex session id. It names this session's assets, all of which
@@ -406,8 +489,8 @@ the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
   role-identity registry `identities.json` (which tool + model + provider
   session id each role actually ran with),
   and the private orchestration trace `trace.jsonl`;
-- the **team** and **per-role config** — so the next run in the same directory
-  does not re-ask them (you'll see `using saved session config`);
+- the **team** and **per-role config** — so a resumed run needs no `--team` or
+  `--config`;
 - the **current phase** (`scouting`/`planning`/`building`) — so a killed run
   resumes into the phase it was in (see
   [Phases and the hand-back](#phases-and-the-hand-back));
@@ -421,25 +504,25 @@ the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
   revision) — so the [reviewer skip on unchanged artifacts](#reviewer-skip-on-unchanged-artifacts-hash-gate)
   survives a resume.
 
-On the next run, if a saved session exists, `cowork` reuses the config and
-**auto-resumes** the saved CLI sessions (`claude --resume <id>` /
-`codex exec resume <thread_id>`). The claude session id is pinned up front
-(`--session-id <uuid>`) and saved immediately, so even an instant kill is
-resumable.
+A saved session is resumed only when it is selected explicitly
+(`--session-file PATH` or `--resume`); a run with no selector starts a new
+session. A resumed run reuses the saved config and resumes the saved CLI
+sessions (`claude --resume <id>` / `codex exec resume <thread_id>`). The claude
+session id is pinned up front (`--session-id <uuid>`) and saved immediately, so
+even an instant kill is resumable.
 
-On a resume, `cowork` **skips the goal prompt and continues automatically** —
-it sends "Continue the session." so the current phase's role picks up where it
-left off with its prior context. To **redirect** the resumed session to a new
-task, pass `--context "…"`; to **start fresh**, use `--no-session` (or delete
-`.cowork/session.json`). `--session-file` points at a different store. Changing
-the saved config is out of scope for now — delete
-`.cowork/session.json` to start fresh.
+A resume without context continues automatically — the current phase's role
+picks up where it left off with its prior context. To **redirect** the resumed
+session, pass `--context`/`--context-file`; to **start fresh**, start a new
+session (no selector, or `--new`) or use `--no-session`. Changing the saved
+team/config of an existing session is not supported beyond the controller
+updates below.
 
 ### Controller switching
 
 If the active controller for the current role is unavailable or stops making
-progress, cowork can switch that role to the other controller and keep the
-session moving. The cowork phase, artifacts, shared context, review baselines,
+progress, the orchestrator can switch that role to another controller and keep
+the session moving. The cowork phase, artifacts, shared context, review baselines,
 epochs, and working tree stay in place. The provider conversation itself starts
 fresh because Claude and Codex do not expose a shared hidden-chat migration path;
 cowork seeds the new controller with an explicit handoff packet.
@@ -452,19 +535,13 @@ session artifacts, any free-form recovery/diagnostic text, and the failed pendin
 turn when there was one. No artifact bodies, context text, or turn contents are
 pasted into the packet.
 
-The switch option appears at these recovery points:
-
-- missing active controller executable at role launch;
-- controller start/resume/probe failure;
-- lead-role turn failure without status-artifact progress;
-- the stuck lead-role gate; and
-- the reviewer/advisor failure gate.
-
-The same state update is available from the CLI:
+cowork offers no in-process switch prompt. A missing executable, a
+start/resume/probe failure, a lead turn with no status progress, a stale lead,
+or an unusable reviewer ends the run with a structured failure; the
+orchestrator then re-invokes with the switch:
 
 ```bash
-./cowork --switch-controller planner=codex
-./cowork --session-file .cowork/session.<uuid>.json --switch-controller builder=claude
+cowork --session-file .cowork/session.<uuid>.json --switch-controller planner=codex
 ```
 
 Before committing the switch, cowork checks the target controller executable and
@@ -472,7 +549,9 @@ uses the existing install guidance if it is missing. When the target is Claude,
 cowork also runs the stream-json probe for that role's prompt/mode/permission
 settings. A failed target check leaves the current controller unchanged.
 
-V1 is manual only. There is no automatic rate-limit failover, no migration of
+Switching is explicit only. There is no automatic rate-limit failover
+(capacity signals pause instead; see
+[Provider capacity pauses](#provider-capacity-pauses-rc-5)), no migration of
 hidden Claude/Codex conversation history, and no guarantee that switching back
 later resumes the exact old provider session id; the saved role entry records one
 active controller/id pair at a time.
@@ -486,12 +565,12 @@ existed — nothing changes until you set one.
 
 ```bash
 # restrict this session, and move both current-phase roles in the same command
-./cowork --allow-controllers claude,codex \
-         --switch-controller builder=codex \
-         --switch-controller build-reviewer=claude
+cowork --session-file PATH --allow-controllers claude,codex \
+       --switch-controller builder=codex \
+       --switch-controller build-reviewer=claude
 
 # lift the restriction again
-./cowork --allow-controllers all
+cowork --session-file PATH --allow-controllers all
 ```
 
 `--switch-controller` is **repeatable**, and `--allow-controllers all` removes
@@ -502,13 +581,6 @@ still checked *against* it — moving a role to a controller the session forbids
 rejected — but the saved allowed list is left byte-for-byte as it was. The mirror
 also holds: a policy change never reassigns a role on its own.
 
-The interactive equivalent is **"Change this session's controllers"**, the third
-entry in the resume-or-new menu. It lets you pick the allowed set and remap the
-current phase's roles, ending in one confirmation. It goes through the same code
-path as the flags, so the same request produces the same saved session either
-way — including the case where you confirm without touching the pre-checked
-boxes, which leaves the policy untouched exactly like the plain switch command.
-
 **Ordering and the all-or-nothing guarantee.** cowork validates the whole
 proposal first — the allowed set, every role move, and whether the current phase
 would still be compliant — then checks that the target controllers are installed
@@ -516,26 +588,20 @@ and working (only ever checking controllers that will be permitted once the
 command finishes), then persists the policy and every role move as one
 **single write**. The whole update completes **before anything resumes**: no role is
 dispatched until that one write has landed. If any part of the proposal is wrong
-you get one clear message, a non-zero exit, and a session file that is
+the run reports one clear message, a non-zero exit, and a session file that is
 untouched — the update is **all-or-nothing**.
 
 **Current phase vs. the rest.** Roles in the **current phase** must comply in the
-same command — a role left on a now-forbidden controller is a hard error telling
-you to add the matching `--switch-controller`. Roles from finished phases are
+same command — a role left on a now-forbidden controller is a hard error naming the
+matching `--switch-controller` to add. Roles from finished phases are
 only reported as a **warning**, left exactly as they are, and blocked if they are
 ever reached.
 
 From then on every attempt to start a controller consults the policy first, for
 leads, paired reviewers, resumes, recovery relaunches and the `--worktree` agent
 alike. A blocked attempt never starts the process — not even a probe or an
-opencode agent-file write — and prints which role wanted which controller and
-what the session allows. Under `--headless` it exits cleanly instead of waiting
-for a human.
-
-**Recovery gates** stop offering a vague "alternate controller" on a session that
-carries a policy and list the specific controllers it still permits. When the
-policy leaves **no eligible controller**, the switch option disappears and the
-reason is stated; retry and end remain.
+opencode agent-file write — and ends the run with a structured failure naming
+which role wanted which controller and what the session allows.
 
 **If a saved policy is unreadable** — a bad hand-edit, a half-written file —
 cowork stops before starting anything rather than treating a damaged restriction
@@ -570,9 +636,7 @@ entry: `eval.drain.start` and `eval.drain.end` both carry `policy=`, and
 `eval.drain.end` also carries the `terminal` and `retired` counts alongside the
 existing ones. Every entry state change emits `eval.entry.lifecycle`
 (`entry_id`, `from_state`, `to_state`, `attempt`, `limit`, `error_class`), so a
-retry budget can be reconstructed from the trace alone. A foreground drain screen
-that fails to render or prompt records `eval.gate.error` rather than failing
-silently.
+retry budget can be reconstructed from the trace alone.
 
 ### Evaluation traceability
 
@@ -750,8 +814,8 @@ downstream is the receipt — never the builder's prose about verification:
   From it Cowork renders ONE overlay of content-free facts on two surfaces:
   the build-reviewer's handoff (fresh and resumed edges, with the receipt
   file delivered by absolute path alongside the other artifacts) and the
-  building-phase human approval gate (a compact banner block, with the
-  agent's own verification prose labeled separately as self-reported). A
+  building-phase review notice in the run transcript (a compact block, with
+  the agent's own verification prose labeled separately as self-reported). A
   structured **contradiction signal** — computed once, from owned state —
   marks the overlay on both surfaces when the builder's verification prose is
   missing or disagrees with the receipt. It is visible, never blocking.
@@ -760,7 +824,7 @@ downstream is the receipt — never the builder's prose about verification:
   to (transaction id, candidate manifest) and recorded as a
   `verification.disposition` trace event (the trace is authoritative; a small
   per-session sidecar is the reconciled read-through cache). `accepted`
-  requires an approving verdict — or an explicit gate approval — with the
+  requires the build-reviewer's approving verdict with the
   accepted candidate manifest still equal to the transaction's captured
   manifest; a valid later blocking finding supersedes the green transaction;
   a red/unverified transaction or an abandoned candidate is `rejected`. The
@@ -777,8 +841,9 @@ downstream is the receipt — never the builder's prose about verification:
   are challenges that are uncited — or contradicted by the owned receipt —
   does NOT reopen the builder: the findings are recorded
   `closure=superseded` + `superseded_by_transaction` (never erased), the
-  transaction survives as `pending_review`, and the user gate's outcome
-  drives its final disposition. Any non-verification blocking finding, or a
+  transaction survives as `pending_review`, and — because the reviewer still
+  did not approve — the phase stops with a `review_not_approved` request for
+  the orchestrator. Any non-verification blocking finding, or a
   validly-cited challenge, reopens exactly as before.
 - **Reuse booked as avoided cost.** A correction that changes only
   agent-authored artifacts (candidate manifest and Git index unchanged) hits
@@ -910,22 +975,12 @@ and visibly, with the reason recorded on disk, and turning evaluation back on
 releases it. Holding is idempotent, so a session resumed ten times under `off`
 accumulates one hold, not ten.
 
-**When a drain is genuinely going to block the run, it says so.** You get a
-distinct screen naming the governing policy and four honest counts —
-pending/running, completed, held/skipped and terminal/failed — with four safe
-choices: **continue** the eligible work, **hold** it for later, **retry**
-eligible failed work, or **end** without scoring. Holding, ending, dismissing
-the prompt and walking away all leave every queue entry intact, and none of them
-records a success for work that did not succeed. Superseded work is reported
-inside held/skipped, never as completed — retiring a superseded candidate scores
-nothing. The screen never uses phase-approval wording, because evaluation-blocked
-time is not a phase you approved. Under `off`, with an empty queue, or with
-nothing left to do, there is no prompt at all — just a short status line, exactly
-as quiet as before. Headless runs — and any run that is not attached to a real
-terminal, such as a scripted or piped one — get identical bookkeeping and
-identical counts, and continue without prompting: there is nobody there to
-answer, and a drain that used to be silent must never be able to stall a
-non-interactive run.
+**A drain never waits for anyone.** It runs with no prompt; the trace's
+`eval.drain.*` events carry the governing policy and the pending/running,
+completed, held/skipped and terminal/failed counts. No drain outcome records a
+success for work that did not succeed, and superseded work is reported inside
+held/skipped, never as completed — retiring a superseded candidate scores
+nothing.
 
 **Failures are classified and retries are bounded.** Every attempt is recorded
 *before* it runs, so a crash costs at most one attempt instead of looping
@@ -933,8 +988,9 @@ forever. A transient failure gets a second attempt; missing or unparseable
 evaluator output, a permanent failure and an unusable entry each stop after the
 first — a retry cannot change any of those. Once the budget is spent the entry is
 **terminal**, and it stays terminal across a resume with its attempt count,
-failure class and history intact. Only an explicit **retry** reopens it, and that
-retry links back to the earlier attempts rather than overwriting them.
+failure class and history intact. Only an explicit **retry** record reopens it,
+linking back to the earlier attempts rather than overwriting them; no `cowork`
+command currently issues one.
 
 Queue files written before any of this loads unchanged: entries with no lifecycle
 data read as pending with a fresh budget, and are never rewritten in place.
@@ -966,11 +1022,11 @@ them is quietly reported as done:
 | --- | --- |
 | `pending` | waiting to be scored |
 | `attempting` | an attempt was recorded but its outcome was not — an interrupted run |
-| `held` | held by policy (`off`) or by you; visible, durable, deliberately unscored |
+| `held` | held by policy (`off`); visible, durable, deliberately unscored |
 | `drained` | scored successfully — the only state that counts as completed |
 | `retired` | superseded by a later round; never scored, and **not** a failure |
 | `terminal` | its retry budget is spent; needs an explicit retry to reopen |
-| `retried` | you explicitly reopened a terminal entry; its earlier history is preserved |
+| `retried` | a terminal entry was explicitly reopened; its earlier history is preserved |
 
 `unverifiable` above is unchanged by any of this and is still **not** a failure:
 such an entry drains successfully, costs no retry budget, and is simply excluded
@@ -984,12 +1040,12 @@ version and snapshot id that produced it.
 
 ### Time
 
-Productive, review, evaluation, verification, recovery and **time spent waiting
-on you** are shown separately. The waiting figure comes from timing every prompt
-that actually blocks on a human — all six of them, from the team menu to the
-approval gates — and never from guessing at gaps between events. A gap is equally
-an ingestion stall, a controller hang or a suspended process; it is not evidence
-of a person.
+Productive, review, evaluation, verification and recovery time are shown
+separately. User-wait time is taken only from recorded `user.wait` spans, never
+inferred from gaps between events; the agent-only runtime emits no such spans,
+so a new session reports user-wait as `unknown`. A gap is equally an ingestion
+stall, a controller hang or a suspended process; it is not evidence of anyone
+waiting.
 
 ### Old sessions
 
@@ -1000,8 +1056,8 @@ with its reason.
 
 ### Context revisions
 
-Explicit context (`--context`/the goal prompt) is a **session-wide event**, not a
-one-off prompt to the scout. It is persisted as the current session context with
+Explicit context (`--context`/`--context-file`) is a **session-wide event**, not
+a one-off prompt to the scout. It is persisted as the current session context with
 a monotonically increasing **revision** (`{text, hash, revision, source}`), and
 every role records the last revision it acknowledged
 (`last_context_revision_seen`). The invariant:
@@ -1011,39 +1067,38 @@ every role records the last revision it acknowledged
 
 Fresh role sessions get it in their prompt naturally. **Resumed** sessions that
 have not acknowledged the current revision are woken with an explicit
-context-update block — "new user context was provided … treat this as the
-current task context, keep prior session knowledge only where it remains
-compatible" — so redirecting a resumed session keeps continuity without any role
+context-update block — "New orchestrator context was provided for this
+resumed cowork session" — so redirecting a resumed session keeps continuity without any role
 quietly operating on stale assumptions. A role acknowledges a revision only after
 it actually ran against it; a crash before that re-delivers the block on the next
 resume.
 
 ## The scout role
 
-`scout` doesn't gather blindly — it runs a short, consensus-building dialogue to
-find the right thing to build, the way a good product conversation goes:
+`scout` doesn't gather blindly — it grounds itself, settles scope, and makes the
+goal measurable before anything is planned:
 
 1. **Recon** — reads/searches the repo to ground itself.
-2. **Clarify** — asks you the scope-defining questions (objective, definition of
-   done, intended behavior). It asks blocking questions rather than guessing.
+2. **Clarify** — resolves ordinary ambiguity itself, choosing the most
+   reasonable interpretation and recording it in `result.assumptions`. Only a
+   decision that needs authority it does not have becomes a `needs_input`
+   request (one exact question in `result.pending_question`), which stops the
+   run for an orchestrator `--answer`.
 3. **Propose options** — when there are tradeoffs, it lays out concrete options
    *with a recommendation* instead of just asking open questions.
-4. **Make the goal measurable** — turns the agreed goal into explicit
+4. **Make the goal measurable** — turns the goal into explicit
    **success criteria** (1–5, each with a concrete measurement, an expected
    result, and a must/should tier — the measurement fitting what's being
    built: a bugfix by its reproduction, a feature by observable behavior, a
    perf goal by a metric vs a baseline, a refactor by invariants + the suite).
-   A goal it can't make measurable becomes a blocking question, never an
-   assumption; the criteria freeze at approval.
-5. **Iterate** — refines with you until you reach product consensus.
-6. **Hand off** — writes its intel and marks it ready for review.
+   The criteria freeze at approval.
+5. **Hand off** — writes its intel and marks it ready for review.
 
 Its **only write targets** are its two intel files,
 `~/.cowork/sessions/<session_uuid>/scout.intel.json` (machine source of truth +
-status channel) and `scout.intel.md` (the human-first rendering you review at the
-gate, like the planner's `plan.md`); it must not touch any other file
-(reading/searching the whole repo is encouraged). Full spec:
-[roles/scout.md](roles/scout.md).
+status channel) and `scout.intel.md` (the readable rendering, like the
+planner's `plan.md`); it must not touch any other file (reading/searching the
+whole repo is encouraged). Full spec: [roles/scout.md](roles/scout.md).
 
 ### Intel files
 
@@ -1062,30 +1117,29 @@ deliverable:
 ```
 
 `result.success_criteria` is required: it is the measurable definition of
-"done" the user approves (rendered as a dedicated **Success criteria** section
+"done" the scout-reviewer approves (rendered as a dedicated **Success criteria** section
 in `scout.intel.md`) and the contract the plan must cover. Intel that reaches
 review without a non-empty list gets an orchestrator **structural auto-finding**
 in the reviewer's brief (structure only — quality judgment stays with the
 reviewer).
 
-cowork reads only `status`. The asked questions and your answers are recorded in
+cowork reads only `status`. Questions and orchestrator answers are recorded in
 `result.clarifications`. If no `planner` role is on the team, the scout also
 includes a lightweight plan in `result`. Alongside the JSON, `scout.intel.md` is
 a readable rendering of the same intel — the scout-reviewer reviews both and
-checks the markdown stays consistent with the JSON, and the scout's approve gate
-points you at the `.md`.
+checks the markdown stays consistent with the JSON.
 
 ## The scout-reviewer role
 
 With `scout-reviewer` on the team, every time the scout marks its intel
-`ready_for_review`, cowork **deterministically** runs the reviewer **before**
-showing you the approve gate — orchestrator control flow, not a model deciding
-when to review. The reviewer starts from the **same context the scout was given**
+`ready_for_review`, cowork **deterministically** runs the reviewer —
+orchestrator control flow, not a model deciding when to review. The reviewer
+starts from the **same context the scout was given**
 (the shared context + the team framing + the scout's current intel; never the
 scout's own write-target brief) and critically checks objective alignment,
 **goal measurability** (each success criterion binary-decidable from its
 stated measurement, the measurement fitting what's being built, the `must`
-set covering the agreed goal), whether blocking product questions were buried
+set covering the goal), whether blocking product questions were buried
 as assumptions, whether cited discoveries hold up, and completeness — it is
 instructed to find gaps, not to rubber-stamp.
 
@@ -1093,22 +1147,21 @@ It writes a verdict to its own file, `~/.cowork/sessions/<session_uuid>/scout-re
 (its **only** write target, cleared before each pass so a stale verdict is never
 read back):
 
-- **`approve`** — the intel proceeds to your normal approve/revise gate.
+- **`approve`** — the only way the phase is approved; the run chains into the
+  next phase or ends with rc 0.
 - **`revise`** — the findings are handed back to the scout as its next turn; the
-  scout fixes the intel and re-proposes. Bounded to **2 rounds** per
-  `ready_for_review`; if the reviewer still hasn't approved, the gate is shown to
-  you anyway **with the reviewer's unresolved notes attached** (it never
-  hard-blocks). A missing or malformed verdict counts as `revise` — the safe
-  non-approving default.
-- **`needs_user`** — the reviewer found an unresolved **product** question only
-  you can answer. The scout relays it to you **in its own voice** (it may
-  rephrase, but must not change the meaning or drop context) and waits for your
-  answer.
+  scout fixes the intel and re-proposes. Bounded by the review round cap
+  (`REVIEW_ROUND_CAP`, currently 5 consecutive reviewer passes; the count
+  resets on an approval, on a cap stop, or when the lead reports
+  `needs_input`, not on each re-submission); past it, the phase stops
+  unapproved with a `review_round_cap` request carrying the reviewer's
+  findings.
+- **`needs_user`** — the reviewer found a decision that needs authority beyond
+  the review; the phase stops with a `reviewer_question` request for the
+  orchestrator.
 
-**Single voice:** the scout is the only role that talks to you. The reviewer is
-not a secret — you'll see a small `reviewed: ...` status marker each time it runs
-— but its raw output never interleaves into the conversation; its questions
-reach you only through the scout's faithful relay. Full spec:
+A missing or malformed verdict never approves: the reviewer is retried once,
+then the run ends with a `reviewer_unavailable` failure. Full spec:
 [roles/scout-reviewer.md](roles/scout-reviewer.md).
 
 The reviewer is a **persistent session** like the scout: its CLI session id is
@@ -1116,134 +1169,20 @@ saved and resumed on every pass and across cowork resumes, and it participates i
 [context revisions](#context-revisions) — a resumed reviewer that hasn't seen the
 latest `--context` gets it as an explicit update block on its next pass.
 
-### The review gate (Ask a question / Request changes / Approve & finish / Stop)
-
-Every interactive review gate spells out the consequence of each choice **as a
-label**, before you pick it, so nothing is a surprise. The approve wording is
-phase- and team-aware: the word **finish** appears only when approval actually
-ends the run.
-
-**Approve is never the highlighted choice**, and nothing approves by omission —
-see [Gates ignore input typed before they were
-ready](#gates-ignore-input-typed-before-they-were-ready) below.
-
-When the scout marks its intel — or the planner its plan — `ready_for_review`,
-the gate gives you these choices, in this order:
-
-- **Ask a question** — the highlighted choice, because it changes nothing. Put a
-  plain question to the role. It answers conversationally in chat and **leaves
-  the artifact exactly as it is** (the label reads "the intel/plan stays
-  as-is"): no edit, no status flip, and — because nothing changed on disk — no
-  re-review (the
-  [hash-gate](#reviewer-skip-on-unchanged-artifacts-hash-gate) skips the paired
-  reviewer). You land right back at the same gate, so you can ask as many
-  questions as you like for free before approving or requesting changes. If a
-  question genuinely surfaces new work, the role can still edit the artifact and
-  reopen — and then a re-review is correct.
-- **Request changes** — the role revises and you'll be asked for feedback; the
-  label names the resuming role ("the scout/planner/builder revises").
-- **Approve** — accept the work. With a downstream role on the team the label
-  previews the transition (**continue to planning** at the scout gate when a
-  planner is on the team, **continue to building** at the planner gate when a
-  builder is on the team); otherwise it reads **Approve & finish** and names the
-  deliverable (intel or plan).
-- **Stop** — the last choice; exits the phase cleanly **without approving and
-  without requesting changes** (see the Stop wording below).
-
-The **builder** gate is a 3-way select on a TTY, in the order **Request
-changes** / **Approve & finish** / **Stop**: Request changes (the highlighted
-choice) has the builder revise from your feedback; Approve & finish previews
-finishing so you can review your working tree; Stop exits cleanly. It has no
-"Ask a question" choice. On the preview-less compatibility path the gate is a
-plain **Approve & finish?** confirm, which now defaults to **No**, so pressing
-Return alone never approves.
-
-**Feedback is never a sign-off.** If you pick Request changes and then submit
-nothing — a blank line, whitespace only, a cancelled editor, or end-of-input —
-you land back at the gate rather than finishing, exactly like a blank question
-has always behaved. The only way to approve is to choose approve.
-
-When the reviewer's round cap is reached without approval, the **dissent** gate
-offers four choices, with continued iteration as the safe default.
-**Keep iterating** hands the reviewer's findings back to the resuming role;
-**Tell it what to do** sends your instructions to that role; **Approve anyway**
-accepts despite the reviewer (the label reads "Approve anyway — continue to
-planning/building" on a non-terminal gate and "Approve & finish anyway" only
-when approval ends the run); **Stop** exits cleanly.
-
-The **Stop** label follows persistence. For a saved session it reads **Stop —
-session remains resumable**: the phase ends without approving, and the saved
-state is left intact so you can pick the run back up later (see
-[Sessions](#sessions)). Stopping never approves, never queues a revision,
-and never advances the phase.
-
-Under `--no-session` nothing is persisted, so the same Stop choice instead reads
-**Stop — end this run without approving**; the clean-exit outcome is identical.
-
-Cancelling any preview-enabled review menu (including a single **Ctrl-C**) takes
-that same Stop path. It never silently becomes "Request changes" or "Keep
-iterating".
-
-Off a TTY (scripted/non-interactive runs) the historical contract is unchanged
-and there is no Stop choice: a blank line finishes, any other text requests
-changes. The question path is scoped to the scout and planner gates only.
-
-### Gates ignore input typed before they were ready
-
-A role turn can run for minutes, and anything you type while it runs goes
-nowhere: it is **discarded**, always. A gate becomes active only once it has
-finished drawing, and only what you type *after* that can select anything.
-
-**Whenever cowork sees that input waiting**, the gate shows a short notice
-telling you input was ignored and should be entered again. The notice carries no
-trace of what you typed — **at most a count** of how many characters arrived.
-cowork never reads that input, never keeps it, never records it in the trace,
-and never replays it into a later prompt.
-
-Even that count is best-effort: cowork asks the operating system how many bytes
-are waiting rather than looking at them, and on a terminal that cannot answer
-the question the notice simply appears without a number. Nothing else changes —
-the input is discarded either way. The same applies to the private trace record,
-which carries the gate name and the count when there is one, and no count at all
-when there isn't.
-
-What your **terminal** does with it is a separate matter. While a role turn is
-running there is no cowork editor attached, so the terminal echoes your
-keystrokes itself and they stay on screen. Seeing your text sitting there does
-not mean cowork received it — it didn't, and it never will. Type it again at the
-gate.
-
-The discarding is absolute; the notice is best-effort. cowork checks the input
-queue and then clears it, and those two steps cannot be made one operation, so a
-keystroke landing in the sliver between them is **still discarded and still
-cannot select anything** — it just goes unmentioned. cowork never warns
-speculatively either, so a notice you do see always refers to input that really
-was queued.
-
-Two cases deliberately fail safe rather than proceeding. If cowork cannot clear
-the leftover input at all — the terminal's own queue, the editor library's
-replay buffer, or the open widget's key buffers — it says so and **refuses to
-run the gate**, because it can no longer tell old keystrokes from new ones, and
-the phase ends without approving. The same happens if input keeps arriving
-through several re-opens. The session stays resumable in both cases.
-
-There is no environment variable and no flag that turns any of this off.
-
-Pasting into an **open** answer box is unaffected: a multi-line paste still
-lands whole as text and still needs an explicit Enter.
+Every stop and its response is described in
+[Stops and orchestrator decisions](#stops-and-orchestrator-decisions).
 
 ### Reviewer skip on unchanged artifacts (hash-gate)
 
-So you can keep chatting with the scout (or planner) without forcing a pointless
-review pass, cowork **skips** the paired reviewer when the artifact set it would
-review is **byte-for-byte identical to what that reviewer last approved** in the
-current phase. It is never a silent bypass: you see a `review skipped — unchanged
-since last approved` marker, the prior approval is reused, and you land at your
-normal approve gate. The "unchanged" check is a composite over **every** file the
+cowork **skips** the paired reviewer when the artifact set it would review is
+**byte-for-byte identical to what that reviewer last approved** in the current
+phase. It is never a silent bypass: the transcript shows a `review skipped —
+unchanged since last approved` marker and the prior approval is reused. The
+"unchanged" check is a composite over **every** file the
 reviewer sees (scout = `scout.intel.json` + `scout.intel.md`; planner =
 `planner.plan.json` + `planner.plan.md`), so any edit — including a markdown-only
 one — forces a full review again. Only a real prior **approve** ever seeds a skip
-(a `revise`, a round-cap dissent, a `needs_user`, or a reviewer-failure skip never
+(a `revise`, a round-cap stop, a `needs_user`, or a reviewer failure never
 does), and the baseline is tied to the phase and to the context revision the
 reviewer actually acknowledged — a phase re-entry (e.g. a planner→scout hand-back)
 or any newer context clears it. The hash-gate covers the **scout and planner
@@ -1251,11 +1190,11 @@ only**; the builder is out (its summary is a deliverable, not a skip baseline).
 
 ## The planner role
 
-When you approve the scout's intel and `planner` is on the team, cowork chains
+When the scout's intel is approved and `planner` is on the team, cowork chains
 straight into the planning phase **in the same run**: the planner is seeded with
-the approved intel JSON plus the current shared context, and becomes the single
-voice you talk to. Like the scout, it runs a dialogue — it asks the decisions
-only you can make (scope, behavior, tradeoffs) as they appear, and marks the
+the approved intel JSON plus the current shared context. Like the scout, it
+resolves ordinary ambiguity itself and raises only decisions that need outside
+authority (scope, behavior, tradeoffs) as `needs_input` stops, and marks the
 plan ready when it is decision-complete.
 
 The planner produces **two artifacts** (its only write targets):
@@ -1270,165 +1209,137 @@ The planner produces **two artifacts** (its only write targets):
   scout intel (`{session, role, status, handoff?, result}`) and doubles as the
   planner's status channel
   (`needs_input | ready_for_review | handoff_back`).
-- `~/.cowork/sessions/<session_uuid>/planner.plan.md` — the **human-first plan** you review
-  at the plan gate: TL;DR; What we're building; Key decisions; How it will
-  work; What changes; How we'll know it works; Out of scope; Risks &
-  assumptions. Sections stay small and scannable; when you want deeper detail,
-  ask the planner — it answers conversationally from the JSON instead of
-  inflating the markdown.
+- `~/.cowork/sessions/<session_uuid>/planner.plan.md` — the **readable plan**:
+  TL;DR; What we're building; Key decisions; How it will work; What changes;
+  How we'll know it works; Out of scope; Risks & assumptions. Sections stay
+  small and scannable; the dense detail stays in the JSON.
 
-At the plan gate you get the same approve/decline flow as the scout's: decline
-with feedback and the planner keeps revising; approve and — with a `builder` on
-the team — the session **chains into the building phase**. Without a builder,
-plan approval ends the run with the plan as the deliverable (a rerun resumes the
-planner conversation like any other resume). The plan JSON may also carry a
-`result.verification` list of `{label, command}` steps the build phase runs.
+When the planning-advisor requests changes, the planner keeps revising; on the
+advisor's approval — with a `builder` on the team — the session **chains into
+the building phase**. Without a builder, plan approval ends the run with the
+plan as the deliverable. The plan JSON may also carry a
+`result.verification` inventory the build phase runs (see
+[Owned verification transaction](#owned-verification-transaction)).
 Full spec: [roles/planner.md](roles/planner.md).
 
 ## The planning-advisor role
 
 The planning-advisor pairs with the planner exactly as the scout-reviewer pairs
 with the scout: each time the planner marks the plan `ready_for_review`, cowork
-deterministically runs the advisor against **both** plan artifacts before
-showing you the gate. Its checks include **criteria coverage**: every intel
+deterministically runs the advisor against **both** plan artifacts. Its checks
+include **criteria coverage**: every intel
 success criterion mapped to steps and to a verification that measures what the
 criterion actually states — uncovered, mis-measured, weakened, or dropped
-criteria are findings. Same verdict semantics — `approve` proceeds to your gate,
-`revise` findings go back to the planner (bounded to 2 rounds, then the gate is
-shown with the advisor's unresolved notes attached; never a hard block),
-`needs_user` questions reach you only through the planner's faithful relay, and
-a missing/malformed verdict counts as `revise`. Its only write target is
+criteria are findings. Same verdict semantics — only `approve` approves,
+`revise` findings go back to the planner (bounded by the round cap, then a
+`review_round_cap` stop), `needs_user` stops with a `reviewer_question`
+request, and a missing/malformed verdict never approves. Its only write target is
 `~/.cowork/sessions/<session_uuid>/planner-review.json`, cleared before each pass. Full
 spec: [roles/planning-advisor.md](roles/planning-advisor.md).
 
 ## The builder role
 
-When you approve the plan and a `builder` is on the team, the session chains
+When the plan is approved and a `builder` is on the team, the session chains
 into the **building phase**. The builder is seeded with the approved plan (JSON
-+ markdown) plus the current shared context, and becomes the single voice you
-talk to. Unlike the scout and planner, its write target is the **whole
++ markdown) plus the current shared context. Unlike the scout and planner, its
+write target is the **whole
 repository** — it executes the plan by editing source files. Its
 `~/.cowork/sessions/<session_uuid>/builder.status.json` is only a status + verification
 channel (`needs_input | ready_for_review | handoff_back`, plus a
 `result.verification` log), not a write restriction.
 
-The builder keeps a **high bar for interrupting you**: routine progress and test
-failures it can fix itself never reach you — it only asks when truly blocked,
-when a big deviation from the plan surfaces, or when the reviewer needs a product
-decision. Before marking the build ready it runs a self-audit: re-read the plan,
+The builder keeps a **high bar for stopping**: routine progress and test
+failures it can fix itself never become requests — it raises `needs_input` only
+when truly blocked or when a big deviation from the plan surfaces. Before
+marking the build ready it runs a self-audit: re-read the plan,
 walk every per-file change, run each plan-listed verification command, and record
-the results. At that self-audit it also emits a human-first build summary,
+the results. At that self-audit it also emits a readable build summary,
 `~/.cowork/sessions/<session_uuid>/builder.summary.md` — what changed per file,
-the verification results, and any issues/deviations — the readable surface you
-review at the build gate (the status JSON stays the machine source of truth). The
+the verification results, and any issues/deviations (the status JSON stays the
+machine source of truth). The
 build-reviewer reads the summary and **consistency-checks it against the real
-working-tree delta** before it reaches you, so it can't mask the build. The
+working-tree delta**, so it can't mask the build. The
 builder itself stays **out** of the reviewer hash-gate: the summary is a
 deliverable, not a skip baseline. Verification is **strict** — it does not declare
 the build ready while a verification command is failing for a reason it
 introduced. A failure it cannot fix in the working tree (a missing dependency,
-broken local tooling) is routed to **you**, not silently past the reviewer. The
-builder runs **no git commit and opens no PR**: approval ends the run with the
-changes in your working tree. Full spec: [roles/builder.md](roles/builder.md).
+broken local tooling) becomes a `needs_input` request, not something silently
+passed to the reviewer. The builder runs **no git commit and opens no PR**:
+approval ends the run with the changes in the working tree. Full spec:
+[roles/builder.md](roles/builder.md).
 
 ## The build-reviewer role
 
 The build-reviewer pairs with the builder exactly as the other reviewers pair
 with their roles: each time the builder marks the build `ready_for_review`,
-cowork deterministically runs it before showing you the gate. Its unit of review
+cowork deterministically runs it. Its unit of review
 is the builder's **full working-tree delta** — it captures the delta itself
 (`git status --porcelain` for staged/unstaged/untracked, `git diff HEAD` for
 tracked changes, and it reads new untracked files directly, since plain
 `git diff` misses staged and untracked files) and checks it against the approved
 plan, the builder's status, and the shared context. cowork records the build's
-baseline commit at building entry and **warns you if the worktree was already
+baseline commit at building entry and **flags a worktree that was already
 dirty** (so pre-existing changes are not silently attributed to the builder).
-Same verdict semantics — `approve` proceeds to your gate,
-`revise` findings go back to the builder (bounded by the round cap, then the gate
-shows the unresolved notes; never a hard block), `needs_user` reaches you only
-through the builder's faithful relay, and a missing/malformed verdict counts as
-`revise`. Its only write target is
+Same verdict semantics — only `approve` approves,
+`revise` findings go back to the builder (bounded by the round cap, then a
+`review_round_cap` stop), `needs_user` stops with a `reviewer_question`
+request, and a missing/malformed verdict never approves. Its only write target is
 `~/.cowork/sessions/<session_uuid>/builder-review.json`, cleared before each pass; it never
 edits code — fixes go through the builder. Full spec:
 [roles/build-reviewer.md](roles/build-reviewer.md).
 
 ## Phases and the hand-back
 
-The session phase (`scouting`/`planning`/`building`) is persisted in
-`.cowork/session.json`, and the flow is a **loop**:
+The session phase (`scouting`/`planning`/`building`) is persisted in the
+session store, and the flow is a **loop**:
 
 ```text
-scouting ─(you approve the intel; planner on team)─▶ planning ─(you approve the plan; builder on team)─▶ building ─(you approve the build)─▶ done (run ends)
-   ▲                                                    │  ▲                                                │
-   └──────(you confirm the planner's hand-back)─────────┘  └──────(you confirm the builder's hand-back)─────┘
+scouting ─(reviewer approves the intel; planner on team)─▶ planning ─(advisor approves the plan; builder on team)─▶ building ─(build-reviewer approves)─▶ done (run ends)
+   ▲                                                          │  ▲                                                    │
+   └──────(orchestrator authorizes the planner's hand-back)───┘  └──────(orchestrator authorizes the builder's hand-back)┘
 ```
 
 Mid-planning, the planner can **hand the work back to the scout**, and
 mid-building, the builder can **hand the work back to the planner** — say a
 foundation in the plan turns out wrong. The role writes a handoff note (what
-changed, what to re-do, what to keep) and signals `handoff_back`; cowork shows
-you an explicit confirmation gate. On yes, the **pre-processor's session
-resumes**, woken with the handoff note, runs its full cycle again, and on your
-re-approval the downstream role resumes (woken with the updated artifact to
-digest) and continues. On no, the role is told and keeps working. A
-`handoff_back` without a note degrades to the normal needs-input prompt — never
-an implicit hand-back.
+changed, what to re-do, what to keep) and signals `handoff_back`; the phase
+stops with a `handoff_requested` request (rc 4). With `--authorize-handoff`,
+the **pre-processor's session resumes**, woken with the handoff note, runs its
+full cycle again, and after its reviewer re-approves, the downstream role
+resumes (woken with the updated artifact to digest) and continues. With
+`--decline-handoff`, the lead is told and continues its own phase. A
+`handoff_back` without a note degrades to a `needs_input` stop — never an
+implicit hand-back.
 
 The signal contract is role-generic (any role → its pre-processor); planner →
-scout and builder → planner are wired. A killed run resumes into the persisted
+scout and builder → planner are wired. A resumed session re-enters the persisted
 phase: a session mid-building re-enters the builder conversation directly,
 without re-running the scout or planner. If the resumed phase's lead role is not
 on the team, the resume cascades down (building → planning → scouting) to the
 nearest phase whose role is present.
 
-### Interacting with scout — the three states
+### Role statuses
 
-Each turn, cowork streams the reply, then reads the intel `status`:
+Each lead turn streams to the transcript on stderr; cowork then reads the
+status artifact:
 
-- **working** — a `scout working…` spinner fills the gap before the first token,
-  then the reply renders **live as markdown** (Rich `Live`) under `scout ›` —
-  length-independent, so replies taller than the screen still render. Off a
-  terminal (piped/scripted), tokens stream raw with no rendering.
-- **`needs_input`** — scout asked you something. The exact question is recorded
-  in `result.pending_question`, repeated in the `scout needs your input` panel,
-  and then cowork waits for your answer. If a role writes `needs_input` without
-  a question, cowork gives it one automatic repair turn instead of showing a
-  blank answer gate; a second malformed turn is called out explicitly.
-- **`ready_for_review`** — scout finished the intel and posts a **summary in the
-  chat**. If the scout-reviewer is on the team it runs first (you'll see a
-  `reviewed: approved`, `reviewed: changes requested`, or
-  `reviewed: needs user input` marker; see
-  [The scout-reviewer role](#the-scout-reviewer-role)), then cowork shows the
-  [review gate](#the-review-gate-ask-a-question--request-changes--approve--finish--stop)
-  (**Ask a question / Request changes / Approve & finish / Stop**): approve
-  ends the session; a question is answered in chat for free (no intel edit, no
-  re-review); requesting changes sends another turn so you keep refining; and
-  Stop exits without approving. Approve is never the highlighted choice and
-  blank feedback re-opens the gate rather than finishing. Off a terminal the
-  historical blank=finish / text=revise contract is unchanged.
-
-**Input.** On a terminal each turn is a prompt_toolkit multiline editor: real line
-editing (arrow keys, word-jump, paste, history) and multiline answers. A dim hint
-sits right above the input line — **Enter to send · Ctrl+J or Alt+Enter for a new
-line**. A **blank line re-prompts**; to stop scout before it's ready, use **Ctrl-C**
-or type **`/quit`**.
-
-About **Shift+Enter**: terminals send the same byte for Enter and Shift+Enter
-unless the Kitty keyboard protocol is active, and prompt_toolkit has no Shift+Enter
-key, so the portable newline keys are **Ctrl+J** and **Alt+Enter**. You can map
-Shift+Enter to send Alt+Enter (ESC+Enter) in your terminal's keymap (VS Code,
-iTerm2, …) to get a newline on Shift+Enter — the same approach as Claude Code's
-`/terminal-setup`.
-
-Turns are color-labeled throughout — your input as `you ›` (cyan), the role's
-replies as `scout ›` (green). All of this uses rich/prompt_toolkit/questionary;
-piped/scripted runs fall back to plain text and `readline`.
+- **`needs_input`** — the role recorded an authority question in
+  `result.pending_question`; the phase stops with a `needs_input` request. If a
+  role writes `needs_input` without a question, cowork gives it one automatic
+  repair turn; if the question is still missing, the stop carries no `question`
+  and the transcript says so.
+- **`ready_for_review`** — the paired reviewer runs (the transcript shows a
+  `reviewed: …` marker), and its verdict decides what happens next (see the
+  reviewer sections above).
+- **`handoff_back`** — see above.
+- A turn that ends in neither state (no status written, or an in-progress one)
+  ends the run as a `role_turn_incomplete` failure.
 
 ## Repository layout
 
 ```text
 .
-|-- cowork                      # executable entry point
+|-- cowork                      # executable entry point (re-execs into .venv when present)
 |-- roles
 |   |-- scout.md                # scout role spec (preloaded into the controller)
 |   |-- scout-reviewer.md       # scout-reviewer role spec (critical review + verdict schema)
@@ -1440,20 +1351,22 @@ piped/scripted runs fall back to plain text and `readline`.
 |-- pricing
 |   `-- snapshot.json           # pricing snapshot (ships EMPTY: everything resolves to `unpriced`)
 `-- scripts
-    |-- cowork.py               # entry flow (questionary menus + args path) + phase loop + role orchestration
+    |-- cowork.py               # argument parser + run-result contract + phase loop + role orchestration + resume-trigger
     |-- cowork_bridge.py        # flag assembly, stream-json framing, codex resume, probe
     |-- cowork_profiles.py      # private controller state + reference-only authentication reuse
     |-- cowork_action_policy.py # controller capability matrix + content-free action decisions
-    |-- cowork_ui.py            # shared UX layer: prompt_toolkit input, Rich markdown/panels, color
-    |-- cowork_preflight.py     # Python-version + pip-package + controller PATH checks
+    |-- cowork_transcript.py    # plain-text transcript writer (stderr during a run; never reads input)
+    |-- cowork_preflight.py     # Python-version + controller PATH checks
     |-- cowork_trace.py         # private JSONL orchestration trace writer
-    |-- cowork_state.py         # .cowork/session.json store (config, phase, session ids, context revisions, verdicts)
+    |-- cowork_state.py         # .cowork/session.<uuid>.json store (config, phase, session ids, context revisions, decisions)
     |-- cowork_measure.py       # builds the AUTHORITATIVE measurement record; the only reader of raw sources
     |-- cowork_report.py        # PURE renderer of that record (computes nothing; refuses a raw source)
     |-- cowork_ingest.py        # read-only, fallible ingestion of the controllers' own session logs
     |-- cowork_ledger.py        # the sole writer of ledger.jsonl and sole minter of stable IDs
     |-- cowork_eval.py          # evaluation policy, sealed envelopes, the durable queue, isolation
     |-- cowork_pricing.py       # versioned normalization + pricing schema and snapshot loader
+    |-- cowork_capacity_scheduler.py # PauseLease claim/replace/consume for provider capacity pauses
+    |-- cowork_wake_macos.py    # launchd wake adapter that fires the capacity resume-trigger
     |-- fixtures/measurement/   # the five criterion fixture sessions + fake controller logs
     `-- test_cowork.py          # unit + live integration tests
 ```
@@ -1568,29 +1481,53 @@ and direct-only sessions remain readable with nested facts marked unavailable.
 
 ## Development
 
-Run the fast unit suite (fakes only — no CLIs spawned, no API calls):
+Run offline tests through the provider barrier, naming explicit unittest ids
+(a module, class, or single test; at least one is required):
 
 ```bash
-python3 -m unittest scripts/test_cowork.py
+python3 scripts/cowork_offline_tests.py test_cowork
+python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x test_m2_negative_controls
 ```
 
-The unit tests cover flag assembly, preflight (including the pip-package check),
-the menus (via injected ask-callables — no questionary prompt or TTY needed), the
-non-interactive args path, the claude stream-json probe, event parsing, denial
-handling, the plan-only fallthrough, the phase loop (scout→planner chaining, the
-hand-back round trip, resume-into-planning, the scout-less refusal), the planner
-loop and planning-advisor gate (via injected fakes), and that `cowork` stays
-self-contained. Tests that exercise the real rich/prompt_toolkit libraries skip
-when the packages aren't installed (like the `COWORK_LIVE` tests); install
-`requirements.txt` to run them. The real terminal experience (live markdown, the
-editor, panels) is a manual check — as is one live end-to-end phase loop:
-scout → approve → planner → hand back → scout → approve → planner → approve.
+The suites use fakes, but a bug can still reach a real `claude`/`codex`/
+`opencode` binary, so plain `python3 -m unittest` is not the recommended way to
+run them. The harness (`scripts/cowork_offline_tests.py`, with
+`scripts/cowork_offline_guard.py`) builds a scratch directory outside the repo,
+drops credentials and `COWORK_LIVE` from the child environment, puts deny stubs
+first on `PATH`, installs an in-process guard that refuses provider launches
+and provider credential paths in every child Python, and runs a preflight probe
+before any test. It passes only when preflight passed, unittest exited 0, the
+run did not time out, and the provider sentinel is empty. Exit codes: 0 pass,
+1 tests failed, 2 usage, 3 provider boundary violation, 4 setup/preflight
+failed, 5 timeout.
+
+This barrier catches accidental launches by ordinary test and product code. It
+is not a sandbox against deliberately hostile code (ctypes, direct
+`_posixsubprocess` calls, C-level file access, obfuscated shell text, or a
+non-Python child that ignores the stub `PATH`), and `HOME` is not redirected,
+so other host files stay readable.
+
+The harness's own self-tests are harmless and run plain from `scripts/`, never
+nested inside the harness (the outer guard would make the inner preflight fail
+closed):
+
+```bash
+cd scripts && python3 -m unittest test_cowork_offline_guard
+```
+
+The unit tests cover flag assembly, preflight, argument parsing and session
+selection, the run-result record and exit codes, the claude stream-json probe,
+event parsing, denial handling, the phase loop (scout→planner chaining, the
+authorized hand-back round trip, resume-into-planning, the scout-less refusal),
+and the reviewer and decision-request paths (via injected fakes). One live
+end-to-end agent-driven loop remains a manual check.
 
 ### Live integration tests
 
-To verify the real contracts against the installed CLIs (catching flag/version
-drift), set `COWORK_LIVE=1`. These spawn real `claude`/`codex` processes, make
-real API calls, and are slow:
+Live tests are a separate, explicit validation outside the offline barrier (the
+harness strips `COWORK_LIVE`). Run them only when you intend to verify the real
+contracts against the installed CLIs (catching flag/version drift). They spawn
+real `claude`/`codex` processes, make real API calls, and are slow:
 
 ```bash
 COWORK_LIVE=1 python3 -m unittest scripts/test_cowork.py

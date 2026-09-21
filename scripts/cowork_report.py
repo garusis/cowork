@@ -417,14 +417,14 @@ def _section_duration(record):
     span_count = _at(record, "duration.user_wait_span_count")
     if isinstance(span_count, int) and not isinstance(span_count, bool) \
             and span_count > 0:
-        lines.append("  user_wait comes from %s timed prompt span(s) and is "
-                     "never inferred from gaps between events."
-                     % _fmt(span_count))
+        lines.append("  user_wait comes from %s timed prompt span(s) recorded "
+                     "by a legacy interactive session and is never inferred "
+                     "from gaps between events." % _fmt(span_count))
     else:
-        lines.append("  user_wait is UNKNOWN: no timed prompt spans exist in "
-                     "this session. It is not 0 — inferring it from gaps "
-                     "between events is forbidden, because a gap is equally an "
-                     "ingestion stall or a suspended process.")
+        lines.append("  user_wait is UNKNOWN: this session recorded no wait "
+                     "spans (agent-only runs have no interactive prompts; only "
+                     "legacy sessions carry them). It is not 0 — inferring it "
+                     "from gaps between events is forbidden.")
     unresolved_count = _at(record, "duration.user_wait_unresolved_count")
     if isinstance(unresolved_count, int) \
             and not isinstance(unresolved_count, bool) \
@@ -1233,8 +1233,8 @@ def _section_scores_legacy(record):
 def _section_activity(record):
     """The durable activity/watchdog facts for this session's most recently
     classified work engagement (`record.activity`) -- the SAME compact-fact
-    vocabulary the interactive/headless renderers show (`cowork_ui.
-    render_compact_activity`/`render_headless_activity`), built here purely
+    vocabulary the run transcript shows (`cowork_transcript.
+    render_activity`), built here purely
     from durable evidence: no live process probe exists once a session has
     ended, so a populated `watchdog_verdict` here is always `no_action` with
     null evidence refs -- never a fabricated post-hoc stall/progress claim.
@@ -1262,5 +1262,133 @@ def _section_activity(record):
         _at(record, "activity.next_inspection_at")))
     lines.append("  interval_seconds   %s" % _fmt(
         _at(record, "activity.interval_seconds")))
+    lines.append("")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# Issue #64 P4: the read-only SESSION OWNER block.                            #
+#                                                                              #
+# This renderer takes an `owner_status_view` PROJECTION -- never a measurement #
+# record, never a session uuid it would have to read a lease for, and never a  #
+# path. It imports nothing new: in particular it never imports cowork_owner or #
+# cowork_state, so the "this module computes nothing and reads nothing"        #
+# boundary the whole file rests on stays literally true for the owner block    #
+# too.                                                                         #
+#                                                                              #
+# It is deliberately the ONE renderer both P4 surfaces use -- the always-on    #
+# `cowork --session-owner` query and the existence-gated block `run_report`    #
+# writes above the provenance banner. A second, gate-local "unowned" rendering #
+# is exactly how the two surfaces would drift into disagreeing about what an   #
+# unowned session looks like, so `view=None` renders what a real               #
+# `verdict: unowned` view renders, byte for byte.                              #
+#                                                                              #
+# Nothing here appears in `LINEAGE` and nothing here enters the measurement    #
+# record: an owner lease is LIVE state observed at print time, not a measured  #
+# figure, and letting one into the record would make its "every figure below   #
+# is a field in it" contract false.                                            #
+# --------------------------------------------------------------------------- #
+
+
+def render_owner_status(view, session_file=None):
+    """Render the read-only single-writer OWNER block (issue #64 P4).
+
+    `view` is a `cowork_owner.owner_status_view` projection, or None meaning
+    "no lease record exists on disk". None renders exactly what a real
+    `verdict: unowned` view renders — the two P4 surfaces cannot drift.
+
+    `session_file` is used for ONE thing: printing the exact
+    `cowork --session-file <path> --take-over` recovery command, which no view
+    carries a path for on its own. With no path known it degrades to a bare
+    `cowork --take-over`, matching `cowork_owner.refusal_message`. It is never
+    a figure and never reaches `render_report`, whose signature is untouched.
+
+    This function REPORTS. It acquires nothing, reads nothing, and never
+    raises for any shape of view it is handed.
+    """
+    return "\n".join(_section_owner_status(view, session_file)) + "\n"
+
+
+def _section_owner_status(view, session_file=None):
+    """The owner block's line list, in this module's `_section_*` house style.
+
+    TOTAL by construction: every value goes through `_fmt`, so a field the
+    projection could not compute prints `unknown` rather than raising. A status
+    surface that crashed would be strictly worse than one that says "unknown",
+    which is the same reason `owner_status_view` itself never raises for
+    anything it finds on disk.
+
+    Two wordings are decided rather than incidental:
+
+      - `reason` is always a token from the closed vocabulary — one of the five
+        `cowork_owner.OWNER_VERDICTS`, plus `foreign_host` appended when the
+        lease is held on another host. Never free prose, never a sixth verdict.
+      - the `corrupt` recovery line NEVER advertises a takeover. A takeover
+        refuses an unreadable lease (`acquire_owner_lease` raises
+        `OwnerLeaseCorrupt` before it can acquire), so pointing an operator at
+        one would be a false recovery — the precise failure P4 exists to
+        remove.
+    """
+    lines = ["Session owner (single-writer lease)", "-" * 56]
+    verdict = (view or {}).get("verdict") if isinstance(view, dict) else None
+    if not isinstance(view, dict) or verdict == "unowned" or not verdict:
+        # The gated path (no lease record on disk) and the real `unowned`
+        # verdict render identically, on purpose.
+        lines.append("  state              unowned")
+        lines.append("  reason             unowned")
+        lines.append("  recovery           none needed — no cowork process "
+                     "holds this session")
+        lines.append("")
+        return lines
+
+    lease = view.get("lease") if isinstance(view.get("lease"), dict) else {}
+    host_matches = view.get("host_matches")
+    heartbeat = view.get("heartbeat_age_s")
+    foreign = host_matches is False
+    takeover = ("cowork%s --take-over"
+                % (" --session-file %s" % session_file if session_file else ""))
+
+    lines.append("  state              %s" % _fmt(verdict))
+    lines.append("  owner              %s (epoch %s)"
+                 % (_fmt(lease.get("owner_id")), _fmt(lease.get("epoch"))))
+    lines.append("  process            pid %s on host %s (%s)"
+                 % (_fmt(lease.get("pid")), _fmt(lease.get("host_id")),
+                    "another host" if foreign
+                    else ("this host" if host_matches else UNKNOWN)))
+    lines.append("  launched           %s" % _fmt(lease.get("launch_dir")))
+    lines.append("  since              %s" % _fmt(lease.get("acquired_at")))
+    lines.append("  heartbeat          %s"
+                 % ("%ds ago" % int(heartbeat)
+                    if isinstance(heartbeat, (int, float))
+                    and not isinstance(heartbeat, bool) else UNKNOWN))
+    lines.append("  deadline           %s (expired %s)"
+                 % (_fmt(view.get("lease_deadline_at")),
+                    _fmt(view.get("expired"))))
+    lines.append("  reason             %s%s"
+                 % (verdict, " (foreign_host)" if foreign else ""))
+    lines.append("  sidecar            %s"
+                 % ("a terminal mark matches this lease"
+                    if view.get("terminal_mark_matches")
+                    else "no matching terminal mark"))
+    if verdict == "corrupt":
+        lines.append("  detail             %s" % _fmt(view.get("detail")))
+
+    if verdict == "live_owner" and not foreign:
+        recovery = ("stop that process, or take over with:  %s" % takeover)
+    elif verdict == "live_owner":
+        recovery = ("act on the owning host; a takeover from here is refused "
+                    "(foreign_host)")
+    elif verdict == "stale_dead_owner":
+        recovery = ("the owner is provably dead — take over with:  %s"
+                    % takeover)
+    elif verdict == "stale_unproven":
+        recovery = ("death is NOT proven — recover from the owning host, or "
+                    "once the process is proved gone; recovery from here is "
+                    "refused")
+    else:
+        recovery = ("the lease record for session %s is unreadable and a "
+                    "takeover cannot repair it — inspect that record"
+                    % _fmt(view.get("session_uuid")))
+    lines.append("  recovery           %s" % recovery)
     lines.append("")
     return lines

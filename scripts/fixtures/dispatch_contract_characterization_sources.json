@@ -11,11 +11,14 @@
     "requested controller. Note the three different answers: that divergence IS",
     "the missing gateway.",
     "v2 (M1 P5): rebaselined onto the signed capability-binding repair",
-    "(binding.effort joins the manifest schema at SCHEMA_VERSION=2). All nine",
+    "(binding.effort joins the manifest schema at SCHEMA_VERSION=2). All",
     "sources are additionally exercised by BackendCriterion1Test in",
     "scripts/test_dispatch_contract_characterization.py, which proves each one",
     "non-vacuously against real manifest-bound allows and real production",
-    "refusals — not just the M0-B record shape pinned below."
+    "refusals — not just the M0-B record shape pinned below.",
+    "Agent-only runtime: the `headless` source (identical dispatch facts to",
+    "`fresh`) and the `retry` source (cowork.retry_terminal_evaluations, a",
+    "removed human recovery action) were retired; seven sources remain."
   ],
   "version": 2,
   "base_commit": "e07b7ee3c6e0e47654fe3e72b43e35e8ee9102da",
@@ -103,17 +106,6 @@
         "pending_switch_after": null
       }
     },
-    "retry": {
-      "gap": 1,
-      "entry_point": "cowork.retry_terminal_evaluations",
-      "note": "the one retry mechanism that links a new attempt to the prior one",
-      "record": {
-        "reopened": 1,
-        "state_after": "retried",
-        "prior_attempt_ref_present": true,
-        "prior_attempt_ref_points_at_terminal_marker": true
-      }
-    },
     "probe": {
       "gap": 1,
       "entry_point": "cowork_bridge.probe_claude_stream_json",
@@ -124,19 +116,6 @@
         "spawns_when_allowed": 1,
         "spawns_when_blocked": 0,
         "policy_block": "raises_DispatchBlocked_kind_probe"
-      }
-    },
-    "headless": {
-      "gap": 1,
-      "entry_point": "cowork.run_scout",
-      "note": "same dispatch facts as `fresh`; only the gate adapter differs",
-      "record": {
-        "controller": "codex",
-        "factory_kwargs": ["on_thread_id", "resume_thread_id"],
-        "resume_value": null,
-        "probe_spawns": 0,
-        "pre_dispatch_guard": false,
-        "policy_block": "clean_return_rc_1"
       }
     }
   }
