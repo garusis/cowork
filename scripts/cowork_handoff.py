@@ -14,8 +14,8 @@ by ONE renderer here. A handoff carries only:
 
 It NEVER embeds bodies, findings, questions, hand-back payloads, controller
 switch-recovery text, evaluation verdict bodies, deterministic diffs, or the
-shared session-context text. Only the original user->scout prompt inlines user
-text; every CROSS-ROLE delivery of the shared context — including the
+shared session-context text. Only the original orchestrator->scout prompt inlines
+context text; every CROSS-ROLE delivery of the shared context — including the
 scout->planner and planner->builder seeds — carries it by PATH (both seed edges
 require a `context` artifact slot).
 
@@ -96,11 +96,11 @@ class ContextError(ValueError):
 SLOT_LABELS = {
     "context": "shared session context (same the active roles were given)",
     "intel_json": "scout intel JSON (machine source of truth)",
-    "intel_md": "scout intel markdown (the user's review surface)",
+    "intel_md": "scout intel markdown (readable review surface)",
     "plan_json": "plan JSON (machine source of truth)",
-    "plan_md": "plan markdown (the user's review surface)",
+    "plan_md": "plan markdown (readable review surface)",
     "build_status": "builder status JSON (status + verification log)",
-    "build_summary": "builder markdown summary (the user's review surface)",
+    "build_summary": "builder markdown summary (readable review surface)",
     "build_baseline": "build-baseline metadata (per-root start commit + dirty)",
     "verification_receipt": "owned verification receipt (orchestrator-run "
                             "transaction result)",
@@ -122,6 +122,7 @@ SLOT_LABELS = {
     "verdict": "reviewer verdict + findings (JSON)",
     "reviewed": "the artifact you reviewed",
     "upstream": "consumed upstream artifact",
+    "answer": "orchestrator answer to a decision request",
 }
 
 
@@ -183,10 +184,6 @@ def _static_role_text(text):
     return _BoundaryText(text, _token=_DELIVERY_TOKEN, kind="static_role")
 
 
-def _user_lead_reply(text):
-    return _BoundaryText(text, _token=_DELIVERY_TOKEN, kind="user_lead_reply")
-
-
 # Cross-role composition uses one transport-owned separator value.  Keeping the
 # separator typed at its source means orchestration code never has to mint a
 # generic "trusted string" merely to join two renderer-produced blocks.
@@ -198,8 +195,8 @@ class DeliveryEnvelope(str):
 
     Cross-role envelopes retain the exact edge identities and descriptors from
     their originating ``HandoffBlock`` objects. Direct envelopes are limited to
-    an explicit closed set for the initial user turn, static role instructions,
-    and subsequent user-facing lead turns.
+    an explicit closed set for the initial context turn and static role
+    instructions.
     """
 
     def __new__(cls, text, *, _token=None, delivery_class=None, edge_ids=None,
@@ -694,20 +691,8 @@ def _render_handback_revise(descriptor_lines, facts, ctx):
         "hand off yet. Read the reviewer's findings from the review file on "
         "disk:\n%s\n"
         "Address them, update your %s, and set status back to "
-        "ready_for_review when done. Do not mention the reviewer to the user."
+        "ready_for_review when done."
         % (noun, descriptor_lines, noun))
-
-
-def _render_handback_needs_user(descriptor_lines, facts, ctx):
-    noun = facts.get("artifact_noun") or "artifact"
-    return (
-        "[reviewer handoff] Before this can go to the user for approval, a "
-        "blocking product question is unresolved. Read the reviewer's "
-        "user_question (and its findings) from the review file on disk:\n%s\n"
-        "Put that question to the user in your own next reply. You MAY rephrase "
-        "it into your own voice, but you must NOT change its meaning or omit any "
-        "part of its context. Then set status back to needs_input. Do not "
-        "mention the reviewer to the user." % descriptor_lines)
 
 
 # ---- routes 3/6: active-lead seed (context MAY be inline — decision 2) ----- #
@@ -716,8 +701,8 @@ def _render_planner_seed(descriptor_lines, facts, ctx):
     # scout->planner is a CROSS-ROLE handoff: the shared context is a file the
     # planner reads from disk (referenced among the descriptors), NEVER inline.
     return (
-        "The scout phase is complete and the user APPROVED the scout intel. "
-        "Digest it and drive the planning conversation. The approved intel AND "
+        "The scout phase is complete and the scout-reviewer APPROVED the scout "
+        "intel. Digest it and produce the plan. The approved intel AND "
         "the current shared context are the files on disk below.\n\n%s"
         % _read_from_disk_block(descriptor_lines))
 
@@ -725,9 +710,8 @@ def _render_planner_seed(descriptor_lines, facts, ctx):
 def _render_builder_seed(descriptor_lines, facts, ctx):
     # planner->builder is a CROSS-ROLE handoff: the shared context rides by path.
     return (
-        "The planning phase is complete and the user APPROVED the plan. "
-        "Execute it: make the code changes, verify them, and drive the build "
-        "conversation. The approved plan AND the current shared context are the "
+        "The planning phase is complete and the planning-advisor APPROVED the "
+        "plan. Execute it: make the code changes and verify them. The approved plan AND the current shared context are the "
         "files on disk below.\n\n%s"
         % _read_from_disk_block(descriptor_lines))
 
@@ -735,8 +719,8 @@ def _render_builder_seed(descriptor_lines, facts, ctx):
 def _render_intel_updated(descriptor_lines, facts, ctx):
     return (
         "The scout intel changed since you started planning: your hand-back was "
-        "executed, the scout re-investigated, and the user approved the updated "
-        "intel. Digest it and continue planning. Keep prior plan content only "
+        "executed, the scout re-investigated, and the scout-reviewer approved the "
+        "updated intel. Digest it and continue planning. Keep prior plan content only "
         "where it remains compatible.\n\n%s"
         % _read_from_disk_block(descriptor_lines))
 
@@ -744,8 +728,8 @@ def _render_intel_updated(descriptor_lines, facts, ctx):
 def _render_plan_updated(descriptor_lines, facts, ctx):
     return (
         "The plan changed since you started building: your hand-back was "
-        "executed, the planner re-planned, and the user approved the UPDATED "
-        "plan. Digest the changes and continue building. Keep prior work only "
+        "executed, the planner re-planned, and the planning-advisor approved the "
+        "UPDATED plan. Digest the changes and continue building. Keep prior work only "
         "where it remains compatible.\n\n%s"
         % _read_from_disk_block(descriptor_lines))
 
@@ -874,18 +858,20 @@ def _render_build_reviewer_resume(descriptor_lines, facts, ctx):
 
 def _render_scout_handback_wake(descriptor_lines, facts, ctx):
     return (
-        "The planner handed the work back to you mid-planning (the user "
-        "confirmed the hand-back). Re-run your full cycle: investigate, clarify "
-        "with the user, update your intel file, and set status "
+        "The planner handed the work back to you mid-planning (the orchestrator "
+        "authorized the hand-back). Re-run your full cycle: investigate, resolve "
+        "what the context settles, raise an authority request only for what it "
+        "does not, update your intel file, and set status "
         "ready_for_review when done. Read the planner's hand-back note from the "
         "file on disk:\n%s" % descriptor_lines)
 
 
 def _render_planner_handback_wake(descriptor_lines, facts, ctx):
     return (
-        "The builder handed the work back to you mid-build (the user confirmed "
-        "the hand-back). Re-plan as needed: update your plan files, clarify "
-        "with the user, and set status ready_for_review when done. Read the "
+        "The builder handed the work back to you mid-build (the orchestrator "
+        "authorized the hand-back). Re-plan as needed: update your plan files, "
+        "raise an authority request only for what the context does not settle, "
+        "and set status ready_for_review when done. Read the "
         "builder's hand-back note from the file on disk:\n%s" % descriptor_lines)
 
 
@@ -935,10 +921,28 @@ def _render_pending_resume(descriptor_lines, facts, ctx):
 
 def _render_context_update(descriptor_lines, facts, ctx):
     return (
-        "New user context was provided for this resumed cowork session.\n\n"
+        "New orchestrator context was provided for this resumed cowork session.\n\n"
         "Treat this as the current task context. Keep prior session knowledge "
         "only where it remains compatible. Read the current context from the "
         "file on disk:\n%s" % descriptor_lines)
+
+
+# ---- route 14: orchestrator decision answers (answer by path) --------------- #
+
+def _render_decision_answer(descriptor_lines, facts, ctx):
+    return (
+        "[orchestrator decision] The orchestrator answered the request this "
+        "phase stopped on. Read the answer from the file on disk, record it "
+        "in your artifact (remove the pending question), and continue your "
+        "phase. The original task context is unchanged; the answer refines "
+        "it:\n%s" % descriptor_lines)
+
+
+def _render_decision_record(descriptor_lines, facts, ctx):
+    return (
+        "Orchestrator answers given earlier in this session refine (never "
+        "replace) the task context. Read them from disk:\n%s"
+        % descriptor_lines)
 
 
 # ---- route 12: peer evaluation evidence (verdict + consumed upstream) ------ #
@@ -1012,11 +1016,6 @@ EDGES = {
         "from_role": "reviewer", "to_role": "lead", "kind": "handback",
         "sources": ["review"], "required": ["review"],
         "facts": ("artifact_noun",), "render": _render_handback_revise,
-    },
-    "reviewer->lead:handback_needs_user": {
-        "from_role": "reviewer", "to_role": "lead", "kind": "handback",
-        "sources": ["review"], "required": ["review"],
-        "facts": ("artifact_noun",), "render": _render_handback_needs_user,
     },
     # route 3 (cross-role seed: context rides by PATH, not inline)
     "scout->planner:seed": {
@@ -1129,6 +1128,17 @@ EDGES = {
         "from_role": "orchestrator", "to_role": "role", "kind": "context_update",
         "sources": ["context"], "required": ["context"], "facts": (),
         "render": _render_context_update,
+    },
+    # route 14 (orchestrator decision answers, by path)
+    "orchestrator->lead:decision_answer": {
+        "from_role": "orchestrator", "to_role": "lead", "kind": "decision",
+        "sources": ["answer"], "required": ["answer"], "facts": (),
+        "render": _render_decision_answer,
+    },
+    "orchestrator->role:decision_record": {
+        "from_role": "orchestrator", "to_role": "role", "kind": "decision",
+        "sources": ["answer"], "required": ["answer"], "facts": (),
+        "render": _render_decision_record,
     },
     # route 12 (peer evaluation evidence — verdict + consumed upstream)
     "eval->reviewer_verdict": {

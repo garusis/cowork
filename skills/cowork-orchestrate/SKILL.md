@@ -1,76 +1,62 @@
 ---
 name: cowork-orchestrate
-description: Route an engineering request into a bounded work package, decide from integrity-verified backend-gate evidence whether it runs on Cowork or stops with an explicit blocked outcome, and supervise the package lifecycle. Use for delegated implementation, planning, review, or recovery that needs explicit authority, candidate-bound gates, and fail-closed routing; use cowork-cli for ordinary Cowork command mechanics and cowork-debug for session forensics.
+description: Turn an engineering request into a bounded work package, run it on Cowork, and supervise it to an explicit outcome. Use for delegated implementation, planning, review, or recovery that needs explicit authority, candidate-bound acceptance, and fail-closed stopping; use cowork-cli for ordinary Cowork command mechanics and cowork-debug for session forensics.
 ---
 
 # Cowork Orchestrate
 
 Turn the request into one bounded package before dispatch. Record the objective,
-base/candidate identity, allowed paths and actions, acceptance gates, provider and
-spend policy, and stopping/recovery conditions. Preserve the user's authority;
-do not infer permission to publish, merge, spend, or widen scope.
+base/candidate identity, allowed paths and actions, acceptance checks, provider
+and spend policy, and stop/recovery conditions. Preserve the user's authority:
+do not infer permission to publish, merge, spend, or widen scope, and do not ask
+again for routine steps the package already authorizes.
 
-## Select the backend first
+## Transport
 
-Read [references/backend-gate.md](references/backend-gate.md), then evaluate the
-release-bound receipts with `scripts/select_backend.py`. Accept Cowork only when
-all six criteria are present, PASS, integrity-verified, carrying a coherent
-validity window, and bound to one release digest. Missing, malformed, partial,
-incoherent, or conflicting evidence yields `blocked` with an explicit reason.
-The selector has no second backend: never silently re-route, and never treat an
-M1 criterion-1 receipt as full eligibility. A validity window that has merely
-elapsed does not by itself disqualify otherwise verified immutable evidence; it
-is reported as `validity_elapsed`.
+Cowork is the agent transport. Run the package through the `cowork` CLI per the
+`cowork-cli` skill; do not duplicate its recipes.
 
-Resolve the compact selector manifest from the stable repository pointer
-described in [backend-gate pointer](references/backend-gate-pointer.md), or use
-an explicitly supplied, independently accepted manifest. The selector checks
-the compact manifest; the supervisor must also validate the pointer, manifest
-hash, current HEAD/tree binding, global adjudication, and referenced receipt
-hashes before accepting Cowork. A plausible JSON object with invented hashes is
-not evidence.
-
-The M4 milestone/global receipt proves criterion 5 only; it does not claim
-criteria 3/4 or the full gate. Treat an M4-only receipt as partial evidence,
-which yields `blocked`. Future releases qualify only through their own complete,
-release-bound receipt passing this selector.
-
-Use the routing outcome for this package only. Re-evaluate after a release,
-policy, candidate, configuration, or gate-evidence change.
-
-## Authorized exception
-
-Cowork is the default and `blocked` is the routing outcome.
-Only a real Cowork blocker (Cowork itself cannot run the package) may be
-repaired through the `invoke-claude-agent` skill — a Claude session run outside
-Cowork. That exception is supervisor-reviewed, is never chosen by the selector
-or by a worker, is bounded to the repair, and returns to Cowork once the
-blocker is repaired.
-An elapsed window, a failed gate, or a self-hosting shape never qualifies.
+- Before dispatch, run `cowork --check`. A failed preflight stops the package
+  as `blocked` with the named missing piece; it is never an assumed pass.
+- A `blocked` package stops and is reported. It never degrades into another
+  transport. Run work through a direct Claude session instead only when the
+  user explicitly asks for that for this work.
+- Choose the smallest team and controller configuration that supplies the
+  discovery, planning, implementation, and assurance the risk needs. Teams are
+  paired and every new session begins with `scout` and `scout-reviewer`; there
+  is no standalone planner, builder, or reviewer session.
 
 ## Run and supervise
 
-- Before dispatch, run the real environmental preflight of the runner
-  (`cowork --check`, per the `cowork-cli` skill). A failed environmental
-  preflight yields `blocked` — never a re-route and never an assumed PASS.
-- On `blocked`, stop the package with the named reason and do not dispatch. A
-  blocked package never degrades into another backend; the only way out is the
-  supervisor-reviewed repair route above, and only for a real Cowork blocker.
-- For `cowork`, read and follow the `cowork-cli` skill for non-interactive launch,
-  worktree, session, resume, and report mechanics. Do not duplicate those recipes.
-- Keep deterministic gates supervisor-owned and candidate-bound. Collect once,
-  execute each gate once per candidate, use the authorized reviewer policy, and
-  persist the fixed-gate decision.
+- Treat the final JSON run-result line as the outcome. Only rc 0 with
+  `approved: true` is success; a stop, capacity pause, failure, or missing line
+  is not.
+- rc 4: answer a stop only within delegated authority, using the request-bound
+  decision flags. A scope, risk, publication, or spending decision beyond it
+  becomes `needs_authority` for the user.
+- rc 5: preserve phase, candidate, policy, session identity, and completed
+  evidence; resume only through the capacity `resume-trigger` path.
+- rc 1/3/17: preserve evidence, then use only an authorized recovery (plain
+  resume after fixing a cause, `--switch-controller`, or an authorized
+  takeover). Never retry blindly or invent a reset, provider switch, or spend.
 - For long-running work, schedule a 15-minute recurring wake unless durable
-  state requests a later inspection. Query each active work once per wake,
-  beginning with compact state/digest; end silently when healthy and
-  non-terminal. Do not add a polling loop or normal-path log tail.
-- On a typed capacity wait, preserve phase, candidate, policy, session identity,
-  and completed evidence. Resume only from a trustworthy once-only signal.
-- On failure, preserve evidence and use only the authorized correction/recovery
-  path. Stop for `needs_authority` rather than widening scope.
-- Use the `cowork-debug` skill only when artifacts, trace, session identity, or
-  status conflict; it owns forensic reconstruction.
+  state requests a later inspection. Query each active work once per wake from
+  compact state; end silently when healthy and non-terminal. Do not add a
+  polling loop or normal-path log tail.
+- Use `cowork-debug` only when the run result, artifacts, trace, session
+  identity, or status conflict.
 
-Report the routing outcome and reason, package state, accepted candidate,
-gate/reviewer outcome, and any remaining authority or eligibility gap.
+## Accept
+
+Cowork commits nothing. After an approved build, review the working-tree diff
+against the package scope yourself and run verification proportional to the
+risk: focused checks for a narrow change, broader suites when shared behavior
+moved. Bind acceptance to the exact candidate you reviewed; a changed candidate
+needs its affected checks re-run.
+
+Tests that protect product behavior belong in the repository. Package and
+milestone evidence (receipts, run results, review notes) stays outside Git
+unless the user asks otherwise.
+
+Report the package state, run outcome and reason, accepted candidate, checks
+run and their results, and any remaining authority gap or unverified risk.

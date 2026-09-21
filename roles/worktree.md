@@ -6,7 +6,7 @@ create a git worktree for the repository cowork was launched in — following th
 repository's own worktree convention — so the rest of the session runs inside an
 isolated worktree. You have **no paired reviewer and no approval gate**: cowork
 reads your status artifact and then independently verifies the worktree exists
-and is git-registered. Create the worktree **without asking the user anything**.
+and is git-registered. Create the worktree **without asking for input**.
 
 ## What you receive
 
@@ -31,7 +31,7 @@ Your brief names, deterministically:
 2. **Create the worktree and a same-named branch off the current HEAD**, e.g.
    `git -C <base> worktree add <path> -b <name>`.
 3. **Apply the collision policy from your brief.** For an **explicit** name
-   (the user passed `--worktree NAME`): never silently rename it — reuse an
+   (the orchestrator passed `--worktree NAME`): never silently rename it — reuse an
    existing worktree only when it is already at the matching path on that exact
    branch (idempotent reuse), otherwise report failure. For an
    **auto-generated** name: on a collision, append a numeric suffix
@@ -74,11 +74,12 @@ repo, and is on the branch you reported. A missing/malformed artifact, a
 with an error — the session never half-redirects into a bad tree. So write the
 artifact accurately, and only claim `ready` once the worktree truly exists.
 
-## Talking to the user
+## Your reply
 
-- Keep chat narration brief and about the worktree you are creating.
+- Your reply text is written to the run transcript. Keep it brief and about the
+  worktree you are creating.
 - Your brief carries a compression directive saying whether the caveman tool is
-  installed. When it is, write that chat narration in terse caveman ultra style;
+  installed. When it is, write that reply text in terse caveman ultra style;
   when it is not, write it in normal prose. This NEVER changes the status
   artifact format — the required JSON is unchanged. Do not invoke /caveman or
   change any global level.
@@ -87,7 +88,7 @@ artifact accurately, and only claim `ready` once the worktree truly exists.
 
 When the building phase starts, cowork records what the build began from as a
 **per-file content manifest**, `build_baseline.json` — every tracked file with
-its SHA-256 and size — alongside the human-readable `build_baseline.txt` (the
+its SHA-256 and size — alongside the readable `build_baseline.txt` (the
 HEAD sha and a dirty flag).
 
 The manifest is what build and review metrics are measured against, not HEAD.

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Cross-surface fact-equivalence tests (M4 Package D): interactive
-(`cowork_ui.render_compact_activity`), headless
-(`cowork_ui.render_headless_activity`), and the report leg
+"""Cross-surface fact-equivalence tests (M4 Package D): the run transcript
+(`cowork_transcript.render_activity`) and the report leg
 (`cowork_report._section_activity`, fed by `cowork_measure.build_record`'s
 `record["activity"]`) all consume the SAME compact facts for the same
 durable evidence -- proven end-to-end through the real Package B/D/E/D
@@ -28,20 +27,11 @@ import cowork_activity as activity  # noqa: E402
 import cowork_measure as measure  # noqa: E402
 import cowork_report as report  # noqa: E402
 import cowork_state as state_store  # noqa: E402
-import cowork_ui as ui  # noqa: E402
+import cowork_transcript as transcript  # noqa: E402
 import cowork  # noqa: E402
 import cowork_bridge as bridge  # noqa: E402
 
 WORK_ID = "99999999-8888-7777-6666-555555555555"
-
-
-class FakeTTY(io.StringIO):
-    """A StringIO that claims to be a terminal, so C's real Spinner (and
-    the interactive renderer's own `is_tty()` check) treat it as one --
-    the same fixture convention `test_cowork_ui_activity.py` already uses."""
-
-    def isatty(self):
-        return True
 
 
 class CrossSurfaceEquivalenceTest(unittest.TestCase):
@@ -74,9 +64,9 @@ class CrossSurfaceEquivalenceTest(unittest.TestCase):
             "interval_seconds": 300, "last_inspection_result_ref": None,
         })
 
-    def _interactive_and_headless_text(self):
-        """The real interactive (off-TTY plain-text branch) and headless
-        renderer output, built from the SAME durable evidence via the real
+    def _transcript_text(self):
+        """The real transcript activity output, built from the durable
+        evidence via the real
         `cowork_state.latest_activity`/`read_next_inspection` reads and a
         real `project_compact_state` projection -- exactly the pipeline
         `cowork.py`'s own activity-emission seam uses."""
@@ -92,59 +82,55 @@ class CrossSurfaceEquivalenceTest(unittest.TestCase):
         compact_state = activity.project_compact_state(
             current["activity_record"], decision, schedule_record,
             current["reconciliation_record"])
-        interactive_out = io.StringIO()
-        ui.render_compact_activity(interactive_out, compact_state,
-                                   enabled=False)
-        headless_out = io.StringIO()
-        ui.render_headless_activity(headless_out, compact_state)
-        return interactive_out.getvalue(), headless_out.getvalue()
+        out = io.StringIO()
+        transcript.render_activity(out, compact_state)
+        return out.getvalue()
 
     def _report_text(self):
         record = measure.build_record(self.session_uuid)
         return "\n".join(report._section_activity(record)), record
 
-    def test_all_three_surfaces_agree_on_activity_class(self):
+    def test_both_surfaces_agree_on_activity_class(self):
         self._write_durable_evidence(activity_class="local_tool_work")
-        interactive, headless = self._interactive_and_headless_text()
+        text_out = self._transcript_text()
         report_text, record = self._report_text()
         # The renderers print a human-readable label for the SAME
         # underlying class the report prints verbatim.
-        self.assertIn("local tool work", interactive)
-        self.assertIn("local tool work", headless)
+        self.assertIn("local tool work", text_out)
         self.assertIn("local_tool_work", report_text)
         self.assertEqual(record["activity"]["activity_class"],
                          "local_tool_work")
 
-    def test_all_three_surfaces_agree_on_source_and_provider_health(self):
+    def test_both_surfaces_agree_on_source_and_provider_health(self):
         self._write_durable_evidence(source="opencode",
                                      provider_health="degraded")
-        interactive, headless = self._interactive_and_headless_text()
+        text_out = self._transcript_text()
         report_text, record = self._report_text()
-        for text in (interactive, headless, report_text):
+        for text in (text_out, report_text):
             self.assertIn("opencode", text)
         self.assertIn("degraded", report_text)
         self.assertEqual(record["activity"]["source"], "opencode")
         self.assertEqual(record["activity"]["provider_health"], "degraded")
 
-    def test_all_three_surfaces_agree_on_next_inspection_at(self):
+    def test_both_surfaces_agree_on_next_inspection_at(self):
         self._write_durable_evidence()
-        interactive, headless = self._interactive_and_headless_text()
+        text_out = self._transcript_text()
         report_text, record = self._report_text()
-        for text in (interactive, headless, report_text):
+        for text in (text_out, report_text):
             self.assertIn("2026-01-01T00:05:00Z", text)
         self.assertEqual(record["activity"]["next_inspection_at"],
                          "2026-01-01T00:05:00Z")
 
-    def test_all_three_surfaces_agree_after_reconciliation(self):
+    def test_both_surfaces_agree_after_reconciliation(self):
         self._write_durable_evidence(activity_class="hung_descendant")
         state_store.reread_before_gate(
             self.session_uuid, WORK_ID, "2026-01-01T00:01:00Z",
             "productive_model_work", "a" * 64, "poll")
-        interactive, headless = self._interactive_and_headless_text()
+        text_out = self._transcript_text()
         report_text, record = self._report_text()
         # The RECONCILED class, never the superseded original, is what
         # every surface reports as the current fact.
-        for text in (interactive, headless):
+        for text in (text_out,):
             self.assertIn("productive model work", text)
             self.assertIn("reconciled from hung descendant", text)
         self.assertIn("productive_model_work", report_text)
@@ -165,24 +151,21 @@ class CrossSurfaceEquivalenceTest(unittest.TestCase):
         # placeholder reserved for a genuinely absent/empty `activity` key.
         self.assertIn(measure.UNKNOWN, report_text)
         self.assertNotIn("no durable activity recorded", report_text)
-        # The interactive/headless renderers, given no compact_state at
-        # all (the real production seam never renders without one -- see
-        # `cowork.py`'s own `_render_activity_snapshot` guard), simply
-        # never fire; there is no fabricated "unknown" activity panel to
-        # cross-check against on those two surfaces for an unrecorded work
-        # engagement, matching this same fixed absence.
+        # The transcript renderer, given no compact_state at all (the real
+        # production seam never renders without one -- see `cowork.py`'s own
+        # `_render_activity_snapshot` guard), simply never fires.
 
     def test_never_fabricates_productive_from_provider_wait_alone(self):
-        # False-productive-attribution guard, proven across all three
-        # surfaces at once: a provider_wait record with NO reconciliation
+        # False-productive-attribution guard, proven across both surfaces
+        # at once: a provider_wait record with NO reconciliation
         # never renders as productive_model_work anywhere.
         self._write_durable_evidence(activity_class="provider_wait")
-        interactive, headless = self._interactive_and_headless_text()
+        text_out = self._transcript_text()
         report_text, record = self._report_text()
         self.assertIn("provider_wait", report_text)
         self.assertEqual(record["activity"]["activity_class"],
                          "provider_wait")
-        for text in (interactive, headless):
+        for text in (text_out,):
             self.assertIn("waiting on provider", text)
             self.assertNotIn("productive model work", text)
         self.assertNotEqual(record["activity"]["activity_class"],
@@ -190,17 +173,15 @@ class CrossSurfaceEquivalenceTest(unittest.TestCase):
 
 
 # =========================================================================== #
-# M4D-MAJ-01 correction: non-vacuous output arbitration -- a REAL             #
-# `cowork_ui.Spinner` (Package C's own, unmocked) writes genuine `\r\033[K`   #
-# CR-frames to a TTY-like sink while a real `cowork_bridge.CodexSession` turn #
-# is in flight; D's retained renderer call fires only once that spinner has  #
-# already closed, with zero interleave between the two.                     #
+# M4D-MAJ-01: output arbitration -- while a real `cowork_bridge.CodexSession` #
+# turn is in flight (with in-turn activity ticks firing), nothing but the     #
+# turn itself writes the transcript; the activity snapshot is written exactly #
+# once per genuine turn-boundary send, never from a tick.                     #
 # =========================================================================== #
 
 class _DelayedLineIter(object):
     """Yields `lines` one at a time, sleeping `delay` seconds before the
-    FIRST line -- long enough for a real (0.1s-per-frame) `cowork_ui.
-    Spinner` background thread to write at least one genuine CR-frame
+    FIRST line -- long enough for several in-turn activity ticks to fire
     before any content arrives."""
 
     def __init__(self, lines, delay):
@@ -227,8 +208,8 @@ def _sleep(seconds):
 
 class _DelayedScriptedProc(object):
     """A `subprocess.Popen`-shaped fake whose `.stdout` delays its first
-    line just long enough for a real Spinner to spin, then completes
-    normally -- never approaching the first-token deadline."""
+    line, then completes normally -- never approaching the first-token
+    deadline."""
 
     def __init__(self, lines, delay=0.35):
         self.stdout = _DelayedLineIter(lines, delay)
@@ -248,16 +229,16 @@ class _DelayedScriptedProc(object):
         self.killed = True
 
 
-class SpinnerThenActivityRenderTest(unittest.TestCase):
-    """Gate 12: real Spinner, TTY-like sink, a positive `\\r\\033[K` frame
-    assertion, then zero interleave with the retained renderer."""
+class InTurnTicksNeverWriteTranscriptTest(unittest.TestCase):
+    """Gate 12: in-turn ticks fire during a delayed real turn, yet the
+    activity snapshot is written exactly once per send."""
 
     def setUp(self):
         self._prior_root = os.environ.get("COWORK_SESSIONS_ROOT")
         self._tmp = tempfile.mkdtemp()
         os.environ["COWORK_SESSIONS_ROOT"] = self._tmp
         self._prior_interval = cowork._ACTIVITY_TICK_INTERVAL_SECONDS
-        # Shrink the tick interval far below the spinner's ~0.35s window so
+        # Shrink the tick interval far below the turn's ~0.35s delay so
         # several ticks WOULD fire during it if they wrote anything at all
         # -- proving zero interleave is not merely "no tick had time to
         # run" but "a tick that DID run wrote nothing".
@@ -271,8 +252,8 @@ class SpinnerThenActivityRenderTest(unittest.TestCase):
             os.environ["COWORK_SESSIONS_ROOT"] = self._prior_root
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def test_real_spinner_frame_then_activity_render_zero_interleave(self):
-        # `_role_loop`'s own status-repair/headless-nudge cascade may issue
+    def test_activity_render_once_per_send_zero_tick_writes(self):
+        # `_role_loop`'s own status-repair cascade may issue
         # MORE than one real send when (as here) a scripted proc never
         # writes a status artifact -- every one of them is a REAL send
         # through the SAME retained call site, so this test does not
@@ -285,7 +266,7 @@ class SpinnerThenActivityRenderTest(unittest.TestCase):
             '"text": "done"}}',
         ]
         proc = _DelayedScriptedProc(lines, delay=0.35)
-        out = FakeTTY()
+        out = io.StringIO()
         session_uuid = "77778888-0000-0000-0000-000000000001"
         work_id = "88887777-0000-0000-0000-000000000001"
 
@@ -303,15 +284,12 @@ class SpinnerThenActivityRenderTest(unittest.TestCase):
             cowork._role_loop(
                 session, "seed", os.path.join(tempfile.mkdtemp(),
                                               "status.json"),
-                context="", io_in=io.StringIO(""), io_out=out,
-                headless=True, session_uuid=session_uuid,
+                context="", io_out=out,
+                session_uuid=session_uuid,
                 role_work_id=work_id, role="scout")
 
         full = out.getvalue()
-        # Positive frame assertion: the real Spinner genuinely wrote at
-        # least one periodic `\r\033[K<frame char>` CR-frame, not merely
-        # its own final clear.
-        self.assertRegex(full, r"\r\x1b\[K[|/\\-] ")
+        self.assertNotIn("\r", full)
 
         # Zero interleave: the retained renderer fires EXACTLY once per
         # genuine turn-boundary send -- never once more from a tick, even
@@ -326,23 +304,6 @@ class SpinnerThenActivityRenderTest(unittest.TestCase):
         # is what disambiguates a genuine render from an evidence-ref
         # substring collision.
         self.assertEqual(full.count("activity: "), len(send_calls))
-
-        # Ordering, scoped to the FIRST turn's own output (the one with
-        # the real in-flight delay): its activity render appears strictly
-        # AFTER that turn's own last periodic spin frame -- never before
-        # or during it.
-        first_chunk_end = full.index("artifact changes: none\n") + len(
-            "artifact changes: none\n")
-        first_chunk = full[:first_chunk_end]
-        last_frame_idx = max(
-            first_chunk.rfind("\r\x1b[K%s" % ch) for ch in "|/\\-")
-        self.assertGreaterEqual(last_frame_idx, 0,
-                                "no periodic spin frame found in the first "
-                                "turn's own output")
-        activity_idx = first_chunk.index("activity:")
-        self.assertGreater(activity_idx, last_frame_idx,
-                           "the activity render appeared before/during the "
-                           "spinner's own last frame")
 
 
 # =========================================================================== #
@@ -361,9 +322,8 @@ class SpinnerThenActivityRenderTest(unittest.TestCase):
 
 class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
     """A second `run_flow` call in the same process, after a first call left
-    `_ACTIVITY_SHUTDOWN_EVENT` set via a real SIGTERM, still produces the
-    real spinner CR-frame followed by the activity render with zero
-    interleave -- proving the shared event is reset at the SECOND run's own
+    `_ACTIVITY_SHUTDOWN_EVENT` set via a real SIGTERM, still produces its
+    activity render -- proving the shared event is reset at the SECOND run's own
     entry, before its SIGTERM handler is installed and before its first
     tick, not merely left clear by test-local cleanup."""
 
@@ -387,10 +347,11 @@ class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     @staticmethod
-    def _headless_scout_args(controller):
+    def _scout_args(controller):
         return cowork.build_parser().parse_args(
-            ["--team", "scout", "--config", "scout=%s,yolo,plan" % controller,
-             "--context", "hello", "--no-session", "--headless"])
+            ["--team", "scout,scout-reviewer",
+             "--config", "scout=%s,yolo,plan" % controller,
+             "--context", "hello", "--no-session"])
 
     def test_second_run_flow_ignores_first_runs_leaked_sigterm_event(self):
         # First run: a real SIGTERM lands mid-run_flow (the same mechanism
@@ -405,7 +366,7 @@ class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
 
         with self.assertRaises(SystemExit) as ctx:
             cowork.run_flow(
-                self._headless_scout_args("claude"), io_out=io.StringIO(),
+                self._scout_args("claude"), io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c, run_scout_fn=fake_scout_kill)
         self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
         self.assertTrue(
@@ -417,9 +378,8 @@ class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
         # process, with the leaked-set event from the first call still
         # standing at the moment this second `run_flow` is entered. Its own
         # `run_scout` override drives the REAL `cowork._role_loop` against a
-        # REAL, unmocked `cowork_ui.Spinner` (via a real `CodexSession`
-        # whose scripted subprocess delays its first line) -- identical
-        # fixture discipline to `SpinnerThenActivityRenderTest` above.
+        # real `CodexSession` whose scripted subprocess delays its first
+        # line -- identical fixture discipline to the test above.
         session_uuid = "77778888-0000-0000-0000-000000000002"
         work_id = "88887777-0000-0000-0000-000000000002"
         lines = [
@@ -428,7 +388,7 @@ class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
             '"text": "done"}}',
         ]
         proc = _DelayedScriptedProc(lines, delay=0.35)
-        out = FakeTTY()
+        out = io.StringIO()
         send_calls = []
         real_send = bridge.CodexSession.send
 
@@ -436,7 +396,7 @@ class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
             send_calls.append(text)
             return real_send(self, text, meta=meta)
 
-        def fake_scout_render(config, context, selected, io_in=None,
+        def fake_scout_render(config, context, selected,
                               io_out=None, on_outcome=None, on_session=None,
                               resume_id=None, session_uuid=None, **kw):
             with mock.patch.object(bridge.subprocess, "Popen",
@@ -448,21 +408,17 @@ class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
                 cowork._role_loop(
                     session, "seed",
                     os.path.join(tempfile.mkdtemp(), "status.json"),
-                    context="", io_in=io.StringIO(""), io_out=io_out,
-                    headless=True, session_uuid=session_uuid,
+                    context="", io_out=io_out,
+                    session_uuid=session_uuid,
                     role_work_id=work_id, role="scout")
             return 0
 
         rc = cowork.run_flow(
-            self._headless_scout_args("codex"), io_out=out,
+            self._scout_args("codex"), io_out=out,
             which=lambda c: "/bin/" + c, run_scout_fn=fake_scout_render)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
 
         full = out.getvalue()
-        # Positive frame assertion: the real Spinner genuinely wrote at
-        # least one periodic `\r\033[K<frame char>` CR-frame during the
-        # second run.
-        self.assertRegex(full, r"\r\x1b\[K[|/\\-] ")
         # Zero interleave AND zero suppression: every genuine turn-boundary
         # send in the second run rendered its own activity fact -- none
         # silently dropped by the first run's leaked shutdown event.
@@ -471,20 +427,6 @@ class ShutdownEventRunBoundaryResetTest(unittest.TestCase):
                          "the second run_flow call's activity render was "
                          "suppressed by the first call's leaked SIGTERM "
                          "event -- M4D-MAJ-03 regression")
-        # Ordering, scoped to the first turn's own output: the activity
-        # render appears strictly after that turn's own last spin frame.
-        first_chunk_end = full.index("artifact changes: none\n") + len(
-            "artifact changes: none\n")
-        first_chunk = full[:first_chunk_end]
-        last_frame_idx = max(
-            first_chunk.rfind("\r\x1b[K%s" % ch) for ch in "|/\\-")
-        self.assertGreaterEqual(last_frame_idx, 0,
-                                "no periodic spin frame found in the second "
-                                "run's own first-turn output")
-        activity_idx = first_chunk.index("activity:")
-        self.assertGreater(activity_idx, last_frame_idx,
-                           "the activity render appeared before/during the "
-                           "spinner's own last frame")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Focused suite for issue #64 implementation package **P1** -- the owner-lease
-store and its liveness classifier -- on the accredited base
-`4aa89e78a509e28077ca67e6f6f148c892e089b4`.
+"""The owner-lease store (`cowork_owner.py`) and its liveness classifier.
 
-P1 is pure store plus pure classification: no wiring into `cowork.py`, no
-dispatch, no send, no spawn. So everything proven here is proven against the
-DURABLE ARTIFACTS and REAL OS PROCESSES, never against an in-memory flag:
+Store and classification only -- no dispatch, no send, no spawn -- so
+everything proven here is proven against the DURABLE ARTIFACTS and REAL OS
+PROCESSES, never against an in-memory flag:
 
   - **G1c / F1 (concurrency).** Eight REAL concurrent OS processes race the
     first acquisition of one session. Exactly one wins at `epoch = 1`; the
@@ -29,14 +27,10 @@ DURABLE ARTIFACTS and REAL OS PROCESSES, never against an in-memory flag:
     convention: `epoch` is derived only from a record no unlocked path can
     overwrite.
 
-    That read-only predicate carve-out AMENDS the accepted plan's G3d
-    STRUCTURAL TEST RECIPE (accepted plan line 2162), which was written
-    reference-scoped. It does NOT amend the guarantee that recipe protects:
-    the single-writer invariant (Rule W1, plan.md:573-588; section 10
-    guarantee 1, plan.md:2747-2751) is WRITE-scoped and is left exactly as
-    published. An existence predicate writes nothing, so admitting it takes
-    nothing away from the invariant, while every write shape, every bare
-    reference and every receiver the sweep cannot resolve stays refused.
+    The read-only predicate carve-out does not weaken the single-writer
+    invariant, which is WRITE-scoped: an existence predicate writes nothing,
+    while every write shape, every bare reference and every receiver the sweep
+    cannot resolve stays refused.
     `LeaseWriterConfinementTests` states the carve-out's exact limits and
     pins each refusal with an adversarial control.
 
@@ -50,13 +44,6 @@ DURABLE ARTIFACTS and REAL OS PROCESSES, never against an in-memory flag:
     EQUAL to `OWNER_VERDICTS`, so the published contract cannot drift from the
     classifier.
 
-  - **G6 / G14 (scope confinement).** The working tree changes exactly the
-    three paths P1 is authorized to touch; every excluded production file is
-    byte-identical to the accredited base; every pre-existing `cowork_state.py`
-    symbol is AST- and docstring-identical to it; `save_role_session` keeps its
-    exact five-parameter signature; and `scripts/test_cowork_state_m3.py` is
-    byte-identical and unedited.
-
   - **G11a / G13f / N11 (the closed exception surface).** The declared
     hierarchy is exactly one base and five subclasses, all deriving from
     `Exception`; there is no bare `except:` and no `except Exception` anywhere
@@ -66,7 +53,7 @@ DURABLE ARTIFACTS and REAL OS PROCESSES, never against an in-memory flag:
     cross-process lock timeout), comes back as `ProviderBindingUnavailable`
     with `__cause__` naming the real failure, and nothing raw escapes.
 
-  - **The P1 halves of F2, F3, F5, F9, F10, F13 and G10.** Clean restart;
+  - **Store-level halves of F2, F3, F5, F9, F10, F13 and G10.** Clean restart;
     a REALLY SIGKILLed owner (before the deadline: refuse; after an INJECTED
     -clock deadline: `stale_dead_owner`, still refused by plain acquire, and
     recoverable only by an explicit `proved_dead` takeover); pid reuse
@@ -88,7 +75,6 @@ Run standalone:
 
 import ast
 import datetime
-import hashlib
 import inspect
 import json
 import os
@@ -107,56 +93,9 @@ from unittest import mock
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork_owner as owner  # noqa: E402
 import cowork_state as state_store  # noqa: E402
-
-# The accredited base this package is bound to.
-BASE_SHA = "4aa89e78a509e28077ca67e6f6f148c892e089b4"
-
-# P1's OWN signed candidate commit -- the other end of this package's interval.
-# `ScopeConfinementTests` below measures the CLOSED interval
-# BASE_SHA..CANDIDATE_SHA, never the live working tree, so what it asserts is a
-# permanent fact about a finished piece of history that no later commit can
-# enter or turn red.
-CANDIDATE_SHA = "325d2cf5e6545c1d29e69dbb86c9fe7196868924"
-
-# P1's write authority, exactly.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork_owner.py",
-    "scripts/cowork_state.py",
-    "scripts/test_m55_owner_store.py",
-})
-
-# Production paths P1 must leave byte-identical to the accredited base. Two
-# are named by the plan for their own reasons: `cowork_eval.py`, whose
-# `drain`'s "never raises" invariant no package may disturb, and
-# `test_cowork_state_m3.py`, whose exact-signature characterization of
-# `save_role_session` is what froze that function.
-EXCLUDED_PATHS = (
-    "scripts/cowork.py",
-    "scripts/cowork_bridge.py",
-    "scripts/cowork_dispatch.py",
-    "scripts/cowork_eval.py",
-    "scripts/cowork_report.py",
-    "scripts/cowork_verification.py",
-    "scripts/cowork_verification_evidence.py",
-    "scripts/cowork_control_plane.py",
-    "scripts/cowork_measure.py",
-    "scripts/cowork_trace.py",
-    "scripts/test_cowork_state_m3.py",
-    "scripts/test_cowork.py",
-)
-
-# The five path helpers P1 may add to `cowork_state.py`, and nothing else.
-ALLOWED_NEW_STATE_SYMBOLS = frozenset({
-    "owner_dir_for",
-    "owner_lease_path_for",
-    "owner_terminal_mark_path_for",
-    "owner_history_path_for",
-    "provider_session_binding_path_for",
-})
 
 # The exception surface the plan declares: one base, five subclasses.
 DECLARED_SUBCLASSES = frozenset({
@@ -177,21 +116,6 @@ TRANSLATED_FAILURE_NAMES = ("TimeoutError", "OSError", "CorruptRecordError",
 # --------------------------------------------------------------------------- #
 
 
-def _git_show_bytes(rev, rel_path):
-    return subprocess.run(
-        ["git", "show", "%s:%s" % (rev, rel_path)],
-        cwd=_REPO_ROOT, capture_output=True, check=True).stdout
-
-
-def _read_local_bytes(rel_path):
-    with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
-        return fh.read()
-
-
-def _sha256(payload):
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _scripts_modules():
     """Every Python module under `scripts/` -- the repo-wide sweep's domain."""
     out = []
@@ -199,46 +123,6 @@ def _scripts_modules():
         if name.endswith(".py"):
             out.append(os.path.join(_HERE, name))
     return out
-
-
-def _candidate_scripts_names():
-    """Sorted basenames of the `.py` files under `scripts/` AT the candidate
-    commit -- the frozen-interval counterpart of `_scripts_modules`.
-
-    A SEPARATE reader rather than a change to `_scripts_modules`: that helper
-    also feeds the three G3d repo-wide lease sweeps, which are claims about the
-    production tree as it stands RIGHT NOW, and re-pointing it would silently
-    convert three live behavioural gates into historical ones.
-
-    `git ls-tree --name-only` emits paths carrying the `scripts/` prefix and
-    includes non-`.py` entries, so both are handled here."""
-    out = subprocess.run(
-        ["git", "--no-optional-locks", "ls-tree", "--name-only",
-         CANDIDATE_SHA, "scripts/"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True).stdout
-    names = []
-    for line in out.split():
-        name = line[len("scripts/"):] if line.startswith("scripts/") else line
-        if name.endswith(".py"):
-            names.append(name)
-    return sorted(names)
-
-
-def _git_merge_base_is_ancestor(ancestor, descendant):
-    """True when `ancestor` really is an ancestor of `descendant`.
-
-    Guards the two frozen endpoint literals against a typo: a mistyped hash
-    would otherwise point every claim in `ScopeConfinementTests` at an
-    unrelated piece of history and go on reporting green. `merge-base
-    --is-ancestor` only -- deliberately NOT the adjacency half of the
-    precedent at test_m5_package_e_integration.py, since a package need not be
-    exactly one commit above its base. `--no-optional-locks` so this cannot
-    refresh `.git/index` while the suite runs as a live-candidate
-    preflight."""
-    return subprocess.run(
-        ["git", "--no-optional-locks", "merge-base", "--is-ancestor",
-         ancestor, descendant],
-        cwd=_REPO_ROOT, capture_output=True).returncode == 0
 
 
 def _module_tree(path):
@@ -919,7 +803,7 @@ class LeaseWriterConfinementTests(unittest.TestCase):
 
 
 class AcquireGateTests(OwnerStoreTestCase):
-    """G4a, plus the P1 halves of F2, F3, F9 and F10."""
+    """G4a, plus the store-level halves of F2, F3, F9 and F10."""
 
     def _expire(self, record, seconds_past=1):
         deadline = datetime.datetime.fromisoformat(
@@ -959,7 +843,7 @@ class AcquireGateTests(OwnerStoreTestCase):
         self.assertIsNone(second["predecessor"])
 
     def test_stale_dead_owner_refuses_and_is_never_implicitly_reclaimed(self):
-        """F3's P1 half: a really-dead owner is proved dead, and STILL
+        """F3's store-level half: a really-dead owner is proved dead, and STILL
         refused -- reclamation is only ever explicit."""
         record = self.acquire()
         dead = _dead_pid()
@@ -982,7 +866,7 @@ class AcquireGateTests(OwnerStoreTestCase):
                          record["owner_id"])
 
     def test_pid_reuse_classifies_dead_never_live(self):
-        """F5's P1 half: the pid is alive, but it is a DIFFERENT process."""
+        """F5's store-level half: the pid is alive, but it is a DIFFERENT process."""
         record = self.acquire()
         fabricated = dict(record)
         fabricated["pid_start_at"] = "1999-01-01T00:00:00Z"
@@ -993,7 +877,7 @@ class AcquireGateTests(OwnerStoreTestCase):
             "stale_dead_owner")
 
     def test_stale_unproven_refuses_without_probing_or_signalling(self):
-        """F10's P1 half: a foreign host is never pid-probed, never
+        """F10's store-level half: a foreign host is never pid-probed, never
         signalled, and refuses both takeover modes."""
         record = self.acquire()
         fabricated = dict(record)
@@ -1071,7 +955,7 @@ class AcquireGateTests(OwnerStoreTestCase):
 
 
 class TakeoverTests(OwnerStoreTestCase):
-    """G4c, G4d, and F3/F12's P1 halves."""
+    """G4c, G4d, and F3/F12's store-level halves."""
 
     def _expire(self, record, seconds_past=1):
         deadline = datetime.datetime.fromisoformat(
@@ -1282,7 +1166,7 @@ class CompareAndSwapTests(OwnerStoreTestCase):
 
 
 class TerminalMarkTests(OwnerStoreTestCase):
-    """W3/W4/W5, and F4/F13's P1 halves."""
+    """W3/W4/W5, and F4/F13's store-level halves."""
 
     def test_a_matching_mark_releases_the_lease(self):
         record = self.acquire()
@@ -1318,7 +1202,7 @@ class TerminalMarkTests(OwnerStoreTestCase):
             self.assertEqual(fh.read(), payload)
 
     def test_a_predecessors_mark_after_a_takeover_is_ignored_entirely(self):
-        """F13/SW64-B01's P1 half. Owner A's lease is taken over by B; A is
+        """F13/SW64-B01's store-level half. Owner A's lease is taken over by B; A is
         THEN SIGTERMed and marks itself terminal. B's lease must be
         byte-identical, the verdict must stay `live_owner`, a third process
         must still be refused, and no epoch may repeat."""
@@ -1420,7 +1304,7 @@ class StatusViewTests(OwnerStoreTestCase):
 
 
 class ExceptionHierarchyTests(unittest.TestCase):
-    """G11a's P1 half."""
+    """G11a's store-level half."""
 
     def test_declared_bases(self):
         self.assertEqual(owner.OwnerLeaseError.__bases__, (Exception,))
@@ -1555,8 +1439,8 @@ class BindingSurfaceStaticTests(unittest.TestCase):
         self.assertEqual(producers, {"bind_provider_session"})
 
     def test_the_module_never_imports_the_orchestrator(self):
-        """G6's import-direction half: P1 must stay independently
-        reviewable, so the dependency runs one way only."""
+        """The owner store sits below the orchestrator: the dependency runs
+        one way only."""
         imported = set()
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Import):
@@ -1568,7 +1452,7 @@ class BindingSurfaceStaticTests(unittest.TestCase):
 
 
 class BindingSurfaceBehaviourTests(OwnerStoreTestCase):
-    """N11's P1 half, by injection at the real reuse boundary."""
+    """N11's store-level half, by injection at the real reuse boundary."""
 
     def setUp(self):
         super().setUp()
@@ -1758,142 +1642,59 @@ class BindingSurfaceBehaviourTests(OwnerStoreTestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ScopeConfinementTests(unittest.TestCase):
-    """G6 and G14, both bound to the accredited base.
+class OwnerStatePathHelperTests(OwnerStoreTestCase):
+    """The owner-lease path helpers `cowork_owner` builds on, checked against
+    the live `cowork_state` module."""
 
-    Measures the CLOSED interval `BASE_SHA..CANDIDATE_SHA` -- P1's own finished
-    history -- rather than the live working tree, so every claim below is a
-    permanent fact about that interval that no later commit can enter. It needs
-    a repository where BOTH endpoint objects exist, which is why the
-    verification inventory measures it through a `candidate_read_only`
-    preflight entry rather than inside the isolated snapshot.
-    """
+    def test_owner_path_helpers_share_one_per_session_owner_dir(self):
+        session = "S-paths-" + uuid.uuid4().hex[:8]
+        owner_dir = state_store.owner_dir_for(session)
+        self.assertEqual(os.path.basename(owner_dir), "owner")
+        for path in (state_store.owner_terminal_mark_path_for(
+                         session, "owner-a"),
+                     state_store.owner_history_path_for(session)):
+            self.assertEqual(os.path.dirname(path), owner_dir)
 
-    def _changed_paths(self):
-        """The change set of the CLOSED interval `BASE_SHA..CANDIDATE_SHA`.
+        # The lease path is only ever reached through the locked seam (G3d),
+        # so it is observed the same way: a real locked transaction whose
+        # mutate declines to write. The lock sidecar it takes lands next to
+        # the lease record, which places the lease in the same owner dir.
+        seen = []
 
-        Two frozen endpoints, named explicitly, so this is neither the
-        working-tree form (`git diff --name-only <BASE>`, which measured
-        whatever happened to be on disk at run time) nor the `<BASE>..` form
-        (which means `<BASE>..HEAD` and follows a moving ref).
+        def observe_without_writing(existing):
+            seen.append(existing)
+            return None
 
-        The `git ls-files --others --exclude-standard` branch that used to be
-        unioned in here is GONE, and that is not a loosening: it existed solely
-        to catch files P1 had added but not yet committed while P1 was the live
-        candidate. `CANDIDATE_SHA` is P1's finished commit, so it already
-        CONTAINS every file P1 added -- including this module -- and the
-        commit-to-commit diff reports them anyway.
-        """
-        tracked = subprocess.run(
-            ["git", "--no-optional-locks", "diff", "--name-only",
-             BASE_SHA, CANDIDATE_SHA],
-            cwd=_REPO_ROOT, capture_output=True, text=True,
-            check=True).stdout.split()
-        return {p for p in tracked if "__pycache__" not in p}
+        result = state_store._locked_json_transaction(
+            state_store.owner_lease_path_for(session),
+            observe_without_writing)
+        self.assertIsNone(result)
+        self.assertEqual(seen, [None])
+        self.assertEqual(sorted(os.listdir(owner_dir)),
+                         [os.path.basename(_lease_file(session)) + ".lock"])
+        self.assertFalse(os.path.exists(_lease_file(session)))
+        self.assertNotEqual(
+            state_store.owner_terminal_mark_path_for(session, "owner-a"),
+            state_store.owner_terminal_mark_path_for(session, "owner-b"))
 
-    def test_changed_paths_are_exactly_the_three_allowed(self):
-        self.assertEqual(self._changed_paths(), set(ALLOWED_CHANGED_PATHS))
+    def test_owner_dir_rejects_an_unsafe_session_identifier(self):
+        with self.assertRaises(ValueError):
+            state_store.owner_dir_for("../escape")
 
-    def test_the_base_is_an_ancestor_of_the_candidate(self):
-        """Both endpoints are frozen literals, so a single mistyped character
-        would silently point every claim in this class at an unrelated piece of
-        history. This fails loudly instead."""
-        self.assertTrue(
-            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
-            "%s is not an ancestor of %s"
-            % (BASE_SHA[:12], CANDIDATE_SHA[:12]))
-
-    def test_every_excluded_production_path_is_byte_identical(self):
-        for rel in EXCLUDED_PATHS:
-            self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
-                             _sha256(_git_show_bytes(BASE_SHA, rel)), rel)
-
-    def test_cowork_state_gains_exactly_the_five_path_helpers(self):
-        """The excluded-symbol half, AST/semantic rather than a byte digest:
-        every pre-existing symbol must be unchanged, and the only additions
-        may be the five named helpers."""
-        base_tree = ast.parse(_git_show_bytes(BASE_SHA,
-                                              "scripts/cowork_state.py"))
-        cand_tree = ast.parse(_git_show_bytes(CANDIDATE_SHA,
-                                              "scripts/cowork_state.py"))
-
-        def symbols(tree):
-            out = {}
-            for node in tree.body:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                     ast.ClassDef)):
-                    out[node.name] = ast.dump(node, include_attributes=False)
-                elif isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            out[target.id] = ast.dump(
-                                node, include_attributes=False)
-            return out
-
-        base, cand = symbols(base_tree), symbols(cand_tree)
-        self.assertEqual(set(base) - set(cand), set())
-        self.assertEqual(set(cand) - set(base), set(ALLOWED_NEW_STATE_SYMBOLS))
-        for name, dumped in base.items():
-            self.assertEqual(cand[name], dumped, name)
-
-    def test_pre_existing_state_docstrings_are_unchanged(self):
-        def docstrings(source):
-            tree = ast.parse(source)
-            return {node.name: ast.get_docstring(node) for node in tree.body
-                    if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
-
-        base = docstrings(_git_show_bytes(BASE_SHA, "scripts/cowork_state.py"))
-        cand = docstrings(_git_show_bytes(CANDIDATE_SHA,
-                                          "scripts/cowork_state.py"))
-        for name, doc in base.items():
-            self.assertEqual(cand[name], doc, name)
-
-    def test_save_role_session_is_frozen(self):
-        """G14: the seam the predecessor plan tried to widen stays exactly as
-        the accredited base left it."""
-        self.assertEqual(
-            list(inspect.signature(
-                state_store.save_role_session).parameters.keys()),
-            ["path", "role", "controller", "session_id", "prior"])
-        base_tree = ast.parse(_git_show_bytes(BASE_SHA,
-                                              "scripts/cowork_state.py"))
-        base_node = next(n for n in base_tree.body
-                         if isinstance(n, ast.FunctionDef)
-                         and n.name == "save_role_session")
-        live_node = ast.parse(textwrap.dedent(
-            inspect.getsource(state_store.save_role_session))).body[0]
-        self.assertEqual(ast.dump(live_node, include_attributes=False),
-                         ast.dump(base_node, include_attributes=False))
-        # `clean=False`: `__doc__` keeps its source indentation, and the
-        # claim being pinned is the docstring's exact bytes, not a dedented
-        # projection of them.
-        self.assertEqual(state_store.save_role_session.__doc__,
-                         ast.get_docstring(base_node, clean=False))
-
-    def test_the_state_characterization_file_is_untouched(self):
-        rel = "scripts/test_cowork_state_m3.py"
-        self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
-                         _sha256(_git_show_bytes(BASE_SHA, rel)))
-        self.assertNotIn(rel, ALLOWED_CHANGED_PATHS)
-
-    def test_the_new_module_is_only_reachable_from_this_package(self):
-        """P1 is pure: nothing in the accredited production tree may import
-        `cowork_owner` yet, so P2-P5's wiring stays reviewable as wiring.
-
-        Swept over P1's OWN candidate tree, not the live one -- P2 onward wire
-        `cowork_owner` in deliberately, so a live sweep turns this negative
-        control red the moment the very wiring it was written to sequence
-        lands. Re-pointed, never deleted: the claim is still that nothing
-        imported the module DURING P1."""
-        importers = []
-        for name in _candidate_scripts_names():
-            if name in ("cowork_owner.py", "test_m55_owner_store.py"):
-                continue
-            text = _git_show_bytes(
-                CANDIDATE_SHA, "scripts/" + name).decode("utf-8", "replace")
-            if "cowork_owner" in text:
-                importers.append(name)
-        self.assertEqual(importers, [])
+    def test_provider_binding_path_is_global_and_keyed_by_both_fields(self):
+        session = "S-paths-" + uuid.uuid4().hex[:8]
+        binding = state_store.provider_session_binding_path_for(
+            "claude", "provider-session-1")
+        self.assertFalse(binding.startswith(
+            state_store.session_assets_dir(session) + os.sep))
+        self.assertEqual(binding, state_store.provider_session_binding_path_for(
+            "claude", "provider-session-1"))
+        self.assertNotEqual(binding, state_store.provider_session_binding_path_for(
+            "codex", "provider-session-1"))
+        self.assertNotEqual(binding, state_store.provider_session_binding_path_for(
+            "claude", "provider-session-2"))
+        with self.assertRaises(ValueError):
+            state_store.provider_session_binding_path_for("claude", "../x")
 
 
 if __name__ == "__main__":

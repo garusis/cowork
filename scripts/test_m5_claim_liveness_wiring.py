@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Focused suite for M5 criterion 5 blocker P5B-B2: PRODUCTION LIVENESS
-WIRING, on the exact signed base
-`3c1d91c4a56271efb60c7d0c435f71ec8dc86c59`.
+"""Production liveness wiring for checkpoint claims.
 
-The proven defect this closes: `classify_checkpoint_claim_liveness` was
-correct but UNREACHABLE from production -- it had zero production call sites
-repo-wide. The only reconstruction surface production used,
-`reconstruct_checkpoint_state`, branches solely on the claim's `state`
-field, so `cowork.checkpoint_wake_block` woke a role with
-`checkpoint_state="claimed"` for a checkpoint whose claimant had crashed
-past its own persisted lease -- forever, and byte-for-byte identically to a
-checkpoint still being worked.
+`reconstruct_checkpoint_state` branches solely on the claim's `state` field,
+so on its own it reports `checkpoint_state="claimed"` for a checkpoint whose
+claimant crashed past its own persisted lease, byte-for-byte identically to a
+checkpoint still being worked. The production wake path must therefore reach
+`classify_checkpoint_claim_liveness` through the liveness-aware surface.
 
 What is proven here, from DURABLE ARTIFACTS ALONE (no terminal output, no
 live process handle, no in-memory state):
 
-  - `reconstruct_checkpoint_state_with_liveness` joins Package A's
-    unmodified per-checkpoint reconstruction to the existing classifier as
+  - `reconstruct_checkpoint_state_with_liveness` joins the per-checkpoint
+    reconstruction to the existing classifier as
     ONE additive `claim_liveness` field, and `reconstruct_all_checkpoints`
     is wired through it;
   - a BOUNDED, EXPIRED, crash-stranded claim with no terminal output
@@ -30,11 +25,10 @@ live process handle, no in-memory state):
     vocabularies are DISJOINT, so no downstream reader can confuse a
     stranded claim with an ordinary `claimed` one, nor a liveness value with
     a lifecycle state;
-  - `reconstruct_checkpoint_state` is BYTE-IDENTICAL to the signed base;
   - `cowork.checkpoint_wake_block` -- the production wake path -- really
     does call the liveness-aware surface and no longer calls the bare one,
     exposes the verdict additively as `block.checkpoint_claim_liveness`, and
-    renders prose byte-identical to what it rendered before;
+    renders the same handoff prose as the fact set without liveness;
   - classification is derived only from durable artifacts and deterministic
     time input: it is re-derived identically in a fresh process with no
     terminal at all, and arbitrary terminal-shaped noise in the durable
@@ -61,17 +55,13 @@ import uuid
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork  # noqa: E402
 import cowork_handoff as handoff  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 
-# The exact signed base this package's frozen brief is bound to.
-BASE_SHA = "3c1d91c4a56271efb60c7d0c435f71ec8dc86c59"
-
-# Package A's frozen, four-value checkpoint lifecycle vocabulary. This suite
+# The four-value checkpoint lifecycle vocabulary. This suite
 # asserts it is preserved EXACTLY -- liveness is additive, never a fifth
 # member and never an overload of an existing one.
 CHECKPOINT_STATES = frozenset({"pending", "claimed", "terminal", "unknown"})
@@ -111,12 +101,6 @@ with open(out_path, "w") as fh:
 def _iso(dt):
     return dt.astimezone(datetime.timezone.utc).isoformat().replace(
         "+00:00", "Z")
-
-
-def _git_show_text(sha, rel):
-    return subprocess.run(["git", "show", "%s:%s" % (sha, rel)],
-                          cwd=_REPO_ROOT, capture_output=True,
-                          check=True).stdout.decode("utf-8")
 
 
 def _top_level_named(source):
@@ -401,27 +385,6 @@ class VocabularyPreservationTests(_ArtifactFixture):
         # the strand must ask for it by its own explicit name.
         self.assertNotEqual(built["state"], built[LIVENESS_FIELD])
 
-    def test_reconstruct_checkpoint_state_is_byte_identical_to_the_base(self):
-        base = _top_level_named(
-            _git_show_text(BASE_SHA, "scripts/cowork_verification.py"))
-        current = _top_level_named(
-            inspect.getsource(verification))
-        self.assertEqual(current["reconstruct_checkpoint_state"],
-                         base["reconstruct_checkpoint_state"])
-        self.assertEqual(
-            hashlib.sha256(current["reconstruct_checkpoint_state"].encode(
-                "utf-8")).hexdigest(),
-            hashlib.sha256(base["reconstruct_checkpoint_state"].encode(
-                "utf-8")).hexdigest())
-
-    def test_classify_checkpoint_claim_liveness_is_byte_identical(self):
-        # The wiring must not have quietly retuned the classifier itself.
-        base = _top_level_named(
-            _git_show_text(BASE_SHA, "scripts/cowork_verification.py"))
-        current = _top_level_named(inspect.getsource(verification))
-        self.assertEqual(current["classify_checkpoint_claim_liveness"],
-                         base["classify_checkpoint_claim_liveness"])
-
 
 # =========================================================================== #
 # `reconstruct_all_checkpoints` is wired through the accessor.                #
@@ -682,7 +645,7 @@ class DurableOnlyDerivationTests(_ArtifactFixture):
         built = verification.reconstruct_checkpoint_state_with_liveness(
             self.session_uuid, checkpoint_id)
         # Durable evidence of a claimant exists, so this is never collapsed
-        # into silence -- and `state` falls back to Package A's own answer.
+        # into silence -- and `state` falls back to the bare reconstruction's answer.
         self.assertEqual(built[LIVENESS_FIELD], "process_crash")
         self.assertIn(built["state"], CHECKPOINT_STATES)
 

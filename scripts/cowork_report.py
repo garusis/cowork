@@ -417,14 +417,14 @@ def _section_duration(record):
     span_count = _at(record, "duration.user_wait_span_count")
     if isinstance(span_count, int) and not isinstance(span_count, bool) \
             and span_count > 0:
-        lines.append("  user_wait comes from %s timed prompt span(s) and is "
-                     "never inferred from gaps between events."
-                     % _fmt(span_count))
+        lines.append("  user_wait comes from %s timed prompt span(s) recorded "
+                     "by a legacy interactive session and is never inferred "
+                     "from gaps between events." % _fmt(span_count))
     else:
-        lines.append("  user_wait is UNKNOWN: no timed prompt spans exist in "
-                     "this session. It is not 0 — inferring it from gaps "
-                     "between events is forbidden, because a gap is equally an "
-                     "ingestion stall or a suspended process.")
+        lines.append("  user_wait is UNKNOWN: this session recorded no wait "
+                     "spans (agent-only runs have no interactive prompts; only "
+                     "legacy sessions carry them). It is not 0 — inferring it "
+                     "from gaps between events is forbidden.")
     unresolved_count = _at(record, "duration.user_wait_unresolved_count")
     if isinstance(unresolved_count, int) \
             and not isinstance(unresolved_count, bool) \
@@ -1233,8 +1233,8 @@ def _section_scores_legacy(record):
 def _section_activity(record):
     """The durable activity/watchdog facts for this session's most recently
     classified work engagement (`record.activity`) -- the SAME compact-fact
-    vocabulary the interactive/headless renderers show (`cowork_ui.
-    render_compact_activity`/`render_headless_activity`), built here purely
+    vocabulary the run transcript shows (`cowork_transcript.
+    render_activity`), built here purely
     from durable evidence: no live process probe exists once a session has
     ended, so a populated `watchdog_verdict` here is always `no_action` with
     null evidence refs -- never a fabricated post-hoc stall/progress claim.

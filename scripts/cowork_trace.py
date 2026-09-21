@@ -3,17 +3,14 @@
 
 The trace complements Claude/Codex controller logs. It records cowork's own
 decisions and controller invocation metadata, but never raw prompts, replies, or
-terminal transcript text. UI render diagnostics are limited to metadata such as
-renderer mode, terminal dimensions, byte/line counts, and status counters.
+transcript text. Transcript stream diagnostics are limited to metadata such as
+chunk, character and line counts.
 """
 
-import contextlib
 import datetime
 import hashlib
-import json
 import os
 import re
-import time
 import uuid
 
 from cowork_guard_broker import append_once
@@ -131,96 +128,6 @@ def identity_meta(controller=None, provider=None, model=None,
     if candidate_index is not None:
         result["candidate_index"] = candidate_index
     return result
-
-
-# --------------------------------------------------------------------------- #
-# Process-global active trace (P15).                                          #
-#                                                                             #
-# One cowork process serves exactly one session, which is why cowork_policy    #
-# already uses and documents this pattern. `user_wait()` needs an emitter at   #
-# six blocking call sites whose signatures carry no trace parameter; threading #
-# one through all of them and their call sites would be invasive and easy to   #
-# miss a site. Tests inject their own ask callables and never call set_active, #
-# so a non-interactive call emits nothing and cannot manufacture wait time in  #
-# the very figure being validated.                                            #
-# --------------------------------------------------------------------------- #
-
-_ACTIVE = {"trace": None, "wait_depth": 0}
-
-
-def set_active(trace):
-    """Install the process-global trace used by `user_wait`."""
-    _ACTIVE["trace"] = trace
-    _ACTIVE["wait_depth"] = 0
-    return trace
-
-
-def active():
-    return _ACTIVE["trace"]
-
-
-def clear_active():
-    _ACTIVE["trace"] = None
-    _ACTIVE["wait_depth"] = 0
-
-
-@contextlib.contextmanager
-def user_wait(reason, work_id=None):
-    """Time one interactive blocker, emitting a paired user.wait span (P15).
-
-    These spans are the ONLY source of user-wait time. Inference from gaps
-    between unrelated events is forbidden: a gap is equally an ingestion stall,
-    a controller hang or a suspended process, and is not evidence of a human.
-
-    The span closes on every exit path and stamps an `outcome` — `answered`,
-    `cancelled`, `eof` or `drain_failed`. Callers set a non-default outcome by
-    assigning to the yielded span's `outcome` field. Nesting is refused: a gate
-    invoked inside another gate contributes exactly one span, never two. With
-    no active trace the whole thing is a no-op.
-    """
-    span = _WaitSpan(reason)
-    tracer = active()
-    if tracer is None or _ACTIVE["wait_depth"] > 0:
-        # No emitter, or already inside a span: hand back an inert handle so
-        # callers need no branch of their own.
-        span.recording = False
-        yield span
-        return
-    span.recording = True
-    _ACTIVE["wait_depth"] += 1
-    started = time.monotonic()
-    work_id = work_id or new_work_id()
-    span.work_id = work_id
-    try:
-        tracer.event("user.wait.start", work_id=work_id, reason=reason)
-    except Exception:  # noqa: BLE001 - instrumentation never breaks a prompt
-        pass
-    try:
-        yield span
-    except KeyboardInterrupt:
-        span.outcome = "cancelled"
-        raise
-    except BaseException:
-        span.outcome = span.outcome or "cancelled"
-        raise
-    finally:
-        _ACTIVE["wait_depth"] -= 1
-        try:
-            tracer.event("user.wait.end", work_id=work_id, reason=reason,
-                         outcome=span.outcome or "answered",
-                         duration_ms=int((time.monotonic() - started) * 1000))
-        except Exception:  # noqa: BLE001
-            pass
-
-
-class _WaitSpan:
-    """Handle yielded by `user_wait`; callers stamp the termination outcome."""
-
-    def __init__(self, reason):
-        self.reason = reason
-        self.outcome = None
-        self.work_id = None
-        self.recording = False
 
 
 def trace_path_for(session_uuid):

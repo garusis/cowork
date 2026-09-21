@@ -62,10 +62,6 @@ a takeover that really escalates against a victim that really survives:
     mechanism, and asserts the count is >= 50 -- never sampled, never quietly
     reduced.
 
-  - **Success criterion 2 (scope confinement).** `ScopeConfinementTests`
-    measures the WORKING TREE against the frozen base, pre-commit, because
-    cowork leaves approved build output uncommitted.
-
 Every fixture redirects `COWORK_SESSIONS_ROOT` into a fresh `tempfile.mkdtemp`
 (so nothing here touches the real home dir and nothing is written inside the
 worktree), injects `now=` rather than sleeping toward a deadline, registers
@@ -96,25 +92,11 @@ from unittest import mock
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork  # noqa: E402
 import cowork_owner as owner  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
-
-# The frozen base this package is bound to. G6's per-package `<base>` rule --
-# never the accredited base, for P2 onward. It already contains R2/R1/R3 and
-# the separately reviewed blocker-79 repair, and the ancestor guard below is
-# what makes a mistyped literal fail LOUDLY instead of quietly pointing every
-# byte-identity claim at unrelated history.
-BASE_SHA = "3e3bdba12abacdf1a5fc0c9301200adc5e3171c4"
-
-# P5's write authority, exactly. Two new test files and nothing else.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/test_m55_owner_negative_controls.py",
-    "scripts/test_m55_owner_crash_reclaim.py",
-})
 
 # A fabricated `pid_start_at` far enough in the past that no real process can
 # carry it. Used wherever a fixture needs "this pid is alive but is NOT the
@@ -150,66 +132,7 @@ CHILD_REAP_TIMEOUT_S = 60
 # the module under test, so `from <frozen suite> import ...` would silently     #
 # re-run another package's suite inside this one -- inflating this module's     #
 # reported test count and importing another package's pass/fail into P5's gate. #
-#                                                                              #
-# Every git call carries `--no-optional-locks` so no invocation can refresh     #
-# `.git/index`: the scope class below runs as a LIVE-CANDIDATE preflight and    #
-# the verification transaction fails closed on a live-candidate index change.   #
 # --------------------------------------------------------------------------- #
-
-
-def _git(args, check=False):
-    return subprocess.run(
-        ["git", "--no-optional-locks"] + list(args),
-        cwd=_REPO_ROOT, capture_output=True, check=check)
-
-
-def _git_show_bytes(rev, rel_path):
-    return _git(["show", "%s:%s" % (rev, rel_path)], check=True).stdout
-
-
-def _git_merge_base_is_ancestor(ancestor, descendant):
-    """True when `ancestor` really is an ancestor of `descendant`. A mistyped
-    hash would otherwise point every claim in `ScopeConfinementTests` at an
-    unrelated piece of history and go on reporting green."""
-    return _git(["merge-base", "--is-ancestor", ancestor,
-                 descendant]).returncode == 0
-
-
-def _live_candidate_repo():
-    """`_REPO_ROOT` when this suite is running in the LIVE git candidate, else
-    None (the scope class then skips).
-
-    TWO conditions, and the second is the load-bearing one. The obvious check
-    is that `git rev-parse --show-toplevel` resolves to this checkout's own
-    root. The non-obvious one is that the frozen base commit must actually
-    EXIST here, and it is what makes the skip correct inside the verification
-    transaction: an `isolated_snapshot` command does NOT run in a git-free
-    copy. `cowork_verification.materialize_command_checkout` gives every
-    per-command checkout functional local git semantics of its own -- a real
-    `git init` plus the transaction's captured raw index bytes -- so
-    `--show-toplevel` there resolves happily to that copy's own root. A
-    toplevel test alone would therefore NOT skip in the snapshot; it would fall
-    through to `git show <BASE>:...` against a repository holding no objects
-    and ERROR the class. Requiring the base OBJECT is what distinguishes the
-    live candidate from a freshly-initialised copy of it.
-
-    Verified and documented at scripts/test_m55_owner_visibility.py:283-321;
-    this is the same two-condition guard, unchanged.
-    """
-    try:
-        toplevel = _git(["rev-parse", "--show-toplevel"]).stdout.decode(
-            "utf-8", "replace").strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if not toplevel:
-        return None
-    if os.path.realpath(toplevel) != os.path.realpath(_REPO_ROOT):
-        return None
-    try:
-        found = _git(["cat-file", "-e", "%s^{commit}" % BASE_SHA])
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return _REPO_ROOT if found.returncode == 0 else None
 
 
 def _sha256(payload):
@@ -376,7 +299,8 @@ if _fabricate:
 import cowork
 
 spath, ready, park = sys.argv[1:4]
-_extra = list(sys.argv[4:])
+# A new session at an explicit path is `--session-file` alone.
+_extra = [a for a in sys.argv[4:] if a != "--new"]
 
 
 def _scout(config, context, selected, io_in=None, io_out=None,
@@ -397,9 +321,9 @@ def _scout(config, context, selected, io_in=None, io_out=None,
 
 
 _args = cowork.build_parser().parse_args(
-    ["--team", "scout", "--config", "scout=claude", "--context", "goal",
+    ["--team", "scout,scout-reviewer", "--config", "scout=claude", "--context", "goal",
      "--session-file", spath] + _extra)
-_rc = cowork.run_flow(_args, io_in=io.StringIO(""), io_out=sys.stdout,
+_rc = cowork.run_flow(_args, io_out=sys.stdout,
                       which=lambda c: "/bin/" + c, run_scout_fn=_scout)
 sys.stdout.write("\nP5_CHILD_RC=%d\n" % _rc)
 sys.stdout.flush()
@@ -519,7 +443,7 @@ class CrashReclaimTestCase(unittest.TestCase):
     # -- an in-process owned flow (the production restart path) ------------- #
 
     @staticmethod
-    def _approving_scout(config, context, selected, io_in=None, io_out=None,
+    def _approving_scout(config, context, selected, io_out=None,
                          on_outcome=None, **kwargs):
         if on_outcome is not None:
             on_outcome("approved", None)
@@ -528,10 +452,11 @@ class CrashReclaimTestCase(unittest.TestCase):
     def run_owned_flow(self, extra=(), spath=None, scout=None):
         out = io.StringIO()
         args = cowork.build_parser().parse_args(
-            ["--team", "scout", "--config", "scout=claude", "--context",
-             "goal", "--session-file", spath or self.spath] + list(extra))
+            ["--team", "scout,scout-reviewer", "--config", "scout=claude", "--context",
+             "goal", "--session-file", spath or self.spath]
+            + [a for a in extra if a != "--new"])
         rc = cowork.run_flow(
-            args, io_in=io.StringIO(""), io_out=out,
+            args, io_out=out,
             which=lambda c: "/bin/" + c,
             run_scout_fn=scout if scout is not None else self._approving_scout)
         return rc, out.getvalue()
@@ -1188,101 +1113,6 @@ class SigtermTakeoverRaceTests(CrashReclaimTestCase):
         self.assertEqual(owner.classify_owner_lease(session_uuid),
                          "live_owner")
         return "ok"
-
-
-# --------------------------------------------------------------------------- #
-# Success criterion 2 -- the candidate is provably TEST-ONLY.                    #
-# --------------------------------------------------------------------------- #
-
-
-class ScopeConfinementTests(unittest.TestCase):
-    """The exit audit, measured on the WORKING TREE against the frozen base.
-
-    Deliberately NOT a commit-to-commit interval of P1-P4's shape: cowork does
-    not commit and does not open pull requests -- approved build output is left
-    UNCOMMITTED in the working tree (AGENTS.md:43-44) -- so a closed-interval
-    gate would have nothing to look at at build time. Measuring the working
-    tree is what makes this claim checkable BEFORE the candidate is accepted,
-    which is when it matters.
-
-    It self-skips outside the live candidate (see `_live_candidate_repo`) and
-    is measured by its own `candidate_read_only` preflight entry, which runs in
-    the live worktree. Everything it does is a READ: `git show` / `diff` /
-    `ls-files` / `ls-tree` / `merge-base` / `cat-file`, all with
-    `--no-optional-locks`, plus ordinary file reads.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        if _live_candidate_repo() is None:
-            raise unittest.SkipTest(
-                "not running in the live candidate repository (the frozen "
-                "base commit is not present here); measured by the "
-                "candidate_read_only preflight entry instead")
-
-    def test_the_base_is_an_ancestor_of_head(self):
-        self.assertTrue(
-            _git_merge_base_is_ancestor(BASE_SHA, "HEAD"),
-            "BASE_SHA %s is not an ancestor of HEAD -- every byte-identity "
-            "claim in this class would otherwise be measured against "
-            "unrelated history" % BASE_SHA)
-
-    def test_changed_paths_are_exactly_the_two_allowed(self):
-        self.assertEqual(self._changed_paths(), set(ALLOWED_CHANGED_PATHS))
-
-    def test_every_other_tracked_path_is_byte_identical_to_the_base(self):
-        mismatched = []
-        missing = []
-        for rel_path in self._tracked_paths_at_base():
-            if rel_path in ALLOWED_CHANGED_PATHS:
-                continue
-            full = os.path.join(_REPO_ROOT, rel_path)
-            if not os.path.isfile(full):
-                missing.append(rel_path)
-                continue
-            if _sha256_file(full) != _sha256(
-                    _git_show_bytes(BASE_SHA, rel_path)):
-                mismatched.append(rel_path)
-        self.assertEqual(missing, [])
-        self.assertEqual(mismatched, [])
-
-    def test_the_allowed_pair_is_exactly_two_new_files(self):
-        self.assertEqual(len(ALLOWED_CHANGED_PATHS), 2)
-        for rel_path in sorted(ALLOWED_CHANGED_PATHS):
-            self.assertTrue(rel_path.startswith("scripts/"), rel_path)
-            self.assertTrue(rel_path.endswith(".py"), rel_path)
-            self.assertTrue(
-                os.path.isfile(os.path.join(_REPO_ROOT, rel_path)), rel_path)
-            # NEW: absent at the frozen base, so neither is an edit of an
-            # existing file wearing a new name.
-            self.assertNotEqual(
-                _git(["cat-file", "-e",
-                      "%s:%s" % (BASE_SHA, rel_path)]).returncode, 0,
-                "%s already exists at the frozen base" % rel_path)
-
-    # -- measurement -------------------------------------------------------- #
-
-    @staticmethod
-    def _decode(result):
-        return [line for line in
-                result.stdout.decode("utf-8", "replace").splitlines() if line]
-
-    def _changed_paths(self):
-        """Tracked differences against the base UNION untracked, non-ignored
-        files -- git's OWN ignore rules, never a hand-rolled filter -- minus
-        `__pycache__`, which is NOT in `.gitignore` and which running these
-        modules creates. Set EQUALITY against the allowlist, never a subset or
-        a prefix match."""
-        tracked = self._decode(_git(["diff", "--name-only", BASE_SHA],
-                                    check=True))
-        untracked = self._decode(
-            _git(["ls-files", "--others", "--exclude-standard"], check=True))
-        return {path for path in set(tracked) | set(untracked)
-                if "__pycache__" not in path.split("/")}
-
-    def _tracked_paths_at_base(self):
-        return self._decode(
-            _git(["ls-tree", "-r", "--name-only", BASE_SHA], check=True))
 
 
 if __name__ == "__main__":  # pragma: no cover

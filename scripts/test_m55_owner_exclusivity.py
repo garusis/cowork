@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Focused suite for issue #64 implementation package **P3** -- controller/
-provider session EXCLUSIVITY -- on the frozen P2 candidate
-`239d8d65e7ac32ea20ad5564cfebc6055288d5d6`.
-
-P1 proved the global binding store. P2 proved the ownership gate and the
-crash-safe lifecycle. P3 is the WIRING between them, so what has to be proven
-here is REACHABILITY, ORDERING and COST:
+"""Controller/provider session EXCLUSIVITY. The global binding store and the
+ownership gate/lifecycle are proven in `test_m55_owner_store.py` and
+`test_m55_owner_gate.py`; what has to be proven here is the wiring between
+them -- REACHABILITY, ORDERING and COST:
 
   - **Three ordered enforcement seams, each refusing before anything is paid
     for.** Enforcement point 1 is `_owner_gate_fact` (pre-dispatch), point 2 is
@@ -28,34 +25,21 @@ here is REACHABILITY, ORDERING and COST:
     sub-arm keeps its real `__cause__`, and nothing anonymous reaches the send
     gateway.
 
-  - **The exit contract stays additive.** 11 and 12 are the only new codes, no
-    integer is used twice, and the frozen 0-10 literal is cross-checked against
-    what the base actually declares.
+  - **The exit contract is exact.** Every resume-trigger outcome name maps to
+    one declared integer, no integer is used twice, and the two exclusivity
+    outcomes (11 and 12) are the names the refusal paths actually emit.
 
-  - **The change set is exactly what was authorized.** `ScopeAndBaseConfinement
-    Tests` compares the working tree against the base commit -- and therefore
-    RUNS ONLY IN THE LIVE TREE. The hermetic verification snapshot is built by
-    `cowork_verification.materialize_command_checkout`, which runs `git init -q`
-    and writes the captured raw index bytes but copies NO commit objects, so
-    `git show <base>:...` cannot work there. That class skip-guards on HEAD
-    resolvability: no commit at all means a snapshot (skip, with a reason); a
-    resolvable HEAD whose base commit is missing is a genuinely broken gate and
-    FAILS, so a real failure can never masquerade as a skip.
+Declared behaviour, asserted as such:
 
-ONE DECLARED ASYMMETRY remains, asserted here as declared behaviour rather
-than treated as a defect, because it follows from symbols this package is not
-authorized to touch:
-
-  1. RESOLVED by R3, and asserted here in its corrected form. A pre-dispatch
-     exclusivity refusal now raises the `ProviderSessionConflict` the gate
+  1. A pre-dispatch exclusivity refusal raises the `ProviderSessionConflict` the gate
      already built, so the run ends under `run.end` reason
      `provider_session_bound` -- the SAME code `dispatch.decision` records --
-     and the operator is shown the block naming the session that actually
+     and the block shown names the session that actually
      holds the provider conversation rather than the one they are sitting in.
 
   2. `ProviderBindingUnavailable` raised inside `_owner_gate_fact` PROPAGATES
-     rather than becoming a refusing fact (no such code exists in the frozen
-     dispatch vocabulary), so `dispatch.contract` / `dispatch.decision` are not
+     rather than becoming a refusing fact (no such code exists in the
+     dispatch refusal vocabulary), so `dispatch.contract` / `dispatch.decision` are not
      emitted on that one path -- the raise precedes `decide()`.
 
 Every fixture redirects `COWORK_SESSIONS_ROOT` into a fresh `tempfile.mkdtemp()`
@@ -65,7 +49,6 @@ spawns no provider and no network client.
 """
 
 import ast
-import copy
 import datetime
 import hashlib
 import inspect
@@ -76,7 +59,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import unittest
 import uuid
 from unittest import mock
@@ -84,7 +66,6 @@ from unittest import mock
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork  # noqa: E402
 import cowork_bridge as bridge  # noqa: E402
@@ -92,85 +73,9 @@ import cowork_owner as owner  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 
-# The frozen base this package is bound to: P2's accepted candidate. G5's
-# per-package `<base>` rule -- never the accredited base, for P2 onward.
-BASE_SHA = "239d8d65e7ac32ea20ad5564cfebc6055288d5d6"
-
-# P3's OWN signed candidate commit -- the other end of this package's interval.
-# `ScopeAndBaseConfinementTests` below measures the CLOSED interval
-# BASE_SHA..CANDIDATE_SHA, never the live working tree, so what it asserts is a
-# permanent fact about a finished piece of history that no later commit can
-# enter or turn red.
-CANDIDATE_SHA = "d451f65b0caecb8f04fbbfb257442afff809337c"
-
-# P3's write authority, exactly. `scripts/cowork_owner.py` is deliberately NOT
-# here: every binding primitive P3 needs already exists there, so this package
-# ends at zero delta on that file.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork.py",
-    "scripts/test_m55_owner_exclusivity.py",
-})
-
-# Production files P3 must leave byte-identical to the base.
-FROZEN_PRODUCTION_PATHS = (
-    "scripts/cowork_owner.py",
-    "scripts/cowork_state.py",
-    "scripts/cowork_bridge.py",
-    "scripts/cowork_dispatch.py",
-    "scripts/cowork_eval.py",
-)
-
-# Historical fixture modules P3 reads but never edits. Their package-scope
-# failures are REPORTED, not repaired (SW64P2F-N06); a byte digest is what
-# proves the reporting is honest.
-FROZEN_TEST_PATHS = (
-    "scripts/test_m55_owner_gate.py",
-    "scripts/test_m55_owner_store.py",
-    "scripts/test_cowork_state_m3.py",
-    "scripts/test_dispatch_contract_characterization.py",
-)
-
-# `cowork.py` top-level symbols P3 may change, and the ones it may add. Every
-# other top-level symbol must be AST- and docstring-identical to the base.
-#
-# `run_flow` is here because enforcement point 3 lives INSIDE it, so its
-# whole-symbol dump necessarily differs. It is not thereby unchecked: it is
-# checked more precisely instead, by
-# `test_run_flow_is_identical_apart_from_the_role_saver_closure`, which
-# compares it against the base with only the one authorized closure's body
-# normalized away. Exempting it outright would leave `run_flow`'s own body --
-# the part P3 has no authority over at all -- unmeasured.
-ALLOWED_CHANGED_TOP_LEVEL = frozenset({
-    "_owner_gate_fact",
-    "run_resume_trigger",
-    "run_flow",
-})
-ALLOWED_NEW_TOP_LEVEL = frozenset({
-    "_record_provider_conflict",
-    "RESUME_TRIGGER_EXIT_PROVIDER_SESSION_BOUND",
-    "RESUME_TRIGGER_EXIT_PROVIDER_BINDING_UNAVAILABLE",
-})
-# The one `run_flow` closure P3 may change: enforcement point 3 lives in it.
-ALLOWED_CHANGED_CLOSURES = frozenset({"role_saver"})
-
-# Plan section 3.7: P2's seven module-level owner symbols. These are the ones
-# whose NAME contains "owner", which is the pattern P2's own gate collects on.
-P2_OWNER_MODULE_SYMBOLS = frozenset({
-    "_OWNER_CONTEXT", "_set_owner_context", "_restore_owner_context",
-    "_current_owner_context", "_owner_gate_fact", "_require_owner",
-    "_run_owner_heartbeat_loop",
-})
-# P3's eighth and only addition. It is listed SEPARATELY rather than folded
-# into the set above because its name does not contain "owner", so the
-# name-pattern sweep cannot see it -- which is exactly why P2's own gate also
-# checks for it by name rather than by pattern.
-P3_NEW_OWNER_MODULE_SYMBOL = "_record_provider_conflict"
-
-# G9's frozen base contract: the 0-10 outcome-name -> integer mapping exactly
-# as the base declares it. Pinned as a LITERAL so the hermetic run (which has
-# no commit history) can still measure the contract, and cross-checked against
-# `git show <base>` in the live-tree class so the literal cannot drift.
-BASE_EXIT_CODES = {
+# The complete resume-trigger exit contract: outcome name -> process exit
+# code, as external callers consume it.
+RESUME_TRIGGER_EXIT_CONTRACT = {
     "success": 0,
     "internal_error": 1,
     "invalid_arguments": 2,
@@ -182,11 +87,11 @@ BASE_EXIT_CODES = {
     "no_pending_turn": 8,
     "send_failed": 9,
     "owner_conflict": 10,
-}
-NEW_EXIT_CODES = {
     "provider_session_bound": 11,
     "provider_binding_unavailable": 12,
 }
+EXCLUSIVITY_EXIT_CODES = ("provider_session_bound",
+                          "provider_binding_unavailable")
 
 OWNER_SUBCLASSES = (
     owner.OwnerLeaseConflict, owner.OwnerLeaseCorrupt, owner.OwnerLeaseLost,
@@ -202,17 +107,6 @@ _ALLOW = {"allowed": True, "refusal_code": None, "refusal_message": None,
 # --------------------------------------------------------------------------- #
 
 
-def _git_show_bytes(rev, rel_path):
-    return subprocess.run(
-        ["git", "show", "%s:%s" % (rev, rel_path)],
-        cwd=_REPO_ROOT, capture_output=True, check=True).stdout
-
-
-def _read_local_bytes(rel_path):
-    with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
-        return fh.read()
-
-
 def _sha256(payload):
     return hashlib.sha256(payload).hexdigest()
 
@@ -224,52 +118,6 @@ def _cowork_source():
 
 def _cowork_tree():
     return ast.parse(_cowork_source(), filename="cowork.py")
-
-
-def _candidate_cowork_tree():
-    """`scripts/cowork.py` as it stood at P3's own candidate commit.
-
-    A SEPARATE reader rather than a change to `_cowork_tree`: that helper also
-    feeds classes that assert things about the module running RIGHT NOW, and
-    re-pointing it would silently convert live behavioural gates into
-    historical ones."""
-    return ast.parse(_git_show_bytes(CANDIDATE_SHA, "scripts/cowork.py"),
-                     filename="cowork.py")
-
-
-def _candidate_scripts_names():
-    """Sorted basenames of the `.py` files under `scripts/` AT the candidate
-    commit -- the frozen-interval counterpart of `os.listdir(_HERE)`.
-
-    `git ls-tree --name-only` emits paths carrying the `scripts/` prefix and
-    includes non-`.py` entries, so both are handled here."""
-    out = subprocess.run(
-        ["git", "--no-optional-locks", "ls-tree", "--name-only",
-         CANDIDATE_SHA, "scripts/"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True).stdout
-    names = []
-    for line in out.split():
-        name = line[len("scripts/"):] if line.startswith("scripts/") else line
-        if name.endswith(".py"):
-            names.append(name)
-    return sorted(names)
-
-
-def _git_merge_base_is_ancestor(ancestor, descendant):
-    """True when `ancestor` really is an ancestor of `descendant`.
-
-    Guards the two frozen endpoint literals against a typo: a mistyped hash
-    would otherwise point every claim in `ScopeAndBaseConfinementTests` at an
-    unrelated piece of history and go on reporting green. `merge-base
-    --is-ancestor` only -- deliberately NOT the adjacency half of the
-    precedent at test_m5_package_e_integration.py, since a package need not be
-    exactly one commit above its base. `--no-optional-locks` so this cannot
-    refresh `.git/index` while the suite runs as a live-candidate
-    preflight."""
-    return subprocess.run(
-        ["git", "--no-optional-locks", "merge-base", "--is-ancestor",
-         ancestor, descendant],
-        cwd=_REPO_ROOT, capture_output=True).returncode == 0
 
 
 def _named_top_level(tree):
@@ -318,28 +166,6 @@ def _find_functions(tree, name):
     return [n for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
             and n.name == name]
-
-
-def _without_bodies_of(node, names):
-    """A deep copy of `node` with the BODY of every nested function whose name
-    is in `names` replaced by a bare `pass`.
-
-    This is what lets a symbol be compared against the base MODULO exactly the
-    part a package is authorized to change, instead of being exempted whole. A
-    `run_flow` exempted whole would leave its own body -- which P3 has no
-    authority over at all -- entirely unmeasured; normalized this way, every
-    statement of it is still compared, and so is the normalized closure's own
-    signature and position."""
-    clone = copy.deepcopy(node)
-    for child in ast.walk(clone):
-        if (isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and child.name in names):
-            child.body = [ast.Pass()]
-    return clone
-
-
-def _dump(node):
-    return ast.dump(node, include_attributes=False)
 
 
 def _called_name(node):
@@ -414,6 +240,19 @@ def _write_raw_lease(session_uuid, payload):
     os.makedirs(state_store.owner_dir_for(session_uuid), exist_ok=True)
     with open(_lease_file(session_uuid), "w") as fh:
         json.dump(payload, fh)
+
+
+def _selector_argv(argv):
+    """The agent-only contract accepts exactly one session selector: a new
+    session at an explicit fresh path is `--session-file` alone, and an
+    ephemeral run names no session file."""
+    argv = list(argv)
+    if "--no-session" in argv and "--session-file" in argv:
+        i = argv.index("--session-file")
+        del argv[i:i + 2]
+    if "--session-file" in argv:
+        argv = [a for a in argv if a != "--new"]
+    return argv
 
 
 class _Raises(object):
@@ -555,31 +394,39 @@ class ExclusivityTestCase(unittest.TestCase):
     # -- run_flow driving -------------------------------------------------- #
 
     def args(self, extra=()):
-        return cowork.build_parser().parse_args(
-            ["--team", "scout", "--config", "scout=claude",
-             "--context", "goal", "--session-file", self.spath] + list(extra))
+        return cowork.build_parser().parse_args(_selector_argv(
+            ["--team", "scout,scout-reviewer", "--config", "scout=claude",
+             "--context", "goal", "--session-file", self.spath] + list(extra)))
 
     def run_flow(self, extra=(), scout=None, **kwargs):
         out = io.StringIO()
         rc = cowork.run_flow(
-            self.args(extra), io_in=io.StringIO(""), io_out=out,
+            self.args(extra), io_out=out,
             which=lambda c: "/bin/" + c,
             run_scout_fn=scout if scout is not None else self._ok_scout,
             **kwargs)
         return rc, out.getvalue()
 
-    @staticmethod
-    def _ok_scout(config, context, selected, io_in=None, io_out=None,
+    def _ok_scout(self, config, context, selected, io_out=None,
                   resume_id=None, on_session=None, intel_path=None,
-                  review_path=None, **kwargs):
+                  review_path=None, on_outcome=None, **kwargs):
+        """The fake scout lead+review seam: it reports the explicit approval
+        the real seam reports on success, because `_final_rc` keeps rc 0 only
+        for an approved last outcome. Each call is recorded so a happy-path
+        run can prove the fake lead actually ran."""
+        self.scout_calls = getattr(self, "scout_calls", 0) + 1
+        on_outcome("approved", None)
         return 0
 
     def establish_session(self):
         """Run one complete owned flow, then return its `session_uuid`. The
         lease it leaves behind is `released`, so a later fixture starts from a
         genuine post-clean-exit state rather than a fabricated one."""
+        before = getattr(self, "scout_calls", 0)
         rc, _out = self.run_flow(["--new"])
         self.assertEqual(rc, 0)
+        self.assertGreater(self.scout_calls, before,
+                           "the fake scout lead never ran")
         return self.saved_session_uuid()
 
     def saved_session_uuid(self):
@@ -762,7 +609,7 @@ class PreDispatchSeamTests(ExclusivityTestCase):
 
     def test_an_unenforced_context_contributes_no_fact(self):
         """N1 parity: with no lease held the limb is unreachable, so
-        `--no-session` behaviour is byte-identical to the base."""
+        `--no-session` behaviour is unchanged by the exclusivity limb."""
         self.assertIs(cowork._OWNER_CONTEXT["enforced"], False)
         with mock.patch.object(owner, "read_provider_binding",
                                _Raises("read_provider_binding")):
@@ -804,8 +651,8 @@ class PreDispatchSeamTests(ExclusivityTestCase):
 
     def test_an_unreadable_index_propagates_without_a_dispatch_decision(self):
         """DECLARED ASYMMETRY 2. `provider_binding_unavailable` is absent from
-        the frozen dispatch vocabulary and `cowork_dispatch.py` is not a P3
-        path, so the condition cannot be expressed as a refusing fact. It
+        the dispatch refusal vocabulary, so the condition cannot be expressed
+        as a refusing fact. It
         propagates instead -- fail-closed and typed -- at the declared cost of
         the two dispatch events not being emitted on this one path."""
         self.own_context()
@@ -1202,7 +1049,7 @@ class DurableBackstopSeamTests(ExclusivityTestCase):
                          "provider_session_bound")
 
     def test_the_conflict_surfaces_at_the_next_governed_seam(self):
-        """R3 / plan section 11.11's declared deferral window: the refusal is
+        """The declared deferral window: the refusal is
         recorded during the callback and RE-RAISED at the next governed seam,
         inside `run_flow`'s own frame, rather than crossing the callback
         boundary into the send gateway's `except Exception`."""
@@ -1274,12 +1121,14 @@ class DurableBackstopSeamTests(ExclusivityTestCase):
         def scout(config, context, selected, **kwargs):
             seen["enforced"] = cowork._OWNER_CONTEXT["enforced"]
             kwargs["on_session"]("claude", "prov-sid-F")
+            kwargs["on_outcome"]("approved", None)
             return 0
 
         with mock.patch.object(owner, "bind_provider_session",
                                _Raises("bind_provider_session")):
             rc, _out = self.run_flow(["--no-session"], scout=scout)
         self.assertEqual(rc, 0)
+        self.assertIn("enforced", seen, "the fake scout lead never ran")
         self.assertIs(seen["enforced"], False)
 
 
@@ -1688,36 +1537,6 @@ class FrozenSeamTests(unittest.TestCase):
                 state_store.save_role_session).parameters.keys()),
             ["path", "role", "controller", "session_id", "prior"])
 
-    def test_the_module_owner_symbol_set_is_p2s_seven_plus_one(self):
-        """P2's own gate collects private module-level symbols whose NAME
-        contains "owner" and asserts that set is exactly its seven. P3's
-        eighth symbol does not match that pattern, so the pattern sweep must
-        still yield the same seven, and the new symbol is checked BY NAME --
-        the same split P2's gate makes with its own `assertNotIn`.
-
-        "And nothing else was added" is not claimed here, because a name
-        pattern cannot support it: that claim belongs to
-        `ScopeAndBaseConfinementTests`, which compares the whole top-level
-        symbol set against the base."""
-        present = set()
-        for node in self.tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                names = {node.name}
-            elif isinstance(node, ast.Assign):
-                names = {t.id for t in node.targets
-                         if isinstance(t, ast.Name)}
-            else:
-                continue
-            for name in names:
-                # Private module-level symbols only: the additive
-                # `RESUME_TRIGGER_EXIT_*` constants are the exit contract's own
-                # public namespace, pinned separately by G9.
-                if name.startswith("_") and "owner" in name.lower():
-                    present.add(name)
-        self.assertEqual(present, set(P2_OWNER_MODULE_SYMBOLS))
-        self.assertIn(P3_NEW_OWNER_MODULE_SYMBOL, self.top)
-        self.assertNotIn(P3_NEW_OWNER_MODULE_SYMBOL, present)
-
     def test_record_provider_conflict_never_raises_and_never_overwrites(self):
         """The deferral helper must be inert: it cannot raise (it is called
         from inside a callback that fires during a live send), and it cannot
@@ -1770,17 +1589,17 @@ class FrozenSeamTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# G9 (git-free half) -- the additive resume-trigger exit contract.              #
+# G9 -- the resume-trigger exit contract.                                       #
 # --------------------------------------------------------------------------- #
 
 
 class ResumeTriggerExitContractTests(unittest.TestCase):
-    """The exit contract measured hermetically (pd3). The base mapping is
-    pinned as a frozen LITERAL here so it can be measured where there is no
-    commit history, and `ScopeAndBaseConfinementTests` cross-checks that
-    literal against what the base actually declares, so it cannot drift."""
 
-    def test_the_two_new_constants_are_eleven_and_twelve(self):
+    def test_the_exit_contract_is_exactly_the_declared_table(self):
+        self.assertEqual(dict(cowork.RESUME_TRIGGER_EXIT_CODES),
+                         RESUME_TRIGGER_EXIT_CONTRACT)
+
+    def test_the_exclusivity_constants_match_the_contract(self):
         self.assertEqual(cowork.RESUME_TRIGGER_EXIT_PROVIDER_SESSION_BOUND, 11)
         self.assertEqual(
             cowork.RESUME_TRIGGER_EXIT_PROVIDER_BINDING_UNAVAILABLE, 12)
@@ -1789,279 +1608,16 @@ class ResumeTriggerExitContractTests(unittest.TestCase):
         codes = cowork.RESUME_TRIGGER_EXIT_CODES
         self.assertEqual(len(set(codes.values())), len(codes))
 
-    def test_every_pre_existing_mapping_is_unchanged(self):
-        codes = cowork.RESUME_TRIGGER_EXIT_CODES
-        for name, value in BASE_EXIT_CODES.items():
-            with self.subTest(name):
-                self.assertIn(name, codes)
-                self.assertEqual(codes[name], value)
-
-    def test_the_only_additions_are_the_two_expected_keys(self):
-        codes = dict(cowork.RESUME_TRIGGER_EXIT_CODES)
-        self.assertEqual(set(codes) - set(BASE_EXIT_CODES), set(NEW_EXIT_CODES))
-        self.assertEqual(set(BASE_EXIT_CODES) - set(codes), set())
-        for name, value in NEW_EXIT_CODES.items():
-            self.assertEqual(codes[name], value)
-
     def test_the_emitted_outcome_names_are_keys_of_the_contract(self):
-        """Self-consistency: every `outcome` string the two new paths write is
-        exactly the contract key that maps to the code they return, so an
-        external consumer can look the integer up by name."""
+        """Every `outcome` string the two exclusivity paths write is exactly
+        the contract key that maps to the code they return, so an external
+        consumer can look the integer up by name."""
         source = _cowork_source()
-        for name, value in NEW_EXIT_CODES.items():
+        for name in EXCLUSIVITY_EXIT_CODES:
             with self.subTest(name):
                 self.assertIn('"outcome": "%s"' % name, source)
-                self.assertEqual(cowork.RESUME_TRIGGER_EXIT_CODES[name], value)
-
-    def test_the_new_codes_sit_above_the_whole_base_contract(self):
-        self.assertEqual(max(BASE_EXIT_CODES.values()), 10)
-        self.assertEqual(sorted(NEW_EXIT_CODES.values()), [11, 12])
-
-
-# --------------------------------------------------------------------------- #
-# G5 / G9 / G14 (git-dependent halves) -- scope and base confinement.           #
-# LIVE TREE ONLY (pd1).                                                        #
-# --------------------------------------------------------------------------- #
-
-
-class ScopeAndBaseConfinementTests(unittest.TestCase):
-    """Every gate that must compare the candidate against the BASE COMMIT.
-
-    These cannot run inside the hermetic verification snapshot:
-    `cowork_verification.materialize_command_checkout` builds that checkout with
-    `git init -q` plus a write of the captured raw index bytes, which gives a
-    working index but NO commit objects and no HEAD. `git show <base>:...` would
-    ERROR there, not fail. The guard below distinguishes the two situations
-    exactly: no resolvable HEAD means a snapshot and skips with a reason; a
-    resolvable HEAD whose base commit is missing is a genuinely broken gate and
-    is allowed to fail."""
-
-    @classmethod
-    def setUpClass(cls):
-        head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
-                              cwd=_REPO_ROOT, capture_output=True, text=True)
-        if head.returncode != 0:
-            raise unittest.SkipTest(
-                "no resolvable HEAD: this checkout is a hermetic verification "
-                "snapshot (index only, no commit objects), so every "
-                "base-comparison gate here runs in the candidate_read_only "
-                "preflight against the live tree instead")
-        base = subprocess.run(["git", "cat-file", "-e", BASE_SHA + "^{commit}"],
-                              cwd=_REPO_ROOT, capture_output=True, text=True)
-        if base.returncode != 0:
-            raise AssertionError(
-                "HEAD resolves but base commit %s is missing -- this is a "
-                "broken gate, not a snapshot" % BASE_SHA)
-
-    def _changed_paths(self):
-        """The change set of the CLOSED interval `BASE_SHA..CANDIDATE_SHA`.
-
-        Two frozen endpoints, named explicitly, so this is neither the
-        working-tree form (`git diff --name-only <BASE>`, which measured
-        whatever happened to be on disk at run time) nor the `<BASE>..` form
-        (which means `<BASE>..HEAD` and follows a moving ref).
-
-        The `git ls-files --others --exclude-standard` branch that used to be
-        unioned in here is GONE, and that is not a loosening: it existed solely
-        to catch files P3 had added but not yet committed while P3 was the live
-        candidate. `CANDIDATE_SHA` is P3's finished commit, so it already
-        CONTAINS every file P3 added -- including this module -- and the
-        commit-to-commit diff reports them anyway.
-        """
-        tracked = subprocess.run(
-            ["git", "--no-optional-locks", "diff", "--name-only",
-             BASE_SHA, CANDIDATE_SHA],
-            cwd=_REPO_ROOT, capture_output=True, text=True,
-            check=True).stdout.split()
-        return {p for p in tracked if "__pycache__" not in p}
-
-    def test_the_base_is_an_ancestor_of_the_candidate(self):
-        """Both endpoints are frozen literals, so a single mistyped character
-        would silently point every claim in this class at an unrelated piece of
-        history. This fails loudly instead."""
-        self.assertTrue(
-            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
-            "%s is not an ancestor of %s"
-            % (BASE_SHA[:12], CANDIDATE_SHA[:12]))
-
-    def test_changed_paths_are_exactly_the_authorized_set(self):
-        """`scripts/cowork_owner.py` is permitted ONLY if a genuine
-        section 3.6 / G13f gap was proved and had to be filled; the expected
-        outcome, and the one this build reports, is zero delta there."""
-        changed = self._changed_paths()
-        self.assertEqual(
-            changed - set(ALLOWED_CHANGED_PATHS)
-            - {"scripts/cowork_owner.py"}, set())
-        self.assertEqual(set(ALLOWED_CHANGED_PATHS) - changed, set())
-
-    def test_the_owner_module_ended_at_zero_delta(self):
-        """Decision pd-a, as a checked fact rather than a claim in a report."""
-        self.assertEqual(
-            _sha256(_git_show_bytes(CANDIDATE_SHA, "scripts/cowork_owner.py")),
-            _sha256(_git_show_bytes(BASE_SHA, "scripts/cowork_owner.py")))
-
-    def test_every_frozen_production_path_is_byte_identical(self):
-        for rel in FROZEN_PRODUCTION_PATHS:
-            with self.subTest(rel):
-                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
-                                 _sha256(_git_show_bytes(BASE_SHA, rel)), rel)
-
-    def test_every_historical_test_module_is_byte_identical(self):
-        """The machine-checkable half of "reported, never repaired": the
-        package-scope fixtures P3 necessarily breaks were not edited to make
-        them pass.
-
-        BOTH halves of the comparison come from the frozen interval: the
-        `test_m5_package_*` LISTING is taken from the candidate commit's own
-        tree, not from a live directory listing. Mixing the two would mean a
-        module added after `CANDIDATE_SHA` made this assertion ERROR on a
-        missing git object instead of reporting a scope breach."""
-        rels = list(FROZEN_TEST_PATHS)
-        rels += sorted(
-            "scripts/" + name for name in _candidate_scripts_names()
-            if name.startswith("test_m5_package_") and name.endswith(".py"))
-        for rel in rels:
-            with self.subTest(rel):
-                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
-                                 _sha256(_git_show_bytes(BASE_SHA, rel)), rel)
-
-    def test_every_other_top_level_symbol_is_ast_and_docstring_identical(self):
-        base = _named_top_level(ast.parse(_git_show_bytes(
-            BASE_SHA, "scripts/cowork.py")))
-        cand = _named_top_level(_candidate_cowork_tree())
-        self.assertEqual(set(base) - set(cand), set(), "a symbol was removed")
-        self.assertEqual(set(cand) - set(base), set(ALLOWED_NEW_TOP_LEVEL))
-        for name, node in base.items():
-            if name in ALLOWED_CHANGED_TOP_LEVEL:
-                continue
-            with self.subTest(name):
-                self.assertEqual(_dump(cand[name]), _dump(node), name)
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                     ast.ClassDef)):
-                    self.assertEqual(ast.get_docstring(cand[name]),
-                                     ast.get_docstring(node), name)
-
-    def test_run_flow_is_identical_apart_from_the_role_saver_closure(self):
-        """`run_flow` is exempted from the whole-symbol comparison above only
-        because enforcement point 3 lives inside it. It is checked HERE
-        instead, and more precisely: compared against the base with just the
-        one authorized closure's body normalized away, so every other
-        statement of `run_flow` -- and `role_saver`'s own signature and
-        position -- is still pinned. Then `role_saver` itself is compared with
-        only `on_sess`'s body normalized away, which pins the fact that the
-        edit is confined to the callback and did not touch the factory around
-        it."""
-        base = _named_top_level(ast.parse(_git_show_bytes(
-            BASE_SHA, "scripts/cowork.py")))["run_flow"]
-        cand = _named_top_level(_candidate_cowork_tree())["run_flow"]
-
-        self.assertEqual(ast.get_docstring(cand), ast.get_docstring(base))
-        self.assertEqual(
-            _dump(_without_bodies_of(cand, ALLOWED_CHANGED_CLOSURES)),
-            _dump(_without_bodies_of(base, ALLOWED_CHANGED_CLOSURES)))
-
-        base_saver = _find_functions(base, "role_saver")
-        cand_saver = _find_functions(cand, "role_saver")
-        self.assertEqual(len(base_saver), 1)
-        self.assertEqual(len(cand_saver), 1)
-        self.assertEqual(
-            _dump(_without_bodies_of(cand_saver[0], {"on_sess"})),
-            _dump(_without_bodies_of(base_saver[0], {"on_sess"})))
-
-    def test_the_only_changed_bare_statement_is_the_exit_map_update(self):
-        """Named symbols are compared above; a bare expression statement (such
-        as `RESUME_TRIGGER_EXIT_CODES.update({...})`) has no name to compare
-        by, so the remaining top-level statements are compared as a sequence
-        and exactly one difference is allowed."""
-
-        def bare(tree):
-            return [ast.unparse(n) for n in tree.body
-                    if not isinstance(n, (ast.FunctionDef,
-                                          ast.AsyncFunctionDef,
-                                          ast.ClassDef, ast.Assign))]
-
-        base = bare(ast.parse(_git_show_bytes(BASE_SHA, "scripts/cowork.py")))
-        cand = bare(_candidate_cowork_tree())
-        self.assertEqual(len(base), len(cand))
-        differing = [(b, l) for b, l in zip(base, cand) if b != l]
-        self.assertEqual(len(differing), 1, differing)
-        self.assertIn("RESUME_TRIGGER_EXIT_CODES.update", differing[0][0])
-        self.assertIn("RESUME_TRIGGER_EXIT_CODES.update", differing[0][1])
-
-    def test_every_other_run_flow_closure_is_ast_identical(self):
-        """The nested half, resolved by name through the module AST -- never
-        `inspect.getsource`, which cannot reach a closure without executing its
-        parent, and never a byte digest, which a legitimate re-indentation
-        would break on a CORRECT candidate."""
-        base = _closures_of(_named_top_level(ast.parse(_git_show_bytes(
-            BASE_SHA, "scripts/cowork.py")))["run_flow"])
-        cand = _closures_of(
-            _named_top_level(_candidate_cowork_tree())["run_flow"])
-        self.assertEqual(set(base) - set(cand), set())
-        self.assertEqual(set(cand) - set(base), set())
-        for name, nodes in base.items():
-            if name in ALLOWED_CHANGED_CLOSURES:
-                continue
-            with self.subTest(name):
-                self.assertEqual(len(nodes), 1, name)
-                self.assertEqual(len(cand[name]), 1, name)
-                self.assertEqual(_dump(cand[name][0]), _dump(nodes[0]))
-                self.assertEqual(ast.get_docstring(cand[name][0]),
-                                 ast.get_docstring(nodes[0]))
-
-    def test_g9_the_frozen_base_literal_matches_the_base_commit(self):
-        """pd3's cross-check: the literal `BASE_EXIT_CODES` the hermetic class
-        measures against is exactly what the base declares."""
-        base_tree = ast.parse(_git_show_bytes(BASE_SHA, "scripts/cowork.py"))
-        namespace = {}
-        for node in base_tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if (isinstance(target, ast.Name)
-                            and target.id.startswith("RESUME_TRIGGER_EXIT_")
-                            and target.id != "RESUME_TRIGGER_EXIT_CODES"):
-                        try:
-                            namespace[target.id] = ast.literal_eval(node.value)
-                        except ValueError:
-                            namespace[target.id] = None
-        # The base's E-specific integers, read from the base itself.
-        self.assertEqual(namespace["RESUME_TRIGGER_EXIT_OWNER_CONFLICT"], 10)
-        self.assertEqual(namespace["RESUME_TRIGGER_EXIT_SEND_FAILED"], 9)
-        self.assertEqual(namespace["RESUME_TRIGGER_EXIT_NO_PENDING_TURN"], 8)
-        self.assertEqual(namespace["RESUME_TRIGGER_EXIT_INVALIDATED"], 7)
-        self.assertEqual(namespace["RESUME_TRIGGER_EXIT_BINDING_MISMATCH"], 6)
-        # Nothing numbered 11 or 12 existed at the base.
-        self.assertEqual(
-            [n for n, v in namespace.items() if v in (11, 12)], [])
-        # And the base's own contract keys are exactly the frozen literal's.
-        base_update = [n for n in base_tree.body
-                       if isinstance(n, ast.Expr)
-                       and isinstance(n.value, ast.Call)
-                       and _called_name(n.value) == "update"
-                       and "RESUME_TRIGGER_EXIT_CODES"
-                       in ast.unparse(n.value.func)]
-        self.assertEqual(len(base_update), 1)
-        added = {k.value for k in base_update[0].value.args[0].keys}
-        self.assertEqual(added, {"binding_mismatch", "invalidated",
-                                 "no_pending_turn", "send_failed",
-                                 "owner_conflict"})
-        self.assertEqual(set(BASE_EXIT_CODES) - added,
-                         {"success", "internal_error", "invalid_arguments",
-                          "not_due", "conflict", "attempts_exhausted"})
-
-    def test_g14_save_role_session_is_frozen_against_the_base(self):
-        base_node = next(
-            n for n in ast.parse(_git_show_bytes(
-                BASE_SHA, "scripts/cowork_state.py")).body
-            if isinstance(n, ast.FunctionDef)
-            and n.name == "save_role_session")
-        live_node = ast.parse(textwrap.dedent(
-            inspect.getsource(state_store.save_role_session))).body[0]
-        self.assertEqual(_dump(live_node), _dump(base_node))
-        # `clean=False`: the claim being pinned is the docstring's exact bytes,
-        # not a dedented projection of them.
-        self.assertEqual(state_store.save_role_session.__doc__,
-                         ast.get_docstring(base_node, clean=False))
+                self.assertEqual(cowork.RESUME_TRIGGER_EXIT_CODES[name],
+                                 RESUME_TRIGGER_EXIT_CONTRACT[name])
 
 
 if __name__ == "__main__":

@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Focused suite for issue #64 implementation package **P5** -- the eleven
-negative controls, the evaluation-drain fixture, and the machine-checked
-fixture matrix -- on the frozen base
-`3e3bdba12abacdf1a5fc0c9301200adc5e3171c4`.
-
-P5 adds **ZERO production delta**. This module and its sibling
-`test_m55_owner_crash_reclaim.py` are the only two paths in the repository that
-differ from that base; the sibling's `ScopeConfinementTests` proves it.
+"""The owner-lease negative controls and the evaluation-drain fixture.
 
 A refusal gate is only as good as the things it must NOT refuse, and the things
 it must not let through anonymously. That is what lives here:
@@ -67,20 +60,11 @@ it must not let through anonymously. That is what lives here:
     runtime witness for it exists anywhere in the tree and N10's accepted span
     is defined over it.
 
-  - **`FixtureMatrixTests`.** The 19-row fixture matrix is a module-level
-    mapping that a test RESOLVES: locally-owned rows must name a test method
-    that exists in one of the two new modules, and mapped rows must name a
-    (frozen file, class, test) triple that exists, resolved by `ast` parse.
-    A prose-only matrix cannot enforce "no row marked covered without a
-    resolvable test id"; this can.
-
 **N10's mapped span, disclosed.** N10's accepted definition also spans F8's
 provider-exclusivity arms. Those are already carried by
 `scripts/test_m55_owner_exclusivity.py::TypedPropagationTests::
-test_n10_nothing_anonymous_reaches_the_send_gateway`, a CLOSED package's frozen
-suite. P5 does NOT re-execute them -- re-driving them would replay P3 -- and
-does not silently drop them either: they are named in `FIXTURE_MATRIX` and
-stated here.
+test_n10_nothing_anonymous_reaches_the_send_gateway`; they are not re-driven
+here, and are stated so they are not silently dropped.
 
 Every fixture redirects `COWORK_SESSIONS_ROOT` into a fresh `tempfile.mkdtemp`,
 injects `now=` rather than sleeping toward a deadline, drives the real
@@ -111,7 +95,6 @@ from unittest import mock
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork  # noqa: E402
 import cowork_bridge as bridge  # noqa: E402
@@ -120,30 +103,10 @@ import cowork_owner as owner  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 
-# The SIBLING module, bound as a MODULE OBJECT under a private name -- never
-# `from ... import <TestCase>`. `unittest.TestLoader.loadTestsFromModule`
-# collects any `TestCase` subclass that is an ATTRIBUTE of the module under
-# test, so a `from`-import would silently re-run the sibling's whole suite
-# inside this module, inflating this module's reported test count. A bound
-# module object is not a `TestCase`, so it is never collected.
-import test_m55_owner_crash_reclaim as _crash_reclaim  # noqa: E402
-
-# The frozen base this package is bound to -- the same single literal the
-# sibling pins, guarded there by `merge-base --is-ancestor`.
-BASE_SHA = "3e3bdba12abacdf1a5fc0c9301200adc5e3171c4"
-
-# P5's write authority, exactly. Cross-checked against the sibling's copy by
-# `FixtureMatrixTests`.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/test_m55_owner_negative_controls.py",
-    "scripts/test_m55_owner_crash_reclaim.py",
-})
-
 # The persistence seam frozen by `test_cowork_state_m3.py`'s characterization
 # suite: the EXACT parameter list, in order.
 SAVE_ROLE_SESSION_PARAMETERS = ["path", "role", "controller", "session_id",
                                 "prior"]
-STATE_CHARACTERIZATION_FILE = "scripts/test_cowork_state_m3.py"
 
 # The C5 failure set the three binding functions must be TOTAL over.
 TRANSLATED_FAILURES = (
@@ -164,333 +127,14 @@ N5_REQUIRED_VIRTUAL_S = 3 * N5_DEADLINE_S
 N5_FIRES = (N5_REQUIRED_VIRTUAL_S // N5_VIRTUAL_STEP_S) + 1
 N5_OBSERVE_EVERY = 4
 
-# The full team P5's flow fixtures drive, so the run really crosses all three
+# The full team the flow fixtures drive, so the run really crosses all three
 # phases and all four measurement boundaries.
 FULL_TEAM = ("scout", "planner", "builder")
 
 
 # --------------------------------------------------------------------------- #
-# The fixture matrix.                                                           #
-#                                                                              #
-# 18 assigned IDs plus F14. Every row is either LOCAL (owned by one of P5's two #
-# new modules) or MAPPED (already carried by a named test in a frozen suite of  #
-# a closed package, with `p5_adds` saying what P5 puts on top). Resolved by     #
-# `FixtureMatrixTests`, never merely written down.                              #
-# --------------------------------------------------------------------------- #
-
-# `module key -> the two new modules`, used to resolve local rows.
-_LOCAL_MODULES = {
-    "crash_reclaim": _crash_reclaim,
-    "negative_controls": sys.modules[__name__],
-}
-
-FIXTURE_MATRIX = {
-    "F2": {
-        "owner": "local",
-        "tests": [("crash_reclaim", "CleanRestartTests",
-                   "test_f2_a_real_child_clean_exit_releases_and_the_next_run"
-                   "_takes_epoch_two")],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "LifecycleTests",
-             "test_a_restart_after_a_clean_exit_acquires_the_next_epoch"),
-            ("scripts/test_m55_owner_store.py", "AcquireGateTests",
-             "test_clean_restart_acquires_epoch_two_without_takeover"),
-        ],
-        "p5_adds": "the REAL separate-process clean exit",
-    },
-    "F3": {
-        "owner": "local",
-        "tests": [
-            ("crash_reclaim", "CrashedOwnerTests",
-             "test_f3_a_real_sigkill_leaves_a_live_lease_until_the_deadline"),
-            ("crash_reclaim", "CrashedOwnerTests",
-             "test_f3_after_the_deadline_take_over_selects_proved_dead_and"
-             "_bumps_the_epoch"),
-        ],
-        "mapped": [
-            ("scripts/test_m55_owner_store.py", "AcquireGateTests",
-             "test_stale_dead_owner_refuses_and_is_never_implicitly_reclaimed"),
-            ("scripts/test_m55_owner_gate.py", "TakeoverWiringTests",
-             "test_take_over_reclaims_a_provably_dead_owner_at_the_next_epoch"),
-        ],
-        "p5_adds": ("a REAL SIGKILL mid-turn, and `select_takeover_mode` "
-                    "asserted to be exactly 'proved_dead' rather than "
-                    "inferred from the takeover succeeding"),
-    },
-    "F4": {
-        "owner": "local",
-        "tests": [("crash_reclaim", "SigtermUnderTakeoverTests",
-                   "test_f4_the_predecessor_marks_terminal_and_the_successor"
-                   "_lease_is_byte_identical")],
-        "mapped": [
-            ("scripts/test_m55_owner_store.py", "TerminalMarkTests",
-             "test_a_predecessors_mark_after_a_takeover_is_ignored_entirely"),
-        ],
-        "p5_adds": ("the full run-level consequence set under a real "
-                    "concurrent takeover: sidecar + aborted PhaseState + "
-                    "run.external_kill + exit 143 + successor byte identity"),
-    },
-    "F5": {
-        "owner": "local",
-        "tests": [("crash_reclaim", "PidReuseTests",
-                   "test_f5_a_live_reused_pid_classifies_stale_dead_owner_and"
-                   "_is_never_signalled")],
-        "mapped": [
-            ("scripts/test_m55_owner_store.py", "AcquireGateTests",
-             "test_pid_reuse_classifies_dead_never_live"),
-            ("scripts/test_m55_owner_store.py", "TakeoverTests",
-             "test_terminate_prior_never_signals_a_mismatched_pid_start"),
-        ],
-        "p5_adds": ("a pid re-bound to a NEWLY SPAWNED, still-running process "
-                    "rather than a synthetic record"),
-    },
-    "F11": {
-        "owner": "local",
-        "tests": [("crash_reclaim", "TakeoverPreservationTests",
-                   "test_f11_ten_artifact_classes_are_sha256_identical_across"
-                   "_a_real_takeover")],
-        "mapped": [],
-        "p5_adds": ("entirely new: the ten-artifact byte-identity sweep across "
-                    "a real takeover"),
-    },
-    "F12": {
-        "owner": "local",
-        "tests": [("crash_reclaim", "TakeoverAbortTests",
-                   "test_f12_a_prior_owner_that_survives_term_and_kill_aborts"
-                   "_the_takeover")],
-        "mapped": [
-            ("scripts/test_m55_owner_store.py", "TakeoverTests",
-             "test_terminate_prior_aborts_and_leaves_the_lease_byte_identical"),
-        ],
-        "p5_adds": ("a REAL live victim process surviving both escalation "
-                    "steps"),
-    },
-    "F13": {
-        "owner": "local",
-        "tests": [("crash_reclaim", "SigtermTakeoverRaceTests",
-                   "test_g8_fifty_randomized_interleavings_plus_both"
-                   "_deterministic_orders")],
-        "mapped": [],
-        "p5_adds": "entirely new: gate G8 at its accepted depth",
-    },
-    "N1": {
-        "owner": "local",
-        "tests": [("negative_controls", "NoSessionTests",
-                   "test_n1_a_full_flow_with_no_session_never_leases_and_never"
-                   "_refuses")],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "NegativeControlTests",
-             "test_no_session_never_leases_and_never_raises"),
-        ],
-        "p5_adds": ("a three-phase flow including its evaluation drains, plus "
-                    "the zero-bind and enforced-never-True arms"),
-    },
-    "N2": {
-        "owner": "local",
-        "tests": [
-            ("negative_controls", "ReadOnlySurfaceTests",
-             "test_n2_the_four_read_only_surfaces_succeed_lease_free_under_a"
-             "_live_owner"),
-            ("negative_controls", "ReadOnlySurfaceTests",
-             "test_n2_evaluate_role_reaches_no_drain_frame"),
-        ],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "ResumeTriggerExitCodeTests",
-             "test_the_read_only_preflight_refusals_stay_lease_free"),
-        ],
-        "p5_adds": "the --evaluate-role no-drain-frame arm",
-    },
-    "N3": {
-        "owner": "local",
-        "tests": [("negative_controls", "SingleOwnerTests",
-                   "test_n3_every_governed_seam_and_every_evaluation"
-                   "_transition_is_enforced")],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "NegativeControlTests",
-             "test_an_owned_run_is_enforced_at_every_governed_seam"),
-        ],
-        "p5_adds": ("the non-vacuity assertions (every governed-seam counter "
-                    "strictly > 0, driven by a lead role that really advances "
-                    "its own phase) and the release-exactly-once arm"),
-    },
-    "N4": {
-        "owner": "local",
-        "tests": [("negative_controls", "LegacySessionTests",
-                   "test_n4_a_legacy_session_acquires_at_epoch_one_with_no"
-                   "_migration_artifact")],
-        "mapped": [],
-        "p5_adds": "entirely new",
-    },
-    "N5": {
-        "owner": "local",
-        "tests": [
-            ("negative_controls", "ParkedOwnerTests",
-             "test_n5_a_parked_owner_stays_live_across_three_deadlines_for_a"
-             "_separate_observer_process"),
-            ("negative_controls", "ParkedOwnerTests",
-             "test_n5_a_foreign_host_observer_still_reads_live_owner"),
-        ],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "LifecycleTests",
-             "test_the_heartbeat_renews_and_a_straggler_cannot_resurrect"),
-        ],
-        "p5_adds": ("the separate-observer-process and simulated-foreign-host "
-                    "arms over more than 3x(heartbeat+grace) of injected "
-                    "clock"),
-    },
-    "N6": {
-        "owner": "local",
-        "tests": [
-            ("negative_controls", "PersistenceSeamTests",
-             "test_n6_save_role_session_signature_is_frozen"),
-            ("negative_controls", "PersistenceSeamTests",
-             "test_n6_the_characterization_file_is_byte_identical_to_the_base"),
-            ("negative_controls", "PersistenceSeamTests",
-             "test_n6_unenforced_durable_output_is_byte_identical"),
-            ("negative_controls", "PersistenceSeamTests",
-             "test_n6_enforced_adds_only_the_provider_binding_record"),
-        ],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "ScopeConfinementTests",
-             "test_save_role_session_is_frozen"),
-            ("scripts/test_m55_owner_gate.py", "ScopeConfinementTests",
-             "test_the_state_characterization_file_is_untouched"),
-        ],
-        "p5_adds": "the byte-identical durable-output arms (iii) and (iv)",
-    },
-    "N7": {
-        "owner": "local",
-        "tests": [("negative_controls", "NestedRunTests",
-                   "test_n7_the_inner_run_restores_all_five_outer_context"
-                   "_fields_including_a_drained_conflict")],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "LifecycleTests",
-             "test_a_nested_run_restores_the_outer_context_verbatim"),
-        ],
-        "p5_adds": ("the `provider_conflict` field and the "
-                    "inner-run-drained-a-conflict-of-its-own arm"),
-    },
-    "N8": {
-        "owner": "local",
-        "tests": [("negative_controls", "EvaluatorExemptionTests",
-                   "test_n8_the_exemption_is_one_site_and_drains_without_owner"
-                   "_exceptions")],
-        "mapped": [
-            ("scripts/test_m55_owner_gate.py", "NegativeControlTests",
-             "test_the_evaluator_exemption_does_not_leak"),
-            ("scripts/test_m55_owner_gate.py", "StaticGateTests",
-             "test_the_dispatch_sites_and_the_single_evaluator_exemption"),
-        ],
-        "p5_adds": "the runtime multi-boundary drain arm alongside the AST count",
-    },
-    "N9": {
-        "owner": "local",
-        "tests": [("negative_controls", "EnqueueBoundTests",
-                   "test_n9_every_post_loss_enqueue_is_preceded_by_a_raising"
-                   "_governed_call")],
-        "mapped": [],
-        "p5_adds": "entirely new: the enqueue-bound witness for rule E4",
-    },
-    "N10": {
-        "owner": "local + mapped",
-        "tests": [("negative_controls", "SendGatewayTests",
-                   "test_n10_no_owner_refusal_and_nothing_anonymous_reaches"
-                   "_the_send_gateway")],
-        "mapped": [
-            ("scripts/test_m55_owner_exclusivity.py", "TypedPropagationTests",
-             "test_n10_nothing_anonymous_reaches_the_send_gateway"),
-        ],
-        "p5_adds": ("the span over N1, N3, N11's injected failures and F14, "
-                    "plus a fifth arm that actually ENTERS the send gateway "
-                    "with a proven provider collision pending -- without it "
-                    "property (1) would be asserted over an empty observation "
-                    "set on every arm, because P5's fake role runners start no "
-                    "turn and therefore never reach `_send`. On those four "
-                    "flow arms the property is STRUCTURAL (zero entries, "
-                    "asserted) and that is disclosed rather than presented as "
-                    "measured. The F8(b)/(c)/(f)/(g) span is PRESERVED BY "
-                    "REFERENCE to the mapped test and is deliberately NOT "
-                    "re-executed here, because re-driving it would replay a "
-                    "closed package"),
-    },
-    "N11": {
-        "owner": "local",
-        "tests": [
-            ("negative_controls", "BindingSurfaceTests",
-             "test_n11_the_four_failure_modes_map_to_provider_binding"
-             "_unavailable_on_all_three_functions"),
-            ("negative_controls", "BindingSurfaceTests",
-             "test_n11_read_returns_none_only_for_an_absent_record"),
-            ("negative_controls", "BindingSurfaceTests",
-             "test_n11_release_swallows_and_traces_its_translated_exception"
-             "_during_teardown"),
-        ],
-        "mapped": [
-            ("scripts/test_m55_owner_store.py", "BindingSurfaceBehaviourTests",
-             "test_every_injected_failure_mode_translates_on_every_reader"),
-        ],
-        "p5_adds": ("the totality sweep as 4 modes x 3 functions in one "
-                    "control, plus the teardown-never-displaces-the-exit-code "
-                    "arm"),
-    },
-    "F14": {
-        "owner": "local",
-        "tests": [
-            ("negative_controls", "EvaluationDrainTests",
-             "test_f14_a_pre_drain_loss_ends_at_rc_three_with_zero_evaluator"
-             "_constructions"),
-            ("negative_controls", "EvaluationDrainTests",
-             "test_f14_a_valid_lease_drains_normally"),
-            ("negative_controls", "EvaluationDrainTests",
-             "test_f14_a_mid_drain_loss_is_observed_at_the_next_governed_seam"),
-        ],
-        "mapped": [],
-        "p5_adds": ("entirely new; authored here so N10's cross-fixture span "
-                    "is genuine rather than nominal"),
-    },
-}
-
-ASSIGNED_FIXTURE_IDS = ("F2", "F3", "F4", "F5", "F11", "F12", "F13",
-                        "N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9",
-                        "N10", "N11")
-
-
-# --------------------------------------------------------------------------- #
 # Helpers and doubles, RE-DECLARED LOCALLY (see the sibling's note on why).      #
 # --------------------------------------------------------------------------- #
-
-
-def _git(args, check=False):
-    return subprocess.run(
-        ["git", "--no-optional-locks"] + list(args),
-        cwd=_REPO_ROOT, capture_output=True, check=check)
-
-
-def _git_show_bytes(rev, rel_path):
-    return _git(["show", "%s:%s" % (rev, rel_path)], check=True).stdout
-
-
-def _live_candidate_repo():
-    """`_REPO_ROOT` when this suite runs in the LIVE git candidate, else None.
-    Two conditions, for exactly the reason the sibling module records: an
-    isolated snapshot HAS git (a real `git init` plus captured index bytes) but
-    no history, so a toplevel test alone would not skip -- it would fall
-    through to `git show <BASE>:...` against a repository holding no objects.
-    """
-    try:
-        toplevel = _git(["rev-parse", "--show-toplevel"]).stdout.decode(
-            "utf-8", "replace").strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if not toplevel:
-        return None
-    if os.path.realpath(toplevel) != os.path.realpath(_REPO_ROOT):
-        return None
-    try:
-        found = _git(["cat-file", "-e", "%s^{commit}" % BASE_SHA])
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return _REPO_ROOT if found.returncode == 0 else None
 
 
 def _sha256(payload):
@@ -531,6 +175,19 @@ def _child_env(root):
     env["PYTHONPATH"] = _HERE + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("COWORK_LIVE", None)
     return env
+
+
+def _selector_argv(argv):
+    """The agent-only contract accepts exactly one session selector: a new
+    session at an explicit fresh path is `--session-file` alone, and an
+    ephemeral run names no session file."""
+    argv = list(argv)
+    if "--no-session" in argv and "--session-file" in argv:
+        i = argv.index("--session-file")
+        del argv[i:i + 2]
+    if "--session-file" in argv:
+        argv = [a for a in argv if a != "--new"]
+    return argv
 
 
 class _Raises(object):
@@ -699,22 +356,22 @@ class NegativeControlTestCase(unittest.TestCase):
         if on_outcome is not None:
             on_outcome("approved", None)
 
-    def fake_scout(self, config, context, selected, io_in=None, io_out=None,
+    def fake_scout(self, config, context, selected, io_out=None,
                    on_outcome=None, **kwargs):
         self._approve(on_outcome)
         return 0
 
-    def fake_planner(self, config, context, selected, io_in=None, io_out=None,
+    def fake_planner(self, config, context, selected, io_out=None,
                      on_outcome=None, **kwargs):
         self._approve(on_outcome)
         return 0
 
-    def fake_builder(self, config, context, selected, io_in=None, io_out=None,
+    def fake_builder(self, config, context, selected, io_out=None,
                      on_outcome=None, **kwargs):
         self._approve(on_outcome)
         return 0
 
-    def advancing_scout(self, config, context, selected, io_in=None,
+    def advancing_scout(self, config, context, selected,
                         io_out=None, on_outcome=None, session_uuid=None,
                         **kwargs):
         """A fake lead role that still does the ONE thing a real one does at
@@ -735,17 +392,26 @@ class NegativeControlTestCase(unittest.TestCase):
     # -- run_flow driving ---------------------------------------------------- #
 
     def args(self, extra=(), team=("scout",)):
-        argv = ["--team", ",".join(team)]
+        # Every lead needs its paired reviewer on the team.
+        paired = []
+        for role in team:
+            paired.append(role)
+            reviewer = cowork.handoff.ROLE_REGISTRY.get(role, {}).get(
+                "reviewer")
+            if reviewer and reviewer not in team:
+                paired.append(reviewer)
+        argv = ["--team", ",".join(paired)]
         for role in team:
             argv += ["--config", "%s=claude" % role]
         argv += ["--context", "goal", "--session-file", self.spath]
-        return cowork.build_parser().parse_args(argv + list(extra))
+        return cowork.build_parser().parse_args(
+            _selector_argv(argv + list(extra)))
 
     def run_flow(self, extra=(), team=("scout",), scout=None, planner=None,
                  builder=None):
         out = io.StringIO()
         rc = cowork.run_flow(
-            self.args(extra, team=team), io_in=io.StringIO(""), io_out=out,
+            self.args(extra, team=team), io_out=out,
             which=lambda c: "/bin/" + c,
             run_scout_fn=scout if scout is not None else self.fake_scout,
             run_planner_fn=planner if planner is not None else
@@ -849,7 +515,7 @@ class NegativeControlTestCase(unittest.TestCase):
 class NoSessionTests(NegativeControlTestCase):
     """N1. `test_m55_owner_gate.py::NegativeControlTests::
     test_no_session_never_leases_and_never_raises` carries the scout-only
-    version. What P5 adds is a THREE-PHASE flow that really reaches all four
+    version. This suite adds a THREE-PHASE flow that really reaches all four
     measurement boundaries and all their evaluation drains, plus the zero-bind
     arm and the "no owner exception of ANY subclass" arm."""
 
@@ -1026,7 +692,7 @@ class ReadOnlySurfaceTests(NegativeControlTestCase):
 class SingleOwnerTests(NegativeControlTestCase):
     """N3, the converse of N1. `test_m55_owner_gate.py::NegativeControlTests::
     test_an_owned_run_is_enforced_at_every_governed_seam` carries the
-    scout-only version. P5 adds the NON-VACUITY assertion -- both counters
+    scout-only version. This suite adds the NON-VACUITY assertion -- both counters
     strictly greater than zero, so a flow that never reached a seam cannot pass
     -- and the release-exactly-once arm."""
 
@@ -1275,9 +941,8 @@ class ParkedOwnerTests(NegativeControlTestCase):
 
 class PersistenceSeamTests(NegativeControlTestCase):
     """N6. `save_role_session` is the seam #64 must not have moved, and
-    `test_cowork_state_m3.py` is what froze it. Arms (i) and (ii) restate that
-    freeze on THIS candidate; arms (iii) and (iv) are what P5 adds -- the
-    durable OUTPUT of the real `role_saver` closure, unenforced and enforced,
+    `test_cowork_state_m3.py` is what froze it. The signature arm restates that
+    freeze; the remaining arms assert the durable OUTPUT of the real `role_saver` closure, unenforced and enforced,
     asserted byte-for-byte."""
 
     SID_UNENFORCED = "p5-n6-unenforced"
@@ -1287,16 +952,6 @@ class PersistenceSeamTests(NegativeControlTestCase):
         parameters = list(inspect.signature(
             state_store.save_role_session).parameters.keys())
         self.assertEqual(parameters, SAVE_ROLE_SESSION_PARAMETERS)
-
-    def test_n6_the_characterization_file_is_byte_identical_to_the_base(self):
-        if _live_candidate_repo() is None:
-            self.skipTest(
-                "not the live candidate repository; the characterization "
-                "file's byte identity is measured by the scope preflight")
-        self.assertEqual(
-            _sha256_file(os.path.join(_REPO_ROOT,
-                                      STATE_CHARACTERIZATION_FILE)),
-            _sha256(_git_show_bytes(BASE_SHA, STATE_CHARACTERIZATION_FILE)))
 
     def _role_entry(self, role):
         state = state_store.load(self.spath) or {}
@@ -1359,7 +1014,7 @@ class PersistenceSeamTests(NegativeControlTestCase):
         entirely."""
         box = {}
 
-        def scout(config, context, selected, io_in=None, io_out=None,
+        def scout(config, context, selected, io_out=None,
                   on_outcome=None, **kwargs):
             box["prior_entry"] = self._role_entry("scout")
             prior = dict(cowork._OWNER_CONTEXT)
@@ -1391,7 +1046,7 @@ class PersistenceSeamTests(NegativeControlTestCase):
         per-path digest-map difference, never a prefix match."""
         box = {}
 
-        def scout(config, context, selected, io_in=None, io_out=None,
+        def scout(config, context, selected, io_out=None,
                   on_outcome=None, **kwargs):
             self.assertIs(cowork._OWNER_CONTEXT["enforced"], True)
             box["prior_entry"] = self._role_entry("scout")
@@ -1438,7 +1093,7 @@ class PersistenceSeamTests(NegativeControlTestCase):
 class NestedRunTests(NegativeControlTestCase):
     """N7. `test_m55_owner_gate.py::LifecycleTests::
     test_a_nested_run_restores_the_outer_context_verbatim` carries the clean
-    nesting case. What P5 adds is the arm where the INNER run records AND
+    nesting case. This suite adds the arm where the INNER run records AND
     drains a provider conflict of its own -- the case where the inner region
     genuinely mutates the shared box before restoring it."""
 
@@ -1472,7 +1127,7 @@ class NestedRunTests(NegativeControlTestCase):
                 drained.append(exc)
                 raise
 
-        def scout(config, context, selected, io_in=None, io_out=None,
+        def scout(config, context, selected, io_out=None,
                   on_outcome=None, **kwargs):
             kwargs["on_session"]("claude", "p5-n7-sid")
             return 0
@@ -1508,7 +1163,7 @@ class EvaluatorExemptionTests(NegativeControlTestCase):
     scoring failure. It is STRUCTURALLY exempt, and the compensating fence sits
     one frame above both swallows at the evaluation region's own boundary.
 
-    P5 adds the RUNTIME arm -- a full owned run whose measurement boundaries
+    This suite adds the RUNTIME arm -- a full owned run whose measurement boundaries
     all drain with zero owner exceptions -- alongside the AST count that keeps
     the exemption from widening."""
 
@@ -1563,7 +1218,7 @@ class EvaluatorExemptionTests(NegativeControlTestCase):
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
         sites = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
                  and _called_name(c) == "_decide_and_trace"]
-        self.assertEqual(len(sites), 24)
+        self.assertEqual(len(sites), 22)
         evaluator = []
         for call in sites:
             purposes = [a.value for a in call.args
@@ -1586,8 +1241,8 @@ class EvaluatorExemptionTests(NegativeControlTestCase):
 
 class EnqueueBoundTests(NegativeControlTestCase):
     """N9, entirely new. Rule E4 declares the evaluator enqueue seam OUT OF
-    SCOPE for this issue: closing it is a new authority decision, not a P5
-    correction. What P5 can honestly do is BOUND it, and that is what this
+    SCOPE for this issue: closing it is a separate authority decision. What
+    can honestly be done here is BOUND it, and that is what this
     control is -- the property is stated, measured and REPORTED, including when
     the measured residual is empty.
 
@@ -1617,7 +1272,7 @@ class EnqueueBoundTests(NegativeControlTestCase):
                 return real(*args, **kwargs)
             return wrapper
 
-        def scout(config, context, selected, io_in=None, io_out=None,
+        def scout(config, context, selected, io_out=None,
                   on_outcome=None, **kwargs):
             ctx = cowork._current_owner_context()
             self.lose_the_lease(ctx["session_uuid"], ctx["owner_id"],
@@ -1675,7 +1330,7 @@ class EnqueueBoundTests(NegativeControlTestCase):
 class SendGatewayTests(NegativeControlTestCase):
     """N10. The send gateway has its own `except Exception`, so it is the one
     place a typed owner refusal could be flattened into an anonymous turn
-    failure. Two properties, over every arm P5 drives itself.
+    failure. Two properties, over every arm this suite drives itself.
 
     (1) `cowork._send` is wrapped with a spy that records `sys.exc_info()` at
         ENTRY. It must be `(None, None, None)` on every call -- the gateway is
@@ -1686,7 +1341,7 @@ class SendGatewayTests(NegativeControlTestCase):
         `_OWNER_CONTEXT['provider_conflict']` and drained exactly once.
 
     WHY THERE IS A FIFTH ARM, AND WHAT THE FIRST FOUR CAN AND CANNOT SHOW.
-    P5's flow fixtures replace the three role runners with fakes, so no turn is
+    The flow fixtures replace the three role runners with fakes, so no turn is
     ever started and NO arm of an ordinary flow reaches `cowork._send` at all.
     On those four arms property (1) is therefore STRUCTURAL: the assertion that
     the gateway was entered zero times is real, but the per-entry
@@ -1851,7 +1506,7 @@ class SendGatewayTests(NegativeControlTestCase):
         if arm == "binding_failure":
             self.seed_foreign_live_binding("claude", "p5-n10-sid")
 
-            def scout(config, context, selected, io_in=None, io_out=None,
+            def scout(config, context, selected, io_out=None,
                       on_outcome=None, **kwargs):
                 kwargs["on_session"]("claude", "p5-n10-sid")
                 return 0
@@ -1880,7 +1535,7 @@ class SendGatewayTests(NegativeControlTestCase):
         failure."""
         self.seed_foreign_live_binding("claude", "p5-n10-frame-sid")
 
-        def scout(config, context, selected, io_in=None, io_out=None,
+        def scout(config, context, selected, io_out=None,
                   on_outcome=None, **kwargs):
             escaped = []
             try:
@@ -1912,7 +1567,7 @@ class SendGatewayTests(NegativeControlTestCase):
 class BindingSurfaceTests(NegativeControlTestCase):
     """N11. `test_m55_owner_store.py::BindingSurfaceBehaviourTests::
     test_every_injected_failure_mode_translates_on_every_reader` carries this
-    in depth. What P5 adds is the TOTALITY SWEEP as one control -- four failure
+    in depth. This suite adds the TOTALITY SWEEP as one control -- four failure
     modes on each of three functions, twelve cells -- plus the arm that a
     teardown failure never displaces a run's real exit code."""
 
@@ -2147,83 +1802,6 @@ class EvaluationDrainTests(NegativeControlTestCase):
             "\n[F14] mid-drain residual=%d entries, all inside the "
             "drain-entry eligible set of %d\n"
             % (len(residual), len(eligible_at_entry[0])))
-
-
-# --------------------------------------------------------------------------- #
-# The fixture matrix, MACHINE-CHECKED.                                          #
-# --------------------------------------------------------------------------- #
-
-
-class FixtureMatrixTests(unittest.TestCase):
-    """Success criteria 2 and 3. A prose-only matrix in a build artifact cannot
-    enforce "no row marked covered without a resolvable test id"; this can, and
-    it fails loudly the moment a row names something that does not exist.
-
-    The semantic judgement -- does the mapped test really carry that evidence?
-    -- stays with the artifact and the independent reviewer. What is mechanised
-    here is the part a human reading a table cannot check reliably: that every
-    id RESOLVES."""
-
-    def test_every_assigned_fixture_row_resolves_to_an_existing_test_id(self):
-        self.assertEqual(
-            sorted(FIXTURE_MATRIX), sorted(set(ASSIGNED_FIXTURE_IDS) | {"F14"}))
-        self.assertEqual(len(FIXTURE_MATRIX), 19)
-
-        for fixture_id in sorted(FIXTURE_MATRIX):
-            row = FIXTURE_MATRIX[fixture_id]
-            with self.subTest(fixture=fixture_id):
-                self.assertIn(row["owner"], ("local", "local + mapped"))
-                self.assertTrue(row["tests"],
-                                "%s names no local test at all" % fixture_id)
-                self.assertTrue((row.get("p5_adds") or "").strip(),
-                                "%s declares no `p5_adds`" % fixture_id)
-                for module_key, class_name, test_name in row["tests"]:
-                    module = _LOCAL_MODULES[module_key]
-                    klass = getattr(module, class_name, None)
-                    self.assertIsNotNone(
-                        klass, "%s: no class %s in %s"
-                        % (fixture_id, class_name, module.__name__))
-                    self.assertTrue(
-                        callable(getattr(klass, test_name, None)),
-                        "%s: no test %s on %s.%s"
-                        % (fixture_id, test_name, module.__name__, class_name))
-                for rel_path, class_name, test_name in row["mapped"]:
-                    self._assert_frozen_test_exists(fixture_id, rel_path,
-                                                    class_name, test_name)
-
-    def test_the_scope_allowlist_agrees_with_the_sibling_module(self):
-        self.assertEqual(ALLOWED_CHANGED_PATHS,
-                         _crash_reclaim.ALLOWED_CHANGED_PATHS)
-        self.assertEqual(BASE_SHA, _crash_reclaim.BASE_SHA)
-        self.assertEqual(len(ALLOWED_CHANGED_PATHS), 2)
-        for rel_path in sorted(ALLOWED_CHANGED_PATHS):
-            self.assertTrue(
-                os.path.isfile(os.path.join(_REPO_ROOT, rel_path)), rel_path)
-
-    # -- resolution ---------------------------------------------------------- #
-
-    def _assert_frozen_test_exists(self, fixture_id, rel_path, class_name,
-                                   test_name):
-        """Resolve a mapped row by AST PARSE of the frozen file -- never by
-        importing it. Importing a frozen suite would bind its `TestCase`
-        subclasses into this module's namespace, and the loader collects any
-        `TestCase` that is a module attribute: P5's own reported test count
-        would then silently include another package's suite."""
-        full = os.path.join(_REPO_ROOT, rel_path)
-        self.assertTrue(os.path.isfile(full),
-                        "%s maps to a file that does not exist: %s"
-                        % (fixture_id, rel_path))
-        with open(full, "r") as fh:
-            tree = ast.parse(fh.read(), filename=full)
-        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-        self.assertIn(class_name, classes,
-                      "%s maps to %s::%s, which does not exist"
-                      % (fixture_id, rel_path, class_name))
-        methods = {n.name for n in classes[class_name].body
-                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        self.assertIn(test_name, methods,
-                      "%s maps to %s::%s::%s, which does not exist"
-                      % (fixture_id, rel_path, class_name, test_name))
 
 
 # --------------------------------------------------------------------------- #

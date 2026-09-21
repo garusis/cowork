@@ -37,12 +37,7 @@ already used by the repository's other pure-schema modules
 normalized copy and never mutates its input; unknown keys are always
 rejected.
 
-Scope note: the real per-turn foreground spinner/status label Package C
-constructs inside three of its six named `cowork_bridge.py` methods is
-explicitly OUT of this module's scope — it is ephemeral, unpersisted
-terminal text, never validated by any validator here, and never confused
-with the durable `ActivityRecord`/`WatchdogDecision`/compact-state objects
-this module defines. Likewise, the `activity` key Package D adds to
+Scope note: the `activity` key Package D adds to
 `cowork_measure.py`'s `build_record` output is a measurement-record field
 consumed by the report leg, not an Activity Contracts schema object of its
 own.
@@ -526,7 +521,7 @@ def validate_controller_turn_outcome(record):
 def project_compact_state(activity_record, health_record, schedule_record,
                            reconciliation_record=None):
     """Pure projection of the canonical compact-state dict every renderer
-    (Package E's render_compact_activity/render_headless_activity) and
+    (Package E's transcript.render_activity) and
     report section (Package D's _section_activity) consumes as their SOLE
     source of fact — no renderer or report section recomputes any fact
     independently of this function.
@@ -619,16 +614,9 @@ PINNED_SIGNATURES = types.MappingProxyType({
         "returns": "dict",
         "body_owner": "A-activity-contracts",
     }),
-    "render_compact_activity": types.MappingProxyType({
+    "render_activity": types.MappingProxyType({
         "owner": "E-cross-surface-rendering",
-        "module": "cowork_ui",
-        "params": ("io_out", "compact_state", "enabled=None"),
-        "returns": "None",
-        "body_owner": "E-cross-surface-rendering",
-    }),
-    "render_headless_activity": types.MappingProxyType({
-        "owner": "E-cross-surface-rendering",
-        "module": "cowork_ui",
+        "module": "cowork_transcript",
         "params": ("io_out", "compact_state"),
         "returns": "None",
         "body_owner": "E-cross-surface-rendering",

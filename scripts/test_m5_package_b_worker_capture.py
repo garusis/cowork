@@ -1,95 +1,33 @@
 #!/usr/bin/env python3
-"""Focused suite for M5 Package B: immutable worker capture and startup
-identity -- garusis/cowork-internal#44, filling the frozen
-`resolve_worker_source`/`spawn_worker` seam Package A reserved in
-`cowork_verification_worker.py`.
+"""Immutable worker capture and startup identity: `resolve_worker_source`
+and `spawn_worker` in `cowork_verification_worker.py`, the captured
+installation manifest the startup classifier verifies against, and reclaim of
+the per-transaction captured tool-snapshot checkout on every parent-side
+terminal path of `run_transaction`.
 
-M5B v3 (bounded successor to v2, garusis/cowork-internal#44 review round 2):
-mechanically adopts v2's worker-capture bytes unchanged, then closes the two
-independent-review majors v2's own two-path allowlist authority could not
-reach -- M5B-R-M1 (the legacy worker-crash fixture, `scripts/test_cowork.py`)
-and M5B-R-M2 (reclaiming the per-transaction captured tool-snapshot checkout,
-`scripts/cowork_verification.py`'s worker-seam import block and
-`run_transaction` lifecycle). This file's own allowlist/exclusion/named-region
-tests below are widened accordingly, from v2's two-path scope to v3's frozen
-four-path scope -- see `ALLOWED_CHANGED_PATHS` and the named-region tests.
+Known, intentional behavior (not asserted as defects here):
 
-MINOR DISPOSITIONS (M5B-R-m1 through m8, from the v2 review, SHA-256
-9865b9d07f051e84d7bd51991b85e34b7272876ac0dbb6deb4b094822088e9b7):
-
-  m1 FIXED -- worker_identity_mismatch now carries exit_code/log_tail too
-     (cowork_verification_worker._classify_worker_startup); proven by
-     IdentityMismatchTests.
-
-  m2 FIXED (documentation only) -- _classify_worker_startup's own
-     docstring now states plainly that an OSError from
-     resolve_worker_source/_materialize_tool_snapshot, not only from
-     Popen, also surfaces as worker_spawn_failed via the spine's except
-     OSError handler; behavior is intentionally UNCHANGED (widening it
-     would be a second, independent production behavior change this
-     package does not own).
-
-  m3 CARRIED, nonblocking -- _build_installation_manifest still silently
-     skips an unreadable non-entry *.py file. A full fix would require
-     introspecting the worker's actual runtime import graph (which module
-     it would fail on, if any) purely to pick a more specific failure
-     reason; the transaction still correctly, safely lands on UNVERIFIED
-     either way (via worker_exited_before_identity_report rather than
-     worker_source_missing), so this is a diagnostic-precision gap, not a
-     correctness gap, and out of proportion to fix here.
-
-  m4 FIXED -- symlinked *.py files (entry point or not) are now excluded
-     from the captured manifest rather than silently mis-captured via
-     os.path.isfile's symlink-following (_iter_installation_source_files);
-     proven by MinorDispositionTests.
-
-  m5 FIXED -- _materialize_tool_snapshot now starts from a clean checkout
-     directory (rmtree first), exactly like the spine's own
-     materialize_command_checkout; proven by MinorDispositionTests.
-
-  m6 CARRIED, nonblocking -- all installation *.py files are still hashed
-     and copied twice per transaction (object store, then checkout) even
-     though only cowork_verification.py participates in the identity
-     check. This is the design's own deliberate provenance/evidence
-     tradeoff (the whole installation is captured, not merely the one
-     file checked), not an oversight; a partial-capture optimization is a
-     larger, riskier redesign out of proportion to a minor.
-
-  m7 CARRIED, not applicable to this candidate's writable scope -- the gate
-     PASS/FAIL ledger durability gap (standalone controller-gates.json vs.
-     the package's own state.json/events.jsonl) is orchestration-state
-     plumbing, not a scripts/ path in this candidate's four-path
-     allowlist; it is the supervisor's concern, not this candidate's.
-
-  m8 FIXED (T1-REV-M2, later independent-review round) -- the hardcoded
-     HEAD==BASE_SHA equality this note originally defended turned out to
-     be exactly the self-invalidation case flagged above: once this
-     package's own signed base gained later, already-integrated
-     descendant commits (exactly what a later T1 successor worktree's own
-     HEAD legitimately looks like), the equality became the wrong
-     invariant to assert. test_head_is_bound_to_the_signed_post_package_a_
-     base is now test_head_descends_from_the_signed_post_package_a_base,
-     an ancestor/descendant lineage assertion (`git merge-base
-     --is-ancestor BASE_SHA HEAD`) that accepts BASE_SHA itself or any
-     genuine descendant of it -- commit-pinned, consistent with the same
-     remedy applied to Package D's own allowlist gate over the fa4f342
-     lease-decisions commit, never the live working tree.
+  - An OSError from resolve_worker_source/_materialize_tool_snapshot, not
+    only from Popen, surfaces as worker_spawn_failed via the spine's except
+    OSError handler.
+  - _build_installation_manifest skips an unreadable non-entry *.py file;
+    the transaction still lands on UNVERIFIED (via
+    worker_exited_before_identity_report rather than worker_source_missing).
+  - The whole installation's *.py files are captured (object store, then
+    checkout) even though only cowork_verification.py participates in the
+    identity check -- a deliberate provenance tradeoff.
 
 Never invokes a real Claude, Codex, or OpenCode session; every fixture that
 needs a real subprocess spawns a bare `python3 -c ...` (or the real worker
-entry point) inside a throwaway git repo / session root, exactly like
-`scripts/test_cowork.py` and `scripts/test_m5_package_a_contracts.py`'s own
-owned-verification fixtures.
+entry point) inside a throwaway git repo / session root.
 
 Run standalone:
 
     python3 -m unittest scripts/test_m5_package_b_worker_capture.py -v
 """
 
-import ast
 import hashlib
 import os
-import py_compile
 import shutil
 import subprocess
 import sys
@@ -103,82 +41,10 @@ import uuid
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork_state as state_store  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 import cowork_verification_worker as worker_module  # noqa: E402
-
-# The exact post-Package-A signed base this package's frozen brief is bound
-# to (the commit this worktree's HEAD already sits at, uncommitted changes
-# on top).
-BASE_SHA = "eae4276d07a887a041177817221bf1b0bcdf99f0"
-
-# This package's own signed commit -- used ONLY to pin the
-# scripts/test_cowork.py named-region proof below to Package B's own
-# committed diff, rather than to the live working-tree file, which drifts
-# the moment any LATER, unrelated package also edits test_cowork.py (its
-# own new top-level test class changes the file's top-level statement
-# count, which this positional-zip diff correctly treats as a structural
-# change no matter which package made it).
-CANDIDATE_SHA = "ff6c0e43ef893bffe752e96b55d9e8d73aee1ad2"
-
-# This package's own exact, frozen v3 four-path allowlist (widened from v2's
-# two-path allowlist by the v3 frozen brief, to close M5B-R-M1/M5B-R-M2).
-# Two of these four are only PARTIALLY writable -- see
-# `NamedRegionScopeTests` below for the named-region check that enforces the
-# narrower, sub-file scope the brief actually grants for each.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork_verification_worker.py",
-    "scripts/cowork_verification.py",
-    "scripts/test_m5_package_b_worker_capture.py",
-    "scripts/test_cowork.py",
-})
-
-# Every path the frozen brief explicitly excludes (read-only for this
-# package) -- must remain byte-identical to the signed base. NOTE: v2's own
-# EXCLUDED_PATHS also listed `scripts/cowork_verification.py` and
-# `scripts/test_cowork.py` -- both are removed here because the v3 frozen
-# brief explicitly, narrowly re-authorizes each (see NamedRegionScopeTests),
-# closing M5B-R-M1/M5B-R-M2. This is a disclosed, brief-authorized widening
-# of what v2's own candidate-local structural assertions rejected, not a
-# silent relaxation.
-EXCLUDED_PATHS = (
-    "scripts/cowork_verification_evidence.py",
-    "scripts/cowork_state.py",
-    "scripts/cowork.py",
-    "scripts/cowork_handoff.py",
-    "scripts/cowork_ledger.py",
-    "scripts/cowork_measure.py",
-)
-
-
-def _git_changed_paths():
-    # Commit-pinned, not live-working-tree: this package's own changed-
-    # paths claim is a property of ITS OWN committed diff
-    # (BASE_SHA..CANDIDATE_SHA). The live-tree form was only ever hermetic
-    # while this package's own edits were the sole uncommitted change in
-    # the worktree; it is inherently stale now that this package is itself
-    # historical (already committed as CANDIDATE_SHA) and any LATER,
-    # unrelated package's own uncommitted test-only edits share the same
-    # worktree.
-    return set(subprocess.run(
-        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines())
-
-
-def _git_show(rev, rel_path):
-    result = subprocess.run(
-        ["git", "show", "%s:%s" % (rev, rel_path)],
-        cwd=_REPO_ROOT, capture_output=True, check=True)
-    return result.stdout
-
-
-def _sha256_file(rel_path):
-    with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
-        return hashlib.sha256(fh.read()).hexdigest()
-
 
 def _init_git_repo(seed_cowork_source=False, garbage_worker_source=False):
     """A throwaway committed git repo -- by default containing only a
@@ -262,309 +128,6 @@ class _SessionFixture(unittest.TestCase):
             pass
         if capture_thread is not None:
             capture_thread.join(timeout=5)
-
-
-# =========================================================================== #
-# Allowlist, py_compile, hash, and integrity gates.                           #
-# =========================================================================== #
-
-
-class AllowlistAndHashTests(unittest.TestCase):
-
-    def test_changed_paths_are_within_the_four_path_allowlist(self):
-        offenders = _git_changed_paths() - ALLOWED_CHANGED_PATHS
-        self.assertFalse(
-            offenders,
-            "paths changed outside the frozen v3 four-path allowlist: %s"
-            % sorted(offenders))
-
-    def test_all_owned_paths_py_compile(self):
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            path = os.path.join(_REPO_ROOT, rel)
-            self.assertTrue(os.path.exists(path), "missing owned path: %s"
-                            % rel)
-            py_compile.compile(path, doraise=True)
-
-    def test_candidate_hashes_are_well_formed_sha256(self):
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            digest = _sha256_file(rel)
-            self.assertRegex(digest, r"^[0-9a-f]{64}$")
-
-    def test_head_descends_from_the_signed_post_package_a_base(self):
-        # T1-REV-M2: HEAD must still be exactly BASE_SHA, or a genuine
-        # descendant of it (base plus zero or more later, already-
-        # integrated, independently-reviewed commits) -- never a foreign
-        # or rewritten history. A hardcoded HEAD == BASE_SHA equality is
-        # the wrong invariant once this package's own signed base gains
-        # legitimate descendant commits (exactly what a later T1
-        # successor worktree's own HEAD looks like); lineage, not
-        # identity, is what this gate actually needs to defend.
-        # Commit-pinned via `git merge-base`, consistent with the
-        # fa4f342^..fa4f342 commit-pinned remedy applied to Package D's
-        # own allowlist gate -- never the live working tree.
-        result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", BASE_SHA, "HEAD"],
-            cwd=_REPO_ROOT, capture_output=True)
-        self.assertEqual(
-            result.returncode, 0,
-            "HEAD is not the signed post-Package-A base %s, nor a "
-            "descendant of it" % BASE_SHA)
-
-
-class ExcludedPathsUntouchedTests(unittest.TestCase):
-    """Every path the frozen brief marks read-only for this package --
-    including Package A's own owned files and its test suite -- must be
-    byte-identical to the signed base commit (main/m5/Package-A
-    integrity)."""
-
-    def test_excluded_paths_are_byte_identical_to_base(self):
-        # Commit-pinned, not live-working-tree: this package's own
-        # read-only claim over each excluded path is a property of ITS OWN
-        # committed diff (BASE_SHA..CANDIDATE_SHA) -- the live-tree form is
-        # inherently stale once this package is itself historical and a
-        # LATER, unrelated package's own uncommitted test-only edits share
-        # the same worktree.
-        for rel in EXCLUDED_PATHS:
-            base_bytes = _git_show(BASE_SHA, rel)
-            current_bytes = _git_show(CANDIDATE_SHA, rel)
-            self.assertEqual(
-                current_bytes, base_bytes,
-                "%s must be byte-identical to the signed base commit "
-                "(read-only for this package)" % rel)
-
-    def test_package_a_test_suite_still_passes_except_its_now_stale_stub_assertions(self):
-        # NAME RETAINED DELIBERATELY: the "except its now stale stub
-        # assertions" clause no longer describes any allowance this test
-        # grants -- there is none left -- but rename authority for this
-        # file's coupled method was not granted, so only the contract
-        # below changed. What it now requires is a FULL pass.
-        #
-        # `test_m5_package_a_contracts.py` describes PACKAGE A's OWN
-        # candidate, and four of its assertions were written to become
-        # stale once the extension seams they reserved were filled in:
-        # `resolve_worker_source` no longer raises NotImplementedError and
-        # is now reached from `spawn_worker`'s own flow, `worker_source_
-        # missing`/`worker_identity_mismatch` are no longer absent
-        # literals (#44), and `reconcile_pending_evidence` no longer raises
-        # either (#51). Those four have since been restated to assert the
-        # positive current contracts instead, so NO failure allowance
-        # remains here: the whole suite must pass. This is run, not merely
-        # asserted, so this candidate packet carries direct, current
-        # evidence rather than an unverified claim.
-        result = subprocess.run(
-            [sys.executable, "-m", "unittest",
-             "scripts.test_m5_package_a_contracts", "-v"],
-            cwd=_REPO_ROOT, capture_output=True, text=True, timeout=300)
-        stderr = result.stderr
-        # Zero FAIL and zero ERROR -- reported by name, so a regression is
-        # diagnosable straight from this test's own output.
-        offenders = [line for line in stderr.splitlines()
-                    if line.startswith("FAIL: ")
-                    or line.startswith("ERROR: ")]
-        self.assertFalse(
-            offenders,
-            "Package A's contract suite must pass in full under the "
-            "restated current contract -- no failure allowance is granted "
-            "here any more; failed/errored: %s\n%s"
-            % ("; ".join(offenders), stderr[-4000:]))
-        # ...and the run itself genuinely succeeded, so an interpreter or
-        # collection error that never emits a FAIL:/ERROR: line at all can
-        # never be mistaken for an empty offender list.
-        self.assertEqual(
-            result.returncode, 0,
-            "Package A's contract suite did not exit 0 (rc=%s)\n%s"
-            % (result.returncode, stderr[-4000:]))
-        self.assertRegex(stderr, r"\nOK\b")
-
-
-# =========================================================================== #
-# Named-region scope: the two PARTIALLY-writable v3 paths.                    #
-# =========================================================================== #
-
-
-def _top_level_diffs(base_source, current_source):
-    """Diff `base_source`/`current_source` (two versions of the SAME file)
-    at exactly two levels -- every top-level statement, and (one level
-    deeper) every member of any top-level `class` whose own text changed --
-    zipped BY POSITION, not by name. Position, not name, is what remains
-    stable across a functionally-scoped edit: this candidate adds or
-    removes no top-level statement, class, or method anywhere in either of
-    the two files this checks, so base and current always have the exact
-    same COUNT and ORDER of top-level (and, inside a changed class,
-    member-level) statements -- only specific bodies differ internally.
-
-    Returns a dict `label -> (kind, base_text, current_text)` for every
-    region whose source text differs, where `label` is the bare
-    function/class name, `"ClassName.method_name"` one level inside a
-    changed class, or `"TOP_LEVEL_STMT_AT_LINE_<n>"` (`<n>` from the BASE
-    file) for a changed anonymous top-level statement (import/assign/try/
-    if) -- literal and specific, so a genuine change to something with no
-    def/class name can never be silently absent from the returned dict. A
-    positional COUNT or KIND/NAME mismatch at any level -- a real
-    structural change (added/removed/reordered top-level statement or
-    class member) this candidate must never make -- is itself returned
-    under a `"__STRUCTURE__..."` label, deliberately never matched by any
-    caller's own allowed-label set, so it always fails any check built on
-    top of this."""
-
-    def segments(body, lines):
-        out = []
-        for node in body:
-            start, end = node.lineno, node.end_lineno
-            name = getattr(node, "name", None)
-            kind = type(node).__name__
-            text = "".join(lines[start - 1:end])
-            out.append((kind, name, text, node))
-        return out
-
-    base_lines = base_source.splitlines(keepends=True)
-    cur_lines = current_source.splitlines(keepends=True)
-    base_segs = segments(ast.parse(base_source).body, base_lines)
-    cur_segs = segments(ast.parse(current_source).body, cur_lines)
-
-    diffs = {}
-    if len(base_segs) != len(cur_segs):
-        diffs["__STRUCTURE__"] = (
-            "TOP_LEVEL", "%d statements" % len(base_segs),
-            "%d statements" % len(cur_segs))
-        return diffs
-
-    for i, (base_seg, cur_seg) in enumerate(zip(base_segs, cur_segs)):
-        bkind, bname, btext, bnode = base_seg
-        ckind, cname, ctext, _cnode = cur_seg
-        if bkind != ckind or bname != cname:
-            diffs["__STRUCTURE__@%d" % i] = (
-                bkind, "%s %r" % (bkind, bname), "%s %r" % (ckind, cname))
-            continue
-        if btext == ctext:
-            continue
-        label = bname or ("TOP_LEVEL_STMT_AT_LINE_%d" % bnode.lineno)
-        if bkind != "ClassDef":
-            diffs[label] = (bkind, btext, ctext)
-            continue
-        # A changed class: recurse ONE level into its own members, by the
-        # exact same positional-zip contract, so the diff is attributed to
-        # the SPECIFIC method(s) that changed, not the whole class.
-        b_inner = segments(bnode.body, base_lines)
-        c_inner = segments(_cnode.body, cur_lines)
-        if len(b_inner) != len(c_inner):
-            diffs["%s.__STRUCTURE__" % label] = (
-                "ClassDef", "%d members" % len(b_inner),
-                "%d members" % len(c_inner))
-            continue
-        for j, (b_mem, c_mem) in enumerate(zip(b_inner, c_inner)):
-            bmkind, bmname, bmtext, bmnode = b_mem
-            cmkind, cmname, cmtext, _cmnode = c_mem
-            if bmkind != cmkind or bmname != cmname:
-                diffs["%s.__STRUCTURE__@%d" % (label, j)] = (
-                    bmkind, "%s %r" % (bmkind, bmname),
-                    "%s %r" % (cmkind, cmname))
-                continue
-            if bmtext == cmtext:
-                continue
-            inner_label = bmname or (
-                "TOP_LEVEL_STMT_AT_LINE_%d" % bmnode.lineno)
-            diffs["%s.%s" % (label, inner_label)] = (
-                bmkind, bmtext, cmtext)
-    return diffs
-
-
-class NamedRegionScopeTests(unittest.TestCase):
-    """Enforces the NARROWER, sub-file scope the v3 frozen brief actually
-    grants for the two partially-writable paths -- `git diff` alone (the
-    path-level `AllowlistAndHashTests` above) cannot express "only this
-    function changed inside this file". Any region outside the allowed set
-    below is disclosed HERE, by name, never silently passed through a
-    path-level check that cannot see inside the file."""
-
-    def test_cowork_verification_changes_are_confined_to_the_authorized_named_regions(self):
-        # Brief: "only the worker-seam import/fallback and run_transaction
-        # worker lifecycle/cleanup sites needed to retain and reclaim the
-        # captured checkout". The seam import/fallback block is the file's
-        # one top-level `try`/`except` statement (adding
-        # `reclaim_tool_snapshot_checkout` to the import list and its
-        # fallback assignment); the lifecycle/cleanup sites are inside
-        # `run_transaction`'s own three-function family.
-        # Commit-pinned, not live-working-tree: this package's own
-        # authorship claim over cowork_verification.py is a property of ITS
-        # OWN committed diff (BASE_SHA..CANDIDATE_SHA), exactly like the
-        # sibling test_cowork.py check just below -- never whatever a
-        # later, unrelated package's own uncommitted edits also happen to
-        # add to the same file in the same worktree.
-        base_source = _git_show(
-            BASE_SHA, "scripts/cowork_verification.py").decode("utf-8")
-        current_source = _git_show(
-            CANDIDATE_SHA, "scripts/cowork_verification.py").decode("utf-8")
-        diffs = _top_level_diffs(base_source, current_source)
-        allowed_functions = {
-            "run_transaction", "_run_transaction_body",
-            "_run_owned_transaction"}
-        offenders = []
-        for label, (kind, _base_text, _cur_text) in diffs.items():
-            if kind == "Try":
-                continue  # the seam import/fallback block itself
-            if label in allowed_functions:
-                continue
-            offenders.append(label)
-        self.assertFalse(
-            offenders,
-            "scripts/cowork_verification.py changed outside the "
-            "authorized worker-seam import/fallback and run_transaction "
-            "lifecycle/cleanup regions: %s" % sorted(offenders))
-        # Non-vacuous: something in each authorized region actually did
-        # change (otherwise this test would trivially pass on an unmodified
-        # file and prove nothing).
-        self.assertTrue(
-            any(kind == "Try" for kind, _b, _c in diffs.values()),
-            "expected the worker-seam import/fallback try block to have "
-            "actually changed (reclaim_tool_snapshot_checkout added)")
-        self.assertTrue(
-            diffs.keys() & allowed_functions,
-            "expected at least one of run_transaction/"
-            "_run_transaction_body/_run_owned_transaction to have "
-            "actually changed (checkout reclaim added)")
-
-    def test_test_cowork_changes_are_confined_to_the_authorized_named_regions(self):
-        # Brief (M5 Package B bounded successor v4): exactly three named
-        # methods and their directly local fixture setup/cleanup --
-        # `test_worker_crash_before_identity_completes_promptly_with_
-        # evidence` (v3's own authorized region, carried forward
-        # unchanged) plus the two v4-authorized regions this candidate
-        # closes (M5B-V4-B1/B2): `test_startup_log_tail_sentinel_survives_
-        # through_the_real_worker_path` and `test_deliberately_older_
-        # parent_executes_captured_newer_worker`, both outside v3's own
-        # authority and left broken by it.
-        # Commit-pinned, not live-working-tree: this candidate's own
-        # authorship claim over test_cowork.py is a property of ITS OWN
-        # committed diff (BASE_SHA..CANDIDATE_SHA), not of whatever a
-        # later, unrelated package's own uncommitted test-only edits also
-        # happen to add to the same file in the same worktree.
-        base_source = _git_show(
-            BASE_SHA, "scripts/test_cowork.py").decode("utf-8")
-        current_source = _git_show(
-            CANDIDATE_SHA, "scripts/test_cowork.py").decode("utf-8")
-        diffs = _top_level_diffs(base_source, current_source)
-        allowed_labels = {
-            "OwnedVerificationLedgerIntegrationTests."
-            "test_worker_crash_before_identity_completes_promptly_with_evidence",
-            "OwnedVerificationLedgerIntegrationTests."
-            "test_startup_log_tail_sentinel_survives_through_the_real_worker_path",
-            "OwnedVerificationWorkerBoundaryTests."
-            "test_deliberately_older_parent_executes_captured_newer_worker",
-        }
-        offenders = [label for label in diffs if label not in allowed_labels]
-        self.assertFalse(
-            offenders,
-            "scripts/test_cowork.py changed outside the three authorized "
-            "test methods (and their directly local fixture setup/"
-            "cleanup, which this candidate kept fully inline in those "
-            "same methods rather than touching any shared fixture): %s"
-            % sorted(offenders))
-        missing = allowed_labels - diffs.keys()
-        self.assertFalse(
-            missing,
-            "expected every one of the three authorized test methods to "
-            "have actually changed: %s" % sorted(missing))
 
 
 # =========================================================================== #
@@ -1138,7 +701,7 @@ class CheckoutNamingAndDirectReclaimTests(_SessionFixture):
 
 class ParentSideTerminalPathReclaimTests(_SessionFixture):
     """Non-vacuous proof that `run_transaction` reclaims the captured
-    checkout on every parent-side terminal path the frozen brief names:
+    checkout on every parent-side terminal path:
     normal completion, startup failure, cancellation, timeout, and an
     exception propagating out of the entry loop -- plus repeated real
     transactions in the same session leaving nothing leaked behind."""

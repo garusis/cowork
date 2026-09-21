@@ -319,7 +319,7 @@ class OverdueScheduledReviewExplicitTest(unittest.TestCase):
 # =========================================================================== #
 # M4D-MAJ-01 correction: D-owned integration tests for cowork.py's own        #
 # activity-emission seam wiring -- tick lifecycle (normal/exception/         #
-# SIGTERM) and headless refusal/no-first-token termination. These exercise   #
+# SIGTERM) and provider refusal/no-first-token termination. These exercise   #
 # the REAL `cowork._role_loop` (never a reimplementation of its logic), the  #
 # only writable-region home available for cowork.py's own new behavior.      #
 # =========================================================================== #
@@ -379,8 +379,7 @@ class TickLifecycleTest(_SessionsRootMixin, unittest.TestCase):
         thread = threading.Thread(target=lambda: result.update(
             r=cowork._role_loop(
                 session, "seed", self._status_path(), context="",
-                io_in=io.StringIO(""), io_out=out, headless=True,
-                session_uuid=session_uuid, role_work_id=work_id,
+                io_out=out, session_uuid=session_uuid, role_work_id=work_id,
                 role="scout")))
         thread.start()
         self.assertTrue(gate.wait(timeout=5), "send() never started")
@@ -441,8 +440,7 @@ class TickLifecycleTest(_SessionsRootMixin, unittest.TestCase):
         thread = threading.Thread(target=lambda: result.update(
             r=cowork._role_loop(
                 RaisingSession(), "seed", self._status_path(), context="",
-                io_in=io.StringIO(""), io_out=out, headless=True,
-                session_uuid=session_uuid, role_work_id=work_id,
+                io_out=out, session_uuid=session_uuid, role_work_id=work_id,
                 role="scout")))
         thread.start()
         self.assertTrue(gate.wait(timeout=5))
@@ -475,8 +473,7 @@ class TickLifecycleTest(_SessionsRootMixin, unittest.TestCase):
         thread = threading.Thread(target=lambda: result.update(
             r=cowork._role_loop(
                 session, "seed", self._status_path(), context="",
-                io_in=io.StringIO(""), io_out=out, headless=True,
-                session_uuid=session_uuid, role_work_id=work_id,
+                io_out=out, session_uuid=session_uuid, role_work_id=work_id,
                 role="scout")))
         thread.start()
         self.assertTrue(gate.wait(timeout=5))
@@ -512,11 +509,10 @@ class TickLifecycleTest(_SessionsRootMixin, unittest.TestCase):
 
 
 class HeadlessTerminationTest(_SessionsRootMixin, unittest.TestCase):
-    """Headless refusal/no-first-token, no-fallback termination: rc 17,
-    naming the provider reason; interactive mode never terminates the
-    process on identical evidence."""
+    """Provider refusal/no-first-token, no-fallback termination: rc 17,
+    naming the provider reason."""
 
-    def test_no_first_token_headless_returns_exit_code_and_reason(self):
+    def test_no_first_token_returns_exit_code_and_reason(self):
         session_uuid = "cccc1111-0000-0000-0000-000000000001"
         work_id = "dddd1111-0000-0000-0000-000000000001"
 
@@ -533,10 +529,9 @@ class HeadlessTerminationTest(_SessionsRootMixin, unittest.TestCase):
         out = io.StringIO()
         rc, outcome, payload = cowork._role_loop(
             NoFirstTokenSession(), "seed", self._status_path(), context="",
-            io_in=io.StringIO(""), io_out=out, headless=True,
-            session_uuid=session_uuid, role_work_id=work_id, role="scout")
-        self.assertEqual(outcome, cowork._OUTCOME_HEADLESS_TERMINATED)
-        self.assertEqual(payload["exit_code"], cowork.HEADLESS_REFUSAL_EXIT_CODE)
+            io_out=out, session_uuid=session_uuid, role_work_id=work_id, role="scout")
+        self.assertEqual(outcome, cowork._OUTCOME_PROCESS_TERMINATED)
+        self.assertEqual(payload["exit_code"], cowork.PROVIDER_REFUSAL_EXIT_CODE)
         self.assertEqual(payload["exit_code"], 17)
         self.assertEqual(payload["controller"], "claude")
         self.assertIn("no_first_token", payload["reason"])
@@ -544,7 +539,7 @@ class HeadlessTerminationTest(_SessionsRootMixin, unittest.TestCase):
         self.assertIn("claude", out.getvalue())
         self.assertIn("no fallback available", out.getvalue())
 
-    def test_refused_headless_names_the_provider_reason(self):
+    def test_refused_provider_names_the_provider_reason(self):
         session_uuid = "cccc2222-0000-0000-0000-000000000002"
         work_id = "dddd2222-0000-0000-0000-000000000002"
 
@@ -566,36 +561,12 @@ class HeadlessTerminationTest(_SessionsRootMixin, unittest.TestCase):
         out = io.StringIO()
         rc, outcome, payload = cowork._role_loop(
             RefusedSession(), "seed", self._status_path(), context="",
-            io_in=io.StringIO(""), io_out=out, headless=True,
-            session_uuid=session_uuid, role_work_id=work_id, role="scout")
-        self.assertEqual(outcome, cowork._OUTCOME_HEADLESS_TERMINATED)
+            io_out=out, session_uuid=session_uuid, role_work_id=work_id, role="scout")
+        self.assertEqual(outcome, cowork._OUTCOME_PROCESS_TERMINATED)
         self.assertEqual(payload["exit_code"], 17)
         self.assertEqual(payload["reason"], "auth")
         self.assertIn("auth", out.getvalue())
         self.assertIn("opencode", out.getvalue())
-
-    def test_interactive_mode_never_terminates_on_identical_evidence(self):
-        session_uuid = "cccc3333-0000-0000-0000-000000000003"
-        work_id = "dddd3333-0000-0000-0000-000000000003"
-
-        class NoFirstTokenSession(object):
-            controller = "claude"
-
-            def send(self, text, meta=None):
-                return {"ok": False, "result": "no_first_token",
-                        "error_type": "no_first_token"}
-
-            def close(self):
-                pass
-
-        out = io.StringIO()
-        rc, outcome, payload = cowork._role_loop(
-            NoFirstTokenSession(), "seed", self._status_path(), context="",
-            io_in=io.StringIO("end\n"), io_out=out, headless=False,
-            session_uuid=session_uuid, role_work_id=work_id, role="scout")
-        self.assertNotEqual(outcome, cowork._OUTCOME_HEADLESS_TERMINATED)
-        self.assertIsNone(payload)
-
 
 class ScheduleRefreshPolicyTest(_SessionsRootMixin, unittest.TestCase):
     """M4D-MAJ-02: the prior schedule is evaluated BEFORE any refresh
@@ -682,8 +653,7 @@ class HardStallReachableEndToEndTest(_SessionsRootMixin, unittest.TestCase):
         out = io.StringIO()
         cowork._role_loop(
             GenericFailSession(), "seed", self._status_path(), context="",
-            io_in=io.StringIO(""), io_out=out, headless=True,
-            session_uuid=session_uuid, role_work_id=work_id, role="scout",
+            io_out=out, session_uuid=session_uuid, role_work_id=work_id, role="scout",
             trace=trace)
         decisions = [kw["verdict"] for name, kw in trace.events
                     if name == "watchdog.decision"]
@@ -725,8 +695,7 @@ class HungDescendantPsWiringIntegrationTest(_SessionsRootMixin,
                 return_value=None) as spy:
             cowork._role_loop(
                 HungButLiveSession(), "seed", self._status_path(), context="",
-                io_in=io.StringIO(""), io_out=io.StringIO(), headless=True,
-                session_uuid=session_uuid, role_work_id=work_id, role="scout")
+                io_out=io.StringIO(), session_uuid=session_uuid, role_work_id=work_id, role="scout")
         spy.assert_called_with(987654)
 
     def test_ps_check_never_attempted_for_a_non_hung_classification(self):
@@ -757,8 +726,8 @@ class HungDescendantPsWiringIntegrationTest(_SessionsRootMixin,
                 return_value=None) as spy:
             cowork._role_loop(
                 GenericFailButLiveSession(), "seed", self._status_path(),
-                context="", io_in=io.StringIO(""), io_out=io.StringIO(),
-                headless=True, session_uuid=session_uuid, role_work_id=work_id,
+                context="", io_out=io.StringIO(),
+                session_uuid=session_uuid, role_work_id=work_id,
                 role="scout")
         spy.assert_not_called()
 
@@ -781,8 +750,7 @@ class HungDescendantPsWiringIntegrationTest(_SessionsRootMixin,
                 return_value=None) as spy:
             cowork._role_loop(
                 NoFirstTokenSession(), "seed", self._status_path(), context="",
-                io_in=io.StringIO(""), io_out=io.StringIO(), headless=True,
-                session_uuid=session_uuid, role_work_id=work_id, role="scout")
+                io_out=io.StringIO(), session_uuid=session_uuid, role_work_id=work_id, role="scout")
         spy.assert_not_called()
 
     def test_hard_stall_eligible_reachable_via_decide_given_dead_probe_and_ps(

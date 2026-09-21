@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""cowork: multi-role CLI orchestration entry flow + the scouting, planning,
+"""cowork: agent-driven multi-role orchestration of the scouting, planning,
 and building phases.
 
-The 3-step entry flow (team checklist, per-role tool config, initial context),
-the preflight dependency check, and a phase loop that drives the user-facing
-roles by spawning the selected CLI and bridging it to the user: the `scout`
-(paired with the `scout-reviewer`) gathers context; on intel approval the
-`planner` (paired with the `planning-advisor`) turns it into a plan; on plan
-approval the `builder` (paired with the `build-reviewer`) executes it. Each
-edge has a user-confirmed hand-back to its pre-processor (planner -> scout,
-builder -> planner). Build approval ends the run with no git side effects.
+An orchestrating agent invokes `cowork` with arguments (--context/--context-
+file, --team, --config, --session-file, ...). A phase loop drives the lead
+roles by spawning the selected controller CLI: the `scout` (paired with the
+`scout-reviewer`) gathers context; on intel approval the `planner` (paired with
+the `planning-advisor`) turns it into a plan; on plan approval the `builder`
+(paired with the `build-reviewer`) executes it. Approval comes only from the
+paired reviewer's explicit verdict. Anything that needs an answer, an
+authorization or an absent reviewer stops the run unapproved with a structured
+request (see `build_run_result`), and the orchestrator resumes the session with
+more arguments. A hand-back to a pre-processor (planner -> scout,
+builder -> planner) executes only with `--authorize-handoff`. Build approval
+ends the run with no git side effects.
 
-Selection uses questionary for real interactive checkbox/choice menus. A
-non-interactive args path (--team/--config/--context) skips the menus entirely
-so the flow is testable and scriptable.
+Nothing here reads human input: no menus, prompts or terminal gates.
 
-Python 3.9+, stdlib only.
+Python 3.9+.
 """
 
 import argparse
@@ -35,7 +37,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,7 +47,7 @@ import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_report  # noqa: E402
 import cowork_handoff as handoff  # noqa: E402
-import cowork_ui as ui  # noqa: E402
+import cowork_transcript as transcript  # noqa: E402
 import cowork_policy as policy  # noqa: E402
 import cowork_measure as measure  # noqa: E402
 import cowork_ingest as ingest  # noqa: E402
@@ -58,11 +59,11 @@ import cowork_dispatch_manifest as dispatch_manifest  # noqa: E402
 import cowork_guard_broker as guard_broker  # noqa: E402
 import cowork_workunit as workunit  # noqa: E402
 import cowork_control_plane as control_plane  # noqa: E402
-import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 import cowork_capacity as capacity_contracts  # noqa: E402
 import cowork_capacity_scheduler as capacity_scheduler  # noqa: E402
 import cowork_activity as activity_contracts  # noqa: E402
 import cowork_watchdog as watchdog  # noqa: E402
+import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 import cowork_owner  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -82,53 +83,44 @@ WORKTREE_ROLE = "worktree"
 WORKTREE_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "worktree.md")
 
 # Max reviewer<->role review rounds per `ready_for_review` (D5). After this many
-# reviewer passes without approval, cowork falls through to the user review gate
-# with the reviewer's last dissent attached. Never hard-blocks. Shared by the
-# scout-reviewer and the planning-advisor.
+# reviewer passes without approval, the phase stops unapproved with the
+# reviewer's last dissent attached. Shared by all three paired reviewers.
 REVIEW_ROUND_CAP = 5
 
 # Max CONSECUTIVE reviewer turns with no usable verdict (account limit, crash,
-# empty/garbled write) before cowork surfaces the visible reviewer-failure gate
-# (retry / skip-review / end). Mirrors the user-facing stuck gate's "2 failing
-# tries" — one silent auto-retry of the reviewer, then the gate. Distinct from
+# empty/garbled write) before the phase stops with a `reviewer_unavailable`
+# request: one silent auto-retry of the reviewer, then the stop. Distinct from
 # REVIEW_ROUND_CAP, which bounds a reviewer that legitimately keeps requesting
 # changes. Shared by all three paired reviewers.
 REVIEW_FAIL_CAP = 2
 
-# Runtime headless notes prepended to a role's/reviewer's seed when --headless is
-# set, so the role itself KNOWS this session is headless on its very first turn
-# (the static role-prompt directives are only "meaningful under --headless" — this
-# is the runtime activation, the primary prompt layer behind the orchestrator
-# safety-net). Leads must not block; reviewers must not pose user questions.
-HEADLESS_LEAD_NOTE = (
-    "[headless mode] This session is running headless — there is NO human "
-    "available to answer questions. Do not set your status to needs_input and "
-    "do not wait for input: choose the most reasonable interpretation of any "
-    "open question, record it in result.assumptions, and drive to "
-    "ready_for_review.")
-HEADLESS_REVIEWER_NOTE = (
-    "[headless mode] This session is running headless — there is NO human "
-    "available. Do not emit a needs_user verdict and do not pose a product or "
-    "review question to the user: review with the context you have, and express "
-    "any concern you would otherwise raise as a user question as a revise "
-    "finding (or approve).")
+# Runtime notes prepended to a lead's/reviewer's seed on every run, so the role
+# KNOWS on its very first turn that no human is attached and how a question that
+# genuinely needs outside authority is reported (the runtime layer behind the
+# role prompts' "Agent session" sections).
+AGENT_LEAD_NOTE = (
+    "[agent session] No human is attached to this session; an orchestrating "
+    "agent reads your status artifact. Resolve ordinary ambiguity yourself: "
+    "choose the most reasonable interpretation, record it in "
+    "result.assumptions, and drive to ready_for_review. Only when the work "
+    "cannot responsibly proceed without a decision or authority you do not "
+    "have, set status needs_input with the exact question in "
+    "result.pending_question — the run then stops and the orchestrator answers "
+    "when it resumes the session. Never wait for input in chat.")
+AGENT_REVIEWER_NOTE = (
+    "[agent session] No human is attached to this session. Review with the "
+    "context you have and express concerns as revise findings (or approve). "
+    "Emit needs_user only for a decision that requires authority beyond the "
+    "review itself; it stops the run unapproved until the orchestrator "
+    "answers.")
 
-# Max headless needs_input nudges per lead role before the phase ends cleanly.
-# The primary bound on a headless needs_input loop is the existing stale-no-op /
-# stuck handling (a byte-identical re-write ends the phase). This cap is the
-# backstop for the pathological case of a role that keeps writing a DIFFERENT
-# needs_input each turn (which the byte-level detector would not catch): after
-# this many nudges with no ready_for_review, the phase ends cleanly so a
-# headless run can never hang. Mirrors REVIEW_ROUND_CAP's "never block" intent.
-HEADLESS_NUDGE_CAP = 5
-
-# Role order matches the user's vision and the phase order: context-gather
-# (scouting), planning, building. Each user-facing role is followed by its
+# Role order matches the phase order: context-gather
+# (scouting), planning, building. Each lead role is followed by its
 # paired critical reviewer. All three phases — `scout`/`scout-reviewer`,
 # `planner`/`planning-advisor`, `builder`/`build-reviewer` — are implemented.
 #
 # `scout-reviewer`, `planning-advisor`, and `build-reviewer` are critical
-# reviewers paired with their user-facing role DURING that role's session
+# reviewers paired with their lead role DURING that role's session
 # (deterministically invoked when the role sets `ready_for_review`). The
 # build-reviewer occupies the paired-reviewer slot the `revisor` name once
 # reserved; `revisor` is dropped (a future sequential plan-revisor would get a
@@ -147,9 +139,9 @@ handoff.validate_role_topology()
 VALID_EVAL_ROLES = state_store.ORCHESTRATOR_EVAL_ROLES
 VALID_ORCHESTRATION_PHASES = state_store.ORCHESTRATOR_EVAL_PHASES
 
-# Hand-back contract: a user-facing role may set `status: "handoff_back"` (plus
+# Hand-back contract: a lead role may set `status: "handoff_back"` (plus
 # a `handoff` payload) in its status file to hand the work back to its
-# pre-processor through a user-confirmed gate. The contract is role-generic:
+# pre-processor through an orchestrator-authorized request. The contract is role-generic:
 # planner -> scout and builder -> planner are wired.
 HANDBACK_PREPROCESSOR = {"planner": "scout", "builder": "planner"}
 
@@ -193,74 +185,7 @@ PHASE_PAIRS = {"scouting": ("scout", SCOUT_REVIEWER),
 
 
 # --------------------------------------------------------------------------- #
-# Menu seam (questionary): the interactive menus take injectable ask-callables  #
-# so they are unit-testable without a TTY or a real questionary prompt. The     #
-# defaults below are the only place questionary is imported.                    #
-# --------------------------------------------------------------------------- #
-
-
-# All three are wrapped in the shared user-wait seam (P15). They are the team,
-# controller and session menus plus the approval and recovery choices — four of
-# the six prompts that actually block on a human. Instrumenting only the two in
-# cowork_ui would have reported an INCOMPLETE user-wait figure as though it were
-# complete, which is a quieter and worse failure than reporting `unknown`.
-# With no active trace (every unit test) these emit nothing.
-
-
-def _q_checkbox(message, options, checked=None):
-    """questionary multi-select. Returns the picked list (or None on Ctrl-C)."""
-    import questionary
-    from questionary import Choice
-    checked = set(checked or [])
-    with trace_store.user_wait("menu.checkbox") as span:
-        picked = questionary.checkbox(
-            message, choices=[Choice(o, checked=(o in checked))
-                              for o in options]
-        ).ask()
-        if picked is None:
-            span.outcome = "cancelled"
-        return picked
-
-
-def _q_select(options, default=None, message=""):
-    """questionary single-select. Returns the picked item, falling back to
-    `default` on cancel so callers never get None."""
-    import questionary
-    with trace_store.user_wait("menu.select") as span:
-        picked = questionary.select(
-            message or "", choices=list(options), default=default).ask()
-        if picked is None:
-            span.outcome = "cancelled"
-        return picked if picked is not None else default
-
-
-def _q_text(message, default=""):
-    """questionary free-text input. Returns `default` on cancel."""
-    import questionary
-    with trace_store.user_wait("menu.text") as span:
-        val = questionary.text(message, default=default).ask()
-        if val is None:
-            span.outcome = "cancelled"
-        return default if val is None else val
-
-
-# --------------------------------------------------------------------------- #
-# Step 1: team checklist (interactive).                                       #
-# --------------------------------------------------------------------------- #
-
-
-def select_team_interactive(checkbox_fn=None):
-    """Checkbox menu, all roles preselected. Returns ordered roles ([] on cancel)."""
-    checkbox_fn = checkbox_fn or _q_checkbox
-    picks = checkbox_fn("Choose your team (space toggles, enter confirms)",
-                        ROLES, checked=ROLES)
-    if not picks:  # None (cancelled) or empty selection
-        return []
-    return [r for r in ROLES if r in picks]
-
-
-# --------------------------------------------------------------------------- #
-# Step 2: per-role tool config.                                               #
+# Role config (machine arguments only: --team / --config / saved session).    #
 # --------------------------------------------------------------------------- #
 
 
@@ -307,413 +232,19 @@ def apply_config_override(config, role, tokens):
     return True, None
 
 
-def format_config_summary(config, header="Tool config:"):
-    """Aligned per-role summary with a column header row."""
-    labels = ("role", "controller", "model", "effort", "permissions", "mode")
-    rows = [
-        (role, config[role]["controller"],
-         config[role].get("model") or "default",
-         config[role].get("effort") or "default",
-         "yolo" if config[role]["yolo"] else "no-yolo", config[role]["mode"])
-        for role in ROLES if role in config
-    ]
-    if not rows:
-        return header
-    cols = list(zip(labels, *rows))
-    widths = [max(len(str(v)) for v in col) for col in cols]
-
-    def fmt(cells):
-        return "  " + "   ".join(
-            str(cell).ljust(widths[i]) for i, cell in enumerate(cells))
-
-    lines = [header, fmt(labels), fmt("-" * w for w in widths)]
-    for row in rows:
-        lines.append(fmt(row))
-    return "\n".join(lines)
-
-
-# Menu sentinels shared by the config screens.
-START_CHOICE = "✓ start with this config"
-DEFAULT_CHOICE = "default (the CLI's own setting)"
-CUSTOM_CHOICE = "custom…"
-BACK_CHOICE = "← back: change team"
-# Returned by configure_roles_interactive when the user picks BACK_CHOICE.
-BACK = object()
-
-# Curated model presets per controller — the silent FALLBACK when live
-# discovery fails. Live sources: claude from the public models.dev catalog
-# (keyless), codex from `codex debug models`, opencode from `opencode models`
-# (only providers with credentials appear there).
-MODEL_PRESETS = {
-    "claude": ["opus", "sonnet", "haiku"],
-    "codex": [],
-    "opencode": [],
-}
-
-# Thinking-effort levels per controller (claude --effort, codex
-# model_reasoning_effort, opencode --variant). opencode variants are
-# provider-specific; the per-provider map below refines the generic list once
-# a model is chosen.
-EFFORT_CHOICES = {
-    "claude": ["low", "medium", "high", "xhigh", "max"],
-    "codex": ["minimal", "low", "medium", "high", "xhigh"],
-    "opencode": ["minimal", "low", "medium", "high", "max"],
-}
-OPENCODE_EFFORTS_BY_PROVIDER = {
-    "anthropic": ["high", "max"],
-    "openai": ["none", "minimal", "low", "medium", "high", "xhigh"],
-    "google": ["low", "high"],
-}
-
-# One access pick sets both yolo and mode: plan+yolo is read-only anyway, so
-# the 2x2 grid collapses to the three combos that actually differ.
-ACCESS_CHOICES = (
-    ("yolo (full access, no approvals)", True, "implement"),
-    ("safe (edits only, other commands denied)", False, "implement"),
-    ("read-only (plan mode)", True, "plan"),
-)
-
-
-def access_label(cfg):
-    if cfg.get("mode") == "plan":
-        return ACCESS_CHOICES[2][0]
-    return ACCESS_CHOICES[0][0] if cfg.get("yolo") else ACCESS_CHOICES[1][0]
-
-
-def _run_opencode_models():
-    """Raw `opencode models` stdout ('' on any failure)."""
-    try:
-        res = subprocess.run(["opencode", "models"], capture_output=True,
-                             text=True, timeout=20)
-    except Exception:  # noqa: BLE001 - a model list is never load-bearing
-        return ""
-    return res.stdout if res.returncode == 0 else ""
-
-
-def list_opencode_models(runner=None):
-    """Parse `opencode models` (one provider/model per line, credentialed
-    providers only) into {provider: [full 'provider/model' ids]}. Empty dict
-    when opencode is missing or lists nothing — the picker falls back to free
-    text."""
-    out = (runner or _run_opencode_models)()
-    models = {}
-    for line in (out or "").splitlines():
-        line = line.strip()
-        if not line or "/" not in line or " " in line:
-            continue
-        provider = line.split("/", 1)[0]
-        models.setdefault(provider, []).append(line)
-    return models
-
-
-def _run_codex_models():
-    """Raw `codex debug models` stdout ('' on any failure)."""
-    try:
-        res = subprocess.run(["codex", "debug", "models"], capture_output=True,
-                             text=True, timeout=10)
-    except Exception:  # noqa: BLE001 - a model list is never load-bearing
-        return ""
-    return res.stdout if res.returncode == 0 else ""
-
-
-def list_codex_models(runner=None):
-    """Parse the `codex debug models` JSON catalog into an ordered list of
-    {'slug', 'efforts'} dicts: visibility=='list' models only, ascending
-    priority (the vendor's flagship/newest-first display order). Empty list on
-    any failure — the picker falls back to MODEL_PRESETS."""
-    try:
-        data = json.loads((runner or _run_codex_models)() or "")
-        raw = data["models"]
-    except Exception:  # noqa: BLE001 - a model list is never load-bearing
-        return []
-    models = []
-    for entry in raw if isinstance(raw, list) else []:
-        if not isinstance(entry, dict) or entry.get("visibility") != "list":
-            continue
-        slug = entry.get("slug")
-        if not isinstance(slug, str) or not slug:
-            continue
-        # Reasoning levels arrive as {'effort': ..., 'description': ...} dicts
-        # today; tolerate plain strings too.
-        efforts = []
-        for level in entry.get("supported_reasoning_levels") or []:
-            if isinstance(level, dict):
-                level = level.get("effort")
-            if isinstance(level, str) and level:
-                efforts.append(level)
-        priority = entry.get("priority")
-        if not isinstance(priority, (int, float)):
-            priority = float("inf")
-        models.append((priority, {"slug": slug, "efforts": efforts}))
-    models.sort(key=lambda pair: pair[0])
-    return [model for _, model in models]
-
-
-MODELS_DEV_URL = "https://models.dev/api.json"
-
-
-def _fetch_models_dev():
-    """Raw models.dev catalog JSON text ('' on any failure). models.dev
-    returns HTTP 403 to a bare urllib request, so the User-Agent header is
-    mandatory — without it discovery would silently fall back forever."""
-    req = urllib.request.Request(MODELS_DEV_URL,
-                                 headers={"User-Agent": "cowork/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=5) as res:
-            return res.read().decode("utf-8")
-    except Exception:  # noqa: BLE001 - a model list is never load-bearing
-        return ""
-
-
-def list_claude_models(fetcher=None):
-    """Full claude model ids from the public models.dev catalog (keyless),
-    sorted newest-first by release_date. Empty list on any failure — the
-    picker falls back to the MODEL_PRESETS aliases."""
-    try:
-        data = json.loads((fetcher or _fetch_models_dev)() or "")
-        raw = data["anthropic"]["models"]
-    except Exception:  # noqa: BLE001 - a model list is never load-bearing
-        return []
-    models = []
-    for model_id, info in raw.items() if isinstance(raw, dict) else []:
-        if not isinstance(model_id, str) or not model_id:
-            continue
-        released = info.get("release_date") if isinstance(info, dict) else None
-        models.append((released if isinstance(released, str) else "", model_id))
-    models.sort(reverse=True)
-    return [model_id for _, model_id in models]
-
-
-def preload_model_catalogs(opencode_models_fn=None, claude_models_fn=None,
-                           codex_models_fn=None):
-    """Fetch all live model catalogs concurrently, once per config-menu open,
-    so the pickers themselves never do I/O. Each discovery fn is bounded by
-    its own timeout and failure-silent, so the join is bounded too; a failed
-    source just leaves its controller on the preset fallback."""
-    fns = {
-        "opencode": opencode_models_fn or list_opencode_models,
-        "claude": claude_models_fn or list_claude_models,
-        "codex": codex_models_fn or list_codex_models,
-    }
-    results = {"opencode": {}, "claude": [], "codex": []}
-
-    def fetch(key):
-        try:
-            results[key] = fns[key]() or results[key]
-        except Exception:  # noqa: BLE001 - a model list is never load-bearing
-            pass
-
-    threads = [threading.Thread(target=fetch, args=(key,), daemon=True)
-               for key in fns]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    return results
-
-
-def pick_model_interactive(role, controller, current, select_fn, text_fn,
-                           opencode_models_fn=None, claude_models=None,
-                           codex_models=None):
-    """One model pick for a role. Returns the model id or None (= default).
-
-    opencode is a two-step pick — provider first (satisfying the provider
-    choice), then that provider's models — discovered live; claude and codex
-    offer their preloaded live catalogs (claude_models newest-first, codex
-    slugs flagship-first) and drop to the curated presets when discovery
-    failed. Every path has a custom… escape hatch to a free-text id."""
-    if controller == "opencode":
-        by_provider = (opencode_models_fn or list_opencode_models)()
-        if by_provider:
-            providers = sorted(by_provider)
-            cur_provider = (current or "").split("/", 1)[0]
-            prov = select_fn(
-                [DEFAULT_CHOICE] + providers + [CUSTOM_CHOICE],
-                default=cur_provider if cur_provider in providers
-                else DEFAULT_CHOICE,
-                message="%s provider (opencode)" % role)
-            if prov is None or prov == DEFAULT_CHOICE:
-                return None
-            if prov != CUSTOM_CHOICE:
-                options = by_provider[prov] + [CUSTOM_CHOICE]
-                pick = select_fn(
-                    options,
-                    default=current if current in by_provider[prov] else None,
-                    message="%s model (%s)" % (role, prov))
-                if pick and pick != CUSTOM_CHOICE:
-                    return pick
-        val = text_fn("%s model (provider/model, empty = default)" % role,
-                      default=current or "")
-        return val.strip() or None
-    if controller == "claude" and claude_models:
-        presets = list(claude_models)
-    elif controller == "codex" and codex_models:
-        presets = [model["slug"] for model in codex_models]
-    else:
-        presets = MODEL_PRESETS.get(controller) or []
-    options = [DEFAULT_CHOICE] + presets + [CUSTOM_CHOICE]
-    pick = select_fn(options,
-                     default=current if current in presets else DEFAULT_CHOICE,
-                     message="%s model (%s)" % (role, controller))
-    if pick is None or pick == DEFAULT_CHOICE:
-        return None
-    if pick == CUSTOM_CHOICE:
-        val = text_fn("%s model id (empty = default)" % role,
-                      default=current or "")
-        return val.strip() or None
-    return pick
-
-
-def pick_effort_interactive(role, controller, current, select_fn, model=None,
-                            codex_models=None):
-    """One thinking-effort pick. Returns the level or None (= default).
-    For codex, a model found in the preloaded catalog narrows the levels to
-    its supported_reasoning_levels; otherwise the generic list stands."""
-    levels = EFFORT_CHOICES.get(controller) or []
-    if controller == "opencode" and model and "/" in model:
-        levels = OPENCODE_EFFORTS_BY_PROVIDER.get(
-            model.split("/", 1)[0], levels)
-    if controller == "codex" and model:
-        for entry in codex_models or []:
-            if entry.get("slug") == model and entry.get("efforts"):
-                levels = entry["efforts"]
-                break
-    options = [DEFAULT_CHOICE] + levels
-    pick = select_fn(options,
-                     default=current if current in levels else DEFAULT_CHOICE,
-                     message="%s thinking effort (%s)" % (role, controller))
-    if pick is None or pick == DEFAULT_CHOICE:
-        return None
-    return pick
-
-
-def configure_role_interactive(role, cfg, select_fn, text_fn,
-                               opencode_models_fn=None, claude_models=None,
-                               codex_models=None):
-    """Edit one role in place: controller -> model -> effort -> access."""
-    controller = select_fn(list(CONTROLLERS), default=cfg["controller"],
-                           message=role + " controller")
-    if controller and controller != cfg["controller"]:
-        # Model ids/effort levels are controller-specific; never carry over.
-        cfg["model"] = None
-        cfg["effort"] = None
-        cfg["controller"] = controller
-    cfg["model"] = pick_model_interactive(
-        role, cfg["controller"], cfg.get("model"), select_fn, text_fn,
-        opencode_models_fn=opencode_models_fn, claude_models=claude_models,
-        codex_models=codex_models)
-    cfg["effort"] = pick_effort_interactive(
-        role, cfg["controller"], cfg.get("effort"), select_fn,
-        model=cfg.get("model"), codex_models=codex_models)
-    labels = [label for label, _y, _m in ACCESS_CHOICES]
-    pick = select_fn(labels, default=access_label(cfg),
-                     message=role + " access")
-    for label, yolo, mode in ACCESS_CHOICES:
-        if pick == label:
-            cfg["yolo"], cfg["mode"] = yolo, mode
-
-
-def configure_roles_interactive(selected, select_fn=None, text_fn=None,
-                                opencode_models_fn=None, claude_models_fn=None,
-                                codex_models_fn=None, config=None,
-                                catalogs=None, allow_back=False):
-    """Step 2: one screen. The current config is shown as a table and the menu
-    is 'start' (default — one Enter accepts everything) plus one entry per
-    role; picking a role walks a short controller -> model -> effort -> access
-    edit and returns to the same screen. No nested defaults-gate, no
-    role-checkbox re-pick. Live model catalogs are preloaded once here and
-    reused across every role edit — the pickers never fetch.
-
-    With `allow_back` a '← back: change team' entry is appended and picking it
-    returns the BACK sentinel (the merged team screen loops to the checkbox).
-    `config`/`catalogs` let that caller keep role edits and preloaded catalogs
-    alive across back-and-forth trips."""
-    select_fn = select_fn or _q_select
-    text_fn = text_fn or _q_text
-    if config is None:
-        config = default_config(selected)
-    if catalogs is None:
-        catalogs = preload_model_catalogs(
-            opencode_models_fn=opencode_models_fn,
-            claude_models_fn=claude_models_fn,
-            codex_models_fn=codex_models_fn)
-    options = ([START_CHOICE] + list(selected)
-               + ([BACK_CHOICE] if allow_back else []))
-    while True:
-        summary = format_config_summary(
-            config, header="Team config (pick a role to edit it):")
-        choice = select_fn(options, default=START_CHOICE, message=summary)
-        if allow_back and choice == BACK_CHOICE:
-            return BACK
-        if choice is None or choice == START_CHOICE:
-            return config
-        if choice in config:
-            configure_role_interactive(
-                choice, config[choice], select_fn, text_fn,
-                opencode_models_fn=lambda: catalogs["opencode"],
-                claude_models=catalogs["claude"],
-                codex_models=catalogs["codex"])
-
-
-def select_and_configure_interactive(checkbox_fn=None, select_fn=None,
-                                     text_fn=None, opencode_models_fn=None,
-                                     claude_models_fn=None,
-                                     codex_models_fn=None):
-    """Steps 1+2 as one navigable flow. Returns (selected, config).
-
-    Team checkbox -> config screen; the config screen's '← back: change team'
-    entry reopens the checkbox with the current picks checked. Role edits and
-    the preloaded model catalogs survive the round trip (a role dropped and
-    re-added does reset to its defaults). Cancelling the checkbox returns
-    ([], {}) — same 'nothing to do' contract as select_team_interactive."""
-    checkbox_fn = checkbox_fn or _q_checkbox
-    selected = list(ROLES)
-    config = {}
-    catalogs = None
-    while True:
-        picks = checkbox_fn("Choose your team (space toggles, enter confirms)",
-                            ROLES, checked=selected)
-        if not picks:  # None (cancelled) or empty selection
-            return [], {}
-        selected = [r for r in ROLES if r in picks]
-        config = {r: config[r] if r in config else dict(DEFAULTS[r])
-                  for r in selected}
-        if catalogs is None:  # preload once; back trips reuse it
-            catalogs = preload_model_catalogs(
-                opencode_models_fn=opencode_models_fn,
-                claude_models_fn=claude_models_fn,
-                codex_models_fn=codex_models_fn)
-        result = configure_roles_interactive(
-            selected, select_fn, text_fn, config=config, catalogs=catalogs,
-            allow_back=True)
-        if result is not BACK:
-            return selected, result
-
-
 # --------------------------------------------------------------------------- #
-# Step 3: initial context.                                                    #
+# Initial context.                                                            #
 # --------------------------------------------------------------------------- #
-
-
-def gather_context_interactive(prompt_fn=None):
-    """One multiline editor for the initial context. EOF/cancel => no context."""
-    prompt_fn = prompt_fn or (lambda: ui.prompt_user(
-        sys.stdin, sys.stdout,
-        header="What do you want to build or change? Describe the goal — "
-               "paste any files, code, or context that matter."))
-    val = prompt_fn()
-    if val is ui.EOF or val is ui.CANCEL:
-        return ""
-    return val
 
 
 def resolve_context(args, resuming=False):
-    """Context from --context, --context-file (or '-' for stdin), or the editor.
+    """Context from --context or --context-file (a path, or '-' for stdin).
 
-    When `resuming` a saved session, skip the interactive goal prompt and return
-    "" — run_scout turns that into "Continue the session." so the resumed scout
-    picks up where it left off automatically. An explicit --context/--context-file
-    still wins (lets you redirect a resumed session)."""
+    Absent both, returns "": a resumed session turns that into "Continue the
+    session." so the current phase's role picks up where it left off. A fresh
+    session without context is refused earlier, in `run_flow`. An explicit
+    --context/--context-file on a plain resume redirects the session goal; with
+    a decision flag it is that decision's answer and never replaces the goal."""
     if args.context is not None:
         return args.context
     if args.context_file is not None:
@@ -721,15 +252,11 @@ def resolve_context(args, resuming=False):
             return sys.stdin.read()
         with open(args.context_file, "r") as fh:
             return fh.read()
-    if _is_non_interactive(args):
-        return ""
-    if resuming:
-        return ""  # auto-continue; no goal prompt on resume
-    return gather_context_interactive()
+    return ""
 
 
 # --------------------------------------------------------------------------- #
-# Argument parsing / non-interactive path.                                    #
+# Argument parsing.                                                           #
 # --------------------------------------------------------------------------- #
 
 
@@ -796,8 +323,9 @@ def build_parser():
                         "(default), final_round, sampled, or off. The overhead "
                         "of the choice is reported separately.")
     p.add_argument("--team",
-                   help="comma-separated roles, e.g. scout,planner "
-                        "(non-interactive)")
+                   help="comma-separated roles, e.g. "
+                        "scout,scout-reviewer (default: every role, or the "
+                        "saved team on resume)")
     p.add_argument("--config", action="append", default=[],
                    metavar="ROLE=opt,opt",
                    help="per-role override, e.g. scout=codex,no-yolo,implement "
@@ -805,16 +333,21 @@ def build_parser():
                         "effort=high (options: claude/codex/opencode, "
                         "model=<id>, effort=<level>, yolo/no-yolo, "
                         "plan/implement; repeatable)")
-    p.add_argument("--context", help="initial context text (non-interactive)")
+    p.add_argument("--context",
+                   help="initial context text (required for a new session); "
+                        "with --session-file/--resume it redirects the saved "
+                        "session, and with --answer it is the answer")
     p.add_argument("--context-file",
-                   help="read initial context from a file, or '-' for stdin")
+                   help="like --context, read from a file, or '-' for stdin")
     p.add_argument("--session-file",
-                   help="path to the session store (default: ./.cowork/session.json)")
+                   help="the session store to use: resumes that saved session "
+                        "when the file exists, or creates a new session there "
+                        "(with --context) when it does not")
     p.add_argument("--no-session", action="store_true",
                    help="do not read or write the session store")
     p.add_argument("--new", action="store_true",
-                   help="start a fresh session, skipping the resume-or-new "
-                        "prompt (prior sessions stay intact)")
+                   help="start a new session (the default when no session "
+                        "selector is given; requires --context)")
     p.add_argument("--take-over", dest="take_over", action="store_true",
                    help="take over this session's single-writer owner lease "
                         "from a prior process (issue #64). Never implicit: a "
@@ -825,8 +358,9 @@ def build_parser():
                         "instead, because guessing here is how two writers "
                         "get created")
     p.add_argument("--resume", action="store_true",
-                   help="open the session picker for this directory (newest "
-                        "first); needs an interactive terminal")
+                   help="resume this directory's most recent saved session "
+                        "(an error when there is none); --session-file names "
+                        "one exactly")
     p.add_argument("--switch-controller", type=parse_switch_controller,
                    action="append", default=[],
                    metavar="ROLE=CONTROLLER",
@@ -852,12 +386,21 @@ def build_parser():
     p.add_argument("--wt-controller", dest="wt_controller",
                    choices=list(CONTROLLERS), default="claude",
                    help="controller for the worktree role (default: claude)")
-    p.add_argument("--headless", "--auto", dest="headless",
-                   action="store_true",
-                   help="drive the whole scout->plan->build flow with no human "
-                        "gates: roles never block, reviewers work with what they "
-                        "have, rounds end on reviewer consensus or the review "
-                        "round cap. Requires --context/--context-file.")
+    p.add_argument("--answer", dest="answer", metavar="REQUEST_ID",
+                   help="answer the saved session's open decision request "
+                        "(needs_input, reviewer_question, review_round_cap, "
+                        "review_not_approved) with --context/--context-file; "
+                        "REQUEST_ID is stop.request_id from the run result")
+    p.add_argument("--authorize-handoff", dest="authorize_handoff",
+                   metavar="REQUEST_ID",
+                   help="authorize the saved session's open hand-back "
+                        "request; the hand-back executes without another "
+                        "lead turn")
+    p.add_argument("--decline-handoff", dest="decline_handoff",
+                   metavar="REQUEST_ID",
+                   help="decline the saved session's open hand-back request; "
+                        "the lead continues its own phase (optional "
+                        "--context is delivered with the decline)")
     # Targeted orchestrator-owned evaluations. `--evaluate-role` is the dispatch
     # flag (handled in main() before run_flow, like --check/--report). The
     # session is named by --eval-session (NOT --session: that would make --sess
@@ -910,11 +453,6 @@ def build_parser():
     p.add_argument("--notes", dest="eval_notes", metavar="TEXT",
                    help="with --evaluate-role: optional free-form note")
     return p
-
-
-def _is_non_interactive(args):
-    return bool(args.team or args.config or args.context is not None
-                or args.context_file or getattr(args, "headless", False))
 
 
 def run_report(args, io_out=None):
@@ -996,7 +534,7 @@ def run_report(args, io_out=None):
 
     if getattr(args, "report_json", False):
         # The authoritative artifact itself. D3 makes the record the authority;
-        # a user with no way to read it would be told it exists and shown only
+        # a caller with no way to read it would be told it exists and shown only
         # the derivation.
         json.dump(record, io_out, indent=2, sort_keys=True, default=str)
         io_out.write("\n")
@@ -1622,7 +1160,8 @@ def caveman_directive(available=None):
 
     A WRITING-STYLE instruction only: it never invokes /caveman and never
     changes any global mode. Internal/peer content is compressed only when
-    caveman is installed; user-facing content is always full prose. `available`
+    caveman is installed; reply text outside internal blocks is always full
+    prose. `available`
     defaults to live detection; tests pass it explicitly."""
     if available is None:
         available = _caveman_available()
@@ -1633,13 +1172,13 @@ def caveman_directive(available=None):
             "self-narration, and for reviewers your whole review narration — in "
             "terse caveman ultra style (drop articles/filler/pleasantries, "
             "fragments OK), preserving every bit of technical substance and any "
-            "required structure. NEVER compress user-facing content: your "
-            "replies to the user stay full, clear prose. Do not invoke /caveman "
-            "or change any global mode."
+            "required structure. NEVER compress reply text outside internal "
+            "blocks or any artifact file: those stay full, clear prose. Do not "
+            "invoke /caveman or change any global mode."
         )
     return (
         "Compression directive: the caveman terse-style tool is NOT installed. "
-        "Write everything — user-facing and internal-channel alike — in normal, "
+        "Write everything — reply text and internal-channel alike — in normal, "
         "full prose. Internal-channel content still routes to the internal "
         "channel (inside `[[internal]]` blocks, or for reviewers your whole "
         "narration), just uncompressed."
@@ -1652,8 +1191,8 @@ def assemble_scout_brief(selected, intel_path, intel_md_path=None,
     domain guardrail, and the plan-only fallthrough for this team.
 
     When `intel_md_path` is given, the scout writes TWO files: the JSON (machine
-    source of truth + status channel) and a human-first markdown rendering (the
-    user's review surface, also reviewed by the scout-reviewer). Both are the
+    source of truth + status channel) and a readable markdown rendering (the
+    review surface, also reviewed by the scout-reviewer). Both are the
     scout's write targets and nothing else."""
     if "planner" in selected:
         plan_note = (
@@ -1669,7 +1208,7 @@ def assemble_scout_brief(selected, intel_path, intel_md_path=None,
         target = (
             "Write your findings as TWO files, to exactly these paths:\n"
             "  JSON (machine source of truth + your status channel): %s\n"
-            "  Markdown (the user's review surface, small scannable sections): "
+            "  Markdown (the readable review surface, small scannable sections): "
             "%s\n"
             "Those two intel files are your ONLY write targets. Do not create, "
             "edit, or delete any other file (reading/searching the repo is "
@@ -1721,7 +1260,7 @@ def _emit_codex_role_prompt_bytes(trace, role, role_text):
 # --------------------------------------------------------------------------- #
 # scout-reviewer: a critical reviewer paired with the scout. Invoked            #
 # deterministically when the scout sets `ready_for_review`. It shares the       #
-# scout's initial context (the user `context`, NOT the scout's write-target     #
+# scout's initial context (the run `context`, NOT the scout's write-target      #
 # brief), reads the scout intel, and writes a verdict to its own review file.   #
 # --------------------------------------------------------------------------- #
 
@@ -1809,9 +1348,15 @@ def _codex_static_prefix_fragment(role_text, team_note):
     return handoff._static_role_text(prefix + "\n\n")
 
 
-def _headless_lead_fragment():
+def _agent_lead_fragment():
     """The one closed runtime note that may prefix a cross-role lead seed."""
-    return handoff._static_role_text(HEADLESS_LEAD_NOTE)
+    return handoff._static_role_text(AGENT_LEAD_NOTE)
+
+
+def _agent_reviewer_fragment():
+    """The closed runtime reviewer note, typed, for a resumed reviewer's
+    composed wake prefix."""
+    return handoff._static_role_text(AGENT_REVIEWER_NOTE)
 
 
 def _repo_discovery_fragment(candidates, base):
@@ -2063,20 +1608,6 @@ def _missing_question_delivery(artifact_noun):
         _missing_question_repair_prompt(artifact_noun))
 
 
-def _headless_nudge_delivery(artifact_noun):
-    return _closed_static_delivery(_headless_nudge_text(artifact_noun))
-
-
-def _handoff_declined_delivery(text_fn):
-    if text_fn not in (handoff_declined_text, handoff_declined_to_planner_text):
-        raise TypeError("handoff-declined text must use a closed static source")
-    return _closed_static_delivery(text_fn())
-
-
-def _user_lead_delivery(text):
-    return handoff.direct_delivery(handoff._user_lead_reply(text))
-
-
 def _is_known_static_fragment(s):
     t = str(s or "").strip()
     if not t:
@@ -2084,7 +1615,7 @@ def _is_known_static_fragment(s):
     if getattr(s, "kind", None) == "static_role" or type(s).__name__ == "_BoundaryText":
         return True
     known_markers = (
-        HEADLESS_LEAD_NOTE, HEADLESS_REVIEWER_NOTE,
+        AGENT_LEAD_NOTE, AGENT_REVIEWER_NOTE,
     )
     if any(t in str(k).strip() for k in known_markers if k):
         return True
@@ -2297,7 +1828,7 @@ def _intel_artifacts(intel_path, intel_md_path=None):
     arts = [{"label": "intel JSON (machine source of truth)",
              "path": intel_path, "kind": "json", "source": "intel_json"}]
     if intel_md_path:
-        arts.append({"label": "intel markdown (the user's review surface)",
+        arts.append({"label": "intel markdown (the readable review surface)",
                      "path": intel_md_path, "kind": "markdown",
                      "source": "intel_md"})
     return arts
@@ -2383,16 +1914,15 @@ def assemble_reviewer_handoff(verdict, review, artifact="intel",
     """Build the role-facing hand-back string (routes 2/5/8) via the shared
     transport. The reviewer's findings / user_question are NOT embedded: the
     lead's prompt names the REVIEW FILE path and instructs it to read the
-    findings (and the user_question, for needs_user) there and relay them in its
-    own voice — preserving the single-voice, faithful-relay guardrail while
-    keeping the transport file-only. `artifact` names what was reviewed ("intel"
-    for the scout, "plan" for the planner, "build" for the builder). Returns ""
-    for `approve` (no handoff; fall through to the user gate).
+    findings there, keeping the transport file-only. Only `revise` hands back:
+    a reviewer `needs_user` stops the run with a structured request instead.
+    `artifact` names what was reviewed ("intel" for the scout, "plan" for the
+    planner, "build" for the builder). Returns "" for any other verdict.
 
     `review_path` is the reviewer's verdict file; when absent (a legacy/test
     call passing only the verdict dict), the verdict is materialized to a
     tempfile so the transport still carries a real path."""
-    if verdict not in ("needs_user", "revise"):
+    if verdict != "revise":
         return ""
     if review_path:
         art = {"label": "reviewer verdict + findings (JSON)",
@@ -2404,43 +1934,17 @@ def assemble_reviewer_handoff(verdict, review, artifact="intel",
             label="reviewer verdict + findings (JSON)", source="review")
         art["kind"] = "json"
     facts = {"artifact_noun": artifact}
-    if verdict == "needs_user":
-        return handoff.render_handoff(
-            "reviewer->lead:handback_needs_user", artifacts=[art], facts=facts)
     return handoff.render_handoff(
         "reviewer->lead:handback_revise", artifacts=[art], facts=facts)
 
 
-def assemble_user_question(text, artifact="intel"):
-    """Wrap a user's gate-time question in a harness-authored prompt.
-
-    The user picked "Ask a question" at the `ready_for_review` gate (not
-    "Request changes"). This is NOT reopened work: the role answers in chat and
-    leaves its artifact byte-identical, so the existing hash-gate auto-skips the
-    paired advisor on the unchanged follow-up. Putting the instruction at the
-    harness boundary makes the behavior robust regardless of role-contract
-    drift. The escape hatch is explicit: if the question genuinely surfaces new
-    work, the role may edit its %s and set needs_input itself — then bytes
-    change and a re-review is correct."""
-    return (
-        "[user question — answer in chat] The user asked a question at the "
-        "review gate. This is NOT a request to change the work. Answer it "
-        "conversationally in your reply. Do NOT edit your %s, and keep its "
-        "status at `ready_for_review` — you will return to the same gate so the "
-        "user can ask again, approve, or request changes. Only if the question "
-        "genuinely surfaces new work should you edit your %s and set status "
-        "back to `needs_input`.\n\n"
-        "Question: %s" % (artifact, artifact, text)
-    )
-
-
 def scout_reviewed_text(verdict=None, round_index=None, round_cap=None):
-    """Marker shown to the user so they can see a review happened (D7).
+    """Transcript marker recording that a review happened (D7).
 
     It exposes only the verdict class, never reviewer findings or questions. The
     substring 'reviewed' is asserted by tests. With `round_index`/`round_cap` it
-    appends a round counter so the user can see review-budget progress and spot
-    resets (a fresh '(round 1/N)' after they re-engage)."""
+    appends a round counter so the transcript shows review-budget progress and
+    resets (a fresh '(round 1/N)' in a new invocation)."""
     v = verdict.get("verdict") if isinstance(verdict, dict) else verdict
     counter = ""
     if round_index is not None and round_cap:
@@ -2450,12 +1954,12 @@ def scout_reviewed_text(verdict=None, round_index=None, round_cap=None):
     if v == "revise":
         return "reviewed: changes requested" + counter
     if v == "needs_user":
-        return "reviewed: needs user input" + counter
+        return "reviewed: needs an orchestrator decision" + counter
     return "reviewed" + counter
 
 
 def review_skipped_text():
-    """Marker shown to the user when the paired reviewer turn is SKIPPED by the
+    """Transcript marker recording that the paired reviewer turn was SKIPPED by the
     hash-gate: the lead's reviewed artifact set is byte-identical to what that
     reviewer last approved this phase, so the prior approval is reused (D6).
 
@@ -2465,37 +1969,15 @@ def review_skipped_text():
 
 
 class _QuietSink:
-    """A write sink that discards everything — used as the reviewer session's
-    `io_out` so its raw stream is never interleaved into the user conversation
-    (single-voice invariant, D7). Reports not-a-tty so sessions take plain
-    paths."""
+    """A write sink that discards everything — used as a muted session's
+    `io_out` so its raw stream is never interleaved into the lead's transcript
+    (single-voice invariant, D7)."""
 
     def write(self, _s):
         return None
 
     def flush(self):
         return None
-
-    def isatty(self):
-        return False
-
-
-def _with_status_spinner(io_out, label, fn):
-    """Run `fn()` while a labeled `ui.Spinner` turns on `io_out`, ALWAYS
-    stopping the spinner before returning (and therefore before any real
-    io_out write `fn`'s caller makes next). Single chokepoint for the
-    otherwise-silent background windows (reviewer/advisor pass, phase-boot
-    probe, build-baseline git snapshot): because the spinner is torn down in a
-    `finally`, the CR-frame loop can never interleave with a subsequent io_out
-    write. Off a TTY `ui.Spinner` is a no-op, so scripted/test paths stay
-    byte-identical. The `label` argument must NOT end in '…' — the primitive
-    appends one itself."""
-    spin = ui.Spinner(io_out, label=label)
-    spin.start()
-    try:
-        return fn()
-    finally:
-        spin.stop()
 
 
 # --------------------------------------------------------------------------- #
@@ -2505,7 +1987,7 @@ def _with_status_spinner(io_out, label, fn):
 # once per planning phase. Each evaluator writes only its own scratch file;    #
 # the orchestrator stamps metadata and aggregates into the per-session         #
 # scores.json. Purely observational: failures are traced and skipped, and no   #
-# evaluation content ever reaches the user or the evaluated role.              #
+# evaluation content ever reaches the transcript or the evaluated role.        #
 # --------------------------------------------------------------------------- #
 
 # The criteria are part of the orchestration contract, not role-spec prose:
@@ -2520,7 +2002,8 @@ EVAL_CRITERIA = {
     ],
     (SCOUT_REVIEWER, "scout"): [
         "intel quality/completeness",
-        "requirement-gathering quality (questions asked vs assumptions buried)",
+        "authority escalation (escalated what needs authority, resolved what "
+        "the context settles)",
         "goal alignment",
         "goal measurability",
     ],
@@ -2563,7 +2046,7 @@ EVAL_CRITERIA = {
     ],
 }
 
-# Which user-facing role a paired reviewer evaluates on its eval turn.
+# Which lead role a paired reviewer evaluates on its eval turn.
 _REVIEWER_EVALUATEE = handoff.reviewer_pairs()
 
 
@@ -2603,8 +2086,8 @@ def assemble_eval_prompt(evaluator, scratch_path, specs):
                (spec.get("artifact_block") or "").strip()))
     return (
         "[private evaluation turn] This is a private evaluation request from "
-        "the cowork orchestrator. It is NOT part of the task conversation: it "
-        "is never shown to the user, and the roles you evaluate never see "
+        "the cowork orchestrator. It is NOT part of the task: it is never "
+        "written to the run transcript, and the roles you evaluate never see "
         "your scores.\n\n"
         "Evaluate the following peer(s) on this session:\n\n%s\n\n"
         "Write your evaluation as a single JSON object to exactly this file:\n"
@@ -2620,7 +2103,7 @@ def assemble_eval_prompt(evaluator, scratch_path, specs):
         "enhancement_suggestions.\n"
         "Rules: do NOT modify your status/intel/plan/review files or any "
         "other file on this turn; never read any other role's evaluation "
-        "file or any scores file; never mention this evaluation to the user. "
+        "file or any scores file; never mention this evaluation in your reply. "
         "Keep your reply text minimal — the scratch file is the deliverable."
         % ("\n\n".join(blocks), scratch_path)
     )
@@ -2630,8 +2113,8 @@ def assemble_eval_prompt(evaluator, scratch_path, specs):
 def _muted_session(session):
     """Temporarily swap a role session's io_out for a quiet sink.
 
-    The scout/planner session is user-facing: both bridges stream assistant
-    text, spinners, and denial messages to `session.io_out`, resolved at send
+    The lead session writes the transcript: the bridges stream assistant
+    text and denial messages to `session.io_out`, resolved at send
     time — so a temporary swap suppresses all of it for the duration of an
     eval send with zero bridge changes. Restored in finally."""
     saved = session.io_out
@@ -3568,7 +3051,7 @@ def _adjudicate_readiness(entries, claimed, required=None):
 
 
 def unverified_readiness_text(reason):
-    """What the user sees when a promotion is handed back unverified."""
+    """The transcript notice when a promotion is handed back unverified."""
     return ("Readiness was claimed before it was verified, so the work was "
             "reopened rather than reviewed.\n%s\nThe cause has been named so "
             "it can be repaired; a new owned verification transaction "
@@ -4490,7 +3973,7 @@ def _current_verification_overlay(session_uuid, work_id=None):
 
 def render_verification_overlay_block(overlay, receipt_path=None,
                                       agent_status_path=None):
-    """The human-gate banner block (UX-021): the owned facts first, the
+    """The review-surface banner block (UX-021): the owned facts first, the
     agent-authored verification prose named SEPARATELY as self-reported, and a
     visible WARNING line when the contradiction flag is set. Empty string when
     no overlay binds (the legacy no-transaction gate is unchanged)."""
@@ -4575,8 +4058,8 @@ def _accepted_manifest_matches(pointer, repo=None):
 
 
 def _grant_gate_acceptance(session_uuid, trace):
-    """The D-0004/D-0005 gate-outcome grant at the building-phase user gate:
-    an explicit human approve OR a headless auto-approve accepts the bound
+    """The D-0004/D-0005 gate-outcome grant at the building-phase gate: the
+    paired reviewer's explicit approve accepts the bound
     transaction — but ONLY while it is still `pending_review` (a reviewer that
     already judged it, either way, is not second-guessed by the gate) and only
     while the accepted candidate manifest still equals the receipt's captured
@@ -4904,133 +4387,29 @@ def drain_evaluations(session_uuid, config=None, trace=None, io_out=None,
 
 
 def run_evaluation_transition(session_uuid, effective_policy, config=None,
-                              trace=None, io_in=None, io_out=None, at=None,
-                              closed_phases=None, headless=False, ask_fn=None,
-                              session_factory=None):
-    """The evaluation drain at one boundary, and its visible foreground state.
+                              trace=None, io_out=None, at=None,
+                              closed_phases=None, session_factory=None):
+    """The evaluation drain at one boundary, and its visible state.
 
     DELIBERATELY NOT INSIDE the best-effort measurement block that surrounds its
-    caller. Two reasons, both load-bearing: a blocking interactive prompt must
-    not sit inside a handler documented as "may never degrade the run", and its
-    exceptions must not be silently eaten by a swallow-all meant for
+    caller: its exceptions must not be silently eaten by a swallow-all meant for
     measurement.
 
-    A BLOCKING GATE OPENS ONLY WHEN THE DRAIN IS ACTUALLY GOING TO RUN WORK:
-    the policy is not `off` AND there is something scoreable or something
-    already terminal to retry. Everything else — `off`, an empty queue, a queue
-    with nothing left to do — stays exactly as quiet as it was, because a prompt
-    at a boundary that was never going to block is just noise. That is what
-    preserves deferred evaluation: an ordinary reviewer round never starts
-    waiting for scoring.
-
-    THE NON-BLOCKING BRANCH STILL DRAINS, and that is not an oversight. With
-    nothing scoreable this is pure reconciliation rather than scoring: it is
-    what records the policy-off holds, and what RETIRES superseded candidates.
-    Returning early would mean a boundary whose only work is a retire set never
-    retires anything — and session end is exactly such a boundary, since it
-    closes every phase. Those entries would be re-partitioned and re-counted at
-    every boundary forever, which is the lifecycle trap this exists to close.
+    Nothing here waits for a decision: the drain always proceeds under the
+    effective policy. With nothing scoreable this is pure reconciliation rather
+    than scoring: it is what records the policy-off holds, and what RETIRES
+    superseded candidates. Returning early would mean a boundary whose only
+    work is a retire set never retires anything — and session end is exactly
+    such a boundary, since it closes every phase.
     """
-    def _drain(policy_value):
-        return drain_evaluations(
-            session_uuid, config=config, trace=trace, at=at,
-            closed_phases=closed_phases, effective_policy=policy_value,
-            session_factory=session_factory)
-
-    summary = drain_evaluations(
+    result = drain_evaluations(
         session_uuid, config=config, trace=trace, at=at,
         closed_phases=closed_phases, effective_policy=effective_policy,
-        mode="preview")
-    blocking = (effective_policy != "off"
-                and (summary.get("scoreable", 0)
-                     or summary.get("terminal_existing", 0)))
-    if not blocking:
-        result = _drain(effective_policy)
-        if any(result.get(key) for key in
-               ("pending_running", "drained_total", "held", "terminal_total")):
-            ui.render_drain_state(io_out, effective_policy, result,
-                                  blocking=False)
-        return result
-    # A drain that WILL block gets a distinct visible state and bounded, safe
-    # control. Headless and non-TTY runs get identical bookkeeping and identical
-    # counts with NO prompt: they continue.
-    #
-    # THE NON-TTY RULE IS LOAD-BEARING, not a nicety. Off a real terminal there
-    # is nobody to answer, so opening the gate would hand the question to
-    # whatever happens to be on stdin — a scripted run, a pipe, or a test
-    # harness — and wait. A drain that used to be silent must not be able to
-    # stall a non-interactive run. An INJECTED `ask_fn` is the deliberate
-    # exception: that is a caller supplying the answer itself.
-    action = "continue"
-    interactive = (ui.is_real_terminal(io_in)
-                   and ui.is_real_terminal(io_out))
-    if not headless and (ask_fn is not None or interactive):
-        try:
-            action = ui.drain_gate(io_in, io_out, effective_policy, summary,
-                                   ask_fn=ask_fn)
-        except (KeyboardInterrupt, EOFError):
-            # Walking away is `end`: nothing scored, the queue preserved.
-            action = "end"
-        except Exception:  # noqa: BLE001
-            # A NAMED failure of the render/prompt only — never the blanket
-            # measurement swallow — falling back to the non-interactive
-            # behavior rather than losing the drain entirely.
-            if trace:
-                trace.event("eval.gate.error", at=at)
-            action = "continue"
-    if action == "end":
-        # Nothing scored, nothing marked, every entry preserved.
-        return summary
-    if action == "hold":
-        queue_path = state_store.evaluation_queue_path_for(session_uuid)
-        records = evaluation.read_queue(queue_path)
-        for entry in evaluation.pending_entries(queue_path):
-            entry_id = entry.get("entry_id")
-            evaluation.mark_held(
-                queue_path, entry_id, held_reason="user_hold",
-                fold=evaluation.read_entry_lifecycle(records, entry_id))
-        # Recount from the durable state WITHOUT scoring — a preview, not a
-        # drain, so holding cannot score the very work it just held.
-        held_summary = drain_evaluations(
-            session_uuid, config=config, trace=trace, at=at,
-            closed_phases=closed_phases, effective_policy=effective_policy,
-            mode="preview")
-        ui.render_drain_state(io_out, effective_policy, held_summary,
-                              blocking=False)
-        return held_summary
-    if action == "retry":
-        retry_terminal_evaluations(session_uuid)
-    result = _drain(effective_policy)
-    ui.render_drain_state(io_out, effective_policy, result, blocking=False)
+        session_factory=session_factory)
+    if any(result.get(key) for key in
+           ("pending_running", "drained_total", "held", "terminal_total")):
+        transcript.render_drain_state(io_out, effective_policy, result)
     return result
-
-
-def retry_terminal_evaluations(session_uuid):
-    """Explicitly reopen every terminal entry in the queue. Returns the count.
-
-    Terminal work is NEVER released by a policy change or by another drain
-    coming round again — only by this, a deliberate user action. The retry is
-    LINKED to what came before (`prior_attempt_ref` names the terminal marker it
-    reopened) rather than overwriting it, so the earlier attempts stay readable:
-    a retry that erased its own history would make the second failure look like
-    the first.
-    """
-    queue_path = state_store.evaluation_queue_path_for(session_uuid)
-    if not os.path.exists(queue_path):
-        return 0
-    records = evaluation.read_queue(queue_path)
-    reopened = 0
-    for entry_id in {rec.get("entry_id") for rec in records
-                     if rec.get("entry_id")}:
-        fold = evaluation.read_entry_lifecycle(records, entry_id)
-        if fold.get("state") not in ("terminal", "failed_permanent"):
-            continue
-        history = fold.get("transition_history") or []
-        if evaluation.mark_retried(queue_path, entry_id,
-                                   prior_attempt_ref=(history[-1]
-                                                      if history else None)):
-            reopened += 1
-    return reopened
 
 
 def _score_queued_entry(entry, verification, session_uuid, config=None,
@@ -5282,6 +4661,18 @@ def context_update_block(text, assets_dir=None, revision=None):
         artifacts=[_shared_context_artifact(text, assets_dir, revision)])
 
 
+def _context_update_prefix(context_update, assets_dir=None, revision=None):
+    """The resumed reviewer's wake prefix: un-acked context TEXT is rendered
+    as a context-update block; an already-typed block (`run_flow` composed the
+    wake block with a decision record for this reviewer) is used as is, so
+    the answer never lands inside the context file."""
+    if not context_update:
+        return None
+    if isinstance(context_update, handoff.HandoffBlock):
+        return context_update
+    return context_update_block(context_update, assets_dir, revision)
+
+
 def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
                                      context_update=None, assets_dir=None,
                                      context_revision=None):
@@ -5291,10 +4682,8 @@ def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
     When the session context changed since the reviewer last acknowledged it
     (`context_update` is the un-acked context text), a context-update wake block
     referencing the persisted context FILE is prepended. No body is inlined."""
-    prefix = None
-    if context_update:
-        prefix = context_update_block(context_update, assets_dir,
-                                      context_revision)
+    prefix = _context_update_prefix(context_update, assets_dir,
+                                    context_revision)
     return handoff.render_handoff(
         "scout->scout-reviewer:review_resume",
         artifacts=_intel_artifacts(intel_path, intel_md_path),
@@ -5342,10 +4731,10 @@ def make_scout_reviewer_runner(intel_md_path, trace=None,
 
 
 # --------------------------------------------------------------------------- #
-# planner: the single user-facing voice of the planning phase, paired with the  #
+# planner: the single lead of the planning phase, paired with the              #
 # planning-advisor exactly as the scout pairs with the scout-reviewer. The      #
 # planner writes TWO artifacts: a plan JSON (machine deliverable and status     #
-# channel) and a human-first plan MD (the user's review surface).               #
+# channel) and a readable plan MD (the review surface).                        #
 # --------------------------------------------------------------------------- #
 
 
@@ -5355,7 +4744,7 @@ def assemble_planner_brief(plan_json_path, plan_md_path, caveman_available=None)
     return (
         "Write your plan as TWO files, to exactly these paths:\n"
         "  JSON (machine deliverable + your status channel): %s\n"
-        "  Markdown (the user's review surface, small scannable sections): %s\n"
+        "  Markdown (the readable review surface, small scannable sections): %s\n"
         "Those two plan files are your ONLY write targets. Do not create, edit, "
         "or delete any other file (reading/searching the repo is fine).\n\n%s"
         % (plan_json_path, plan_md_path, caveman_directive(caveman_available))
@@ -5368,7 +4757,7 @@ def assemble_planner_seed(intel_path, context, assets_dir=None,
     scout intel AND the shared session context, both carried by PATH via the
     shared transport. scout->planner is a cross-role handoff, so the context is
     persisted and referenced by path — never inlined (only the original
-    user->scout prompt inlines user text)."""
+    orchestrator->scout prompt inlines context text)."""
     artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
     artifacts.extend(_intel_artifacts(intel_path))
     return handoff.render_handoff("scout->planner:seed", artifacts=artifacts)
@@ -5376,7 +4765,7 @@ def assemble_planner_seed(intel_path, context, assets_dir=None,
 
 def intel_updated_block(intel_path):
     """Wake block (route 3, resume) for a resumed planner after a hand-back round
-    trip: the scout re-ran its full cycle and the user approved the UPDATED
+    trip: the scout re-ran its full cycle and the scout-reviewer approved the UPDATED
     intel. The intel is carried path-first via the shared transport."""
     return handoff.render_handoff(
         "scout->planner:intel_updated", artifacts=_intel_artifacts(intel_path))
@@ -5393,17 +4782,8 @@ def handoff_wake_block(payload, assets_dir=None):
             label="planner hand-back note")])
 
 
-def handoff_declined_text():
-    """Turn injected into the planner when the user declines the hand-back."""
-    return (
-        "The user DECLINED the hand-back to the scout. Continue planning with "
-        "the current intel; raise anything unresolved with the user directly "
-        "and update your plan status as appropriate."
-    )
-
-
 # --------------------------------------------------------------------------- #
-# builder: the single user-facing voice of the building phase, paired with the  #
+# builder: the single lead of the building phase, paired with the              #
 # build-reviewer exactly as the scout pairs with the scout-reviewer and the     #
 # planner with the planning-advisor. The builder edits the repository to        #
 # execute the approved plan; its status JSON is a status channel + verification  #
@@ -5418,20 +4798,20 @@ def assemble_builder_brief(build_status_path, build_summary_path=None,
     plan); the status file named here is only its status/verification channel,
     not a write restriction.
 
-    When `build_summary_path` is given, the builder ALSO emits a human-first
+    When `build_summary_path` is given, the builder ALSO emits a readable
     markdown summary at its self-audit (when it marks ready_for_review): the
-    user's review surface for the build, consistency-checked by the
+    review surface for the build, consistency-checked by the
     build-reviewer against the working-tree delta. It is a deliverable, not a
     write restriction (the builder still edits the whole repo)."""
     summary_note = ""
     if build_summary_path:
         summary_note = (
             "At your self-audit, when you mark the build ready_for_review, also "
-            "write a human-first markdown summary of the build to exactly this "
+            "write a readable markdown summary of the build to exactly this "
             "file:\n  %s\n"
             "Cover, in small scannable sections: a TL;DR; the changes by file; "
             "the verification results; any issues & deviations from the plan; "
-            "and anything left for the user. Keep it CONSISTENT with the actual "
+            "and anything left open. Keep it CONSISTENT with the actual "
             "working-tree changes and your status JSON.\n" % build_summary_path
         )
     return (
@@ -5441,7 +4821,8 @@ def assemble_builder_brief(build_status_path, build_summary_path=None,
         "handoff, and the result.verification log) — NOT a restriction on what "
         "you may edit. You execute the approved plan by editing the repository "
         "itself. Do NOT run any git commit or PR/branch tooling: approval ends "
-        "the run and leaves the changes in the working tree for the user.\n%s\n%s"
+        "the run and leaves the changes in the working tree for the "
+        "orchestrator.\n%s\n%s"
         % (build_status_path, summary_note,
            caveman_directive(caveman_available))
     )
@@ -5461,7 +4842,7 @@ def assemble_builder_seed(plan_json_path, plan_md_path, context,
 def plan_updated_block(plan_json_path, plan_md_path):
     """Wake block (route 6, resume) for a resumed builder after a hand-back round
     trip: the builder handed back to the planner, the planner re-planned, and the
-    user approved the UPDATED plan. The plan is carried path-first via the shared
+    planning-advisor approved the UPDATED plan. The plan is carried path-first via the shared
     transport."""
     return handoff.render_handoff(
         "planner->builder:plan_updated",
@@ -5479,20 +4860,11 @@ def plan_handback_wake_block(payload, assets_dir=None):
             label="builder hand-back note")])
 
 
-def handoff_declined_to_planner_text():
-    """Turn injected into the builder when the user declines the hand-back."""
-    return (
-        "The user DECLINED the hand-back to the planner. Continue building with "
-        "the current plan; raise anything unresolved with the user directly "
-        "and update your build status as appropriate."
-    )
-
-
 def _plan_artifacts(plan_json_path, plan_md_path):
     return [
         {"label": "plan JSON (machine source of truth)",
          "path": plan_json_path, "kind": "json", "source": "plan_json"},
-        {"label": "plan markdown (the user's review surface)",
+        {"label": "plan markdown (the readable review surface)",
          "path": plan_md_path, "kind": "markdown", "source": "plan_md"},
     ]
 
@@ -5525,10 +4897,8 @@ def assemble_advisor_resume_context(plan_json_path, plan_md_path,
     path) — plus a context-update wake block referencing the persisted context
     FILE when the session context changed since the advisor last acknowledged
     it. No body is inlined."""
-    prefix = None
-    if context_update:
-        prefix = context_update_block(context_update, assets_dir,
-                                      context_revision)
+    prefix = _context_update_prefix(context_update, assets_dir,
+                                    context_revision)
     return handoff.render_handoff(
         "planner->planning-advisor:review_resume",
         artifacts=_plan_artifacts(plan_json_path, plan_md_path),
@@ -5805,7 +5175,7 @@ def assemble_worktree_brief(status_path, base_toplevel, name, explicit):
     return (
         "You are the cowork worktree role. Create a git worktree for the "
         "repository below, FOLLOWING that repository's own worktree "
-        "convention, WITHOUT asking the user anything.\n\n"
+        "convention, WITHOUT asking for input.\n\n"
         "Base repository (git work-tree toplevel): %s\n"
         "Desired worktree/branch name: %s\n\n"
         "Steps:\n"
@@ -5837,7 +5207,7 @@ def assemble_worktree_brief(status_path, base_toplevel, name, explicit):
 
 
 def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
-                 io_in=None, io_out=None, session_factory=None,
+                 io_out=None, session_factory=None,
                  claude_spawn=None, session_uuid=None, trace=None,
                  extra_writable_dir=None):
     """Spawn ONE agent (controller from --wt-controller) to create the worktree,
@@ -5848,7 +5218,6 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
     `wt_config` is the single-role config dict {controller, yolo, mode}. The
     role runs with execution enabled (yolo) so it can run `git worktree add`
     (D5). `session_factory` is injectable for tests."""
-    io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     controller = wt_config["controller"]
     # Fail-closed order: check policy FIRST (cheap, no side effects) so a
@@ -5917,8 +5286,8 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
         trace.event("worktree.run.start", controller=controller,
                     base_toplevel=base_toplevel, worktree_name=name,
                     explicit=explicit, status_path=status_path)
-    ui.banner(io_out, "worktree — creating a git worktree for this session\n"
-              "name → %s\nbase → %s" % (name, base_toplevel), "start")
+    transcript.notice(io_out, "worktree — creating a git worktree for this session\n"
+              "name → %s\nbase → %s" % (name, base_toplevel))
     io_out.flush()
 
     if controller == "claude":
@@ -5926,13 +5295,11 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
         if session_factory:
             session = session_factory("claude")
         else:
-            ok, alert = _with_status_spinner(
-                io_out, "starting worktree role",
-                lambda: bridge.probe_claude_stream_json(
+            ok, alert = bridge.probe_claude_stream_json(
                     spawn, mode=wt_config["mode"], yolo=wt_config["yolo"],
                     role_prompt_file=WORKTREE_PROMPT_PATH, trace=trace,
                     role=WORKTREE_ROLE, extra_writable_dir=extra_writable_dir,
-                    cache_enabled=True))
+                    cache_enabled=True)
             if not ok:
                 _decide_and_trace(
                     trace, WORKTREE_ROLE, controller, "worktree",
@@ -6023,12 +5390,14 @@ def assemble_repo_discovery_note(candidates, base=None):
     return (
         "Repository discovery (computed for you from the launch folder):\n"
         "%s%s\n\n"
-        "Your discovery responsibility: confirm with the user WHICH of these "
-        "git roots the ticket actually touches, and record the chosen subset in "
-        "your intel (result.repos, with a `selected` flag per root, plus "
+        "Your discovery responsibility: determine WHICH of these git roots the "
+        "ticket actually touches, and record the chosen subset in your intel "
+        "(result.repos, with a `selected` flag per root, plus "
         "result.repo_discovery). When exactly ONE root was discovered (including "
-        "an ancestor or fallback single-root outcome), take it as the set and "
-        "skip the confirmation question; ask only when 2+ candidate roots exist."
+        "an ancestor or fallback single-root outcome), take it as the set. With "
+        "2+ candidates, decide from the context and record the choice in "
+        "result.assumptions; use needs_input only when the context cannot "
+        "decide it."
         % (base_line, lines))
 
 
@@ -6157,7 +5526,7 @@ def _build_reviewer_artifacts(plan_json_path, plan_md_path, build_status_path,
          "path": build_status_path, "kind": "json", "source": "build_status"},
     ]
     if build_summary_path:
-        arts.append({"label": "builder markdown summary (the user's review "
+        arts.append({"label": "builder markdown summary (the readable review "
                      "surface)", "path": build_summary_path, "kind": "markdown",
                      "source": "build_summary"})
     if verification_receipt_path:
@@ -6261,7 +5630,7 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
     artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
     ctx = {"repos": list(baseline_repos or [])}
     if context_update:
-        ctx["context_update_prefix"] = context_update_block(
+        ctx["context_update_prefix"] = _context_update_prefix(
             context_update, assets_dir, context_revision)
     facts = {"team": []}
     if verification_overlay:
@@ -6421,7 +5790,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     The reviewer writes its verdict to `review_path`; we read it back via
     `state_store.read_review` (the review file is the handoff channel because the
     session bridges stream to io_out and return no value). Its raw stream goes to
-    a quiet sink so nothing reaches the user. On any failure or missing/malformed
+    a quiet sink so nothing reaches the transcript. On any failure or missing/malformed
     file, read_review yields a safe non-approving `revise` (or None, which the
     caller treats as revise)."""
     prompt_path = prompt_path or SCOUT_REVIEWER_PROMPT_PATH
@@ -6477,8 +5846,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
              else "policy_blocked"},
             alert=None if manifest_refused else _rdec["refusal_message"])
     quiet = _QuietSink()
-    # When `surface_io_out` is set the REVIEW turn streams to the user on the
-    # wholly-internal (dim) channel under the reviewer's own label; otherwise it
+    # When `surface_io_out` is set the REVIEW turn streams to the transcript
+    # under the reviewer's own label; otherwise it
     # goes to the quiet sink, byte-identical to the historical hidden behavior.
     # The reviewer's peer-eval send always stays muted (D-eval-stays-muted).
     surface = surface_io_out is not None
@@ -6690,69 +6059,64 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     return verdict
 
 
-# Banner text producers. The text is rendered through ui.banner (a gum-styled box
-# on a TTY, plain text otherwise). The full intel path is shown once, in the start
-# banner; later banners use the shortened form (#11/#12). Keyword substrings
-# ("needs your input", "ready for review", "scout finished") are preserved so the
-# non-TTY/test path can assert them.
+# Transcript notice producers (written through `transcript.notice`). Keyword
+# substrings ("needs input", "ready for review", "scout finished") are part of
+# the transcript tests assert on.
 
 
-def scout_start_text(intel_path, resuming=False, enabled=False):
+def scout_start_text(intel_path, resuming=False):
     if resuming:
         head = (
-            "scout — resuming our previous session\n"
-            "Picking up where we left off with the earlier context (no goal prompt "
-            "needed). To start fresh instead, run with --no-session; to redirect, "
-            "pass --context. Ctrl-C aborts."
+            "scout — resuming the saved session\n"
+            "Continuing from the saved context. Pass --new for a fresh session "
+            "or --context to redirect this one."
         )
     else:
         head = (
             "scout — gathering context\n"
-            "I'll investigate, ask what I need, and propose options. I finish on my\n"
-            "own once we agree. You drive — answer my questions. Ctrl-C aborts."
+            "Investigating and writing the intel; the scout-reviewer decides "
+            "approval. An open question stops the run for the orchestrator."
         )
-    return head + "\nintel → %s" % ui.render_path(intel_path, enabled)
+    return head + "\nintel → %s" % transcript.render_path(intel_path)
 
 
 def scout_needs_input_text():
-    return "scout needs your input"
+    return "scout needs input — stopping for the orchestrator"
 
 
-def scout_review_text(intel_path, enabled=False):
-    return "scout intel ready for review — %s" % ui.render_path(
-        intel_path, enabled)
+def scout_review_text(intel_path):
+    return "scout intel ready for review — %s" % transcript.render_path(intel_path)
 
 
-def scout_done_text(intel_path, enabled=False):
-    return "scout finished — intel → %s" % ui.render_path(intel_path, enabled)
+def scout_done_text(intel_path):
+    return "scout finished — intel → %s" % transcript.render_path(intel_path)
 
 
-def planner_start_text(plan_md_path, resuming=False, enabled=False):
+def planner_start_text(plan_md_path, resuming=False):
     if resuming:
         head = (
-            "planner — resuming our previous planning session\n"
-            "Picking up where we left off. Ctrl-C aborts."
+            "planner — resuming the saved planning session\n"
+            "Continuing from the saved context."
         )
     else:
         head = (
             "planner — planning from the approved intel\n"
-            "I'll draft the plan, ask what I need, and mark it ready when we "
-            "agree. You drive — answer my questions. Ctrl-C aborts."
+            "Drafting the plan; the planning-advisor decides approval. An open "
+            "question stops the run for the orchestrator."
         )
-    return head + "\nplan → %s" % ui.render_path(plan_md_path, enabled)
+    return head + "\nplan → %s" % transcript.render_path(plan_md_path)
 
 
 def planner_needs_input_text():
-    return "planner needs your input"
+    return "planner needs input — stopping for the orchestrator"
 
 
-def planner_review_text(plan_md_path, enabled=False):
-    return "plan ready for review — %s" % ui.render_path(plan_md_path, enabled)
+def planner_review_text(plan_md_path):
+    return "plan ready for review — %s" % transcript.render_path(plan_md_path)
 
 
-def planner_done_text(plan_md_path, enabled=False):
-    return "planner finished — plan approved → %s" % ui.render_path(
-        plan_md_path, enabled)
+def planner_done_text(plan_md_path):
+    return "planner finished — plan approved → %s" % transcript.render_path(plan_md_path)
 
 
 def handoff_gate_text(payload):
@@ -6760,46 +6124,45 @@ def handoff_gate_text(payload):
             "handoff note:\n%s" % (payload or "").strip())
 
 
-def builder_start_text(build_surface_path, resuming=False, enabled=False):
+def builder_start_text(build_surface_path, resuming=False):
     if resuming:
         head = (
-            "builder — resuming our previous build session\n"
-            "Picking up where we left off. Ctrl-C aborts."
+            "builder — resuming the saved build session\n"
+            "Continuing from the saved context."
         )
     else:
         head = (
             "builder — building from the approved plan\n"
-            "I'll make the changes, verify them, and mark the build ready when "
-            "it's done. You drive — answer my questions. Ctrl-C aborts."
+            "Making and verifying the changes; the build-reviewer decides "
+            "approval. An open question stops the run for the orchestrator."
         )
     # The review surface is the build summary when one is wired (mirrors the
     # scout's intel.md / planner's plan.md start banner); falls back to the
     # status file when no summary path is given.
-    return head + "\nsummary → %s" % ui.render_path(build_surface_path, enabled)
+    return head + "\nsummary → %s" % transcript.render_path(build_surface_path)
 
 
 def builder_needs_input_text():
-    return "builder needs your input"
+    return "builder needs input — stopping for the orchestrator"
 
 
-def builder_review_text(build_status_path, enabled=False, overlay=None,
+def builder_review_text(build_status_path, overlay=None,
                         receipt_path=None, agent_status_path=None):
-    """The building-phase human-gate banner line, plus — when an owned
+    """The building-phase review-surface banner line, plus — when an owned
     verification receipt binds the current candidate (ORCH-050/UX-021) — the
     derived overlay block: owned facts, the separately-labeled agent prose
     pointer, and the contradiction warning. With no overlay the historical
     one-line banner is returned byte-identically."""
-    text = "build ready for review — %s" % ui.render_path(
-        build_status_path, enabled)
+    text = "build ready for review — %s" % transcript.render_path(build_status_path)
     block = render_verification_overlay_block(
         overlay, receipt_path=receipt_path,
         agent_status_path=agent_status_path)
     return text + block if block else text
 
 
-def builder_done_text(build_status_path, enabled=False):
+def builder_done_text(build_status_path):
     return ("builder finished — review your working tree → %s"
-            % ui.render_path(build_status_path, enabled))
+            % transcript.render_path(build_status_path))
 
 
 def builder_handoff_gate_text(payload):
@@ -6822,9 +6185,9 @@ SkipBaseline = collections.namedtuple(
 
 
 # The single, historical `_role_loop`/run_* outcome string for "this role's
-# turn loop ended without an approval, a handoff, or a controller switch" —
-# EOF, /quit, /stop, a controller failure, a stuck gate, or a pre-loop
-# refusal (manifest/policy/probe/start) all collapse to this ONE outward
+# turn loop ended on a failure" — a turn that wrote no status, a controller
+# failure, an unresolved no-op, an unusable reviewer, or a pre-loop refusal
+# (manifest/policy/probe/start) all collapse to this ONE outward
 # value, which `run_flow` and the existing test suite depend on byte-for-byte
 # (see e.g. test_run_flow_traces_context_and_saved_session and every
 # `self.assertEqual(outcome, "ended")` in test_cowork.py). M2 Package E does
@@ -6843,122 +6206,124 @@ _OUTCOME_ENDED = "ended"
 # a stale "still productive" append landing after it.
 _ACTIVITY_SHUTDOWN_EVENT = threading.Event()
 
-# M4 Package D: headless refusal/no-first-token, no-fallback termination
+# M4 Package D: provider refusal/no-first-token, no-fallback termination
 # (see `_role_loop`'s send-failure seam). One literal nonzero code, outside
 # {0,1,2,130} (this file's own pre-existing rc/KeyboardInterrupt/EOFError
 # literals) and outside 128..255 (every signal-exit range this file's own
 # SIGTERM handler -- `128 + signum` -- and every real POSIX signal number
 # already occupy).
-HEADLESS_REFUSAL_EXIT_CODE = 17
+PROVIDER_REFUSAL_EXIT_CODE = 17
 
-# `_role_loop` outcome naming a headless run that terminated the WHOLE
+# `_role_loop` outcome naming a run that terminated the WHOLE
 # process (never merely ended one phase) because a send failure was a
 # typed provider refusal or a first-token-deadline expiry, with no fallback
 # available -- distinct from the ordinary `_OUTCOME_ENDED` (which leaves the
 # process exit code at 0).
-_OUTCOME_HEADLESS_TERMINATED = "headless_terminated"
+_OUTCOME_PROCESS_TERMINATED = "process_terminated"
+
+# `_role_loop` outcome naming a phase that STOPPED without approval because
+# it needs something this process cannot supply: an answer, an explicit
+# authorization, or a usable reviewer. Never an approval; the phase is not
+# advanced and the session stays resumable. `payload` is the structured
+# request built by `_agent_stop_payload`.
+_OUTCOME_STOPPED = "stopped"
+
+# What a stop needs from the orchestrator (the closed `requires` vocabulary).
+AGENT_STOP_REQUIREMENTS = ("answer", "authorization", "reviewer", "operator")
 
 
-# Returned by the turn readers to mean "end the conversation" (EOF / Ctrl-D /
-# explicit /quit), distinct from a blank line (which re-prompts).
-_END = object()
+def _agent_stop_payload(kind, role, requires, **facts):
+    """The structured, non-approving request a stopped phase reports.
 
-# Returned by the dissent review gate to mean "hand the reviewer's unresolved
-# findings back to the role for another pass" — the user opted to keep
-# iterating without writing their own feedback.
-_ITERATE = object()
-
-# Tags the ('_ASK', text) marker tuple returned by _read_review when the user
-# picks "Ask a question" at the review gate: the question is answered in chat
-# WITHOUT reopening work, editing the artifact, or re-running the advisor.
-_ASK = object()
-
-# Returned by the gate readers when the user picks the non-default "Stop"
-# choice (TTY only). _role_loop maps it to the clean-end path
-# (outcome_kind='ended'): no approval, no revision turn, no done banner — the
-# same terminal outcome as an off-TTY 'end', so run_flow never advances the
-# phase and the saved (resumable) session record is left intact.
-_STOP = object()
+    `kind` names the gate that stopped; `requires` is one of
+    AGENT_STOP_REQUIREMENTS. `None`-valued facts are dropped so the record
+    carries only what was actually observed."""
+    if requires not in AGENT_STOP_REQUIREMENTS:
+        raise ValueError("unknown stop requirement %r" % (requires,))
+    out = {"kind": kind, "role": role, "requires": requires,
+           "approved": False}
+    for key, value in facts.items():
+        if value is not None:
+            out[key] = value
+    return out
 
 
-# The phase- and team-aware facts run_flow supplies about what approval at a
-# given gate does, so the gate readers can render concise consequence previews
-# beside every choice. Built by make_gate_preview and threaded through the
-# run_* helpers into _role_loop, which passes it into the readers. When None
-# (the historical default) the readers keep their plain, preview-free labels so
-# no existing caller or test regresses.
-GatePreview = collections.namedtuple(
-    "GatePreview",
-    ["approve_suffix",    # e.g. 'continue to planning' | 'intel is the deliverable'
-     "terminal",          # True when approving ends the run (drives 'finish' wording)
-     "next_phase",        # 'planning' | 'building' | None (dissent approve-anyway)
-     "resuming_role",     # 'scout' | 'planner' | 'builder' (request-changes/ask/iterate/tell)
-     "artifact_noun",     # 'intel' | 'plan' | 'build' (ask 'stays as-is' clause)
-     "session_enabled"])  # drives the Stop label variant
+def _handoff_request_digest(note):
+    """Content digest of one hand-back payload (traced beside the gate
+    decision; the orchestrator-facing id is the decision request_id)."""
+    return hashlib.sha256(
+        str(note).encode("utf-8", "replace")).hexdigest()
 
 
-# The per-role approve descriptor: (next_phase_name, terminal_suffix, noun).
-# next_phase_name is None for the builder (approval is always terminal).
-_GATE_APPROVE = {
-    "scout": ("planning", "intel is the deliverable", "intel"),
-    "planner": ("building", "plan is the deliverable", "plan"),
-    "builder": (None, "review your working tree", "build"),
-}
+_DECISION_VIEW_KEYS = ("request_id", "kind", "role", "phase", "requires",
+                       "question", "handoff", "findings", "state")
 
 
-def make_gate_preview(role, downstream_on_team, session_enabled):
-    """Build the GatePreview for `role`'s review gate. `downstream_on_team` is
-    whether the phase that approval would chain into has its lead on the team
-    (a planner for the scout gate, a builder for the planner gate; ignored for
-    the always-terminal builder gate). Terminality — and thus whether 'finish'
-    appears — depends on that downstream membership, not the phase alone."""
-    next_phase_name, terminal_suffix, artifact_noun = _GATE_APPROVE[role]
-    if next_phase_name and downstream_on_team:
-        return GatePreview(
-            approve_suffix="continue to %s" % next_phase_name,
-            terminal=False, next_phase=next_phase_name, resuming_role=role,
-            artifact_noun=artifact_noun, session_enabled=session_enabled)
-    return GatePreview(
-        approve_suffix=terminal_suffix, terminal=True, next_phase=None,
-        resuming_role=role, artifact_noun=artifact_noun,
-        session_enabled=session_enabled)
+def _decision_request_view(request):
+    """The run-result `stop` view of a decision request record (or None)."""
+    if not isinstance(request, dict):
+        return None
+    view = {key: request.get(key) for key in _DECISION_VIEW_KEYS
+            if request.get(key) is not None}
+    view["approved"] = False
+    return view
 
 
-def _preview_approve_label(preview):
-    lead = "Approve & finish" if preview.terminal else "Approve"
-    return "%s — %s" % (lead, preview.approve_suffix)
+def _decision_candidate_changed(request):
+    """True when the artifact a stopped phase left behind no longer has the
+    bytes it had when the request was opened: a response written for that
+    state would be applied to different work."""
+    path = (request or {}).get("status_path")
+    expected = (request or {}).get("status_sha256")
+    if not path:
+        return False
+    return state_store.fingerprint_status(path)["sha256"] != expected
 
 
-def _preview_ask_label(preview):
-    return ("Ask a question — answered in chat; the %s stays as-is"
-            % preview.artifact_noun)
+def _decision_response_hint(request):
+    kinds = state_store.DECISION_RESPONSES.get((request or {}).get("kind"), ())
+    rid = (request or {}).get("request_id")
+    if "answer" in kinds:
+        return "--answer %s --context-file <answer>" % rid
+    return " or ".join("--%s %s" % (k.replace("_", "-"), rid) for k in kinds)
 
 
-def _preview_changes_label(preview):
-    return ("Request changes — the %s revises; you'll be asked for feedback"
-            % preview.resuming_role)
+HANDOFF_DECLINED_NOTE = (
+    "[orchestrator decision] Your hand-back request to the %s was DECLINED. "
+    "Do not hand back again for the same reason: continue your own phase "
+    "with the approved inputs you already have. Your status file was moved "
+    "from handoff_back to needs_input; rewrite it with the correct status "
+    "when your turn ends.")
 
 
-def _preview_stop_label(preview):
-    if preview.session_enabled:
-        return "Stop — session remains resumable"
-    return "Stop — end this run without approving"
+def _handoff_declined_fragment(to_role):
+    """The one closed runtime note delivered to a lead whose hand-back the
+    orchestrator declined."""
+    return handoff._static_role_text(
+        HANDOFF_DECLINED_NOTE % (to_role or "pre-processor"))
 
 
-def _preview_dissent_iterate_label(preview):
-    return ("Keep iterating — hand the reviewer's findings back to the %s"
-            % preview.resuming_role)
+def decision_answer_block(answer_path):
+    """The typed block (route 14) that delivers one orchestrator answer to the
+    lead whose phase stopped on the request -- by PATH, never inlined."""
+    return handoff.render_handoff(
+        "orchestrator->lead:decision_answer",
+        artifacts=[{"label": "answer", "path": os.path.abspath(answer_path),
+                    "kind": "markdown", "source": "answer"}])
 
 
-def _preview_dissent_tell_label(preview):
-    return ("Tell it what to do — your instructions go to the %s"
-            % preview.resuming_role)
-
-
-def _preview_dissent_approve_label(preview):
-    if preview.terminal:
-        return "Approve & finish anyway — accept despite the reviewer"
-    return "Approve anyway — continue to %s" % preview.next_phase
+def decision_record_block(answers):
+    """The typed block that makes every earlier orchestrator answer available
+    beside the original brief, or None when the session has none."""
+    paths = [a.get("answer_path") for a in answers or ()
+             if a.get("answer_path")]
+    if not paths:
+        return None
+    return handoff.render_handoff(
+        "orchestrator->role:decision_record",
+        artifacts=[{"label": "answer", "path": os.path.abspath(path),
+                    "kind": "markdown", "source": "answer"}
+                   for path in paths])
 
 
 def _pending_question(status_path):
@@ -6997,304 +6362,17 @@ def _pending_question(status_path):
 def _missing_question_repair_prompt(artifact="intel"):
     return (
         "Your %s status says `needs_input`, but its JSON records no non-empty "
-        "`result.pending_question`. Repair the status artifact now: if a user "
-        "decision is truly required, record the exact question in "
-        "`result.pending_question`, keep `status: needs_input`, and ask that "
-        "same question plainly in your reply. If no decision is required, "
-        "finish the work and set `status: ready_for_review`. Do not wait for "
-        "an answer until the artifact contains the question." % artifact)
-
-
-def _read_turn(io_in, io_out):
-    """Read one working-turn reply. Blank input and a cancelled editor re-prompt;
-    only EOF or an explicit /quit (or /stop) ends the loop (#4/#10)."""
-    while True:
-        ui.turn_separator(io_out)
-        reply = ui.prompt_user(io_in, io_out, header="your answer")
-        if reply is ui.EOF:        # input exhausted / Ctrl-D — end
-            return _END
-        if reply is ui.CANCEL:     # editor dismissed — discard draft, re-prompt
-            continue
-        if reply.strip() == "":    # blank line — re-prompt, never abort (#10)
-            continue
-        if reply.strip() in ("/quit", "/stop"):
-            return _END
-        return reply
-
-
-def _gate_trace_callbacks(trace, role):
-    """The (on_discard, on_drain_fail) pair every protected gate reader takes.
-
-    Tracing lives here rather than in cowork_ui so the UI layer keeps no trace
-    dependency, and so the emitted fields are assertable in a plain unit test.
-    Neither closure ever calls cowork_trace.prompt_meta: a hash of discarded
-    input is content-derived and is forbidden by the discard policy. `errno_name`
-    is a symbolic errno such as 'ENOTTY', never a message that could carry user
-    data.
-
-    Both closures match cowork_ui's single declared callback signature exactly,
-    and Trace.event drops None-valued fields, so `input.drain_failed` carries no
-    `reopens` key and `input.gate_abandoned` carries neither `errno` nor
-    `typeahead_cleared`. With no trace both are None, which the ui wrappers read
-    as 'do not report'.
-
-    Event routing is by OUTCOME, not by channel: `reopen_limit` is the only
-    reason that is a policy give-up rather than a boundary failure, so it alone
-    becomes `input.gate_abandoned`. Every genuine failure to clear a stale-input
-    channel — `tcflush`, `typeahead`, `key_queue` — is an `input.drain_failed`
-    whose `reason` field names the channel. A new channel therefore cannot
-    silently be traced as an abandonment."""
-    if not trace:
-        return None, None
-
-    def on_discard(gate, epoch, phase, count):
-        trace.event("input.discarded", role=role, gate=gate, epoch=epoch,
-                    phase=phase, chars=count)
-
-    def on_drain_fail(gate, epoch, phase, reason, errno_name,
-                      typeahead_cleared, reopens):
-        trace.event(
-            "input.gate_abandoned" if reason == "reopen_limit"
-            else "input.drain_failed",
-            role=role, gate=gate, epoch=epoch, phase=phase, reason=reason,
-            errno=errno_name, typeahead_cleared=typeahead_cleared,
-            reopens=reopens)
-
-    return on_discard, on_drain_fail
-
-
-def _read_review(io_in, io_out, allow_ask=True, preview=None,
-                 on_discard=None, on_drain_fail=None):
-    """At ready_for_review, decide approve-vs-(ask)-vs-revise.
-
-    With `allow_ask` (the scout intel gate and planner plan gate) a TTY shows a
-    questionary select: 'Ask a question' / 'Request changes' / 'Approve &
-    finish', plus a 'Stop' when a `preview` is supplied. Without `allow_ask`
-    (the builder build gate) a TTY with a `preview` shows a 3-way select —
-    Request changes / Approve & finish / Stop — while a preview-less call keeps
-    the binary confirm 'Approve & finish?' contract, now defaulting to No. Off a
-    TTY both keep the historical blank=finish / text=revise contract (no Stop)
-    so the scripted/test path is unchanged.
-
-    Approve is never the highlighted choice and never happens by omission: blank,
-    whitespace-only, cancelled and end-of-input feedback all re-open the gate,
-    and a dismissed menu stops. The ONLY route to _END is an explicit approve
-    selection (or an explicit Yes at the confirm) made after activation.
-
-    When `preview` (a GatePreview) is given, every choice label carries a short,
-    phase- and team-aware consequence; when None the plain labels are used.
-
-    Returns _END to approve & finish, _STOP for the Stop choice, a dismissed
-    menu such as Ctrl-C, or a failed input boundary (clean exit), the
-    ('_ASK', text) marker tuple to ask a question (answered in chat without
-    reopening work; only when `allow_ask`), or revision feedback."""
-    if ui.is_tty(io_in) and ui.is_tty(io_out):
-        if not allow_ask:
-            if preview is None:
-                # Builder gate, preview-less: the binary confirm contract, now
-                # default=No and looping, so nothing finishes by omission.
-                while True:
-                    approved = ui.confirm(
-                        "Approve & finish?", default=False,
-                        io_in=io_in, io_out=io_out, gate="ready_for_review",
-                        on_discard=on_discard, on_drain_fail=on_drain_fail)
-                    if approved is ui.DRAIN_FAILED:
-                        return _STOP
-                    if approved:
-                        return _END
-                    fb = ui.prompt_user(io_in, io_out,
-                                        header="Revise — your feedback",
-                                        gate="review_feedback",
-                                        on_discard=on_discard,
-                                        on_drain_fail=on_drain_fail)
-                    if fb is ui.DRAIN_FAILED:
-                        return _STOP
-                    if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
-                        # Nothing typed: re-ask rather than finish. Blank or
-                        # cancelled feedback must never be read as a sign-off.
-                        continue
-                    return fb
-            # Builder gate with a preview: a 3-way select so every consequence
-            # is visible before selection — Request changes / Approve & finish /
-            # Stop, with approve deliberately not the highlighted choice.
-            while True:
-                choice = ui.select(
-                    "Ready for review — what now?",
-                    [("changes", _preview_changes_label(preview)),
-                     ("approve", _preview_approve_label(preview)),
-                     ("stop", _preview_stop_label(preview))],
-                    io_in=io_in, io_out=io_out, gate="ready_for_review",
-                    on_discard=on_discard, on_drain_fail=on_drain_fail)
-                if choice is ui.DRAIN_FAILED:
-                    return _STOP
-                if choice == "approve":
-                    return _END
-                if choice == "stop" or choice is None:
-                    # Questionary returns None for a dismissed menu, including
-                    # a single Ctrl-C.  Cancellation follows the explicit Stop
-                    # path; it must never be reinterpreted as a revision.
-                    return _STOP
-                # 'changes': request changes. Blank or cancelled feedback
-                # re-opens the gate — it is never an approval.
-                fb = ui.prompt_user(io_in, io_out,
-                                    header="Request changes — your feedback",
-                                    gate="review_feedback",
-                                    on_discard=on_discard,
-                                    on_drain_fail=on_drain_fail)
-                if fb is ui.DRAIN_FAILED:
-                    return _STOP
-                if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
-                    continue
-                return fb
-        approve_label = (_preview_approve_label(preview) if preview is not None
-                         else "Approve & finish")
-        ask_label = (_preview_ask_label(preview) if preview is not None
-                     else "Ask a question")
-        changes_label = (_preview_changes_label(preview) if preview is not None
-                         else "Request changes")
-        # 'Ask a question' leads: the highlighted choice must change nothing.
-        choices = [("ask", ask_label),
-                   ("changes", changes_label),
-                   ("approve", approve_label)]
-        if preview is not None:
-            choices.append(("stop", _preview_stop_label(preview)))
-        while True:
-            choice = ui.select("Ready for review — what now?", choices,
-                               io_in=io_in, io_out=io_out,
-                               gate="ready_for_review",
-                               on_discard=on_discard,
-                               on_drain_fail=on_drain_fail)
-            if choice is ui.DRAIN_FAILED:
-                return _STOP
-            if choice == "approve":
-                return _END
-            if choice == "stop" or choice is None:
-                # A dismissed Questionary menu (notably Ctrl-C) is the same
-                # clean non-approving outcome as the visible Stop choice —
-                # cancelling a gate is never an approval.
-                return _STOP
-            if choice == "ask":
-                q = ui.prompt_user(io_in, io_out, header="Your question",
-                                   gate="review_question",
-                                   on_discard=on_discard,
-                                   on_drain_fail=on_drain_fail)
-                if q is ui.DRAIN_FAILED:
-                    return _STOP
-                if q is ui.CANCEL or q is ui.EOF or q.strip() == "":
-                    # Nothing typed: re-show the gate rather than approve — a
-                    # blank question must never be read as a sign-off.
-                    continue
-                return (_ASK, q)
-            # 'changes': request changes. Blank or cancelled feedback re-opens
-            # the gate, exactly like the blank-question path above.
-            fb = ui.prompt_user(io_in, io_out,
-                                header="Request changes — your feedback",
-                                gate="review_feedback",
-                                on_discard=on_discard,
-                                on_drain_fail=on_drain_fail)
-            if fb is ui.DRAIN_FAILED:
-                return _STOP
-            if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
-                continue
-            return fb
-    line = io_in.readline()
-    if line == "" or line.strip() == "":
-        return _END
-    return line.rstrip("\n")
-
-
-def _read_review_dissent(io_in, io_out, preview=None,
-                         on_discard=None, on_drain_fail=None):
-    """The `ready_for_review` gate when the reviewer's round cap was exhausted
-    without approval. On a TTY a questionary select — the safe default (Enter)
-    keeps iterating on the reviewer's feedback, so unresolved dissent is never
-    approved by accident. 'Tell it what to do' prompts for custom instructions;
-    blank custom input falls back to iterating. A dismissed preview-enabled
-    menu (including Ctrl-C) follows Stop. With a
-    `preview` (a GatePreview) a fourth non-default 'Stop' choice is added and
-    every label carries a phase-truthful consequence — the approve-anyway label
-    reads 'Approve & finish anyway' only when approval is terminal, else
-    'Approve anyway — continue to <phase>'. Off a TTY it keeps the historical
-    blank=finish / text=revise contract (no Stop) so the scripted/test path is
-    unchanged.
-
-    Returns _END to approve & finish, _STOP for the non-default Stop choice,
-    menu cancellation, or a failed input boundary (clean exit), _ITERATE to hand
-    the reviewer's unresolved findings back to the role, or the custom feedback
-    text."""
-    if ui.is_tty(io_in) and ui.is_tty(io_out):
-        if preview is not None:
-            choices = [
-                ("iterate", _preview_dissent_iterate_label(preview)),
-                ("tell", _preview_dissent_tell_label(preview)),
-                ("approve", _preview_dissent_approve_label(preview)),
-                ("stop", _preview_stop_label(preview))]
-        else:
-            choices = [
-                ("iterate", "Keep iterating on the reviewer's feedback"),
-                ("tell", "Tell it what to do"),
-                ("approve", "Approve & finish anyway")]
-        choice = ui.select(
-            "Reviewer still requests changes — what now?", choices,
-            io_in=io_in, io_out=io_out, gate="review_dissent",
-            on_discard=on_discard, on_drain_fail=on_drain_fail)
-        if choice is ui.DRAIN_FAILED:
-            return _STOP
-        if choice == "approve":
-            return _END
-        if choice == "stop" or (choice is None and preview is not None):
-            # Questionary cancellation/Ctrl-C follows the explicit Stop path
-            # on every preview-enabled real-flow gate.
-            return _STOP
-        if choice == "tell":
-            fb = ui.prompt_user(io_in, io_out, header="Your instructions",
-                                gate="review_dissent_tell",
-                                on_discard=on_discard,
-                                on_drain_fail=on_drain_fail)
-            if fb is ui.DRAIN_FAILED:
-                return _STOP
-            if fb is ui.CANCEL or fb is ui.EOF or fb.strip() == "":
-                return _ITERATE
-            return fb
-        # 'iterate' (or a dismissed legacy preview-less select): the safe
-        # non-approving default.
-        return _ITERATE
-    line = io_in.readline()
-    if line == "" or line.strip() == "":
-        return _END
-    return line.rstrip("\n")
-
-
-def _dissent_suffix(verdict):
-    """A short, user-visible note attached to the review gate when the reviewer's
-    concerns were not resolved within the round cap."""
-    header = ("\nreview cap reached (%d rounds) — reviewer still requests "
-              "changes; you are the tiebreaker." % REVIEW_ROUND_CAP)
-    findings = (verdict or {}).get("findings") or []
-    if not findings:
-        # No specific findings (e.g. a missing/unreadable review): still tell the
-        # user the reviewer did not sign off, rather than implying a clean pass.
-        return header + "\nreviewer's unresolved notes:\n  - reviewer did not " \
-               "approve within the review round cap."
-    return header + "\nreviewer's unresolved notes:\n" + "\n".join(
-        "  - " + str(f) for f in findings)
-
-
-# Returned by the stuck-gate reader (the visible escalation shown when an
-# automatic repair turn also fails to change the status artifact).
-_STUCK_RETRY = object()
-_STUCK_INSPECT = object()
-_STUCK_END = object()
-_STUCK_SWITCH = object()
-
-_CTRL_RETRY = object()
-_CTRL_SWITCH = object()
-_CTRL_END = object()
+        "`result.pending_question`. Repair the status artifact now: if a "
+        "decision that needs authority is truly required, record the exact, "
+        "self-contained question in `result.pending_question` and keep "
+        "`status: needs_input` (the run then stops for the orchestrator). If "
+        "no such decision is required, finish the work and set "
+        "`status: ready_for_review`." % artifact)
 
 
 def _repair_prompt(artifact_noun):
     """The firm, role-parameterized instruction sent on the single automatic
-    repair turn (and on a user-driven stuck-gate retry). It tells the role that
+    repair turn. It tells the role that
     its status artifact did not change on disk and that the harness gates on the
     literal on-disk `status` field, not on what the role claims in chat."""
     return (
@@ -7307,238 +6385,6 @@ def _repair_prompt(artifact_noun):
         "`ready_for_review` once the work is complete). Writing the file is "
         "mandatory — a chat-only reply will be treated as no progress."
         % (artifact_noun, artifact_noun))
-
-
-def _headless_nudge_text(artifact_noun):
-    """The canned directive re-sent to a LEAD that set needs_input under
-    --headless (F2): no human is available, so proceed on the best assumption
-    and drive to ready_for_review. Bounded by the existing stale-no-op/stuck
-    handling and a headless nudge cap so it can never hang."""
-    return (
-        "This session is running in headless mode — there is NO human available "
-        "to answer questions. Do not wait for input. Choose the most reasonable "
-        "interpretation of the open question, record it explicitly in your "
-        "status artifact's result.assumptions, complete the work, and set the "
-        "%s status to ready_for_review. If the work genuinely cannot proceed, "
-        "make your best effort and still move to ready_for_review with the "
-        "assumption recorded — never leave the status at needs_input."
-        % artifact_noun)
-
-
-def _switch_option_text(eligible):
-    """The switch clause of a recovery-gate banner.
-
-    `eligible=None` (this session carries no policy) reproduces today's wording
-    byte-for-byte. A list names the specific controllers this session still
-    permits; an EMPTY list means the policy leaves no target at all, so the
-    switch option is dropped and the reason is stated instead."""
-    if eligible is None:
-        return "switch-controller (move this role to the alternate controller)"
-    if not eligible:
-        return None
-    return ("switch-controller (move this role to %s)"
-            % " or ".join(eligible))
-
-
-def _no_eligible_note(eligible):
-    if eligible is None or eligible:
-        return ""
-    return ("\nswitching controllers is not offered: this session's controller "
-            "policy leaves no other controller available.")
-
-
-def _choice_clause(options):
-    """'a, b, or c' — the historical phrasing of every recovery-gate banner."""
-    if len(options) == 1:
-        return options[0]
-    return ", ".join(options[:-1]) + ", or " + options[-1]
-
-
-def _stuck_gate_text(status_path, role, enabled=False, eligible=None):
-    """The banner shown at the visible stuck gate. With `eligible=None` (a
-    session with no controller policy) the text is byte-identical to what it has
-    always been."""
-    options = ["retry (run it once more)"]
-    switch = _switch_option_text(eligible)
-    if switch:
-        options.append(switch)
-    options.append("inspect (show the status file)")
-    options.append("end (end this phase cleanly)")
-    return (
-        "the %s appears stuck — it reopened work but its status file did not "
-        "change across an automatic repair attempt.\n  status file: %s\n"
-        "choose: %s.%s" % (role, ui.render_path(status_path, enabled),
-                           _choice_clause(options), _no_eligible_note(eligible)))
-
-
-def _controller_failure_text(role, controller, reason, alert=None,
-                             eligible=None):
-    """With `eligible=None` (no controller policy) the text is byte-identical to
-    what it has always been."""
-    options = ["retry (try %s again)" % controller]
-    switch = _switch_option_text(eligible)
-    if switch:
-        options.append(switch)
-    options.append("end (end this phase cleanly)")
-    text = (
-        "the %s controller for %s cannot make progress (%s).\n"
-        "choose: %s.%s"
-        % (controller, role, reason, _choice_clause(options),
-           _no_eligible_note(eligible)))
-    if alert:
-        text += "\n\n" + str(alert)
-    return text
-
-
-def _emit_stuck_inspect(io_out, status_path):
-    """Print the diagnostic for the stuck-gate `inspect` action: the artifact
-    path, its current on-disk status field, and the raw file content. Read-only
-    — never runs the role."""
-    io_out.write("status file: %s\n" % ui.render_path(
-        status_path, ui.is_tty(io_out)))
-    io_out.write("on-disk status: %s\n" % state_store.read_status(status_path))
-    try:
-        with open(status_path, "r") as fh:
-            content = fh.read()
-    except OSError:
-        content = "<missing or unreadable>"
-    io_out.write(content)
-    if not content.endswith("\n"):
-        io_out.write("\n")
-    io_out.flush()
-
-
-def _eligible_switch_choices(eligible, label_fmt):
-    """The per-controller switch entries for a policy-aware gate select."""
-    return [("switch-controller:%s" % name, label_fmt % name)
-            for name in eligible]
-
-
-def _eligible_switch_token(token, eligible):
-    """Resolve an off-TTY gate token into a `_SwitchTo`, or None.
-
-    `switch <name>` and `switch-controller=<name>` name a target explicitly;
-    a bare `switch` picks the first eligible controller."""
-    if not eligible:
-        return None
-    parts = token.replace("=", " ").split()
-    if not parts or parts[0] not in ("switch", "switch-controller"):
-        return None
-    if len(parts) == 1:
-        return _SwitchTo(eligible[0])
-    if parts[1] in eligible:
-        return _SwitchTo(parts[1])
-    return None
-
-
-def _read_stuck_gate(io_in, io_out, eligible=None,
-                     on_discard=None, on_drain_fail=None):
-    """Read the stuck-gate choice. On a TTY a questionary select; off a TTY a
-    readline where `retry`/`inspect` map to those actions and anything else
-    (including blank/EOF) ends the phase — the safe terminating default so a
-    scripted/test path is never trapped at the gate.
-
-    With `eligible=None` (a session with no controller policy) the choices and
-    the return sentinels are exactly what they have always been: one opaque
-    switch option returning `_STUCK_SWITCH`. With a list, one option per
-    eligible controller returning `_SwitchTo(target)`; with an EMPTY list the
-    switch option is absent entirely.
-
-    A failed input boundary ends the phase cleanly (`_STUCK_END`), exactly like
-    EOF.
-
-    Returns `_STUCK_RETRY`, `_STUCK_INSPECT`, `_STUCK_END`, `_STUCK_SWITCH`, or
-    a `_SwitchTo`."""
-    if ui.is_tty(io_in) and ui.is_tty(io_out):
-        choices = [("retry", "Run it once more")]
-        if eligible is None:
-            choices.append(
-                ("switch-controller",
-                 "Move this role to the alternate controller"))
-        else:
-            choices += _eligible_switch_choices(
-                eligible, "Move this role to %s")
-        choices += [("inspect", "Show the status file"),
-                    ("end", "End this phase")]
-        choice = ui.select(
-            "The role reopened work but didn't update its status — what now?",
-            choices, io_in=io_in, io_out=io_out, gate="stuck",
-            on_discard=on_discard, on_drain_fail=on_drain_fail)
-        if choice is ui.DRAIN_FAILED:
-            return _STUCK_END
-        if isinstance(choice, str) and choice.startswith("switch-controller:"):
-            return _SwitchTo(choice.split(":", 1)[1])
-        return {"retry": _STUCK_RETRY, "inspect": _STUCK_INSPECT,
-                "switch-controller": _STUCK_SWITCH,
-                "end": _STUCK_END}.get(choice, _STUCK_END)
-    line = io_in.readline()
-    token = line.strip().lower()
-    if token == "retry":
-        return _STUCK_RETRY
-    if eligible is None:
-        if token in ("switch", "switch-controller"):
-            return _STUCK_SWITCH
-    else:
-        picked = _eligible_switch_token(token, eligible)
-        if picked is not None:
-            return picked
-    if token == "inspect":
-        return _STUCK_INSPECT
-    return _STUCK_END
-
-
-def _read_controller_failure_gate(io_in, io_out, eligible=None,
-                                  on_discard=None, on_drain_fail=None):
-    """Read the controller-failure gate choice.
-
-    Off a TTY, only explicit retry/switch tokens continue; blank/EOF keeps the
-    historical safe terminating behavior. A failed input boundary takes the same
-    safe terminating exit (`_CTRL_END`). `eligible` follows the same three-way
-    contract as `_read_stuck_gate`.
-    """
-    if ui.is_tty(io_in) and ui.is_tty(io_out):
-        choices = [("retry", "Try the same controller again")]
-        if eligible is None:
-            choices.append(
-                ("switch-controller",
-                 "Move this role to the alternate controller"))
-        else:
-            choices += _eligible_switch_choices(
-                eligible, "Move this role to %s")
-        choices.append(("end", "End this phase"))
-        choice = ui.select("The controller cannot continue — what now?",
-                           choices, io_in=io_in, io_out=io_out,
-                           gate="controller_failure",
-                           on_discard=on_discard, on_drain_fail=on_drain_fail)
-        if choice is ui.DRAIN_FAILED:
-            return _CTRL_END
-        if isinstance(choice, str) and choice.startswith("switch-controller:"):
-            return _SwitchTo(choice.split(":", 1)[1])
-        return {"retry": _CTRL_RETRY, "switch-controller": _CTRL_SWITCH,
-                "end": _CTRL_END}.get(choice, _CTRL_END)
-    line = io_in.readline()
-    token = line.strip().lower()
-    if token == "retry":
-        return _CTRL_RETRY
-    if eligible is None:
-        if token in ("switch", "switch-controller"):
-            return _CTRL_SWITCH
-    else:
-        picked = _eligible_switch_token(token, eligible)
-        if picked is not None:
-            return picked
-    return _CTRL_END
-
-
-# Returned by the reviewer-failure gate reader (the visible escalation shown when
-# the paired reviewer/advisor fails to return a usable verdict REVIEW_FAIL_CAP
-# times running — an account limit, a crash, or an empty/garbled write — distinct
-# from a reviewer that legitimately keeps asking for changes, which the
-# REVIEW_ROUND_CAP dissent path already handles).
-_REVFAIL_RETRY = object()
-_REVFAIL_SKIP = object()
-_REVFAIL_END = object()
-_REVFAIL_SWITCH = object()
 
 
 def _is_review_failure(verdict):
@@ -7567,33 +6413,6 @@ def _is_review_failure(verdict):
     return False
 
 
-def _reviewer_fail_gate_text(reviewer_role, role, detail=None, eligible=None):
-    """The banner shown at the visible reviewer-failure gate. With
-    `eligible=None` (no controller policy) the text is byte-identical to what it
-    has always been."""
-    options = [
-        "retry (run the reviewer once more)",
-        "skip-review (stop reviewing for the rest of this phase and go straight "
-        "to the approve/revise gate)",
-    ]
-    if eligible is None:
-        options.append(
-            "switch-controller (move the reviewer to the alternate controller)")
-    elif eligible:
-        options.append("switch-controller (move the reviewer to %s)"
-                       % " or ".join(eligible))
-    options.append("end (end this phase cleanly)")
-    text = (
-        "the %s could not return a usable verdict (account limit, crash, or an "
-        "empty/garbled write) across %d tries — it is not reviewing the %s's "
-        "work.\nchoose: %s.%s"
-        % (reviewer_role, REVIEW_FAIL_CAP, role, _choice_clause(options),
-           _no_eligible_note(eligible)))
-    if detail:
-        text += "\n\n" + str(detail)
-    return text
-
-
 def _controller_failure_verdict(send_result=None, alert=None):
     out = {"malformed": True, "controller_failure": True}
     if send_result:
@@ -7601,83 +6420,6 @@ def _controller_failure_verdict(send_result=None, alert=None):
     if alert:
         out["controller_failure_alert"] = alert
     return out
-
-
-def _read_reviewer_fail_gate(io_in, io_out, eligible=None,
-                             on_discard=None, on_drain_fail=None):
-    """Read the reviewer-failure-gate choice. On a TTY a questionary select; off
-    a TTY a readline where `retry`/`end` map to those actions and anything else
-    (including blank/EOF) skips the review — the safe default so a
-    scripted/test path is never trapped AND a broken reviewer never blocks a
-    headless run (skip-review then reaches the user gate, which off a TTY reads
-    blank=approve, preserving the historical 'scripted runs complete' contract).
-
-    `eligible` follows the same three-way contract as `_read_stuck_gate`.
-
-    A failed input boundary ends the phase cleanly (`_REVFAIL_END`) — never
-    `_REVFAIL_SKIP`, which would advance the work past a review that never
-    happened.
-
-    Returns `_REVFAIL_RETRY`, `_REVFAIL_SKIP`, `_REVFAIL_END`,
-    `_REVFAIL_SWITCH`, or a `_SwitchTo`."""
-    if ui.is_tty(io_in) and ui.is_tty(io_out):
-        choices = [
-            ("retry", "Run the reviewer once more"),
-            ("skip-review", "Skip review for this phase — go to approve/revise"),
-        ]
-        if eligible is None:
-            choices.append(
-                ("switch-controller",
-                 "Move the reviewer to the alternate controller"))
-        else:
-            choices += _eligible_switch_choices(
-                eligible, "Move the reviewer to %s")
-        choices.append(("end", "End this phase"))
-        choice = ui.select(
-            "The reviewer isn't returning a usable verdict — what now?",
-            choices, io_in=io_in, io_out=io_out, gate="reviewer_failure",
-            on_discard=on_discard, on_drain_fail=on_drain_fail)
-        if choice is ui.DRAIN_FAILED:
-            return _REVFAIL_END
-        if isinstance(choice, str) and choice.startswith("switch-controller:"):
-            return _SwitchTo(choice.split(":", 1)[1])
-        return {"retry": _REVFAIL_RETRY, "skip-review": _REVFAIL_SKIP,
-                "switch-controller": _REVFAIL_SWITCH,
-                "end": _REVFAIL_END}.get(choice, _REVFAIL_SKIP)
-    line = io_in.readline()
-    token = line.strip().lower()
-    if token == "retry":
-        return _REVFAIL_RETRY
-    if eligible is None:
-        if token in ("switch", "switch-controller"):
-            return _REVFAIL_SWITCH
-    else:
-        picked = _eligible_switch_token(token, eligible)
-        if picked is not None:
-            return picked
-    if token == "end":
-        return _REVFAIL_END
-    return _REVFAIL_SKIP
-
-
-def _read_handoff_confirm(io_in, io_out, prompt="Hand the work back to the scout?",
-                          on_discard=None, on_drain_fail=None):
-    """The hand-back confirmation gate. On a TTY an explicit questionary
-    confirm (with the role-appropriate `prompt`); off a TTY a readline where
-    blank/y/yes confirms (mirrors the blank=approve contract of `_read_review`
-    for the scripted/test path).
-
-    The confirm keeps default=True: 'yes' hands work back to the scout, which is
-    consequential but is not an approval. A failed input boundary declines."""
-    if ui.is_tty(io_in) and ui.is_tty(io_out):
-        confirmed = ui.confirm(prompt, io_in=io_in, io_out=io_out,
-                               gate="handoff_back", on_discard=on_discard,
-                               on_drain_fail=on_drain_fail)
-        if confirmed is ui.DRAIN_FAILED:
-            return False
-        return confirmed
-    line = io_in.readline()
-    return line.strip().lower() in ("", "y", "yes")
 
 
 # =========================================================================== #
@@ -7961,12 +6703,10 @@ def _watchdog_decision_for_presentation(session_uuid, work_id, session,
 
 
 def _render_activity_snapshot(io_out, activity_record, decision,
-                              schedule_record, headless):
-    """D's sole output-arbitration call site: Package E's real `render_
-    compact_activity`/`render_headless_activity`, called ONLY here -- at
-    the retained turn boundary, after Package C's per-turn foreground
-    spinner has already closed (this function runs strictly after
-    `_send()` has returned). Never called from an in-turn tick. Best-
+                              schedule_record):
+    """D's sole output-arbitration call site: `transcript.render_activity`,
+    called ONLY here -- at the retained turn boundary, strictly after
+    `_send()` has returned. Never called from an in-turn tick. Best-
     effort: a malformed/incomplete input never raises past this point --
     a broken activity snapshot must never break the turn it decorates."""
     if activity_record is None or decision is None or schedule_record is None:
@@ -7974,77 +6714,68 @@ def _render_activity_snapshot(io_out, activity_record, decision,
     try:
         compact_state = activity_contracts.project_compact_state(
             activity_record, decision, schedule_record)
-        if headless:
-            ui.render_headless_activity(io_out, compact_state)
-        else:
-            ui.render_compact_activity(io_out, compact_state)
+        transcript.render_activity(io_out, compact_state)
     except (ValueError, TypeError):
         pass
 
 
-def _role_loop(session, first, status_path, context, io_in, io_out,
+def _role_loop(session, first, status_path, context, io_out,
                role="scout", review_fn=None, trace=None,
                reviewer_role=SCOUT_REVIEWER,
                needs_input_text=scout_needs_input_text,
                review_text=scout_review_text,
                done_text=scout_done_text,
                artifact_noun="intel",
-               handoff_enabled=False, handoff_confirm=None,
+               handoff_enabled=False,
                handoff_gate_text_fn=handoff_gate_text,
-               handoff_confirm_prompt="Hand the work back to the scout?",
-               handoff_declined_text_fn=handoff_declined_text,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
                phase=None, is_resume=False, seed_artifact_paths=None,
                on_first_send_accepted=None, on_first_send_rejected=None,
-               headless=False,
-                 review_allow_ask=True, gate_preview=None,
                   require_pending_question=False, review_path=None,
                   save_pending_turn_fn=None, clear_pending_turn_fn=None,
                   spath=None, session_uuid=None, build_summary_path=None,
                   role_work_id=None, checkpoint_id=None, artifact_kind=None):
-    """Drive a user-facing role's per-turn loop: send → read status → prompt,
-    gate, or finish. Role-generic: the scout and the planner both run on this
+    """Drive a lead role's per-turn loop: send → read status → review, stop,
+    or finish. Role-generic: the scout, planner and builder all run on this
     loop, differing only in banners, status file, paired reviewer, and whether
-    the hand-back contract is enabled.
+    the hand-back contract is enabled. Nothing here reads human input.
 
     Returns `(rc, outcome, payload)` where outcome is one of:
-      - "approved": the user approved at the `ready_for_review` gate.
-      - "ended": EOF/Ctrl-D or /quit ended the conversation.
-      - "interrupted": Ctrl-C.
-      - "handoff": the role signaled `handoff_back` with a payload and the
-        user CONFIRMED the gate; `payload` carries the handoff note.
-      - "switch_controller": a recovery gate asked the caller to switch the
-        active role; `payload` carries role/reason/pending-turn metadata.
+      - "approved": the paired reviewer explicitly approved at the
+        `ready_for_review` gate (or its hash-gate approval was carried).
+      - "stopped": the phase needs an answer, an authorization, or a usable
+        reviewer; `payload` is the structured `_agent_stop_payload` request.
+        Never an approval.
+      - "ended": the phase ended on a failure (controller failure, stale
+        no-op); `payload` names the failure when one was observed.
+      - "interrupted": a signal interrupted the run.
       - "awaiting_capacity" (M3 Package E): a genuine quota/overload send
         failure durably entered `awaiting_capacity` (CapacityPacket +
         PauseLease persisted, pending turn persisted-then-acknowledged);
         `payload` carries the role/provider/candidate/controller-policy/
         model/effort binding. The caller (`run_flow`) treats this like any
         other unrecognized outcome -- it ends this run cleanly; resumption
-        happens out-of-process via the headless resume-trigger CLI once the
+        happens out-of-process via the resume-trigger CLI once the
         lease is genuinely eligible.
 
-    A blank line re-prompts. When `review_fn` is provided (the paired reviewer
-    is on the team), each `ready_for_review` first runs the reviewer (topology
-    D) BEFORE the user gate: `review_fn(status_path, round_index)` returns a
-    verdict dict {verdict, findings, user_question}. The reviewer is bounded by
-    REVIEW_ROUND_CAP rounds, after which cowork falls through to the user with
-    the reviewer's dissent attached. The reviewer never writes to the user
-    channel; only the content-free `reviewed` marker and the role's own replies
-    appear.
+    When `review_fn` is provided (the paired reviewer is on the team), each
+    `ready_for_review` runs the reviewer (topology D):
+    `review_fn(status_path, round_index)` returns a verdict dict
+    {verdict, findings, user_question}. Only `approve` approves. `revise` hands
+    back to the role, bounded by REVIEW_ROUND_CAP rounds, after which the
+    phase stops with the dissent attached. A reviewer question, a reviewer
+    that fails REVIEW_FAIL_CAP times, and a missing reviewer all stop.
 
     When `evaluate_fn(session, verdict, round_index)` is provided, it runs
     right after each verdict readback and BEFORE branching on the verdict kind
     — one seam that covers approve, revise, needs_user, and round-cap rounds
-    identically. It is purely observational: failures are traced and skipped,
-    and the only user-visible sign is a content-free 'Handoff in progress'
-    spinner (no-op off a TTY).
+    identically. It is purely observational: failures are traced and skipped.
 
-    When `handoff_enabled`, a `handoff_back` status with a payload shows the
-    user confirmation gate: confirmed → the loop returns the "handoff" outcome;
-    declined → the status is downgraded and the role continues with a declined
-    note. A `handoff_back` without a payload degrades to the needs-input gate
-    (never an implicit hand-back).
+    When `handoff_enabled`, a `handoff_back` status with a payload is an
+    authority request: the phase stops with a `handoff_requested` request and
+    the status is left untouched (`run_flow` executes or declines it only on
+    an explicit orchestrator decision). A `handoff_back` without a payload
+    degrades to the needs-input stop (never an implicit hand-back).
 
     `checkpoint_id`/`artifact_kind` (M5 Package E, additive, both default
     `None`): when the caller has already dispatched a deterministic
@@ -8058,7 +6789,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     checkpoint_id=checkpoint_id, artifact_kind=artifact_kind)
     # `_role_loop` is the actual initial lead boundary. Production callers
     # already pass a typed seed; direct/test callers enter through this one
-    # closed initial-user constructor rather than a generic lead fallback.
+    # closed initial-context constructor rather than a generic lead fallback.
     pending = (first if isinstance(
         first, (handoff.DeliveryEnvelope, handoff.HandoffBlock))
                else _initial_user_delivery(first))
@@ -8085,13 +6816,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     # invalidates inline and never sets the boolean, yet is still a reopen the
     # stale-no-op detector must cover (the general invariant, D1/D9).
     pending_reopen_reason = None
-    # Transient flag set at the review gate's "Ask a question" branch and
-    # consumed at the loop top: a user question is a NON-reopen turn (it never
-    # sets pending_reopen_reason), so it is tagged for per-turn accounting here
-    # without tripping the invalidate / stale-no-op / baseline machinery.
-    pending_user_question = False
     # Stale-no-op repair state: True between the firing of the single automatic
-    # repair turn and its result (or a user-driven stuck-gate retry). When True,
+    # repair turn and its result (or an explicit machine re-invocation). When True,
     # the next send is re-checked for a no-op even without a fresh reopen.
     in_repair = False
     repair_reason = None  # reopen reason carried into the repair/escalation
@@ -8100,13 +6826,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     last_send_source_ref = None  # source_ref built for the most recent send
     review_rounds = 0
     # Consecutive reviewer turns with no usable verdict (reset by a usable
-    # verdict or by user re-engagement); once `skip_review` is set at the
-    # reviewer-failure gate it stays set for the rest of this phase, bypassing
-    # the reviewer straight to the user gate.
+    # verdict).
     review_failures = 0
-    skip_review = False
-    # Headless needs_input nudges fired this phase (HEADLESS_NUDGE_CAP backstop).
-    headless_nudges = 0
     # A real wrapper may require needs_input artifacts to record the question.
     # One automatic repair is enough; a second malformed turn becomes an
     # explicit diagnostic at the input gate instead of an invisible loop.
@@ -8114,17 +6835,12 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     outcome_kind = _OUTCOME_ENDED
     payload = None
 
-    def _breaker_decision(reason):
-        """Ask D's durable recovery breaker whether ANOTHER attempt at this
-        exact cause (role, config_digest, controller, candidate, reason) is
-        still permitted, atomically recording this attempt against durable
-        history first. Returns the breaker's decision dict, or None when
+    def _breaker_cause():
+        """The durable recovery breaker's cause key for this engagement --
+        (ledger, role, config_digest, controller, candidate) -- or None when
         there is no session/proven manifest to key a genuine fingerprint on
-        -- the breaker is silent rather than fabricating one. Keyed on the
-        SAME manifest digest `_complete_phase` binds as this WorkUnit's
-        candidate, so the breaker's cause identity and the WorkUnit's
-        candidate identity are never two competing definitions of "which
-        dispatch this is"."""
+        (the breaker is silent rather than fabricating one). Keyed on the
+        SAME manifest digest `_complete_phase` binds as the candidate."""
         if not session_uuid:
             return None
         manifest = dispatch_manifest.load_manifest(
@@ -8133,11 +6849,18 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             "config_digest")
         if not config_digest:
             return None
-        controller_name = getattr(session, "controller", None) or "unknown"
-        candidate = (manifest or {}).get("digest")
-        decision = recovery_breaker.attempt(
-            state_store.ledger_path_for(session_uuid), role, config_digest,
-            controller_name, candidate, reason)
+        return (state_store.ledger_path_for(session_uuid), role,
+                config_digest, getattr(session, "controller", None) or
+                "unknown", (manifest or {}).get("digest"))
+
+    def _breaker_record(reason):
+        """Durably count one failed attempt at this exact cause. A later
+        machine re-invocation of the same cause is refused before dispatch
+        once the budget is spent (see the pre-send check below)."""
+        cause = _breaker_cause()
+        if cause is None:
+            return None
+        decision = recovery_breaker.attempt(*(cause + (reason,)))
         if trace:
             trace.event("recovery.breaker.decision", role=role, reason=reason,
                         fingerprint=decision["fingerprint"],
@@ -8146,23 +6869,66 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         tripped=decision["tripped"])
         return decision
 
+    def _breaker_exhausted(reason):
+        cause = _breaker_cause()
+        if cause is None:
+            return None
+        history = recovery_breaker.history(*(cause + (reason,)))
+        if len(history) >= recovery_breaker.TRIP_THRESHOLD:
+            return {"attempts": len(history),
+                    "threshold": recovery_breaker.TRIP_THRESHOLD}
+        return None
+
+    breaker_checked = False
+
+    def _end_unapproved(stop):
+        """Record a non-approving end. A request for an answer or an
+        authorization is a genuine authority wait (`needs_authority`, outcome
+        "stopped"); an unusable/absent reviewer or a broken turn is a failure
+        (`failed`, outcome "ended") -- the two are never conflated."""
+        authority = stop["requires"] in ("answer", "authorization")
+        _advance_phase(
+            session_uuid, role_work_id,
+            "capability_missing" if authority else "execution_failed",
+            evidence={"reason": stop["kind"]}, source="gate.runtime")
+        return (_OUTCOME_STOPPED if authority else _OUTCOME_ENDED), stop
+
     try:
         # Controller-switch packets are controller-only recovery context.  The
-        # switch itself already has a compact user-facing status line; echoing
+        # switch itself already has a compact transcript status line; echoing
         # this packet here would dump artifacts and orchestration markup into
-        # the terminal as though the user had written it.
+        # the transcript as though it were the run context.
         internal_switch_context = context.lstrip().startswith(
             handoff.SWITCH_HANDOFF_MARKER)
         if context.strip() and not internal_switch_context:
-            io_out.write(ui.label("you", ui.is_tty(io_out)) + context.strip() + "\n")
+            io_out.write(transcript.CONTEXT_LABEL + context.strip() + "\n")
             io_out.flush()
         while True:
+            if not breaker_checked:
+                # A machine re-invocation of an engagement whose identical
+                # cause (same role, config, controller and candidate) has
+                # already failed TRIP_THRESHOLD times is refused BEFORE any
+                # paid dispatch; a different controller or config is a
+                # different cause with its own budget.
+                breaker_checked = True
+                exhausted = _breaker_exhausted("controller_failure")
+                if exhausted:
+                    if trace:
+                        trace.event("gate.decision", decider="runtime",
+                                    role=role, gate="recovery_budget",
+                                    action="refuse", **exhausted)
+                    if on_first_send_rejected:
+                        on_first_send_rejected()
+                    outcome_kind, payload = _end_unapproved(
+                        _agent_stop_payload(
+                            "recovery_budget_exhausted", role,
+                            requires="operator",
+                            controller=getattr(session, "controller", None),
+                            **exhausted))
+                    break
             # Capture the reopen signal BEFORE the invalidate/reset block runs.
             reopened_this_turn = pending_reopen_reason is not None
             reopen_reason_this_turn = pending_reopen_reason
-            # Consume the transient user-question flag (a non-reopen turn).
-            question_turn = pending_user_question
-            pending_user_question = False
             if pending_reopens_work:
                 before_status = state_store.read_status(status_path)
                 changed = state_store.invalidate_ready_status(status_path)
@@ -8200,8 +6966,6 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 lead_kind = "handoff_wake"
             elif reopen_reason_this_turn:
                 lead_kind = "user_answer"
-            elif question_turn:
-                lead_kind = "user_question"
             elif pending is first:
                 lead_kind = "role_seed"
             else:
@@ -8290,9 +7054,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
             # M4 Package D: the activity-emission seam's real turn-boundary
             # append (Package C's classify_<controller>_activity on this
             # turn's real, flattened evidence, durably appended via Package
-            # B) and D's sole output-arbitration call site: the retained
-            # renderer fires ONLY here, strictly after C's per-turn
-            # foreground spinner has already closed.
+            # B) and D's sole output-arbitration call site: the activity
+            # snapshot is written ONLY here, after the send has returned.
             turn_activity_record = _emit_activity_record(
                 session_uuid, role_work_id, session,
                 _turn_boundary_activity_evidence(
@@ -8307,7 +7070,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     role=role)
                 _render_activity_snapshot(
                     io_out, turn_activity_record, turn_watchdog_decision,
-                    turn_schedule_record, headless)
+                    turn_schedule_record)
             fp_after = state_store.fingerprint_status(status_path)
             if trace:
                 trace.event("role.fingerprint.after", role=role,
@@ -8343,8 +7106,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     _capacity_now())
                 # M4 Package D: reconcile + decide immediately before the
                 # actual stall/retry/invalidation presentation below (the
-                # capacity-entry write, the headless auto-end/termination,
-                # or the interactive controller-failure gate) -- retains
+                # capacity-entry write or the structured end/termination)
+                # -- retains
                 # original plus reconciled classification durably, and
                 # combines durable evidence with a live process probe
                 # before any terminal-leaning watchdog verdict.
@@ -8365,8 +7128,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     # signal must never auto-retry the SAME provider (the
                     # frozen brief's invariant) -- attempt a durable
                     # awaiting-capacity entry BEFORE falling through to the
-                    # ordinary headless/interactive controller-failure
-                    # handling below, in either mode. `provider_session_id`
+                    # ordinary controller-failure end below.
+                    # `provider_session_id`
                     # is sourced from THIS session's own durable resume
                     # state (`_durable_provider_session_id`), never an
                     # in-process session object attribute -- works
@@ -8380,7 +7143,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         controller_outcome, str(pending),
                         getattr(session, "model", None),
                         getattr(session, "effort", None),
-                        raw_evidence=raw_evidence)
+                        raw_evidence=raw_evidence,
+                        # Only the FIRST send carries the launch's decision
+                        # blocks (a later send follows an accepted, already
+                        # acknowledged one).
+                        decision_bindings=(
+                            _decision_launch_bindings(session_uuid, role)
+                            if first_send else None))
                     if capacity_payload is not None:
                         if trace:
                             trace.event(
@@ -8399,159 +7168,73 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         outcome_kind = "awaiting_capacity"
                         payload = capacity_payload
                         break
-                if headless:
-                    # No human to choose retry/switch/end: a controller failure
-                    # is an environment problem, so end the phase cleanly rather
-                    # than show an interactive gate (F2: never block headless).
-                    #
-                    # M4 Package D: a headless run has no fallback at all (in
-                    # scope or otherwise) -- so a TYPED provider refusal or a
-                    # first-token-deadline expiry (never mere elapsed time or
-                    # an event tail: `no_first_token` is real, positive
-                    # evidence the deadline mechanism itself observed and
-                    # reaped) terminates the WHOLE PROCESS nonzero, naming
-                    # the provider reason, rather than quietly ending only
-                    # this phase at exit code 0. Every other headless send
-                    # failure keeps the pre-existing clean-end-at-0 behavior
-                    # below, unchanged.
-                    _turn_outcome = send_result.get("controller_turn_outcome")
-                    _no_fallback_terminal = (
-                        send_result.get("result") == "no_first_token"
-                        or (isinstance(_turn_outcome, dict)
-                            and _turn_outcome.get("outcome") == "refused"))
-                    if _no_fallback_terminal:
-                        _termination_reason = (
-                            (_turn_outcome or {}).get("failure_class")
-                            or send_result.get("result") or "no_first_token")
-                        io_out.write(
-                            "cowork: headless run terminating -- %s (%s), "
-                            "no fallback available.\n"
-                            % (controller_name or "controller",
-                               _termination_reason))
-                        io_out.flush()
-                        if trace:
-                            trace.event(
-                                "headless.auto", role=role,
-                                gate="controller_failure",
-                                action="terminate_process",
-                                reason=_termination_reason)
-                        _advance_phase(
-                            session_uuid, role_work_id, "execution_failed",
-                            evidence={
-                                "reason": "send_failed", "headless": True,
-                                "headless_termination": True,
-                                "termination_reason": _termination_reason},
-                            source="headless.auto")
-                        if first_send and on_first_send_rejected:
-                            on_first_send_rejected()
-                        outcome_kind = _OUTCOME_HEADLESS_TERMINATED
-                        payload = {
-                            "exit_code": HEADLESS_REFUSAL_EXIT_CODE,
-                            "role": role, "controller": controller_name,
-                            "reason": _termination_reason}
-                        break
+                # Agent-only: there is no in-process recovery choice. A controller
+                # failure ends the phase with a structured, non-approving
+                # outcome; recovery is a machine re-invocation (resume, or
+                # --switch-controller) by the orchestrator.
+                #
+                # M4 Package D: a run has no fallback at all -- so a TYPED
+                # provider refusal or a
+                # first-token-deadline expiry (never mere elapsed time or
+                # an event tail: `no_first_token` is real, positive
+                # evidence the deadline mechanism itself observed and
+                # reaped) terminates the WHOLE PROCESS nonzero, naming
+                # the provider reason, rather than quietly ending only
+                # this phase. Every other send failure ends the phase with
+                # the structured controller-failure outcome below.
+                _turn_outcome = send_result.get("controller_turn_outcome")
+                _no_fallback_terminal = (
+                    send_result.get("result") == "no_first_token"
+                    or (isinstance(_turn_outcome, dict)
+                        and _turn_outcome.get("outcome") == "refused"))
+                if _no_fallback_terminal:
+                    _termination_reason = (
+                        (_turn_outcome or {}).get("failure_class")
+                        or send_result.get("result") or "no_first_token")
+                    io_out.write(
+                        "cowork: run terminating -- %s (%s), "
+                        "no fallback available.\n"
+                        % (controller_name or "controller",
+                           _termination_reason))
+                    io_out.flush()
                     if trace:
-                        trace.event("headless.auto", role=role,
-                                    gate="controller_failure", action="end")
+                        trace.event(
+                            "gate.decision", decider="runtime", role=role,
+                            gate="controller_failure",
+                            action="terminate_process",
+                            reason=_termination_reason)
                     _advance_phase(
                         session_uuid, role_work_id, "execution_failed",
-                        evidence={"reason": "send_failed", "headless": True},
-                        source="headless.auto")
-                    if first_send and on_first_send_rejected:
-                        on_first_send_rejected()
-                    outcome_kind = _OUTCOME_ENDED
-                    break
-                outcome_kind = None
-                while True:
-                    gate_eligible = gate_eligible_for(
-                        getattr(session, "controller", None))
-                    ui.banner(io_out, _controller_failure_text(
-                        role, getattr(session, "controller", "configured"),
-                        send_result.get("error_type")
-                        or send_result.get("subtype")
-                        or send_result.get("result") or "send failed",
-                        eligible=gate_eligible),
-                        "dissent")
-                    gate_discard, gate_drain_fail = _gate_trace_callbacks(
-                        trace, role)
-                    action = _read_controller_failure_gate(
-                        io_in, io_out, eligible=gate_eligible,
-                        on_discard=gate_discard,
-                        on_drain_fail=gate_drain_fail)
-                    if action is _CTRL_RETRY:
-                        if controller_outcome in _RETRY_BLOCKED_OUTCOMES:
-                            # M3 Package E: quota/overload/authentication
-                            # outcomes may NEVER auto-retry the SAME
-                            # provider -- a user-forced retry choice is
-                            # refused exactly like a tripped breaker, never
-                            # silently honored.
-                            if trace:
-                                trace.event(
-                                    "user.action", role=role,
-                                    action="controller_failure_retry_blocked",
-                                    reason="same_provider_retry_blocked",
-                                    controller_outcome=controller_outcome)
-                            _advance_phase(
-                                session_uuid, role_work_id, "execution_failed",
-                                evidence={
-                                    "reason": "same_provider_retry_blocked",
-                                    "controller_outcome": controller_outcome},
-                                source="recovery_breaker")
-                            if first_send and on_first_send_rejected:
-                                on_first_send_rejected()
-                            outcome_kind = _OUTCOME_ENDED
-                            break
-                        breaker = _breaker_decision("controller_failure")
-                        if breaker and breaker["tripped"]:
-                            if trace:
-                                trace.event(
-                                    "user.action", role=role,
-                                    action="controller_failure_retry_blocked",
-                                    fingerprint=breaker["fingerprint"])
-                            _advance_phase(
-                                session_uuid, role_work_id, "execution_failed",
-                                evidence={
-                                    "reason": "recovery_breaker_tripped",
-                                    "fingerprint": breaker["fingerprint"]},
-                                source="recovery_breaker")
-                            if first_send and on_first_send_rejected:
-                                on_first_send_rejected()
-                            outcome_kind = _OUTCOME_ENDED
-                            break
-                        if trace:
-                            trace.event("user.action", role=role,
-                                        action="controller_failure_retry")
-                        outcome_kind = None
-                        break
-                    if action is _CTRL_SWITCH or isinstance(action, _SwitchTo):
-                        if trace:
-                            trace.event("user.action", role=role,
-                                        action="controller_failure_switch")
-                        outcome_kind = "switch_controller"
-                        payload = {
-                            "role": role,
+                        evidence={
                             "reason": "send_failed",
-                            "pending": pending,
-                            "prompt_kind": lead_kind,
-                            "result": dict(send_result),
-                            "target": _switch_target_of(action),
-                        }
-                        break
-                    if trace:
-                        trace.event("user.action", role=role,
-                                    action="controller_failure_end")
-                    _advance_phase(
-                        session_uuid, role_work_id, "execution_failed",
-                        evidence={"reason": "send_failed",
-                                 "user_action": "controller_failure_end"},
-                        source="user.action")
+                            "terminates_process": True,
+                            "termination_reason": _termination_reason},
+                        source="gate.runtime")
                     if first_send and on_first_send_rejected:
                         on_first_send_rejected()
-                    outcome_kind = _OUTCOME_ENDED
+                    outcome_kind = _OUTCOME_PROCESS_TERMINATED
+                    payload = {
+                        "exit_code": PROVIDER_REFUSAL_EXIT_CODE,
+                        "role": role, "controller": controller_name,
+                        "reason": _termination_reason}
                     break
-                if outcome_kind in ("switch_controller", _OUTCOME_ENDED):
-                    break
-                continue
+                if trace:
+                    trace.event("gate.decision", decider="runtime", role=role,
+                                gate="controller_failure", action="end")
+                _breaker_record("controller_failure")
+                _advance_phase(
+                    session_uuid, role_work_id, "execution_failed",
+                    evidence={"reason": "send_failed"},
+                    source="gate.runtime")
+                if first_send and on_first_send_rejected:
+                    on_first_send_rejected()
+                outcome_kind = _OUTCOME_ENDED
+                payload = _agent_stop_payload(
+                    "controller_failure", role, requires="operator",
+                    controller=controller_name,
+                    controller_outcome=controller_outcome,
+                    status_path=status_path)
+                break
             if send_result.get("ok", True):
                 if first_send and on_first_send_accepted:
                     on_first_send_accepted()
@@ -8595,8 +7278,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     pending = _repair_delivery(artifact_noun,
                                               attempt_link=_repair_link)
                     continue
-                # Second consecutive no-op: the automatic repair failed. Show the
-                # visible stuck gate instead of looping forever.
+                # Second consecutive no-op: the automatic repair failed. End
+                # with a structured failure instead of looping forever.
                 if trace:
                     trace.event(
                         "stale_noop.unresolved", role=role,
@@ -8607,82 +7290,20 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         after_sha256=fp_after["sha256"],
                         repair_attempted=True)
                 in_repair = False
-                if headless:
-                    # No human to choose retry/switch/inspect: the bounded
-                    # nudge (the automatic repair turn) already failed, so end
-                    # the phase cleanly rather than hang (F2_auto_resolve_gates).
-                    if trace:
-                        trace.event("headless.auto", role=role, gate="stuck",
-                                    action="end")
-                    _advance_phase(
-                        session_uuid, role_work_id, "execution_failed",
-                        evidence={"reason": "stale_noop", "headless": True},
-                        source="headless.auto")
-                    outcome_kind = _OUTCOME_ENDED
-                    break
-                gate_decision = None
-                while gate_decision is None:
-                    gate_eligible = gate_eligible_for(
-                        getattr(session, "controller", None))
-                    ui.banner(io_out, _stuck_gate_text(
-                        status_path, role, ui.is_tty(io_out),
-                        eligible=gate_eligible), "dissent")
-                    gate_discard, gate_drain_fail = _gate_trace_callbacks(
-                        trace, role)
-                    action = _read_stuck_gate(io_in, io_out,
-                                              eligible=gate_eligible,
-                                              on_discard=gate_discard,
-                                              on_drain_fail=gate_drain_fail)
-                    if action is _STUCK_INSPECT:
-                        if trace:
-                            trace.event("user.action", role=role,
-                                        action="stuck_inspect")
-                        _emit_stuck_inspect(io_out, status_path)
-                        continue
-                    gate_decision = action
-                if gate_decision is _STUCK_RETRY:
-                    if trace:
-                        trace.event("user.action", role=role,
-                                    action="stuck_retry")
-                    repair_ordinal += 1
-                    _repair_link = _build_gate_repair_attempt_link(
-                        role, phase, last_send_source_ref,
-                        _repair_prompt(artifact_noun), repair_ordinal)
-                    if session_uuid:
-                        guard_broker.append_once(
-                            state_store.dispatch_links_path_for(session_uuid),
-                            _repair_link, key="idempotency_key")
-                    if trace:
-                        trace.event("dispatch.attempt_link", role=role,
-                                    kind="gate_repair", ordinal=repair_ordinal,
-                                    attempt_id=_repair_link["attempt_id"],
-                                    idempotency_key=_repair_link["idempotency_key"])
-                    pending = _repair_delivery(artifact_noun,
-                                              attempt_link=_repair_link)
-                    in_repair = True  # re-checked; re-shows gate if still stuck
-                    continue
-                if gate_decision is _STUCK_SWITCH or isinstance(
-                        gate_decision, _SwitchTo):
-                    if trace:
-                        trace.event("user.action", role=role,
-                                    action="stuck_switch")
-                    outcome_kind = "switch_controller"
-                    payload = {
-                        "role": role,
-                        "reason": "stuck",
-                        "pending": _repair_prompt(artifact_noun),
-                        "prompt_kind": "repair",
-                        "target": _switch_target_of(gate_decision),
-                    }
-                    break
-                # _STUCK_END: end this phase cleanly, like EOF.
+                # Agent-only: the bounded automatic repair already failed, so
+                # the phase ends with a structured, non-approving outcome
+                # rather than waiting on an inspect/retry choice.
                 if trace:
-                    trace.event("user.action", role=role, action="stuck_end")
+                    trace.event("gate.decision", decider="runtime", role=role, gate="stuck",
+                                action="end")
                 _advance_phase(
                     session_uuid, role_work_id, "execution_failed",
-                    evidence={"reason": "stale_noop", "user_action": "stuck_end"},
-                    source="user.action")
+                    evidence={"reason": "stale_noop"},
+                    source="gate.runtime")
                 outcome_kind = _OUTCOME_ENDED
+                payload = _agent_stop_payload(
+                    "stale_noop", role, requires="operator",
+                    status_path=status_path, reopen_reason=repair_reason)
                 break
             # Progress (the file changed) — clear any repair state and proceed.
             in_repair = False
@@ -8699,56 +7320,25 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     trace.event("handoff.signal", role=role, path=status_path,
                                 has_payload=bool(note))
                 if note:
-                    ui.banner(io_out, handoff_gate_text_fn(note), "review")
-                    if headless:
-                        # Headless auto-DECLINES a hand-back (D10): no human to
-                        # arbitrate, and auto-executing cross-phase hand-backs
-                        # could loop unbounded. Downgrade + nudge to proceed.
-                        confirmed = False
-                        if trace:
-                            trace.event("headless.auto", role=role,
-                                        gate="handoff_back", action="decline")
-                    elif handoff_confirm:
-                        confirmed = handoff_confirm(io_in, io_out)
-                    else:
-                        gate_discard, gate_drain_fail = _gate_trace_callbacks(
-                            trace, role)
-                        confirmed = _read_handoff_confirm(
-                            io_in, io_out, handoff_confirm_prompt,
-                            on_discard=gate_discard,
-                            on_drain_fail=gate_drain_fail)
-                    decline_event_id = None
+                    transcript.notice(io_out, handoff_gate_text_fn(note))
+                    # A hand-back is a cross-phase authority request. The
+                    # phase stops with a structured request and the status is
+                    # left untouched; only an explicit orchestrator decision
+                    # on a later invocation (--authorize-handoff or
+                    # --decline-handoff naming the recorded request) acts on
+                    # it.
+                    handoff_digest = _handoff_request_digest(note)
                     if trace:
-                        # The gate decision is what causes the invalidation
-                        # below, so its id is the transition's referent (P16).
-                        decline_event_id = trace.event(
-                            "handoff.gate", role=role,
-                            confirmed=bool(confirmed))
-                    if confirmed:
-                        outcome_kind, payload = "handoff", note
-                        break
-                    # Declined: downgrade the stale handoff_back so the status
-                    # file cannot re-trigger the gate, then let the role
-                    # continue planning.
-                    decl_before = state_store.read_status(status_path)
-                    changed = state_store.invalidate_ready_status(
-                        status_path, from_status="handoff_back")
-                    decl_after = state_store.read_status(status_path)
-                    if trace and decl_before != decl_after:
-                        trace.event("status.invalidated", role=role,
-                                    path=status_path, changed=changed,
-                                    requested_status="needs_input",
-                                    before=decl_before, after=decl_after,
-                                    reason="handoff_declined",
-                                    triggering_event_id=decline_event_id)
-                    pending = _handoff_declined_delivery(
-                        handoff_declined_text_fn)
-                    # Detection keys off the reason, not the boolean: this branch
-                    # invalidates inline and intentionally does not set
-                    # pending_reopens_work, so the top-of-loop invalidate is not
-                    # re-run, but the next send is still checked for a no-op.
-                    pending_reopen_reason = "handoff_declined"
-                    continue
+                        trace.event("gate.decision", decider="runtime",
+                                    role=role, gate="handoff_back",
+                                    action="stop",
+                                    payload_digest=handoff_digest)
+                    outcome_kind, payload = _end_unapproved(_agent_stop_payload(
+                        "handoff_requested", role, requires="authorization",
+                        status_path=status_path, handoff=note,
+                        payload_digest=handoff_digest,
+                        to_role=HANDBACK_PREPROCESSOR.get(role)))
+                    break
                 # Payload-less handoff_back: degrade to the needs-input gate
                 # (D10) — never an implicit hand-back.
                 status = "needs_input"
@@ -8806,23 +7396,21 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         pending_reopens_work = True
                         pending_reopen_reason = "unverified_readiness"
                         pending_reopen_event_id = readiness.get("event_id")
-                        ui.banner(io_out, unverified_readiness_text(
-                            readiness.get("reason") or ""), "warn")
+                        transcript.notice(io_out, unverified_readiness_text(
+                            readiness.get("reason") or ""))
                         continue
-                dissent = ""
-                dissent_verdict = None
+                reviewer_approved = False
                 # Hash-gate (scout + planner): when the lead's reviewed artifact
                 # set is byte-identical to what the paired reviewer LAST APPROVED
                 # in this phase epoch + acked context revision, skip the reviewer
-                # turn entirely — reuse that approval and fall through to the
-                # user gate with a visible marker (never a silent bypass, D6).
+                # turn entirely — reuse that approval, with a visible marker
+                # (never a silent bypass, D6).
                 # Only on the FIRST round of a fresh ready_for_review
                 # (review_rounds == 0); a revise loop already in progress always
-                # re-reviews. Latched skip_review (reviewer-failure) takes
-                # precedence. The builder passes no bundle, so it never skips.
+                # re-reviews. The builder passes no bundle, so it never skips.
                 review_skipped = False
                 if (skip_baseline is not None and review_fn is not None
-                        and not skip_review and review_rounds == 0):
+                        and review_rounds == 0):
                     composite = skip_baseline.compute_composite()
                     if skip_baseline.eligible(composite):
                         review_skipped = True
@@ -8830,21 +7418,22 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             trace.event("review.skipped", role=reviewer_role,
                                         reason="unchanged_since_approved",
                                         composite=composite)
-                        ui.banner(io_out, review_skipped_text(), "info")
-                # Reviewer gate (topology D): runs transparently before the user.
-                # `skip_review` (latched at the reviewer-failure gate) bypasses it
-                # for the rest of the phase, straight to the user gate.
-                if review_fn is not None and not skip_review \
-                        and not review_skipped and \
+                        transcript.notice(io_out, review_skipped_text())
+                        # The reviewer's own prior approval of these exact
+                        # bytes (same epoch + acked context) is carried.
+                        reviewer_approved = True
+                # Reviewer gate (topology D): the only source of approval.
+                if review_fn is not None and not review_skipped and \
                         review_rounds < REVIEW_ROUND_CAP:
                     review_rounds += 1
                     if trace:
                         trace.event("review.round.start", role=reviewer_role,
                                     round=review_rounds,
                                     round_cap=REVIEW_ROUND_CAP)
-                    # None: fall through to the user gate this round.
-                    # "continue"/"end": act on the OUTER loop after the inner one.
+                    # None: fall through to the approval check this round.
+                    # "continue"/"stop": act on the OUTER loop after the inner one.
                     review_action = None
+                    stop_payload = None
                     # A reviewer-failure RETRY (D8) re-runs the reviewer with the
                     # path-first full-reread packet instead of a diff: a
                     # malformed/weak verdict means the diff was insufficient to
@@ -8854,11 +7443,10 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     # auto-retry) re-runs the reviewer in place — same round, no
                     # bounce through the role.
                     while True:
-                        # The review turn streams on the internal channel (the
-                        # bridge raises its own pre-first-token spinner on io_out);
-                        # no outer \r-frame spinner here — it would collide with the
-                        # Live region the bridge opens on the same io_out. The muted
-                        # probe/eval inside the pass need no visible spinner.
+                        # The bytes the reviewer is judging: an approval binds
+                        # to exactly this artifact state.
+                        reviewed_sha256 = state_store.fingerprint_status(
+                            status_path)["sha256"]
                         verdict = _call_review_fn(
                             review_fn, status_path, review_rounds,
                             force_full_reread) or {}
@@ -8883,88 +7471,36 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     fail_cap=REVIEW_FAIL_CAP)
                             if review_failures < REVIEW_FAIL_CAP:
                                 # Silent auto-retry of the reviewer (mirrors the
-                                # stuck gate's one automatic repair attempt).
+                                # stale no-op's one automatic repair attempt).
                                 force_full_reread = True  # D8: retry full-reread
                                 continue
-                            if headless:
-                                # No human to choose retry/skip/switch: skip
-                                # review for the rest of this phase and fall
-                                # through to the (auto-approving) user gate
-                                # (F2_auto_resolve_gates).
-                                if trace:
-                                    trace.event(
-                                        "headless.auto", role=role,
-                                        reviewer_role=reviewer_role,
-                                        gate="reviewer_failure", action="skip")
-                                skip_review = True
-                                review_failures = 0
-                                break
-                            rev_eligible = gate_eligible_for(
-                                _call_reviewer_controller(review_fn))
-                            ui.banner(io_out, _reviewer_fail_gate_text(
-                                reviewer_role, role,
-                                verdict.get("controller_failure_alert"),
-                                eligible=rev_eligible),
-                                "dissent")
-                            gate_discard, gate_drain_fail = (
-                                _gate_trace_callbacks(trace, role))
-                            decision = _read_reviewer_fail_gate(
-                                io_in, io_out, eligible=rev_eligible,
-                                on_discard=gate_discard,
-                                on_drain_fail=gate_drain_fail)
-                            if decision is _REVFAIL_RETRY:
-                                # Re-run the reviewer, SAME round, counter kept —
-                                # re-shows the gate if it fails again.
-                                if trace:
-                                    trace.event("user.action", role=role,
-                                                action="review_fail_retry")
-                                force_full_reread = True  # D8: retry full-reread
-                                continue
-                            if decision is _REVFAIL_SKIP:
-                                # Stop reviewing for the rest of this phase; fall
-                                # through to the normal approve/revise gate.
-                                if trace:
-                                    trace.event("user.action", role=role,
-                                                action="review_fail_skip")
-                                skip_review = True
-                                review_failures = 0
-                                break
-                            if decision is _REVFAIL_SWITCH or isinstance(
-                                    decision, _SwitchTo):
-                                switcher = getattr(
-                                    review_fn, "switch_controller", None)
-                                if switcher and _call_reviewer_switch(
-                                        switcher, "reviewer_failure",
-                                        _switch_target_of(decision)):
-                                    if trace:
-                                        trace.event(
-                                            "user.action", role=role,
-                                            reviewer_role=reviewer_role,
-                                            action="review_fail_switch")
-                                    force_full_reread = True
-                                    review_failures = 0
-                                    continue
-                                if trace:
-                                    trace.event(
-                                        "user.action", role=role,
-                                        reviewer_role=reviewer_role,
-                                        action="review_fail_switch_failed")
-                                # Re-show the failure gate if the switch could
-                                # not be committed (for example the alternate
-                                # CLI is missing).
-                                continue
-                            # _REVFAIL_END: end this phase cleanly, like EOF.
+                            # Agent-only: a reviewer that cannot return a
+                            # usable verdict is an ABSENT reviewer. Review is
+                            # never skipped and the work is never approved
+                            # without it: the phase stops with a structured,
+                            # non-approving request.
                             if trace:
-                                trace.event("user.action", role=role,
-                                            action="review_fail_end")
-                            review_action = "end"
+                                trace.event(
+                                    "gate.decision", decider="runtime", role=role,
+                                    reviewer_role=reviewer_role,
+                                    gate="reviewer_failure", action="stop")
+                            review_action = "stop"
+                            stop_payload = _agent_stop_payload(
+                                "reviewer_unavailable", role,
+                                requires="reviewer",
+                                reviewer_role=reviewer_role,
+                                status_path=status_path,
+                                review_path=review_path,
+                                failures=review_failures,
+                                detail=verdict.get(
+                                    "controller_failure_alert"))
                             break
                         # Usable verdict: clear the failure counter and branch.
                         review_failures = 0
-                        ui.banner(io_out, scout_reviewed_text(
-                            verdict, review_rounds, REVIEW_ROUND_CAP), "info")
+                        transcript.notice(io_out, scout_reviewed_text(
+                            verdict, review_rounds, REVIEW_ROUND_CAP))
                         if evaluate_fn is not None:
-                            # SEAL AND ENQUEUE ONLY — no send, no spinner, no
+                            # SEAL AND ENQUEUE ONLY — no send, no
                             # wait (P12). Scoring used to run here as an extra
                             # turn on the role's own session, which put
                             # measurement between the reviewer's verdict and the
@@ -8979,27 +7515,27 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         v = verdict.get("verdict")
                         has_question = bool(str(
                             verdict.get("user_question") or "").strip())
-                        if headless and v == "needs_user" and has_question:
-                            # Headless orchestrator safety-net
-                            # (F2_reviewer_needs_user): no human to answer, so a
-                            # reviewer's user question is downgraded to a 'revise'
-                            # finding handed back to the lead — never surfaced as
-                            # a user question.
-                            q = str(verdict.get("user_question") or "").strip()
-                            verdict = dict(
-                                verdict, verdict="revise",
-                                findings=list(verdict.get("findings") or [])
-                                + ["(headless) reviewer raised a question with "
-                                   "no human to answer — resolve it with your "
-                                   "best judgment: " + q])
-                            v = "revise"
-                            has_question = False
+                        if v == "needs_user" and has_question:
+                            # A reviewer question needs an answer this process
+                            # cannot supply. It is never guessed at and never
+                            # downgraded: the phase stops with the question as
+                            # a structured request (answer by resuming with
+                            # --context).
                             if trace:
                                 trace.event(
-                                    "headless.auto", role=role,
+                                    "gate.decision", decider="runtime", role=role,
                                     reviewer_role=reviewer_role,
-                                    gate="reviewer_needs_user",
-                                    action="downgrade_revise")
+                                    gate="reviewer_needs_user", action="stop")
+                            review_action = "stop"
+                            stop_payload = _agent_stop_payload(
+                                "reviewer_question", role, requires="answer",
+                                reviewer_role=reviewer_role,
+                                question=str(
+                                    verdict.get("user_question") or "").strip(),
+                                findings=list(verdict.get("findings") or []),
+                                status_path=status_path,
+                                review_path=review_path)
+                            break
                         # ORCH-050 / CV-050 (D-0001/D-0004/D-0005): review
                         # dispositions for the bound owned receipt, and the
                         # mechanical supersession of defeated verification
@@ -9024,7 +7560,20 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 session_uuid, phase, reviewer_role,
                                 default=review_rounds)
                             if session_uuid else None)
+                        if v == "approve" and state_store.fingerprint_status(
+                                status_path)["sha256"] != reviewed_sha256:
+                            # The artifact changed while it was under review:
+                            # the approval names bytes that no longer exist.
+                            review_action = "stop"
+                            stop_payload = _agent_stop_payload(
+                                "review_candidate_changed", role,
+                                requires="reviewer",
+                                reviewer_role=reviewer_role,
+                                status_path=status_path,
+                                review_path=review_path)
+                            break
                         if v == "approve":
+                            reviewer_approved = True
                             if receipt_pointer:
                                 # accepted ONLY when the candidate being
                                 # approved is still exactly the candidate the
@@ -9041,7 +7590,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     reviewed_manifest_digest=(
                                         receipt_pointer.get(
                                             "manifest_digest")))
-                            # Only an explicit approve reaches the user gate.
+                            # Only an explicit approve approves the phase.
                             review_rounds = 0
                             # Seed the hash-gate baseline so the NEXT unchanged
                             # ready_for_review skips the reviewer (D4: only a
@@ -9053,31 +7602,6 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             if skip_baseline is not None:
                                 skip_baseline.record(
                                     skip_baseline.compute_composite())
-                        elif v == "needs_user" and has_question:
-                            review_rounds = 0
-                            pending = assemble_reviewer_handoff(
-                                "needs_user", verdict, artifact=artifact_noun,
-                                review_path=review_path)
-                            pending_reopens_work = True
-                            pending_reopen_reason = "reviewer_needs_user"
-                            if trace:
-                                # The correction handoff is RECORDED here,
-                                # strictly before anything scores this round —
-                                # the ordering invariant C4 asserts. Its id is
-                                # the referent for the status transition below.
-                                pending_reopen_event_id = trace.event(
-                                    "review.handoff",
-                                    from_role=reviewer_role,
-                                    to_role=role, kind="needs_user")
-                                trace.event(
-                                    "review.handoff.recorded", phase=phase,
-                                    round=state_store.current_phase_round(
-                                        session_uuid, phase, role,
-                                        default=review_rounds),
-                                    loop_round=review_rounds,
-                                    from_role=reviewer_role,
-                                    to_role=role, kind="needs_user")
-                            review_action = "continue"
                         elif suppress_reopen_for_challenges:
                             # D-0004 mechanical supersession: EVERY blocking
                             # finding is an uncited-or-contradicted verification
@@ -9085,7 +7609,7 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             # receipt certifies. The FINDINGS are superseded
                             # (recorded, never erased); the transaction
                             # SURVIVES as `pending_review` — NO builder reopen,
-                            # NO review.handoff — and the fall-through user-gate
+                            # NO review.handoff — and the fall-through gate
                             # outcome drives the final disposition (D-0005).
                             _record_findings(
                                 session_uuid,
@@ -9101,6 +7625,22 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     transaction_id=receipt_pointer.get(
                                         "transaction_id"),
                                     superseded_count=len(defeated_challenges))
+                            # The reviewer still did not approve: supersession
+                            # removes the reopen, never the approval
+                            # requirement. The transaction stays
+                            # `pending_review` and the phase stops for an
+                            # explicit decision.
+                            review_action = "stop"
+                            stop_payload = _agent_stop_payload(
+                                "review_not_approved", role,
+                                requires="answer",
+                                reviewer_role=reviewer_role,
+                                verdict=v,
+                                findings=list(verdict.get("findings") or []),
+                                superseded_challenges=len(
+                                    defeated_challenges),
+                                status_path=status_path,
+                                review_path=review_path)
                         elif review_rounds < REVIEW_ROUND_CAP:
                             # A legitimate revise (reviewer wants changes): hand
                             # back to the role for another pass. A VALID
@@ -9153,8 +7693,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     to_role=role, kind="revise")
                             review_action = "continue"
                         else:
-                            # Round cap reached on a legitimate revise: fall
-                            # through to the user with the dissent attached (D5).
+                            # Round cap reached on a legitimate revise: stop
+                            # unapproved with the dissent attached (D5).
                             # The unresolved blocking finding still invalidates
                             # the green transaction (D-0005): the gate cannot
                             # later accept it.
@@ -9168,147 +7708,94 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                     reviewed_manifest_digest=(
                                         receipt_pointer.get(
                                             "manifest_digest")))
-                            dissent = _dissent_suffix(verdict)
-                            dissent_verdict = verdict
                             review_rounds = 0
                             if trace:
                                 trace.event("review.round_cap",
                                             role=reviewer_role,
                                             round_cap=REVIEW_ROUND_CAP)
+                            # Unresolved dissent is never accepted: the phase
+                            # stops with the reviewer's findings attached.
+                            review_action = "stop"
+                            stop_payload = _agent_stop_payload(
+                                "review_round_cap", role,
+                                requires="answer",
+                                reviewer_role=reviewer_role,
+                                round_cap=REVIEW_ROUND_CAP,
+                                findings=list(verdict.get("findings") or []),
+                                status_path=status_path,
+                                review_path=review_path)
                         break
                     if review_action == "continue":
                         continue
-                    if review_action == "end":
-                        _advance_phase(
-                            session_uuid, role_work_id, "execution_failed",
-                            evidence={"reason": "reviewer_failure_end"},
-                            source="user.action")
-                        outcome_kind = _OUTCOME_ENDED
+                    if review_action == "stop":
+                        outcome_kind, payload = _end_unapproved(stop_payload)
                         break
+                if not reviewer_approved:
+                    # Approval is an explicit reviewer approve (or its carried
+                    # hash-gate approval) and nothing else. A missing reviewer
+                    # never approves by omission.
+                    stop_kind = ("reviewer_absent" if review_fn is None
+                                 else "review_not_approved")
+                    if trace:
+                        trace.event("gate.decision", decider="runtime", role=role,
+                                    gate="ready_for_review", action="stop",
+                                    reason=stop_kind)
+                    outcome_kind, payload = _end_unapproved(_agent_stop_payload(
+                        stop_kind, role, requires="reviewer",
+                        reviewer_role=reviewer_role, status_path=status_path,
+                        review_path=review_path))
+                    break
+                bound_receipt = (
+                    state_store.read_current_receipt_pointer(session_uuid)
+                    if role == "builder" and session_uuid else None)
+                if (isinstance(bound_receipt, dict)
+                        and bound_receipt.get("transaction_id")
+                        and not _accepted_manifest_matches(bound_receipt)):
+                    # Verification no longer holds for the candidate the
+                    # reviewer approved: never an approval. The receipt's
+                    # candidate was abandoned, which the grant records.
+                    _grant_gate_acceptance(session_uuid, trace)
+                    outcome_kind, payload = _end_unapproved(
+                        _agent_stop_payload(
+                            "verification_not_current", role,
+                            requires="operator",
+                            transaction_id=bound_receipt.get("transaction_id"),
+                            status_path=status_path))
+                    break
+                transcript.notice(io_out, review_text(status_path))
                 if trace:
                     trace.event("gate.show", role=role,
                                 gate="ready_for_review", path=status_path,
-                                has_dissent=bool(dissent))
-                ui.banner(io_out,
-                          review_text(status_path, ui.is_tty(io_out)) + dissent,
-                          "dissent" if dissent else "review")
-                if headless:
-                    # Headless auto-approves the ready_for_review user gate
-                    # (F2_auto_resolve_gates). At the review round cap the dissent
-                    # was already attached to the banner above and traced, so the
-                    # unresolved dissent is recorded as the work is accepted and
-                    # the phase advances (F2_consensus_and_cap).
-                    if trace:
-                        trace.event("headless.auto", role=role,
-                                    gate="ready_for_review", action="approve",
-                                    has_dissent=bool(dissent))
-                    outcome = _END
-                elif dissent:
-                    gate_discard, gate_drain_fail = _gate_trace_callbacks(
-                        trace, role)
-                    outcome = _read_review_dissent(io_in, io_out,
-                                                   preview=gate_preview,
-                                                   on_discard=gate_discard,
-                                                   on_drain_fail=gate_drain_fail)
-                else:
-                    gate_discard, gate_drain_fail = _gate_trace_callbacks(
-                        trace, role)
-                    outcome = _read_review(io_in, io_out,
-                                           allow_ask=review_allow_ask,
-                                           preview=gate_preview,
-                                           on_discard=gate_discard,
-                                           on_drain_fail=gate_drain_fail)
-                if outcome is _STOP:
-                    # The explicit non-default Stop choice (TTY only): a clean
-                    # exit — no approval, no revision turn, no done banner. This
-                    # mirrors the off-TTY 'end' path, so run_flow never advances
-                    # the phase and the saved (resumable) session is left intact.
-                    if trace:
-                        trace.event("user.action", role=role, action="stop",
-                                    gate="ready_for_review")
-                    _advance_phase(
-                        session_uuid, role_work_id, "cancelled",
-                        evidence={"reason": "user_stop",
-                                 "gate": "ready_for_review"},
-                        source="user.action")
-                    outcome_kind = _OUTCOME_ENDED
-                    break
-                if outcome is _ITERATE:
-                    # Hand the reviewer's unresolved findings straight back to
-                    # the role — the user shouldn't have to retype them.
-                    pending = assemble_reviewer_handoff(
-                        "revise", dissent_verdict, artifact=artifact_noun,
-                        review_path=review_path)
-                    if trace:
-                        trace.event("user.action", role=role,
-                                    action="iterate_review",
-                                    gate="ready_for_review")
-                    pending_reopens_work = True
-                    pending_reopen_reason = "user_iterate"
-                    review_rounds = 0  # user re-engaged: fresh review budget
-                    review_failures = 0  # and a fresh reviewer-failure budget
-                    continue
-                if outcome is _END:
-                    if trace:
-                        trace.event("user.action", role=role,
-                                    action="approve", gate="ready_for_review")
-                        trace.event("gate.show", role=role, gate="done",
-                                    path=status_path)
-                    # D-0004/D-0005 gate-outcome grant: an explicit human
-                    # approve (or the headless auto-approve above) accepts the
-                    # still-pending bound transaction while the candidate
-                    # manifest equals the receipt's; a reviewer judgment
-                    # already made is never second-guessed here.
-                    if role == "builder":
-                        _grant_gate_acceptance(session_uuid, trace)
-                    ui.banner(io_out, done_text(
-                        status_path, ui.is_tty(io_out)), "done")
-                    if session_uuid and role_work_id:
-                        _approved_manifest = dispatch_manifest.load_manifest(
-                            state_store.manifest_path_for(session_uuid, role))
-                        _approved_digest = (_approved_manifest or {}).get("digest")
-                        if _approved_digest:
-                            _complete_phase(session_uuid, role_work_id,
-                                            _approved_digest,
-                                            source="user.action")
-                    outcome_kind = "approved"
-                    break
-                if (isinstance(outcome, tuple) and len(outcome) == 2
-                        and outcome[0] is _ASK):
-                    # "Ask a question": a NON-reopen turn. Send the question as an
-                    # ordinary pending turn; leave pending_reopens_work=False and
-                    # pending_reopen_reason=None so the invalidate / stale-no-op /
-                    # baseline machinery never fires — the role answers in chat,
-                    # the artifact stays byte-identical, and the existing
-                    # hash-gate auto-skips the advisor on the unchanged follow-up.
-                    question_text = outcome[1]
-                    pending = _user_lead_delivery(
-                        assemble_user_question(question_text, artifact_noun))
-                    pending_user_question = True
-                    if trace:
-                        trace.event(
-                            "user.action", role=role, action="question",
-                            gate="ready_for_review",
-                            **trace_store.prompt_meta(question_text,
-                                                      prefix="input"))
-                    continue
-                pending = _user_lead_delivery(
-                    outcome)  # revision feedback → another turn
-                if trace:
-                    trace.event("user.action", role=role, action="revise",
-                                gate="ready_for_review",
-                                **trace_store.prompt_meta(outcome, prefix="input"))
-                pending_reopens_work = True
-                pending_reopen_reason = "user_revise"
-                review_rounds = 0  # user re-engaged: fresh review budget
-                review_failures = 0  # and a fresh reviewer-failure budget
+                                has_dissent=False)
+                    trace.event("gate.decision", decider="reviewer",
+                                role=role, reviewer_role=reviewer_role,
+                                gate="ready_for_review", action="approve")
+                    trace.event("gate.show", role=role, gate="done",
+                                path=status_path)
+                # D-0004/D-0005 gate-outcome grant: the reviewer's explicit
+                # approve accepts the still-pending bound transaction while
+                # the candidate manifest equals the receipt's.
+                if role == "builder":
+                    _grant_gate_acceptance(session_uuid, trace)
+                transcript.notice(io_out, done_text(
+                    status_path))
+                if session_uuid and role_work_id:
+                    _approved_manifest = dispatch_manifest.load_manifest(
+                        state_store.manifest_path_for(session_uuid, role))
+                    _approved_digest = (_approved_manifest or {}).get("digest")
+                    if _approved_digest:
+                        _complete_phase(session_uuid, role_work_id,
+                                        _approved_digest,
+                                        source="gate.reviewer")
+                outcome_kind = "approved"
+                break
             else:
                 if status == "needs_input":
                     review_rounds = 0  # role re-opened work: fresh review budget
                     pending_question = _pending_question(status_path)
                     if pending_question:
                         missing_question_repairs = 0
-                    elif (require_pending_question and not headless
+                    elif (require_pending_question
                           and missing_question_repairs == 0):
                         # Do not present a blank "your answer" box when the role
                         # failed its needs_input contract.  Give it one bounded
@@ -9321,11 +7808,10 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 status=status,
                                 reason="needs_input_without_question",
                                 repair_attempted=True)
-                        ui.banner(
+                        transcript.notice(
                             io_out,
                             "%s\nNo question was recorded; asking %s to repair "
-                            "its status." % (needs_input_text(), role),
-                            "dissent")
+                            "its status." % (needs_input_text(), role))
                         pending = _missing_question_delivery(artifact_noun)
                         pending_reopen_reason = "missing_question"
                         continue
@@ -9341,51 +7827,27 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     elif require_pending_question:
                         gate_text += (
                             "\nNo question was provided after an automatic "
-                            "repair. Tell the role what to do, or type /stop "
-                            "to leave this phase.")
-                    ui.banner(io_out, gate_text, "needs_input")
-                if headless:
-                    # No human to answer: re-send the canned nudge so the role
-                    # records an assumption and proceeds (F2_roles_never_block).
-                    # The stale-no-op/stuck handling bounds a role that keeps
-                    # re-writing the SAME status; HEADLESS_NUDGE_CAP backstops a
-                    # role that keeps writing DIFFERENT needs_input each turn.
-                    headless_nudges += 1
-                    if headless_nudges > HEADLESS_NUDGE_CAP:
-                        if trace:
-                            trace.event("headless.auto", role=role,
-                                        gate="needs_input", action="end",
-                                        nudges=headless_nudges)
-                        _advance_phase(
-                            session_uuid, role_work_id, "execution_failed",
-                            evidence={"reason": "headless_nudge_cap",
-                                     "nudges": headless_nudges},
-                            source="headless.auto")
-                        outcome_kind = _OUTCOME_ENDED
-                        break
-                    if trace:
-                        trace.event("headless.auto", role=role,
-                                    gate="needs_input", action="nudge",
-                                    nudges=headless_nudges)
-                    pending = _headless_nudge_delivery(artifact_noun)
-                    pending_reopens_work = True
-                    pending_reopen_reason = "user_answer"
-                    continue
-                outcome = _read_turn(io_in, io_out)
-                if outcome is _END:
-                    if trace:
-                        trace.event("user.action", role=role, action="eof")
-                    _advance_phase(
-                        session_uuid, role_work_id, "cancelled",
-                        evidence={"reason": "eof"}, source="user.action")
-                    outcome_kind = _OUTCOME_ENDED
-                    break
-                pending = _user_lead_delivery(outcome)
+                            "repair.")
+                    transcript.notice(io_out, gate_text)
+                # An open question needs an answer this process cannot supply:
+                # stop with the question as a structured request. The status
+                # is left as-is; the orchestrator answers by resuming the
+                # session with --context.
+                # A turn that ended in neither state (no status written, or
+                # an in-progress one) is stopped the same way, named apart.
+                stop_kind = ("needs_input" if status == "needs_input"
+                             else "role_turn_incomplete")
                 if trace:
-                    trace.event("user.action", role=role, action="answer",
-                                **trace_store.prompt_meta(outcome, prefix="input"))
-                pending_reopens_work = True
-                pending_reopen_reason = "user_answer"
+                    trace.event("gate.decision", decider="runtime", role=role,
+                                gate="needs_input", action="stop",
+                                reason=stop_kind)
+                outcome_kind, payload = _end_unapproved(_agent_stop_payload(
+                    stop_kind, role,
+                    requires=("answer" if stop_kind == "needs_input"
+                              else "operator"),
+                    question=_pending_question(status_path) or None,
+                    status=status, status_path=status_path))
+                break
     except KeyboardInterrupt:
         if trace:
             trace.event("role.interrupted", role=role)
@@ -9407,13 +7869,12 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
     return 0, outcome_kind, payload
 
 
-def _scout_loop(session, first, intel_path, context, io_in, io_out,
+def _scout_loop(session, first, intel_path, context, io_out,
                 review_fn=None, trace=None, on_outcome=None,
                 evaluate_fn=None, intel_md_path=None, skip_baseline=None,
                 context_revision=None, is_resume=False,
                 on_first_send_accepted=None, on_first_send_rejected=None,
-                headless=False,
-                gate_preview=None, review_path=None,
+                review_path=None,
                 save_pending_turn_fn=None, clear_pending_turn_fn=None,
                 session_uuid=None, role_work_id=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
@@ -9421,24 +7882,24 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
     `run_flow` can chain into the planning phase on approval.
 
     `intel_md_path`, when given, repoints the review/done gate surfaces at the
-    human-first intel markdown (mirroring the planner gate pointing at plan.md);
+    readable intel markdown (mirroring the planner gate pointing at plan.md);
     the status file driving the loop stays the intel JSON. `skip_baseline` wires
     the reviewer hash-gate (see `_role_loop`)."""
     loop_kwargs = dict(
         role="scout", review_fn=review_fn, trace=trace,
         reviewer_role=SCOUT_REVIEWER, evaluate_fn=evaluate_fn,
         skip_baseline=skip_baseline, context_revision=context_revision,
-        phase="scouting", is_resume=is_resume, headless=headless,
-        gate_preview=gate_preview, require_pending_question=True,
+        phase="scouting", is_resume=is_resume,
+        require_pending_question=True,
         review_path=review_path, save_pending_turn_fn=save_pending_turn_fn,
         clear_pending_turn_fn=clear_pending_turn_fn)
     if intel_md_path:
         loop_kwargs["review_text"] = (
-            lambda _p, en=False: scout_review_text(intel_md_path, en))
+            lambda _p: scout_review_text(intel_md_path))
         loop_kwargs["done_text"] = (
-            lambda _p, en=False: scout_done_text(intel_md_path, en))
+            lambda _p: scout_done_text(intel_md_path))
     rc, outcome, payload = _role_loop(
-        session, first, intel_path, context, io_in, io_out,
+        session, first, intel_path, context, io_out,
         on_first_send_accepted=on_first_send_accepted,
         on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
             session_uuid=session_uuid, role_work_id=role_work_id)
@@ -9464,7 +7925,7 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    session_uuid=None, intel_path=None, planning_epoch=None,
                    consumed_upstream=None, extra_writable_dir=None,
                    surface_io_out=None, intel_md_path=None,
-                   review_packet_ctx=None, switch_controller_fn=None,
+                   review_packet_ctx=None,
                    switch_note_fn=None, on_switch_consumed=None,
                    reviewer_controller_check_fn=None,
                    evaluation_policy=None):
@@ -9632,12 +8093,21 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                 reviewer_role, phase, round_index, review_path,
                 artifact_path, verdict, trace=trace,
                 evaluation_policy=evaluation_policy)
-        if verdict is not None:
+        if verdict is not None and not (isinstance(verdict, dict)
+                                        and verdict.get("controller_failure")):
             # The reviewer ran against the current context: acknowledge the
-            # revision once and stop repeating the wake block.
+            # revision once and stop repeating the wake block. A controller
+            # failure never reached the reviewer, so the wake block (and any
+            # decision record riding it) and the ack are kept for the next
+            # pass of this run.
             holder["context_update"] = None
             if holder["ack"]:
-                holder["ack"]()
+                # An ack that also settles a decision delivery needs to know
+                # whether this pass actually reached the reviewer.
+                if getattr(holder["ack"], "accepts_verdict", False):
+                    holder["ack"](verdict)
+                else:
+                    holder["ack"]()
                 holder["ack"] = None
             if holder["switch_note"] and not _is_review_failure(verdict):
                 if on_switch_consumed:
@@ -9645,29 +8115,6 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                 holder["switch_note"] = None
         return verdict
 
-    def switch_review_controller(reason="reviewer_failure", target=None):
-        if not switch_controller_fn:
-            return False
-        # `target` is passed only when the gate named one, so an injected
-        # switch double keeping the historical (role, reason, source) signature
-        # is still callable.
-        extra = {"target": target} if target is not None else {}
-        ok = switch_controller_fn(reviewer_role, reason=reason, source="gate",
-                                  **extra)
-        if not ok:
-            return False
-        holder["resume_id"] = None
-        holder["context_update"] = None
-        holder["ack"] = None
-        holder["switch_note"] = switch_note_fn(
-            reviewer_role) if switch_note_fn else None
-        return True
-
-    review_fn.switch_controller = switch_review_controller
-    # Read live (not snapshotted): a gate switch rewrites config[reviewer_role],
-    # and the next gate must offer eligible targets for the NEW controller.
-    review_fn.reviewer_controller = (
-        lambda: (config.get(reviewer_role) or {}).get("controller"))
 
     return review_fn
 
@@ -9912,8 +8359,8 @@ def _compile_role_manifest(
 # gates, and terminal correlation — keys off it. `_advance_phase` is the ONE  #
 # place in this file that calls A's closed reducer (`cowork_control_plane.    #
 # advance`) and persists the result via B's public                           #
-# `cowork_state.append_phase_state_entry`; no exit code, EOF, headless        #
-# fallthrough, or status-file read ever sets `lifecycle_state` directly. A    #
+# `cowork_state.append_phase_state_entry`; no exit code, EOF, stop            #
+# outcome, or status-file read ever sets `lifecycle_state` directly. A    #
 # transition the reducer refuses (illegal for the current state, or missing/ #
 # mismatched gate evidence) writes nothing and this helper returns the durable#
 # record UNCHANGED — advancing on a bad event can never fabricate progress.   #
@@ -10440,10 +8887,10 @@ def _advance_phase(session_uuid, work_id, event, evidence=None, source=None,
 # Wires C's pure outcome classification (`cowork_bridge.classify_<ctrl>_      #
 # failure`) and D's lease decisions (`cowork_capacity_scheduler`) into the    #
 # live retain-on-send-failure seam (`_role_loop`'s send-failure block) and    #
-# its retry/switch/end recovery gate. Quota/overload/authentication outcomes  #
-# never auto-retry the SAME provider (quota/overload durably enter           #
-# `awaiting_capacity`; authentication_failed is refused at the interactive    #
-# gate's retry choice, see `_RETRY_BLOCKED_OUTCOMES`). Every classification   #
+# its structured controller-failure end. Quota/overload/authentication       #
+# outcomes never retry the SAME provider (quota/overload durably enter        #
+# `awaiting_capacity`; no in-process retry exists for any other outcome).     #
+# Every classification                                                        #
 # -- including the explicit `unknown_provider_failure` member -- is recorded #
 # as a durable ProviderHealth fact (`_record_provider_health`).              #
 #                                                                              #
@@ -10470,15 +8917,6 @@ _CONTROLLER_FAILURE_CLASSIFIERS = {
     "codex": bridge.classify_codex_failure,
     "opencode": bridge.classify_opencode_failure,
 }
-
-# Named per the frozen brief: these three ControllerOutcome members may never
-# justify a same-provider auto-retry. `quota_limited`/`overloaded` bypass the
-# interactive gate entirely (durable `awaiting_capacity` entry, below);
-# `authentication_failed` is not capacity-eligible, so it still reaches the
-# interactive gate -- where a user-chosen "retry" is refused exactly like a
-# tripped recovery breaker (see the gate wiring in `_role_loop`).
-_RETRY_BLOCKED_OUTCOMES = frozenset({
-    "quota_limited", "overloaded", "authentication_failed"})
 
 # This worker's own design choice (like ProviderHealth's schema itself,
 # `cowork_state.py`'s M3B banner) for mapping a ControllerOutcome onto
@@ -10603,7 +9041,7 @@ def _durable_provider_session_id(session_uuid, role, controller):
     """The durable, resume-surviving `provider_session_id` for (role,
     controller) -- read from THIS session's own persisted state via the
     IDENTICAL lookup (`_find_session_state` + `state_store.
-    get_role_session`) the headless resume-trigger CLI already uses to
+    get_role_session`) the resume-trigger CLI already uses to
     reconstruct a resume session. Never an in-process session object's own
     attribute: e.g. `bridge.ClaudeSession` never updates its own
     `self.session_id` once the provider's real id is observed mid-turn --
@@ -10710,11 +9148,262 @@ def _capacity_evidence_fields(controller, controller_outcome, raw_evidence, now)
            {"kind": evidence_source, "sha256": digest})
 
 
+# Orchestrator decision deliveries composed into a lead's CURRENT launch, per
+# (session_uuid, role): `run_flow` binds them when it composes the seed and
+# unbinds them when the launch returns or is acknowledged. `_role_loop` reads
+# them only for a capacity pause of that launch's FIRST send, so the durable
+# pending turn names exactly the deliveries its bytes carry.
+_DECISION_LAUNCH_BINDINGS = {}
+
+
+def _bind_decision_launch(session_uuid, role, bindings):
+    key = (session_uuid, role)
+    if bindings:
+        _DECISION_LAUNCH_BINDINGS[key] = tuple(dict(b) for b in bindings)
+    else:
+        _DECISION_LAUNCH_BINDINGS.pop(key, None)
+
+
+def _decision_launch_bindings(session_uuid, role):
+    return [dict(b) for b in _DECISION_LAUNCH_BINDINGS.get(
+        (session_uuid, role), ())]
+
+
+def _pause_lease_horizon_epoch(lease):
+    """Epoch seconds after which a PauseLease is past the retry horizon: its
+    latest event (issue, `not_before`, claim) plus
+    `cowork_capacity.MAX_RETRY_HORIZON_SECONDS`. None when it has no event
+    timestamp or any of them is unreadable."""
+    anchors = []
+    for key in ("issued_at", "not_before", "claimed_at"):
+        value = lease.get(key)
+        if not value:
+            continue
+        epoch = capacity_contracts.rfc3339_to_epoch_seconds(value)
+        if epoch is None:
+            return None
+        anchors.append(epoch)
+    if not anchors:
+        return None
+    return max(anchors) + capacity_contracts.MAX_RETRY_HORIZON_SECONDS
+
+
+def _pause_lease_horizon_release_at(lease):
+    """RFC3339 (UTC, whole seconds, rounded up) form of
+    `_pause_lease_horizon_epoch`, or None."""
+    epoch = _pause_lease_horizon_epoch(lease or {})
+    if epoch is None:
+        return None
+    return datetime.datetime.fromtimestamp(
+        int(-(-epoch // 1)), datetime.timezone.utc).isoformat().replace(
+            "+00:00", "Z")
+
+
+def _pause_lease_past_horizon(lease, now=None):
+    """True when a still-`unclaimed`/`claimed` PauseLease has had no event
+    (issue, `not_before`, claim) for longer than the capacity retry horizon
+    (`cowork_capacity.MAX_RETRY_HORIZON_SECONDS`). No PauseLease field names
+    an expiry, and no wake is ever scheduled past that horizon, so such a
+    lease -- e.g. one whose claimant crashed after an accepted send -- is
+    treated as expired. An unreadable timestamp never counts as expired."""
+    horizon = _pause_lease_horizon_epoch(lease)
+    now_epoch = capacity_contracts.rfc3339_to_epoch_seconds(
+        now or _capacity_now())
+    if horizon is None or now_epoch is None:
+        return False
+    return now_epoch > horizon
+
+
+def _capacity_turn_decision_hold(session_uuid, role, request_id,
+                                 expire_stale=False, expiry_failures=None):
+    """The PauseLease id holding decision `request_id` for `role`, or None.
+
+    A decision is held when `role`'s acknowledged capacity pending turn
+    carries it and that turn's PauseLease is live: `unclaimed` or `claimed`
+    and not past the retry horizon (`_pause_lease_past_horizon`). Only the
+    resume-trigger that sends those turn bytes may deliver (and acknowledge)
+    it. A terminal lease (consumed, cancelled, replaced, expired), a missing
+    lease, or a lease past the horizon releases the hold. With
+    `expire_stale`, a lease past the horizon is also durably marked expired
+    before the hold is released, so no later trigger can resend its stale
+    turn. When that expiry cannot be persisted the hold is KEPT (its lease id
+    is returned) and the error type name is recorded in `expiry_failures`
+    (a dict keyed by lease id, when given) so the caller refuses with it. A
+    `PauseLeaseConflict` means the lease is already terminal or gone, which
+    releases the hold."""
+    record = state_store.read_pending_turn_before_pause(session_uuid, role)
+    if not (isinstance(record, dict) and record.get("acknowledged")):
+        return None
+    if not any(b.get("request_id") == request_id
+               for b in record.get("decision_bindings") or ()):
+        return None
+    lease_id = record.get("lease_id")
+    lease = (state_store.read_pause_lease(session_uuid, lease_id)
+             if lease_id else None)
+    if not lease or lease.get("consumption_state") not in (
+            "unclaimed", "claimed"):
+        return None
+    if _pause_lease_past_horizon(lease):
+        if expire_stale:
+            try:
+                state_store.mark_pause_lease_expired(session_uuid, lease_id)
+            except state_store.PauseLeaseConflict:
+                pass
+            except (OSError, TimeoutError, ValueError) as exc:
+                if expiry_failures is not None:
+                    expiry_failures[lease_id] = type(exc).__name__
+                return lease_id
+        return None
+    return lease_id
+
+
+def _capacity_turn_holds_decision(session_uuid, role, request_id):
+    """True when a live capacity pause holds decision `request_id` for
+    `role` (see `_capacity_turn_decision_hold`)."""
+    return _capacity_turn_decision_hold(
+        session_uuid, role, request_id) is not None
+
+
+def _capacity_held_decisions(session_uuid, trusted_state):
+    """Every trusted pending decision delivery a live capacity pause holds:
+    `{"request_id", "role", "lease_id"}` dicts, oldest first. Leases past
+    the retry horizon are durably expired on the way (they hold nothing);
+    one whose expiry could not be persisted still holds, and its dict also
+    carries `"expiry_failed": <error type name>`."""
+    holds = []
+    expiry_failures = {}
+    for entry in state_store.read_pending_decision_deliveries(
+            session_uuid, trusted_state=trusted_state):
+        rid = entry.get("request_id")
+        trusted = state_store.trusted_decision_response(
+            trusted_state, rid,
+            (entry.get("delivery") or {}).get("response_kind")) or {}
+        for target in state_store.pending_delivery_targets(entry):
+            if target not in (trusted.get("targets") or ()):
+                continue
+            lease_id = _capacity_turn_decision_hold(
+                session_uuid, target, rid, expire_stale=True,
+                expiry_failures=expiry_failures)
+            if lease_id:
+                hold = {"request_id": rid, "role": target,
+                        "lease_id": lease_id}
+                if lease_id in expiry_failures:
+                    hold["expiry_failed"] = expiry_failures[lease_id]
+                holds.append(hold)
+    return holds
+
+
+def _capacity_hold_refusal(session_uuid, hold):
+    """`(stop_details, message, rc)` for a run refused because `hold` (one
+    `_capacity_held_decisions` entry) keeps its decision on a capacity
+    pause. The details name the lease's state, claimant/automation refs and
+    the time its retry horizon releases it, so a crashed claimant can be
+    recovered; no reset or cancel command is invented."""
+    rid, role, lease_id = hold["request_id"], hold["role"], hold["lease_id"]
+    lease = state_store.read_pause_lease(session_uuid, lease_id) or {}
+    lease_state = lease.get("consumption_state")
+    claimant_ref = lease.get("claimant_ref")
+    automation_ref = lease.get("automation_ref")
+    release_at = _pause_lease_horizon_release_at(lease)
+    details = {
+        "kind": "decision_held_by_capacity_pause",
+        "request_id": rid, "role": role, "lease_id": lease_id,
+        "lease_state": lease_state, "claimant_ref": claimant_ref,
+        "automation_ref": automation_ref,
+        "horizon_release_at": release_at}
+    if hold.get("expiry_failed"):
+        details["expiry_failed"] = hold["expiry_failed"]
+        details["lease_path"] = state_store.pause_lease_path_for(
+            session_uuid, lease_id)
+        return details, (
+            "decision %s for %s rides the capacity-paused turn of lease %s, "
+            "which is past its retry horizon (%s) but could not be durably "
+            "marked expired (%s); the hold is kept so no wake resends that "
+            "stale turn. Make the lease record at %s writable and rerun"
+            % (rid, role, lease_id, release_at or "unknown",
+               hold["expiry_failed"], details["lease_path"])), 1
+    if lease_state == "claimed":
+        return details, (
+            "decision %s for %s rides the capacity-paused turn of lease %s, "
+            "claimed by %s but never consumed (its claimant stopped after "
+            "claiming). Retrigger it with the SAME identities: "
+            "`resume-trigger --session-uuid %s --lease-id %s --claimant-ref "
+            "%s --automation-ref %s` (verbatim, no --redirected-context); "
+            "after the lease is released (consumed, or past its retry "
+            "horizon at %s) a plain run delivers it"
+            % (rid, role, lease_id, claimant_ref, session_uuid, lease_id,
+               claimant_ref, automation_ref, release_at or "unknown")
+        ), CAPACITY_WAIT_EXIT_CODE
+    return details, (
+        "decision %s for %s rides the capacity-paused turn of lease %s; it "
+        "is delivered by `resume-trigger --lease-id %s` (verbatim, no "
+        "--redirected-context), or released when that lease is cancelled or "
+        "expires" % (rid, role, lease_id, lease_id)), CAPACITY_WAIT_EXIT_CODE
+
+
+def _acknowledge_capacity_turn_decisions(session_uuid, pending_record,
+                                         failed=None):
+    """The capacity pending turn was accepted by the provider: acknowledge
+    exactly the decision deliveries bound to those turn bytes, per target.
+    Returns the acknowledged bindings; a binding whose acknowledgment failed
+    is appended to `failed` (when given) so the caller reports it.
+
+    Delivery here is AT LEAST ONCE, not exactly once. A store failure leaves
+    that delivery pending and never blocks the lease consumption that must
+    follow an accepted send, so a later plain run re-sends the block. A crash
+    between the accepted send and the acknowledgment leaves the lease
+    `claimed`: the decision stays held until that lease is cancelled or
+    passes the retry horizon, and the next delivery re-sends the block.
+    Either way only the block (by path) repeats: no phase or epoch
+    transition is applied twice."""
+    acked = []
+    for binding in (pending_record or {}).get("decision_bindings") or ():
+        try:
+            state_store.mark_decision_delivered(
+                session_uuid, binding["request_id"],
+                target=binding.get("target") or pending_record.get("role"))
+        except (OSError, TimeoutError, ValueError, KeyError):
+            if failed is not None:
+                failed.append(dict(binding))
+            continue
+        acked.append(dict(binding))
+    return acked
+
+
+def _redirect_refused_decisions(args, pending_record):
+    """The request ids a `--redirected-context` resume-trigger would drop
+    from the paused turn's bytes (empty for a verbatim wake, or a turn that
+    carries no decision)."""
+    if getattr(args, "redirected_context", None) is None:
+        return []
+    return [str(b.get("request_id"))
+            for b in (pending_record or {}).get("decision_bindings") or ()]
+
+
+def _capacity_turn_tampered_answer(session_uuid, state, pending_record):
+    """The first decision the capacity pending turn names that the session
+    store did not record, or whose answer no longer has the recorded bytes;
+    None when every one is intact."""
+    for binding in (pending_record or {}).get("decision_bindings") or ():
+        rid = binding.get("request_id")
+        entry = state_store.trusted_decision_response(state, rid)
+        if entry is None:
+            return rid
+        if entry.get("answer_sha256"):
+            try:
+                state_store.verified_decision_answer_path(
+                    session_uuid, state, rid)
+            except state_store.DecisionAnswerTampered:
+                return rid
+    return None
+
+
 def _enter_awaiting_capacity(session_uuid, work_id, role, provider,
                              provider_session_id, controller_outcome,
                              pending_text, model, effort, raw_evidence=None,
                              replace_lease_id=None,
-                             replace_automation_ref=None):
+                             replace_automation_ref=None,
+                             decision_bindings=None):
     """Durable capacity-entry seam: on a genuine `quota_limited`/`overloaded`
     classification, persist the in-flight pending turn BEFORE
     acknowledgment (`cowork_state.write_pending_turn_before_pause`), mint
@@ -10730,6 +9419,11 @@ def _enter_awaiting_capacity(session_uuid, work_id, role, provider,
     feeds `_capacity_evidence_fields` so `capacity_source`/`resume_mode`/
     `retry_after` derive from C's real evidence-extraction seam, never a
     synthesized value.
+
+    `decision_bindings` (`{"request_id", "target"}` dicts) names the
+    orchestrator decision deliveries `pending_text` carries; they are written
+    into the same pending-turn record, so the resume-trigger that later sends
+    these bytes acknowledges exactly them.
 
     `replace_lease_id`, when given, is a PRIOR lease for this EXACT SAME
     binding that a genuine post-claim resume-trigger failure just left
@@ -10755,7 +9449,7 @@ def _enter_awaiting_capacity(session_uuid, work_id, role, provider,
     missing provider_session_id/pending text, an outcome outside
     `cowork_capacity.CAPACITY_ELIGIBLE_OUTCOMES`, or a storage/validation
     failure) means this failure cannot be honestly entered as capacity --
-    the caller falls back to its ordinary interactive/headless/resume-
+    the caller falls back to its ordinary controller-failure/resume-
     trigger failure handling instead of fabricating a transition."""
     if not (session_uuid and work_id and provider_session_id and pending_text
            and controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES):
@@ -10771,7 +9465,8 @@ def _enter_awaiting_capacity(session_uuid, work_id, role, provider,
     lease_id = str(uuid.uuid4())
     try:
         pending_record = state_store.write_pending_turn_before_pause(
-            session_uuid, role, pending_text, lease_id=lease_id)
+            session_uuid, role, pending_text, lease_id=lease_id,
+            decision_bindings=decision_bindings)
     except ValueError:
         return None
 
@@ -11062,8 +9757,8 @@ def _complete_phase(session_uuid, work_id, candidate_manifest_digest,
     real candidate digest first (see `_bind_candidate`), then drives the
     reducer through `turn_completed` (running -> awaiting_gate) and
     `gate_validated` with candidate-bound evidence naming it (awaiting_gate
-    -> completed). Exit code 0, EOF, headless fallthrough, and status-file
-    presence never appear here — only an explicit user/headless APPROVAL at
+    -> completed). Exit code 0, EOF, a stop outcome, and status-file
+    presence never appear here — only the paired reviewer's explicit APPROVAL at
     the `ready_for_review` gate calls this, and only when a real proven
     manifest digest exists to bind."""
     if not session_uuid or not work_id or not candidate_manifest_digest:
@@ -11229,7 +9924,7 @@ def _guard_to_policy_fact(controller, role, phase=None, trace=None):
                 "refusal_message": str(exc), "source": "policy_guard"}
 
 
-def run_scout(config, context, selected, io_in=None, io_out=None,
+def run_scout(config, context, selected, io_out=None,
               evaluation_policy=None,
               claude_spawn=None, resume_id=None, on_session=None,
               intel_path=None, session_factory=None, review_path=None,
@@ -11240,11 +9935,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               eval_scratch_path=None, reviewer_eval_scratch_path=None,
               scores_path=None, session_uuid=None, intel_md_path=None,
               skip_baseline=None, review_packet_ctx=None,
-              switch_controller_fn=None, reviewer_switch_note_fn=None,
+              reviewer_switch_note_fn=None,
               on_reviewer_switch_consumed=None,
               on_first_send_accepted=None, on_first_send_rejected=None,
-              reviewer_controller_check_fn=None, headless=False,
-              gate_preview=None, save_pending_turn_fn=None,
+              reviewer_controller_check_fn=None,
+              save_pending_turn_fn=None,
               clear_pending_turn_fn=None, worktree=None, worktree_base=None):
     """Spin up the scout's CLI and drive the review loop.
 
@@ -11265,7 +9960,6 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     `session_uuid` wire the per-round peer evaluations (scout <->
     scout-reviewer); absent, no evaluations happen.
     """
-    io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     cfg = config["scout"]
     # Writable root granted to the agent CLIs so a no-yolo role can write its
@@ -11348,7 +10042,6 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         scores_path=scores_path, session_uuid=session_uuid,
         extra_writable_dir=sessions_dir, surface_io_out=io_out,
         review_packet_ctx=review_packet_ctx,
-        switch_controller_fn=switch_controller_fn,
         switch_note_fn=reviewer_switch_note_fn,
         on_switch_consumed=on_reviewer_switch_consumed,
         reviewer_controller_check_fn=reviewer_controller_check_fn)
@@ -11368,9 +10061,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         trace.event("role.start", role="scout", controller=cfg["controller"],
                     resume=bool(resume_id), intel_path=intel_path,
                     review_path=review_path)
-    ui.banner(io_out, scout_start_text(
-        intel_md_path or intel_path or "", resuming=bool(resume_id),
-        enabled=ui.is_tty(io_out)), "start")
+    transcript.notice(io_out, scout_start_text(
+        intel_md_path or intel_path or "", resuming=bool(resume_id)))
     io_out.flush()
     # `preflight_passed` (preflighting -> running) is bound per controller
     # branch below, ONLY once that branch's own policy/probe/session-start
@@ -11408,12 +10100,10 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                 source="policy_guard")
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = _with_status_spinner(
-            io_out, "starting scout",
-            lambda: bridge.probe_claude_stream_json(
+        ok, alert = bridge.probe_claude_stream_json(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=SCOUT_PROMPT_PATH, trace=trace, role="scout",
-                extra_writable_dir=sessions_dir, cache_enabled=True))
+                extra_writable_dir=sessions_dir, cache_enabled=True)
         if not ok:
             _decide_and_trace(
                 trace, "scout", cfg["controller"], "launch", "run_scout",
@@ -11487,7 +10177,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         _advance_phase(session_uuid, role_work_id, "preflight_passed",
                        source="run_scout")
         first = _role_seed_delivery(brief, context)
-        return _scout_loop(session, first, intel_path, context, io_in, io_out,
+        return _scout_loop(session, first, intel_path, context, io_out,
                            review_fn=review_fn, trace=trace,
                            on_outcome=on_outcome, evaluate_fn=evaluate_fn,
                            intel_md_path=intel_md_path,
@@ -11497,7 +10187,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
                            on_first_send_rejected=on_first_send_rejected,
-                           headless=headless, gate_preview=gate_preview,
+
                            review_path=review_path,
                            save_pending_turn_fn=save_pending_turn_fn,
                            clear_pending_turn_fn=clear_pending_turn_fn,
@@ -11556,7 +10246,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         _advance_phase(session_uuid, role_work_id, "preflight_passed",
                        source="run_scout")
         first = _role_seed_delivery(brief, context)
-        return _scout_loop(session, first, intel_path, context, io_in, io_out,
+        return _scout_loop(session, first, intel_path, context, io_out,
                            review_fn=review_fn, trace=trace,
                            on_outcome=on_outcome, evaluate_fn=evaluate_fn,
                            intel_md_path=intel_md_path,
@@ -11566,7 +10256,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                            is_resume=bool(resume_id),
                            on_first_send_accepted=on_first_send_accepted,
                            on_first_send_rejected=on_first_send_rejected,
-                           headless=headless, gate_preview=gate_preview,
+
                            review_path=review_path,
                            save_pending_turn_fn=save_pending_turn_fn,
                            clear_pending_turn_fn=clear_pending_turn_fn,
@@ -11604,7 +10294,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     # legally advance preflighting -> running.
     _advance_phase(session_uuid, role_work_id, "preflight_passed",
                    source="run_scout")
-    return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
+    return _scout_loop(session, prompt, intel_path, context, io_out,
                        review_fn=review_fn, trace=trace, on_outcome=on_outcome,
                        evaluate_fn=evaluate_fn, intel_md_path=intel_md_path,
                        skip_baseline=skip_baseline,
@@ -11613,7 +10303,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                        is_resume=bool(resume_id),
                        on_first_send_accepted=on_first_send_accepted,
                        on_first_send_rejected=on_first_send_rejected,
-                        headless=headless, gate_preview=gate_preview,
+
                         review_path=review_path,
                         save_pending_turn_fn=save_pending_turn_fn,
                         clear_pending_turn_fn=clear_pending_turn_fn,
@@ -11621,7 +10311,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                             role_work_id=role_work_id)
 
 
-def run_planner(config, context, selected, io_in=None, io_out=None,
+def run_planner(config, context, selected, io_out=None,
                 evaluation_policy=None,
                 claude_spawn=None, resume_id=None, on_session=None,
                 plan_json_path=None, plan_md_path=None,
@@ -11629,16 +10319,16 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 reviewer_runner=None, reviewer_resume_id=None,
                 on_reviewer_session=None, reviewer_context=None,
                 reviewer_context_update=None, on_reviewer_context_ack=None,
-                trace=None, handoff_confirm=None, on_outcome=None,
+                trace=None, on_outcome=None,
                 eval_scratch_path=None, reviewer_eval_scratch_path=None,
                 scores_path=None, session_uuid=None, intel_path=None,
                 planning_epoch=None, skip_baseline=None, intel_md_path=None,
-                review_packet_ctx=None, switch_controller_fn=None,
+                review_packet_ctx=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None, on_first_send_rejected=None,
-                reviewer_controller_check_fn=None, headless=False,
-                gate_preview=None, save_pending_turn_fn=None,
+                reviewer_controller_check_fn=None,
+                save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
@@ -11646,7 +10336,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     `context` is the seed message for this cycle: the approved-intel seed on a
     fresh chain, a digest wake block after a hand-back round trip, or "" on a
     plain resume (auto-continue). The plan JSON (`plan_json_path`) doubles as
-    the planner's status channel; `plan_md_path` is the user's review surface.
+    the planner's status channel; `plan_md_path` is the readable review surface.
     `review_path` + the planning-advisor being on the team enable the advisor
     gate; `reviewer_runner` overrides the advisor pass (for tests).
     `eval_scratch_path`/`reviewer_eval_scratch_path` + `scores_path` +
@@ -11654,8 +10344,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     planning-advisor, each bundling a one-time ->scout eval of the approved
     intel at `intel_path`); absent, no evaluations happen.
     `on_outcome(outcome, payload)` reports how the loop ended so `run_flow` can
-    execute a confirmed hand-back ("handoff" outcome) or finish the session."""
-    io_in = io_in or sys.stdin
+    chain, stop or finish the session."""
     io_out = io_out or sys.stdout
     cfg = config["planner"]
     # Writable root granted to the agent CLIs so a no-yolo role can write its
@@ -11741,7 +10430,6 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         intel_md_path=intel_md_path,
         extra_writable_dir=sessions_dir, surface_io_out=io_out,
         review_packet_ctx=review_packet_ctx,
-        switch_controller_fn=switch_controller_fn,
         switch_note_fn=reviewer_switch_note_fn,
         on_switch_consumed=on_reviewer_switch_consumed,
         reviewer_controller_check_fn=reviewer_controller_check_fn)
@@ -11763,9 +10451,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         trace.event("role.start", role="planner", controller=cfg["controller"],
                     resume=bool(resume_id), plan_json_path=plan_json_path,
                     plan_md_path=plan_md_path, review_path=review_path)
-    ui.banner(io_out, planner_start_text(plan_md_path or "",
-                                         resuming=bool(resume_id),
-                                         enabled=ui.is_tty(io_out)), "start")
+    transcript.notice(io_out, planner_start_text(plan_md_path or "",
+                                         resuming=bool(resume_id)))
     io_out.flush()
     # `preflight_passed` (preflighting -> running) is bound per controller
     # branch below, ONLY once that branch's own policy/probe/session-start
@@ -11788,16 +10475,16 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         role="planner", review_fn=review_fn, trace=trace,
         reviewer_role=PLANNING_ADVISOR,
         needs_input_text=planner_needs_input_text,
-        review_text=lambda _p, en=False: planner_review_text(
-            plan_md_path or "", en),
-        done_text=lambda _p, en=False: planner_done_text(plan_md_path or "", en),
+        review_text=lambda _p: planner_review_text(
+            plan_md_path or ""),
+        done_text=lambda _p: planner_done_text(plan_md_path or ""),
         artifact_noun="plan",
-        handoff_enabled=True, handoff_confirm=handoff_confirm,
+        handoff_enabled=True,
         evaluate_fn=evaluate_fn, skip_baseline=skip_baseline,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="planning", is_resume=bool(resume_id),
-        seed_artifact_paths=[intel_path], headless=headless,
-        gate_preview=gate_preview, require_pending_question=True,
+        seed_artifact_paths=[intel_path],
+        require_pending_question=True,
         review_path=review_path, save_pending_turn_fn=save_pending_turn_fn,
         clear_pending_turn_fn=clear_pending_turn_fn)
 
@@ -11823,13 +10510,11 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = _with_status_spinner(
-            io_out, "starting planner",
-            lambda: bridge.probe_claude_stream_json(
+        ok, alert = bridge.probe_claude_stream_json(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=PLANNER_PROMPT_PATH, trace=trace,
                 role="planner", extra_writable_dir=sessions_dir,
-                cache_enabled=True))
+                cache_enabled=True)
         if not ok:
             _decide_and_trace(
                 trace, "planner", cfg["controller"], "launch", "run_planner",
@@ -11898,7 +10583,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                        source="run_planner")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
-            session, first, plan_json_path, context, io_in, io_out,
+            session, first, plan_json_path, context, io_out,
             on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
                 session_uuid=session_uuid, role_work_id=role_work_id)
@@ -11953,7 +10638,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                        source="run_planner")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
-            session, first, plan_json_path, context, io_in, io_out,
+            session, first, plan_json_path, context, io_out,
             on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
                 session_uuid=session_uuid, role_work_id=role_work_id)
@@ -11994,7 +10679,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     _advance_phase(session_uuid, role_work_id, "preflight_passed",
                    source="run_planner")
     rc, outcome, payload = _role_loop(
-        session, prompt, plan_json_path, context, io_in, io_out,
+        session, prompt, plan_json_path, context, io_out,
         on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
             session_uuid=session_uuid, role_work_id=role_work_id)
@@ -12002,7 +10687,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     return rc
 
 
-def run_builder(config, context, selected, io_in=None, io_out=None,
+def run_builder(config, context, selected, io_out=None,
                 evaluation_policy=None,
                 claude_spawn=None, resume_id=None, on_session=None,
                 build_status_path=None, build_review_path=None,
@@ -12010,17 +10695,17 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 reviewer_runner=None, reviewer_resume_id=None,
                 on_reviewer_session=None, reviewer_context=None,
                 reviewer_context_update=None, on_reviewer_context_ack=None,
-                trace=None, handoff_confirm=None, on_outcome=None,
+                trace=None, on_outcome=None,
                 eval_scratch_path=None, reviewer_eval_scratch_path=None,
                 scores_path=None, session_uuid=None, plan_json_path=None,
                 plan_md_path=None, building_epoch=None, baseline_note="",
                 baseline_repos=None, build_summary_path=None,
-                review_packet_ctx=None, switch_controller_fn=None,
+                review_packet_ctx=None,
                 reviewer_switch_note_fn=None,
                 on_reviewer_switch_consumed=None,
                 on_first_send_accepted=None, on_first_send_rejected=None,
-                reviewer_controller_check_fn=None, headless=False,
-                gate_preview=None, save_pending_turn_fn=None,
+                reviewer_controller_check_fn=None,
+                save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None,
                 checkpoint_id=None, artifact_kind=None):
     """Spin up the builder's CLI and drive the building loop (the builder
@@ -12037,9 +10722,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     build-reviewer, each bundling a one-time ->planner eval of the approved
     plan at `plan_json_path`/`plan_md_path`); absent, no evaluations happen.
     `on_outcome(outcome, payload)` reports how the loop ended so `run_flow` can
-    execute a confirmed hand-back ("handoff" outcome, builder -> planner) or
-    finish the session."""
-    io_in = io_in or sys.stdin
+    stop or finish the session."""
     io_out = io_out or sys.stdout
     cfg = config["builder"]
     # Writable root granted to the agent CLIs so a no-yolo role can write its
@@ -12136,7 +10819,6 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         scores_path=scores_path, session_uuid=session_uuid,
         consumed_upstream=consumed, extra_writable_dir=sessions_dir,
         surface_io_out=io_out, review_packet_ctx=review_packet_ctx,
-        switch_controller_fn=switch_controller_fn,
         switch_note_fn=reviewer_switch_note_fn,
         on_switch_consumed=on_reviewer_switch_consumed,
         reviewer_controller_check_fn=reviewer_controller_check_fn)
@@ -12157,14 +10839,13 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         trace.event("role.start", role="builder", controller=cfg["controller"],
                     resume=bool(resume_id), build_status_path=build_status_path,
                     review_path=build_review_path)
-    # The user-facing gate surfaces (start / review / done) point at the build
+    # The lead's gate surfaces (start / review / done) point at the build
     # summary markdown when one is wired — the readable review surface — mirroring
     # the scout's intel.md and the planner's plan.md; the status file driving the
     # loop stays build_status_path. Falls back to the status file otherwise.
     build_surface_path = build_summary_path or build_status_path
-    ui.banner(io_out, builder_start_text(build_surface_path or "",
-                                         resuming=bool(resume_id),
-                                         enabled=ui.is_tty(io_out)), "start")
+    transcript.notice(io_out, builder_start_text(build_surface_path or "",
+                                         resuming=bool(resume_id)))
     io_out.flush()
     # `preflight_passed` (preflighting -> running) is bound per controller
     # branch below, ONLY once that branch's own policy/probe/session-start
@@ -12183,14 +10864,14 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         _advance_phase(session_uuid, role_work_id, "preflight_rejected",
                        evidence=evidence, source=source)
 
-    def _gate_review_text(_p, en=False):
-        # UX-021: the human gate renders the SAME derived overlay the reviewer
+    def _gate_review_text(_p):
+        # UX-021: the review-surface gate renders the SAME derived overlay the reviewer
         # surface carries — read fresh from the current-receipt pointer at
         # banner time, with the agent-authored prose labeled separately and a
         # visible warning when the contradiction flag is set.
         overlay, pointer = _current_verification_overlay(session_uuid)
         return builder_review_text(
-            build_surface_path or "", en, overlay=overlay,
+            build_surface_path or "", overlay=overlay,
             receipt_path=(pointer.get("receipt_path")
                           if isinstance(pointer, dict) else None),
             agent_status_path=build_status_path)
@@ -12200,25 +10881,16 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         reviewer_role=BUILD_REVIEWER,
         needs_input_text=builder_needs_input_text,
         review_text=_gate_review_text,
-        done_text=lambda _p, en=False: builder_done_text(
-            build_surface_path or "", en),
+        done_text=lambda _p: builder_done_text(
+            build_surface_path or ""),
         artifact_noun="build",
-        # review_allow_ask=False removes only the "Ask a question" choice from
-        # the builder gate (scoped to the scout/planner artifact gates). With a
-        # gate_preview the builder gate is still the preview-enabled 3-way CLI
-        # select — Request changes / Approve & finish / Stop (see _read_review);
-        # the plain binary approve/revise confirm survives only for the
-        # preview-less (gate_preview=None) compatibility path.
-        review_allow_ask=False,
-        handoff_enabled=True, handoff_confirm=handoff_confirm,
+        handoff_enabled=True,
         handoff_gate_text_fn=builder_handoff_gate_text,
-        handoff_confirm_prompt="Hand the work back to the planner?",
-        handoff_declined_text_fn=handoff_declined_to_planner_text,
         evaluate_fn=evaluate_fn,
         context_revision=(review_packet_ctx or {}).get("context_revision"),
         phase="building", is_resume=bool(resume_id),
-        seed_artifact_paths=[plan_json_path, plan_md_path], headless=headless,
-        gate_preview=gate_preview, require_pending_question=True,
+        seed_artifact_paths=[plan_json_path, plan_md_path],
+        require_pending_question=True,
         review_path=build_review_path, save_pending_turn_fn=save_pending_turn_fn,
         clear_pending_turn_fn=clear_pending_turn_fn,
         build_summary_path=build_summary_path)
@@ -12245,13 +10917,11 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = _with_status_spinner(
-            io_out, "starting builder",
-            lambda: bridge.probe_claude_stream_json(
+        ok, alert = bridge.probe_claude_stream_json(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=BUILDER_PROMPT_PATH, trace=trace,
                 role="builder", extra_writable_dir=sessions_dir,
-                cache_enabled=True))
+                cache_enabled=True)
         if not ok:
             _decide_and_trace(
                 trace, "builder", cfg["controller"], "launch", "run_builder",
@@ -12318,7 +10988,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                        source="run_builder")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
-            session, first, build_status_path, context, io_in, io_out,
+            session, first, build_status_path, context, io_out,
             on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
                 session_uuid=session_uuid, role_work_id=role_work_id,
@@ -12374,7 +11044,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                        source="run_builder")
         first = _role_seed_delivery(brief, context)
         rc, outcome, payload = _role_loop(
-            session, first, build_status_path, context, io_in, io_out,
+            session, first, build_status_path, context, io_out,
             on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
                 session_uuid=session_uuid, role_work_id=role_work_id,
@@ -12416,7 +11086,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     _advance_phase(session_uuid, role_work_id, "preflight_passed",
                    source="run_builder")
     rc, outcome, payload = _role_loop(
-        session, prompt, build_status_path, context, io_in, io_out,
+        session, prompt, build_status_path, context, io_out,
         on_first_send_accepted=on_first_send_accepted,
             on_first_send_rejected=on_first_send_rejected, **loop_kwargs,
             session_uuid=session_uuid, role_work_id=role_work_id,
@@ -12436,222 +11106,106 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
 # A directory holds many resumable sessions (each its own                     #
 # .cowork/session.<uuid>.json, plus a legacy .cowork/session.json discovered   #
 # in place). `select_session` decides which one this run uses BEFORE any       #
-# team/config/phase logic, from the flags and the directory's existing         #
-# sessions. Its result is an explicit tri-state so --no-session runs the flow  #
-# while only a user dismissal returns rc 0.                                    #
+# team/config/phase logic, from explicit flags only. It never prompts and     #
+# never resumes saved work without --session-file or --resume.                #
 # --------------------------------------------------------------------------- #
 
-# path: chosen session-file path (None only on error/cancel). new_uuid: the
-# minted uuid on a New path (so run_flow names the file and the internal
-# session_uuid identically), else None. cancelled: user dismissed a picker/menu
-# (benign rc 0). error: a message for a conflicting/invalid invocation (rc 2).
-# action: an interactive action the user picked for the chosen session, handled
-# later in run_flow ('edit_controllers' = the guided controller-policy flow).
-# select_session owns only the CHOICE: it asks no controller questions and reads
-# no saved config, because at that point neither exists yet.
+# path: chosen session-file path (None only on error). new_uuid: the minted
+# uuid on a New path (so run_flow names the file and the internal session_uuid
+# identically), else None. resume: True when an explicit selector names saved
+# work. error/reason: a refused invocation (rc 2) and its closed reason code.
 SessionChoice = collections.namedtuple(
-    "SessionChoice", ["path", "new_uuid", "cancelled", "error", "action"])
-SessionChoice.__new__.__defaults__ = (None, None, False, None, None)
+    "SessionChoice", ["path", "new_uuid", "error", "reason", "resume"])
+SessionChoice.__new__.__defaults__ = (None, None, None, None, False)
 
 
-def _session_picker_label(row, now):
-    """Compose a picker row: '<relative time> · <phase> — <summary|fallback>',
-    plus the issue #64 P4 owner suffix.
-
-    The suffix is ` · owned (pid N)` for a live owner and
-    ` · stale owner (<reason>)` for every non-live lease state, so a contested
-    session is visible BEFORE it is picked. `<reason>` is always a member of
-    the closed `cowork_owner.OWNER_VERDICTS` set, never prose.
-
-    An unowned session, a row with no `owner` key (any pre-P4 caller building
-    rows by hand) and a malformed `owner` value all get no suffix and never
-    raise: `list_sessions` is total by contract, and the picker must be too.
-    """
-    when = ui.format_relative_time(row.get("last_active") or row.get("created"),
-                                   now)
-    summary = row.get("summary") or state_store.fallback_label(
-        row.get("id"), row.get("created") or row.get("last_active"))
-    label = "%s · %s — %s" % (when, row.get("phase") or "scouting", summary)
-    owner_view = row.get("owner")
-    if not isinstance(owner_view, dict):
-        return label
-    verdict = owner_view.get("verdict")
-    if verdict == "live_owner":
-        lease = (owner_view.get("lease")
-                 if isinstance(owner_view.get("lease"), dict) else {})
-        return label + " · owned (pid %s)" % lease.get("pid")
-    if verdict in ("stale_dead_owner", "stale_unproven", "corrupt"):
-        return label + " · stale owner (%s)" % verdict
-    return label
+def _decision_flags(args):
+    """The orchestrator decision responses this invocation carries, as
+    (response_kind, request_id) pairs."""
+    out = []
+    for kind, attr in (("answer", "answer"),
+                       ("authorize_handoff", "authorize_handoff"),
+                       ("decline_handoff", "decline_handoff")):
+        value = getattr(args, attr, None)
+        if value:
+            out.append((kind, value))
+    return out
 
 
-def select_session(args, io_in, io_out, select_fn=None, now=None):
-    """Decide which session this run uses. Returns a SessionChoice.
+def select_session(args):
+    """Decide which session this run uses, from arguments alone. Returns a
+    SessionChoice; never prompts and never picks saved work implicitly.
 
-    Decision order (conflicts FIRST, before any path resolution, so an explicit
-    --session-file never bypasses them):
-      1. --new + --resume          -> error
-         --no-session + --resume   -> error
-      2. --no-session              -> run the flow with the default/explicit
-                                      path; never read/written (ephemeral).
-      3. --session-file            -> single-session mode (no discovery/picker).
-      4. discover the directory's sessions.
-      5. --new                     -> mint a fresh uuid + per-session path.
-      6. --resume                  -> picker (errors with no sessions or no TTY).
-      7. no flag                   -> zero sessions: mint fresh; non-interactive:
-                                      most-recent; interactive: Resume/New menu.
-    """
-    select_fn = select_fn or ui.select
-    if now is None:
-        now = time.time()
+      * --session-file PATH  -> that session (saved work when the file exists)
+      * --resume             -> the directory's most recent saved session
+      * --no-session         -> an ephemeral session, never read or written
+      * --new, or nothing    -> a new session (it needs --context)
 
-    # 1. Conflict checks first (before --session-file / --no-session / discovery).
-    if args.new and args.resume:
-        return SessionChoice(error="--new and --resume cannot be combined.")
-    if args.no_session and args.resume:
+    At most one selector may be given. Saved-session operations (a
+    controller update, an orchestrator decision, --take-over) require an
+    explicit --session-file or --resume."""
+    selectors = [flag for flag, on in (
+        ("--session-file", bool(args.session_file)),
+        ("--resume", bool(args.resume)),
+        ("--new", bool(args.new)),
+        ("--no-session", bool(args.no_session))) if on]
+    if len(selectors) > 1:
         return SessionChoice(
-            error="--resume cannot be combined with --no-session "
-                  "(there is no session to resume).")
-
-    # The two session-mutating controller flags share one selection path: both
-    # must land on an EXISTING saved session, and each error names the flag that
-    # was actually supplied.
-    controller_flag = None
+            error="conflicting session selectors: %s (pass exactly one)"
+                  % " ".join(selectors),
+            reason="conflicting_session_selectors")
+    explicit_saved = bool(args.session_file or args.resume)
+    saved_ops = []
     if args.switch_controller:
-        controller_flag = "--switch-controller"
-    elif getattr(args, "allow_controllers", None) is not None:
-        controller_flag = "--allow-controllers"
-    if controller_flag:
-        if args.no_session:
-            return SessionChoice(
-                error="%s cannot be combined with --no-session "
-                      "(it must update an existing saved session)."
-                      % controller_flag)
-        if args.new:
-            return SessionChoice(
-                error="%s cannot be combined with --new "
-                      "(it must update an existing saved session)."
-                      % controller_flag)
-        if args.team:
-            return SessionChoice(
-                error="%s cannot be combined with --team "
-                      "(it reuses the saved team)." % controller_flag)
-        if args.config:
-            return SessionChoice(
-                error="%s cannot be combined with --config "
-                      "(it reuses the saved role config)." % controller_flag)
+        saved_ops.append("--switch-controller")
+    if getattr(args, "allow_controllers", None) is not None:
+        saved_ops.append("--allow-controllers")
+    saved_ops += ["--" + kind.replace("_", "-")
+                  for kind, _id in _decision_flags(args)]
+    if getattr(args, "take_over", False):
+        saved_ops.append("--take-over")
+    if saved_ops and not explicit_saved:
+        return SessionChoice(
+            error="%s applies to a saved session; name it with "
+                  "--session-file PATH or --resume" % " ".join(saved_ops),
+            reason="saved_session_selector_required")
+    controller_flag = ("--switch-controller" if args.switch_controller
+                       else "--allow-controllers"
+                       if getattr(args, "allow_controllers", None) is not None
+                       else None)
+    if controller_flag and args.team:
+        return SessionChoice(
+            error="%s cannot be combined with --team "
+                  "(it reuses the saved team)." % controller_flag,
+            reason="conflicting_arguments")
+    if controller_flag and args.config:
+        return SessionChoice(
+            error="%s cannot be combined with --config "
+                  "(it reuses the saved role config)." % controller_flag,
+            reason="conflicting_arguments")
 
-        cwd = os.getcwd()
-        interactive_picker_ok = ui.is_tty(io_in) and ui.is_tty(io_out)
-        if args.session_file:
-            if not os.path.exists(args.session_file):
-                return SessionChoice(
-                    error="%s: session file does not exist: %s"
-                          % (controller_flag, args.session_file))
-            return SessionChoice(path=args.session_file)
-
+    cwd = os.getcwd()
+    if args.no_session:
+        return SessionChoice(path=state_store.session_path())
+    if args.session_file:
+        if saved_ops and not os.path.exists(args.session_file):
+            return SessionChoice(
+                error="%s: session file does not exist: %s"
+                      % (saved_ops[0], args.session_file),
+                reason="session_not_found")
+        return SessionChoice(path=args.session_file,
+                             resume=os.path.exists(args.session_file))
+    if args.resume:
         discovered = state_store.list_sessions(cwd)
         if not discovered:
             return SessionChoice(
-                error="%s: no saved sessions found in %s."
-                      % (controller_flag, state_store.session_dir(cwd)))
-
-        def run_picker():
-            choices = [(row["path"], _session_picker_label(row, now))
-                       for row in discovered]
-            chosen = select_fn("Switch controller in which session?", choices)
-            if not chosen:
-                return SessionChoice(cancelled=True)
-            return SessionChoice(path=chosen)
-
-        if args.resume:
-            if not interactive_picker_ok:
-                return SessionChoice(
-                    error="--resume with %s needs an interactive terminal; use "
-                          "--session-file instead." % controller_flag)
-            return run_picker()
-        if len(discovered) == 1:
-            return SessionChoice(path=discovered[0]["path"])
-        if interactive_picker_ok:
-            return run_picker()
-        return SessionChoice(
-            error="%s found multiple saved sessions; pass --session-file to "
-                  "choose one." % controller_flag)
-
-    # 2. --no-session: not cancelled, not error — the flow still runs with an
-    # ephemeral session; the path is computed exactly as today but never read or
-    # written because session_enabled stays False downstream.
-    if args.no_session:
-        return SessionChoice(
-            path=args.session_file or state_store.session_path())
-
-    # 3. --session-file forces single-session mode: operate on that exact file,
-    # skipping discovery and the picker (preserves existing scripts/tests).
-    if args.session_file:
-        return SessionChoice(path=args.session_file)
-
-    cwd = os.getcwd()
-    interactive_picker_ok = (not _is_non_interactive(args)
-                             and ui.is_tty(io_in) and ui.is_tty(io_out))
-
-    # 4. Discover this directory's sessions (newest-first).
-    discovered = state_store.list_sessions(cwd)
-
-    def mint_new():
-        u = str(uuid.uuid4())
-        return SessionChoice(path=state_store.new_session_path(cwd, u),
-                             new_uuid=u)
-
-    def run_picker():
-        choices = [(row["path"], _session_picker_label(row, now))
-                   for row in discovered]
-        chosen = select_fn("Resume which session?", choices)
-        if not chosen:
-            return SessionChoice(cancelled=True)
-        return SessionChoice(path=chosen)
-
-    # 5. --new: skip the prompt, fresh session.
-    if args.new:
-        return mint_new()
-
-    # 6. --resume: jump straight to the picker.
-    if args.resume:
-        if not discovered:
-            return SessionChoice(
                 error="--resume: no sessions to resume in %s."
-                      % state_store.session_dir(cwd))
-        if not interactive_picker_ok:
-            return SessionChoice(
-                error="--resume needs an interactive terminal; direct resume "
-                      "by id is out of scope.")
-        return run_picker()
-
-    # 7. No flag.
-    if not discovered:
-        return mint_new()  # nothing to resume -> start fresh, no prompt
-    if not interactive_picker_ok:
-        # Piped/scripted: continue the most-recent session (today's behavior).
-        return SessionChoice(path=discovered[0]["path"])
-    # The third entry is the INTERACTIVE equivalent of --allow-controllers /
-    # --switch-controller. It appears only here — a TTY with at least one
-    # discovered session — so --new/--resume/--no-session, the piped/scripted
-    # path and headless never produce it. select_session only returns the
-    # ACTION; every prompt, validation, write and resume happens later at
-    # run_flow's single controller-update call site.
-    choice = select_fn("Resume an existing session or start a new one?",
-                       [("resume", "Resume an existing session"),
-                        ("new", "Start a new session"),
-                        ("controllers", "Change this session's controllers")])
-    if choice == "resume":
-        return run_picker()
-    if choice == "new":
-        return mint_new()
-    if choice == "controllers":
-        picked = run_picker()
-        if picked.path is None:
-            return picked  # cancelled at the picker
-        return SessionChoice(path=picked.path, action="edit_controllers")
-    return SessionChoice(cancelled=True)  # menu dismissed
+                      % state_store.session_dir(cwd),
+                reason="session_not_found")
+        return SessionChoice(path=discovered[0]["path"], resume=True)
+    u = str(uuid.uuid4())
+    return SessionChoice(path=state_store.new_session_path(cwd, u),
+                         new_uuid=u)
 
 
 def effective_phase_for(state, selected):
@@ -12664,90 +11218,6 @@ def effective_phase_for(state, selected):
     if phase == "planning" and not planner_on_team:
         phase = "scouting"
     return phase
-
-
-def alternate_controller(controller):
-    """Fallback target when a switch is requested without an explicit target on
-    a session with NO policy. claude <-> codex stay a toggle; opencode falls
-    back to claude."""
-    return "codex" if controller == "claude" else "claude"
-
-
-def eligible_controllers(current, allowed=None):
-    """The controllers a role on `current` may be switched to under `allowed`
-    (None = unrestricted). Thin delegation to the shared policy helper so the
-    recovery gates and the policy decision can never disagree."""
-    return policy.eligible(allowed, current)
-
-
-def gate_eligible_for(controller):
-    """The eligible-controller list a recovery gate should offer for a role
-    currently on `controller`, or None when this session carries NO policy.
-
-    None is the back-compat signal: the gate then renders today's single
-    "alternate controller" option, wording and return sentinels byte-identical,
-    which is what keeps every pre-existing gate test untouched. Reads the
-    process-global active policy directly, so no eligible-list parameter has to
-    be threaded through the role loops."""
-    meta = policy.active_meta()
-    if meta.get("mode") == "allowed":
-        return policy.eligible(meta.get("allowed"), controller)
-    if meta.get("mode") == "invalid":
-        # Unreadable policy: nothing may start, so no switch target exists.
-        return []
-    return None
-
-
-class _SwitchTo:
-    """A recovery-gate choice naming a SPECIFIC controller (the policy-aware
-    rendering). The policy-free rendering keeps returning the historical
-    `_STUCK_SWITCH` / `_CTRL_SWITCH` / `_REVFAIL_SWITCH` sentinels."""
-
-    __slots__ = ("target",)
-
-    def __init__(self, target):
-        self.target = target
-
-    def __repr__(self):
-        return "_SwitchTo(%r)" % self.target
-
-    def __eq__(self, other):
-        return isinstance(other, _SwitchTo) and other.target == self.target
-
-    def __hash__(self):
-        return hash(("_SwitchTo", self.target))
-
-
-def _switch_target_of(action):
-    """The controller a gate choice names, or None for the generic sentinel."""
-    return getattr(action, "target", None)
-
-
-def _call_reviewer_controller(review_fn):
-    """The paired reviewer's CURRENT controller, or None when the review_fn does
-    not expose one (test-injected doubles). Used only to compute the reviewer
-    gate's eligible list; None simply yields the unrestricted rendering."""
-    getter = getattr(review_fn, "reviewer_controller", None)
-    if getter is None:
-        return None
-    try:
-        return getter() if callable(getter) else getter
-    except Exception:  # noqa: BLE001 - a gate must never crash on a double
-        return None
-
-
-def _call_reviewer_switch(switcher, reason, target):
-    """Invoke a reviewer switch callable, passing `target` only when the
-    callable actually accepts it — test-injected doubles keep the historical
-    `switch_controller(reason=...)` signature."""
-    if target is not None:
-        try:
-            params = inspect.signature(switcher).parameters
-        except (TypeError, ValueError):
-            params = {}
-        if "target" in params:
-            return switcher(reason=reason, target=target)
-    return switcher(reason=reason)
 
 
 def validate_switch_role(role, target, phase, selected, state,
@@ -12847,114 +11317,7 @@ def validate_controller_proposal(proposal, saved_allowed, phase, selected,
     return (effective, None, warnings)
 
 
-def interactive_proposal_policy(chosen, saved_allowed):
-    """Map the interactive screen's chosen set onto the SAME three-way
-    representation the flags produce, so both surfaces persist identical state
-    for the same intent.
-
-    The PRESERVE rule is checked FIRST: a user who opens the guided flow only to
-    move a role, leaving the pre-checked boxes alone, must not rewrite the
-    policy field where the equivalent CLI invocation leaves it byte-identical.
-    Choosing all three controllers is the interactive `--allow-controllers all`.
-    """
-    picked = policy.normalize(chosen)
-    if saved_allowed is not None and picked == policy.normalize(saved_allowed):
-        return policy.PRESERVE
-    if picked == policy.CONTROLLERS:
-        return policy.ALL
-    return picked
-
-
-def _policy_effect_sentence(proposal_policy, effective):
-    """What the confirmation summary says is about to happen to the allowed
-    set — in words, so the user confirms the actual effect."""
-    if proposal_policy is policy.PRESERVE:
-        return "leaving the allowed controllers unchanged (%s)" % (
-            policy.format_allowed(effective))
-    if proposal_policy is policy.ALL:
-        return "removing the restriction — this session may use any controller"
-    return "restricting this session to %s" % policy.format_allowed(effective)
-
-
-def prompt_controller_update(saved_kind, saved_raw, config, selected, phase,
-                             io_out, multiselect_fn=None, select_fn=None,
-                             confirm_fn=None):
-    """The guided interactive controller update. Returns a ControllerProposal,
-    or None when the user cancelled (dismissing ANY prompt cancels the whole
-    invocation cleanly — nothing written, nothing resumed).
-
-    Runs at the SAME call site as the CLI update, after the session state,
-    config and phase are resolved, so it can pre-check the current policy and
-    only offer real roles and real targets. Declining the final summary re-opens
-    the allowed-set prompt once so a mistake is fixable."""
-    multiselect_fn = multiselect_fn or ui.multiselect
-    select_fn = select_fn or ui.select
-    confirm_fn = confirm_fn or ui.confirm
-    saved_allowed = saved_raw if saved_kind == "allowed" else None
-    # An unrestricted OR unreadable policy pre-checks everything: there is no
-    # meaningful saved set to reproduce, and pre-checking all three makes the
-    # obvious confirm ("leave it open") the safe one.
-    precheck = list(saved_allowed) if saved_allowed else list(policy.CONTROLLERS)
-
-    for attempt in range(2):
-        chosen = multiselect_fn(
-            "Which controllers may this session use?",
-            [(c, c) for c in policy.CONTROLLERS], selected=precheck)
-        if not chosen:
-            return None  # dismissed, or nothing checked -> cancel, never "none"
-        try:
-            proposal_policy = interactive_proposal_policy(chosen, saved_allowed)
-        except ValueError:
-            return None
-        effective = policy.effective_allowed(proposal_policy, saved_allowed)
-
-        mappings = []
-        cancelled = False
-        for role in PHASE_PAIRS.get(phase, ()):
-            if role not in selected or role not in config:
-                continue
-            current = (config[role] or {}).get("controller")
-            if policy.is_allowed(effective, current):
-                continue
-            targets = [c for c in policy.CONTROLLERS
-                       if policy.is_allowed(effective, c) and c != current]
-            picked = select_fn(
-                "%s is on %s, which the new set does not allow — move it to:"
-                % (role, current), [(c, c) for c in targets])
-            if not picked:
-                cancelled = True
-                break
-            mappings.append((role, picked))
-        if cancelled:
-            return None
-
-        lines = ["This will commit, as one update:",
-                 "  - " + _policy_effect_sentence(proposal_policy, effective)]
-        for role, target in mappings:
-            lines.append("  - moving %s to %s" % (role, target))
-        if not mappings:
-            lines.append("  - no role moves")
-        for role in selected:
-            if role in PHASE_PAIRS.get(phase, ()) or role not in config:
-                continue
-            current = (config[role] or {}).get("controller")
-            if not policy.is_allowed(effective, current):
-                lines.append(
-                    "  - warning: %s (not in the current %s phase) stays on %s "
-                    "and will be blocked if reached" % (role, phase, current))
-        io_out.write("\n".join(lines) + "\n")
-        io_out.flush()
-        answer = confirm_fn("Apply this controller update?")
-        if answer:
-            return policy.ControllerProposal(
-                proposal_policy, tuple(mappings), "interactive")
-        if attempt == 0:
-            continue  # a 'no' re-opens the allowed-set prompt exactly once
-        return None
-    return None
-
-
-def controller_policy_invalid_text(session_file, enabled=False):
+def controller_policy_invalid_text(session_file):
     """The one message shown when a saved policy cannot be read. Names the
     session file and BOTH repair routes; nothing can launch while this state is
     loaded, so the message has to be actionable on its own."""
@@ -12968,7 +11331,7 @@ def controller_policy_invalid_text(session_file, enabled=False):
         "    - remove the controller_policy field from the session file by "
         "hand.\n"
         "  read-only commands (--check, --report) keep working meanwhile.\n"
-        % ui.render_path(session_file, enabled))
+        % transcript.render_path(session_file))
 
 
 def switch_handoff_packet(role, phase, pending_switch, artifact_paths=None,
@@ -13101,16 +11464,133 @@ def pending_resume_packet(role, phase, pending_entry, artifact_paths=None,
         "lead->pending_resume", artifacts=artifacts, facts=facts)
 
 
-def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
-             run_planner_fn=None, run_builder_fn=None, run_worktree_fn=None):
-    io_in = io_in or sys.stdin
+# --------------------------------------------------------------------------- #
+# Run result: the machine contract of one `cowork` run.                        #
+#                                                                              #
+# Every `cowork` run invocation writes EXACTLY ONE JSON object as the final    #
+# line of stdout (`main` -> `emit_run_result`). Exit codes:                    #
+#   0   approved: the last phase that ran was approved by its paired reviewer  #
+#   1   failed: controller/preflight/reviewer failure, a failed phase, or an   #
+#       internal error                                                         #
+#   2   invalid invocation (refused before anything was dispatched)            #
+#   3   owner conflict                                                         #
+#   4   stopped: an open decision request needs an orchestrator answer or      #
+#       authorization (stop.request_id; decision_argv)                         #
+#   5   paused awaiting provider capacity (resume-trigger)                     #
+#   17  provider refusal / no first token                                      #
+#   130 interrupted                                                            #
+#   143 terminated by SIGTERM                                                  #
+#                                                                              #
+# The provider transcript is written to stderr; stdout carries only the       #
+# result line. A consumer binds the record to the process exit status (its    #
+# `rc` must equal it) and treats a missing line (SIGKILL) as a failure.       #
+# --------------------------------------------------------------------------- #
+
+RUN_RESULT_VERSION = 1
+AGENT_STOP_EXIT_CODE = 4
+CAPACITY_WAIT_EXIT_CODE = 5
+
+_RC_OUTCOME = {1: "failed", 2: "invalid_invocation", 3: "owner_conflict",
+               AGENT_STOP_EXIT_CODE: "stopped",
+               CAPACITY_WAIT_EXIT_CODE: "awaiting_capacity",
+               PROVIDER_REFUSAL_EXIT_CODE: "terminated", 130: "interrupted",
+               128 + 15: "terminated"}
+
+
+def _final_rc(rc, last_outcome):
+    """Map a normally-ending run's last phase outcome onto the exit code.
+
+    Only an explicit approval keeps 0: a stop, a pause for capacity, an
+    interrupt, a failed phase, or no recorded outcome at all is never success."""
+    if rc != 0:
+        return rc
+    if last_outcome == "approved":
+        return 0
+    if last_outcome == _OUTCOME_STOPPED:
+        return AGENT_STOP_EXIT_CODE
+    if last_outcome == "awaiting_capacity":
+        return CAPACITY_WAIT_EXIT_CODE
+    if last_outcome == "interrupted":
+        return 130
+    return 1
+
+
+def build_run_result(rc, result_box):
+    """The structured record `main` emits for one run."""
+    last = result_box.get("last") or {}
+    outcome = last.get("outcome")
+    payload = last.get("payload")
+    masked = rc != 0 and outcome == "approved"
+    if masked:
+        # A later failure (a lead that could not launch, a crash at session
+        # end) is never masked by an earlier phase's approval, and that
+        # earlier phase is not reported as the current one.
+        outcome = None
+        payload = None
+    if outcome == _OUTCOME_PROCESS_TERMINATED:
+        outcome = "terminated"
+    elif outcome in (_OUTCOME_ENDED, None):
+        outcome = _RC_OUTCOME.get(rc, "failed") if rc != 0 else "failed"
+    session_file = result_box.get("session_file")
+    stop = payload if isinstance(payload, dict) and outcome in (
+        _OUTCOME_STOPPED, "failed", "awaiting_capacity",
+        "terminated") else None
+    if stop is None:
+        stop = result_box.get("stop")
+    result = {
+        "cowork_result": RUN_RESULT_VERSION,
+        "rc": rc,
+        "outcome": outcome,
+        "approved": rc == 0 and outcome == "approved",
+        "session_uuid": result_box.get("session_uuid"),
+        "session_file": session_file,
+        "persisted": bool(session_file),
+        "phase": result_box.get("phase") or (None if masked
+                                              else last.get("phase")),
+        "role": None if masked else last.get("role"),
+        "phase_outcome": None if masked else last.get("outcome"),
+        "stop": stop,
+        "reason": result_box.get("reason"),
+    }
+    if result_box.get("decision_ack_failed"):
+        result["decision_ack_failed"] = list(result_box["decision_ack_failed"])
+    if session_file:
+        resume = ["--session-file", session_file]
+        result["resume_argv"] = resume
+        request_id = (stop or {}).get("request_id")
+        kinds = state_store.DECISION_RESPONSES.get((stop or {}).get("kind"), ())
+        if request_id and kinds:
+            result["decision_argv"] = [
+                resume + ["--answer", request_id, "--context-file", "<answer>"]
+                if kind == "answer" else
+                resume + ["--" + kind.replace("_", "-"), request_id]
+                for kind in kinds]
+    return result
+
+
+def emit_run_result(io_out, rc, result_box):
+    """Write the one JSON run-result line. Best-effort: a closed stdout never
+    masks the run's own exit code."""
+    try:
+        io_out.write(json.dumps(build_run_result(rc, result_box),
+                                sort_keys=True) + "\n")
+        io_out.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def run_flow(args, io_out=None, which=None, run_scout_fn=None,
+             run_planner_fn=None, run_builder_fn=None, run_worktree_fn=None,
+             result_box=None):
+    """Run one agent-driven cowork invocation. Returns the exit code (see the
+    run-result block above); `result_box`, when given, is filled with what
+    `build_run_result` needs, and `main` emits that record."""
     io_out = io_out or sys.stdout
+    result_box = result_box if result_box is not None else {}
     run_scout_fn = run_scout_fn or run_scout
     run_planner_fn = run_planner_fn or run_planner
     run_builder_fn = run_builder_fn or run_builder
     run_worktree_fn = run_worktree_fn or run_worktree
-    interactive = not _is_non_interactive(args)
-    headless = bool(getattr(args, "headless", False))
     worktree_requested = bool(getattr(args, "worktree", None))
     # The builder and reviewer CLI sessions spawn in the process cwd, so their
     # `git diff` is relative to cwd — NOT to the session-file parent (which may
@@ -13118,13 +11598,42 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # baseline must be read from the same cwd to match what they see.
     run_cwd = os.getcwd()
 
-    # Headless requires its initial context up front (F2_context_required): no
-    # human will be prompted, so a missing --context/--context-file is a hard
-    # error before any phase runs.
-    if headless and args.context is None and not args.context_file:
-        io_out.write("cowork: --headless requires initial context; pass "
-                     "--context or --context-file.\n")
-        return 2
+    context_supplied = (args.context is not None
+                        or args.context_file is not None)
+    decisions = _decision_flags(args)
+
+    def refuse(reason, message, rc=2, trace_obj=None):
+        """A refused invocation: nothing is dispatched. The closed `reason`
+        code rides the run result."""
+        result_box["reason"] = reason
+        if trace_obj is not None:
+            trace_obj.event("run.end", rc=rc, reason=reason)
+        io_out.write("cowork: " + message + "\n")
+        io_out.flush()
+        return rc
+
+    if len(decisions) > 1:
+        return refuse("conflicting_decisions",
+                      "one decision per invocation: %s"
+                      % " ".join("--" + k.replace("_", "-")
+                                 for k, _i in decisions))
+    decision = decisions[0] if decisions else None
+    if decision and decision[0] == "answer" and not context_supplied:
+        return refuse("answer_requires_context",
+                      "--answer needs the answer in --context or "
+                      "--context-file")
+    if decision and decision[0] == "authorize_handoff" and context_supplied:
+        return refuse("conflicting_arguments",
+                      "--authorize-handoff executes the recorded request as "
+                      "is; it takes no --context")
+    # The supplied text is read exactly once, here, before anything is
+    # created: an unreadable --context-file is an invalid invocation.
+    try:
+        supplied_text = resolve_context(args) if context_supplied else ""
+    except OSError as exc:
+        return refuse("context_file_unreadable",
+                      "--context-file %s cannot be read (%s)"
+                      % (args.context_file, type(exc).__name__))
 
     # Deterministic --worktree git gate (D1): runs early, before session
     # selection, so a non-git launch fails fast with rc 2 and no half-init. The
@@ -13134,9 +11643,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     if worktree_requested:
         worktree_base = git_worktree_toplevel(run_cwd)
         if worktree_base is None:
-            io_out.write("cowork: --worktree requires launching inside a git "
-                         "work tree; %s is not one.\n" % run_cwd)
-            return 2
+            return refuse("worktree_requires_git",
+                          "--worktree requires launching inside a git work "
+                          "tree; %s is not one." % run_cwd)
     # The real worktree path this session's roles dispatch into, once
     # created/reused below — None until then (and always None when no
     # worktree was requested), never invented. Bound to every role manifest
@@ -13155,40 +11664,77 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # and independently verified by validate_worktree.
     active_worktree_root = None
 
-    # Session store: select which of the directory's sessions this run uses
-    # (resume-or-new prompt, --new/--resume, picker) BEFORE any team/config/phase
-    # logic. The result is an explicit tri-state: error -> rc 2; cancelled -> rc 0
-    # (benign); else proceed with the chosen path.
+    # Session store: select which session this run uses from explicit flags
+    # only, BEFORE any team/config/phase logic. A refused selection is rc 2
+    # with nothing read, written or dispatched.
     session_enabled = not args.no_session
-    choice = select_session(args, io_in, io_out)
-    if choice.error or choice.cancelled:
-        # No session was chosen, so there is no session_uuid to key a trace on:
-        # record run.end under an ephemeral uuid (only when persistence is on)
-        # so these early exits are still traced, exactly as the plan prescribes.
-        eph_uuid = str(uuid.uuid4())
-        etrace = trace_store.Trace(
-            trace_store.trace_path_for(eph_uuid) if session_enabled else None,
-            session_uuid=eph_uuid, enabled=session_enabled)
-        if choice.error:
-            etrace.event("run.end", rc=2, reason="session_select_error")
-            io_out.write("cowork: " + choice.error + "\n")
-            return 2
-        etrace.event("run.end", rc=0, reason="session_select_cancelled")
-        io_out.write("cowork: cancelled; nothing to do.\n")
-        return 0
+    choice = select_session(args)
+    if choice.error:
+        return refuse(choice.reason or "session_selection_refused",
+                      choice.error)
     spath = choice.path
     saved = state_store.load(spath) if session_enabled else None
-    # Both session-mutating controller flags — and the interactive equivalent —
-    # need a loadable saved session with saved team/config; each error names the
-    # flag that was actually supplied.
     controller_update_requested = (
-        bool(args.switch_controller) or args.allow_controllers is not None
-        or choice.action == "edit_controllers")
+        bool(args.switch_controller) or args.allow_controllers is not None)
+    resuming_saved = bool(session_enabled and choice.resume
+                          and state_store.has_config(saved))
+    # Nothing here can ask for the goal: work that is not an explicitly
+    # selected saved session (a new session, or --no-session) needs its
+    # context in the arguments.
+    if not context_supplied and not resuming_saved:
+        if session_enabled and choice.resume and not controller_update_requested:
+            return refuse("session_not_resumable",
+                          "%s is not a resumable cowork session (no saved "
+                          "team/config); pass --context to start a new "
+                          "session there" % spath)
+        if not controller_update_requested:
+            return refuse("context_required",
+                          "a new session requires initial context; pass "
+                          "--context or --context-file.")
+    if decision and not resuming_saved:
+        return refuse("session_not_resumable",
+                      "--%s applies to a saved session with an open decision "
+                      "request; %s is not one" % (
+                          decision[0].replace("_", "-"), spath))
+    # Team, config and reviewer pairing are validated BEFORE any session is
+    # created or lease acquired: an invalid invocation leaves nothing behind
+    # for a later --resume to pick up.
+    if args.team:
+        preview_selected, team_err = parse_team(args.team)
+        if team_err:
+            return refuse("parse_team_error", team_err)
+    elif resuming_saved:
+        preview_selected = [r for r in ROLES if r in saved["team"]]
+    else:
+        preview_selected = list(ROLES)
+    if not preview_selected:
+        return refuse("no_roles_selected", "no roles selected; nothing to do.")
+    if args.config:
+        config_ok, config_err = apply_config_args(
+            default_config(preview_selected), args.config)
+        if not config_ok:
+            return refuse("config_error", config_err)
+    # The same phase resolution the run itself applies after the lease.
+    preview_phase = (effective_phase_for(saved, preview_selected)
+                     if session_enabled else "scouting")
+    if preview_phase == "scouting" and "scout" not in preview_selected:
+        return refuse(
+            "scout_not_selected",
+            "scout not selected: every cowork run begins with the scouting "
+            "phase; add scout and scout-reviewer to --team (a saved session "
+            "already past scouting resumes into its saved phase).")
+    for lead in PHASE_LEADS.values():
+        reviewer = handoff.ROLE_REGISTRY[lead]["reviewer"]
+        if lead in preview_selected and reviewer not in preview_selected:
+            return refuse(
+                "reviewer_not_selected",
+                "%s needs its paired reviewer %s on the team (approval comes "
+                "only from the reviewer); add it to --team" % (lead, reviewer))
+    # Both session-mutating controller flags need a loadable saved session with
+    # saved team/config; each error names the flag that was actually supplied.
     if controller_update_requested and session_enabled:
         controller_flag = ("--switch-controller" if args.switch_controller
-                           else "--allow-controllers"
-                           if args.allow_controllers is not None
-                           else "changing this session's controllers")
+                           else "--allow-controllers")
         reason = None
         message = None
         if saved is None:
@@ -13202,16 +11748,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 "%s requires a saved session with saved team/config."
                 % controller_flag)
         if message:
-            eph_uuid = (state_store.get_session_uuid(saved)
-                        if isinstance(saved, dict)
-                        and state_store.get_session_uuid(saved)
-                        else str(uuid.uuid4()))
-            etrace = trace_store.Trace(
-                trace_store.trace_path_for(eph_uuid),
-                session_uuid=eph_uuid, enabled=True)
-            etrace.event("run.end", rc=2, reason=reason)
-            io_out.write("cowork: " + message + "\n")
-            return 2
+            return refuse(reason, message)
     # cowork session UUID (distinct from any claude/codex session id): names this
     # session's assets, e.g. the scout intel file. On a New path, reuse the uuid
     # select_session minted into the filename so the filename uuid, the internal
@@ -13222,6 +11759,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         session_uuid = state_store.get_session_uuid(saved)
     else:
         session_uuid = str(uuid.uuid4())
+    # No decision delivery is bound to a launch until this run composes one.
+    for _launch_key in [key for key in _DECISION_LAUNCH_BINDINGS
+                        if key[0] == session_uuid]:
+        _DECISION_LAUNCH_BINDINGS.pop(_launch_key, None)
     trace = trace_store.Trace(
         trace_store.trace_path_for(session_uuid) if session_enabled else None,
         session_uuid=session_uuid,
@@ -13229,6 +11770,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     )
     trace.event("run.start", cwd=os.getcwd(), session_file=spath,
                 session_enabled=session_enabled)
+    result_box.update(session_uuid=session_uuid,
+                      session_file=spath if session_enabled else None)
     # Issue #64: SINGLE-WRITER OWNERSHIP. Acquired HERE -- after `run.start`
     # is traced and BEFORE the global preflight, before the `session.start`
     # measurement checkpoint, before any phase entry, before any controller or
@@ -13297,88 +11840,147 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             daemon=True)
         heartbeat_thread.start()
     try:
-        # The user-visible lever on measurement overhead. A CLI value is persisted
+        # Orchestrator decisions bind to the ONE open decision request this
+        # session recorded when a phase stopped, and are checked here, before
+        # anything is written or dispatched. An open answer/authorization
+        # request without a response is refused, never silently redirected.
+        open_request = (state_store.read_decision_request(session_uuid)
+                        if session_enabled else None)
+        if not (isinstance(open_request, dict)
+                and open_request.get("state") == "open"):
+            open_request = None
+        if decision is not None:
+            try:
+                bound_request = state_store.check_decision_response(
+                    session_uuid, decision[1], decision[0])
+            except state_store.DecisionConflict as exc:
+                result_box["stop"] = _decision_request_view(exc.request)
+                return refuse("decision_" + exc.reason, str(exc),
+                              trace_obj=trace)
+            if _decision_candidate_changed(bound_request):
+                # The request describes bytes that no longer exist: it is
+                # retired (never applied to different work) and the next plain
+                # run continues from the artifact as it now is.
+                state_store.retire_decision_request(
+                    session_uuid, "candidate_changed")
+                trace.event("decision.request.retired",
+                            request_id=bound_request.get("request_id"),
+                            reason="candidate_changed")
+                result_box["stop"] = _decision_request_view(bound_request)
+                return refuse(
+                    "decision_stale",
+                    "request %s no longer matches its artifact (%s changed "
+                    "since the phase stopped)" % (
+                        decision[1], bound_request.get("status_path")),
+                    trace_obj=trace)
+        elif (open_request is not None
+                and _decision_candidate_changed(open_request)):
+            state_store.retire_decision_request(
+                session_uuid, "candidate_changed")
+            trace.event("decision.request.retired",
+                        request_id=open_request.get("request_id"),
+                        reason="candidate_changed")
+        elif open_request is not None:
+            result_box["stop"] = _decision_request_view(open_request)
+            result_box["phase"] = open_request.get("phase")
+            return refuse(
+                "decision_required",
+                "session has an open %s request %s; respond with %s"
+                % (open_request.get("kind"), open_request.get("request_id"),
+                   _decision_response_hint(open_request)),
+                rc=AGENT_STOP_EXIT_CODE, trace_obj=trace)
+        if session_enabled and session_uuid:
+            # A consumed decision still owed to a role, but with no matching
+            # response record in the session store, is neither delivered
+            # (it is not orchestrator authority) nor silently dropped: the
+            # run stops before anything is written or dispatched.
+            unverified = state_store.read_unverified_decision_deliveries(
+                session_uuid, saved)
+            if unverified:
+                rids = [entry.get("request_id") for entry in unverified]
+                result_box["stop"] = {
+                    "kind": "decision_delivery_unverified",
+                    "request_id": rids[0], "request_ids": rids,
+                    "decision_record_path":
+                        state_store.decision_request_path_for(session_uuid)}
+                return refuse(
+                    "decision_delivery_unverified",
+                    "decision request(s) %s are consumed with a pending "
+                    "delivery, but the session store %s has no matching "
+                    "orchestrator response record; nothing was run. Restore "
+                    "the session store's decision_responses from a copy, or "
+                    "have the supervisor retire the delivery record at %s"
+                    % (", ".join(str(r) for r in rids), spath,
+                       state_store.decision_request_path_for(session_uuid)),
+                    rc=1, trace_obj=trace)
+            # A decision whose block rides a live capacity pause is delivered
+            # only by the resume-trigger that sends those turn bytes. Running
+            # the target now would launch it without its decision, so the run
+            # waits for capacity instead -- before any write, drain or
+            # dispatch. An expired, cancelled or consumed lease holds nothing.
+            holds = _capacity_held_decisions(session_uuid, saved)
+            if holds:
+                first = holds[0]
+                trace.event("decision.delivery.held",
+                            request_id=first["request_id"],
+                            role=first["role"], lease_id=first["lease_id"],
+                            reason="capacity_pending_turn")
+                stop, message, hold_rc = _capacity_hold_refusal(
+                    session_uuid, first)
+                stop["holds"] = holds
+                result_box["stop"] = stop
+                return refuse("decision_held_by_capacity_pause", message,
+                              rc=hold_rc, trace_obj=trace)
+        # The caller-visible lever on measurement overhead. A CLI value is persisted
         # so the choice survives a resume; otherwise the saved value stands, and the
         # default is `all_rounds`. Whatever it is, the overhead of scoring is
         # reported as its own cost class, so the choice can be made from data.
+        # The CLI value is written only after every precheck below passed (a
+        # refused invocation changes no saved configuration).
         evaluation_policy = getattr(args, "evaluation_policy", None)
-        if evaluation_policy and session_enabled:
-            try:
-                saved = state_store.save_evaluation_policy(
-                    spath, evaluation_policy, prior=saved)
-            except ValueError:
-                pass
-        elif not evaluation_policy:
+        persist_evaluation_policy = bool(evaluation_policy and session_enabled)
+        if not evaluation_policy:
             evaluation_policy = state_store.get_evaluation_policy(saved)
         trace.event("evaluation.policy", policy=evaluation_policy)
-        # `user_wait` needs an emitter at the six blocking prompts, whose signatures
-        # carry no trace parameter (P15). Same process-global pattern the controller
-        # policy already uses and documents: one cowork process, one session.
-        trace_store.set_active(trace)
         reuse_config = (session_enabled and state_store.has_config(saved)
                         and not args.team and not args.config)
 
-        # Step 1: team. When both team and config are interactive they run as one
-        # merged flow (checkbox <-> config screen with back navigation).
-        merged_config = None
+        # Step 1: team (--team, else the saved team, else every role).
+        # Validated before the session was created (see above).
         if args.team:
-            selected, err = parse_team(args.team)
-            if err:
-                trace.event("run.end", rc=2, reason="parse_team_error")
-                io_out.write("cowork: " + err + "\n")
-                return 2
+            selected, _err = parse_team(args.team)
         elif reuse_config:
             selected = [r for r in ROLES if r in saved["team"]]
-        elif interactive and not args.config:
-            selected, merged_config = select_and_configure_interactive()
-        elif interactive:
-            selected = select_team_interactive()
         else:
             selected = list(ROLES)
-        if not selected:
-            trace.event("run.end", rc=0, reason="no_roles_selected")
-            io_out.write("cowork: no roles selected; nothing to do.\n")
-            return 0
 
         # Step 2: config.
         config = default_config(selected)
         if args.config:
-            ok, err = apply_config_args(config, args.config)
-            if not ok:
-                trace.event("run.end", rc=2, reason="config_error")
-                io_out.write("cowork: " + err + "\n")
-                return 2
+            apply_config_args(config, args.config)
         elif reuse_config:
             # normalize: older saved sessions predate the model/effort keys.
             config = {r: normalize_role_config(saved["config"][r])
                       for r in selected if r in saved["config"]}
             io_out.write("cowork: using saved session config (%s)\n" % spath)
-        elif merged_config is not None:
-            config = merged_config
-        elif interactive:
-            config = configure_roles_interactive(selected)
         trace.event("run.config", selected=selected, reuse_config=reuse_config,
                     config={r: dict(config[r]) for r in selected if r in config})
 
-        # Persist team + config the first time (or whenever freshly chosen).
-        if session_enabled and not reuse_config:
-            saved = state_store.save_config(spath, selected, config, prior=saved or {})
+        # Team + config are persisted the first time (or whenever freshly
+        # chosen) only after the decision/worktree/controller prechecks below.
 
-        # Global preflight (Python + interactive UI packages only). Controller
-        # executables are checked on-demand when each role is about to launch, so a
-        # missing active controller can reach the switch-controller recovery gate.
-        kwargs = {"interactive": interactive}
+        # Global preflight (Python only). Controller executables are checked
+        # on-demand when each role is about to launch.
+        kwargs = {}
         if which is not None:
             kwargs["which"] = which
         ok, alerts = preflight.preflight({}, **kwargs)
         trace.event("preflight.result", ok=ok, alerts_count=len(alerts))
         if not ok:
-            trace.event("run.end", rc=1, reason="preflight_failed")
-            io_out.write("cowork preflight failed:\n")
-            for alert in alerts:
-                io_out.write("  - " + alert + "\n")
-            io_out.flush()
-            return 1
+            return refuse("preflight_failed",
+                          "preflight failed:\n" + "".join(
+                              "  - " + alert + "\n" for alert in alerts),
+                          rc=1, trace_obj=trace)
 
         # Phase: resume into the persisted phase (default scouting). The cascade
         # falls back when the resumed phase's lead role is not on the team: a
@@ -13387,19 +11989,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         phase = effective_phase_for(saved, selected) if session_enabled else "scouting"
         planner_on_team = "planner" in selected
         builder_on_team = "builder" in selected
-        if phase == "scouting" and "scout" not in selected:
-            trace.event("run.end", rc=0, reason="scout_not_selected")
-            if planner_on_team:
-                io_out.write(
-                    "cowork: scout not selected. Planning requires approved scout "
-                    "intel: add the scout role to the team (a session already in "
-                    "the planning phase resumes without re-running the scout).\n")
-            else:
-                io_out.write(
-                    "cowork: scout not selected. Every cowork run begins with the "
-                    "scouting phase; add the scout role to the team (a session "
-                    "already past scouting resumes into its saved phase).\n")
-            return 0
+        # Team shape (scout on a scouting team, every lead paired with its
+        # reviewer) was refused before the session existed, above.
 
         # Saved CLI session ids per role. With the session store enabled they are
         # persisted; otherwise they are kept in-run only, so phase chaining (and a
@@ -13523,174 +12114,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         alerts_count=len(alerts))
             return alerts
 
-        def default_switch_target(current):
-            """The implicit target for a switch with no explicit one. Under a
-        policy, the first ELIGIBLE controller; otherwise today's toggle."""
-            eligible = gate_eligible_for(current)
-            if eligible is None:
-                return alternate_controller(current)
-            return eligible[0] if eligible else None
-
-        def switch_controller(role, reason=None, target=None, source="gate", pending_turn=None):
-            if role not in config:
-                io_out.write("cowork: cannot switch %s — role is not configured.\n"
-                             % role)
-                return False
-            current = config[role].get("controller")
-            target = target or default_switch_target(current)
-            if target is None:
-                io_out.write(
-                    "cowork: cannot switch %s — this session's controller policy "
-                    "leaves no other controller available (allowed: %s).\n"
-                    % (role, policy.format_allowed(policy.active_allowed())))
-                trace.event("controller.switch.end", role=role, phase=phase,
-                            result="no_eligible_controller",
-                            allowed=list(policy.active_allowed() or ()))
-                return False
-            trace.event("controller.switch.request", role=role, phase=phase,
-                        source=source, reason=reason, from_controller=current,
-                        to_controller=target)
-            if target == current:
-                io_out.write("cowork: %s is already using %s.\n" % (role, target))
-                trace.event("controller.switch.end", role=role, phase=phase,
-                            result="already_current", controller=target)
-                return False
-            # The policy decision runs FIRST — before the executable preflight and
-            # before the claude probe below — so a disallowed target is never
-            # preflighted, never probed, and never spawned. No manifest exists yet
-            # at this point (it is compiled below, only for an allowed target), so
-            # nothing is bound here — binding a not-yet-compiled manifest would be
-            # inventing an identifier.
-            _swf = _guard_to_policy_fact(target, role, phase=phase, trace=trace)
-            _swdec = _decide_and_trace(
-                trace, role, target, "switch", "run_flow.switch_controller",
-                policy_result=_swf, phase=phase)
-            if _swdec["outcome"] == "refuse":
-                io_out.write(_swdec["refusal_message"] + "\n")
-                io_out.flush()
-                trace.event("controller.switch.end", role=role, phase=phase,
-                            result="policy_blocked", controller=target)
-                return False
-            ok, alerts = check_controller_tool(target)
-            if not ok:
-                trace.event("controller.switch.preflight_failed", role=role,
-                            phase=phase, target_controller=target,
-                            alerts_count=len(alerts))
-                io_out.write("cowork: cannot switch %s to %s yet:\n" % (role, target))
-                for alert in alerts:
-                    io_out.write("  - " + alert + "\n")
-                io_out.flush()
-                return False
-            if target == "claude":
-                cfg = dict(config[role])
-                prompt_path = ROLE_PROMPT_PATHS.get(role)
-                ok, alert = _with_status_spinner(
-                    io_out, "checking claude for %s" % role,
-                    lambda: bridge.probe_claude_stream_json(
-                        bridge._real_claude_spawn, mode=cfg["mode"],
-                        yolo=cfg["yolo"], role_prompt_file=prompt_path,
-                        trace=trace, role=role,
-                        extra_writable_dir=state_store.session_assets_dir(
-                            session_uuid),
-                        cache_enabled=True))
-                if not ok:
-                    trace.event("controller.switch.probe_failed", role=role,
-                                phase=phase, target_controller=target)
-                    io_out.write("cowork: cannot switch %s to claude: %s\n"
-                                 % (role, alert))
-                    io_out.flush()
-                    return False
-            if session_uuid:
-                _sw_cfg = config.get(role) or {}
-                _sw_sdir = state_store.session_assets_dir(session_uuid)
-                _sw_role_work_id = _current_role_work_id(role)
-                try:
-                    _sw_artifacts = switch_artifacts_for(role)
-                    _sw_manifest, _ = _compile_role_manifest(
-                        role=role, session_uuid=session_uuid, work_id=role,
-                        controller=target,
-                        mode=_sw_cfg.get("mode", "implement"),
-                        model=_sw_cfg.get("model"), effort=_sw_cfg.get("effort"),
-                        instruction_paths=[ROLE_PROMPT_PATHS.get(role)
-                                           or SCOUT_PROMPT_PATH],
-                        sessions_dir=_sw_sdir,
-                        worktree=active_worktree, worktree_base=active_worktree_root,
-                        candidate_snapshot=(
-                            _file_snapshot(_sw_artifacts[0])
-                            if _sw_artifacts else None),
-                        force_recompile=True,
-                        role_work_id=_sw_role_work_id)
-                except GraphDeclarationRejected as _grej:
-                    _reject_graph_declaration(
-                        session_uuid, _sw_role_work_id, role, target,
-                        _grej.reason, model=_sw_cfg.get("model"),
-                        effort=_sw_cfg.get("effort"),
-                        source="run_flow.switch_controller")
-                    trace.event("controller.switch.end", role=role, phase=phase,
-                                result="graph_declaration_rejected",
-                                controller=target)
-                    io_out.write(
-                        "cowork: manifest not proven for %s switch — blocked.\n"
-                        % role)
-                    io_out.flush()
-                    return False
-                except Exception:
-                    _sw_manifest = {}
-                _swmdec = _decide_and_trace(
-                    trace, role, target, "switch", "run_flow.switch_controller",
-                    manifest=_sw_manifest,
-                    preflight_result=_manifest_preflight_fact(_sw_manifest),
-                    phase=phase)
-                if _swmdec["outcome"] == "refuse":
-                    _emit_dispatch_escalation(trace, role, "manifest_proven",
-                                              "recompile and preflight the manifest",
-                                              "switch_controller")
-                    io_out.write(
-                        "cowork: manifest not proven for %s switch — blocked.\n"
-                        % role)
-                    io_out.flush()
-                    return False
-            entry = {
-                "from_controller": current,
-                "to_controller": target,
-                "reason": reason,
-                "source": source,
-                "created": time.time(),
-            }
-            pt = pending_turn if pending_turn is not None else pending_switch_turns.get(role)
-            if session_enabled:
-                # One mapping, set_policy defaulting to False: a gate/recovery
-                # switch is a single-write, POLICY-PRESERVING transition — exactly
-                # the semantics the CLI mapping-only path has.
-                holder["state"] = state_store.apply_controller_transition(
-                    spath, [(role, target)], prior=holder["state"], reason=reason,
-                    source=source, created=entry["created"],
-                    pending_turns={role: pt} if pt is not None else None)
-                # Keep the in-memory config in lockstep with the saved config.
-                config[role] = dict(holder["state"]["config"][role])
-            else:
-                config[role] = dict(config[role], controller=target)
-                pending_switches[role] = entry
-            local_ids.pop(role, None)
-            trace.event("controller.switch.commit", role=role, phase=phase,
-                        source=source, reason=reason, from_controller=current,
-                        to_controller=target)
-            if session_uuid:
-                state_store.invalidate_manifest_for(session_uuid, role)
-            io_out.write("cowork: switched %s controller %s -> %s\n"
-                         % (role, current, target))
-            io_out.flush()
-            return True
-
         def ensure_controller_dispatchable(role, reason="launch"):
             """The pre-launch gate for one role: is its configured controller both
         ALLOWED by this session's policy and actually installed?
 
         The policy check runs first and is NOT retryable — a policy block is not
         an environment problem, so retrying or prompting would be theatre. It
-        prints the block, traces it, and returns False in headless AND
-        interactive mode alike. The missing-executable retry/switch/end loop
-        below it is unchanged."""
+        prints the block, traces it, and returns False. A missing executable
+        is likewise reported and returns False (no retry/switch prompt)."""
             controller = config[role].get("controller")
             # No manifest exists yet at this point (it is compiled below, only
             # once policy allows this controller), so nothing is bound here —
@@ -13706,6 +12137,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 trace.event("controller.failure", role=role, phase=phase,
                             controller=controller, reason="policy_blocked",
                             artifact_progress=False)
+                result_box["reason"] = "lead_policy_blocked"
                 return False
             if session_uuid:
                 _disp_cfg = config.get(role) or {}
@@ -13741,6 +12173,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         "cowork: manifest not proven for %s — dispatch blocked.\n"
                         % role)
                     io_out.flush()
+                    result_box["reason"] = "graph_declaration_rejected"
                     return False
                 except Exception:
                     _disp_manifest = {}
@@ -13757,91 +12190,47 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         "cowork: manifest not proven for %s — dispatch blocked.\n"
                         % role)
                     io_out.flush()
+                    result_box["reason"] = "manifest_not_proven"
                     return False
-            while True:
-                controller = config[role].get("controller")
-                ok, alerts = check_controller_tool(controller)
-                if ok:
-                    return True
-                alert = "\n".join(alerts)
-                trace.event("controller.failure", role=role, phase=phase,
-                            controller=controller, reason="missing_executable",
-                            artifact_progress=False)
-                if headless:
-                    # No human to choose retry/switch/end: a missing controller is
-                    # an environment problem cowork cannot fix, so fail cleanly
-                    # instead of showing an interactive gate.
-                    trace.event("headless.auto", role=role,
-                                gate="controller_failure", action="end",
-                                reason=reason)
-                    return False
-                gate_eligible = gate_eligible_for(controller)
-                ui.banner(io_out, _controller_failure_text(
-                    role, controller, "missing executable", alert,
-                    eligible=gate_eligible), "dissent")
-                gate_discard, gate_drain_fail = _gate_trace_callbacks(trace, role)
-                action = _read_controller_failure_gate(
-                    io_in, io_out, eligible=gate_eligible,
-                    on_discard=gate_discard, on_drain_fail=gate_drain_fail)
-                if action is _CTRL_RETRY:
-                    trace.event("user.action", role=role,
-                                action="controller_failure_retry",
-                                reason=reason)
-                    continue
-                if action is _CTRL_SWITCH or isinstance(action, _SwitchTo):
-                    trace.event("user.action", role=role,
-                                action="controller_failure_switch",
-                                reason=reason)
-                    if switch_controller(role, reason="missing_executable",
-                                         source="gate",
-                                         target=_switch_target_of(action)):
-                        return True
-                    continue
-                trace.event("user.action", role=role,
-                            action="controller_failure_end", reason=reason)
-                return False
+            controller = config[role].get("controller")
+            ok, alerts = check_controller_tool(controller)
+            if ok:
+                return True
+            io_out.write("cowork: %s controller %s is not dispatchable:\n"
+                         % (role, controller))
+            for alert in alerts:
+                io_out.write("  - " + alert + "\n")
+            io_out.flush()
+            trace.event("controller.failure", role=role, phase=phase,
+                        controller=controller, reason="missing_executable",
+                        artifact_progress=False)
+            # No in-process recovery choice: a missing controller is an
+            # environment problem cowork cannot fix. Fail with a structured
+            # stop; the orchestrator installs it or re-invokes with
+            # --switch-controller.
+            trace.event("gate.decision", decider="runtime", role=role,
+                        gate="controller_failure", action="end",
+                        reason=reason)
+            result_box["reason"] = "lead_controller_missing"
+            return False
 
         # Kept as the historical name for in-tree callers; the policy check is now
         # part of the same pre-launch decision.
         ensure_controller_available = ensure_controller_dispatchable
 
         def recover_controller_failure(role, reason, alert=None):
-            while True:
-                controller = config[role].get("controller")
-                trace.event("controller.failure", role=role, phase=phase,
-                            controller=controller, reason=reason,
-                            artifact_progress=False)
-                if headless:
-                    # No human to choose retry/switch/end: end cleanly instead of
-                    # showing an interactive recovery gate.
-                    trace.event("headless.auto", role=role,
-                                gate="controller_failure", action="end",
-                                reason=reason)
-                    return "end"
-                gate_eligible = gate_eligible_for(controller)
-                ui.banner(io_out, _controller_failure_text(
-                    role, controller, reason, alert,
-                    eligible=gate_eligible), "dissent")
-                gate_discard, gate_drain_fail = _gate_trace_callbacks(trace, role)
-                action = _read_controller_failure_gate(
-                    io_in, io_out, eligible=gate_eligible,
-                    on_discard=gate_discard, on_drain_fail=gate_drain_fail)
-                if action is _CTRL_RETRY:
-                    trace.event("user.action", role=role,
-                                action="controller_failure_retry",
-                                reason=reason)
-                    return "retry"
-                if action is _CTRL_SWITCH or isinstance(action, _SwitchTo):
-                    trace.event("user.action", role=role,
-                                action="controller_failure_switch",
-                                reason=reason)
-                    if switch_controller(role, reason=reason, source="gate",
-                                         target=_switch_target_of(action)):
-                        return "switch"
-                    continue
-                trace.event("user.action", role=role,
-                            action="controller_failure_end", reason=reason)
-                return "end"
+            """A lead failed to start. There is no in-process retry/switch
+            choice: the failure is traced and the run ends; recovery is a
+            machine re-invocation (resume, or --switch-controller)."""
+            controller = config[role].get("controller")
+            trace.event("controller.failure", role=role, phase=phase,
+                        controller=controller, reason=reason,
+                        artifact_progress=False)
+            trace.event("gate.decision", decider="runtime", role=role,
+                        gate="controller_failure", action="end",
+                        reason=reason)
+            result_box.setdefault("reason", "controller_startup_failed")
+            return "end"
 
         # ---------------------------------------------------------------------- #
         # Session controller policy: ONE validated, all-or-nothing transition,    #
@@ -13989,9 +12378,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 if target != "claude":
                     continue
                 cfg = dict(config.get(role) or {})
-                ok, alert = _with_status_spinner(
-                    io_out, "checking claude for %s" % role,
-                    lambda c=cfg, r=role: bridge.probe_claude_stream_json(
+                ok, alert = (lambda c=cfg, r=role: bridge.probe_claude_stream_json(
                         bridge._real_claude_spawn,
                         mode=c.get("mode", "implement"),
                         yolo=c.get("yolo", True),
@@ -13999,7 +12386,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         trace=trace, role=r,
                         extra_writable_dir=state_store.session_assets_dir(
                             session_uuid),
-                        cache_enabled=True))
+                        cache_enabled=True))()
                 if not ok:
                     trace.event("controller.switch.probe_failed", role=role,
                                 phase=phase, target_controller=target)
@@ -14109,14 +12496,6 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 else args.allow_controllers,
                 tuple(args.switch_controller or ()),
                 "cli")
-        elif choice.action == "edit_controllers":
-            proposal = prompt_controller_update(
-                saved_policy_kind, saved_policy_raw, config, selected, phase,
-                io_out)
-            if proposal is None:
-                trace.event("run.end", rc=0, reason="controller_update_cancelled")
-                io_out.write("cowork: cancelled; nothing to do.\n")
-                return 0
 
         # A present-but-invalid policy fails CLOSED. Only a proposal that REPLACES
         # it (ALL or SET, from either surface) may repair it — PRESERVE has nothing
@@ -14128,19 +12507,128 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         raw_policy_type=type(saved_policy_raw).__name__,
                         reason="controller_policy is not a readable allowed set",
                         repairable=True)
-            io_out.write(controller_policy_invalid_text(spath, ui.is_tty(io_out)))
+            io_out.write(controller_policy_invalid_text(spath))
             io_out.flush()
+            result_box["reason"] = "controller_policy_invalid"
             trace.event("run.end", rc=2, reason="controller_policy_invalid")
             return 2
+
+        def decision_precheck(lead, reason_prefix, allowed, cfg):
+            """No-spend, no-write readiness of one lead and its paired
+            reviewer against the policy and controllers this run WILL use
+            (`allowed`/`cfg`, a validated controller update included): both
+            on the team, and each controller allowed and installed. Refuses
+            (and returns False) before any write, evaluation drain, worktree
+            agent or lead call; the real pre-launch gates still run when the
+            lead launches."""
+            if lead not in selected:
+                refuse("%s_not_selected" % reason_prefix,
+                       "%s is not on the team; nothing can take this work"
+                       % lead, trace_obj=trace)
+                result_box["refusal_rc"] = 2
+                return False
+            reviewer = handoff.ROLE_REGISTRY[lead]["reviewer"]
+            if reviewer not in selected:
+                refuse("reviewer_not_selected",
+                       "%s needs its paired reviewer %s on the team (approval "
+                       "comes only from the reviewer); add it to --team"
+                       % (lead, reviewer), trace_obj=trace)
+                result_box["refusal_rc"] = 2
+                return False
+            for role, reason in ((reviewer, "reviewer_not_dispatchable"),
+                                 (lead, "lead_not_dispatchable")):
+                controller = (cfg.get(role) or {}).get("controller")
+                if not policy.is_allowed(allowed, controller):
+                    result_box["refusal_rc"] = 1
+                    refuse(reason,
+                           "%s is configured for %s, which this session does "
+                           "not allow (allowed: %s)" % (
+                               role, controller,
+                               policy.format_allowed(allowed)),
+                           rc=1, trace_obj=trace)
+                    return False
+                tool_ok, tool_alerts = check_controller_tool(controller)
+                if not tool_ok:
+                    result_box["refusal_rc"] = 1
+                    refuse(reason,
+                           "%s controller %s is not dispatchable:\n  - %s"
+                           % (role, controller, "\n  - ".join(tool_alerts)),
+                           rc=1, trace_obj=trace)
+                    return False
+            return True
+
+        # Everything a decision, a paid worktree agent or a controller update
+        # depends on is checked HERE: before the controller update or any
+        # other configuration is written, before the session-start evaluation
+        # drain, and before any worktree or lead call. A refusal leaves the
+        # saved team, config, policy and open request exactly as they were.
+        precheck_allowed = (saved_policy_raw if saved_policy_kind == "allowed"
+                            else None)
+        precheck_config = config
+        proposal_err = None
+        if proposal is not None:
+            proposal_effective, proposal_err, _warnings = \
+                validate_controller_proposal(
+                    proposal, precheck_allowed, phase, selected,
+                    holder["state"])
+            if not proposal_err:
+                precheck_allowed = proposal_effective
+                precheck_config = dict(config)
+                for _role, _target in proposal.mappings or ():
+                    precheck_config[_role] = dict(config.get(_role) or {},
+                                                  controller=_target)
+        decision_target = decision_target_phase = None
+        decision_targets = []
+        # An invalid proposal is refused by `apply_controller_update` below,
+        # before it writes anything.
+        if proposal_err is None:
+            if decision is not None:
+                bound = state_store.read_decision_request(session_uuid) or {}
+                if decision[0] == "authorize_handoff":
+                    decision_target = HANDBACK_PREPROCESSOR.get(
+                        bound.get("role"))
+                    decision_target_phase = {
+                        v: k for k, v in PHASE_LEADS.items()}.get(
+                            decision_target)
+                    reason_prefix = "handoff_target"
+                else:
+                    decision_target = bound.get("role")
+                    decision_target_phase = bound.get("phase")
+                    reason_prefix = "decision_target"
+                if not decision_precheck(decision_target, reason_prefix,
+                                         precheck_allowed, precheck_config):
+                    return result_box.get("refusal_rc", 2)
+                decision_targets = [decision_target]
+                if bound.get("kind") == "reviewer_question":
+                    # The paired reviewer asked: it receives the answer too.
+                    decision_targets.append(
+                        handoff.ROLE_REGISTRY[decision_target]["reviewer"])
+            elif worktree_requested and not decision_precheck(
+                    PHASE_LEADS[phase], "lead", precheck_allowed,
+                    precheck_config):
+                return result_box.get("refusal_rc", 2)
+            recorded_worktree = (state_store.get_worktree(holder["state"])
+                                 if session_enabled else None)
+            if worktree_requested and not recorded_worktree:
+                wt_controller = getattr(args, "wt_controller", "claude")
+                if not policy.is_allowed(precheck_allowed, wt_controller):
+                    return refuse(
+                        "worktree_policy_blocked",
+                        "the worktree controller %s is not allowed in this "
+                        "session (allowed: %s)" % (
+                            wt_controller,
+                            policy.format_allowed(precheck_allowed)),
+                        trace_obj=trace)
 
         if proposal is not None:
             ok, message, rc_reject = apply_controller_update(proposal)
             if not ok:
                 io_out.write("cowork: " + message + "\n")
                 io_out.flush()
-                trace.event("run.end", rc=rc_reject,
-                            reason=("switch_controller_failed" if rc_reject == 1
-                                    else "controller_policy_rejected"))
+                reject_reason = ("switch_controller_failed" if rc_reject == 1
+                                 else "controller_policy_rejected")
+                result_box["reason"] = reject_reason
+                trace.event("run.end", rc=rc_reject, reason=reject_reason)
                 return rc_reject
             # Re-activate from the freshly saved state so the in-force policy and
             # the persisted one can never disagree after a write.
@@ -14152,23 +12640,34 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             # guarded exactly like an update.
             _activate_policy(saved_policy_kind, saved_policy_raw)
 
-        # Resolved BEFORE the context step so we can skip the goal prompt on a
-        # resume of the current phase's user-facing role.
+        # Only now, with every refusal behind us, is freshly chosen
+        # configuration persisted.
+        if persist_evaluation_policy:
+            try:
+                holder["state"] = saved = state_store.save_evaluation_policy(
+                    spath, evaluation_policy, prior=holder["state"])
+            except ValueError:
+                pass
+        if session_enabled and not reuse_config:
+            holder["state"] = saved = state_store.save_config(
+                spath, selected, config, prior=holder["state"] or {})
+
         lead_role = PHASE_LEADS[phase]
         lead_resume_id = role_resume_id(lead_role)
-        lead_switch_pending = bool(
-            session_enabled
-            and state_store.read_pending_switch(holder["state"], lead_role))
         if lead_resume_id:
             trace.event("run.resume", role=lead_role,
                         controller=config[lead_role]["controller"],
                         session_id=lead_resume_id, phase=phase)
 
-        # Step 3: context. On a resume, skip the goal prompt and auto-continue.
-        context = resolve_context(
-            args, resuming=(bool(lead_resume_id)
-                            or bool(args.switch_controller)
-                            or lead_switch_pending))
+        # Step 3: context, read once before the session existed.
+        context = supplied_text
+        # With a decision flag the supplied text is that decision's answer
+        # (or decline note): it is persisted as its own request-bound artifact
+        # below and NEVER becomes the session goal. Only a plain explicit
+        # --context redirect changes the goal.
+        decision_text = context if decision is not None else None
+        if decision is not None:
+            context = ""
 
         # Context invariant: explicit context is a session-wide event. Persist it as
         # the CURRENT session context (bumping the revision when it changed), and
@@ -14198,25 +12697,89 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
         shared_context = (current_text or context) if session_enabled else context
 
-        def with_headless_lead(seed):
-            """Prepend the runtime headless note to a LEAD seed when --headless is
-        set, so the lead knows on its first turn that no human is available
-        (F2_roles_never_block, runtime activation of the prompt layer)."""
-            if not headless:
-                return seed
-            note = HEADLESS_LEAD_NOTE
+        # What consumed orchestrator decisions still owe each target role,
+        # filled from the durable pending deliveries below:
+        #   decision_pending_for: role -> [request_id, ...] not yet acknowledged
+        #   decision_answer_for:  role -> [request_id, ...] carrying an answer
+        #   decline_note_for:     role -> True when a decline note is owed
+        #   decision_included:    role -> [request_id, ...] composed into that
+        #                         role's current launch (acknowledged only by
+        #                         that launch's accepted first send / pass)
+        decision_pending_for = {}
+        decision_answer_for = {}
+        decline_note_for = {}
+        decision_included = {}
+
+        def verified_answer_path(rid):
+            """The answer artifact of `rid`, checked against the digest the
+            session store recorded when the orchestrator answered -- before
+            EVERY use. A mismatch raises DecisionAnswerTampered (the run
+            ends; edited content is never delivered as an orchestrator
+            decision)."""
+            return state_store.verified_decision_answer_path(
+                session_uuid, holder["state"], rid)
+
+        def answers_record_block():
+            """Every recorded orchestrator answer of this session, verified
+            now, as one typed block (or None)."""
+            if not session_enabled:
+                return None
+            return decision_record_block(state_store.decision_answers(
+                session_uuid, trusted_state=holder["state"]))
+
+        def _compose_front(fragment, seed):
+            if not seed:
+                return fragment
+            if isinstance(seed, handoff.HandoffBlock) or getattr(
+                    seed, "kind", None) == "static_role":
+                return handoff.compose_handoff_blocks(
+                    fragment, handoff.STATIC_SEPARATOR, seed)
+            return (str(fragment) + "\n\n" + str(seed).strip()).strip()
+
+        def with_decision_note(role, seed):
+            """Compose what orchestrator decisions owe `role` onto its next
+            seed: each answer block (by path, verified) and/or the hand-back
+            decline note. Once per launch; acknowledged by that launch's
+            accepted first send. The request ids are also bound to the launch
+            (`_bind_decision_launch`) so a capacity pause of this first send
+            records exactly which deliveries its pending turn carries."""
+            for rid in reversed(decision_answer_for.get(role) or ()):
+                seed = _compose_front(
+                    decision_answer_block(verified_answer_path(rid)), seed)
+            if decline_note_for.get(role):
+                seed = _compose_front(_handoff_declined_fragment(
+                    HANDBACK_PREPROCESSOR.get(role)), seed)
+            rids = list(decision_pending_for.get(role) or ())
+            if rids:
+                decision_included[role] = rids
+            _bind_decision_launch(session_uuid, role, [
+                {"request_id": rid, "target": role} for rid in rids])
+            return seed
+
+        def with_agent_lead_note(seed):
+            """Prepend the runtime agent-session note to a LEAD seed, so the lead
+        knows on its first turn that no human is attached and how an
+        unanswerable question is reported (runtime layer of the role prompt)."""
+            note = AGENT_LEAD_NOTE
             if not seed:
                 return note
             if isinstance(seed, handoff.HandoffBlock):
                 return handoff.compose_handoff_blocks(
-                    _headless_lead_fragment(), handoff.STATIC_SEPARATOR, seed)
+                    _agent_lead_fragment(), handoff.STATIC_SEPARATOR, seed)
             return (str(note) + "\n\n" + str(seed).strip()).strip()
 
-        # The reviewer context passed to every paired reviewer this run: under
-        # --headless it carries the runtime headless reviewer note so the reviewer
-        # itself works with what it has (F2_reviewer_needs_user, prompt layer).
-        reviewer_ctx = ((HEADLESS_REVIEWER_NOTE + "\n\n" + (shared_context or ""))
-                        .strip() if headless else shared_context)
+        def reviewer_context_now():
+            """The reviewer context passed to a paired reviewer launch: the
+            runtime agent-session reviewer note (prompt layer), the shared
+            context, and every recorded orchestrator answer beside it (fresh
+            reviewer sessions read it from here; the goal is never replaced).
+            Rebuilt per launch so the answers are verified at each use."""
+            text = (AGENT_REVIEWER_NOTE + "\n\n"
+                    + (shared_context or "")).strip()
+            record = answers_record_block()
+            if record is not None:
+                text = (text + "\n\n" + str(record)).strip()
+            return text
 
         def deliver_context(role, seed):
             """Prepend the current-context wake block to `seed` when `role` is a
@@ -14250,23 +12813,68 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             """The context-update wake block for a RESUMED paired reviewer that has
         not acknowledged the current revision, else None.
 
-        Under --headless the runtime headless reviewer note is prepended (or sent
-        alone when there is no other gap) so a RESUMED reviewer — whose first
-        pass uses context_update, not reviewer_context — still gets the 'no human
-        available' instruction on its first headless turn. A FRESH reviewer
+        The runtime agent-session reviewer note is prepended (or sent alone when
+        there is no other gap) so a RESUMED reviewer — whose first pass uses
+        context_update, not reviewer_context — still gets the note on its first
+        turn of this invocation. A FRESH reviewer
         ignores context_update and gets the note via reviewer_context instead, so
-        the note is never doubled."""
+        the note is never doubled.
+
+        An orchestrator answer owed to this reviewer (it asked the question)
+        rides the RESUMED reviewer's context_update as its own typed decision
+        record block beside the wake block -- never folded into the context
+        text, so the goal and the answer keep their own provenance. A FRESH
+        reviewer reads it from reviewer_context. Either way the request ids
+        are recorded as included, and `reviewer_acker` acknowledges them on
+        the reviewer's first pass that actually reached it."""
             gap = None
-            if session_enabled and role_resume_id(reviewer_role):
+            resumed = bool(role_resume_id(reviewer_role))
+            if session_enabled and resumed:
                 gap = state_store.role_context_gap(holder["state"], reviewer_role)
                 trace.event("context.gap", role=reviewer_role, revision=current_rev,
                             context_revision=current_rev,
                             delivered=bool(gap), reason="reviewer_resume")
-            if headless and role_resume_id(reviewer_role):
-                if gap:
-                    return (HEADLESS_REVIEWER_NOTE + "\n\n" + gap).strip()
-                return HEADLESS_REVIEWER_NOTE
-            return gap
+            rids = list(decision_pending_for.get(reviewer_role) or ())
+            if rids:
+                decision_included[reviewer_role] = rids
+            if not resumed:
+                return gap
+            text = (AGENT_REVIEWER_NOTE + "\n\n" + gap).strip() if gap \
+                else AGENT_REVIEWER_NOTE
+            answer_rids = [rid for rid in decision_answer_for.get(
+                reviewer_role) or () if rid in rids]
+            if not answer_rids:
+                return text
+            record = decision_record_block(
+                [{"answer_path": verified_answer_path(rid)}
+                 for rid in answer_rids])
+            trace.event("decision.delivery.compose", role=reviewer_role,
+                        request_ids=answer_rids, resumed=True)
+            # Typed parts only: the closed reviewer note, the context-update
+            # block for a real gap (the context file holds the context text
+            # alone), and the answer record by path.
+            parts = [_agent_reviewer_fragment(), handoff.STATIC_SEPARATOR]
+            if gap:
+                parts += [context_update_block(gap, intel_dir, current_rev),
+                          handoff.STATIC_SEPARATOR]
+            return handoff.compose_handoff_blocks(*(parts + [record]))
+
+        def reviewer_acker(role):
+            """The paired reviewer's first-pass acknowledgment: the context
+            revision and the decision deliveries composed into this reviewer
+            launch -- neither when the pass never reached the reviewer (a
+            controller failure)."""
+            ack_context = context_acker(role)
+
+            def ack(verdict=None):
+                if isinstance(verdict, dict) and verdict.get(
+                        "controller_failure"):
+                    return
+                if ack_context:
+                    ack_context()
+                decision_delivered(role)
+            ack.accepts_verdict = True
+            return ack
 
         def context_acker(role):
             if not session_enabled:
@@ -14335,8 +12943,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             _require_owner(session_uuid)
             return run_evaluation_transition(
                 session_uuid, evaluation_policy, config=config, trace=trace,
-                io_in=io_in, io_out=io_out, at=at, closed_phases=closed_phases,
-                headless=headless)
+                io_out=io_out, at=at, closed_phases=closed_phases)
 
         def measurement_checkpoint(at, closed_phases=None):
             """The three measurement steps that run together at every boundary.
@@ -14349,13 +12956,64 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
         The ingest and rebuild steps stay entirely best-effort: they degrade the
         measurement and never the run. The evaluation transition in the middle
-        has its OWN error policy (see `evaluation_transition`) because it can
-        block on the user, and a blocking prompt inside a swallow-all handler is
-        how a gate fails invisibly.
+        has its OWN error policy (see `evaluation_transition`): its exceptions
+        must not be eaten by a swallow-all meant for measurement.
         """
             results = _measurement_ingest(at)
             evaluation_transition(at, closed_phases=closed_phases)
             _measurement_rebuild(at, results)
+
+        def reviewer_ready_for(lead):
+            """Refuse a lead launch BEFORE any paid dispatch when its paired
+            reviewer -- the only source of approval -- is not on the team or
+            cannot be dispatched (policy or missing executable)."""
+            reviewer = handoff.ROLE_REGISTRY[lead]["reviewer"]
+            if reviewer not in selected:
+                # rc 2 only while nothing has run; after an earlier phase
+                # spent, this is a failure of the run, not a bad invocation.
+                result_box["refusal_rc"] = 1 if result_box.get("last") else 2
+                refuse("reviewer_not_selected",
+                       "%s needs its paired reviewer %s on the team (approval "
+                       "comes only from the reviewer); add it to --team"
+                       % (lead, reviewer))
+                return False
+            alerts = reviewer_controller_check(reviewer)
+            if alerts:
+                result_box["refusal_rc"] = 1
+                refuse("reviewer_not_dispatchable",
+                       "%s's reviewer %s cannot be dispatched:\n  - %s"
+                       % (lead, reviewer, "\n  - ".join(alerts)))
+                return False
+            return True
+
+        def record_outcome(role, box):
+            """Remember the latest phase outcome for the run result, and
+            durably open a decision request for a stop that needs an answer
+            or an authorization (a saved session only)."""
+            payload = box["payload"]
+            if (box["outcome"] == _OUTCOME_STOPPED and session_enabled
+                    and isinstance(payload, dict)
+                    and payload.get("kind") in state_store.DECISION_RESPONSES):
+                status_path = payload.get("status_path")
+                record = state_store.open_decision_request(session_uuid, {
+                    "kind": payload["kind"], "role": role, "phase": phase,
+                    "requires": payload.get("requires"),
+                    "work_id": active_work_box.get("work_id"),
+                    "status_path": status_path,
+                    "status_sha256": (state_store.fingerprint_status(
+                        status_path)["sha256"] if status_path else None),
+                    "question": payload.get("question"),
+                    "handoff": payload.get("handoff"),
+                    "findings": payload.get("findings"),
+                })
+                payload = dict(payload, request_id=record["request_id"])
+                box["payload"] = payload
+                trace.event("decision.request.open", role=role, phase=phase,
+                            kind=payload["kind"],
+                            request_id=record["request_id"])
+            result_box["last"] = {"phase": phase, "role": role,
+                                  "outcome": box["outcome"],
+                                  "payload": payload}
 
         def set_phase(new_phase):
             if session_enabled:
@@ -14379,7 +13037,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # SESSION START: drain anything a PREVIOUS process left queued (P12). This
         # is what bounds the cost of deferring scoring — a session killed mid-phase
         # leaves its rounds on disk with their original sealed digests, and they are
-        # scored here rather than lost.
+        # scored here rather than lost. Every refusal precheck ran above, so a
+        # refused invocation never pays for this drain.
         measurement_checkpoint("session.start")
         intel_path = scout_intel_path(intel_dir, session_uuid)
         intel_md_path = state_store.scout_intel_md_path_for(intel_dir, session_uuid)
@@ -14401,6 +13060,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # location: spath is absolutized here so later save_* calls keep writing
         # there after the os.chdir, and the assets dir is home-dir keyed by uuid
         # (unaffected by cwd). The worktree role has NO reviewer and NO gate.
+        # Everything a decision or a paid worktree agent depends on was checked
+        # above (`decision_precheck`), before any write or spend.
         if worktree_requested:
             spath = os.path.abspath(spath)
             worktree_status_path = state_store.worktree_status_path_for(
@@ -14439,28 +13100,30 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     policy.guard(wt_controller, role=WORKTREE_ROLE,
                                  kind="dispatch", phase=phase, trace=trace)
                 except policy.DispatchBlocked as exc:
-                    trace.event("run.end", rc=2, reason="worktree_policy_blocked")
-                    io_out.write(str(exc) + "\n")
-                    io_out.flush()
-                    return 2
+                    # Normally refused by the precheck above; reached only when
+                    # a recorded worktree no longer validates. The drain may
+                    # already have spent, so this is a failed run.
+                    return refuse("worktree_policy_blocked", str(exc), rc=1,
+                                  trace_obj=trace)
                 wt_cfg = {"controller": wt_controller,
                           "model": None, "effort": None,
                           "yolo": True, "mode": "implement"}
                 artifact = run_worktree_fn(
                     wt_cfg, worktree_status_path, worktree_base, wt_name,
-                    bool(explicit_name), io_in=io_in, io_out=io_out,
+                    bool(explicit_name), io_out=io_out,
                     session_uuid=session_uuid, trace=trace,
                     extra_writable_dir=intel_dir)
                 ok, wt_path, wt_branch, err = validate_worktree(
                     worktree_base, artifact)
                 if not ok:
                     # Fail-fast (D13): no chdir, no scouting — the session never
-                    # half-redirects into a bad/nonexistent tree.
-                    trace.event("run.end", rc=2, reason="worktree_failed",
-                                detail=err)
-                    io_out.write("cowork: worktree creation failed: %s\n" % err)
-                    io_out.flush()
-                    return 2
+                    # half-redirects into a bad/nonexistent tree. The worktree
+                    # agent already ran: a failed run, not an invalid
+                    # invocation.
+                    trace.event("worktree.failed", detail=err)
+                    return refuse("worktree_failed",
+                                  "worktree creation failed: %s" % err, rc=1,
+                                  trace_obj=trace)
                 if session_enabled:
                     holder["state"] = state_store.set_worktree(
                         spath, wt_path, wt_branch, prior=holder["state"])
@@ -14559,24 +13222,18 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         or getattr(seed, "kind", None) == "static_role"):
                     return handoff.compose_handoff_blocks(
                         note, handoff.STATIC_SEPARATOR, seed)
-                raise TypeError(
-                    "controller-switch handoff cannot be combined with untyped "
-                    "seed text")
+                # An untyped seed here is the raw shared-context text of a
+                # fresh launch (e.g. a resume that both switches controller
+                # and redirects with --context). The switch packet already
+                # carries the CURRENT shared context by path, so the raw text
+                # is not re-sent; the scout keeps its standing discovery
+                # note, which is typed.
+                if role == "scout":
+                    return handoff.compose_handoff_blocks(
+                        note, handoff.STATIC_SEPARATOR,
+                        repo_discovery_fragment)
+                return note
             raise TypeError("controller-switch note lacks handoff provenance")
-
-        def prepare_fresh_seed_after_switch(role):
-            if role == "scout":
-                # The switch packet already carries the shared-context FILE path.
-                # Re-inlining shared_context here would both duplicate it and erase
-                # the handoff provenance required by the send boundary.
-                return with_discovery("")
-            if role == "planner":
-                return assemble_planner_seed(intel_path, shared_context, intel_dir, current_rev)
-            if role == "builder":
-                return assemble_builder_seed(
-                    plan_json_path, plan_md_path, shared_context,
-                    intel_dir, current_rev)
-            return shared_context
 
         # Peer-evaluation assets: a per-role scratch file (each evaluator's only
         # eval write target) and the orchestrator-only aggregate scores file.
@@ -14636,7 +13293,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             builder_attempt_box["attempt"] = 0
 
         # Scouting-phase epoch: the scout-side analogue of planning_epoch. Bumped on
-        # every planning -> scouting transition (a user-confirmed planner -> scout
+        # every planning -> scouting transition (an orchestrator-authorized planner -> scout
         # hand-back), so the scout reviewer hash-gate baseline from the prior
         # scouting pass is invalidated by a re-entry (D12). The initial scouting
         # pass runs at the persisted epoch (0 for a fresh session).
@@ -14733,11 +13390,11 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # delta, which it captures itself (status --porcelain + git diff HEAD +
         # untracked). Recorded once, the first time building is entered this run, so
         # the reviewer knows which commit the delta is measured from; a dirty start
-        # is surfaced to the user (pre-existing changes get conflated otherwise).
+        # is written to the transcript (pre-existing changes get conflated otherwise).
         baseline_box = {"computed": False, "note": None, "repos": None}
 
         def build_baseline():
-            # Per-repo baseline over the user-confirmed repo set (plan JSON
+            # Per-repo baseline over the approved repo set (plan JSON
             # result.repos, falling back to discovery from run_cwd — never the
             # session-file/intel dir). Each selected root gets its own (HEAD, dirty)
             # snapshot; the explicit root list (with a has_head flag) is threaded to
@@ -14750,10 +13407,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
                 def gather():
                     # Per-repo git reads (rev-parse + status --porcelain, 10s
-                    # timeouts each) run synchronously over the repo set — the slow
-                    # window. trace.event does not touch io_out, so it is safe under
-                    # the spinner; the dirty warning (which DOES write io_out) is
-                    # deferred until after the spinner stops.
+                    # timeouts each) run synchronously over the repo set; the
+                    # dirty warning is written once the snapshot is complete.
                     for path in repo_paths:
                         head, dirty = _git_build_baseline(path)
                         entries.append({"path": path, "head": head, "dirty": dirty})
@@ -14770,9 +13425,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         if head and dirty:
                             dirty_repos.append(path)
 
-                _with_status_spinner(io_out, "reading repo state", gather)
-                # Spinner is down — now safe to write the dirty-worktree warning to
-                # io_out without a CR-frame interleave.
+                gather()
                 for path in dirty_repos:
                     io_out.write(
                         "cowork: building from a dirty worktree in %s — "
@@ -14786,7 +13439,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             return baseline_box
 
         # Phase loop: scouting -> (on intel approval, planner on team) planning ->
-        # (on a user-confirmed hand-back) scouting -> ... Plan approval, EOF, or an
+        # (on an authorized hand-back) scouting -> ... Plan approval, EOF, or an
         # interrupt ends the run; the persisted phase makes a rerun resume here.
         rc = 0
         # Discover the candidate git roots from the LAUNCH folder (run_cwd, never the
@@ -14841,6 +13494,180 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 builder_seed = assemble_builder_seed(
                     plan_json_path, plan_md_path, shared_context,
                     intel_dir, current_rev)
+
+        # The orchestrator's decision, validated and prechecked before anything
+        # ran, is consumed HERE exactly once, under the store lock (a
+        # concurrent or replayed response is refused). What the decision still
+        # owes a role -- its phase transition and the block the role must
+        # receive -- is written in the SAME transaction, so no crash, signal,
+        # evaluation drain or failed launch after this point can lose it: a
+        # plain resume reads the pending deliveries back and delivers each
+        # target once.
+        if decision is not None:
+            delivery = {"response_kind": decision[0],
+                        "role": decision_target,
+                        "targets": list(decision_targets),
+                        "target_phase": decision_target_phase}
+            if decision[0] == "authorize_handoff":
+                delivery["epoch_before"] = (
+                    scouting_epoch_box["epoch"] if decision_target == "scout"
+                    else epoch_box["epoch"])
+                delivery["transition_applied"] = False
+            answer_sha = None
+            if decision_text is not None and decision_text.strip():
+                answer_path, answer_sha = state_store.write_decision_answer(
+                    session_uuid, decision[1], decision_text)
+                delivery.update(answer_path=answer_path,
+                                answer_sha256=answer_sha)
+            # The orchestrator's response (kind, targets, exact answer
+            # digest) is recorded in the session store BEFORE consumption:
+            # every later use is checked against it, never against the
+            # role-writable assets copy alone.
+            holder["state"] = state_store.record_trusted_decision_response(
+                spath, decision[1], decision[0], answer_sha256=answer_sha,
+                targets=decision_targets, prior=holder["state"])
+            try:
+                consumed = state_store.consume_decision_request(
+                    session_uuid, decision[1], decision[0],
+                    response_digest=answer_sha, delivery=delivery)
+            except state_store.DecisionConflict as exc:
+                result_box["stop"] = _decision_request_view(exc.request)
+                return refuse("decision_" + exc.reason, str(exc),
+                              trace_obj=trace)
+            trace.event("gate.decision", decider="orchestrator",
+                        gate=consumed.get("kind"), action=decision[0],
+                        role=consumed.get("role"),
+                        request_id=consumed.get("request_id"),
+                        targets=list(decision_targets))
+        # Every consumed decision some target has not acknowledged yet --
+        # including older ones (a changed team, a second stop) -- is processed
+        # per target, oldest first; only decisions the session store recorded
+        # count as orchestrator authority.
+        pending_entries = (state_store.read_pending_decision_deliveries(
+            session_uuid, trusted_state=holder["state"])
+            if session_enabled else [])
+        for entry in pending_entries:
+            delivery = entry.get("delivery") or {}
+            rid = entry.get("request_id")
+            response_kind = delivery.get("response_kind")
+            trusted = state_store.trusted_decision_response(
+                holder["state"], rid, response_kind) or {}
+            targets = []
+            for target in state_store.pending_delivery_targets(entry):
+                if target not in (trusted.get("targets") or ()):
+                    continue
+                if _capacity_turn_holds_decision(session_uuid, target, rid):
+                    # A paused turn already carries this block; whoever sends
+                    # it acknowledges it (the capacity resume-trigger).
+                    trace.event("decision.delivery.held", request_id=rid,
+                                role=target, reason="capacity_pending_turn")
+                    continue
+                targets.append(target)
+            if not targets:
+                continue
+            if decision is None:
+                trace.event("decision.delivery.resume", request_id=rid,
+                            targets=targets)
+            lead_target = delivery.get("role")
+            if (response_kind == "authorize_handoff"
+                    and lead_target in ("scout", "planner")
+                    and lead_target in targets):
+                note = entry.get("handoff") or ""
+                if not delivery.get("transition_applied"):
+                    target_phase = delivery.get("target_phase")
+                    if phase != target_phase:
+                        phase = set_phase(target_phase)
+                    epoch_now = (scouting_epoch_box if lead_target == "scout"
+                                 else epoch_box)["epoch"]
+                    if epoch_now == delivery.get("epoch_before"):
+                        if lead_target == "scout":
+                            bump_scouting_epoch()
+                        else:
+                            bump_planning_epoch()
+                    state_store.update_decision_delivery(
+                        session_uuid, rid, transition_applied=True)
+                    trace.event("handoff.execute",
+                                from_role=entry.get("role"),
+                                to_role=lead_target, request_id=rid,
+                                **trace_store.prompt_meta(note,
+                                                          prefix="payload"))
+                if lead_target == "scout":
+                    scout_seed = with_discovery(
+                        handoff_wake_block(note, intel_dir))
+                    planner_seed = None
+                else:
+                    planner_seed = plan_handback_wake_block(note, intel_dir)
+                    builder_seed = None
+            elif (response_kind == "decline_handoff"
+                    and lead_target in targets):
+                status_path = entry.get("status_path")
+                if status_path:
+                    state_store.invalidate_ready_status(
+                        status_path, from_status="handoff_back")
+                decline_note_for[lead_target] = True
+            for target in targets:
+                decision_pending_for.setdefault(target, []).append(rid)
+                if trusted.get("answer_sha256"):
+                    verified_answer_path(rid)      # refuse tampering up front
+                    decision_answer_for.setdefault(target, []).append(rid)
+
+        def with_decision_record(seed):
+            """Compose the session's orchestrator answers (verified now) onto
+            a FRESH lead seed (built from the original brief + approved
+            artifacts)."""
+            record = answers_record_block()
+            if record is None or not isinstance(seed, handoff.HandoffBlock):
+                return seed
+            return handoff.compose_handoff_blocks(
+                seed, handoff.STATIC_SEPARATOR, record)
+
+        if planner_seed is not None and not role_resume_id("planner"):
+            planner_seed = with_decision_record(planner_seed)
+        if builder_seed is not None and not role_resume_id("builder"):
+            builder_seed = with_decision_record(builder_seed)
+
+        def decision_first_send(role, accepted_cb):
+            """Wrap a launch's first-send-accepted callback so the decision
+            block that rode this launch is acknowledged exactly when the
+            provider accepted it (never earlier)."""
+            def accepted():
+                if accepted_cb:
+                    accepted_cb()
+                decision_delivered(role)
+            return accepted
+
+        def decision_delivered(role):
+            """Acknowledge, for `role` only, every decision delivery composed
+            into its current launch. Other targets of the same decision stay
+            pending until their own launch acknowledges them."""
+            _bind_decision_launch(session_uuid, role, None)
+            rids = decision_included.pop(role, None)
+            if not rids:
+                return
+            for rid in rids:
+                try:
+                    state_store.mark_decision_delivered(session_uuid, rid,
+                                                        target=role)
+                except (OSError, TimeoutError, ValueError, KeyError) as exc:
+                    # The same store failures
+                    # `_acknowledge_capacity_turn_decisions` reports.
+                    # The block reached the role but the acknowledgment was
+                    # not recorded: it stays pending and a later run re-sends
+                    # it (at least once). Reported, never claimed delivered.
+                    result_box.setdefault("decision_ack_failed", []).append(
+                        {"request_id": rid, "target": role})
+                    trace.event("decision.delivery.ack_failed", role=role,
+                                request_id=rid, error=type(exc).__name__)
+                    continue
+                trace.event("decision.delivery.ack", role=role,
+                            request_id=rid)
+            decision_pending_for[role] = [
+                rid for rid in decision_pending_for.get(role) or ()
+                if rid not in rids]
+            decision_answer_for[role] = [
+                rid for rid in decision_answer_for.get(role) or ()
+                if rid not in rids]
+            decline_note_for.pop(role, None)
 
         # M2 Package E: durable external-kill terminal truth. `active_work_box`
         # names the WorkUnit engagement currently live -- gate or mid-turn, it
@@ -14928,10 +13755,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         # Only reachable through a hand-back on a team that resumed into
                         # planning without the scout. The fresh-team case was refused
                         # above.
-                        io_out.write(
-                            "cowork: cannot run the scouting phase — scout is not on "
-                            "the team.\n")
-                        rc = 2
+                        # rc 2 only while nothing has run this invocation.
+                        rc = refuse("handoff_target_not_selected",
+                                    "cannot run the scouting phase — scout is "
+                                    "not on the team.",
+                                    rc=1 if result_box.get("last") else 2)
+                        break
+                    if not reviewer_ready_for("scout"):
+                        rc = result_box.get("refusal_rc", 2)
                         break
                     if not ensure_controller_available("scout", reason="lead_launch"):
                         rc = 1
@@ -14943,22 +13774,23 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                             "scout", pending_switch_for("scout"), phase,
                             session_uuid, trace, clear_pending_switch_for)
                         if pending_switch_for("scout") else None)
+                    scout_first_send_cb = decision_first_send("scout", scout_first_send_cb)
                     rc = run_scout_fn(
                         config,
-                        with_headless_lead(seed_with_switch_note(
-                            "scout", deliver_context("scout", scout_seed))),
+                        with_agent_lead_note(with_decision_note("scout", seed_with_switch_note(
+                            "scout", deliver_context("scout", scout_seed)))),
                         selected,
-                        io_in=io_in, io_out=io_out,
+                        io_out=io_out,
                         evaluation_policy=evaluation_policy,
                         resume_id=role_resume_id("scout"),
                         on_session=role_saver("scout"),
                         intel_path=intel_path, review_path=review_path,
                         reviewer_resume_id=role_resume_id(SCOUT_REVIEWER),
                         on_reviewer_session=role_saver(SCOUT_REVIEWER),
-                        reviewer_context=reviewer_ctx,
+                        reviewer_context=reviewer_context_now(),
                         reviewer_context_update=reviewer_gap(SCOUT_REVIEWER)
                         if SCOUT_REVIEWER in selected else None,
-                        on_reviewer_context_ack=context_acker(SCOUT_REVIEWER),
+                        on_reviewer_context_ack=reviewer_acker(SCOUT_REVIEWER),
                         trace=trace,
                         eval_scratch_path=eval_scratch["scout"],
                         reviewer_eval_scratch_path=eval_scratch[SCOUT_REVIEWER],
@@ -14968,59 +13800,31 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         review_packet_ctx={"epoch": scouting_epoch_box["epoch"],
                                            "attempt": scout_attempt_box["attempt"],
                                            "context_revision": current_rev},
-                        switch_controller_fn=switch_controller,
                         reviewer_switch_note_fn=switch_note_for,
                         on_reviewer_switch_consumed=clear_pending_switch_for,
                         on_first_send_accepted=scout_first_send_cb,
                         on_first_send_rejected=scout_first_send_rejected_cb,
                         reviewer_controller_check_fn=reviewer_controller_check,
-                        headless=headless,
-                        gate_preview=make_gate_preview(
-                            "scout", planner_on_team, session_enabled),
                         save_pending_turn_fn=save_pending_turn_for,
                         clear_pending_turn_fn=clear_pending_switch_for,
                         worktree=active_worktree, worktree_base=active_worktree_root,
                         on_outcome=lambda o, p=None: outcome_box.update(
                             outcome=o, payload=p))
+                    _bind_decision_launch(session_uuid, "scout", None)
+                    record_outcome("scout", outcome_box)
                     if rc != 0:
-                        action = recover_controller_failure("scout", "startup_or_probe")
-                        if action == "retry":
-                            # BL-3: a fresh attempt, not a fresh epoch -- the
-                            # prior attempt's WorkUnit may already be terminal
-                            # (rejected_preflight/needs_authority), so the next
-                            # attempt must mint its own identity.
-                            scout_attempt_box["attempt"] += 1
-                            continue
-                        if action == "switch":
-                            scout_attempt_box["attempt"] += 1
-                            scout_seed = prepare_fresh_seed_after_switch("scout")
-                            continue
+                        recover_controller_failure("scout", "startup_or_probe")
                         break
-                    if rc == 0 and outcome_box["outcome"] == _OUTCOME_HEADLESS_TERMINATED:
-                        # M4 Package D: headless refusal/no-first-token, no
+                    if rc == 0 and outcome_box["outcome"] == _OUTCOME_PROCESS_TERMINATED:
+                        # M4 Package D: provider refusal/no-first-token, no
                         # fallback -- terminate the WHOLE process nonzero rather
                         # than falling through to the ordinary rc==0 end.
                         rc = (outcome_box["payload"] or {}).get(
-                            "exit_code", HEADLESS_REFUSAL_EXIT_CODE)
-                        break
-                    if (rc == 0 and outcome_box["outcome"] == "switch_controller"):
-                        payload = outcome_box["payload"] or {}
-                        if payload.get("pending"):
-                            pending_switch_turns["scout"] = payload.get("pending")
-                        if switch_controller("scout", reason=payload.get("reason"),
-                                             source="gate",
-                                             target=payload.get("target")):
-                            # BL-3: this engagement was `running` under the OLD
-                            # controller; the NEW controller's launch needs a
-                            # fresh WorkUnit (no legal `preflight_started` edge
-                            # back to `preflighting` from `running`).
-                            scout_attempt_box["attempt"] += 1
-                            scout_seed = prepare_fresh_seed_after_switch("scout")
-                            continue
-                        rc = 1
+                            "exit_code", PROVIDER_REFUSAL_EXIT_CODE)
                         break
                     if rc == 0 and scout_first_send_box["delivered"]:
                         ack_lead("scout")
+                        decision_delivered("scout")
                     if (rc == 0 and outcome_box["outcome"] == "approved"
                             and planner_on_team):
                         phase = set_phase("planning")
@@ -15031,12 +13835,17 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         if role_resume_id("planner"):
                             planner_seed = intel_updated_block(intel_path)
                         else:
-                            planner_seed = assemble_planner_seed(
-                                intel_path, shared_context, intel_dir, current_rev)
+                            planner_seed = with_decision_record(
+                                assemble_planner_seed(
+                                    intel_path, shared_context, intel_dir,
+                                    current_rev))
                         continue
                     break
 
                 if phase == "planning":
+                    if not reviewer_ready_for("planner"):
+                        rc = result_box.get("refusal_rc", 2)
+                        break
                     if not ensure_controller_available("planner", reason="lead_launch"):
                         rc = 1
                         break
@@ -15047,14 +13856,15 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                             "planner", pending_switch_for("planner"), phase,
                             session_uuid, trace, clear_pending_switch_for)
                         if pending_switch_for("planner") else None)
+                    planner_first_send_cb = decision_first_send("planner", planner_first_send_cb)
                     rc = run_planner_fn(
                         config,
-                        with_headless_lead(seed_with_switch_note(
+                        with_agent_lead_note(with_decision_note("planner", seed_with_switch_note(
                             "planner",
                             deliver_context(
                                 "planner",
-                                planner_seed if planner_seed is not None else ""))),
-                        selected, io_in=io_in, io_out=io_out,
+                                planner_seed if planner_seed is not None else "")))),
+                        selected, io_out=io_out,
                         evaluation_policy=evaluation_policy,
                         resume_id=role_resume_id("planner"),
                         on_session=role_saver("planner"),
@@ -15062,10 +13872,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         review_path=planner_review_path,
                         reviewer_resume_id=role_resume_id(PLANNING_ADVISOR),
                         on_reviewer_session=role_saver(PLANNING_ADVISOR),
-                        reviewer_context=reviewer_ctx,
+                        reviewer_context=reviewer_context_now(),
                         reviewer_context_update=reviewer_gap(PLANNING_ADVISOR)
                         if PLANNING_ADVISOR in selected else None,
-                        on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
+                        on_reviewer_context_ack=reviewer_acker(PLANNING_ADVISOR),
                         trace=trace,
                         eval_scratch_path=eval_scratch["planner"],
                         reviewer_eval_scratch_path=eval_scratch[PLANNING_ADVISOR],
@@ -15076,66 +13886,27 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         review_packet_ctx={"epoch": epoch_box["epoch"],
                                            "attempt": planner_attempt_box["attempt"],
                                            "context_revision": current_rev},
-                        switch_controller_fn=switch_controller,
                         reviewer_switch_note_fn=switch_note_for,
                         on_reviewer_switch_consumed=clear_pending_switch_for,
                         on_first_send_accepted=planner_first_send_cb,
                         on_first_send_rejected=planner_first_send_rejected_cb,
                         reviewer_controller_check_fn=reviewer_controller_check,
-                        headless=headless,
-                        gate_preview=make_gate_preview(
-                            "planner", builder_on_team, session_enabled),
                         save_pending_turn_fn=save_pending_turn_for,
                         clear_pending_turn_fn=clear_pending_switch_for,
                         worktree=active_worktree, worktree_base=active_worktree_root,
                         on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+                    _bind_decision_launch(session_uuid, "planner", None)
+                    record_outcome("planner", planner_box)
                     if rc != 0:
-                        action = recover_controller_failure("planner", "startup_or_probe")
-                        if action == "retry":
-                            # BL-3: see the scout phase's identical comment --
-                            # a fresh attempt, not a fresh epoch.
-                            planner_attempt_box["attempt"] += 1
-                            continue
-                        if action == "switch":
-                            planner_attempt_box["attempt"] += 1
-                            planner_seed = prepare_fresh_seed_after_switch("planner")
-                            continue
+                        recover_controller_failure("planner", "startup_or_probe")
                         break
-                    if rc == 0 and planner_box["outcome"] == _OUTCOME_HEADLESS_TERMINATED:
+                    if rc == 0 and planner_box["outcome"] == _OUTCOME_PROCESS_TERMINATED:
                         rc = (planner_box["payload"] or {}).get(
-                            "exit_code", HEADLESS_REFUSAL_EXIT_CODE)
-                        break
-                    if (rc == 0 and planner_box["outcome"] == "switch_controller"):
-                        payload = planner_box["payload"] or {}
-                        if payload.get("pending"):
-                            pending_switch_turns["planner"] = payload.get("pending")
-                        if switch_controller("planner", reason=payload.get("reason"),
-                                             source="gate",
-                                             target=payload.get("target")):
-                            planner_attempt_box["attempt"] += 1
-                            planner_seed = prepare_fresh_seed_after_switch("planner")
-                            continue
-                        rc = 1
+                            "exit_code", PROVIDER_REFUSAL_EXIT_CODE)
                         break
                     if rc == 0 and planner_first_send_box["delivered"]:
                         ack_lead("planner")
-                    if rc == 0 and planner_box["outcome"] == "handoff":
-                        # User-confirmed hand-back (planner -> its pre-processor):
-                        # resume the scout session with the handoff payload and run the
-                        # full scout cycle again.
-                        phase = set_phase("scouting")
-                        # Each planner -> scout hand-back is a new scouting phase: bump
-                        # the scouting epoch so a stale scout hash-gate baseline from the
-                        # prior pass cannot authorize a skip on the re-investigated intel.
-                        bump_scouting_epoch()
-                        trace.event("handoff.execute", from_role="planner",
-                                    to_role=HANDBACK_PREPROCESSOR["planner"],
-                                    **trace_store.prompt_meta(
-                                        planner_box["payload"] or "", prefix="payload"))
-                        scout_seed = with_discovery(
-                            handoff_wake_block(planner_box["payload"], intel_dir))
-                        planner_seed = None
-                        continue
+                        decision_delivered("planner")
                     if (rc == 0 and planner_box["outcome"] == "approved"
                             and builder_on_team):
                         # Plan approved with a builder on the team: chain into the
@@ -15151,9 +13922,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                             builder_seed = plan_updated_block(
                                 plan_json_path, plan_md_path)
                         else:
-                            builder_seed = assemble_builder_seed(
-                                plan_json_path, plan_md_path, shared_context,
-                                intel_dir, current_rev)
+                            builder_seed = with_decision_record(
+                                assemble_builder_seed(
+                                    plan_json_path, plan_md_path,
+                                    shared_context, intel_dir, current_rev))
                         continue
                     if (rc == 0 and planner_box["outcome"] == "approved"
                             and not builder_on_team):
@@ -15168,6 +13940,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     break
 
                 # building phase
+                if not reviewer_ready_for("builder"):
+                    rc = result_box.get("refusal_rc", 2)
+                    break
                 if not ensure_controller_available("builder", reason="lead_launch"):
                     rc = 1
                     break
@@ -15178,13 +13953,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         "builder", pending_switch_for("builder"), phase,
                         session_uuid, trace, clear_pending_switch_for)
                     if pending_switch_for("builder") else None)
+                builder_first_send_cb = decision_first_send("builder", builder_first_send_cb)
                 rc = run_builder_fn(
                     config,
-                    with_headless_lead(seed_with_switch_note(
+                    with_agent_lead_note(with_decision_note("builder", seed_with_switch_note(
                         "builder",
                         deliver_context("builder",
-                                        builder_seed if builder_seed is not None else ""))),
-                    selected, io_in=io_in, io_out=io_out,
+                                        builder_seed if builder_seed is not None else "")))),
+                    selected, io_out=io_out,
                     evaluation_policy=evaluation_policy,
                     resume_id=role_resume_id("builder"),
                     on_session=role_saver("builder"),
@@ -15192,10 +13968,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     build_review_path=build_review_path,
                     reviewer_resume_id=role_resume_id(BUILD_REVIEWER),
                     on_reviewer_session=role_saver(BUILD_REVIEWER),
-                    reviewer_context=reviewer_ctx,
+                    reviewer_context=reviewer_context_now(),
                     reviewer_context_update=reviewer_gap(BUILD_REVIEWER)
                     if BUILD_REVIEWER in selected else None,
-                    on_reviewer_context_ack=context_acker(BUILD_REVIEWER),
+                    on_reviewer_context_ack=reviewer_acker(BUILD_REVIEWER),
                     trace=trace,
                     eval_scratch_path=eval_scratch["builder"],
                     reviewer_eval_scratch_path=eval_scratch[BUILD_REVIEWER],
@@ -15208,68 +13984,36 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     review_packet_ctx={"epoch": building_epoch_box["epoch"],
                                        "attempt": builder_attempt_box["attempt"],
                                        "context_revision": current_rev},
-                    switch_controller_fn=switch_controller,
                     reviewer_switch_note_fn=switch_note_for,
                     on_reviewer_switch_consumed=clear_pending_switch_for,
                     on_first_send_accepted=builder_first_send_cb,
                     on_first_send_rejected=builder_first_send_rejected_cb,
                     reviewer_controller_check_fn=reviewer_controller_check,
-                    headless=headless,
-                    gate_preview=make_gate_preview(
-                        "builder", builder_on_team, session_enabled),
                     save_pending_turn_fn=save_pending_turn_for,
                     clear_pending_turn_fn=clear_pending_switch_for,
                     worktree=active_worktree, worktree_base=active_worktree_root,
                     on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
+                _bind_decision_launch(session_uuid, "builder", None)
+                record_outcome("builder", builder_box)
                 if rc != 0:
-                    action = recover_controller_failure("builder", "startup_or_probe")
-                    if action == "retry":
-                        # BL-3: see the scout phase's identical comment -- a
-                        # fresh attempt, not a fresh epoch.
-                        builder_attempt_box["attempt"] += 1
-                        continue
-                    if action == "switch":
-                        builder_attempt_box["attempt"] += 1
-                        builder_seed = prepare_fresh_seed_after_switch("builder")
-                        continue
+                    recover_controller_failure("builder", "startup_or_probe")
                     break
-                if rc == 0 and builder_box["outcome"] == _OUTCOME_HEADLESS_TERMINATED:
+                if rc == 0 and builder_box["outcome"] == _OUTCOME_PROCESS_TERMINATED:
                     rc = (builder_box["payload"] or {}).get(
-                        "exit_code", HEADLESS_REFUSAL_EXIT_CODE)
-                    break
-                if (rc == 0 and builder_box["outcome"] == "switch_controller"):
-                    payload = builder_box["payload"] or {}
-                    if payload.get("pending"):
-                        pending_switch_turns["builder"] = payload.get("pending")
-                    if switch_controller("builder", reason=payload.get("reason"),
-                                         source="gate",
-                                         target=payload.get("target")):
-                        builder_attempt_box["attempt"] += 1
-                        builder_seed = prepare_fresh_seed_after_switch("builder")
-                        continue
-                    rc = 1
+                        "exit_code", PROVIDER_REFUSAL_EXIT_CODE)
                     break
                 if rc == 0 and builder_first_send_box["delivered"]:
                     ack_lead("builder")
-                if rc == 0 and builder_box["outcome"] == "handoff":
-                    # User-confirmed hand-back (builder -> planner): resume the planner
-                    # session with the handoff payload, re-plan, and chain forward into
-                    # the building phase again on the next plan approval.
-                    phase = set_phase("planning")
-                    bump_planning_epoch()
-                    trace.event("handoff.execute", from_role="builder",
-                                to_role=HANDBACK_PREPROCESSOR["builder"],
-                                **trace_store.prompt_meta(
-                                    builder_box["payload"] or "", prefix="payload"))
-                    planner_seed = plan_handback_wake_block(
-                        builder_box["payload"], intel_dir)
-                    builder_seed = None
-                    continue
+                    decision_delivered("builder")
                 # Build approval is terminal for this run (the phase stays `building`,
                 # so a rerun resumes the builder conversation), and EOF/interrupt ends
                 # the run the same way.
                 break
         finally:
+            # No launch outlives the loop: a lead that raised never leaves its
+            # decision bindings behind for a later launch in this process.
+            for _bound_role in ("scout", "planner", "builder"):
+                _bind_decision_launch(session_uuid, _bound_role, None)
             if _prior_sigterm_handler is not None:
                 try:
                     signal.signal(signal.SIGTERM, _prior_sigterm_handler)
@@ -15281,7 +14025,10 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         # Session end closes every phase: nothing more can supersede a candidate.
         measurement_checkpoint("session.end",
                                closed_phases=list(PHASE_PAIRS) + [phase])
-        trace.event("run.end", rc=rc)
+        result_box["phase"] = phase
+        rc = _final_rc(rc, (result_box.get("last") or {}).get("outcome"))
+        trace.event("run.end", rc=rc,
+                    outcome=(result_box.get("last") or {}).get("outcome"))
         return rc
     except cowork_owner.OwnerLeaseError as exc:
         # Catch point 1 (plan §3.7): the DECLARED BASE, never a tuple of
@@ -15297,6 +14044,32 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             exc, session_uuid=session_uuid, session_file=spath))
         io_out.flush()
         return 3
+    except state_store.DecisionAnswerTampered as exc:
+        # A recorded orchestrator answer no longer has the bytes the
+        # orchestrator gave: nothing more is delivered under its authority,
+        # and any delivery still owed stays pending. The request is already
+        # consumed, so it cannot be answered again: the only recovery is
+        # restoring the exact bytes (every later run re-verifies every
+        # recorded answer and stops the same way until then).
+        result_box["reason"] = "decision_answer_tampered"
+        result_box["stop"] = {
+            "kind": "decision_answer_tampered",
+            "request_id": exc.request_id,
+            "answer_path": exc.answer_path,
+            "expected_sha256": exc.expected_sha256}
+        trace.event("decision.answer.tampered", request_id=exc.request_id,
+                    answer_path=exc.answer_path,
+                    expected_sha256=exc.expected_sha256)
+        trace.event("run.end", rc=1, reason="decision_answer_tampered")
+        io_out.write("cowork: %s\n" % exc)
+        if exc.expected_sha256:
+            io_out.write(
+                "cowork: recovery: restore the exact bytes of the answer to "
+                "request %s at %s (sha256 %s), then rerun; the request is "
+                "consumed and cannot be answered again\n" % (
+                    exc.request_id, exc.answer_path, exc.expected_sha256))
+        io_out.flush()
+        return 1
     except KeyboardInterrupt:
         release_reason = "interrupted"
         raise
@@ -15332,13 +14105,13 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 
 
 # --------------------------------------------------------------------------- #
-# M3 Package E: headless resume-trigger CLI, consumed externally by          #
+# M3 Package E: resume-trigger CLI, consumed externally by                   #
 # Package F's wake adapters -- a versioned contract deliberately narrow, in  #
 # the same spirit as D's own `cowork_capacity_scheduler.run_wake_trigger`:   #
 # claim, binding-preflight, InvalidationRecord no-replay, and the ONE        #
 # exactly-once replay of the persisted pending turn. It never drives the     #
-# rest of the role's interactive loop -- once the accepted send lands, an    #
-# ordinary `cowork.py --resume` continues the conversation normally.         #
+# rest of the role's lead loop -- once the accepted send lands, an explicit #
+# `cowork.py --session-file` (or `--resume`) run continues normally.        #
 # --------------------------------------------------------------------------- #
 
 RESUME_TRIGGER_CONTRACT_VERSION = 1
@@ -15417,7 +14190,7 @@ def build_resume_trigger_arg_parser():
     parser = argparse.ArgumentParser(
         prog="cowork.py resume-trigger", add_help=True,
         description=(
-            "M3 Package E versioned headless resume-trigger contract (v%d), "
+            "M3 Package E versioned resume-trigger contract (v%d), "
             "consumed externally by Package F's wake adapters: claim a due "
             "PauseLease (D's scheduler contract), prove the claimed binding "
             "is still exactly the one this engagement paused on, and replay "
@@ -15508,7 +14281,7 @@ def _current_role_work_id_for_session(cwd, session_uuid, role):
 
 
 def _resume_seed_delivery(pending_text, redirected_context):
-    """Typed seed for a headless resume turn -- issue #57: `pending_text`
+    """Typed seed for a resume-trigger turn -- issue #57: `pending_text`
     and any `redirected_context` override MUST pass through the closed
     boundary constructors before reaching any transport call, never a bare/
     untyped string handed straight to a session's send(). Covers both
@@ -15647,7 +14420,7 @@ def _account_failed_wake_attempt(session_uuid, lease, automation_ref):
 
 
 def run_resume_trigger(argv, output=None, session_factory=None):
-    """Versioned headless resume-trigger entrypoint (see
+    """Versioned resume-trigger entrypoint (see
     RESUME_TRIGGER_CONTRACT_VERSION), consumed externally by Package F's
     wake adapters -- writes exactly one JSON result line to `output`
     (defaults to `sys.stdout.write`) and returns one of
@@ -15749,7 +14522,7 @@ def run_resume_trigger(argv, output=None, session_factory=None):
          episode) for a genuine repeat quota/overload, or CANCELS the
          lease and advances `execution_failed` (a terminal WorkUnit outcome
          -- no further wake-ceiling accounting is meaningful; no
-         interactive gate exists in a headless trigger)."""
+         decision gate exists in a resume trigger)."""
     write = output if output is not None else sys.stdout.write
     parser = build_resume_trigger_arg_parser()
     try:
@@ -15798,12 +14571,14 @@ def run_resume_trigger(argv, output=None, session_factory=None):
 
     effective_role = args.role if args.role is not None else precheck_lease["role"]
 
-    def _preflight_conflict(reason, code):
+    def _preflight_conflict(reason, code, **details):
         _account_failed_wake_attempt(
             session_uuid, precheck_lease, args.automation_ref)
-        write(json.dumps({"outcome": "conflict",
-                          "lease_id": precheck_lease["lease_id"],
-                          "reason": reason}) + "\n")
+        line = {"outcome": "conflict",
+                "lease_id": precheck_lease["lease_id"],
+                "reason": reason}
+        line.update(details)
+        write(json.dumps(line) + "\n")
         return code
 
     if args.role is not None and args.role != precheck_lease["role"]:
@@ -15839,6 +14614,46 @@ def run_resume_trigger(argv, output=None, session_factory=None):
            or pending_record.get("lease_id") != precheck_lease["lease_id"]):
         return _preflight_conflict(
             "no_pending_turn", RESUME_TRIGGER_EXIT_NO_PENDING_TURN)
+    # An orchestrator answer this turn carries by path is re-sent only while
+    # it still has the bytes the session store recorded (never edited content
+    # under orchestrator authority).
+    tampered_rid = _capacity_turn_tampered_answer(
+        session_uuid, state, pending_record)
+    if tampered_rid:
+        expected = (state_store.trusted_decision_response(
+            state, tampered_rid) or {}).get("answer_sha256")
+        details = {"request_id": tampered_rid, "expected_sha256": expected}
+        if expected:
+            details["answer_path"] = state_store.decision_answer_path_for(
+                session_uuid, tampered_rid)
+            details["recovery"] = ("restore the exact bytes (sha256 %s) at "
+                                   "answer_path, then trigger again"
+                                   % expected)
+        else:
+            details["recovery"] = ("the session store has no response record "
+                                   "for this request; the turn cannot be "
+                                   "resent under orchestrator authority")
+        return _preflight_conflict(
+            "decision_answer_tampered", RESUME_TRIGGER_EXIT_BINDING_MISMATCH,
+            **details)
+    # A turn that carries orchestrator decision blocks is only ever resent
+    # verbatim: a redirected context would replace those bytes, and the
+    # decisions would be acknowledged without ever being sent. Refused before
+    # any claim, phase advance, session construction or send, and (like the
+    # exclusivity refusal below) without charging a failed wake attempt --
+    # nothing was attempted. The lease stays live and still holds the
+    # decisions; a verbatim trigger delivers them.
+    bound_rids = _redirect_refused_decisions(args, pending_record)
+    if bound_rids:
+        write(json.dumps({
+            "outcome": "invalid_arguments",
+            "reason": "decision_bound_turn_not_redirectable",
+            "lease_id": precheck_lease["lease_id"],
+            "request_ids": bound_rids,
+            "detail": "the paused turn carries orchestrator decision(s) %s; "
+                      "resume it without --redirected-context"
+                      % ", ".join(bound_rids)}) + "\n")
+        return RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS
 
     # Issue #64 P3, ENFORCEMENT POINT 2: provider/controller exclusivity, one
     # step BEFORE ownership is even acquired. Placed here, a refusal has
@@ -15883,7 +14698,7 @@ def run_resume_trigger(argv, output=None, session_factory=None):
                 "owner_session_uuid": rt_bound_to}) + "\n")
             return RESUME_TRIGGER_EXIT_PROVIDER_SESSION_BOUND
 
-    # Issue #64: SINGLE-WRITER OWNERSHIP for the headless entry point too.
+    # Issue #64: SINGLE-WRITER OWNERSHIP for the resume-trigger entry point too.
     # Acquired BEFORE step 2's state-mutating claim -- and therefore before
     # any phase advance, any provider-session construction and any send -- so
     # a duplicate resume-trigger against a session another process already
@@ -16069,6 +14884,12 @@ def run_resume_trigger(argv, output=None, session_factory=None):
                or pending_record.get("lease_id") != canonical_lease["lease_id"]):
             return _release_and_conflict(
                 "no_pending_turn", RESUME_TRIGGER_EXIT_NO_PENDING_TURN)
+        if _redirect_refused_decisions(args, pending_record):
+            # The fresh re-read gained decision bindings after the pre-claim
+            # check: refused the same way, the claim released.
+            return _release_and_conflict(
+                "decision_bound_turn_not_redirectable",
+                RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS)
 
         _advance_phase(session_uuid, work_id, "preflight_passed",
                        source="resume_trigger")
@@ -16097,6 +14918,15 @@ def run_resume_trigger(argv, output=None, session_factory=None):
 
         send_result = _send(session, delivery, meta={"prompt_kind": "resume_wake"})
         if send_result.get("ok", True):
+            # The provider accepted the exact turn bytes (never a redirected
+            # substitute: refused above): the orchestrator decision deliveries
+            # bound to them reached their target, so they are acknowledged
+            # now -- before anything else can fail -- and a later plain run
+            # never rebuilds them. A failed acknowledgment is reported in the
+            # result line and re-sent later (at least once).
+            ack_failed = []
+            _acknowledge_capacity_turn_decisions(
+                session_uuid, pending_record, failed=ack_failed)
             # Step 8, accepted send: mark the durable lease consumed FIRST --
             # only THEN is `consumption_state=consumed` asserted anywhere
             # (the pending turn is cleared after) -- an accepted send consumes
@@ -16110,8 +14940,12 @@ def run_resume_trigger(argv, output=None, session_factory=None):
                                   % exc.reason}) + "\n")
                 return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
             state_store.clear_pending_turn_before_pause(session_uuid, effective_role)
-            write(json.dumps({
-                "outcome": "success", "lease_id": canonical_lease["lease_id"]}) + "\n")
+            success = {"outcome": "success",
+                       "lease_id": canonical_lease["lease_id"]}
+            if ack_failed:
+                success["decision_ack_failed"] = [
+                    b.get("request_id") for b in ack_failed]
+            write(json.dumps(success) + "\n")
             return RESUME_TRIGGER_EXIT_SUCCESS
 
         # Post-wake send failure: the lease is NEVER marked consumed for a
@@ -16130,7 +14964,8 @@ def run_resume_trigger(argv, output=None, session_factory=None):
                 session_uuid, work_id, effective_role, controller, provider_session_id,
                 controller_outcome, seed_text, cfg.get("model"), cfg.get("effort"),
                 raw_evidence=raw_evidence, replace_lease_id=canonical_lease["lease_id"],
-                replace_automation_ref=args.automation_ref)
+                replace_automation_ref=args.automation_ref,
+                decision_bindings=pending_record.get("decision_bindings"))
             if capacity_payload is not None:
                 write(json.dumps({
                     "outcome": "send_failed", "lease_id": canonical_lease["lease_id"],
@@ -16148,7 +14983,7 @@ def run_resume_trigger(argv, output=None, session_factory=None):
             pass
         _advance_phase(
             session_uuid, work_id, "execution_failed",
-            evidence={"reason": "send_failed", "headless": True,
+            evidence={"reason": "send_failed",
                      "controller_outcome": controller_outcome},
             source="resume_trigger")
         write(json.dumps({
@@ -16179,38 +15014,54 @@ def run_resume_trigger(argv, output=None, session_factory=None):
         _restore_owner_context(rt_prior_owner_context)
 
 
+def _terminate_run(signum, frame):
+    """Whole-run SIGTERM handler: unwind (releasing the lease in run_flow's
+    finally) and exit 128+SIGTERM with a structured result."""
+    raise SystemExit(128 + int(signal.SIGTERM))
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["resume-trigger"]:
-        # M3 Package E: the headless resume-trigger CLI is a wholly separate,
+        # M3 Package E: the resume-trigger CLI is a wholly separate,
         # independently-versioned contract (RESUME_TRIGGER_CONTRACT_VERSION)
         # -- dispatched here, before the main flat argparse, exactly like D's
         # own standalone `cowork_capacity_scheduler.run_wake_trigger` never
         # shares a parser with anything else.
         return run_resume_trigger(argv[1:])
     try:
-        args = build_parser().parse_args(argv)
+        try:
+            args = build_parser().parse_args(argv)
+        except SystemExit as exc:
+            # argparse already wrote its usage error to stderr. A refused
+            # invocation still ends with its one structured result (--help,
+            # exit 0, is not a run and emits none).
+            if exc.code not in (0, None):
+                emit_run_result(sys.stdout, 2, {"reason": "argument_error"})
+            raise
         # --check / --report / --session-owner are read-only and short-circuit
         # BELOW, before run_flow — which is what keeps them working on a
         # session whose saved policy is unreadable. They stay mutually
-        # exclusive with the two session-mutating controller flags.
-        for flag, supplied in (("--switch-controller",
-                                bool(args.switch_controller)),
-                               ("--allow-controllers",
-                                args.allow_controllers is not None)):
-            if supplied and args.check:
-                sys.stderr.write(
-                    "cowork: %s cannot be combined with --check.\n" % flag)
-                return 2
-            if supplied and args.report:
-                sys.stderr.write(
-                    "cowork: %s cannot be combined with --report.\n" % flag)
-                return 2
-            if supplied and args.session_owner:
-                sys.stderr.write(
-                    "cowork: %s cannot be combined with --session-owner.\n"
-                    % flag)
-                return 2
+        # exclusive with every session-mutating flag (controller updates,
+        # orchestrator decisions, --take-over); the refusal ends with its one
+        # structured result like any other invalid invocation.
+        mutating = [("--switch-controller", bool(args.switch_controller)),
+                    ("--allow-controllers",
+                     args.allow_controllers is not None),
+                    ("--take-over", bool(getattr(args, "take_over", False)))]
+        mutating += [("--" + kind.replace("_", "-"), True)
+                     for kind, _rid in _decision_flags(args)]
+        for flag, supplied in mutating:
+            for read_only, active in (("--check", args.check),
+                                      ("--report", args.report),
+                                      ("--session-owner",
+                                       args.session_owner)):
+                if supplied and active:
+                    sys.stderr.write("cowork: %s cannot be combined with "
+                                     "%s.\n" % (flag, read_only))
+                    emit_run_result(sys.stdout, 2,
+                                    {"reason": "conflicting_arguments"})
+                    return 2
         if args.check:
             return preflight.main()
         if args.report:
@@ -16228,10 +15079,55 @@ def main(argv=None):
         # Runtime controller dispatches are governed from this point onward.
         # Read-only --check/--report paths above never need a broker.
         prior_guard = bridge.set_nested_guard_active(True)
+        result_box = {}
+        rc = None
+        # Whole-run SIGTERM: outside run_flow's own phase handler (lease,
+        # preflight, worktree setup, the final measurement checkpoint) a
+        # termination still unwinds through the finally below and ends with
+        # its structured result (rc 143). SIGKILL cannot be observed; a caller
+        # must treat a missing result line as a failure. Known narrow window:
+        # the handler is restored in the `finally` below before the result is
+        # emitted, so a SECOND SIGTERM arriving during that unwind can end the
+        # process without the line -- the same missing-line rule applies.
         try:
-            return run_flow(args)
+            prior_sigterm = signal.signal(signal.SIGTERM, _terminate_run)
+        except (ValueError, RuntimeError):
+            prior_sigterm = None
+        try:
+            # The provider transcript goes to stderr; stdout carries only the
+            # one trusted run-result line, so no model output can stand in
+            # for it.
+            rc = run_flow(args, io_out=sys.stderr, result_box=result_box)
+            return rc
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 1
+            raise
+        except Exception as exc:  # noqa: BLE001 - one truthful terminal result
+            if isinstance(exc, cowork_owner.OwnerLeaseError):
+                raise
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            rc = 1
+            result_box["reason"] = "internal_error"
+            result_box["error_type"] = type(exc).__name__
+            return rc
         finally:
+            if prior_sigterm is not None:
+                try:
+                    signal.signal(signal.SIGTERM, prior_sigterm)
+                except (ValueError, RuntimeError):
+                    pass
             bridge.set_nested_guard_active(prior_guard)
+            # The result line must agree with the exit code the backstops
+            # below produce for an exception escaping run_flow.
+            escaping = sys.exc_info()[1]
+            if isinstance(escaping, cowork_owner.OwnerLeaseError):
+                rc = 3
+            elif isinstance(escaping, KeyboardInterrupt):
+                rc = 130
+            elif rc is None:
+                rc = 1
+            emit_run_result(sys.stdout, rc, result_box)
     except cowork_owner.OwnerLeaseError:
         # Issue #64 catch point 2: a STRUCTURAL backstop, not a second
         # reporting surface. `run_flow`'s own handler already traced the
@@ -16242,12 +15138,8 @@ def main(argv=None):
         # of it.
         return 3
     except KeyboardInterrupt:
-        # Clean exit on Ctrl-C instead of dumping a traceback. 130 = 128 + SIGINT.
+        # SIGINT: exit without a traceback. 130 = 128 + SIGINT.
         sys.stderr.write("\ncowork: interrupted.\n")
-        return 130
-    except EOFError:
-        # Ctrl-D at a prompt / closed stdin.
-        sys.stderr.write("\ncowork: input closed.\n")
         return 130
 
 

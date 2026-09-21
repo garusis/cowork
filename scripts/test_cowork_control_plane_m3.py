@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""M3 Package A tests for cowork_control_plane's narrow awaiting_capacity
-activation: set-difference proof against the signed M2 baseline, binding-
-specific wake-failure evidence, local-guard/unknown-provider unreachability,
+"""cowork_control_plane's awaiting_capacity activation: the exact EVENTS/
+TRANSITIONS table, binding-specific wake-failure evidence, local-guard/unknown-provider unreachability,
 and closed-trust-source/malformed-parser coverage that lives at the
 control-plane evidence-validator layer.
 
@@ -27,21 +26,19 @@ _HASH_B = "b" * 64
 _HASH_C = "c" * 64
 
 # ---------------------------------------------------------------------------
-# M2 baseline, captured verbatim from the signed base commit
-# 7a2440c7571d01eb20251589bd82ab2caf620e4d's scripts/cowork_control_plane.py.
-# This is a hardcoded constant, not a re-derivation from the current module
-# — the set-difference proof below compares the CURRENT cp.EVENTS/
-# cp.TRANSITIONS against this frozen snapshot plus exactly the M3 additions.
+# The expected control-plane table, as a hardcoded constant rather than a
+# re-derivation from the module under test.
 # ---------------------------------------------------------------------------
 
-M2_BASELINE_EVENTS = (
+EXPECTED_EVENTS = (
     "preflight_started", "preflight_passed", "preflight_rejected",
     "capability_missing", "turn_completed", "gate_validated", "gate_rejected",
     "dependency_blocked", "dependency_unblocked", "capacity_reserved",
     "execution_failed", "cancelled", "aborted",
+    "capacity_wake_claimed", "capacity_wake_preflight_failed",
 )
 
-M2_BASELINE_TRANSITIONS = {
+EXPECTED_TRANSITIONS = {
     ("pending", "preflight_started"): ("preflighting", "preflight_started"),
     ("pending", "cancelled"): ("cancelled", "cancelled"),
     ("pending", "aborted"): ("aborted", "aborted"),
@@ -70,12 +67,7 @@ M2_BASELINE_TRANSITIONS = {
 
     ("needs_authority", "cancelled"): ("cancelled", "cancelled"),
     ("needs_authority", "aborted"): ("aborted", "aborted"),
-}
 
-# The frozen brief's exact M3 additions.
-M3_NEW_EVENTS = ("capacity_wake_claimed", "capacity_wake_preflight_failed")
-
-M3_NEW_TRANSITIONS = {
     ("running", "capacity_reserved"): ("awaiting_capacity", "capacity_reserved"),
     ("preflighting", "capacity_reserved"): ("awaiting_capacity", "capacity_reserved"),
     ("awaiting_capacity", "capacity_wake_claimed"): ("preflighting", "capacity_wake_claimed"),
@@ -161,52 +153,15 @@ _BOUND_CANDIDATE = {"candidate_manifest_digest": _HASH_B, "candidate_index": 0}
 _BOUND_CANDIDATE_NULL_INDEX = {"candidate_manifest_digest": _HASH_B, "candidate_index": None}
 
 
-class SetDifferenceProofTest(unittest.TestCase):
-    """Explicit before/after set-difference proof: current EVENTS/
-    TRANSITIONS equal the frozen M2 baseline plus exactly the M3 additions
-    — never a hand-recount."""
+class ControlPlaneTableTest(unittest.TestCase):
+    """The live EVENTS/TRANSITIONS table equals the expected table exactly."""
 
-    def test_events_equal_m2_baseline_plus_exactly_two_additions(self):
-        self.assertEqual(len(M2_BASELINE_EVENTS), 13)
-        self.assertEqual(len(M3_NEW_EVENTS), 2)
+    def test_events_equal_the_expected_set_without_duplicates(self):
+        self.assertEqual(set(cp.EVENTS), set(EXPECTED_EVENTS))
+        self.assertEqual(len(cp.EVENTS), len(set(cp.EVENTS)))
 
-        current = set(cp.EVENTS)
-        baseline = set(M2_BASELINE_EVENTS)
-        added = current - baseline
-        removed = baseline - current
-
-        self.assertEqual(added, set(M3_NEW_EVENTS))
-        self.assertEqual(removed, set())
-        self.assertEqual(current, baseline | set(M3_NEW_EVENTS))
-        self.assertEqual(len(cp.EVENTS), len(M2_BASELINE_EVENTS) + len(M3_NEW_EVENTS))
-
-    def test_transitions_equal_m2_baseline_plus_exactly_six_additions(self):
-        self.assertEqual(len(M2_BASELINE_TRANSITIONS), 23)
-        self.assertEqual(len(M3_NEW_TRANSITIONS), 6)
-
-        current = dict(cp.TRANSITIONS)
-        baseline_keys = set(M2_BASELINE_TRANSITIONS)
-        current_keys = set(current)
-        added_keys = current_keys - baseline_keys
-        removed_keys = baseline_keys - current_keys
-
-        self.assertEqual(added_keys, set(M3_NEW_TRANSITIONS))
-        self.assertEqual(removed_keys, set())
-
-        # Every pre-existing M2 entry is byte-identical (same value, not
-        # just same key).
-        for key in baseline_keys:
-            self.assertEqual(current[key], M2_BASELINE_TRANSITIONS[key],
-                              "M2 entry %r drifted" % (key,))
-        # Every new entry matches the frozen brief exactly.
-        for key, value in M3_NEW_TRANSITIONS.items():
-            self.assertEqual(current[key], value, "M3 entry %r drifted" % (key,))
-
-        expected = dict(M2_BASELINE_TRANSITIONS)
-        expected.update(M3_NEW_TRANSITIONS)
-        self.assertEqual(current, expected)
-        self.assertEqual(
-            len(cp.TRANSITIONS), len(M2_BASELINE_TRANSITIONS) + len(M3_NEW_TRANSITIONS))
+    def test_transitions_equal_the_expected_table(self):
+        self.assertEqual(dict(cp.TRANSITIONS), EXPECTED_TRANSITIONS)
 
 
 class CapacityReservedEvidenceTest(unittest.TestCase):

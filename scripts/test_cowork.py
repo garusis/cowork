@@ -7,11 +7,9 @@ fakes; no real claude/codex CLI is spawned. Run:
     python3 -m unittest scripts/test_cowork.py
 """
 
-import array
 import ast
 import collections
 import contextlib
-import errno
 import fcntl
 import hashlib
 import io
@@ -19,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import re
-import select as select_mod
 import signal
 import shutil
 import socket
@@ -27,7 +24,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
 import unittest
@@ -42,7 +38,7 @@ import cowork_dispatch_manifest as manifest_mod  # noqa: E402
 import cowork_preflight as preflight  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
-import cowork_ui as ui  # noqa: E402
+import cowork_transcript as transcript  # noqa: E402
 import cowork_policy as policy  # noqa: E402
 import cowork_action_policy as action_policy  # noqa: E402
 import cowork_action_guard as action_guard  # noqa: E402
@@ -52,26 +48,14 @@ import cowork_measure as measure  # noqa: E402
 import cowork_profiles as controller_profiles  # noqa: E402
 import cowork_report as report  # noqa: E402
 import cowork_eval as evaluation  # noqa: E402
-import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 import cowork_workunit as workunit  # noqa: E402
 import cowork_control_plane as control_plane  # noqa: E402
 import cowork_capacity as capacity_contracts  # noqa: E402
 import cowork_capacity_scheduler as capacity_scheduler  # noqa: E402
 import cowork_wake_macos as wake_macos  # noqa: E402
 
-# The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
-# that exercise the real libraries skip when they are absent — same pattern as the
-# COWORK_LIVE integration tests below.
-try:
-    import rich  # noqa: F401
-    import prompt_toolkit  # noqa: F401
-    import questionary  # noqa: F401
-    HAS_UI_DEPS = True
-except ImportError:
-    HAS_UI_DEPS = False
-
-# Structural frontmatter parsing (OpencodeBridgeTest) is PyYAML-gated the
-# same way — skip rather than fail when it is absent.
+# Structural frontmatter parsing (OpencodeBridgeTest) is PyYAML-gated: skip
+# rather than fail when it is absent.
 try:
     import yaml  # noqa: F401
     HAS_YAML = True
@@ -1484,37 +1468,6 @@ class OpencodeSeatbeltWrapTest(unittest.TestCase):
             self.assertEqual(cmd[0], "sandbox-exec")
 
 
-class StatusSpinnerTest(unittest.TestCase):
-    def test_returns_fn_value_and_runs_it(self):
-        seen = {}
-
-        def fn():
-            seen["ran"] = True
-            return "verdict"
-
-        out = io.StringIO()  # not a TTY
-        result = cowork._with_status_spinner(out, "reviewing", fn)
-        self.assertEqual(result, "verdict")
-        self.assertTrue(seen["ran"])
-
-    def test_noop_off_tty_writes_nothing(self):
-        # ui.Spinner is TTY-gated, so off a TTY the helper must add zero bytes —
-        # the scripted/test path stays byte-identical.
-        out = io.StringIO()
-        cowork._with_status_spinner(out, "reading repo state", lambda: None)
-        self.assertEqual(out.getvalue(), "")
-
-    def test_stops_spinner_even_when_fn_raises(self):
-        # The spinner is torn down in a finally, so an exception still leaves a
-        # clean stream (and off a TTY, nothing was written).
-        out = io.StringIO()
-        with self.assertRaises(ValueError):
-            cowork._with_status_spinner(
-                out, "starting scout",
-                lambda: (_ for _ in ()).throw(ValueError("boom")))
-        self.assertEqual(out.getvalue(), "")
-
-
 class PreflightTest(unittest.TestCase):
     def test_python_floor(self):
         ok, alert = preflight.check_python((3, 9, 6))
@@ -1546,489 +1499,14 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(alerts, [])
 
-    def test_preflight_aggregates_non_interactive(self):
+    def test_preflight_aggregates_alerts(self):
         cfg = {"scout": {"controller": "codex"}}
         ok, alerts = preflight.preflight(
-            cfg, version_info=(3, 8, 0), which=lambda c: None, interactive=False
+            cfg, version_info=(3, 8, 0), which=lambda c: None
         )
         self.assertFalse(ok)
-        # python alert + codex alert (no gum required when non-interactive)
+        # python alert + codex alert
         self.assertEqual(len(alerts), 2)
-
-    def test_preflight_requires_packages_only_when_interactive(self):
-        cfg = {"scout": {"controller": "claude"}}
-        present = lambda c: "/bin/" + c if c == "claude" else None
-        have = lambda name: object()   # all packages importable
-        missing = lambda name: None    # none importable
-        # Non-interactive: pip packages are not required.
-        ok, _ = preflight.preflight(cfg, which=present, interactive=False,
-                                    find_spec=missing)
-        self.assertTrue(ok)
-        # Interactive + packages missing -> fail with a package alert.
-        ok, alerts = preflight.preflight(cfg, which=present, interactive=True,
-                                         find_spec=missing)
-        self.assertFalse(ok)
-        self.assertTrue(any("prompt_toolkit" in a or "rich" in a
-                            or "questionary" in a for a in alerts))
-        # Interactive + packages present -> ok.
-        ok, _ = preflight.preflight(cfg, which=present, interactive=True,
-                                    find_spec=have)
-        self.assertTrue(ok)
-
-    def test_check_python_packages(self):
-        ok, alerts = preflight.check_python_packages(
-            ["rich", "questionary"], find_spec=lambda n: None)
-        self.assertFalse(ok)
-        self.assertEqual(len(alerts), 2)
-        self.assertIn("pip install", alerts[0])
-        ok, alerts = preflight.check_python_packages(
-            ["rich"], find_spec=lambda n: object())
-        self.assertTrue(ok)
-        self.assertEqual(alerts, [])
-
-
-# configure_roles_interactive preloads live model catalogs on entry; menu
-# tests inject these no-op discovery fns so no test ever touches the network
-# or a real CLI.
-OFFLINE_CATALOGS = {
-    "opencode_models_fn": lambda: {},
-    "claude_models_fn": lambda: [],
-    "codex_models_fn": lambda: [],
-}
-
-
-class MenuTest(unittest.TestCase):
-    """Interactive menus driven by injected ask-callables; questionary never runs."""
-
-    def test_select_team_interactive(self):
-        self.assertEqual(
-            cowork.select_team_interactive(
-                checkbox_fn=lambda msg, opts, checked=None: ["planner", "scout"]),
-            ["scout", "planner"])  # re-ordered by canonical ROLES
-
-    def test_select_team_cancel_returns_empty(self):
-        self.assertEqual(
-            cowork.select_team_interactive(checkbox_fn=lambda *a, **k: None), [])
-        self.assertEqual(
-            cowork.select_team_interactive(checkbox_fn=lambda *a, **k: []), [])
-
-    def test_configure_roles_accepts_defaults(self):
-        # One Enter: the start entry is the menu default, so returning the
-        # default accepts the whole config untouched.
-        cfg = cowork.configure_roles_interactive(
-            ["scout", "planning-advisor"],
-            select_fn=lambda opts, default=None, message="": default,
-            **OFFLINE_CATALOGS)
-        self.assertEqual(cfg["scout"], cowork.DEFAULTS["scout"])
-
-    def test_configure_roles_customizes(self):
-        picks = {"n": 0}
-
-        def select_fn(opts, default=None, message=""):
-            if cowork.START_CHOICE in opts:  # the table screen
-                picks["n"] += 1
-                return "scout" if picks["n"] == 1 else cowork.START_CHOICE
-            if message.endswith("controller"):
-                return "codex"
-            if message.endswith("access"):
-                return "safe (edits only, other commands denied)"
-            return default  # model + effort selects keep the default
-        cfg = cowork.configure_roles_interactive(
-            ["scout"], select_fn=select_fn,
-            text_fn=lambda message, default="": default,
-            **OFFLINE_CATALOGS)
-        self.assertEqual(cfg["scout"]["controller"], "codex")
-        self.assertFalse(cfg["scout"]["yolo"])
-        self.assertEqual(cfg["scout"]["mode"], "implement")
-        self.assertIsNone(cfg["scout"]["model"])
-        self.assertIsNone(cfg["scout"]["effort"])
-
-    def test_configure_roles_opencode_provider_model_effort(self):
-        picks = {"n": 0}
-
-        def select_fn(opts, default=None, message=""):
-            if cowork.START_CHOICE in opts:
-                picks["n"] += 1
-                return "builder" if picks["n"] == 1 else cowork.START_CHOICE
-            if message.endswith("controller"):
-                return "opencode"
-            if message.endswith("provider (opencode)"):
-                self.assertIn("anthropic", opts)
-                return "anthropic"
-            if message.endswith("model (anthropic)"):
-                return "anthropic/claude-sonnet-4-5"
-            if message.endswith("thinking effort (opencode)"):
-                self.assertIn("max", opts)  # provider-tailored levels
-                return "max"
-            return default
-        cfg = cowork.configure_roles_interactive(
-            ["builder"], select_fn=select_fn,
-            text_fn=lambda message, default="": default,
-            opencode_models_fn=lambda: {
-                "anthropic": ["anthropic/claude-sonnet-4-5",
-                              "anthropic/claude-opus-4-5"]},
-            claude_models_fn=lambda: [], codex_models_fn=lambda: [])
-        self.assertEqual(cfg["builder"]["controller"], "opencode")
-        self.assertEqual(cfg["builder"]["model"], "anthropic/claude-sonnet-4-5")
-        self.assertEqual(cfg["builder"]["effort"], "max")
-
-    def test_configure_roles_switching_controller_resets_model_effort(self):
-        picks = {"n": 0}
-
-        def select_fn(opts, default=None, message=""):
-            if cowork.START_CHOICE in opts:
-                picks["n"] += 1
-                if picks["n"] == 1:
-                    return "scout"      # first edit: claude + opus + high
-                if picks["n"] == 2:
-                    return "scout"      # second edit: switch to codex
-                return cowork.START_CHOICE
-            if message.endswith("controller"):
-                return "claude" if picks["n"] == 1 else "codex"
-            if picks["n"] == 1 and message.endswith("model (claude)"):
-                return "opus"
-            if picks["n"] == 1 and message.endswith("thinking effort (claude)"):
-                return "high"
-            return default
-        cfg = cowork.configure_roles_interactive(
-            ["scout"], select_fn=select_fn,
-            text_fn=lambda message, default="": default,
-            **OFFLINE_CATALOGS)
-        # The claude model/effort never leak into the codex config.
-        self.assertEqual(cfg["scout"]["controller"], "codex")
-        self.assertIsNone(cfg["scout"]["model"])
-        self.assertIsNone(cfg["scout"]["effort"])
-
-    def test_configure_roles_back_only_when_allowed(self):
-        seen = {}
-
-        def select_fn(opts, default=None, message=""):
-            seen["opts"] = list(opts)
-            return cowork.START_CHOICE
-        cowork.configure_roles_interactive(
-            ["scout"], select_fn=select_fn,
-            text_fn=lambda message, default="": default, **OFFLINE_CATALOGS)
-        self.assertNotIn(cowork.BACK_CHOICE, seen["opts"])
-
-    def test_configure_roles_back_returns_sentinel(self):
-        result = cowork.configure_roles_interactive(
-            ["scout"],
-            select_fn=lambda opts, default=None, message="": cowork.BACK_CHOICE,
-            text_fn=lambda message, default="": default,
-            allow_back=True, **OFFLINE_CATALOGS)
-        self.assertIs(result, cowork.BACK)
-
-    def test_select_and_configure_back_keeps_edits_and_reopens_checkbox(self):
-        checkbox_calls = []
-        picks = {"n": 0}
-
-        def checkbox_fn(message, options, checked=None):
-            checkbox_calls.append(list(checked))
-            return (["scout", "builder"] if len(checkbox_calls) == 1
-                    else ["scout"])
-
-        def select_fn(opts, default=None, message=""):
-            if cowork.START_CHOICE in opts:  # the table screen
-                self.assertIn(cowork.BACK_CHOICE, opts)
-                picks["n"] += 1
-                if picks["n"] == 1:
-                    return "scout"              # edit scout first
-                if picks["n"] == 2:
-                    return cowork.BACK_CHOICE   # back to the checkbox
-                return cowork.START_CHOICE
-            if message.endswith("controller"):
-                return "codex"
-            return default
-        selected, cfg = cowork.select_and_configure_interactive(
-            checkbox_fn=checkbox_fn, select_fn=select_fn,
-            text_fn=lambda message, default="": default, **OFFLINE_CATALOGS)
-        # Checkbox: all roles preselected first, then the current picks.
-        self.assertEqual(checkbox_calls[0], cowork.ROLES)
-        self.assertEqual(checkbox_calls[1], ["scout", "builder"])
-        self.assertEqual(selected, ["scout"])
-        self.assertEqual(sorted(cfg), ["scout"])  # builder dropped on re-pick
-        self.assertEqual(cfg["scout"]["controller"], "codex")  # edit survived
-
-    def test_select_and_configure_cancel_returns_empty(self):
-        self.assertEqual(
-            cowork.select_and_configure_interactive(
-                checkbox_fn=lambda *a, **k: None, **OFFLINE_CATALOGS),
-            ([], {}))
-        self.assertEqual(
-            cowork.select_and_configure_interactive(
-                checkbox_fn=lambda *a, **k: [], **OFFLINE_CATALOGS),
-            ([], {}))
-
-    def test_select_and_configure_preloads_once_across_back_trips(self):
-        calls = collections.Counter()
-        rounds = {"n": 0}
-
-        def checkbox_fn(message, options, checked=None):
-            rounds["n"] += 1
-            return ["scout"]
-
-        def select_fn(opts, default=None, message=""):
-            if cowork.START_CHOICE in opts:
-                return (cowork.BACK_CHOICE if rounds["n"] == 1
-                        else cowork.START_CHOICE)
-            return default
-
-        def count(key, value):
-            def fn():
-                calls[key] += 1
-                return value
-            return fn
-        cowork.select_and_configure_interactive(
-            checkbox_fn=checkbox_fn, select_fn=select_fn,
-            text_fn=lambda message, default="": default,
-            opencode_models_fn=count("opencode", {}),
-            claude_models_fn=count("claude", []),
-            codex_models_fn=count("codex", []))
-        self.assertEqual(rounds["n"], 2)
-        self.assertEqual(calls, {"opencode": 1, "claude": 1, "codex": 1})
-
-    def test_list_opencode_models_parses_and_tolerates_failure(self):
-        parsed = cowork.list_opencode_models(
-            runner=lambda: "anthropic/claude-sonnet-4-5\nopenai/gpt-5.4\n"
-                           "openai/gpt-5.4-mini\nnot a model line\n")
-        self.assertEqual(parsed, {
-            "anthropic": ["anthropic/claude-sonnet-4-5"],
-            "openai": ["openai/gpt-5.4", "openai/gpt-5.4-mini"]})
-        self.assertEqual(cowork.list_opencode_models(runner=lambda: ""), {})
-
-    def test_list_codex_models_parses_orders_filters(self):
-        # Out-of-order priorities, one hidden model, reasoning levels as the
-        # CLI's {'effort': ...} dicts.
-        catalog = json.dumps({"models": [
-            {"slug": "gpt-5.4", "visibility": "list", "priority": 16,
-             "supported_reasoning_levels": [
-                 {"effort": "low"}, {"effort": "high"}]},
-            {"slug": "codex-auto-review", "visibility": "hide", "priority": 1,
-             "supported_reasoning_levels": [{"effort": "medium"}]},
-            {"slug": "gpt-5.5", "visibility": "list", "priority": 7,
-             "supported_reasoning_levels": [
-                 {"effort": "medium"}, {"effort": "xhigh"}, "high"]},
-            {"slug": "", "visibility": "list", "priority": 2},
-            "not a model entry",
-        ]})
-        self.assertEqual(cowork.list_codex_models(runner=lambda: catalog), [
-            {"slug": "gpt-5.5", "efforts": ["medium", "xhigh", "high"]},
-            {"slug": "gpt-5.4", "efforts": ["low", "high"]},
-        ])
-
-    def test_list_codex_models_failure_modes(self):
-        def boom():
-            raise RuntimeError("codex exploded")
-        for runner in (lambda: "", lambda: "not json",
-                       lambda: json.dumps({"nope": []}),
-                       lambda: json.dumps({"models": "garbage"}), boom):
-            self.assertEqual(cowork.list_codex_models(runner=runner), [])
-
-    def test_list_claude_models_sorts_newest_first(self):
-        catalog = json.dumps({"anthropic": {"models": {
-            "claude-opus-4-8": {"release_date": "2026-05-28"},
-            "claude-sonnet-5": {"release_date": "2026-06-29"},
-            "claude-undated": "not a dict",
-            "claude-fable-5": {"release_date": "2026-06-07"},
-        }}})
-        self.assertEqual(cowork.list_claude_models(fetcher=lambda: catalog),
-                         ["claude-sonnet-5", "claude-fable-5",
-                          "claude-opus-4-8", "claude-undated"])
-
-    def test_list_claude_models_failure_modes(self):
-        def boom():
-            raise RuntimeError("network down")
-        for fetcher in (lambda: "", lambda: "<html>403</html>",
-                        lambda: json.dumps({"openai": {}}),
-                        lambda: json.dumps({"anthropic": {"models": []}}),
-                        boom):
-            self.assertEqual(cowork.list_claude_models(fetcher=fetcher), [])
-
-    def test_fetch_models_dev_sends_user_agent(self):
-        # models.dev 403s bare urllib requests; a missing User-Agent would be
-        # a permanent silent fallback, so pin the header at the Request level.
-        seen = {}
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def read(self):
-                return b"{}"
-
-        def fake_urlopen(req, timeout=None):
-            seen["user_agent"] = req.get_header("User-agent")
-            seen["url"] = req.full_url
-            return FakeResponse()
-
-        real = cowork.urllib.request.urlopen
-        cowork.urllib.request.urlopen = fake_urlopen
-        try:
-            self.assertEqual(cowork._fetch_models_dev(), "{}")
-        finally:
-            cowork.urllib.request.urlopen = real
-        self.assertEqual(seen["url"], cowork.MODELS_DEV_URL)
-        self.assertTrue((seen["user_agent"] or "").startswith("cowork/"))
-
-    def test_pick_model_claude_uses_live_catalog_newest_first(self):
-        live = ["claude-sonnet-5", "claude-fable-5", "claude-opus-4-8"]
-        seen = {}
-
-        def select_fn(opts, default=None, message=""):
-            seen["opts"] = opts
-            return "claude-fable-5"
-        pick = cowork.pick_model_interactive(
-            "scout", "claude", None, select_fn,
-            text_fn=lambda message, default="": default, claude_models=live)
-        self.assertEqual(pick, "claude-fable-5")
-        self.assertEqual(seen["opts"],
-                         [cowork.DEFAULT_CHOICE] + live + [cowork.CUSTOM_CHOICE])
-
-    def test_pick_model_codex_uses_live_catalog_priority_order(self):
-        live = [{"slug": "gpt-5.5", "efforts": ["low", "high"]},
-                {"slug": "gpt-5.4", "efforts": ["low"]}]
-        seen = {}
-
-        def select_fn(opts, default=None, message=""):
-            seen["opts"] = opts
-            return "gpt-5.5"
-        pick = cowork.pick_model_interactive(
-            "scout", "codex", None, select_fn,
-            text_fn=lambda message, default="": default, codex_models=live)
-        self.assertEqual(pick, "gpt-5.5")
-        self.assertEqual(seen["opts"],
-                         [cowork.DEFAULT_CHOICE, "gpt-5.5", "gpt-5.4",
-                          cowork.CUSTOM_CHOICE])
-
-    def test_pick_model_falls_back_to_presets_without_live_data(self):
-        seen = {}
-
-        def select_fn(opts, default=None, message=""):
-            seen[message] = opts
-            return cowork.DEFAULT_CHOICE
-        cowork.pick_model_interactive(
-            "scout", "claude", None, select_fn,
-            text_fn=lambda message, default="": default, claude_models=[])
-        cowork.pick_model_interactive(
-            "scout", "codex", None, select_fn,
-            text_fn=lambda message, default="": default, codex_models=[])
-        self.assertEqual(seen["scout model (claude)"],
-                         [cowork.DEFAULT_CHOICE, "opus", "sonnet", "haiku",
-                          cowork.CUSTOM_CHOICE])
-        self.assertEqual(seen["scout model (codex)"],
-                         [cowork.DEFAULT_CHOICE, cowork.CUSTOM_CHOICE])
-
-    def test_pick_effort_codex_uses_model_levels(self):
-        live = [{"slug": "gpt-5.5", "efforts": ["medium", "xhigh"]},
-                {"slug": "gpt-5.4", "efforts": []}]
-        seen = {}
-
-        def select_fn(opts, default=None, message=""):
-            seen["opts"] = opts
-            return "xhigh"
-        pick = cowork.pick_effort_interactive(
-            "scout", "codex", None, select_fn, model="gpt-5.5",
-            codex_models=live)
-        self.assertEqual(pick, "xhigh")
-        self.assertEqual(seen["opts"],
-                         [cowork.DEFAULT_CHOICE, "medium", "xhigh"])
-        # Unknown model (custom id) and empty catalog efforts both keep the
-        # generic codex list.
-        for model in ("gpt-6-custom", "gpt-5.4"):
-            cowork.pick_effort_interactive(
-                "scout", "codex", None, select_fn, model=model,
-                codex_models=live)
-            self.assertEqual(
-                seen["opts"],
-                [cowork.DEFAULT_CHOICE] + cowork.EFFORT_CHOICES["codex"])
-
-    def test_preload_model_catalogs_merges_and_tolerates_failure(self):
-        def boom():
-            raise RuntimeError("offline")
-        catalogs = cowork.preload_model_catalogs(
-            opencode_models_fn=lambda: {"openai": ["openai/gpt-5.4"]},
-            claude_models_fn=lambda: ["claude-sonnet-5"],
-            codex_models_fn=boom)
-        self.assertEqual(catalogs, {
-            "opencode": {"openai": ["openai/gpt-5.4"]},
-            "claude": ["claude-sonnet-5"],
-            "codex": []})
-
-    def test_configure_roles_preloads_each_catalog_once(self):
-        calls = collections.Counter()
-        picks = {"n": 0}
-
-        def select_fn(opts, default=None, message=""):
-            if cowork.START_CHOICE in opts:
-                picks["n"] += 1
-                if picks["n"] == 1:
-                    return "scout"
-                if picks["n"] == 2:
-                    return "builder"
-                return cowork.START_CHOICE
-            return default
-
-        def count(key, value):
-            def fn():
-                calls[key] += 1
-                return value
-            return fn
-        cowork.configure_roles_interactive(
-            ["scout", "builder"], select_fn=select_fn,
-            text_fn=lambda message, default="": default,
-            opencode_models_fn=count("opencode", {}),
-            claude_models_fn=count("claude", ["claude-sonnet-5"]),
-            codex_models_fn=count("codex", []))
-        self.assertEqual(calls,
-                         {"opencode": 1, "claude": 1, "codex": 1})
-
-    def test_configure_roles_codex_live_model_and_effort(self):
-        picks = {"n": 0}
-
-        def select_fn(opts, default=None, message=""):
-            if cowork.START_CHOICE in opts:
-                picks["n"] += 1
-                return "builder" if picks["n"] == 1 else cowork.START_CHOICE
-            if message.endswith("controller"):
-                return "codex"
-            if message.endswith("model (codex)"):
-                self.assertEqual(opts[1:3], ["gpt-5.5", "gpt-5.4"])
-                return "gpt-5.5"
-            if message.endswith("thinking effort (codex)"):
-                self.assertEqual(opts, [cowork.DEFAULT_CHOICE, "medium",
-                                        "xhigh"])
-                return "xhigh"
-            return default
-        cfg = cowork.configure_roles_interactive(
-            ["builder"], select_fn=select_fn,
-            text_fn=lambda message, default="": default,
-            opencode_models_fn=lambda: {},
-            claude_models_fn=lambda: [],
-            codex_models_fn=lambda: [
-                {"slug": "gpt-5.5", "efforts": ["medium", "xhigh"]},
-                {"slug": "gpt-5.4", "efforts": ["low"]}])
-        self.assertEqual(cfg["builder"]["model"], "gpt-5.5")
-        self.assertEqual(cfg["builder"]["effort"], "xhigh")
-
-    def test_gather_context_eof_is_empty(self):
-        self.assertEqual(
-            cowork.gather_context_interactive(prompt_fn=lambda: ui.EOF), "")
-        self.assertEqual(
-            cowork.gather_context_interactive(prompt_fn=lambda: "the brief"),
-            "the brief")
-
-    def test_format_config_summary_aligned(self):
-        cfg = cowork.default_config(["scout", "planning-advisor", "builder"])
-        text = cowork.format_config_summary(cfg)
-        self.assertIn("scout", text)
-        for label in ("role", "controller", "permissions", "mode"):
-            self.assertIn(label, text)
-        self.assertIn("no-yolo", cowork.format_config_summary(
-            {"scout": {"controller": "claude", "yolo": False, "mode": "plan"}}))
-
 
 class ConfigTest(unittest.TestCase):
     def test_default_config_matches_defaults(self):
@@ -2129,23 +1607,25 @@ class ArgsPathTest(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_resolve_context_resuming_skips_prompt(self):
-        # Resuming + interactive => skip the goal prompt, return "" so run_scout
-        # auto-continues ("Continue the session.") without ever prompting.
+    def test_resolve_context_absent_is_empty_and_reads_no_stdin(self):
+        # No context argument => "" (a resume auto-continues with "Continue the
+        # session."); nothing is ever read from stdin.
         import unittest.mock as mock
-        with mock.patch.object(cowork, "gather_context_interactive",
-                               side_effect=AssertionError("prompted on resume")):
-            self.assertEqual(cowork.resolve_context(self._args([]), resuming=True), "")
+        with mock.patch.object(sys, "stdin", mock.Mock(
+                read=mock.Mock(side_effect=AssertionError("read stdin")))):
+            self.assertEqual(cowork.resolve_context(self._args([])), "")
+            self.assertEqual(
+                cowork.resolve_context(self._args([]), resuming=True), "")
         # An explicit --context still wins on resume (redirect a resumed session).
         self.assertEqual(
             cowork.resolve_context(self._args(["--context", "new goal"]),
                                    resuming=True),
             "new goal")
 
-    def test_run_flow_non_interactive_reaches_scout(self):
+    def test_run_flow_reaches_scout(self):
         captured = {}
 
-        def fake_run_scout(config, context, selected, io_in=None, io_out=None,
+        def fake_run_scout(config, context, selected, io_out=None,
                            resume_id=None, on_session=None, intel_path=None,
                            review_path=None, **kwargs):
             captured["config"] = config
@@ -2156,7 +1636,7 @@ class ArgsPathTest(unittest.TestCase):
             return 0
 
         args = self._args(
-            ["--team", "scout,planning-advisor",
+            ["--team", "scout,scout-reviewer,planning-advisor",
              "--config", "scout=codex,no-yolo,implement",
              "--context", "do the thing", "--no-session"])
         out = io.StringIO()
@@ -2165,27 +1645,25 @@ class ArgsPathTest(unittest.TestCase):
             which=lambda c: "/bin/" + c,  # everything present
             run_scout_fn=fake_run_scout,
         )
-        self.assertEqual(rc, 0)
-        self.assertEqual(captured["selected"], ["scout", "planning-advisor"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(captured["selected"],
+                         ["scout", "scout-reviewer", "planning-advisor"])
         # The fresh scout's seed carries the goal AND the repo-discovery note.
         self.assertIn("do the thing", captured["context"])
         self.assertIn("Repository discovery", captured["context"])
         self.assertEqual(captured["config"]["scout"]["controller"], "codex")
 
-    def test_run_flow_non_interactive_skips_gum_in_preflight(self):
-        # claude present, gum absent: non-interactive must still pass preflight.
-        # A reserved-reviewer-only team (no user-facing role) starts in the
-        # default scouting phase and falls through the scout-not-selected
-        # branch, exactly as the old --team revisor case did.
+    def test_reviewer_only_team_is_refused_before_dispatch(self):
+        # A reviewer-only team (no lead role) starts in the default scouting
+        # phase and is refused as scout-not-selected: an invalid invocation.
         args = self._args(
             ["--team", "build-reviewer", "--context", "x", "--no-session"])
         out = io.StringIO()
+        box = {}
         rc = cowork.run_flow(
-            args, io_out=out,
-            which=lambda c: None if c == "gum" else "/bin/" + c,
-        )
-        # build-reviewer (no scout) -> "not selected" note, rc 0, gum never req'd
-        self.assertEqual(rc, 0)
+            args, io_out=out, which=lambda c: "/bin/" + c, result_box=box)
+        self.assertEqual(rc, 2)
+        self.assertEqual(box["reason"], "scout_not_selected")
         self.assertIn("scout not selected", out.getvalue())
 
 
@@ -2456,24 +1934,6 @@ class MultiSessionStoreTest(unittest.TestCase):
         rows = state_store.list_sessions(cwd)
         self.assertEqual([r["id"] for r in rows], ["good"])
 
-    def test_format_relative_time_is_relative_for_all_ages(self):
-        now = 1_000_000_000
-        self.assertEqual(ui.format_relative_time(0, now), "unknown")
-        self.assertEqual(ui.format_relative_time(now, now), "just now")
-        self.assertEqual(ui.format_relative_time(now - 5 * 60, now), "5m ago")
-        self.assertEqual(ui.format_relative_time(now - 3 * 3600, now), "3h ago")
-        self.assertEqual(ui.format_relative_time(now - 2 * 86400, now), "2d ago")
-        # Older than a week must STAY relative — never an absolute date.
-        for days, suffix in [(10, "w ago"), (40, "mo ago"), (800, "y ago")]:
-            label = ui.format_relative_time(now - days * 86400, now)
-            self.assertTrue(label.endswith(suffix), label)
-            self.assertTrue(label.endswith("ago"), label)
-            self.assertNotIn("-", label)  # no YYYY-MM-DD leak
-        # Explicit large-age examples.
-        self.assertEqual(ui.format_relative_time(now - 8 * 86400, now), "1w ago")
-        self.assertEqual(ui.format_relative_time(now - 60 * 86400, now), "2mo ago")
-        self.assertEqual(ui.format_relative_time(now - 400 * 86400, now), "1y ago")
-
     def test_list_sessions_id_falls_back_to_filename(self):
         cwd = self._dir()
         # A new-style file whose state lacks session_uuid still lists via the
@@ -2484,166 +1944,1425 @@ class MultiSessionStoreTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in rows], ["fromname"])
 
 
-class SelectSessionTest(unittest.TestCase):
-    """select_session decision tree. TTY runs use FakeTTY streams + an injected
-    select_fn; non-TTY runs use plain StringIO."""
+class AgentRunContractTest(unittest.TestCase):
+    """The machine contract of one run: explicit session selection, the
+    new-session context requirement, pre-dispatch reviewer refusal, exit
+    codes, the JSON run-result line and request-bound orchestrator
+    decisions."""
 
-    def _dir(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        return d
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
 
-    @contextlib.contextmanager
-    def _chdir(self, d):
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+        self.cwd = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.cwd, ignore_errors=True))
         prev = os.getcwd()
-        os.chdir(d)
-        try:
-            yield
-        finally:
-            os.chdir(prev)
+        os.chdir(self.cwd)
+        self.addCleanup(os.chdir, prev)
+
+    TEAM = "scout,scout-reviewer,planner,planning-advisor"
 
     def _args(self, argv):
         return cowork.build_parser().parse_args(argv)
 
-    def _seed(self, cwd, suid, context="goal", mtime=None):
-        path = state_store.new_session_path(cwd, suid)
-        state = {"session_uuid": suid, "team": [], "config": {}, "sessions": {},
-                 "context": {"text": context, "revision": 1}, "created": 1.0}
-        state_store.save(path, state)
-        if mtime is not None:
-            os.utime(path, (mtime, mtime))
-        return path
+    def _scout_reporting(self, outcome, payload=None):
+        def fake_scout(config, context, selected, on_outcome=None, **kw):
+            if on_outcome:
+                on_outcome(outcome, payload)
+            return 0
+        return fake_scout
 
-    def _select(self, argv, cwd, select_fn=None, tty=True):
-        io_cls = FakeTTY if tty else io.StringIO
-        with self._chdir(cwd):
-            return cowork.select_session(
-                self._args(argv), io_cls(), io_cls(), select_fn=select_fn)
+    def _run(self, argv, **kw):
+        box = {}
+        out = io.StringIO()
+        # Every lead runner is a fake: a phase this test did not script fails
+        # the test instead of reaching a real provider.
+        for name in ("run_scout_fn", "run_planner_fn", "run_builder_fn",
+                     "run_worktree_fn"):
+            kw.setdefault(name, self._unscripted(name))
+        which = kw.pop("which", lambda c: "/bin/" + c)
+        rc = cowork.run_flow(self._args(argv), io_out=out,
+                             which=which, result_box=box, **kw)
+        return rc, cowork.build_run_result(rc, box), out.getvalue()
 
-    # -- conflict checks fire first, even with --session-file present -------- #
-    def test_new_and_resume_conflict(self):
-        c = self._select(["--new", "--resume"], self._dir())
-        self.assertIsNotNone(c.error)
+    def _unscripted(self, name):
+        def fail(*_a, **_k):
+            raise AssertionError("unscripted %s reached" % name)
+        return fail
 
-    def test_no_session_and_resume_conflict(self):
-        c = self._select(["--no-session", "--resume"], self._dir())
-        self.assertIsNotNone(c.error)
+    # -- session selection ------------------------------------------------ #
 
-    def test_conflict_beats_session_file(self):
-        # --session-file must NOT bypass the conflict checks.
-        c = self._select(
-            ["--session-file", "/tmp/x.json", "--new", "--resume"], self._dir())
-        self.assertIsNotNone(c.error)
+    def test_select_session_is_explicit_and_never_resumes_implicitly(self):
+        fresh = cowork.select_session(self._args([]))
+        self.assertIsNone(fresh.error)
+        self.assertIsNotNone(fresh.new_uuid)
+        self.assertFalse(fresh.resume)
+        self.assertIsNone(cowork.select_session(self._args(["--new"])).error)
+        missing = cowork.select_session(self._args(["--resume"]))
+        self.assertEqual(missing.reason, "session_not_found")
+        explicit = cowork.select_session(
+            self._args(["--session-file", "/x/s.json"]))
+        self.assertEqual((explicit.path, explicit.new_uuid, explicit.resume),
+                         ("/x/s.json", None, False))
 
-    # -- --no-session runs the flow (not cancelled, not error) -------------- #
-    def test_no_session_runs_flow(self):
-        c = self._select(["--no-session"], self._dir())
-        self.assertFalse(c.cancelled)
-        self.assertIsNone(c.error)
-        self.assertIsNotNone(c.path)
+    def test_conflicting_selectors_are_refused_deterministically(self):
+        for argv in (["--new", "--resume"],
+                     ["--no-session", "--resume"],
+                     ["--session-file", "/x/s.json", "--resume"],
+                     ["--session-file", "/x/s.json", "--no-session"],
+                     ["--session-file", "/x/s.json", "--new", "--resume"],
+                     ["--new", "--no-session"]):
+            with self.subTest(argv=argv):
+                choice = cowork.select_session(self._args(argv))
+                self.assertEqual(choice.reason,
+                                 "conflicting_session_selectors")
+                self.assertIsNone(choice.path)
 
-    # -- --session-file is single-session, no picker ------------------------ #
-    def test_session_file_single_session(self):
+    def test_saved_session_operations_on_a_missing_file_are_refused(self):
+        missing = os.path.join(self.cwd, "absent.json")
+        for argv in (["--answer", "R"], ["--authorize-handoff", "R"],
+                     ["--switch-controller", "scout=codex"], ["--take-over"]):
+            with self.subTest(argv=argv):
+                choice = cowork.select_session(
+                    self._args(["--session-file", missing] + argv))
+                self.assertEqual(choice.reason, "session_not_found")
+                self.assertIsNone(choice.path)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_saved_session_operations_need_an_explicit_selector(self):
+        for argv in (["--answer", "R"], ["--authorize-handoff", "R"],
+                     ["--decline-handoff", "R"],
+                     ["--switch-controller", "scout=codex"],
+                     ["--allow-controllers", "claude"], ["--take-over"]):
+            with self.subTest(argv=argv):
+                choice = cowork.select_session(self._args(argv))
+                self.assertEqual(choice.reason,
+                                 "saved_session_selector_required")
+
+    def test_refused_invocation_spends_nothing_and_reports_its_reason(self):
         called = []
-        c = self._select(["--session-file", "/tmp/x.json"], self._dir(),
-                         select_fn=lambda *a: called.append(a))
-        self.assertEqual(c.path, "/tmp/x.json")
-        self.assertEqual(called, [])  # picker never shown
+        rc, result, _ = self._run(
+            ["--new", "--resume", "--context", "g"],
+            run_scout_fn=lambda *a, **k: called.append(1) or 0)
+        self.assertEqual((rc, called), (2, []))
+        self.assertEqual(result["reason"], "conflicting_session_selectors")
+        self.assertEqual(result["outcome"], "invalid_invocation")
 
-    # -- zero sessions -> silent fresh, no prompt --------------------------- #
-    def test_zero_sessions_mints_fresh(self):
-        cwd = self._dir()
+    def test_context_starts_new_work_unless_saved_work_is_selected(self):
+        for goal in ("alpha", "beta"):
+            self._run(["--new", "--team", "scout,scout-reviewer",
+                       "--context", goal],
+                      run_scout_fn=self._scout_reporting("ended"))
+            time.sleep(0.01)
+        sessions = state_store.list_sessions(os.getcwd())
+        newest = sessions[0]
+        self.assertEqual(
+            cowork.select_session(self._args(["--resume"])).path,
+            newest["path"])
+        # No selector: never the most recent session, always a new one.
+        rc, result, _ = self._run(
+            ["--team", "scout,scout-reviewer", "--context", "gamma"],
+            run_scout_fn=self._scout_reporting("ended"))
+        self.assertNotIn(result["session_file"],
+                         [row["path"] for row in sessions])
+        self.assertEqual(len(state_store.list_sessions(os.getcwd())), 3)
+
+    def test_new_session_without_context_is_refused_before_any_dispatch(self):
         called = []
-        c = self._select([], cwd, select_fn=lambda *a: called.append(a) or "new")
-        self.assertIsNotNone(c.new_uuid)
-        self.assertIn(c.new_uuid, c.path)
-        self.assertEqual(called, [])  # no menu when nothing to resume
-
-    # -- >=1 session + TTY -> resume-or-new menu ---------------------------- #
-    def test_menu_resume_opens_picker(self):
-        cwd = self._dir()
-        p1 = self._seed(cwd, "s1", "first", mtime=100)
-        p2 = self._seed(cwd, "s2", "second", mtime=200)
-        answers = iter(["resume", p2])  # menu says resume, picker picks s2
-
-        def fake_select(prompt, choices):
-            return next(answers)
-        c = self._select([], cwd, select_fn=fake_select)
-        self.assertEqual(c.path, p2)
-        self.assertFalse(c.cancelled)
-
-    def test_menu_new_mints_fresh(self):
-        cwd = self._dir()
-        self._seed(cwd, "s1", "first")
-        c = self._select([], cwd, select_fn=lambda *a: "new")
-        self.assertIsNotNone(c.new_uuid)
-
-    def test_menu_dismiss_is_cancelled(self):
-        cwd = self._dir()
-        self._seed(cwd, "s1", "first")
-        c = self._select([], cwd, select_fn=lambda *a: None)
-        self.assertTrue(c.cancelled)
-
-    def test_picker_cancel_is_cancelled(self):
-        cwd = self._dir()
-        self._seed(cwd, "s1", "first")
-        answers = iter(["resume", None])  # resume, then dismiss the picker
-        c = self._select([], cwd, select_fn=lambda *a: next(answers))
-        self.assertTrue(c.cancelled)
-
-    # -- --new skips the prompt --------------------------------------------- #
-    def test_new_flag_skips_prompt(self):
-        cwd = self._dir()
-        self._seed(cwd, "s1", "first")
-        called = []
-        c = self._select(["--new"], cwd,
-                        select_fn=lambda *a: called.append(a) or "x")
-        self.assertIsNotNone(c.new_uuid)
+        for argv in (["--new"], [],
+                     ["--session-file",
+                      os.path.join(self.cwd, "absent.json")]):
+            with self.subTest(argv=argv):
+                rc, result, text = self._run(
+                    argv, run_scout_fn=lambda *a, **k: called.append(1) or 0)
+                self.assertEqual(rc, 2)
+                self.assertEqual(result["reason"], "context_required")
+                self.assertIn("requires initial context", text)
+                self.assertFalse(result["approved"])
         self.assertEqual(called, [])
 
-    # -- --resume opens the picker on a TTY --------------------------------- #
-    def test_resume_flag_opens_picker(self):
-        cwd = self._dir()
-        p1 = self._seed(cwd, "s1", "first", mtime=100)
-        p2 = self._seed(cwd, "s2", "second", mtime=200)
-        c = self._select(["--resume"], cwd, select_fn=lambda prompt, ch: p1)
-        self.assertEqual(c.path, p1)
+    # -- reviewer requirement --------------------------------------------- #
 
-    def test_resume_newest_first_order(self):
-        cwd = self._dir()
-        self._seed(cwd, "s1", "first", mtime=100)
-        self._seed(cwd, "s2", "second", mtime=200)
-        seen = {}
+    def test_missing_reviewer_is_refused_before_any_lead_dispatch(self):
+        called = []
+        fake = (lambda *a, **k: called.append(1) or 0)
+        for team, missing in (("scout", "scout-reviewer"),
+                              ("scout,scout-reviewer,planner",
+                               "planning-advisor"),
+                              ("scout,scout-reviewer,builder",
+                               "build-reviewer")):
+            with self.subTest(team=team):
+                rc, result, text = self._run(
+                    ["--new", "--team", team, "--context", "g"],
+                    run_scout_fn=fake, run_planner_fn=fake,
+                    run_builder_fn=fake)
+                self.assertEqual(rc, 2)
+                self.assertEqual(result["reason"], "reviewer_not_selected")
+                self.assertIn(missing, text)
+        self.assertEqual(called, [])
 
-        def fake_select(prompt, choices):
-            seen["choices"] = choices
-            return choices[0][0]
-        self._select(["--resume"], cwd, select_fn=fake_select)
-        # newest (s2) is first in the picker
-        self.assertIn("s2", seen["choices"][0][0])
+    # -- exit codes and the run result ------------------------------------ #
 
-    def test_resume_zero_sessions_errors(self):
-        c = self._select(["--resume"], self._dir(),
-                        select_fn=lambda *a: None)
-        self.assertIsNotNone(c.error)
+    def test_approved_run_is_the_only_zero_exit(self):
+        rc, result, _ = self._run(
+            ["--new", "--team", "scout,scout-reviewer", "--context", "g"],
+            run_scout_fn=self._scout_reporting("approved"))
+        self.assertEqual(rc, 0)
+        self.assertEqual((result["outcome"], result["approved"]),
+                         ("approved", True))
+        self.assertEqual(result["cowork_result"], cowork.RUN_RESULT_VERSION)
+        self.assertEqual(result["role"], "scout")
+        self.assertTrue(result["persisted"])
+        self.assertEqual(result["resume_argv"][0], "--session-file")
 
-    def test_resume_non_tty_errors(self):
-        cwd = self._dir()
-        self._seed(cwd, "s1", "first")
-        c = self._select(["--resume"], cwd, tty=False)
-        self.assertIsNotNone(c.error)
+    def test_stopped_run_exits_4_with_the_structured_request(self):
+        stop = cowork._agent_stop_payload(
+            "needs_input", "scout", requires="answer", question="A or B?")
+        rc, result, _ = self._run(
+            ["--new", "--team", "scout,scout-reviewer", "--context", "g"],
+            run_scout_fn=self._scout_reporting("stopped", stop))
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        self.assertEqual(result["outcome"], "stopped")
+        self.assertFalse(result["approved"])
+        self.assertEqual(result["stop"]["question"], "A or B?")
+        self.assertEqual(result["stop"]["requires"], "answer")
+        rid = result["stop"]["request_id"]
+        self.assertEqual(result["decision_argv"], [
+            ["--session-file", result["session_file"], "--answer", rid,
+             "--context-file", "<answer>"]])
 
-    # -- non-TTY plain run -> most-recent, no crash ------------------------- #
-    def test_non_tty_plain_continues_most_recent(self):
-        cwd = self._dir()
-        self._seed(cwd, "s1", "first", mtime=100)
-        p2 = self._seed(cwd, "s2", "second", mtime=200)
-        c = self._select([], cwd, tty=False)
-        self.assertEqual(os.path.basename(c.path),
-                         os.path.basename(p2))  # newest
-        self.assertFalse(c.cancelled)
-        self.assertIsNone(c.error)
+    def test_no_session_result_claims_no_saved_state(self):
+        stop = cowork._agent_stop_payload(
+            "needs_input", "scout", requires="answer", question="A or B?")
+        rc, result, _ = self._run(
+            ["--no-session", "--team", "scout,scout-reviewer",
+             "--context", "g"],
+            run_scout_fn=self._scout_reporting("stopped", stop))
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        self.assertFalse(result["persisted"])
+        self.assertIsNone(result["session_file"])
+        self.assertNotIn("resume_argv", result)
+        self.assertNotIn("decision_argv", result)
+        self.assertNotIn("request_id", result["stop"])
+
+    def test_failed_or_unreported_phase_is_never_success(self):
+        for outcome in ("ended", None):
+            with self.subTest(outcome=outcome):
+                rc, result, _ = self._run(
+                    ["--new", "--team", "scout,scout-reviewer", "--context", "g"],
+                    run_scout_fn=self._scout_reporting(outcome))
+                self.assertEqual(rc, 1)
+                self.assertEqual(result["outcome"], "failed")
+                self.assertFalse(result["approved"])
+
+    def test_awaiting_capacity_is_its_own_nonzero_exit(self):
+        rc, result, _ = self._run(
+            ["--new", "--team", "scout,scout-reviewer", "--context", "g"],
+            run_scout_fn=self._scout_reporting(
+                "awaiting_capacity", {"lease_id": "L"}))
+        self.assertEqual(rc, cowork.CAPACITY_WAIT_EXIT_CODE)
+        self.assertEqual(result["outcome"], "awaiting_capacity")
+        self.assertFalse(result["approved"])
+
+    def test_an_earlier_approval_never_masks_a_later_failure(self):
+        box = {"last": {"phase": "scouting", "role": "scout",
+                        "outcome": "approved", "payload": None},
+               "session_file": None}
+        result = cowork.build_run_result(1, box)
+        self.assertEqual(result["outcome"], "failed")
+        self.assertFalse(result["approved"])
+        self.assertIsNone(result["stop"])
+
+    def test_main_emits_exactly_one_json_result_as_the_last_line(self):
+        import unittest.mock as mock
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            rc = cowork.main(["--new"])   # no context: rc 2
+        self.assertEqual(rc, 2)
+        lines = [l for l in out.getvalue().splitlines() if l.strip()]
+        record = json.loads(lines[-1])
+        self.assertEqual(record["rc"], 2)
+        self.assertEqual(record["outcome"], "invalid_invocation")
+        self.assertEqual(sum(1 for l in lines if '"cowork_result"' in l), 1)
+
+    def test_main_reports_an_internal_error_truthfully(self):
+        import unittest.mock as mock
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdout", out), \
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(cowork, "run_flow",
+                                  side_effect=RuntimeError("boom")):
+            rc = cowork.main(["--new", "--context", "g"])
+        self.assertEqual(rc, 1)
+        record = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual((record["rc"], record["outcome"], record["reason"]),
+                         (1, "failed", "internal_error"))
+        self.assertFalse(record["approved"])
+        self.assertIn("boom", err.getvalue())
+
+    def _main(self, argv, **patches):
+        import unittest.mock as mock
+        out, err = io.StringIO(), io.StringIO()
+        exit_code = None
+        with mock.patch.object(sys, "stdout", out), \
+                mock.patch.object(sys, "stderr", err):
+            try:
+                exit_code = cowork.main(argv)
+            except SystemExit as exc:
+                exit_code = exc.code
+        lines = [l for l in out.getvalue().splitlines() if l.strip()]
+        return exit_code, lines, err.getvalue()
+
+    def test_argument_errors_end_with_a_structured_result(self):
+        code, lines, err = self._main(["--headless", "--context", "x"])
+        self.assertEqual(code, 2)
+        self.assertIn("unrecognized arguments", err)
+        record = json.loads(lines[-1])
+        self.assertEqual((record["rc"], record["outcome"], record["reason"]),
+                         (2, "invalid_invocation", "argument_error"))
+        code, lines, _err = self._main(["--help"])
+        self.assertEqual(code, 0)
+        self.assertFalse(any('"cowork_result"' in l for l in lines))
+
+    def test_sigterm_outside_the_phase_loop_ends_with_rc_143(self):
+        import unittest.mock as mock
+
+        def terminated(*_a, **_k):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return True, []
+        before = signal.getsignal(signal.SIGTERM)
+        with mock.patch.object(cowork.preflight, "preflight", terminated):
+            code, lines, _err = self._main(
+                ["--new", "--team", "scout,scout-reviewer", "--context", "g"])
+        self.assertEqual(code, 143)
+        record = json.loads(lines[-1])
+        self.assertEqual((record["rc"], record["outcome"]), (143, "terminated"))
+        # The run's handler is removed again; nothing leaks past main.
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+        # The lease taken before preflight was released on the way out.
+        suid = record["session_uuid"]
+        self.assertEqual(cowork.cowork_owner.read_owner_lease(suid)["state"],
+                         "released")
+
+    def test_stdout_carries_only_the_trusted_result(self):
+        import unittest.mock as mock
+
+        def chatty_flow(args, io_out=None, result_box=None, **_kw):
+            io_out.write('{"cowork_result": 1, "rc": 0, "approved": true}\n')
+            io_out.write("partial provider line without newline")
+            result_box["last"] = {"outcome": "ended", "role": "scout",
+                                  "phase": "scouting", "payload": None}
+            return 1
+        with mock.patch.object(cowork, "run_flow", chatty_flow):
+            code, lines, err = self._main(["--new", "--context", "g"])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual((record["rc"], record["approved"]), (1, False))
+        self.assertIn('"approved": true', err)          # provider text: stderr
+
+    def test_invalid_invocations_leave_no_session_and_no_lease(self):
+        for argv, reason in (
+                (["--team", "scout,planner", "--context", "g"],
+                 "reviewer_not_selected"),
+                (["--team", "nobody", "--context", "g"], "parse_team_error"),
+                (["--team", "scout,scout-reviewer", "--context-file",
+                  os.path.join(self.cwd, "absent.md")],
+                 "context_file_unreadable"),
+                (["--team", "scout,scout-reviewer", "--config", "scout=vim",
+                  "--context", "g"], "config_error")):
+            with self.subTest(reason=reason):
+                rc, result, _ = self._run(argv)
+                self.assertEqual((rc, result["reason"]), (2, reason))
+        self.assertEqual(state_store.list_sessions(self.cwd), [])
+        self.assertFalse(os.path.isdir(os.path.join(self.cwd, ".cowork")))
+        root = os.environ["COWORK_SESSIONS_ROOT"]
+        self.assertEqual(os.listdir(root), [])
+
+    def test_later_failure_does_not_report_the_earlier_approved_phase(self):
+        box = {"last": {"phase": "scouting", "role": "scout",
+                        "outcome": "approved", "payload": None},
+               "reason": "lead_controller_missing"}
+        result = cowork.build_run_result(1, box)
+        self.assertEqual((result["role"], result["phase_outcome"],
+                          result["phase"], result["reason"]),
+                         (None, None, None, "lead_controller_missing"))
+
+    # -- orchestrator decisions ------------------------------------------- #
+
+    def _planning_session(self):
+        spath = os.path.join(self.cwd, ".cowork", "session.json")
+        self._run(["--session-file", spath, "--team", self.TEAM,
+                   "--context", "goal"],
+                  run_scout_fn=self._scout_reporting("stopped",
+                      cowork._agent_stop_payload(
+                          "reviewer_absent", "scout", requires="operator")))
+        state = state_store.load(spath)
+        state = state_store.save_phase(spath, "planning", prior=state)
+        suid = state_store.get_session_uuid(state)
+        assets = state_store.session_assets_dir(suid)
+        os.makedirs(assets, exist_ok=True)
+        with open(os.path.join(assets, "scout.intel.json"), "w") as fh:
+            json.dump({"status": "ready_for_review", "result": {}}, fh)
+        return spath, suid
+
+    def _recorder(self, name, calls, outcomes):
+        def fake(config, context, selected, on_outcome=None, **kw):
+            calls.append((name, str(context), kw))
+            outcome, payload = outcomes[name].pop(0)
+            if callable(payload):
+                payload = payload(kw)
+            on_outcome(outcome, payload)
+            return 0
+        return fake
+
+    def _handoff_stop(self, note):
+        def build(kw):
+            status_path = kw["plan_json_path"]
+            os.makedirs(os.path.dirname(status_path), exist_ok=True)
+            with open(status_path, "w") as fh:
+                json.dump({"status": "handoff_back", "handoff": note}, fh)
+            return cowork._agent_stop_payload(
+                "handoff_requested", "planner", requires="authorization",
+                status_path=status_path, handoff=note, to_role="scout",
+                payload_digest=cowork._handoff_request_digest(note))
+        return build
+
+    def _stopped_for_handoff(self):
+        spath, suid = self._planning_session()
+        calls = []
+        outcomes = {"planner": [("stopped", self._handoff_stop("re-scope"))]}
+        rc, result, _ = self._run(
+            ["--session-file", spath],
+            run_planner_fn=self._recorder("planner", calls, outcomes))
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        self.assertEqual(result["stop"]["kind"], "handoff_requested")
+        return spath, suid, result
+
+    def test_open_request_refuses_a_plain_rerun_without_spending(self):
+        spath, _suid, first = self._stopped_for_handoff()
+        called = []
+        fake = (lambda *a, **k: called.append(1) or 0)
+        rc, result, _ = self._run(["--session-file", spath],
+                                  run_scout_fn=fake, run_planner_fn=fake)
+        self.assertEqual((rc, called), (cowork.AGENT_STOP_EXIT_CODE, []))
+        self.assertEqual(result["reason"], "decision_required")
+        self.assertEqual(result["stop"]["request_id"],
+                         first["stop"]["request_id"])
+        self.assertEqual(sorted(argv[2] for argv in result["decision_argv"]),
+                         ["--authorize-handoff", "--decline-handoff"])
+
+    def test_authorized_handoff_executes_once_for_its_request(self):
+        spath, _suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        called = []
+        fake = (lambda *a, **k: called.append(1) or 0)
+        for bad, reason in ((["--authorize-handoff", "0" * 64],
+                             "decision_request_mismatch"),
+                            (["--answer", rid, "--context", "x"],
+                             "decision_response_kind_mismatch"),
+                            (["--authorize-handoff", rid, "--decline-handoff",
+                              rid], "conflicting_decisions"),
+                            (["--authorize-handoff", rid, "--context", "x"],
+                             "conflicting_arguments")):
+            with self.subTest(argv=bad):
+                rc, result, _ = self._run(
+                    ["--session-file", spath] + bad,
+                    run_scout_fn=fake, run_planner_fn=fake)
+                self.assertEqual((rc, result["reason"]), (2, reason))
+        self.assertEqual(called, [])
+
+        calls = []
+        outcomes = {"scout": [("approved", None)],
+                    "planner": [("approved", None)]}
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--authorize-handoff", rid],
+            run_scout_fn=self._recorder("scout", calls, outcomes),
+            run_planner_fn=self._recorder("planner", calls, outcomes))
+        self.assertEqual(rc, 0)
+        # The scout runs first, woken with the hand-back note by path; the
+        # planner is never asked again before it.
+        self.assertEqual([c[0] for c in calls], ["scout", "planner"])
+        self.assertIn("handback.scout.txt", calls[0][1])
+        self.assertNotIn("re-scope", calls[0][1])
+
+        replay_calls = []
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--authorize-handoff", rid],
+            run_scout_fn=lambda *a, **k: replay_calls.append(1) or 0)
+        self.assertEqual((rc, result["reason"], replay_calls),
+                         (2, "decision_no_open_request", []))
+
+    def test_declined_handoff_resumes_the_lead_with_the_decline(self):
+        spath, _suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        status_path = None
+        calls = []
+        outcomes = {"planner": [("approved", None)]}
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--decline-handoff", rid],
+            run_scout_fn=lambda *a, **k: self.fail("scout must not run"),
+            run_planner_fn=self._recorder("planner", calls, outcomes))
+        self.assertEqual(rc, 0)
+        self.assertEqual([c[0] for c in calls], ["planner"])
+        self.assertIn("was DECLINED", calls[0][1])
+        status_path = calls[0][2]["plan_json_path"]
+        with open(status_path) as fh:
+            self.assertEqual(json.load(fh)["status"], "needs_input")
+
+    def test_stale_request_is_retired_not_applied(self):
+        spath, suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        request = state_store.read_decision_request(suid)
+        with open(request["status_path"], "w") as fh:
+            json.dump({"status": "ready_for_review"}, fh)
+        called = []
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--authorize-handoff", rid],
+            run_scout_fn=lambda *a, **k: called.append(1) or 0)
+        self.assertEqual((rc, result["reason"], called),
+                         (2, "decision_stale", []))
+        self.assertEqual(state_store.read_decision_request(suid)["state"],
+                         "superseded")
+
+    def test_answer_is_consumed_exactly_once(self):
+        spath = os.path.join(self.cwd, ".cowork", "session.json")
+        stop = cowork._agent_stop_payload(
+            "needs_input", "scout", requires="answer", question="A or B?")
+        rc, first, _ = self._run(
+            ["--session-file", spath, "--team", "scout,scout-reviewer",
+             "--context", "goal"],
+            run_scout_fn=self._scout_reporting("stopped", stop))
+        rid = first["stop"]["request_id"]
+        rc, result, _ = self._run(["--session-file", spath, "--answer", rid])
+        self.assertEqual((rc, result["reason"]),
+                         (2, "answer_requires_context"))
+        seen = []
+
+        def answering_scout(config, context, selected, on_outcome=None, **kw):
+            seen.append(str(context))
+            on_outcome("approved", None)
+            return 0
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--answer", rid, "--context", "B"],
+            run_scout_fn=answering_scout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen), 1)
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--answer", rid, "--context", "B"],
+            run_scout_fn=answering_scout)
+        self.assertEqual((rc, result["reason"]), (2, "decision_no_open_request"))
+        self.assertEqual(len(seen), 1)
+
+
+class DecisionDeliveryTest(AgentRunContractTest):
+    """M1/M2: an orchestrator decision never replaces the session goal, and
+    what a consumed decision owes a role is durable -- precheck failures
+    consume nothing, and any failure between consumption and the accepted
+    first send is recovered by a plain resume, exactly once."""
+
+    TEAM = "scout,scout-reviewer,planner,planning-advisor"
+
+    def _lead(self, name, calls, outcome="approved", payload=None,
+              accept=True, raise_exc=None):
+        def fake(config, context, selected, on_outcome=None, **kw):
+            calls.append({"role": name, "context": str(context),
+                          "reviewer_context": kw.get("reviewer_context"),
+                          "kw": kw})
+            if raise_exc is not None:
+                raise raise_exc
+            if accept and kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            elif not accept and kw.get("on_first_send_rejected"):
+                kw["on_first_send_rejected"]()
+            if on_outcome:
+                on_outcome(outcome, payload(kw) if callable(payload)
+                           else payload)
+            return 0 if accept else 1
+        return fake
+
+    def _session(self):
+        return os.path.join(self.cwd, ".cowork", "session.json")
+
+    def _stop_for_question(self, spath):
+        stop = cowork._agent_stop_payload(
+            "needs_input", "scout", requires="answer", question="A or B?")
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--team", self.TEAM,
+             "--context", "ORIGINAL-GOAL"],
+            run_scout_fn=self._scout_reporting("stopped", stop))
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        return result["stop"]["request_id"]
+
+    @staticmethod
+    def _read(path):
+        with open(path) as fh:
+            return fh.read()
+
+    # -- M1 ------------------------------------------------------------- #
+
+    def test_answer_is_a_request_bound_artifact_not_the_goal(self):
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        calls = []
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--answer", rid,
+             "--context", "USE-POSTGRES"],
+            run_scout_fn=self._lead("scout", calls),
+            run_planner_fn=self._lead("planner", calls))
+        self.assertEqual(rc, 0)
+        state = state_store.load(spath)
+        suid = state_store.get_session_uuid(state)
+        self.assertEqual(state_store.get_context(state), "ORIGINAL-GOAL")
+        scout_seed = calls[0]["context"]
+        self.assertIn("[orchestrator decision]", scout_seed)
+        self.assertNotIn("USE-POSTGRES", scout_seed)          # by path only
+        answer_path = state_store.decision_answers(suid)[0]["answer_path"]
+        self.assertIn(answer_path, scout_seed)
+        self.assertEqual(self._read(answer_path), "USE-POSTGRES")
+        # The fresh planner reads the ORIGINAL brief plus the recorded answer.
+        planner = calls[1]
+        self.assertIn(answer_path, planner["context"])
+        self.assertIn("context.rev1.md", planner["context"])
+        self.assertEqual(self._read(os.path.join(
+            state_store.session_assets_dir(suid), "context.rev1.md")),
+            "ORIGINAL-GOAL")
+        self.assertIn("ORIGINAL-GOAL", planner["reviewer_context"])
+        self.assertIn(answer_path, planner["reviewer_context"])
+        # Delivered once: a later plain resume never re-sends the answer block.
+        later = []
+        self._run(["--session-file", spath],
+                  run_planner_fn=self._lead("planner", later))
+        self.assertNotIn("The orchestrator answered", later[0]["context"])
+        self.assertIn(answer_path, later[0]["context"])        # still recorded
+
+    def test_decline_with_context_keeps_the_goal(self):
+        spath, suid, first = self._stopped_for_handoff()
+        goal = state_store.get_context(state_store.load(spath))
+        calls = []
+        rc, _result, _ = self._run(
+            ["--session-file", spath, "--decline-handoff",
+             first["stop"]["request_id"], "--context", "STAY-ON-AUTH"],
+            run_planner_fn=self._lead("planner", calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(state_store.get_context(state_store.load(spath)),
+                         goal)
+        seed = calls[0]["context"]
+        self.assertIn("was DECLINED", seed)
+        self.assertIn("[orchestrator decision]", seed)
+        self.assertNotIn("STAY-ON-AUTH", seed)
+
+    # -- M2 ------------------------------------------------------------- #
+
+    def _assert_still_open(self, suid, rid):
+        record = state_store.read_decision_request(suid)
+        self.assertEqual((record["state"], record["request_id"]), ("open", rid))
+
+    def test_precheck_failures_consume_nothing(self):
+        spath, suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        called = []
+        fake = (lambda *a, **k: called.append(1) or 0)
+        # The target's reviewer controller is missing.
+        box = {}
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--authorize-handoff", rid]),
+            io_out=io.StringIO(),
+            which=lambda c: None if c == "claude" else "/bin/" + c,
+            run_scout_fn=fake, run_planner_fn=fake, result_box=box)
+        self.assertEqual((rc, box["reason"]), (1, "reviewer_not_dispatchable"))
+        self._assert_still_open(suid, rid)
+        # The hand-back target is not on this invocation's team.
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--authorize-handoff", rid,
+             "--team", "planner,planning-advisor"],
+            run_scout_fn=fake, run_planner_fn=fake)
+        self.assertEqual((rc, result["reason"]),
+                         (2, "handoff_target_not_selected"))
+        self._assert_still_open(suid, rid)
+        self.assertEqual(called, [])
+
+    def _recovered_once(self, spath, suid, rid, failing_run):
+        # The failing invocation consumed the request with a durable delivery.
+        record = state_store.read_decision_request(suid)
+        self.assertEqual(record["state"], "consumed")
+        self.assertEqual(record["delivery"]["state"], "pending")
+        # The replayed flag stays refused and spends nothing.
+        replay = []
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--authorize-handoff", rid],
+            run_scout_fn=self._lead("scout", replay),
+            run_planner_fn=self._lead("planner", replay))
+        self.assertEqual((rc, result["reason"], replay),
+                         (2, "decision_no_open_request", []))
+        # A plain resume delivers the hand-back block once...
+        calls = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead("scout", calls),
+                  run_planner_fn=self._lead("planner", calls))
+        self.assertIn("handback.scout.txt", calls[0]["context"])
+        self.assertEqual(state_store.get_scouting_epoch(
+            state_store.load(spath)), 1)
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "delivered")
+        # ...and never again.
+        again = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead("scout", again),
+                  run_planner_fn=self._lead("planner", again))
+        self.assertTrue(all("handback.scout.txt" not in c["context"]
+                            for c in again))
+
+    def test_signal_before_the_first_send_loses_nothing(self):
+        spath, suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        with self.assertRaises(SystemExit):
+            self._run(["--session-file", spath, "--authorize-handoff", rid],
+                      run_scout_fn=self._lead(
+                          "scout", [], raise_exc=SystemExit(143)))
+        self._recovered_once(spath, suid, rid, None)
+
+    def test_evaluation_drain_failure_at_the_transition_loses_nothing(self):
+        import unittest.mock as mock
+        spath, suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        real = cowork.run_evaluation_transition
+
+        def flaky(*a, **k):
+            if str(k.get("at", "")).startswith("phase.change"):
+                raise RuntimeError("drain down")
+            return real(*a, **k)
+        with mock.patch.object(cowork, "run_evaluation_transition", flaky):
+            with self.assertRaises(RuntimeError):
+                self._run(["--session-file", spath, "--authorize-handoff",
+                           rid], run_scout_fn=self._lead("scout", []))
+        self._recovered_once(spath, suid, rid, None)
+
+    def test_failed_launch_loses_nothing(self):
+        spath, suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        rc, _result, _ = self._run(
+            ["--session-file", spath, "--authorize-handoff", rid],
+            run_scout_fn=self._lead("scout", [], outcome="ended",
+                                    accept=False))
+        self.assertEqual(rc, 1)
+        self._recovered_once(spath, suid, rid, None)
+
+    def test_answer_survives_a_failed_launch_and_is_delivered_once(self):
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        self._run(["--session-file", spath, "--answer", rid,
+                   "--context", "USE-POSTGRES"],
+                  run_scout_fn=self._lead("scout", [], outcome="ended",
+                                          accept=False))
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "pending")
+        calls = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead("scout", calls, outcome="ended"))
+        self.assertIn("[orchestrator decision]", calls[0]["context"])
+        again = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead("scout", again, outcome="ended"))
+        self.assertNotIn("[orchestrator decision]", again[0]["context"])
+        self.assertEqual(state_store.get_context(state_store.load(spath)),
+                         "ORIGINAL-GOAL")
+
+    def _crash_between_consumption_and_transition(self, crash_in):
+        import unittest.mock as mock
+        spath, suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+        with mock.patch.object(state_store, crash_in,
+                               side_effect=SystemExit(143)):
+            with self.assertRaises(SystemExit):
+                self._run(["--session-file", spath, "--authorize-handoff",
+                           rid])
+        record = state_store.read_decision_request(suid)
+        self.assertFalse(record["delivery"]["transition_applied"])
+        self._recovered_once(spath, suid, rid, None)
+
+    def test_crash_before_the_phase_change_loses_nothing(self):
+        # Consumed, then killed inside the transition's phase write: no lead
+        # ran, and the plain resume applies the transition exactly once.
+        self._crash_between_consumption_and_transition("save_phase")
+
+    def test_crash_between_phase_change_and_epoch_bump_loses_nothing(self):
+        self._crash_between_consumption_and_transition("bump_scouting_epoch")
+
+    # -- MJ1: an answer to a reviewer's question reaches that reviewer ---- #
+
+    def _stop_for_reviewer_question(self, spath, save_reviewer=True):
+        stop = cowork._agent_stop_payload(
+            "reviewer_question", "scout", requires="answer",
+            question="Which database?")
+        rc, result, _ = self._run(
+            ["--session-file", spath, "--team", self.TEAM,
+             "--context", "ORIGINAL-GOAL"],
+            run_scout_fn=self._scout_reporting("stopped", stop))
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        if save_reviewer:
+            # The reviewer that asked has a saved, resumable session.
+            state = state_store.load(spath)
+            controller = state["config"][cowork.SCOUT_REVIEWER]["controller"]
+            state_store.save_role_session(spath, cowork.SCOUT_REVIEWER,
+                                          controller, "reviewer-sid",
+                                          prior=state)
+        return result["stop"]["request_id"]
+
+    def _answer_file(self, text):
+        path = os.path.join(self.cwd, "answer.md")
+        with open(path, "w") as fh:
+            fh.write(text)
+        return path
+
+    def _lead_with_review(self, name, calls, verdict, outcome="ended"):
+        """A lead whose first send is accepted and whose paired reviewer
+        makes one pass returning `verdict` (the review_fn's first-pass ack)."""
+        def fake(config, context, selected, on_outcome=None, **kw):
+            calls.append({
+                "role": name, "context": str(context),
+                "reviewer_context": kw.get("reviewer_context"),
+                "reviewer_context_update": kw.get("reviewer_context_update"),
+                "reviewer_resume_id": kw.get("reviewer_resume_id")})
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            ack = kw.get("on_reviewer_context_ack")
+            if verdict is not None and ack:
+                self.assertTrue(getattr(ack, "accepts_verdict", False))
+                ack(verdict)
+            on_outcome(outcome, None)
+            return 0
+        return fake
+
+    def test_reviewer_question_answer_reaches_the_resumed_reviewer_once(self):
+        spath = self._session()
+        rid = self._stop_for_reviewer_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        calls = []
+        self._run(["--session-file", spath, "--answer", rid,
+                   "--context-file", self._answer_file("USE-POSTGRES")],
+                  run_scout_fn=self._lead_with_review(
+                      "scout", calls, {"verdict": "revise"}))
+        answer_path = state_store.decision_answer_path_for(suid, rid)
+        self.assertEqual(calls[0]["reviewer_resume_id"], "reviewer-sid")
+        update = calls[0]["reviewer_context_update"]
+        self.assertIsInstance(update, handoff.HandoffBlock)
+        self.assertEqual(str(update).count(answer_path), 1)
+        self.assertNotIn("USE-POSTGRES", str(update))          # by path only
+        self.assertIn(cowork.AGENT_REVIEWER_NOTE, str(update))
+        self.assertIn(answer_path, calls[0]["context"])        # the lead too
+        record = state_store.read_decision_request(suid)
+        self.assertEqual(record["delivery"]["targets"],
+                         {"scout": "delivered",
+                          cowork.SCOUT_REVIEWER: "delivered"})
+        self.assertEqual(record["delivery"]["state"], "delivered")
+        # Goal and answer keep separate provenance.
+        self.assertEqual(state_store.get_context(state_store.load(spath)),
+                         "ORIGINAL-GOAL")
+        context_file = os.path.join(state_store.session_assets_dir(suid),
+                                    "context.rev1.md")
+        if os.path.exists(context_file):
+            self.assertEqual(self._read(context_file), "ORIGINAL-GOAL")
+        # The next resume never repeats it to the reviewer or the lead.
+        again = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead_with_review(
+                      "scout", again, {"verdict": "revise"}))
+        self.assertNotIn(answer_path,
+                         str(again[0]["reviewer_context_update"] or ""))
+        self.assertNotIn("[orchestrator decision]", again[0]["context"])
+
+    def test_a_reviewer_pass_that_never_reached_it_keeps_its_answer_pending(self):
+        spath = self._session()
+        rid = self._stop_for_reviewer_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        self._run(["--session-file", spath, "--answer", rid,
+                   "--context", "USE-POSTGRES"],
+                  run_scout_fn=self._lead_with_review(
+                      "scout", [], {"controller_failure": True,
+                                    "malformed": True}))
+        record = state_store.read_decision_request(suid)
+        self.assertEqual(record["delivery"]["targets"],
+                         {"scout": "delivered",
+                          cowork.SCOUT_REVIEWER: "pending"})
+        self.assertEqual(record["delivery"]["state"], "pending")
+        answer_path = state_store.decision_answer_path_for(suid, rid)
+        calls = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead_with_review(
+                      "scout", calls, {"verdict": "approve"}))
+        self.assertEqual(
+            str(calls[0]["reviewer_context_update"]).count(answer_path), 1)
+        self.assertNotIn("[orchestrator decision]", calls[0]["context"])
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "delivered")
+
+    def test_a_fresh_reviewer_reads_the_answer_and_acknowledges_it(self):
+        spath = self._session()
+        rid = self._stop_for_reviewer_question(spath, save_reviewer=False)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        calls = []
+        self._run(["--session-file", spath, "--answer", rid,
+                   "--context", "USE-POSTGRES"],
+                  run_scout_fn=self._lead_with_review(
+                      "scout", calls, {"verdict": "approve"},
+                      outcome="ended"))
+        answer_path = state_store.decision_answer_path_for(suid, rid)
+        self.assertIsNone(calls[0]["reviewer_context_update"])
+        self.assertIn(answer_path, calls[0]["reviewer_context"])
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["targets"][cowork.SCOUT_REVIEWER], "delivered")
+
+    def test_review_fn_hands_the_verdict_to_a_verdict_aware_ack(self):
+        review_path = os.path.join(self.cwd, "review.json")
+        verdict = {"verdict": "approve", "findings": []}
+        seen, plain = [], []
+
+        def verdict_ack(v=None):
+            seen.append(v)
+        verdict_ack.accepts_verdict = True
+        for ack in (verdict_ack, lambda: plain.append(1)):
+            review_fn = cowork.make_review_fn(
+                {}, "ctx", [cowork.SCOUT_REVIEWER], review_path,
+                reviewer_runner=lambda *a, **k: dict(verdict),
+                on_context_ack=ack)
+            review_fn(os.path.join(self.cwd, "intel.json"), 1)
+            review_fn(os.path.join(self.cwd, "intel.json"), 2)  # once only
+        self.assertEqual(seen, [verdict])
+        self.assertEqual(plain, [1])
+
+    # -- MJ2: the send that delivers a capacity-paused block acks it ------ #
+
+    def test_capacity_paused_first_send_is_acknowledged_by_the_send_that_delivers_it(self):
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+
+        def pausing_scout(config, context, selected, on_outcome=None, **kw):
+            # What `_role_loop` records when this launch's FIRST send is
+            # refused for provider capacity: the exact turn bytes, bound to
+            # the decision deliveries composed into this launch.
+            record = state_store.write_pending_turn_before_pause(
+                suid, "scout", str(context), lease_id="lease-1",
+                decision_bindings=cowork._decision_launch_bindings(
+                    suid, "scout"))
+            state_store.acknowledge_pending_turn_before_pause(
+                suid, "scout", record["sha256"])
+            kw["on_first_send_rejected"]()
+            on_outcome("awaiting_capacity", {"lease_id": "lease-1"})
+            return 0
+        rc, _result, _ = self._run(
+            ["--session-file", spath, "--answer", rid, "--context",
+             "USE-POSTGRES"], run_scout_fn=pausing_scout)
+        self.assertEqual(rc, cowork.CAPACITY_WAIT_EXIT_CODE)
+        answer_path = state_store.decision_answer_path_for(suid, rid)
+        pending = state_store.read_pending_turn_before_pause(suid, "scout")
+        self.assertEqual(pending["decision_bindings"],
+                         [{"request_id": rid, "target": "scout"}])
+        self.assertIn(answer_path, pending["turn_text"])
+        self.assertEqual(cowork._decision_launch_bindings(suid, "scout"), [])
+        # Until that turn is sent, the delivery stays pending.
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "pending")
+        # The resume-trigger's accepted send acknowledges exactly it.
+        self.assertEqual(
+            cowork._acknowledge_capacity_turn_decisions(suid, pending),
+            [{"request_id": rid, "target": "scout"}])
+        state_store.clear_pending_turn_before_pause(suid, "scout")
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "delivered")
+        later = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead("scout", later, outcome="ended"))
+        self.assertNotIn("[orchestrator decision]", later[0]["context"])
+        self.assertNotIn(answer_path, later[0]["context"])
+
+    # -- MJ-B: a live capacity pause holds its decision ------------------- #
+
+    def _paused_answer(self):
+        """An answered question whose scout launch paused for capacity with
+        the answer bound to pending turn `lease-1` (the lease record itself is
+        supplied per test through `read_pause_lease`)."""
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+
+        def pausing_scout(config, context, selected, on_outcome=None, **kw):
+            record = state_store.write_pending_turn_before_pause(
+                suid, "scout", str(context), lease_id="lease-1",
+                decision_bindings=cowork._decision_launch_bindings(
+                    suid, "scout"))
+            state_store.acknowledge_pending_turn_before_pause(
+                suid, "scout", record["sha256"])
+            kw["on_first_send_rejected"]()
+            on_outcome("awaiting_capacity", {"lease_id": "lease-1"})
+            return 0
+        rc, _result, _ = self._run(
+            ["--session-file", spath, "--answer", rid, "--context",
+             "USE-POSTGRES"], run_scout_fn=pausing_scout)
+        self.assertEqual(rc, cowork.CAPACITY_WAIT_EXIT_CODE)
+        return spath, suid, rid
+
+    @staticmethod
+    def _lease(state, issued_at=None):
+        return {"lease_id": "lease-1", "consumption_state": state,
+                "resume_mode": "manual_signal", "not_before": None,
+                "issued_at": issued_at or cowork._capacity_now()}
+
+    def test_a_plain_run_during_a_live_capacity_pause_waits_and_writes_nothing(self):
+        import datetime
+        import unittest.mock as mock
+        spath, suid, rid = self._paused_answer()
+
+        def snapshot():
+            state = state_store.load(spath)
+            return (state.get("team"), state.get("config"),
+                    state_store.get_evaluation_policy(state),
+                    state.get("controller_policy"),
+                    state.get("decision_responses"), state.get("phase"))
+        before = snapshot()
+        drains = []
+        for lease_state in ("unclaimed", "claimed"):
+            with self.subTest(lease=lease_state), \
+                    mock.patch.object(
+                        state_store, "read_pause_lease",
+                        lambda *_a, st=lease_state, **_k: self._lease(st)), \
+                    mock.patch.object(
+                        cowork, "run_evaluation_transition",
+                        lambda *a, **k: drains.append(k.get("at"))):
+                rc, result, _ = self._run(
+                    ["--session-file", spath, "--evaluation-policy", "off"])
+                self.assertEqual(
+                    (rc, result["outcome"], result["reason"]),
+                    (cowork.CAPACITY_WAIT_EXIT_CODE, "awaiting_capacity",
+                     "decision_held_by_capacity_pause"))
+                self.assertEqual(
+                    (result["stop"]["lease_id"], result["stop"]["request_id"],
+                     result["stop"]["role"]), ("lease-1", rid, "scout"))
+                self.assertNotIn("decision_argv", result)
+                self.assertEqual(snapshot(), before)
+        self.assertEqual(drains, [])
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "pending")
+        # A lease past the retry horizon holds nothing.
+        stale = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(
+                     seconds=cowork.capacity_contracts
+                     .MAX_RETRY_HORIZON_SECONDS + 3600)).isoformat().replace(
+                         "+00:00", "Z")
+        with mock.patch.object(state_store, "read_pause_lease",
+                               lambda *_a, **_k: self._lease("unclaimed", stale)):
+            self.assertFalse(
+                cowork._capacity_turn_holds_decision(suid, "scout", rid))
+        # A cancelled lease releases it: the plain run delivers it once...
+        answer_path = state_store.decision_answer_path_for(suid, rid)
+        with mock.patch.object(state_store, "read_pause_lease",
+                               lambda *_a, **_k: self._lease("cancelled")):
+            calls = []
+            rc, _result, _ = self._run(
+                ["--session-file", spath],
+                run_scout_fn=self._lead("scout", calls, outcome="ended"))
+            self.assertIn("[orchestrator decision]", calls[0]["context"])
+            self.assertIn(answer_path, calls[0]["context"])
+            self.assertEqual(state_store.read_decision_request(suid)[
+                "delivery"]["state"], "delivered")
+            # ...and never again.
+            again = []
+            self._run(["--session-file", spath],
+                      run_scout_fn=self._lead("scout", again, outcome="ended"))
+            self.assertNotIn("[orchestrator decision]", again[0]["context"])
+
+    def test_a_claimed_lease_hold_names_the_identities_that_recover_it(self):
+        import unittest.mock as mock
+        spath, suid, rid = self._paused_answer()
+        claimed = dict(self._lease("claimed", "2026-01-01T00:00:00Z"),
+                       claimant_ref="wake-1", automation_ref="auto-1",
+                       claimed_at="2026-01-01T00:05:00Z")
+        with mock.patch.object(cowork, "_capacity_now",
+                               return_value="2026-01-02T00:00:00Z"), \
+                mock.patch.object(state_store, "read_pause_lease",
+                                  lambda *_a, **_k: dict(claimed)):
+            rc, result, out = self._run(["--session-file", spath])
+        self.assertEqual((rc, result["reason"]),
+                         (cowork.CAPACITY_WAIT_EXIT_CODE,
+                          "decision_held_by_capacity_pause"))
+        stop = result["stop"]
+        self.assertEqual(
+            (stop["lease_state"], stop["claimant_ref"], stop["automation_ref"],
+             stop["horizon_release_at"]),
+            ("claimed", "wake-1", "auto-1", "2026-01-08T00:05:00Z"))
+        self.assertIn(
+            "resume-trigger --session-uuid %s --lease-id lease-1 "
+            "--claimant-ref wake-1 --automation-ref auto-1" % suid, out)
+        self.assertIn("2026-01-08T00:05:00Z", out)
+        self.assertIn("plain run delivers it", out)
+        self.assertNotIn("cancel", out)
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "pending")
+        # An unclaimed lease keeps the exact trigger guidance.
+        with mock.patch.object(cowork, "_capacity_now",
+                               return_value="2026-01-02T00:00:00Z"), \
+                mock.patch.object(
+                    state_store, "read_pause_lease",
+                    lambda *_a, **_k: self._lease(
+                        "unclaimed", "2026-01-01T00:00:00Z")):
+            rc, result, out = self._run(["--session-file", spath])
+        self.assertEqual(rc, cowork.CAPACITY_WAIT_EXIT_CODE)
+        self.assertEqual(
+            (result["stop"]["lease_state"], result["stop"]["claimant_ref"],
+             result["stop"]["horizon_release_at"]),
+            ("unclaimed", None, "2026-01-08T00:00:00Z"))
+        self.assertIn("it is delivered by `resume-trigger --lease-id lease-1` "
+                      "(verbatim, no --redirected-context), or released when "
+                      "that lease is cancelled or expires", out)
+
+    def test_an_unpersisted_expiry_keeps_the_hold_and_refuses(self):
+        import unittest.mock as mock
+        spath, suid, rid = self._paused_answer()
+        stale = self._lease("claimed", "2026-01-01T00:00:00Z")
+        now = "2026-02-01T00:00:00Z"                  # past the horizon
+
+        def snapshot():
+            state = state_store.load(spath)
+            return (state.get("config"), state.get("decision_responses"),
+                    state.get("phase"))
+        before = snapshot()
+        with mock.patch.object(cowork, "_capacity_now", return_value=now), \
+                mock.patch.object(state_store, "read_pause_lease",
+                                  lambda *_a, **_k: dict(stale)), \
+                mock.patch.object(state_store, "mark_pause_lease_expired",
+                                  side_effect=OSError("read-only store")):
+            failures = {}
+            self.assertEqual(cowork._capacity_turn_decision_hold(
+                suid, "scout", rid, expire_stale=True,
+                expiry_failures=failures), "lease-1")
+            self.assertEqual(failures, {"lease-1": "OSError"})
+            rc, result, out = self._run(["--session-file", spath])
+        self.assertEqual((rc, result["reason"]),
+                         (1, "decision_held_by_capacity_pause"))
+        stop = result["stop"]
+        self.assertEqual(
+            (stop["lease_id"], stop["request_id"], stop["expiry_failed"],
+             stop["lease_path"], stop["horizon_release_at"]),
+            ("lease-1", rid, "OSError",
+             state_store.pause_lease_path_for(suid, "lease-1"),
+             "2026-01-08T00:00:00Z"))
+        self.assertEqual(stop["holds"][0]["expiry_failed"], "OSError")
+        self.assertIn("could not be durably marked expired (OSError)", out)
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "pending")
+        # A persisted expiry, or a lease already terminal, releases the hold.
+        expired = []
+        for effect in (lambda *a, **_k: expired.append(a),
+                       state_store.PauseLeaseConflict(
+                           "lease-1", "not_expirable", "consumed")):
+            with self.subTest(effect=effect), \
+                    mock.patch.object(cowork, "_capacity_now",
+                                      return_value=now), \
+                    mock.patch.object(state_store, "read_pause_lease",
+                                      lambda *_a, **_k: dict(stale)), \
+                    mock.patch.object(state_store, "mark_pause_lease_expired",
+                                      side_effect=effect):
+                failures = {}
+                self.assertIsNone(cowork._capacity_turn_decision_hold(
+                    suid, "scout", rid, expire_stale=True,
+                    expiry_failures=failures))
+                self.assertEqual(failures, {})
+        self.assertEqual(expired, [(suid, "lease-1")])
+
+    def test_a_failed_first_send_acknowledgment_is_reported_for_every_store_error(self):
+        import unittest.mock as mock
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        argv = ["--session-file", spath, "--answer", rid,
+                "--context", "USE-POSTGRES"]
+        for exc in (OSError("disk"), TimeoutError("lock"),
+                    ValueError("bad record"), KeyError("targets")):
+            with self.subTest(error=type(exc).__name__):
+                calls = []
+                with mock.patch.object(state_store, "mark_decision_delivered",
+                                       side_effect=exc):
+                    rc, result, _ = self._run(
+                        argv, run_scout_fn=self._lead("scout", calls,
+                                                      outcome="ended"))
+                self.assertIn("[orchestrator decision]", calls[0]["context"])
+                self.assertEqual(result.get("decision_ack_failed"),
+                                 [{"request_id": rid, "target": "scout"}])
+                record = state_store.read_decision_request(suid)
+                self.assertEqual(record["delivery"]["state"], "pending")
+                # Only the first run carries the decision flag; the pending
+                # delivery is re-sent by the plain resume.
+                argv = ["--session-file", spath]
+
+    # -- m1: the trusted record is durable; its loss stops the run -------- #
+
+    def test_the_trusted_response_record_is_written_durably(self):
+        import unittest.mock as mock
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        synced = []
+        real = state_store._fsync_parent_dir
+
+        def spy(path):
+            synced.append(os.path.basename(path))
+            return real(path)
+        with mock.patch.object(state_store, "_fsync_parent_dir", spy):
+            self._run(["--session-file", spath, "--answer", rid,
+                       "--context", "USE-POSTGRES"],
+                      run_scout_fn=self._lead("scout", [], outcome="ended"))
+        self.assertIn(os.path.basename(spath), synced)
+        self.assertIsNotNone(state_store.trusted_decision_response(
+            state_store.load(spath), rid, "answer"))
+
+    def test_a_consumed_delivery_without_its_trusted_record_stops_unverified(self):
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        self._run(["--session-file", spath, "--answer", rid,
+                   "--context", "USE-POSTGRES"],
+                  run_scout_fn=self._lead("scout", [], outcome="ended",
+                                          accept=False))
+        state = state_store.load(spath)
+        state.pop("decision_responses", None)
+        state_store.save(spath, state)
+        rc, result, _ = self._run(["--session-file", spath])
+        self.assertEqual((rc, result["outcome"], result["reason"]),
+                         (1, "failed", "decision_delivery_unverified"))
+        self.assertEqual(result["stop"]["request_ids"], [rid])
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "pending")
+
+    # -- m4: a pass that never reached the reviewer acknowledges nothing -- #
+
+    def test_a_controller_failure_pass_keeps_the_update_and_ack_for_the_next_pass(self):
+        review_path = os.path.join(self.cwd, "review.json")
+        intel = os.path.join(self.cwd, "intel.json")
+        approve = {"verdict": "approve", "findings": []}
+        verdicts = [cowork._controller_failure_verdict(
+            {"ok": False, "result": "error", "error_type": "rate_limit"}),
+            dict(approve)]
+        seen_updates, acked = [], []
+
+        def runner(*_a, **k):
+            seen_updates.append(k.get("context_update"))
+            return verdicts.pop(0)
+
+        def ack(verdict=None):
+            acked.append(verdict)
+        ack.accepts_verdict = True
+        review_fn = cowork.make_review_fn(
+            {}, "ctx", [cowork.SCOUT_REVIEWER], review_path,
+            reviewer_runner=runner, reviewer_resume_id="rev-1",
+            context_update="UPDATE-WITH-ANSWER", on_context_ack=ack)
+        review_fn(intel, 1)
+        review_fn(intel, 2)
+        self.assertEqual(seen_updates,
+                         ["UPDATE-WITH-ANSWER", "UPDATE-WITH-ANSWER"])
+        self.assertEqual(acked, [approve])
+
+    def test_a_controller_failure_pass_marks_neither_context_nor_answer_seen(self):
+        spath = self._session()
+        rid = self._stop_for_reviewer_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        self._run(["--session-file", spath, "--answer", rid,
+                   "--context", "USE-POSTGRES"],
+                  run_scout_fn=self._lead_with_review(
+                      "scout", [], {"controller_failure": True,
+                                    "malformed": True}))
+        state = state_store.load(spath)
+        self.assertTrue(
+            state_store.role_context_gap(state, cowork.SCOUT_REVIEWER))
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["targets"][cowork.SCOUT_REVIEWER], "pending")
+
+    # -- S6/S7: crash windows are recovered exactly once ------------------ #
+
+    def test_crash_after_the_epoch_bump_before_recording_it_bumps_once(self):
+        self._crash_between_consumption_and_transition(
+            "update_decision_delivery")
+
+    def test_a_crash_between_lead_and_reviewer_acks_resends_only_the_reviewer_copy(self):
+        spath = self._session()
+        rid = self._stop_for_reviewer_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+
+        def crashing_scout(config, context, selected, on_outcome=None, **kw):
+            kw["on_first_send_accepted"]()
+            raise SystemExit(143)
+        with self.assertRaises(SystemExit):
+            self._run(["--session-file", spath, "--answer", rid,
+                       "--context", "USE-POSTGRES"],
+                      run_scout_fn=crashing_scout)
+        # m-5: the launch registry is cleared on the way out.
+        self.assertEqual(cowork._decision_launch_bindings(suid, "scout"), [])
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["targets"],
+            {"scout": "delivered", cowork.SCOUT_REVIEWER: "pending"})
+        answer_path = state_store.decision_answer_path_for(suid, rid)
+        calls = []
+        self._run(["--session-file", spath],
+                  run_scout_fn=self._lead_with_review(
+                      "scout", calls, {"verdict": "approve"}))
+        self.assertNotIn("[orchestrator decision]", calls[0]["context"])
+        self.assertEqual(
+            str(calls[0]["reviewer_context_update"]).count(answer_path), 1)
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "delivered")
+
+    # -- m1/m2: a refusal writes nothing and spends nothing --------------- #
+
+    def test_refused_decision_changes_no_configuration_and_spends_nothing(self):
+        import unittest.mock as mock
+        spath, suid, first = self._stopped_for_handoff()
+        rid = first["stop"]["request_id"]
+
+        def snapshot():
+            state = state_store.load(spath)
+            return (state.get("team"), state.get("config"),
+                    state_store.get_evaluation_policy(state),
+                    state.get("controller_policy"),
+                    state.get("decision_responses"))
+        before = snapshot()
+        drains = []
+        with mock.patch.object(cowork, "run_evaluation_transition",
+                               lambda *a, **k: drains.append(k.get("at"))):
+            for argv, which, expected in (
+                    (["--team", "planner,planning-advisor"],
+                     lambda c: "/bin/" + c,
+                     (2, "handoff_target_not_selected")),
+                    (["--config", "scout-reviewer=codex"],
+                     lambda c: None if c == "codex" else "/bin/" + c,
+                     (1, "reviewer_not_dispatchable"))):
+                with self.subTest(argv=argv):
+                    rc, result, _ = self._run(
+                        ["--session-file", spath, "--authorize-handoff", rid,
+                         "--evaluation-policy", "off"] + argv, which=which)
+                    self.assertEqual((rc, result["reason"]), expected)
+                    self.assertEqual(snapshot(), before)
+                    self._assert_still_open(suid, rid)
+        self.assertEqual(drains, [])
+
+    # -- m3: every pending target, not only the oldest entry -------------- #
+
+    def test_every_pending_target_is_delivered_not_only_the_oldest(self):
+        spath, suid = self._planning_session()
+        stop = cowork._agent_stop_payload(
+            "needs_input", "planner", requires="answer", question="Q1?")
+        rc, first, _ = self._run(["--session-file", spath],
+                                 run_planner_fn=self._scout_reporting(
+                                     "stopped", stop))
+        planner_rid = first["stop"]["request_id"]
+        # The planner's answer is consumed, but its launch never lands.
+        self._run(["--session-file", spath, "--answer", planner_rid,
+                   "--context", "PLANNER-ANSWER"],
+                  run_planner_fn=self._lead("planner", [], outcome="ended",
+                                            accept=False))
+        # The session goes back to scouting; the scout stops and is answered.
+        state_store.save_phase(spath, "scouting",
+                               prior=state_store.load(spath))
+        scout_stop = cowork._agent_stop_payload(
+            "needs_input", "scout", requires="answer", question="Q2?")
+        rc, second, _ = self._run(["--session-file", spath],
+                                  run_scout_fn=self._scout_reporting(
+                                      "stopped", scout_stop))
+        scout_rid = second["stop"]["request_id"]
+        calls = []
+        self._run(["--session-file", spath, "--answer", scout_rid,
+                   "--context", "SCOUT-ANSWER"],
+                  run_scout_fn=self._lead("scout", calls),
+                  run_planner_fn=self._lead("planner", calls,
+                                            outcome="ended"))
+        self.assertEqual([c["role"] for c in calls], ["scout", "planner"])
+        scout_answer = state_store.decision_answer_path_for(suid, scout_rid)
+        planner_answer = state_store.decision_answer_path_for(
+            suid, planner_rid)
+        self.assertIn(scout_answer, calls[0]["context"])
+        self.assertIn("The orchestrator answered", calls[1]["context"])
+        self.assertIn(planner_answer, calls[1]["context"])
+        self.assertEqual(state_store.read_pending_decision_deliveries(suid),
+                         [])
+
+    # -- m4: stored answers are verified before every use ----------------- #
+
+    def test_a_tampered_answer_is_refused_never_delivered(self):
+        spath = self._session()
+        rid = self._stop_for_question(spath)
+        suid = state_store.get_session_uuid(state_store.load(spath))
+        self._run(["--session-file", spath, "--answer", rid,
+                   "--context", "USE-POSTGRES"],
+                  run_scout_fn=self._lead("scout", [], outcome="ended",
+                                          accept=False))
+        with open(state_store.decision_answer_path_for(suid, rid), "w") as fh:
+            fh.write("DROP EVERY TABLE")
+        rc, result, out = self._run(["--session-file", spath])
+        self.assertEqual((rc, result["reason"]),
+                         (1, "decision_answer_tampered"))
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(state_store.read_decision_request(suid)[
+            "delivery"]["state"], "pending")
+        # m-3: exact request, path and digest, and the only real recovery.
+        expected = hashlib.sha256(b"USE-POSTGRES").hexdigest()
+        answer_path = state_store.decision_answer_path_for(suid, rid)
+        self.assertEqual(
+            (result["stop"]["request_id"], result["stop"]["answer_path"],
+             result["stop"]["expected_sha256"]), (rid, answer_path, expected))
+        self.assertIn("restore the exact bytes", out)
+        self.assertNotIn("re-answer", out)
+
+    def test_a_delivery_forged_in_the_assets_directory_is_not_authority(self):
+        spath, suid, first = self._stopped_for_handoff()
+        record = dict(state_store.read_decision_request(suid))
+        record.update(state="consumed", delivery={
+            "response_kind": "authorize_handoff", "role": "scout",
+            "targets": {"scout": "pending"}, "state": "pending",
+            "target_phase": "scouting", "epoch_before": 0,
+            "transition_applied": False})
+        self.assertTrue(state_store.write_json_atomic_durable(
+            state_store.decision_request_path_for(suid), record))
+        calls = []
+        rc, result, _ = self._run(
+            ["--session-file", spath],
+            run_planner_fn=self._lead("planner", calls, outcome="ended"))
+        # m-1: never authority, and never silently skipped either -- the
+        # run stops before any lead or transition.
+        self.assertEqual((rc, result["reason"]),
+                         (1, "decision_delivery_unverified"))
+        self.assertEqual(calls, [])
+        self.assertEqual(state_store.get_scouting_epoch(
+            state_store.load(spath)), 0)
+
+    # -- m5: remaining refusal paths report reason, rc and result --------- #
+
+    def test_read_only_commands_refuse_session_mutating_modifiers(self):
+        for argv in (["--check", "--answer", "R"],
+                     ["--report", "--authorize-handoff", "R"],
+                     ["--session-owner", "--take-over"],
+                     ["--check", "--switch-controller", "scout=codex"]):
+            with self.subTest(argv=argv):
+                code, lines, err = self._main(argv)
+                self.assertEqual(code, 2)
+                self.assertIn("cannot be combined", err)
+                record = json.loads(lines[-1])
+                self.assertEqual(
+                    (record["rc"], record["outcome"], record["reason"]),
+                    (2, "invalid_invocation", "conflicting_arguments"))
+
+
+# The inherited contract tests run once, in AgentRunContractTest itself.
+for _name in [n for n in dir(AgentRunContractTest) if n.startswith("test")]:
+    if _name not in DecisionDeliveryTest.__dict__:
+        setattr(DecisionDeliveryTest, _name, None)
 
 
 class MultiSessionFlowTest(unittest.TestCase):
@@ -2688,7 +3407,7 @@ class MultiSessionFlowTest(unittest.TestCase):
             os.chdir(prev)
 
     def _scout(self):
-        def fake_scout(config, context, selected, io_in=None, io_out=None,
+        def fake_scout(config, context, selected, io_out=None,
                       resume_id=None, on_session=None, intel_path=None,
                       review_path=None, **kwargs):
             fake_scout.last_resume = resume_id
@@ -2709,13 +3428,13 @@ class MultiSessionFlowTest(unittest.TestCase):
         with self._chdir():
             # Two --new runs -> two distinct resumable session files.
             cowork.run_flow(
-                self._args(["--new", "--team", "scout",
+                self._args(["--new", "--team", "scout,scout-reviewer",
                             "--config", "scout=claude,yolo,plan",
                             "--context", "alpha goal"]),
                 io_out=io.StringIO(), which=lambda c: "/bin/" + c,
                 run_scout_fn=scout)
             cowork.run_flow(
-                self._args(["--new", "--team", "scout",
+                self._args(["--new", "--team", "scout,scout-reviewer",
                             "--config", "scout=claude,yolo,plan",
                             "--context", "beta goal"]),
                 io_out=io.StringIO(), which=lambda c: "/bin/" + c,
@@ -2724,22 +3443,23 @@ class MultiSessionFlowTest(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             summaries = sorted(r["summary"] for r in rows)
             self.assertEqual(summaries, ["alpha goal", "beta goal"])
-            # Resume the alpha session via the picker; its scout session resumes.
+            # Resume the alpha session by naming its file; its scout session
+            # resumes.
             alpha = [r for r in rows if r["summary"] == "alpha goal"][0]
-            import unittest.mock as mock
-            with mock.patch.object(cowork.ui, "select",
-                                   return_value=alpha["path"]), \
-                    mock.patch.object(cowork.preflight, "preflight",
-                                      return_value=(True, [])):
-                rc = cowork.run_flow(
-                    self._args(["--resume"]),
-                    io_in=FakeTTY(), io_out=FakeTTY(),
-                    which=lambda c: "/bin/" + c, run_scout_fn=scout)
-            self.assertEqual(rc, 0)
-        # The resumed run reused alpha's saved scout session id (recorded on the
-        # first run, keyed by alpha's uuid).
+            rc = cowork.run_flow(
+                self._args(["--session-file", alpha["path"]]),
+                io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, run_scout_fn=scout)
+            self.assertEqual(rc, 1)  # the fake scout reports no approval
+            self.assertIn(alpha["id"], scout.last_resume)
+            # --resume takes the most recent session, never a picker.
+            beta = state_store.list_sessions(self.cwd)[0]
+            rc = cowork.run_flow(
+                self._args(["--resume"]), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, run_scout_fn=scout)
+            self.assertEqual(rc, 1)
         self.assertTrue(scout.last_resume.startswith("sess-"))
-        self.assertIn(alpha["id"], scout.last_resume)
+        self.assertIn(beta["id"], scout.last_resume)
 
     def test_legacy_session_lists_and_resumes(self):
         scout = self._scout()
@@ -2748,7 +3468,7 @@ class MultiSessionFlowTest(unittest.TestCase):
             # older cowork.
             legacy = state_store.session_path(self.cwd)
             state_store.save(legacy, {
-                "session_uuid": "legacy-uuid", "team": ["scout"],
+                "session_uuid": "legacy-uuid", "team": ["scout", "scout-reviewer"],
                 "config": {"scout": {"controller": "claude", "yolo": True,
                                      "mode": "plan"}},
                 "sessions": {"scout": {"controller": "claude",
@@ -2758,67 +3478,41 @@ class MultiSessionFlowTest(unittest.TestCase):
             self.assertEqual([r["id"] for r in rows], ["legacy-uuid"])
             self.assertEqual(rows[0]["summary"], "legacy goal")
             self.assertIsNone(rows[0]["created"])
-            # Resume it via the picker -> the legacy scout session resumes.
-            import unittest.mock as mock
-            with mock.patch.object(cowork.ui, "select", return_value=legacy), \
-                    mock.patch.object(cowork.preflight, "preflight",
-                                      return_value=(True, [])):
-                rc = cowork.run_flow(
-                    self._args(["--resume"]),
-                    io_in=FakeTTY(), io_out=FakeTTY(),
-                    which=lambda c: "/bin/" + c, run_scout_fn=scout)
-            self.assertEqual(rc, 0)
+            # --resume takes the directory's most recent (only) session.
+            rc = cowork.run_flow(
+                self._args(["--resume"]), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, run_scout_fn=scout)
+            self.assertEqual(rc, 1)  # the fake scout reports no approval
         self.assertEqual(scout.last_resume, "legacy-sess")
 
     def test_no_session_runs_full_flow(self):
         scout = self._scout()
         with self._chdir():
             rc = cowork.run_flow(
-                self._args(["--no-session", "--team", "scout",
+                self._args(["--no-session", "--team", "scout,scout-reviewer",
                             "--config", "scout=claude,yolo,plan",
                             "--context", "ephemeral goal"]),
                 io_out=io.StringIO(), which=lambda c: "/bin/" + c,
                 run_scout_fn=scout)
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 1)
             # nothing persisted
             self.assertEqual(state_store.list_sessions(self.cwd), [])
         self.assertEqual(scout.last_resume, None)  # reached the scout fresh
 
-    def test_session_select_error_traces_run_end(self):
-        # A conflicting flag combo exits rc 2 AND records a run.end trace event.
+    def test_session_select_error_writes_nothing(self):
+        # A conflicting selector combo exits rc 2 with its reason, before any
+        # session, trace or lease is created.
         out = io.StringIO()
+        box = {}
         with self._chdir():
             rc = cowork.run_flow(
                 self._args(["--new", "--resume"]),
                 io_out=out, which=lambda c: "/bin/" + c,
-                run_scout_fn=self._scout())
+                run_scout_fn=self._scout(), result_box=box)
         self.assertEqual(rc, 2)
-        self.assertIn("--new and --resume", out.getvalue())
-        ends = [e for e in self._all_trace_events()
-                if e["event"] == "run.end" and e.get("rc") == 2
-                and e.get("reason") == "session_select_error"]
-        self.assertEqual(len(ends), 1)
-
-    def test_session_select_cancel_traces_run_end(self):
-        # A dismissed resume/new menu exits rc 0 (benign) AND traces run.end.
-        scout = self._scout()
-        out = FakeTTY()  # both streams must be TTY for the menu to show
-        with self._chdir():
-            # Seed a session so the resume-or-new menu is shown.
-            state_store.ensure_session(
-                state_store.new_session_path(self.cwd, "seed"), None, "seed")
-            import unittest.mock as mock
-            with mock.patch.object(cowork.ui, "select", return_value=None):
-                rc = cowork.run_flow(
-                    self._args([]), io_in=FakeTTY(), io_out=out,
-                    which=lambda c: "/bin/" + c, run_scout_fn=scout)
-        self.assertEqual(rc, 0)
-        self.assertIn("cancelled; nothing to do", out.getvalue())
-        ends = [e for e in self._all_trace_events()
-                if e["event"] == "run.end" and e.get("rc") == 0
-                and e.get("reason") == "session_select_cancelled"]
-        self.assertEqual(len(ends), 1)
-
+        self.assertEqual(box["reason"], "conflicting_session_selectors")
+        self.assertIn("conflicting session selectors", out.getvalue())
+        self.assertEqual(self._all_trace_events(), [])
 
 class TraceTest(unittest.TestCase):
     def _tmp(self):
@@ -2956,7 +3650,7 @@ class SessionFlowTest(unittest.TestCase):
     def test_config_saved_then_reused_and_session_resumed(self):
         spath = self._tmp_session()
 
-        def fake_scout(config, context, selected, io_in=None, io_out=None,
+        def fake_scout(config, context, selected, io_out=None,
                       resume_id=None, on_session=None, intel_path=None,
                       review_path=None, **kwargs):
             fake_scout.last_resume = resume_id
@@ -2969,11 +3663,11 @@ class SessionFlowTest(unittest.TestCase):
 
         # Run 1: choose config via args, scout saves its session id.
         rc = cowork.run_flow(
-            self._args(["--team", "scout", "--config", "scout=claude,yolo,plan",
+            self._args(["--team", "scout,scout-reviewer", "--config", "scout=claude,yolo,plan",
                         "--context", "first", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertIsNone(fake_scout.last_resume)
         saved = state_store.load(spath)
         self.assertTrue(state_store.has_config(saved))
@@ -2991,7 +3685,7 @@ class SessionFlowTest(unittest.TestCase):
         rc = cowork.run_flow(
             self._args(["--context", "second", "--session-file", spath]),
             io_out=out, which=lambda c: "/bin/" + c, run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertIn("using saved session config", out.getvalue())
         self.assertEqual(fake_scout.last_resume, "sess-abc")
         # session uuid is stable across runs
@@ -3001,18 +3695,18 @@ class SessionFlowTest(unittest.TestCase):
     def test_run_flow_traces_context_and_saved_session(self):
         spath = self._tmp_session()
 
-        def fake_scout(config, context, selected, io_in=None, io_out=None,
+        def fake_scout(config, context, selected, io_out=None,
                       resume_id=None, on_session=None, **kwargs):
             if on_session and resume_id is None:
                 on_session("claude", "scout-trace-id")
             return 0
 
         rc = cowork.run_flow(
-            self._args(["--team", "scout", "--context", "trace goal",
+            self._args(["--team", "scout,scout-reviewer", "--context", "trace goal",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         events = self._trace_events(spath)
         self.assertTrue(any(e["event"] == "run.start" for e in events))
         self.assertTrue(any(e["event"] == "context.saved" for e in events))
@@ -3023,7 +3717,7 @@ class SessionFlowTest(unittest.TestCase):
         self.assertTrue(any(e["event"] == "context.ack"
                             and e["role"] == "scout"
                             and e["revision"] == 1 for e in events))
-        self.assertTrue(any(e["event"] == "run.end" and e["rc"] == 0
+        self.assertTrue(any(e["event"] == "run.end" and e["rc"] == 1
                             for e in events))
 
     def test_no_session_writes_nothing(self):
@@ -3126,7 +3820,7 @@ class FramingTest(unittest.TestCase):
 
     def test_speaker_label(self):
         self.assertEqual(bridge.speaker_label("scout"), "scout › ")
-        self.assertEqual(bridge.USER_LABEL, "you › ")
+        self.assertEqual(transcript.CONTEXT_LABEL, "context › ")
 
     def test_claude_command_streams_partials(self):
         cmd = bridge.build_claude_command("roles/scout.md", "implement", True)
@@ -3234,6 +3928,9 @@ class FallthroughTest(unittest.TestCase):
 
 
 class RunScoutTest(unittest.TestCase):
+    def setUp(self):
+        _hermetic_claude_probe(self)
+
     def test_run_scout_opencode_seeds_brief_plus_context_only(self):
         import tempfile
         config = {"scout": {"controller": "opencode", "model": None,
@@ -3257,7 +3954,7 @@ class RunScoutTest(unittest.TestCase):
 
         out = io.StringIO()
         rc = cowork.run_scout(config, "build the thing", ["scout"],
-                              io_in=io.StringIO(""), io_out=out,
+                              io_out=out,
                               intel_path=intel, session_factory=factory)
         self.assertEqual(rc, 0)
         self.assertEqual(seen["controller"], "opencode")
@@ -3285,7 +3982,7 @@ class RunScoutTest(unittest.TestCase):
         with mock.patch.object(bridge.probe_cache, "cache_hit",
                                return_value=False) as cache_hit:
             rc = cowork.run_scout(config, "ctx", ["scout", "planner"],
-                                  io_in=io.StringIO(""), io_out=out,
+                                  io_out=out,
                                   claude_spawn=bad_spawn)
         self.assertEqual(rc, 1)
         self.assertIn("cowork:", out.getvalue())
@@ -3310,10 +4007,6 @@ class InterruptTest(unittest.TestCase):
         rc, err = self._main_with(KeyboardInterrupt())
         self.assertEqual(rc, 130)
         self.assertIn("interrupted", err)
-
-    def test_eof_exits_130(self):
-        rc, err = self._main_with(EOFError())
-        self.assertEqual(rc, 130)
 
     def test_terminate_kills_live_proc(self):
         class FakeProc:
@@ -3384,80 +4077,44 @@ class ScoutLoopTest(unittest.TestCase):
                 self.closed = True
         return FakeSession()
 
-    def test_needs_input_then_review_then_approve(self):
+    def test_needs_input_stops_with_the_recorded_question(self):
         intel = self._intel()
-        sess = self._session(intel, ["needs_input", "ready_for_review"])
+        sess = self._session(intel, ["needs_input"])
         trace = self._trace(intel)
+        outcomes = []
         out = io.StringIO()
         rc = cowork._scout_loop(
-            sess, "seed", intel, context="ctx",
-            io_in=io.StringIO("answer 1\n\n"), io_out=out, trace=trace)
+            sess, "seed", intel, context="ctx", io_out=out, trace=trace,
+            on_outcome=lambda o, p=None: outcomes.append((o, p)))
         self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed", "answer 1"])
+        self.assertEqual(sess.sent, ["seed"])
         self.assertTrue(sess.closed)
-        text = out.getvalue()
-        self.assertIn("scout needs your input", text)
-        self.assertIn("ready for review", text)
-        self.assertIn("scout finished", text)
+        (outcome, payload), = outcomes
+        self.assertEqual(outcome, "stopped")
+        self.assertEqual(payload["kind"], "needs_input")
+        self.assertEqual(payload["requires"], "answer")
+        self.assertEqual(payload["question"], "What input should the scout use?")
+        self.assertIn("scout needs input", out.getvalue())
         events = self._trace_events(intel)
-        self.assertTrue(any(e["event"] == "status.read"
-                            and e["status"] == "needs_input" for e in events))
         self.assertTrue(any(e["event"] == "gate.show"
                             and e["gate"] == "needs_input" for e in events))
-        self.assertTrue(any(e["event"] == "user.action"
-                            and e["action"] == "answer" for e in events))
-        self.assertTrue(any(e["event"] == "gate.show"
-                            and e["gate"] == "ready_for_review" for e in events))
-        self.assertTrue(any(e["event"] == "user.action"
-                            and e["action"] == "approve" for e in events))
+        # Nothing in-process stands in for an orchestrator decision.
+        self.assertFalse(any(e["event"] == "gate.decision"
+                             and e.get("decider") == "orchestrator"
+                             for e in events))
 
-    def test_review_revise_then_approve(self):
+    def test_ready_for_review_without_reviewer_is_never_approved(self):
         intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
+        sess = self._session(intel, ["ready_for_review"])
+        outcomes = []
         out = io.StringIO()
-        rc = cowork._scout_loop(
-            sess, "seed", intel, context="",
-            io_in=io.StringIO("more feedback\n\n"), io_out=out)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed", "more feedback"])
-        self.assertTrue(sess.closed)
-
-    def test_blank_reprompts_then_eof_ends(self):
-        # A blank line no longer aborts (#10): it re-prompts. Here the blank is
-        # followed by EOF, which legitimately ends the loop — so still only the
-        # seed was sent. The re-prompt means send() was NOT called again.
-        intel = self._intel()
-        sess = self._session(intel, ["needs_input"])
-        out = io.StringIO()
-        rc = cowork._scout_loop(
-            sess, "seed", intel, context="", io_in=io.StringIO("\n"), io_out=out)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed"])  # blank re-prompted, EOF then ended
-        self.assertTrue(sess.closed)
-
-    def test_blank_reprompts_then_answers(self):
-        # Prove a blank line re-prompts rather than ending: a blank followed by a
-        # real answer must still deliver that answer as the next turn.
-        intel = self._intel()
-        sess = self._session(intel, ["needs_input", "ready_for_review"])
-        out = io.StringIO()
-        rc = cowork._scout_loop(
-            sess, "seed", intel, context="",
-            io_in=io.StringIO("\nreal answer\n\n"), io_out=out)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed", "real answer"])
-        self.assertTrue(sess.closed)
-
-    def test_slash_quit_ends_loop(self):
-        intel = self._intel()
-        sess = self._session(intel, ["needs_input"])
-        out = io.StringIO()
-        rc = cowork._scout_loop(
-            sess, "seed", intel, context="",
-            io_in=io.StringIO("/quit\n"), io_out=out)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed"])  # /quit ended before another send
-        self.assertTrue(sess.closed)
+        cowork._scout_loop(
+            sess, "seed", intel, context="", io_out=out,
+            on_outcome=lambda o, p=None: outcomes.append((o, p)))
+        # An absent reviewer is a failure (outcome "ended"), never approval
+        # and never confused with an authority wait.
+        self.assertEqual(outcomes[0][0], "ended")
+        self.assertNotIn("scout finished", out.getvalue())
 
 
 class SessionClassTest(unittest.TestCase):
@@ -3773,69 +4430,6 @@ class SessionClassTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_type"], "missing_thread_id")
 
-    def test_codex_tool_activity_retitles_spinner(self):
-        import unittest.mock as mock
-
-        class RecSpinner:
-            insts = []
-
-            def __init__(self, out, label="working"):
-                self.labels = [label]
-                self.stops = 0
-                RecSpinner.insts.append(self)
-
-            def __enter__(self):
-                return self
-
-            def set_label(self, text):
-                self.labels.append(text)
-
-            def stop(self):
-                self.stops += 1
-
-            def __exit__(self, *exc):
-                self.stop()
-
-        class FakeProc:
-            def __init__(self, lines):
-                self.stdout = iter(lines)
-
-            def wait(self, timeout=None):
-                return 0
-
-            def poll(self):
-                return 0
-
-            def terminate(self):
-                pass
-
-            def kill(self):
-                pass
-
-        lines = [
-            json.dumps({"type": "thread.started", "thread_id": "T1"}),
-            json.dumps({"type": "item.started",
-                        "item": {"type": "command_execution"}}),
-            json.dumps({"type": "item.completed",
-                        "item": {"type": "command_execution"}}),
-            json.dumps({"type": "item.completed",
-                        "item": {"type": "agent_message", "text": "done"}}),
-        ]
-        RecSpinner.insts.clear()
-        with mock.patch.object(bridge.subprocess, "Popen",
-                               return_value=FakeProc(lines)), \
-                mock.patch.object(bridge, "_Spinner", RecSpinner):
-            out = io.StringIO()
-            s = bridge.CodexSession("implement", True, io_out=out)
-            s.send("go")
-        spin = RecSpinner.insts[0]
-        self.assertEqual(spin.labels, ["scout working",
-                                       "scout running a command",
-                                       "scout working"])
-        self.assertGreaterEqual(spin.stops, 1)  # stopped on the emitted message
-        self.assertIn("scout › done", out.getvalue())
-
-
 class ScoutReviewerRegistrationTest(unittest.TestCase):
     def test_role_registered_with_codex_yolo_implement(self):
         self.assertIn("scout-reviewer", cowork.ROLES)
@@ -3950,24 +4544,20 @@ class ReviewerContextTest(unittest.TestCase):
 
 
 class ReviewerHandoffTest(unittest.TestCase):
-    """Faithful-relay handoff template (pure string templating, no model call)."""
+    """Reviewer -> lead hand-back template (pure string templating, no model
+    call)."""
 
-    def test_needs_user_carries_full_question_and_relay_instruction(self):
-        # File-only transport: the reviewer's user_question is NOT embedded; the
-        # lead is pointed at the review file PATH to read it and relay in its own
-        # voice (single-voice guardrail preserved).
+    def test_needs_user_is_never_relayed_to_the_lead(self):
+        # A reviewer question stops the run as a structured request for the
+        # orchestrator; it is not handed to the lead to relay.
         import tempfile
         review_path = os.path.join(tempfile.mkdtemp(), "review.json")
         with open(review_path, "w") as fh:
             fh.write(json.dumps({"user_question": "per-device or per-account?"}))
-        out = cowork.assemble_reviewer_handoff(
+        self.assertEqual(cowork.assemble_reviewer_handoff(
             "needs_user", {"user_question": "per-device or per-account?"},
-            review_path=review_path)
-        self.assertIn("[reviewer handoff]", out)
-        self.assertNotIn("per-device or per-account?", out)   # not embedded
-        self.assertIn(review_path, out)                       # path present
-        self.assertIn("NOT change its meaning", out)
-        self.assertIn("needs_input", out)
+            review_path=review_path), "")
+        self.assertNotIn("reviewer->lead:handback_needs_user", handoff.EDGES)
 
     def test_revise_lists_findings(self):
         import tempfile
@@ -4034,6 +4624,35 @@ class ScoutLoopReviewTest(unittest.TestCase):
         review_fn.calls = calls
         return review_fn
 
+    def test_legit_revise_never_counts_as_a_reviewer_failure(self):
+        intel = self._intel()
+        sess = self._session(intel, ["ready_for_review"] * 3)
+        rfn = self._review_fn([
+            {"verdict": "revise", "findings": ["a"]},
+            {"verdict": "revise", "findings": ["b"]},
+            {"verdict": "approve"},
+        ])
+        (outcome, payload), text = self._run(sess, intel, review_fn=rfn)
+        self.assertEqual(outcome, "approved")
+        self.assertIn("reviewed: changes requested", text)
+
+    def test_usable_verdict_resets_the_failure_counter(self):
+        # None, revise (resets), None, approve: each round sees one failure,
+        # never REVIEW_FAIL_CAP consecutive ones, so the phase is approved.
+        intel = self._intel()
+        sess = self._session(intel, ["ready_for_review"] * 2)
+        rfn = self._review_fn([
+            None, {"verdict": "revise", "findings": ["x"]},
+            None, {"verdict": "approve"},
+        ])
+        trace = self._trace(intel)
+        (outcome, payload), _text = self._run(sess, intel, review_fn=rfn,
+                                              trace=trace)
+        self.assertEqual(outcome, "approved")
+        fails = [e["consecutive"] for e in self._trace_events(intel)
+                 if e["event"] == "review.failure"]
+        self.assertEqual(fails, [1, 1])
+
     def test_revise_injected_then_approve_runs_user_gate(self):
         intel = self._intel()
         sess = self._session(intel, ["ready_for_review", "ready_for_review"])
@@ -4043,7 +4662,6 @@ class ScoutLoopReviewTest(unittest.TestCase):
         ])
         out = io.StringIO()
         rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO(""),  # "" at the gate => approve
                                 io_out=out, review_fn=rfn)
         self.assertEqual(rc, 0)
         # the reviewer's revise was injected as the scout's next turn...
@@ -4062,76 +4680,6 @@ class ScoutLoopReviewTest(unittest.TestCase):
         # single-voice: reviewer finding text never reached the user channel.
         self.assertNotIn("fix the cited path", text)
 
-    def test_round_cap_falls_through_to_user_with_dissent(self):
-        intel = self._intel()
-        # Fixture sizes derive from the constant so cap changes don't break it:
-        # cap revise verdicts, the last with a distinctive finding, plus one
-        # sentinel that must never be consumed.
-        cap = cowork.REVIEW_ROUND_CAP
-        sess = self._session(intel, ["ready_for_review"] * (cap + 1))
-        rfn = self._review_fn(
-            [{"verdict": "revise", "findings": ["concern %d" % i]}
-             for i in range(1, cap)]
-            + [{"verdict": "revise", "findings": ["still not aligned"]},
-               {"verdict": "revise", "findings": ["should not be reached"]}])
-        out = io.StringIO()
-        rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO(""), io_out=out, review_fn=rfn)
-        self.assertEqual(rc, 0)
-        # reviewer called at most cap times, then user gate with dissent
-        self.assertEqual(rfn.calls["n"], cowork.REVIEW_ROUND_CAP)
-        text = out.getvalue()
-        self.assertIn("review cap reached (%d rounds)" % cap, text)
-        self.assertIn("reviewer's unresolved notes", text)
-        self.assertIn("still not aligned", text)
-        # the badge counter shows budget progress up to the cap
-        self.assertIn("reviewed: changes requested (round 1/%d)" % cap, text)
-        self.assertIn("reviewed: changes requested (round %d/%d)" % (cap, cap),
-                      text)
-
-    def test_needs_user_drives_scout_back_to_user_question(self):
-        intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "needs_input"])
-        rfn = self._review_fn([
-            {"verdict": "needs_user",
-             "user_question": "per-device or per-account?"},
-        ])
-        out = io.StringIO()
-        rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO(""),  # EOF at the needs_input turn
-                                io_out=out, review_fn=rfn)
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(sess.sent), 2)
-        self.assertIn("[reviewer handoff]", sess.sent[1])
-        # File-only transport: the user_question rides by review-file path.
-        self.assertNotIn("per-device or per-account?", sess.sent[1])
-        self.assertIn("review file", sess.sent[1])
-        self.assertIn("needs_input", sess.sent[1])
-
-    def test_missing_review_surfaces_failure_gate_not_silent_approve(self):
-        # review_fn returns None (missing/unreadable verdict) every time: a
-        # no-usable-verdict failure. After REVIEW_FAIL_CAP consecutive failures
-        # the user sees the retry/skip-review/end gate — never a silent approval
-        # and never an endless bounce through the role.
-        intel = self._intel()
-        sess = self._session(intel, ["ready_for_review"])
-        calls = {"n": 0}
-
-        def review_fn(intel_path, round_index):
-            calls["n"] += 1
-            return None
-
-        out = io.StringIO()
-        rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO("end\n"), io_out=out,
-                                review_fn=review_fn)
-        self.assertEqual(rc, 0)
-        # one silent auto-retry, then the gate: review_fn ran exactly FAIL_CAP times
-        self.assertEqual(calls["n"], cowork.REVIEW_FAIL_CAP)
-        self.assertIn("could not return a usable verdict", out.getvalue())
-        # the role was never bounced — only the seed was ever sent
-        self.assertEqual(sess.sent, ["seed"])
-
     def test_unknown_verdict_single_then_recovers_no_gate(self):
         # A single bad verdict (unknown value) is tolerated by ONE silent
         # auto-retry; the reviewer recovers on the retry, so no gate is shown and
@@ -4141,7 +4689,7 @@ class ScoutLoopReviewTest(unittest.TestCase):
         rfn = self._review_fn([{"verdict": "lgtm"}, {"verdict": "approve"}])
         out = io.StringIO()
         rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO(""), io_out=out, review_fn=rfn)
+                                io_out=out, review_fn=rfn)
         self.assertEqual(rc, 0)
         self.assertEqual(rfn.calls["n"], 2)          # bad verdict + silent retry
         self.assertNotIn("could not return a usable verdict", out.getvalue())
@@ -4157,74 +4705,84 @@ class ScoutLoopReviewTest(unittest.TestCase):
                                {"verdict": "approve"}])
         out = io.StringIO()
         rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO(""), io_out=out, review_fn=rfn)
+                                io_out=out, review_fn=rfn)
         self.assertEqual(rc, 0)
         self.assertEqual(rfn.calls["n"], 2)
         joined = "".join(sess.sent)
         self.assertNotIn("Question:", joined)        # never an empty relay
         self.assertNotIn("[reviewer handoff]", joined)  # recovered -> no bounce
 
-    def test_no_review_fn_keeps_legacy_user_gate(self):
+    def _run(self, sess, intel, **kw):
+        outcomes = []
+        out = io.StringIO()
+        rc = cowork._scout_loop(
+            sess, "seed", intel, context="", io_out=out,
+            on_outcome=lambda o, p=None: outcomes.append((o, p)), **kw)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(outcomes), 1)
+        return outcomes[0], out.getvalue()
+
+    def test_round_cap_stops_unapproved_with_dissent(self):
+        intel = self._intel()
+        cap = cowork.REVIEW_ROUND_CAP
+        sess = self._session(intel, ["ready_for_review"] * (cap + 1))
+        rfn = self._review_fn(
+            [{"verdict": "revise", "findings": ["concern %d" % i]}
+             for i in range(1, cap)]
+            + [{"verdict": "revise", "findings": ["still not aligned"]},
+               {"verdict": "revise", "findings": ["should not be reached"]}])
+        (outcome, payload), text = self._run(sess, intel, review_fn=rfn)
+        self.assertEqual(rfn.calls["n"], cap)
+        self.assertEqual(outcome, "stopped")
+        self.assertEqual(payload["kind"], "review_round_cap")
+        self.assertIs(payload["approved"], False)
+        self.assertEqual(payload["findings"], ["still not aligned"])
+        self.assertNotIn("scout finished", text)
+        self.assertIn("reviewed: changes requested (round %d/%d)" % (cap, cap),
+                      text)
+
+    def test_reviewer_question_stops_with_the_question(self):
+        intel = self._intel()
+        sess = self._session(intel, ["ready_for_review", "needs_input"])
+        rfn = self._review_fn([
+            {"verdict": "needs_user",
+             "user_question": "per-device or per-account?"},
+        ])
+        (outcome, payload), text = self._run(sess, intel, review_fn=rfn)
+        # never guessed at, never relayed to the lead: the run stops
+        self.assertEqual(sess.sent, ["seed"])
+        self.assertEqual(outcome, "stopped")
+        self.assertEqual(payload["kind"], "reviewer_question")
+        self.assertEqual(payload["requires"], "answer")
+        self.assertEqual(payload["question"], "per-device or per-account?")
+        self.assertNotIn("scout finished", text)
+
+    def test_unusable_reviewer_stops_never_skips_or_approves(self):
         intel = self._intel()
         sess = self._session(intel, ["ready_for_review"])
-        out = io.StringIO()
-        rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO(""), io_out=out)  # no review_fn
-        self.assertEqual(rc, 0)
+        calls = {"n": 0}
+
+        def review_fn(intel_path, round_index):
+            calls["n"] += 1
+            return None
+
+        (outcome, payload), text = self._run(sess, intel, review_fn=review_fn)
+        self.assertEqual(calls["n"], cowork.REVIEW_FAIL_CAP)
         self.assertEqual(sess.sent, ["seed"])
-        self.assertNotIn("reviewed", out.getvalue())
-
-    def test_user_revision_invalidates_stale_ready_before_next_turn(self):
-        intel = self._intel()
-
-        class FakeSession:
-            def __init__(self):
-                self.sent = []
-                self.closed = False
-
-            def send(self, text):
-                self.sent.append(text)
-                os.makedirs(os.path.dirname(intel), exist_ok=True)
-                if len(self.sent) == 1:
-                    with open(intel, "w") as fh:
-                        json.dump({"status": "ready_for_review",
-                                   "result": {"summary": "old ready"}}, fh)
-                else:
-                    # Turn 2: the role genuinely rewrites the artifact (a new
-                    # needs_input question), so it is real progress — not the
-                    # stale-no-op the detector targets.
-                    with open(intel, "w") as fh:
-                        json.dump({"status": "needs_input",
-                                   "result": {"question": "what about X?"}}, fh)
-
-            def close(self):
-                self.closed = True
-
-        sess = FakeSession()
-        rfn = self._review_fn([{"verdict": "approve"}])
-        trace = self._trace(intel)
-        out = io.StringIO()
-        rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO("new concern\n"),
-                                io_out=out, review_fn=rfn, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed", "new concern"])
-        self.assertTrue(sess.closed)
-        self.assertEqual(rfn.calls["n"], 1)
-        text = out.getvalue()
-        self.assertIn("scout needs your input", text)
+        self.assertEqual(outcome, "ended")
+        self.assertEqual(payload["kind"], "reviewer_unavailable")
+        self.assertEqual(payload["requires"], "reviewer")
         self.assertNotIn("scout finished", text)
-        with open(intel, "r") as fh:
-            self.assertEqual(json.load(fh)["status"], "needs_input")
-        events = self._trace_events(intel)
-        self.assertTrue(any(e["event"] == "review.verdict"
-                            and e["verdict"] == "approve" for e in events))
-        self.assertTrue(any(e["event"] == "user.action"
-                            and e["action"] == "revise" for e in events))
-        self.assertTrue(any(e["event"] == "status.invalidated"
-                            and e["changed"] for e in events))
-        self.assertTrue(any(e["event"] == "gate.show"
-                            and e["gate"] == "needs_input" for e in events))
+
+    def test_no_review_fn_stops_reviewer_absent(self):
+        intel = self._intel()
+        sess = self._session(intel, ["ready_for_review"])
+        (outcome, payload), text = self._run(sess, intel)
+        self.assertEqual(sess.sent, ["seed"])
+        self.assertEqual(outcome, "ended")
+        self.assertEqual(payload["kind"], "reviewer_absent")
+        self.assertNotIn("reviewed", text)
+        self.assertNotIn("scout finished", text)
 
 
 class StaleNoOpTest(unittest.TestCase):
@@ -4281,588 +4839,105 @@ class StaleNoOpTest(unittest.TestCase):
 
     _READY = {"status": "ready_for_review", "result": {}}
 
+    # A genuinely-new artifact written on the reopened turn (different raw
+    # bytes) — used for the content-changing no-false-positive half of T7.
+    _DIFF = {"status": "needs_input", "result": {"q": "genuinely new question"}}
+
+    # A genuinely-new artifact written on the reopened turn (different raw
+    # bytes) — the content-changing, no-false-positive half.
+    _DIFF = {"status": "needs_input",
+             "result": {"pending_question": "genuinely new question"}}
+
+    def _revise_once(self, then=None):
+        return self._review_fn(
+            [{"verdict": "revise", "findings": ["x"]}] + list(then or []))
+
     def test_t1_detect_repair_fires(self):
         path = self._path()
-        # turn1 ready -> user revise -> turn2 NO-OP -> repair -> turn3 progress.
+        # turn1 ready -> reviewer revise -> turn2 NO-OP -> repair -> turn3
+        # progress (a new question, which then stops the phase).
         sess = self._session(path, [
-            dict(self._READY),
-            None,
-            {"status": "needs_input", "result": {"q": "more?"}}])
+            dict(self._READY), None, dict(self._DIFF)])
         trace = self._trace(path)
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\n"), io_out=io.StringIO(), trace=trace)
+        rc, outcome, payload = cowork._role_loop(
+            sess, "seed", path, context="", io_out=io.StringIO(),
+            review_fn=self._revise_once(), trace=trace)
         self.assertEqual(rc, 0)
-        # The repair prompt was sent on the turn after the no-op.
         self.assertEqual(len(sess.sent), 3)
         self.assertIn("byte-identical", sess.sent[2])
+        self.assertEqual((outcome, payload["kind"]), ("stopped", "needs_input"))
         events = self._events(path)
         sn = [e for e in events if e["event"] == "stale_noop"]
         self.assertEqual(len(sn), 1)
-        self.assertEqual(sn[0]["reopen_reason"], "user_revise")
+        self.assertEqual(sn[0]["reopen_reason"], "reviewer_revise")
         self.assertTrue(sn[0]["repair_attempted"])
         self.assertFalse(any(e["event"] == "stale_noop.unresolved"
                              for e in events))
 
     def test_t2_repair_succeeds_reviewer_runs(self):
         path = self._path()
-        # turn1 ready -> reviewer approve -> user revise -> turn2 no-op ->
-        # repair -> turn3 ready again -> reviewer runs again -> approve.
         sess = self._session(path, [dict(self._READY), None, dict(self._READY)])
-        rfn = self._review_fn([{"verdict": "approve"}, {"verdict": "approve"}])
+        rfn = self._revise_once(then=[{"verdict": "approve"}])
         trace = self._trace(path)
-        out = io.StringIO()
         rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\n"), io_out=out,
+            sess, "seed", path, context="", io_out=io.StringIO(),
             review_fn=rfn, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
-        # Reviewer ran on the first ready AND on the repaired ready.
+        self.assertEqual((rc, outcome), (0, "approved"))
         self.assertEqual(rfn.calls["n"], 2)
         events = self._events(path)
         self.assertTrue(any(e["event"] == "stale_noop" for e in events))
         self.assertFalse(any(e["event"] == "stale_noop.unresolved"
                              for e in events))
-        self.assertNotIn("appears stuck", out.getvalue())
 
-    def test_t3_repair_fails_stuck_gate_end(self):
+    def test_t3_repair_fails_ends_with_structured_failure(self):
         path = self._path()
-        # turn1 ready -> revise -> turn2 no-op -> repair -> turn3 no-op ->
-        # stuck gate -> 'end'.
+        # turn1 ready -> revise -> turn2 no-op -> repair -> turn3 no-op: the
+        # phase ends (no inspect/retry choice exists) and names why.
         sess = self._session(path, [dict(self._READY), None, None])
         trace = self._trace(path)
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\nend\n"), io_out=out, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
-        self.assertIn("appears stuck", out.getvalue())
+        rc, outcome, payload = cowork._role_loop(
+            sess, "seed", path, context="", io_out=io.StringIO(),
+            review_fn=self._revise_once(), trace=trace)
+        self.assertEqual((rc, outcome), (0, "ended"))
+        self.assertEqual(payload["kind"], "stale_noop")
+        self.assertEqual(payload["requires"], "operator")
+        self.assertEqual(payload["reopen_reason"], "reviewer_revise")
         events = self._events(path)
         sn = [e for e in events if e["event"] == "stale_noop"]
         unr = [e for e in events if e["event"] == "stale_noop.unresolved"]
         self.assertEqual(len(sn), 1)
         self.assertEqual(len(unr), 1)
-        # The unresolved event carries the SAME reopen_reason as the first.
-        self.assertEqual(unr[0]["reopen_reason"], sn[0]["reopen_reason"])
-        self.assertEqual(unr[0]["reopen_reason"], "user_revise")
-        self.assertTrue(any(e["event"] == "user.action"
-                            and e["action"] == "stuck_end" for e in events))
-
-    def test_t3b_stuck_gate_retry_progress(self):
-        path = self._path()
-        # ... -> stuck gate -> 'retry' -> role writes ready -> proceeds, no
-        # second gate.
-        sess = self._session(
-            path, [dict(self._READY), None, None, dict(self._READY)])
-        trace = self._trace(path)
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\nretry\n"), io_out=out, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
-        events = self._events(path)
-        self.assertTrue(any(e["event"] == "user.action"
-                            and e["action"] == "stuck_retry" for e in events))
-        # The retry re-ran the role with the repair prompt (the 4th send).
-        self.assertEqual(len(sess.sent), 4)
-        self.assertIn("byte-identical", sess.sent[3])
-        # Gate shown exactly once (progress after retry -> not re-shown).
-        self.assertEqual(out.getvalue().count("appears stuck"), 1)
-
-    def test_t3b_stuck_gate_retry_then_noop_reshows(self):
-        path = self._path()
-        # ... -> stuck gate -> 'retry' -> role no-ops AGAIN -> gate re-shown.
-        sess = self._session(path, [dict(self._READY), None, None, None])
-        trace = self._trace(path)
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\nretry\nend\n"), io_out=out, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
-        # Gate shown twice: once after auto-repair, once after the retry no-op.
-        self.assertEqual(out.getvalue().count("appears stuck"), 2)
-
-    def test_t3c_stuck_gate_inspect_is_read_only(self):
-        path = self._path()
-        # A distinctive marker in the artifact's result survives the
-        # ready->needs_input invalidation (invalidate preserves result), so we
-        # can prove the RAW file content — not just the path/status labels — was
-        # emitted by inspect.
-        marker = "INSPECT_MARKER_9F3A"
-        first = {"status": "ready_for_review", "result": {"marker": marker}}
-        sess = self._session(path, [first, None, None])
-        trace = self._trace(path)
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\ninspect\nend\n"), io_out=out,
-            trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
-        text = out.getvalue()
-        # Inspect emitted the artifact path + on-disk status + raw content.
-        self.assertIn("status file:", text)
-        self.assertIn("on-disk status:", text)
-        # The raw artifact body itself was printed (the marker only appears in
-        # the file content dump, never in the labels).
-        self.assertIn(marker, text)
-        # Inspect ran NO role turn: only seed, revise, and the single repair
-        # send happened — inspect added no 4th send.
-        self.assertEqual(len(sess.sent), 3)
-        events = self._events(path)
-        self.assertTrue(any(e["event"] == "user.action"
-                            and e["action"] == "stuck_inspect" for e in events))
-        # Gate re-shown after inspect (so two banners total).
-        self.assertEqual(text.count("appears stuck"), 2)
+        self.assertEqual(unr[0]["reopen_reason"], "reviewer_revise")
+        # Nothing in-process stands in for an orchestrator decision.
+        self.assertFalse(any(e["event"] == "gate.decision"
+                             and e.get("decider") == "orchestrator"
+                             for e in events))
 
     def test_t4_legit_new_question_no_false_positive(self):
         path = self._path()
-        # turn1 ready -> revise -> turn2 rewrites a NEW needs_input question
-        # (different bytes) -> progress, NOT a stale no-op.
-        sess = self._session(path, [
-            dict(self._READY),
-            {"status": "needs_input", "result": {"q": "brand new question"}}])
+        sess = self._session(path, [dict(self._READY), dict(self._DIFF)])
         trace = self._trace(path)
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\n"), io_out=io.StringIO(), trace=trace)
-        self.assertEqual(rc, 0)
+        cowork._role_loop(
+            sess, "seed", path, context="", io_out=io.StringIO(),
+            review_fn=self._revise_once(), trace=trace)
         events = self._events(path)
         self.assertFalse(any(e["event"] == "stale_noop" for e in events))
-        self.assertEqual(sess.sent, ["seed", "fix it"])
+        self.assertEqual(len(sess.sent), 2)
+        self.assertIn("[reviewer handoff]", sess.sent[1])
 
     def test_t5_invalidation_trace_actual_status(self):
         path = self._path()
-        sess = self._session(path, [
-            dict(self._READY),
-            {"status": "needs_input", "result": {"q": "next?"}}])
+        sess = self._session(path, [dict(self._READY), dict(self._DIFF)])
         trace = self._trace(path)
         cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("fix it\n"), io_out=io.StringIO(), trace=trace)
+            sess, "seed", path, context="", io_out=io.StringIO(),
+            review_fn=self._revise_once(), trace=trace)
         events = self._events(path)
         inv = [e for e in events if e["event"] == "status.invalidated"
                and e.get("reason") == "work_reopened"]
         self.assertTrue(inv)
-        # The previously-ambiguous changed:false case is now self-explanatory:
-        # the event records the REAL on-disk status before and after.
         self.assertEqual(inv[0]["before"], "ready_for_review")
         self.assertEqual(inv[0]["after"], "needs_input")
-
-    # A genuinely-new artifact written on the reopened turn (different raw
-    # bytes) — used for the content-changing no-false-positive half of T7.
-    _DIFF = {"status": "needs_input", "result": {"q": "genuinely new question"}}
-
-    def test_t7_general_invariant_reopen_sources(self):
-        # The general invariant (D1/D9): for EVERY work-reopening source, assert
-        # BOTH halves — a byte-identical role turn triggers exactly one repair
-        # (stale_noop with the matching reopen_reason), AND a content-changing
-        # turn does NOT (no false positive). user_iterate is exercised the same
-        # way in test_t7_user_iterate_source (it needs the TTY dissent gate to
-        # emit _ITERATE); handoff_declined in test_t7_handoff_declined_source.
-        # review_fn is single-use (pops), so each scenario gets a fresh one via
-        # the factory.
-        cases = [
-            # (reason, review_fn_factory, noop_io, content_io)
-            ("user_revise", lambda: None, "feedback\nend\n", "feedback\n"),
-            ("reviewer_revise",
-             lambda: self._review_fn([{"verdict": "revise", "findings": ["x"]}]),
-             "end\n", ""),
-            ("reviewer_needs_user",
-             lambda: self._review_fn(
-                 [{"verdict": "needs_user", "user_question": "which?"}]),
-             "end\n", ""),
-        ]
-        for reason, rfn_factory, noop_io, content_io in cases:
-            with self.subTest(reason=reason, mode="noop"):
-                path = self._path()
-                sess = self._session(path, [dict(self._READY), None, None])
-                trace = self._trace(path)
-                cowork._role_loop(
-                    sess, "seed", path, context="",
-                    io_in=io.StringIO(noop_io), io_out=io.StringIO(),
-                    review_fn=rfn_factory(), trace=trace)
-                events = self._events(path)
-                sn = [e for e in events if e["event"] == "stale_noop"]
-                self.assertEqual(len(sn), 1, "exactly one repair for %s" % reason)
-                self.assertEqual(sn[0]["reopen_reason"], reason)
-            with self.subTest(reason=reason, mode="content"):
-                path = self._path()
-                sess = self._session(path, [dict(self._READY), dict(self._DIFF)])
-                trace = self._trace(path)
-                cowork._role_loop(
-                    sess, "seed", path, context="",
-                    io_in=io.StringIO(content_io), io_out=io.StringIO(),
-                    review_fn=rfn_factory(), trace=trace)
-                events = self._events(path)
-                self.assertFalse(
-                    any(e["event"] == "stale_noop" for e in events),
-                    "no false positive for content-changing %s" % reason)
-
-    def test_t7_handoff_declined_source(self):
-        path = self._path()
-        # handoff_back -> declined -> inline invalidate -> next turn no-op.
-        # The declined branch sets reason WITHOUT pending_reopens_work, so this
-        # proves detection keys off the reason, not the boolean.
-        sess = self._session(path, [
-            {"status": "handoff_back", "handoff": "re-plan auth"},
-            None, None])
-        trace = self._trace(path)
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
-            handoff_enabled=True,
-            handoff_confirm=lambda io_in, io_out: False,  # decline
-            trace=trace)
-        events = self._events(path)
-        sn = [e for e in events if e["event"] == "stale_noop"]
-        self.assertEqual(len(sn), 1)
-        self.assertEqual(sn[0]["reopen_reason"], "handoff_declined")
-
-    def test_t7_handoff_declined_content_change_no_false_positive(self):
-        path = self._path()
-        # Declined hand-back, then the role genuinely rewrites the artifact
-        # (different bytes) -> progress, NOT a stale no-op.
-        sess = self._session(path, [
-            {"status": "handoff_back", "handoff": "re-plan auth"},
-            dict(self._DIFF)])
-        trace = self._trace(path)
-        cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO(""), io_out=io.StringIO(),
-            handoff_enabled=True,
-            handoff_confirm=lambda io_in, io_out: False,  # decline
-            trace=trace)
-        events = self._events(path)
-        self.assertFalse(any(e["event"] == "stale_noop" for e in events))
-
-    def test_t7_user_iterate_source(self):
-        # user_iterate reaches the reopen seam only via the TTY dissent gate
-        # (_read_review_dissent -> _ITERATE). Force the dissent path with a
-        # one-round review cap and patch the dissent reader to iterate once.
-        import unittest.mock as mock
-        path = self._path()
-        sess = self._session(path, [dict(self._READY), None, None])
-        rfn = self._review_fn([{"verdict": "revise", "findings": ["y"]}])
-        trace = self._trace(path)
-        with mock.patch.object(cowork, "REVIEW_ROUND_CAP", 1), \
-                mock.patch.object(cowork, "_read_review_dissent",
-                                  return_value=cowork._ITERATE):
-            cowork._role_loop(
-                sess, "seed", path, context="",
-                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
-                review_fn=rfn, trace=trace)
-        events = self._events(path)
-        sn = [e for e in events if e["event"] == "stale_noop"]
-        self.assertEqual(len(sn), 1)
-        self.assertEqual(sn[0]["reopen_reason"], "user_iterate")
-
-        # Content-changing half: an iterate that genuinely rewrites the artifact
-        # is progress, NOT a stale no-op.
-        path2 = self._path()
-        sess2 = self._session(path2, [dict(self._READY), dict(self._DIFF)])
-        rfn2 = self._review_fn([{"verdict": "revise", "findings": ["y"]}])
-        trace2 = self._trace(path2)
-        with mock.patch.object(cowork, "REVIEW_ROUND_CAP", 1), \
-                mock.patch.object(cowork, "_read_review_dissent",
-                                  return_value=cowork._ITERATE):
-            cowork._role_loop(
-                sess2, "seed", path2, context="",
-                io_in=io.StringIO(""), io_out=io.StringIO(),
-                review_fn=rfn2, trace=trace2)
-        events2 = self._events(path2)
-        self.assertFalse(any(e["event"] == "stale_noop" for e in events2))
-
-    def test_t7_user_answer_source(self):
-        # The ORIGINALLY-reported deadlock path: the role is at the needs_input
-        # gate, the user answers, and the role consumes the answer but leaves
-        # the artifact byte-identical. This is the source the whole feature was
-        # motivated by, so it gets explicit both-halves coverage.
-        first = {"status": "needs_input", "result": {"q": "first"}}
-
-        # No-op half: a byte-identical answer turn -> exactly one repair tagged
-        # user_answer.
-        path = self._path()
-        sess = self._session(path, [dict(first), None, None])
-        trace = self._trace(path)
-        cowork._role_loop(
-            sess, "seed", path, context="",
-            io_in=io.StringIO("my answer\nend\n"), io_out=io.StringIO(),
-            trace=trace)
-        events = self._events(path)
-        sn = [e for e in events if e["event"] == "stale_noop"]
-        self.assertEqual(len(sn), 1)
-        self.assertEqual(sn[0]["reopen_reason"], "user_answer")
-
-        # Content-changing half: an answer turn that rewrites the artifact with
-        # new bytes is progress, NOT a stale no-op.
-        path2 = self._path()
-        sess2 = self._session(path2, [dict(first), dict(self._DIFF)])
-        trace2 = self._trace(path2)
-        cowork._role_loop(
-            sess2, "seed", path2, context="",
-            io_in=io.StringIO("my answer\n"), io_out=io.StringIO(),
-            trace=trace2)
-        events2 = self._events(path2)
-        self.assertFalse(any(e["event"] == "stale_noop" for e in events2))
-
-
-class ControllerSwitchLoopTest(unittest.TestCase):
-    def _path(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        return os.path.join(d, ".cowork", "status.json")
-
-    def test_send_failure_without_artifact_progress_returns_switch_outcome(self):
-        path = self._path()
-
-        class FailingSession:
-            controller = "claude"
-
-            def __init__(self):
-                self.sent = []
-                self.closed = False
-
-            def send(self, text):
-                self.sent.append(text)
-                return {"ok": False, "result": "error",
-                        "error_type": "rate_limit"}
-
-            def close(self):
-                self.closed = True
-
-        sess = FailingSession()
-        out = io.StringIO()
-        rc, outcome, payload = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO("switch\n"),
-            io_out=out, role="planner")
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "switch_controller")
-        self.assertEqual(payload["role"], "planner")
-        self.assertEqual(payload["reason"], "send_failed")
-        self.assertEqual(payload["pending"], "seed")
-        self.assertTrue(sess.closed)
-        self.assertIn("switch-controller", out.getvalue())
-        self.assertIn("the claude controller for planner", out.getvalue())
-
-    def test_later_turn_failures_preserve_failed_pending_turn(self):
-        cases = []
-
-        def user_answer(path):
-            return {
-                "writes": [{"status": "needs_input", "result": {"q": "q?"}},
-                           {"fail": "rate_limit"}],
-                "io": "answer text\nswitch\n",
-                "review_fn": None,
-                "expect": "answer text",
-            }
-
-        def reviewer_handoff(path):
-            def review_fn(_status_path, _round_index):
-                return {"verdict": "revise", "findings": ["fix risk"]}
-            return {
-                "writes": [{"status": "ready_for_review", "result": {}},
-                           {"fail": "rate_limit"}],
-                "io": "switch\n",
-                "review_fn": review_fn,
-                # File-only transport: the findings ride by review-file path, so
-                # the preserved pending turn names the review file, not the body.
-                "expect": "review file",
-            }
-
-        def repair(path):
-            return {
-                "writes": [{"status": "ready_for_review", "result": {}},
-                           None,
-                           {"fail": "rate_limit"}],
-                "io": "revise it\nswitch\n",
-                "review_fn": None,
-                "expect": "byte-identical",
-            }
-
-        cases.extend([
-            ("user_answer", user_answer),
-            ("reviewer_handoff", reviewer_handoff),
-            ("repair", repair),
-        ])
-        for name, factory in cases:
-            with self.subTest(name=name):
-                path = self._path()
-                cfg = factory(path)
-
-                class Session:
-                    controller = "claude"
-
-                    def __init__(self):
-                        self.sent = []
-
-                    def send(self, text):
-                        self.sent.append(text)
-                        item = cfg["writes"].pop(0)
-                        if isinstance(item, dict) and item.get("fail"):
-                            return {"ok": False, "result": "error",
-                                    "error_type": item["fail"]}
-                        if item is not None:
-                            os.makedirs(os.path.dirname(path), exist_ok=True)
-                            with open(path, "w") as fh:
-                                json.dump(item, fh)
-
-                    def close(self):
-                        pass
-
-                rc, outcome, payload = cowork._role_loop(
-                    Session(), "seed", path, context="",
-                    io_in=io.StringIO(cfg["io"]), io_out=io.StringIO(),
-                    role="planner", review_fn=cfg["review_fn"])
-                self.assertEqual(rc, 0)
-                self.assertEqual(outcome, "switch_controller")
-                self.assertIn(cfg["expect"], payload["pending"])
-
-    def test_stuck_gate_switch_returns_switch_outcome(self):
-        path = self._path()
-
-        class Session:
-            def __init__(self):
-                self.sent = []
-
-            def send(self, text):
-                self.sent.append(text)
-                if len(self.sent) == 1:
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "w") as fh:
-                        json.dump({"status": "ready_for_review",
-                                   "result": {}}, fh)
-                # Later sends intentionally write nothing: stale/no-op.
-
-            def close(self):
-                pass
-
-        rc, outcome, payload = cowork._role_loop(
-            Session(), "seed", path, context="",
-            io_in=io.StringIO("fix it\nswitch\n"), io_out=io.StringIO(),
-            role="planner")
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "switch_controller")
-        self.assertEqual(payload["reason"], "stuck")
-        self.assertIn("byte-identical", payload["pending"])
-
-    def test_reviewer_failure_switch_retries_same_round_without_lead_bounce(self):
-        path = self._path()
-
-        class LeadSession:
-            def __init__(self):
-                self.sent = []
-
-            def send(self, text):
-                self.sent.append(text)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as fh:
-                    json.dump({"status": "ready_for_review", "result": {}}, fh)
-
-            def close(self):
-                pass
-
-        class ReviewFn:
-            def __init__(self):
-                self.calls = 0
-                self.switched = False
-
-            def __call__(self, status_path, round_index,
-                         force_full_reread=False):
-                self.calls += 1
-                if not self.switched:
-                    return {}
-                self.force_full_reread = force_full_reread
-                return {"verdict": "approve"}
-
-            def switch_controller(self, reason="reviewer_failure"):
-                self.switched = True
-                self.reason = reason
-                return True
-
-        lead = LeadSession()
-        review_fn = ReviewFn()
-        rc, outcome, _ = cowork._role_loop(
-            lead, "seed", path, context="",
-            io_in=io.StringIO("switch\n\n"), io_out=io.StringIO(),
-            role="planner", reviewer_role=cowork.PLANNING_ADVISOR,
-            review_fn=review_fn)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
-        self.assertEqual(lead.sent, ["seed"])
-        self.assertEqual(review_fn.calls, 3)  # fail, silent retry, switched pass
-        self.assertTrue(review_fn.switched)
-        self.assertEqual(review_fn.reason, "reviewer_failure")
-        self.assertTrue(review_fn.force_full_reread)
-
-    def test_reviewer_preflight_failure_routes_to_switch_gate(self):
-        status_path = self._path()
-        review_path = status_path + ".review"
-        config = cowork.default_config(["planner", cowork.PLANNING_ADVISOR])
-        # Exercise a persisted pre-migration Codex reviewer: the shipped
-        # default is now Claude, but existing sessions still need the switch
-        # gate when their saved Codex binary is unavailable.
-        config[cowork.PLANNING_ADVISOR]["controller"] = "codex"
-        calls = {"runner": [], "checks": 0, "switches": []}
-
-        class LeadSession:
-            def __init__(self):
-                self.sent = []
-
-            def send(self, text):
-                self.sent.append(text)
-                os.makedirs(os.path.dirname(status_path), exist_ok=True)
-                with open(status_path, "w") as fh:
-                    json.dump({"status": "ready_for_review", "result": {}}, fh)
-
-            def close(self):
-                pass
-
-        def check(role):
-            calls["checks"] += 1
-            if config[role]["controller"] == "codex":
-                return [
-                    "Required tool 'codex' not found on PATH.\n"
-                    "    Install it with: npm install -g @openai/codex"
-                ]
-            return None
-
-        def switch(role, reason=None, source=None):
-            calls["switches"].append((role, reason, source))
-            config[role]["controller"] = "claude"
-            return True
-
-        def runner(config, context, selected, artifact_path, review_path, **kw):
-            calls["runner"].append((context, kw.get("force_full_reread")))
-            return {"verdict": "approve"}
-
-        review_fn = cowork.make_review_fn(
-            config, "shared context", ["planner", cowork.PLANNING_ADVISOR],
-            review_path, reviewer_runner=runner,
-            reviewer_role=cowork.PLANNING_ADVISOR,
-            switch_controller_fn=switch,
-            switch_note_fn=lambda role: "fresh reviewer switch note",
-            reviewer_controller_check_fn=check)
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            LeadSession(), "seed", status_path, context="",
-            io_in=io.StringIO("switch\n\n"), io_out=out,
-            role="planner", reviewer_role=cowork.PLANNING_ADVISOR,
-            review_fn=review_fn)
-
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
-        self.assertEqual(
-            calls["switches"],
-            [(cowork.PLANNING_ADVISOR, "reviewer_failure", "gate")])
-        self.assertEqual(len(calls["runner"]), 1)
-        self.assertIn("fresh reviewer switch note", calls["runner"][0][0])
-        self.assertIn("Required tool 'codex' not found", out.getvalue())
 
 
 class MakeReviewFnTest(unittest.TestCase):
@@ -4994,7 +5069,7 @@ class ContextUpdateBlockTest(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         block = cowork.context_update_block("the new goal", d, 3)
-        self.assertIn("New user context was provided", block)
+        self.assertIn("New orchestrator context was provided", block)
         # File-only transport: the context text is NOT inlined; it rides by path.
         self.assertNotIn("the new goal", block)
         self.assertIn("context.rev3.md", block)
@@ -5011,11 +5086,11 @@ class ContextUpdateBlockTest(unittest.TestCase):
             intel, context_update="redirected goal", assets_dir=d,
             context_revision=1)
         self.assertNotIn("redirected goal", ctx)       # not inlined
-        self.assertIn("New user context was provided", ctx)
+        self.assertIn("New orchestrator context was provided", ctx)
         self.assertIn("context.rev1.md", ctx)          # context by path
         self.assertIn(intel, ctx)                      # intel still included
         # without an update there is no wake block
-        self.assertNotIn("New user context was provided",
+        self.assertNotIn("New orchestrator context was provided",
                          cowork.assemble_reviewer_resume_context(intel))
 
 
@@ -5076,7 +5151,7 @@ class ReviewerSessionFlowTest(unittest.TestCase):
         spath = self._tmp_session()
         rec = []
 
-        def fake(config, context, selected, io_in=None, io_out=None,
+        def fake(config, context, selected, io_out=None,
                  resume_id=None, on_session=None, intel_path=None,
                  review_path=None, reviewer_resume_id=None,
                  on_reviewer_session=None, reviewer_context=None,
@@ -5102,9 +5177,10 @@ class ReviewerSessionFlowTest(unittest.TestCase):
                         "--context", "the original goal",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_scout_fn=fake)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertIsNone(rec[0]["reviewer_resume_id"])
-        self.assertEqual(rec[0]["reviewer_context"], "the original goal")
+        self.assertEqual(rec[0]["reviewer_context"],
+                         cowork.AGENT_REVIEWER_NOTE + "\n\nthe original goal")
         saved = state_store.load(spath)
         self.assertEqual(state_store.get_context(saved), "the original goal")
         self.assertEqual(
@@ -5116,15 +5192,18 @@ class ReviewerSessionFlowTest(unittest.TestCase):
             self._args(["--team", "scout,scout-reviewer",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_scout_fn=fake)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         # plain resume auto-continues: the seed carries the standing discovery
         # note (every cycle) but NO re-injected user goal.
         self.assertIn("Repository discovery", rec[1]["context"])
         self.assertNotIn("original goal", rec[1]["context"])
         self.assertEqual(rec[1]["reviewer_resume_id"], "rev-1")  # stored id reused
-        self.assertEqual(rec[1]["reviewer_context"], "the original goal")  # from store
-        # both roles already acknowledged revision 1 -> no wake block
-        self.assertIsNone(rec[1]["reviewer_context_update"])
+        self.assertEqual(rec[1]["reviewer_context"],
+                         cowork.AGENT_REVIEWER_NOTE + "\n\n" + "the original goal")  # from store
+        # both roles already acknowledged revision 1 -> no wake block, only the
+        # runtime agent-session note a resumed reviewer always receives
+        self.assertEqual(rec[1]["reviewer_context_update"],
+                         cowork.AGENT_REVIEWER_NOTE)
 
         # Run 3: resume WITH a new --context (a redirect). Revision bumps; the
         # resumed reviewer must get the new context as a wake block; the scout
@@ -5134,15 +5213,17 @@ class ReviewerSessionFlowTest(unittest.TestCase):
                         "--context", "redirected goal",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_scout_fn=fake)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         # scout gets the redirect wrapped in the wake block (same semantics the
         # reviewer gets: current context, keep prior memory only if compatible)
-        self.assertIn("New user context was provided", rec[2]["context"])
+        self.assertIn("New orchestrator context was provided", rec[2]["context"])
         # File-only transport: the context rides by path, not inline.
         self.assertNotIn("<context>", rec[2]["context"])
         self.assertIn("context.rev2.md", rec[2]["context"])
-        self.assertEqual(rec[2]["reviewer_context"], "redirected goal")
-        self.assertEqual(rec[2]["reviewer_context_update"], "redirected goal")
+        self.assertEqual(rec[2]["reviewer_context"],
+                         cowork.AGENT_REVIEWER_NOTE + "\n\n" + "redirected goal")
+        self.assertEqual(rec[2]["reviewer_context_update"],
+                         cowork.AGENT_REVIEWER_NOTE + "\n\nredirected goal")
         saved = state_store.load(spath)
         self.assertEqual(state_store.get_context_revision(saved), 2)
         # both roles acknowledged revision 2 (fake ran the ack + rc==0)
@@ -5169,8 +5250,8 @@ class ReviewerSessionFlowTest(unittest.TestCase):
             self._args(["--team", "scout,scout-reviewer",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_scout_fn=fake)
-        self.assertEqual(rc, 0)
-        self.assertIn("New user context was provided", rec[0])
+        self.assertEqual(rc, 1)
+        self.assertIn("New orchestrator context was provided", rec[0])
         # File-only transport: context rides by path, not inline.
         self.assertNotIn("<context>", rec[0])
         self.assertIn("context.rev1.md", rec[0])
@@ -5220,8 +5301,7 @@ class RunReviewerOnceTest(unittest.TestCase):
         self.assertEqual(verdict["user_question"], "scope?")
         self.assertEqual(seen["controller"], "claude")    # governed default
         self.assertTrue(seen["closed"])
-        # single-voice: the reviewer's io_out is a quiet sink, not a real terminal.
-        self.assertFalse(ui.is_tty(seen["io_out"]))
+        # single-voice: the reviewer's io_out is a quiet sink.
         self.assertIsInstance(seen["io_out"], cowork._QuietSink)
         # Claude reviewers receive shared context by authoritative file path,
         # never pasted inline, plus the intel artifact path.
@@ -5286,158 +5366,27 @@ class RunReviewerOnceTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# UX layer (cowork_ui). Pure/fallback paths run anywhere; the rich-library paths #
-# use a FakeTTY stream + injected seams, and skip when the deps are absent.      #
+# Transcript output (cowork_transcript).                                      #
 # --------------------------------------------------------------------------- #
 
 
-class FakeTTY(io.StringIO):
-    """A StringIO that claims to be a terminal, so is_tty() returns True."""
-
-    def isatty(self):
-        return True
-
-
-class UiBasicsTest(unittest.TestCase):
-    def test_is_tty(self):
-        self.assertTrue(ui.is_tty(FakeTTY()))
-        self.assertFalse(ui.is_tty(io.StringIO()))
-
-    def test_colorize_gated(self):
-        self.assertEqual(ui.colorize("x", ui.RED, False), "x")
-        self.assertEqual(ui.colorize("x", ui.RED, True),
-                         ui.RED + "x" + ui.RESET)
-
-    def test_label_plain_and_colored(self):
-        # Plain forms must match the historical labels exactly.
-        self.assertEqual(ui.label("you", False), "you › ")
-        self.assertEqual(ui.label("scout", False), "scout › ")
-        self.assertEqual(ui.label("you", True), ui.CYAN + "you › " + ui.RESET)
-        self.assertEqual(ui.label("scout", True), ui.GREEN + "scout › " + ui.RESET)
-
+class TranscriptBasicsTest(unittest.TestCase):
     def test_shorten_path(self):
         cwd = "/tmp/work"
         self.assertEqual(
-            ui.shorten_path("/tmp/work/.cowork/scout.intel.X.json", cwd=cwd),
+            transcript.shorten_path("/tmp/work/.cowork/scout.intel.X.json", cwd=cwd),
             ".cowork/scout.intel.X.json")
         self.assertEqual(
-            ui.shorten_path("/var/data/scout.intel.Y.json", cwd=cwd),
+            transcript.shorten_path("/var/data/scout.intel.Y.json", cwd=cwd),
             "…/scout.intel.Y.json")
 
-    def test_turn_separator_tty_only(self):
+class WriteReplyTest(unittest.TestCase):
+    def test_writes_reply_verbatim(self):
         out = io.StringIO()
-        ui.turn_separator(out)              # non-TTY -> nothing
-        self.assertEqual(out.getvalue(), "")
-        tout = FakeTTY()
-        ui.turn_separator(tout)             # TTY -> a dim rule
-        self.assertIn("─", tout.getvalue())
-
-    def test_spinner_noop_off_tty(self):
-        s = ui.Spinner(io.StringIO())
-        s.start()
-        self.assertIsNone(s._thread)        # never spawns a thread off a TTY
-        s.stop()
-
-    def test_spinner_set_label(self):
-        out = io.StringIO()
-        s = ui.Spinner(out, "scout working")
-        s.start()
-        s.set_label("scout using Bash")
-        s.stop()
-        self.assertEqual(s.label, "scout using Bash")
-        self.assertEqual(out.getvalue(), "")  # off-TTY: zero bytes, ever
-
-
-class PromptUserFallbackTest(unittest.TestCase):
-    """The non-TTY readline fallback — unchanged from before, runs without deps."""
-
-    def test_readline_returns_line(self):
-        self.assertEqual(
-            ui.prompt_user(io.StringIO("hello\n"), io.StringIO()), "hello")
-
-    def test_readline_eof_returns_sentinel(self):
-        self.assertIs(ui.prompt_user(io.StringIO(""), io.StringIO()), ui.EOF)
-
-    def test_readline_blank_line_is_empty_not_eof(self):
-        # A blank line ("\n") is distinct from EOF: it yields "" (re-prompt).
-        self.assertEqual(ui.prompt_user(io.StringIO("\n"), io.StringIO()), "")
-
-
-@unittest.skipUnless(HAS_UI_DEPS, "prompt_toolkit not installed")
-class PromptUserTtyTest(unittest.TestCase):
-    """The TTY editor path, driven through an injected prompt_toolkit session.
-    (Still needs prompt_toolkit: prompt_user builds real key bindings.)"""
-
-    def _session_factory(self, behaviour):
-        class FakeSession:
-            def prompt(self, message, **kw):
-                self.message = message
-                self.kw = kw
-                return behaviour()
-        self._sess = FakeSession()
-        return lambda: self._sess
-
-    def test_returns_stripped_text(self):
-        got = ui.prompt_user(FakeTTY(), FakeTTY(), header="your answer",
-                             session_factory=self._session_factory(
-                                 lambda: "multi\nline\n"))
-        self.assertEqual(got, "multi\nline")
-        # multiline enabled + the header and inline submit hint are in the prompt.
-        self.assertTrue(self._sess.kw.get("multiline"))
-        msg = getattr(self._sess.message, "value", self._sess.message)
-        self.assertIn("your answer", msg)
-        self.assertIn("Enter to send", msg)        # submit key is discoverable
-
-    def test_eof_returns_sentinel(self):
-        def boom():
-            raise EOFError
-        self.assertIs(
-            ui.prompt_user(FakeTTY(), FakeTTY(),
-                           session_factory=self._session_factory(boom)),
-            ui.EOF)
-
-    def test_keyboard_interrupt_propagates(self):
-        def boom():
-            raise KeyboardInterrupt
-        with self.assertRaises(KeyboardInterrupt):
-            ui.prompt_user(FakeTTY(), FakeTTY(),
-                           session_factory=self._session_factory(boom))
-
-
-@unittest.skipUnless(HAS_UI_DEPS, "prompt_toolkit not installed")
-class KeyBindingsTest(unittest.TestCase):
-    """Drive a real PromptSession headlessly: Enter submits, Ctrl+J newlines."""
-
-    def test_enter_submits_ctrl_j_newlines(self):
-        from prompt_toolkit import PromptSession
-        from prompt_toolkit.input import create_pipe_input
-        from prompt_toolkit.output import DummyOutput
-        with create_pipe_input() as inp:
-            # "ab", Ctrl+J (\n -> newline), "cd", Enter (\r -> submit).
-            inp.send_text("ab\ncd\r")
-            session = PromptSession(
-                input=inp, output=DummyOutput(), multiline=True,
-                key_bindings=ui.build_key_bindings())
-            result = session.prompt("> ")
-        self.assertEqual(result, "ab\ncd")
-
-
-class RenderMarkdownTest(unittest.TestCase):
-    def test_non_tty_writes_raw(self):
-        out = io.StringIO()
-        ui.render_markdown(out, "# hi\nbody", enabled=False)
+        transcript.write_reply(out, "# hi\nbody")
         self.assertEqual(out.getvalue(), "# hi\nbody\n")
 
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_renders_via_rich(self):
-        out = FakeTTY()
-        ui.render_markdown(out, "**bold**", enabled=True)
-        text = out.getvalue()
-        self.assertNotIn("**bold**", text)   # markers rendered away
-        self.assertIn("bold", text)
-
-
-class StreamingMarkdownTest(unittest.TestCase):
+class TranscriptStreamTest(unittest.TestCase):
     class RecTrace:
         def __init__(self):
             self.events = []
@@ -5445,33 +5394,20 @@ class StreamingMarkdownTest(unittest.TestCase):
         def event(self, name, **fields):
             self.events.append(dict({"event": name}, **fields))
 
-    def test_non_tty_streams_raw_with_label(self):
+    def test_streams_with_label(self):
         out = io.StringIO()
-        region = ui.StreamingMarkdown(out, "scout › ")
+        region = transcript.TranscriptStream(out, "scout › ")
         region.__enter__()
         region.feed("hello ")
         region.feed("world")
         region.__exit__(None, None, None)
         self.assertEqual(out.getvalue(), "\nscout › hello world\n")
 
-    def test_non_tty_status_is_silent(self):
-        # set_status/clear_status interleaved with feed must not change one
-        # byte of the non-TTY stream — THE contract the test suite relies on.
-        out = io.StringIO()
-        region = ui.StreamingMarkdown(out, "scout › ")
-        region.__enter__()
-        region.feed("hello ")
-        region.set_status("scout using Bash…")
-        region.feed("world")
-        region.clear_status()
-        region.__exit__(None, None, None)
-        self.assertEqual(out.getvalue(), "\nscout › hello world\n")
-
-    def test_non_tty_traces_render_metadata_without_content(self):
+    def test_traces_stream_metadata_without_content(self):
         trace = self.RecTrace()
         out = io.StringIO()
         secret = "secret output text"
-        region = ui.StreamingMarkdown(
+        region = transcript.TranscriptStream(
             out, "scout › ", trace=trace,
             trace_fields={"controller": "claude", "role": "scout"})
         region.__enter__()
@@ -5479,294 +5415,27 @@ class StreamingMarkdownTest(unittest.TestCase):
         region.__exit__(None, None, None)
 
         names = [e["event"] for e in trace.events]
-        self.assertEqual(names, ["ui.markdown.start", "ui.markdown.end"])
+        self.assertEqual(names, ["transcript.stream.start",
+                                 "transcript.stream.end"])
         start, end = trace.events
-        self.assertEqual(start["renderer"], "raw")
-        self.assertFalse(start["tty"])
         self.assertEqual(start["controller"], "claude")
         self.assertEqual(start["role"], "scout")
         self.assertEqual(end["chunks"], 1)
         self.assertEqual(end["chars"], len(secret))
         self.assertNotIn(secret, json.dumps(trace.events))
 
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_renders_buffer(self):
-        out = FakeTTY()
-        with ui.StreamingMarkdown(out, "scout › ") as region:
-            region.feed("**bold**")
-        text = out.getvalue()
-        self.assertIn("scout › ", text)
-        self.assertIn("bold", text)
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_status_row_renders_and_clears(self):
-        import unittest.mock as mock
-        out = FakeTTY()
-        # Test runners often set TERM=dumb; Rich intentionally suppresses live
-        # frames there. This test is for the TTY render path, so pin a capable
-        # terminal name around the Live console construction.
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            region = ui.StreamingMarkdown(out, "scout › ")
-            region.__enter__()
-            try:
-                region.feed("hello")
-                region.set_status("scout using Bash")
-                region._live.refresh()  # force a frame (auto-refresh is time-based)
-                self.assertIn("using Bash", out.getvalue())
-                region.clear_status()
-            finally:
-                region.__exit__(None, None, None)
-        self.assertIsNone(region._status)  # final render carries no status row
-
-    def test_safe_commit_point_paragraph_and_fence(self):
-        # commits greedily through every finalized paragraph, leaving the
-        # still-growing tail in the live region...
-        t = "para one\n\npara two\n\ntail"
-        self.assertEqual(ui._safe_commit_point(t, 0), len("para one\n\npara two\n\n"))
-        # ...but never inside an open ``` fence (fences may contain blank lines).
-        t2 = "intro\n\n```\ncode\n\nmore\n```\n\nafter"
-        self.assertEqual(t2[:ui._safe_commit_point(t2, 0)], "intro\n\n```\ncode\n\nmore\n```\n\n")
-        # nothing finalized yet -> nothing to commit.
-        self.assertIsNone(ui._safe_commit_point("partial line", 0))
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_long_reply_does_not_replay_lines(self):
-        # Regression: a multi-paragraph reply streamed in chunks must print each
-        # finalized paragraph exactly once. The old whole-buffer Live re-render
-        # replayed lines that scrolled past the viewport.
-        import unittest.mock as mock
-        out = FakeTTY()
-        trace = self.RecTrace()
-        paras = [f"Paragraph number {i} with a unique marker word zzz{i}." for i in range(8)]
-        text = "\n\n".join(paras) + "\n"
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            with ui.StreamingMarkdown(out, "scout › ", trace=trace) as region:
-                for ch in text:  # feed char-by-char, the worst case for replay
-                    region.feed(ch)
-        rendered = out.getvalue()
-        for i in range(8):
-            self.assertEqual(rendered.count(f"zzz{i}"), 1, f"marker zzz{i} replayed")
-        self.assertTrue(any(e["event"] == "ui.markdown.commit"
-                            for e in trace.events))
-        self.assertNotIn("zzz0", json.dumps(trace.events))
-
-
-class BannerTest(unittest.TestCase):
-    def test_non_tty_plain_keeps_substrings(self):
-        for text in ("scout needs your input",
+class NoticeTest(unittest.TestCase):
+    def test_notice_keeps_substrings(self):
+        for text in ("scout needs input",
                      "scout intel ready for review — x",
                      "scout finished — intel → x"):
             out = io.StringIO()
-            ui.banner(out, text, "info")
+            transcript.notice(out, text)
             self.assertIn(text, out.getvalue())
 
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_renders_panel(self):
-        out = FakeTTY()
-        ui.banner(out, "ready for review", "review")
-        text = out.getvalue()
-        self.assertIn("ready for review", text)
-        # Rich Panel draws a box border.
-        self.assertTrue(any(ch in text for ch in "─│╭╰╮╯┌└"))
-
-
-class ConfirmTest(unittest.TestCase):
-    def test_injected_ask_fn(self):
-        self.assertTrue(ui.confirm("ok?", ask_fn=lambda: True))
-        self.assertFalse(ui.confirm("ok?", ask_fn=lambda: False))
-        self.assertFalse(ui.confirm("ok?", ask_fn=lambda: None))  # cancel -> False
-
-
-class SelectTest(unittest.TestCase):
-    def test_injected_ask_fn(self):
-        choices = [("a", "Option A"), ("b", "Option B")]
-        self.assertEqual(ui.select("pick", choices, ask_fn=lambda: "b"), "b")
-        # dismissed -> None passes through; callers pick their safe fallback
-        self.assertIsNone(ui.select("pick", choices, ask_fn=lambda: None))
-
-
-class ScoutLoopTtyTest(unittest.TestCase):
-    """The review gate uses an explicit 3-way select on a TTY (#8): Approve &
-    finish / Ask a question / Request changes. ui.select / ui.prompt_user /
-    ui.banner are patched so no real prompt/library is needed."""
-
-    def _intel(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        return os.path.join(d, ".cowork", "scout.intel.X.json")
-
-    def _session(self, intel_path, statuses):
-        class FakeSession:
-            def __init__(self):
-                self.sent = []
-                self.closed = False
-
-            def send(self, text):
-                self.sent.append(text)
-                st = statuses.pop(0) if statuses else "ready_for_review"
-                os.makedirs(os.path.dirname(intel_path), exist_ok=True)
-                with open(intel_path, "w") as fh:
-                    json.dump({"status": st}, fh)
-
-            def close(self):
-                self.closed = True
-        return FakeSession()
-
-    def test_review_select_approve(self):
-        import unittest.mock as mock
-        intel = self._intel()
-        sess = self._session(intel, ["ready_for_review"])
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select",
-                                  return_value="approve") as sel:
-            rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                    io_in=FakeTTY(), io_out=FakeTTY())
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed"])
-        sel.assert_called_once()
-
-    def test_review_select_changes_then_approve(self):
-        import unittest.mock as mock
-        intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select",
-                                  side_effect=["changes", "approve"]), \
-                mock.patch.object(cowork.ui, "prompt_user",
-                                  return_value="please tweak X"):
-            rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                    io_in=FakeTTY(), io_out=FakeTTY())
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent, ["seed", "please tweak X"])
-
-    def test_review_select_ask_then_approve(self):
-        # "Ask a question" at the normal gate: answered in chat, then approve.
-        import unittest.mock as mock
-        intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select",
-                                  side_effect=["ask", "approve"]), \
-                mock.patch.object(cowork.ui, "prompt_user",
-                                  return_value="why this approach?"):
-            rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                    io_in=FakeTTY(), io_out=FakeTTY())
-        self.assertEqual(rc, 0)
-        # The question rode to the role as an ordinary turn (not a revise), and
-        # the intel was never reopened.
-        self.assertEqual(len(sess.sent), 2)
-        self.assertIn("[user question", sess.sent[-1])
-
-    def _always_revise_fn(self, finding="still not aligned"):
-        """Revise for exactly REVIEW_ROUND_CAP rounds (hitting the dissent
-        gate), then approve."""
-        calls = {"n": 0}
-
-        def review_fn(intel_path, round_index):
-            calls["n"] += 1
-            if calls["n"] <= cowork.REVIEW_ROUND_CAP:
-                return {"verdict": "revise", "findings": [finding]}
-            return {"verdict": "approve"}
-        review_fn.calls = calls
-        return review_fn
-
-    def test_dissent_gate_iterate_hands_findings_back(self):
-        import unittest.mock as mock
-        intel = self._intel()
-        cap = cowork.REVIEW_ROUND_CAP
-        sess = self._session(intel, [])  # always ready_for_review
-        rfn = self._always_revise_fn()
-        banners = []
-        with mock.patch.object(cowork.ui, "banner",
-                               side_effect=lambda _io, text, kind="info",
-                               **kw: banners.append((text, kind))), \
-                mock.patch.object(cowork.ui, "select",
-                                  return_value="iterate") as sel, \
-                mock.patch.object(cowork, "_read_review",
-                                  return_value=cowork._END):
-            rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                    io_in=FakeTTY(), io_out=FakeTTY(),
-                                    review_fn=rfn)
-        self.assertEqual(rc, 0)
-        sel.assert_called_once()
-        # iterate injected the reviewer hand-back (findings by review-file path)
-        self.assertIn("[reviewer handoff]", sess.sent[-1])
-        self.assertNotIn("still not aligned", sess.sent[-1])
-        self.assertIn("review file", sess.sent[-1])
-        # fresh budget after iterate: reviewer ran once more and approved
-        self.assertEqual(rfn.calls["n"], cap + 1)
-        texts = [t for t, _k in banners]
-        # dissent banner used the dissent kind and the cap-reached header
-        self.assertTrue(any(k == "dissent" and "review cap reached" in t
-                            for t, k in banners))
-        # the badge counter climbed to the cap, then visibly reset to 1
-        self.assertIn("reviewed: changes requested (round %d/%d)" % (cap, cap),
-                      texts)
-        self.assertIn("reviewed: approved (round 1/%d)" % cap, texts)
-
-    def test_dissent_gate_tell_blank_falls_back_to_iterate(self):
-        import unittest.mock as mock
-        intel = self._intel()
-        sess = self._session(intel, [])
-        rfn = self._always_revise_fn()
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select",
-                                  return_value="tell"), \
-                mock.patch.object(cowork.ui, "prompt_user",
-                                  return_value="") as pu, \
-                mock.patch.object(cowork, "_read_review",
-                                  return_value=cowork._END):
-            rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                    io_in=FakeTTY(), io_out=FakeTTY(),
-                                    review_fn=rfn)
-        self.assertEqual(rc, 0)
-        pu.assert_called_once()
-        # blank instructions never approve: the reviewer handoff was injected
-        self.assertIn("[reviewer handoff]", sess.sent[-1])
-        self.assertEqual(rfn.calls["n"], cowork.REVIEW_ROUND_CAP + 1)
-
-    def test_dissent_gate_tell_sends_custom_instructions(self):
-        import unittest.mock as mock
-        intel = self._intel()
-        sess = self._session(intel, [])
-        rfn = self._always_revise_fn()
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select", return_value="tell"), \
-                mock.patch.object(cowork.ui, "prompt_user",
-                                  return_value="focus on the schema"), \
-                mock.patch.object(cowork, "_read_review",
-                                  return_value=cowork._END):
-            rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                    io_in=FakeTTY(), io_out=FakeTTY(),
-                                    review_fn=rfn)
-        self.assertEqual(rc, 0)
-        self.assertIn("focus on the schema", sess.sent)
-
-    def test_dissent_gate_approve_finishes(self):
-        import unittest.mock as mock
-        intel = self._intel()
-        cap = cowork.REVIEW_ROUND_CAP
-        sess = self._session(intel, [])
-        rfn = self._always_revise_fn()
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select",
-                                  return_value="approve"), \
-                mock.patch.object(cowork, "_read_review") as rr:
-            rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                    io_in=FakeTTY(), io_out=FakeTTY(),
-                                    review_fn=rfn)
-        self.assertEqual(rc, 0)
-        # approved straight from the dissent gate: no extra reviewer rounds,
-        # no plain approve gate
-        self.assertEqual(rfn.calls["n"], cap)
-        self.assertEqual(len(sess.sent), cap)  # seed + (cap-1) revise handoffs
-        rr.assert_not_called()
-
-
-class ClaudeSessionTtyTest(unittest.TestCase):
-    """On a TTY the claude reply streams into a render region (#5). The region is
-    injected so this test needs no real terminal or Rich."""
+class ClaudeSessionTranscriptTest(unittest.TestCase):
+    """The claude reply streams, in order, into the transcript stream (the
+    stream factory is injectable)."""
 
     class _Stdin:
         def write(self, s):
@@ -5781,7 +5450,7 @@ class ClaudeSessionTtyTest(unittest.TestCase):
     class _Proc:
         def __init__(self, lines):
             self.stdout = iter(lines)
-            self.stdin = ClaudeSessionTtyTest._Stdin()
+            self.stdin = ClaudeSessionTranscriptTest._Stdin()
 
         def poll(self):
             return 0
@@ -5866,103 +5535,16 @@ class ClaudeSessionTtyTest(unittest.TestCase):
             s.send("secret prompt")
 
         ui_events = [e for e in trace.events
-                     if e["event"].startswith("ui.markdown.")]
+                     if e["event"].startswith("transcript.stream.")]
         self.assertEqual([e["event"] for e in ui_events],
-                         ["ui.markdown.start", "ui.markdown.end"])
+                         ["transcript.stream.start", "transcript.stream.end"])
         self.assertEqual(ui_events[0]["controller"], "claude")
         self.assertEqual(ui_events[0]["role"], "scout")
-        self.assertEqual(ui_events[0]["renderer"], "raw")
         self.assertEqual(ui_events[1]["chunks"], 1)
         self.assertEqual(ui_events[1]["chars"], len(secret))
         dumped = json.dumps(trace.events)
         self.assertNotIn(secret, dumped)
         self.assertNotIn("secret prompt", dumped)
-
-    def test_tool_activity_drives_spinner_and_status(self):
-        # The loading-state contract: tool calls before the first token retitle
-        # the spinner; tool calls mid-stream show a status row in the region;
-        # text resuming clears it.
-        import unittest.mock as mock
-
-        class RecSpinner:
-            insts = []
-
-            def __init__(self, out, label="working"):
-                self.labels = [label]
-                self.stopped = False
-                RecSpinner.insts.append(self)
-
-            def start(self):
-                return self
-
-            def set_label(self, text):
-                self.labels.append(text)
-
-            def stop(self):
-                self.stopped = True
-
-        class FakeRegion:
-            log = []
-
-            def __init__(self, io_out, label):
-                self.buf = []
-                self.status_calls = []
-                self.clears = 0
-                FakeRegion.log.append(self)
-
-            def __enter__(self):
-                return self
-
-            def feed(self, chunk):
-                self.buf.append(chunk)
-
-            def set_status(self, text):
-                self.status_calls.append(text)
-
-            def clear_status(self):
-                self.clears += 1
-
-            def __exit__(self, *exc):
-                pass
-
-        def tool_use(name):
-            return json.dumps({"type": "stream_event", "event": {
-                "type": "content_block_start",
-                "content_block": {"type": "tool_use", "name": name}}})
-
-        def token(text):
-            return json.dumps({"type": "stream_event", "event": {
-                "delta": {"type": "text_delta", "text": text}}})
-
-        user = json.dumps({"type": "user", "message": {"content": []}})
-        lines = [
-            tool_use("Bash"),   # pre-token: spinner label flips
-            user,               # tool done: spinner back to working
-            token("hi"),        # region opens, spinner stops
-            tool_use("Grep"),   # mid-stream: status row
-            user,               # tool done: status back to working
-            token(" there"),    # text resumes: status cleared
-            json.dumps({"type": "result", "subtype": "success", "result": ""}),
-        ]
-        FakeRegion.log.clear()
-        RecSpinner.insts.clear()
-        with mock.patch.object(bridge.subprocess, "Popen",
-                               return_value=self._Proc(lines)), \
-                mock.patch.object(bridge.ui, "Spinner", RecSpinner):
-            s = bridge.ClaudeSession(
-                "roles/scout.md", "implement", True, io_out=FakeTTY(),
-                region_factory=FakeRegion)
-            s.send("go")
-        spin = RecSpinner.insts[0]
-        self.assertEqual(spin.labels, ["scout working", "scout using Bash",
-                                       "scout working"])
-        self.assertTrue(spin.stopped)
-        region = FakeRegion.log[0]
-        self.assertEqual("".join(region.buf), "hi there")
-        self.assertEqual(region.status_calls,
-                         ["scout using Grep…", "scout working…"])
-        self.assertEqual(region.clears, 1)  # cleared when text resumed
-
 
 # --------------------------------------------------------------------------- #
 # Live integration tests against the real claude / codex CLIs.                #
@@ -6357,8 +5939,8 @@ class PlannerLoopTest(unittest.TestCase):
                 self.closed = True
         return FakeSession()
 
-    def _run(self, plan_json, plan_md, sess, io_in, reviewer_runner=None,
-             handoff_confirm=None, selected=None):
+    def _run(self, plan_json, plan_md, sess, reviewer_runner=None,
+             selected=None):
         out = io.StringIO()
         outcomes = []
         config = cowork.default_config(
@@ -6366,36 +5948,14 @@ class PlannerLoopTest(unittest.TestCase):
         config["planner"]["controller"] = "codex"
         rc = cowork.run_planner(
             config, "seed", selected or ["scout", "planner", "planning-advisor"],
-            io_in=io_in, io_out=out,
+            io_out=out,
             plan_json_path=plan_json, plan_md_path=plan_md,
             review_path=os.path.join(os.path.dirname(plan_json),
                                      "planner-review.X.json"),
             session_factory=lambda *a, **k: sess,
             reviewer_runner=reviewer_runner,
-            handoff_confirm=handoff_confirm,
             on_outcome=lambda o, p: outcomes.append((o, p)))
         return rc, out.getvalue(), outcomes
-
-    def test_needs_input_then_ready_then_approve(self):
-        plan_json, plan_md = self._paths()
-        sess = self._session(plan_json, [{"status": "needs_input"},
-                                         {"status": "ready_for_review"}])
-        rfn_calls = []
-
-        def runner(config, context, selected, p, review_path, **kw):
-            rfn_calls.append(p)
-            return {"verdict": "approve"}
-
-        rc, text, outcomes = self._run(
-            plan_json, plan_md, sess, io.StringIO("answer\n\n"),
-            reviewer_runner=runner)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent[1], "answer")
-        self.assertIn("planner needs your input", text)
-        self.assertIn("plan ready for review", text)
-        self.assertIn("planner finished", text)
-        self.assertEqual(rfn_calls, [plan_json])     # advisor saw the plan JSON
-        self.assertEqual(outcomes, [("approved", None)])
 
     def test_advisor_revise_loops_then_user_gate(self):
         plan_json, plan_md = self._paths()
@@ -6408,7 +5968,7 @@ class PlannerLoopTest(unittest.TestCase):
             return verdicts.pop(0)
 
         rc, text, outcomes = self._run(
-            plan_json, plan_md, sess, io.StringIO(""), reviewer_runner=runner)
+            plan_json, plan_md, sess, reviewer_runner=runner)
         self.assertEqual(rc, 0)
         self.assertIn("[reviewer handoff]", sess.sent[1])
         # File-only transport: findings ride by review-file path, not embedded.
@@ -6421,61 +5981,62 @@ class PlannerLoopTest(unittest.TestCase):
         self.assertIn("reviewed: changes requested", text)
         self.assertEqual(outcomes, [("approved", None)])
 
-    def test_handoff_confirmed_returns_payload(self):
+    def test_needs_input_stops_with_the_question(self):
         plan_json, plan_md = self._paths()
-        sess = self._session(
-            plan_json, [{"status": "handoff_back", "handoff": "re-scout auth"}])
-        rc, text, outcomes = self._run(
-            plan_json, plan_md, sess, io.StringIO(""),
-            handoff_confirm=lambda io_in, io_out: True)
+        sess = self._session(plan_json, [{"status": "needs_input"},
+                                         {"status": "ready_for_review"}])
+        rc, text, outcomes = self._run(plan_json, plan_md, sess)
         self.assertEqual(rc, 0)
-        self.assertIn("hand the work back to the scout", text)
-        self.assertIn("re-scout auth", text)        # payload shown at the gate
-        self.assertEqual(outcomes, [("handoff", "re-scout auth")])
-        self.assertTrue(sess.closed)
+        self.assertEqual(len(sess.sent), 1)
+        self.assertIn("planner needs input", text)
+        self.assertNotIn("planner finished", text)
+        (outcome, payload), = outcomes
+        self.assertEqual(outcome, "stopped")
+        self.assertEqual(payload["kind"], "needs_input")
+        self.assertEqual(payload["question"],
+                         "What input should the planner use?")
 
-    def test_handoff_declined_continues_planning(self):
+    def test_unauthorized_handoff_stops_with_the_request(self):
         plan_json, plan_md = self._paths()
         sess = self._session(
             plan_json, [{"status": "handoff_back", "handoff": "re-scout auth"},
                         {"status": "ready_for_review"}])
-
-        def runner(config, context, selected, p, review_path, **kw):
-            return {"verdict": "approve"}
-
-        rc, text, outcomes = self._run(
-            plan_json, plan_md, sess, io.StringIO(""),
-            reviewer_runner=runner,
-            handoff_confirm=lambda io_in, io_out: False)
+        rc, text, outcomes = self._run(plan_json, plan_md, sess)
         self.assertEqual(rc, 0)
-        # the declined note was injected as the planner's next turn...
-        self.assertIn("DECLINED", sess.sent[1])
-        # ...the stale handoff_back was downgraded before that turn ran
-        self.assertEqual(outcomes, [("approved", None)])
+        self.assertEqual(len(sess.sent), 1)     # never auto-declined and resent
+        (outcome, payload), = outcomes
+        self.assertEqual(outcome, "stopped")
+        self.assertEqual(payload["kind"], "handoff_requested")
+        self.assertEqual(payload["requires"], "authorization")
+        self.assertEqual(payload["to_role"], "scout")
+        self.assertEqual(payload["payload_digest"],
+                         cowork._handoff_request_digest("re-scout auth"))
+        self.assertNotIn("handoff", [o for o, _p in outcomes])
+        with open(plan_json) as fh:             # the request is left in place
+            self.assertEqual(json.load(fh)["status"], "handoff_back")
 
-    def test_handoff_without_payload_degrades_to_needs_input(self):
+    def test_handoff_without_payload_stops_as_needs_input(self):
         plan_json, plan_md = self._paths()
-        sess = self._session(
-            plan_json,
-            [{"status": "handoff_back"}, {"status": "needs_input"}])
-        gates = []
-        rc, text, outcomes = self._run(
-            plan_json, plan_md, sess, io.StringIO(""),  # EOF ends after gate
-            handoff_confirm=lambda io_in, io_out: gates.append(True) or True)
+        # payload-less hand-back -> one missing-question repair -> the role
+        # records its question -> the phase stops.
+        sess = self._session(plan_json, [{"status": "handoff_back"},
+                                         {"status": "needs_input"}])
+        rc, text, outcomes = self._run(plan_json, plan_md, sess)
         self.assertEqual(rc, 0)
-        self.assertEqual(gates, [])                     # gate never shown
-        self.assertIn("planner needs your input", text)
-        self.assertEqual(outcomes, [("ended", None)])
+        self.assertEqual(outcomes[0][0], "stopped")
+        self.assertEqual(outcomes[0][1]["kind"], "needs_input")
 
-    def test_no_advisor_on_team_skips_review(self):
+    def test_no_advisor_on_team_is_never_approved(self):
         plan_json, plan_md = self._paths()
         sess = self._session(plan_json, [{"status": "ready_for_review"}])
         rc, text, outcomes = self._run(
-            plan_json, plan_md, sess, io.StringIO(""),
-            selected=["scout", "planner"])
+            plan_json, plan_md, sess, selected=["scout", "planner"])
         self.assertEqual(rc, 0)
         self.assertNotIn("reviewed", text)
-        self.assertEqual(outcomes, [("approved", None)])
+        self.assertNotIn("planner finished", text)
+        # An absent reviewer is a failure, not an authority wait.
+        self.assertEqual(outcomes[0][0], "ended")
+        self.assertEqual(outcomes[0][1]["kind"], "reviewer_absent")
 
 
 class PlannerSeedTest(unittest.TestCase):
@@ -6589,10 +6150,10 @@ class SwitchControllerFlowTest(unittest.TestCase):
     def _saved_planning_session(self):
         spath = self._tmp_session()
         state = state_store.ensure_session(spath, None, "SWITCH-S")
-        cfg = cowork.default_config(
-            ["scout", "planner", cowork.PLANNING_ADVISOR])
+        team = ["scout", "scout-reviewer", "planner", cowork.PLANNING_ADVISOR]
+        cfg = cowork.default_config(team)
         state = state_store.save_config(
-            spath, ["scout", "planner", cowork.PLANNING_ADVISOR],
+            spath, team,
             cfg, prior=state)
         state = state_store.save_phase(spath, "planning", prior=state)
         state = state_store.save_role_session(
@@ -6604,6 +6165,35 @@ class SwitchControllerFlowTest(unittest.TestCase):
             json.dump({"status": "ready_for_review",
                        "result": {"finding": "keep"}}, fh)
         return spath
+
+    def test_pending_switch_resume_with_new_context_delivers_both(self):
+        # Regression: a resume that both carries a pending controller switch
+        # and redirects with --context used to raise TypeError composing the
+        # typed switch packet with the raw context seed.
+        spath = self._saved_planning_session()
+        state_store.switch_role_controller(
+            spath, "planner", "codex", prior=state_store.load(spath),
+            reason="cli", source="cli")
+        calls = []
+
+        def fake_planner(config, context, selected, on_outcome=None, **kw):
+            calls.append(context)
+            if kw.get("on_first_send_accepted"):
+                kw["on_first_send_accepted"]()
+            on_outcome("approved", None)
+            return 0
+
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath,
+                        "--context", "REDIRECTED-GOAL"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("[controller switch handoff]", calls[0])
+        # The redirected context rides by path in the switch packet.
+        self.assertNotIn("REDIRECTED-GOAL", calls[0])
+        self.assertIn("context.rev1.md", calls[0])
 
     def test_switch_controller_parser_rejects_invalid_role_and_controller(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -6634,7 +6224,7 @@ class SwitchControllerFlowTest(unittest.TestCase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                         "--switch-controller", "planner=codex"]),
-            io_in=io.StringIO(), io_out=out,
+            io_out=out,
             which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
 
         self.assertEqual(rc, 0)
@@ -6693,14 +6283,11 @@ class SwitchControllerFlowTest(unittest.TestCase):
                 on_outcome("approved", None)
             return 0
 
-        with mock.patch.object(
-                cowork, "gather_context_interactive",
-                side_effect=AssertionError("saved switch must not ask a new goal")):
-            rc = cowork.run_flow(
-                self._args(["--session-file", spath]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
-                which=lambda c: "/bin/" + c,
-                run_planner_fn=fake_planner)
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath]),
+            io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c,
+            run_planner_fn=fake_planner)
 
         self.assertEqual(rc, 0)
         self.assertEqual(len(calls), 1)
@@ -6717,49 +6304,13 @@ class SwitchControllerFlowTest(unittest.TestCase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                         "--switch-controller", "scout=codex"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            io_out=out, which=lambda c: "/bin/" + c,
             run_planner_fn=lambda *a, **k: 0)
         self.assertEqual(rc, 2)
         self.assertIn("not switchable in the current planning phase",
                       out.getvalue())
         self.assertEqual(state_store.load(spath)["config"], before["config"])
         self.assertEqual(state_store.load(spath)["sessions"], before["sessions"])
-
-    def test_missing_active_controller_reaches_switch_gate_before_launch(self):
-        spath = self._tmp_session()
-        state = state_store.ensure_session(spath, None, "SWITCH-MISSING")
-        cfg = cowork.default_config(["scout"])
-        state = state_store.save_config(spath, ["scout"], cfg, prior=state)
-        state_store.save_phase(spath, "scouting", prior=state)
-        calls = []
-
-        def fake_scout(config, context, selected, on_session=None,
-                       on_outcome=None, **kw):
-            calls.append({"config": config, "context": context})
-            if kw.get("on_first_send_accepted"):
-                kw["on_first_send_accepted"]()
-            if on_session:
-                on_session("codex", "scout-codex-thread")
-            if on_outcome:
-                on_outcome("ended")
-            return 0
-
-        def which(cmd):
-            return None if cmd == "claude" else "/bin/" + cmd
-
-        rc = cowork.run_flow(
-            self._args(["--session-file", spath]),
-            io_in=io.StringIO("switch\n"), io_out=io.StringIO(),
-            which=which, run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["config"]["scout"]["controller"], "codex")
-        self.assertIn("[controller switch handoff]", calls[0]["context"])
-        saved = state_store.load(spath)
-        self.assertEqual(saved["config"]["scout"]["controller"], "codex")
-        self.assertEqual(
-            state_store.get_role_session(saved, "scout", "codex"),
-            "scout-codex-thread")
 
     def test_cli_switch_rejects_incompatible_flags_without_mutation(self):
         spath = self._saved_planning_session()
@@ -6770,7 +6321,7 @@ class SwitchControllerFlowTest(unittest.TestCase):
             ["--session-file", spath, "--switch-controller", "planner=codex",
              "--new"],
             ["--session-file", spath, "--switch-controller", "planner=codex",
-             "--team", "planner"],
+             "--team", "planner,planning-advisor"],
             ["--session-file", spath, "--switch-controller", "planner=codex",
              "--config", "planner=codex"],
         ]
@@ -6778,11 +6329,13 @@ class SwitchControllerFlowTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 out = io.StringIO()
                 rc = cowork.run_flow(
-                    self._args(argv), io_in=io.StringIO(), io_out=out,
+                    self._args(argv), io_out=out,
                     which=lambda c: "/bin/" + c,
                     run_planner_fn=lambda *a, **k: 0)
                 self.assertEqual(rc, 2)
-                self.assertIn("cannot be combined", out.getvalue())
+                self.assertRegex(out.getvalue(),
+                                 "cannot be combined|conflicting session "
+                                 "selectors")
                 self.assertEqual(state_store.load(spath)["config"],
                                  before["config"])
                 self.assertEqual(state_store.load(spath)["sessions"],
@@ -6808,21 +6361,21 @@ class SwitchControllerFlowTest(unittest.TestCase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                         "--switch-controller", "planner=codex"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+            io_out=out, which=lambda c: "/bin/" + c)
         self.assertEqual(rc, 2)
         self.assertIn("requires a saved session", out.getvalue())
 
         spath = self._tmp_session()
         state = state_store.ensure_session(spath, None, "NO-ROLE")
-        cfg = cowork.default_config(["scout", "planner"])
+        cfg = cowork.default_config(["scout", "scout-reviewer", "planner", "planning-advisor"])
         state = state_store.save_config(
-            spath, ["scout", "planner"], cfg, prior=state)
+            spath, ["scout", "scout-reviewer", "planner", "planning-advisor"], cfg, prior=state)
         state_store.save_phase(spath, "planning", prior=state)
         out = io.StringIO()
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
-                        "--switch-controller", "planning-advisor=codex"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                        "--switch-controller", "builder=codex"]),
+            io_out=out, which=lambda c: "/bin/" + c,
             run_planner_fn=lambda *a, **k: 0)
         self.assertEqual(rc, 2)
         self.assertIn("not on the saved team", out.getvalue())
@@ -6838,7 +6391,7 @@ class SwitchControllerFlowTest(unittest.TestCase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                         "--switch-controller", "planner=codex"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+            io_out=out, which=lambda c: "/bin/" + c)
         self.assertEqual(rc, 2)
         self.assertIn("not a loadable cowork session", out.getvalue())
         with open(spath, "r") as fh:
@@ -6854,19 +6407,20 @@ class SwitchControllerFlowTest(unittest.TestCase):
             out = io.StringIO()
             rc = cowork.run_flow(
                 self._args(["--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+                io_out=out, which=lambda c: "/bin/" + c)
             self.assertEqual(rc, 2)
-            self.assertIn("no saved sessions", out.getvalue())
+            self.assertIn("name it with --session-file", out.getvalue())
 
+            # Saved sessions exist: still never picked implicitly.
             for sid in ("S1", "S2"):
                 state_store.ensure_session(
                     state_store.new_session_path(cwd, sid), None, sid)
             out = io.StringIO()
             rc = cowork.run_flow(
                 self._args(["--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+                io_out=out, which=lambda c: "/bin/" + c)
             self.assertEqual(rc, 2)
-            self.assertIn("multiple saved sessions", out.getvalue())
+            self.assertIn("name it with --session-file", out.getvalue())
         finally:
             os.chdir(prev)
 
@@ -6881,7 +6435,7 @@ class SwitchControllerFlowTest(unittest.TestCase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                         "--switch-controller", "planner=codex"]),
-            io_in=io.StringIO(), io_out=out, which=which,
+            io_out=out, which=which,
             run_planner_fn=lambda *a, **k: 0)
         self.assertEqual(rc, 1)
         self.assertIn("cannot switch planner to codex", out.getvalue())
@@ -6889,102 +6443,6 @@ class SwitchControllerFlowTest(unittest.TestCase):
         self.assertEqual(saved["config"], before["config"])
         self.assertEqual(saved["sessions"], before["sessions"])
         self.assertIsNone(state_store.read_pending_switch(saved, "planner"))
-
-    def test_lead_startup_failure_can_switch_and_relaunch_same_phase(self):
-        spath = self._saved_planning_session()
-        calls = []
-
-        def fake_planner(config, context, selected, on_session=None,
-                         on_outcome=None, **kw):
-            calls.append({"controller": config["planner"]["controller"],
-                          "context": context})
-            if len(calls) == 1:
-                return 1  # models startup/probe failure in the active controller
-            if kw.get("on_first_send_accepted"):
-                kw["on_first_send_accepted"]()
-            if on_session:
-                on_session("codex", "after-startup-switch")
-            if on_outcome:
-                on_outcome("approved", None)
-            return 0
-
-        rc = cowork.run_flow(
-            self._args(["--session-file", spath]),
-            io_in=io.StringIO("switch\n"), io_out=io.StringIO(),
-            which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
-        self.assertEqual(rc, 0)
-        self.assertEqual([c["controller"] for c in calls], ["claude", "codex"])
-        self.assertIn("[controller switch handoff]", calls[1]["context"])
-        self.assertEqual(
-            state_store.get_role_session(
-                state_store.load(spath), "planner", "codex"),
-            "after-startup-switch")
-
-    def test_cli_switch_resume_picker_targets_selected_session(self):
-        import tempfile
-        import unittest.mock as mock
-        cwd = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(cwd, ignore_errors=True))
-        prev = os.getcwd()
-        os.chdir(cwd)
-        try:
-            paths = []
-            for sid in ("PICK-1", "PICK-2"):
-                spath = state_store.new_session_path(cwd, sid)
-                paths.append(spath)
-                state = state_store.ensure_session(spath, None, sid)
-                cfg = cowork.default_config(
-                    ["scout", "planner", cowork.PLANNING_ADVISOR])
-                state = state_store.save_config(
-                    spath, ["scout", "planner", cowork.PLANNING_ADVISOR],
-                    cfg, prior=state)
-                state = state_store.save_phase(spath, "planning", prior=state)
-                state_store.save_role_session(
-                    spath, "planner", "claude", "old-" + sid, prior=state)
-                intel = os.path.join(state_store.session_assets_dir(sid),
-                                     "scout.intel.json")
-                os.makedirs(os.path.dirname(intel), exist_ok=True)
-                with open(intel, "w") as fh:
-                    json.dump({"status": "ready_for_review",
-                               "result": {"session": sid}}, fh)
-
-            calls = []
-
-            def fake_planner(config, context, selected, on_session=None,
-                             on_outcome=None, **kw):
-                calls.append(context)
-                if kw.get("on_first_send_accepted"):
-                    kw["on_first_send_accepted"]()
-                if on_session:
-                    on_session("codex", "picked-thread")
-                if on_outcome:
-                    on_outcome("approved", None)
-                return 0
-
-            with mock.patch.object(cowork.ui, "select", return_value=paths[1]):
-                rc = cowork.run_flow(
-                    self._args(["--resume", "--switch-controller",
-                                "planner=codex"]),
-                    io_in=FakeTTY(), io_out=FakeTTY(),
-                    which=lambda c: "/bin/" + c,
-                    run_planner_fn=fake_planner)
-            self.assertEqual(rc, 0)
-            self.assertEqual(len(calls), 1)
-            # File-only transport: the intel body is not embedded; the selected
-            # session (PICK-2) is identified by its intel FILE path.
-            self.assertNotIn('"session": "PICK-2"', calls[0])
-            self.assertIn(os.path.join("PICK-2", "scout.intel.json"), calls[0])
-            self.assertEqual(
-                state_store.get_role_session(
-                    state_store.load(paths[1]), "planner", "codex"),
-                "picked-thread")
-            self.assertEqual(
-                state_store.get_role_session(
-                    state_store.load(paths[0]), "planner", "claude"),
-                "old-PICK-1")
-        finally:
-            os.chdir(prev)
-
 
 class PhaseChainFlowTest(unittest.TestCase):
     """run_flow phase loop: chaining, hand-back round trip, resume, refusal."""
@@ -7107,11 +6565,11 @@ class PhaseChainFlowTest(unittest.TestCase):
         calls, fake_scout, fake_planner = self._fakes(
             ["ended"], [("approved", None)])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor",
                         "--context", "x", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls["planner"]), 0)
         self.assertEqual(state_store.get_phase(state_store.load(spath)),
                          "scouting")
@@ -7123,11 +6581,11 @@ class PhaseChainFlowTest(unittest.TestCase):
         spath = self._tmp_session()
         calls, fake_scout, _ = self._fakes(["ended"], [])
         rc = cowork.run_flow(
-            self._args(["--team", "scout", "--context", "do x",
+            self._args(["--team", "scout,scout-reviewer", "--context", "do x",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         seed = calls["scout"][0]["context"]
         self.assertIn("Repository discovery", seed)
         self.assertIn(os.getcwd(), seed)               # base is the launch folder
@@ -7139,16 +6597,16 @@ class PhaseChainFlowTest(unittest.TestCase):
         spath = self._tmp_session()
         calls, fake_scout, _ = self._fakes(["ended", "ended"], [])
         rc = cowork.run_flow(
-            self._args(["--team", "scout", "--context", "x",
+            self._args(["--team", "scout,scout-reviewer", "--context", "x",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         rc = cowork.run_flow(  # resume, no --context
-            self._args(["--team", "scout", "--session-file", spath]),
+            self._args(["--team", "scout,scout-reviewer", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(calls["scout"][1]["resume_id"], "scout-1")
         self.assertIn("Repository discovery", calls["scout"][1]["context"])
 
@@ -7212,12 +6670,12 @@ class PhaseChainFlowTest(unittest.TestCase):
 
         out = io.StringIO()
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner,builder",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor,builder,build-reviewer",
                         "--context", "x", "--session-file", spath]),
             io_out=out, which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner,
             run_builder_fn=fake_builder)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         # one snapshot per selected root, in plan order
         self.assertEqual(base_calls, [repoA, repoB, repoC])
         # per-root has_head flag threaded to the reviewer
@@ -7238,7 +6696,10 @@ class PhaseChainFlowTest(unittest.TestCase):
         spath = self._tmp_session()
         calls, fake_scout, fake_planner = self._fakes(
             ["approved", "approved"],
-            [("handoff", "narrow scope to auth"), ("approved", None)])
+            [("stopped", cowork._agent_stop_payload(
+                "handoff_requested", "planner", requires="authorization",
+                handoff="narrow scope to auth", to_role="scout")),
+             ("approved", None)])
         state_store.ensure_session(spath, None, "S")
         intel = os.path.join(state_store.session_assets_dir("S"),
                              "scout.intel.json")
@@ -7247,8 +6708,14 @@ class PhaseChainFlowTest(unittest.TestCase):
             json.dump({"status": "ready_for_review", "result": {}}, fh)
 
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor",
                         "--context", "x", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        rid = state_store.read_decision_request("S")["request_id"]
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--authorize-handoff", rid]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
         self.assertEqual(rc, 0)
@@ -7286,14 +6753,16 @@ class PhaseChainFlowTest(unittest.TestCase):
             spath, "planner", "claude", "planner-9", prior=state)
         calls, fake_scout, fake_planner = self._fakes([], [("approved", None)])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner", "--session-file", spath]),
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
         self.assertEqual(rc, 0)
         self.assertEqual(len(calls["scout"]), 0)     # no scout run, no prompt
         self.assertEqual(len(calls["planner"]), 1)
         self.assertEqual(calls["planner"][0]["resume_id"], "planner-9")
-        self.assertEqual(calls["planner"][0]["context"], "")  # auto-continue
+        # auto-continue: only the runtime agent-session note rides the seed
+        self.assertEqual(calls["planner"][0]["context"],
+                         cowork.AGENT_LEAD_NOTE)
 
     def test_fresh_planner_without_scout_is_refused(self):
         out = io.StringIO()
@@ -7302,17 +6771,16 @@ class PhaseChainFlowTest(unittest.TestCase):
                         "--context", "x", "--no-session"]),
             io_out=out, which=lambda c: "/bin/" + c,
             run_scout_fn=lambda *a, **k: 0,
-            run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+            run_planner_fn=lambda *a, **k: self.fail("planner must not run"))
+        self.assertEqual(rc, 2)
         self.assertIn("scout not selected", out.getvalue())
-        self.assertIn("Planning requires approved scout intel", out.getvalue())
 
     def test_team_without_planner_keeps_terminal_scout(self):
         spath = self._tmp_session()
         calls, fake_scout, fake_planner = self._fakes(
             ["approved"], [("approved", None)])
         rc = cowork.run_flow(
-            self._args(["--team", "scout", "--context", "x",
+            self._args(["--team", "scout,scout-reviewer", "--context", "x",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
@@ -7337,22 +6805,31 @@ class PhaseChainFlowTest(unittest.TestCase):
         state = state_store.mark_context_seen(spath, "scout", 1, prior=state)
         state = state_store.mark_context_seen(spath, "planner", 1, prior=state)
         calls, fake_scout, fake_planner = self._fakes(
-            ["ended"], [("handoff", "re-scope auth")])
+            ["ended"], [("stopped", cowork._agent_stop_payload(
+                "handoff_requested", "planner", requires="authorization",
+                handoff="re-scope auth", to_role="scout"))])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor",
                         "--context", "new direction", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        rid = state_store.read_decision_request(
+            state_store.get_session_uuid(state_store.load(spath)))["request_id"]
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--authorize-handoff", rid]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 1)
         # planner (resumed, unacked rev 2) got the new context as a wake block,
         # file-only (context by path, not inline).
-        self.assertIn("New user context was provided",
+        self.assertIn("New orchestrator context was provided",
                       calls["planner"][0]["context"])
         self.assertIn("context.rev2.md", calls["planner"][0]["context"])
         self.assertNotIn("new direction", calls["planner"][0]["context"])
         # scout got BOTH the unseen revision and the handoff payload, by path
         scout_ctx = calls["scout"][0]["context"]
-        self.assertIn("New user context was provided", scout_ctx)
+        self.assertIn("New orchestrator context was provided", scout_ctx)
         self.assertIn("context.rev2.md", scout_ctx)
         self.assertNotIn("new direction", scout_ctx)
         self.assertNotIn("re-scope auth", scout_ctx)
@@ -7379,7 +6856,7 @@ class PhaseChainFlowTest(unittest.TestCase):
                        "result": {"finding": "F1"}}, fh)
         calls, fake_scout, fake_planner = self._fakes([], [("approved", None)])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner", "--session-file", spath]),
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
         self.assertEqual(rc, 0)
@@ -7396,7 +6873,7 @@ class PhaseChainFlowTest(unittest.TestCase):
         calls, fake_scout, fake_planner = self._fakes(
             ["approved"], [("approved", None)])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner", "--context", "x",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor", "--context", "x",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout, run_planner_fn=fake_planner)
@@ -7673,7 +7150,7 @@ class EvalPromptTest(unittest.TestCase):
         self.assertIn("accuracy of findings", prompt)
         self.assertIn("VERDICT-JSON-HERE", prompt)
         self.assertIn("enhancement_suggestions", prompt)
-        self.assertIn("never mention this evaluation to the user", prompt)
+        self.assertIn("never mention this evaluation in your reply", prompt)
         self.assertIn("never read any other role's evaluation file", prompt)
 
     def test_prompt_bundles_multiple_specs(self):
@@ -8011,8 +7488,7 @@ class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
         sess = self._session(intel, ["ready_for_review", "ready_for_review"])
         efn = self._recording_eval()
         rc = cowork._scout_loop(
-            sess, "seed", intel, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(),
+            sess, "seed", intel, context="", io_out=io.StringIO(),
             review_fn=self._review_fn([
                 {"verdict": "revise", "findings": ["gap"]},
                 {"verdict": "approve"}]),
@@ -8025,8 +7501,7 @@ class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
         sess = self._session(intel, ["ready_for_review", "needs_input"])
         efn = self._recording_eval()
         cowork._scout_loop(
-            sess, "seed", intel, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(),
+            sess, "seed", intel, context="", io_out=io.StringIO(),
             review_fn=self._review_fn([
                 {"verdict": "needs_user", "user_question": "scope?"}]),
             evaluate_fn=efn)
@@ -8038,8 +7513,7 @@ class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
         sess = self._session(intel, ["ready_for_review"] * (cap + 1))
         efn = self._recording_eval()
         cowork._scout_loop(
-            sess, "seed", intel, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(),
+            sess, "seed", intel, context="", io_out=io.StringIO(),
             review_fn=self._review_fn(
                 [{"verdict": "revise", "findings": ["no"]}] * (cap + 1)),
             evaluate_fn=efn)
@@ -8058,8 +7532,7 @@ class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
             sess = self._session(intel, list(statuses))
             out = io.StringIO()
             rc = cowork._scout_loop(
-                sess, "seed", intel, context="", io_in=io.StringIO(""),
-                io_out=out, review_fn=self._review_fn(list(verdicts)),
+                sess, "seed", intel, context="", io_out=out, review_fn=self._review_fn(list(verdicts)),
                 trace=trace, evaluate_fn=evaluate_fn)
             return rc, sess, out.getvalue()
 
@@ -8114,8 +7587,7 @@ class RoleLoopEvalTest(_EvalEnvMixin, unittest.TestCase):
             "scout", "scout-reviewer", "scouting", scratch,
             state_store.scores_path_for("X"), "X")
         rc = cowork._scout_loop(
-            sess, "seed", intel, context="", io_in=io.StringIO(""),
-            io_out=out, review_fn=self._review_fn([{"verdict": "approve"}]),
+            sess, "seed", intel, context="", io_out=out, review_fn=self._review_fn([{"verdict": "approve"}]),
             evaluate_fn=efn)
         self.assertEqual(rc, 0)
         text = out.getvalue()
@@ -8483,7 +7955,7 @@ class EvalEndToEndTest(_EvalEnvMixin, unittest.TestCase):
         out = io.StringIO()
         rc = cowork.run_scout(
             config, "the goal", ["scout", "scout-reviewer"],
-            io_in=io.StringIO(""), io_out=out, intel_path=intel,
+            io_out=out, intel_path=intel,
             session_factory=factory, review_path=review,
             reviewer_runner=reviewer_runner,
             eval_scratch_path=scout_scratch,
@@ -8572,7 +8044,7 @@ class EvalEndToEndTest(_EvalEnvMixin, unittest.TestCase):
         outcomes = []
         rc = cowork.run_planner(
             config, "seed", ["planner", "planning-advisor"],
-            io_in=io.StringIO(""), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             plan_json_path=plan_json, plan_md_path=plan_md,
             session_factory=factory, review_path=review,
             reviewer_runner=reviewer_runner,
@@ -8979,71 +8451,21 @@ class BuilderLoopTest(unittest.TestCase):
                 self.closed = True
         return FakeSession()
 
-    def _run(self, status_path, review_path, pj, pm, sess, io_in,
-             reviewer_runner=None, handoff_confirm=None, selected=None):
+    def _run(self, status_path, review_path, pj, pm, sess,
+             reviewer_runner=None, selected=None):
         out = io.StringIO()
         outcomes = []
         selected = selected or ["builder", "build-reviewer"]
         config = cowork.default_config(selected)
         config["builder"]["controller"] = "codex"
         rc = cowork.run_builder(
-            config, "seed", selected, io_in=io_in, io_out=out,
+            config, "seed", selected, io_out=out,
             build_status_path=status_path, build_review_path=review_path,
             plan_json_path=pj, plan_md_path=pm,
             session_factory=lambda *a, **k: sess,
             reviewer_runner=reviewer_runner,
-            handoff_confirm=handoff_confirm,
             on_outcome=lambda o, p: outcomes.append((o, p)))
         return rc, out.getvalue(), outcomes
-
-    def test_tty_gate_is_binary_no_ask(self):
-        # The builder gate keeps its prior binary confirm contract on a TTY:
-        # the scout/planner-only 'Ask a question' path must NOT appear here.
-        import unittest.mock as mock
-        status, review, pj, pm = self._paths()
-        sess = self._session(status, [{"status": "ready_for_review"}])
-
-        def runner(config, context, selected, p, review_path, **kw):
-            return {"verdict": "approve"}
-
-        config = cowork.default_config(["builder", "build-reviewer"])
-        config["builder"]["controller"] = "codex"
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "confirm",
-                                  return_value=True) as conf, \
-                mock.patch.object(cowork.ui, "select") as sel:
-            rc = cowork.run_builder(
-                config, "seed", ["builder", "build-reviewer"],
-                io_in=FakeTTY(), io_out=FakeTTY(),
-                build_status_path=status, build_review_path=review,
-                plan_json_path=pj, plan_md_path=pm,
-                session_factory=lambda *a, **k: sess,
-                reviewer_runner=runner,
-                on_outcome=lambda o, p: None)
-        self.assertEqual(rc, 0)
-        conf.assert_called_once()        # binary approve gate
-        sel.assert_not_called()          # no 3-way ask gate for the builder
-
-    def test_needs_input_then_ready_then_approve(self):
-        status, review, pj, pm = self._paths()
-        sess = self._session(status, [{"status": "needs_input"},
-                                      {"status": "ready_for_review"}])
-        rfn_calls = []
-
-        def runner(config, context, selected, p, review_path, **kw):
-            rfn_calls.append(p)
-            return {"verdict": "approve"}
-
-        rc, text, outcomes = self._run(
-            status, review, pj, pm, sess, io.StringIO("answer\n\n"),
-            reviewer_runner=runner)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sess.sent[1], "answer")
-        self.assertIn("builder needs your input", text)
-        self.assertIn("build ready for review", text)
-        self.assertIn("builder finished", text)
-        self.assertEqual(rfn_calls, [status])     # reviewer saw the status file
-        self.assertEqual(outcomes, [("approved", None)])
 
     def test_reviewer_revise_loops_then_user_gate(self):
         status, review, pj, pm = self._paths()
@@ -9056,7 +8478,7 @@ class BuilderLoopTest(unittest.TestCase):
             return verdicts.pop(0)
 
         rc, text, outcomes = self._run(
-            status, review, pj, pm, sess, io.StringIO(), reviewer_runner=runner)
+            status, review, pj, pm, sess, reviewer_runner=runner)
         self.assertEqual(rc, 0)
         self.assertIn("[reviewer handoff]", sess.sent[1])
         # File-only transport: findings ride by review-file path, not embedded.
@@ -9068,32 +8490,34 @@ class BuilderLoopTest(unittest.TestCase):
         self.assertIn("reviewed: changes requested", text)
         self.assertEqual(outcomes, [("approved", None)])
 
-    def test_needs_user_relayed_in_builder_voice(self):
+    def test_needs_input_stops_with_the_question(self):
         status, review, pj, pm = self._paths()
-        # ready (reviewer needs_user) -> builder relays + writes needs_input ->
-        # user answers -> ready (reviewer approves).
-        sess = self._session(status, [{"status": "ready_for_review"},
-                                      {"status": "needs_input"},
-                                      {"status": "ready_for_review"}])
-        verdicts = [{"verdict": "needs_user",
-                     "user_question": "ship behind a flag or not?"},
-                    {"verdict": "approve"}]
+        sess = self._session(status, [{"status": "needs_input"}])
+        rc, text, outcomes = self._run(status, review, pj, pm, sess)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(sess.sent), 1)
+        self.assertIn("builder needs input", text)
+        (outcome, payload), = outcomes
+        self.assertEqual((outcome, payload["kind"]), ("stopped", "needs_input"))
+
+    def test_reviewer_question_stops_unapproved(self):
+        status, review, pj, pm = self._paths()
+        sess = self._session(status, [{"status": "ready_for_review"}])
 
         def runner(config, context, selected, p, review_path, **kw):
-            return verdicts.pop(0)
+            return {"verdict": "needs_user",
+                    "user_question": "ship behind a flag or not?"}
 
         rc, text, outcomes = self._run(
-            status, review, pj, pm, sess, io.StringIO("flag it\n"),
-            reviewer_runner=runner)
-        self.assertEqual(rc, 0)
-        # File-only transport: the reviewer's question rides by review-file path;
-        # the builder reads it and relays in its own voice.
-        self.assertNotIn("ship behind a flag or not?", sess.sent[1])
-        self.assertIn("review file", sess.sent[1])
-        self.assertIn("builder needs your input", text)
-        self.assertEqual(outcomes, [("approved", None)])
+            status, review, pj, pm, sess, reviewer_runner=runner)
+        self.assertEqual(len(sess.sent), 1)
+        (outcome, payload), = outcomes
+        self.assertEqual(outcome, "stopped")
+        self.assertEqual(payload["kind"], "reviewer_question")
+        self.assertEqual(payload["question"], "ship behind a flag or not?")
+        self.assertNotIn("builder finished", text)
 
-    def test_round_cap_falls_through_to_dissent_gate(self):
+    def test_round_cap_stops_unapproved(self):
         status, review, pj, pm = self._paths()
         sess = self._session(
             status, [{"status": "ready_for_review"}] * (cowork.REVIEW_ROUND_CAP
@@ -9102,63 +8526,50 @@ class BuilderLoopTest(unittest.TestCase):
         def runner(config, context, selected, p, review_path, **kw):
             return {"verdict": "revise", "findings": ["still wrong"]}
 
-        # off a TTY the dissent gate keeps the blank=finish contract
         rc, text, outcomes = self._run(
-            status, review, pj, pm, sess, io.StringIO("\n"),
-            reviewer_runner=runner)
+            status, review, pj, pm, sess, reviewer_runner=runner)
         self.assertEqual(rc, 0)
-        self.assertIn("review cap reached", text)
-        self.assertIn("still wrong", text)        # dissent notes shown to user
-        self.assertEqual(outcomes, [("approved", None)])
+        (outcome, payload), = outcomes
+        self.assertEqual((outcome, payload["kind"]),
+                         ("stopped", "review_round_cap"))
+        self.assertEqual(payload["findings"], ["still wrong"])
+        self.assertNotIn("builder finished", text)
 
-    def test_handoff_confirmed_returns_payload_and_names_planner(self):
+    def test_unauthorized_handoff_stops_naming_planner(self):
         status, review, pj, pm = self._paths()
         sess = self._session(
-            status, [{"status": "handoff_back",
-                      "handoff": "re-plan the schema"}])
-        prompts = []
-        rc, text, outcomes = self._run(
-            status, review, pj, pm, sess, io.StringIO(),
-            handoff_confirm=lambda io_in, io_out: prompts.append(True) or True)
-        self.assertEqual(rc, 0)
-        # the gate banner names the PLANNER (not the scout)
-        self.assertIn("hand the work back to the planner", text)
-        self.assertIn("re-plan the schema", text)
-        self.assertEqual(outcomes, [("handoff", "re-plan the schema")])
+            status, [{"status": "handoff_back", "handoff": "re-plan"}])
+        rc, text, outcomes = self._run(status, review, pj, pm, sess)
+        (outcome, payload), = outcomes
+        self.assertEqual((outcome, payload["kind"]),
+                         ("stopped", "handoff_requested"))
+        self.assertEqual(payload["to_role"], "planner")
+        self.assertEqual(len(sess.sent), 1)
 
-    def test_handoff_declined_names_planner_and_continues(self):
-        status, review, pj, pm = self._paths()
-        sess = self._session(
-            status, [{"status": "handoff_back", "handoff": "re-plan"},
-                     {"status": "ready_for_review"}])
-
-        def runner(config, context, selected, p, review_path, **kw):
-            return {"verdict": "approve"}
-
-        rc, text, outcomes = self._run(
-            status, review, pj, pm, sess, io.StringIO(),
-            reviewer_runner=runner,
-            handoff_confirm=lambda io_in, io_out: False)
-        self.assertEqual(rc, 0)
-        # the decline note injected into the builder names the PLANNER
-        self.assertIn("DECLINED", sess.sent[1])
-        self.assertIn("planner", sess.sent[1])
-        self.assertEqual(outcomes, [("approved", None)])
-
-    def test_no_reviewer_on_team_skips_review(self):
+    def test_no_reviewer_on_team_is_never_approved(self):
         status, review, pj, pm = self._paths()
         sess = self._session(status, [{"status": "ready_for_review"}])
         rc, text, outcomes = self._run(
-            status, review, pj, pm, sess, io.StringIO(),
-            selected=["builder"])
+            status, review, pj, pm, sess, selected=["builder"])
         self.assertEqual(rc, 0)
-        self.assertNotIn("reviewed", text)
-        self.assertEqual(outcomes, [("approved", None)])
+        self.assertNotIn("builder finished", text)
+        self.assertEqual(outcomes[0][0], "ended")
+        self.assertEqual(outcomes[0][1]["kind"], "reviewer_absent")
 
 
 class BuildPhaseFlowTest(unittest.TestCase):
     """run_flow planning -> building chaining, builder->planner hand-back round
     trip, resume cascades, and the builder-not-on-team notice."""
+
+    def setUp(self):
+        # Session assets (and decision requests) live under an isolated root,
+        # never the real ~/.cowork/sessions.
+        import unittest.mock as mock
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        env_patch = mock.patch.dict(os.environ, {"COWORK_SESSIONS_ROOT": root})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
     def _tmp_session(self):
         import tempfile
@@ -9229,7 +8640,7 @@ class BuildPhaseFlowTest(unittest.TestCase):
             ["approved"], [("approved", None)], [("approved", None)])
         rc = cowork.run_flow(
             self._args(["--team",
-                        "scout,planner,builder,build-reviewer",
+                        "scout,scout-reviewer,planner,planning-advisor,builder,build-reviewer",
                         "--context", "do it", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
@@ -9263,7 +8674,7 @@ class BuildPhaseFlowTest(unittest.TestCase):
             ["approved"], [("approved", None)], [])
         out = io.StringIO()
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor",
                         "--context", "x", "--session-file", spath]),
             io_out=out, which=lambda c: "/bin/" + c,
             run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
@@ -9279,10 +8690,22 @@ class BuildPhaseFlowTest(unittest.TestCase):
         calls, fs, fp, fb = self._fakes(
             ["approved"],
             [("approved", None), ("approved", None)],
-            [("handoff", "re-plan the data model"), ("approved", None)])
+            [("stopped", cowork._agent_stop_payload(
+                "handoff_requested", "builder", requires="authorization",
+                handoff="re-plan the data model", to_role="planner")),
+             ("approved", None)])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner,builder",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor,builder,build-reviewer",
                         "--context", "x", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
+        # The hand-back is an authority request: the run stops, and only an
+        # explicit orchestrator authorization bound to it executes it.
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        self.assertEqual(len(calls["planner"]), 1)
+        rid = state_store.read_decision_request("S")["request_id"]
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--authorize-handoff", rid]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
         self.assertEqual(rc, 0)
@@ -9305,14 +8728,15 @@ class BuildPhaseFlowTest(unittest.TestCase):
     def test_resume_into_building_without_builder_falls_back_to_planning(self):
         spath = self._tmp_session()
         state = state_store.save_config(
-            spath, ["scout", "planner", "planning-advisor"],
-            cowork.default_config(["scout", "planner", "planning-advisor"]))
+            spath, ["scout", "scout-reviewer", "planner", "planning-advisor"],
+            cowork.default_config(["scout", "scout-reviewer", "planner",
+                                   "planning-advisor"]))
         state = state_store.save_phase(spath, "building", prior=state)
         state = state_store.save_role_session(
             spath, "planner", "claude", "planner-9", prior=state)
         calls, fs, fp, fb = self._fakes([], [("approved", None)], [])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner,planning-advisor",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
@@ -9331,10 +8755,10 @@ class BuildPhaseFlowTest(unittest.TestCase):
             spath, "scout", "claude", "scout-9", prior=state)
         calls, fs, fp, fb = self._fakes([("ended")], [], [])
         rc = cowork.run_flow(
-            self._args(["--team", "scout", "--session-file", spath]),
+            self._args(["--team", "scout,scout-reviewer", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls["scout"]), 1)        # scout resumes
         self.assertEqual(calls["scout"][0]["resume_id"], "scout-9")
 
@@ -9350,7 +8774,8 @@ class BuildPhaseFlowTest(unittest.TestCase):
             self._args(["--team", "build-reviewer", "--session-file", spath]),
             io_out=out, which=lambda c: "/bin/" + c,
             run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 2)
+        self.assertEqual(calls, {"scout": [], "planner": [], "builder": []})
         self.assertIn("scout not selected", out.getvalue())
 
     def test_dirty_worktree_warns_and_passes_baseline_note(self):
@@ -9372,7 +8797,7 @@ class BuildPhaseFlowTest(unittest.TestCase):
         with mock.patch.object(cowork, "_git_build_baseline",
                                return_value=("deadbeefcafe1234", True)):
             rc = cowork.run_flow(
-                self._args(["--team", "scout,planner,builder",
+                self._args(["--team", "scout,scout-reviewer,planner,planning-advisor,builder,build-reviewer",
                             "--context", "x", "--session-file", spath]),
                 io_out=out, which=lambda c: "/bin/" + c,
                 run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fake_builder)
@@ -9386,6 +8811,13 @@ class BuildPhaseFlowTest(unittest.TestCase):
         # read from the process cwd (where builder/reviewer's git diff runs),
         # not from the session-file parent.
         import unittest.mock as mock
+        # A real git fixture repo as the process cwd, so the baseline source is
+        # independent of wherever the test runner happens to start.
+        repo = _init_git_repo()
+        self.addCleanup(shutil.rmtree, repo, True)
+        prev_cwd = os.getcwd()
+        os.chdir(repo)
+        self.addCleanup(os.chdir, prev_cwd)
         spath = self._tmp_session()       # a temp dir, far from cwd
         self._prime_intel_and_plan(spath, "S")
         calls, fs, fp, fb = self._fakes(
@@ -9398,7 +8830,7 @@ class BuildPhaseFlowTest(unittest.TestCase):
 
         with mock.patch.object(cowork, "_git_build_baseline", fake_baseline):
             rc = cowork.run_flow(
-                self._args(["--team", "scout,planner,builder",
+                self._args(["--team", "scout,scout-reviewer,planner,planning-advisor,builder,build-reviewer",
                             "--context", "x", "--session-file", spath]),
                 io_out=io.StringIO(), which=lambda c: "/bin/" + c,
                 run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
@@ -9419,7 +8851,7 @@ class BuildPhaseFlowTest(unittest.TestCase):
         state = state_store.save_phase(spath, "building", prior=state)
         calls, fs, fp, fb = self._fakes([], [], [("approved", None)])
         rc = cowork.run_flow(
-            self._args(["--team", "scout,planner,builder",
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor,builder,build-reviewer",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fs, run_planner_fn=fp, run_builder_fn=fb)
@@ -9549,7 +8981,7 @@ class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
 class ChannelParserTest(unittest.TestCase):
     def test_happy_path_splits_and_strips_markers(self):
         text = "before\n[[internal]]\nnote\n[[/internal]]\nafter\n"
-        segs, end = ui.split_channel_segments(text)
+        segs, end = transcript.split_channel_segments(text)
         self.assertEqual([c for c, _ in segs], ["user", "internal", "user"])
         joined = "".join(s for _c, s in segs)
         self.assertNotIn("[[internal]]", joined)
@@ -9561,23 +8993,23 @@ class ChannelParserTest(unittest.TestCase):
 
     def test_marker_free_is_byte_identical(self):
         for text in ("", "plain text", "a\n\nb\n", "line1\nline2"):
-            segs, end = ui.split_channel_segments(text)
+            segs, end = transcript.split_channel_segments(text)
             self.assertEqual("".join(s for _c, s in segs), text)
             self.assertFalse(end)
 
     def test_unclosed_block_reports_internal_end(self):
-        segs, end = ui.split_channel_segments("u\n[[internal]]\nstill open\n")
+        segs, end = transcript.split_channel_segments("u\n[[internal]]\nstill open\n")
         self.assertTrue(end)  # force-close is the caller's job (end of turn)
         self.assertEqual(segs[-1][0], "internal")
 
     def test_stray_close_and_double_open_are_noops(self):
         # stray close with no open: dropped, stays user.
-        segs, end = ui.split_channel_segments("[[/internal]]\nplain\n")
+        segs, end = transcript.split_channel_segments("[[/internal]]\nplain\n")
         self.assertEqual([c for c, _ in segs], ["user"])
         self.assertNotIn("[[/internal]]", "".join(s for _c, s in segs))
         self.assertFalse(end)
         # second open while already open: no-op (depth-1 boolean).
-        segs2, _ = ui.split_channel_segments(
+        segs2, _ = transcript.split_channel_segments(
             "[[internal]]\na\n[[internal]]\nb\n[[/internal]]\n")
         self.assertEqual([c for c, _ in segs2], ["internal"])
         self.assertIn("a", "".join(s for _c, s in segs2))
@@ -9586,25 +9018,25 @@ class ChannelParserTest(unittest.TestCase):
     def test_literal_marker_mid_line_is_verbatim(self):
         # Only a full line equal to the marker is control; mid-line is content.
         text = "talk about [[internal]] inline\n"
-        segs, _ = ui.split_channel_segments(text)
+        segs, _ = transcript.split_channel_segments(text)
         self.assertEqual(segs, [("user", text)])
 
     def test_internal_start_seeds_state(self):
-        segs, end = ui.split_channel_segments("carried\n", internal_start=True)
+        segs, end = transcript.split_channel_segments("carried\n", internal_start=True)
         self.assertEqual(segs[0][0], "internal")
         self.assertTrue(end)
 
 
 class StreamingChannelTest(unittest.TestCase):
-    def test_nontty_strips_marker_lines_plain(self):
+    def test_strips_marker_lines_plain(self):
         out = io.StringIO()
-        with ui.StreamingMarkdown(out, "scout › ") as r:
+        with transcript.TranscriptStream(out, "scout › ") as r:
             r.feed("hi\n[[internal]]\nsecret\n[[/internal]]\nbye\n")
         self.assertEqual(out.getvalue(), "\nscout › hi\nsecret\nbye\n\n")
 
-    def test_nontty_marker_split_across_chunks(self):
+    def test_marker_split_across_chunks(self):
         out = io.StringIO()
-        with ui.StreamingMarkdown(out, "scout › ") as r:
+        with transcript.TranscriptStream(out, "scout › ") as r:
             r.feed("before\n[[intern")          # marker split mid-line
             r.feed("al]]\nINSIDE\n[[/internal]]\nafter\n")
         text = out.getvalue()
@@ -9614,183 +9046,28 @@ class StreamingChannelTest(unittest.TestCase):
         self.assertIn("before", text)
         self.assertIn("after", text)
 
-    def test_nontty_marker_free_byte_identical(self):
+    def test_marker_free_byte_identical(self):
         out = io.StringIO()
-        with ui.StreamingMarkdown(out, "scout › ") as r:
+        with transcript.TranscriptStream(out, "scout › ") as r:
             r.feed("a\n\n")
             r.feed("b")
         self.assertEqual(out.getvalue(), "\nscout › a\n\nb\n")
 
     def test_fresh_region_starts_on_user_channel(self):
         # Channel state never carries across turns: a new region is fresh.
-        r = ui.StreamingMarkdown(io.StringIO(), "scout › ")
-        self.assertFalse(r._channel_internal)
-        self.assertFalse(r._nontty_internal)
+        r = transcript.TranscriptStream(io.StringIO(), "scout › ")
+        self.assertEqual(r._pending, "")
 
-    def test_internal_region_seeds_internal_state(self):
-        r = ui.StreamingMarkdown(io.StringIO(), "rev › ", internal=True)
-        self.assertTrue(r._channel_internal)
-
-    def test_internal_region_nontty_still_plain(self):
-        # Off a TTY there is no styling; an internal region writes plain text.
+class WriteReplyChannelTest(unittest.TestCase):
+    def test_strips_markers(self):
         out = io.StringIO()
-        with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
-            r.feed("verdict notes")
-        self.assertEqual(out.getvalue(), "\nrev › verdict notes\n")
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_internal_block_dimmed_markers_stripped(self):
-        import unittest.mock as mock
-        out = FakeTTY()
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            with ui.StreamingMarkdown(out, "scout › ") as r:
-                r.feed("user line\n\n[[internal]]\ninternal note\n"
-                       "[[/internal]]\n\ntail line\n")
-        text = out.getvalue()
-        self.assertNotIn("[[internal]]", text)
-        self.assertNotIn("[[/internal]]", text)
-        self.assertIn("internal note", text)
-        self.assertIn("user line", text)
-        self.assertIn("\x1b[2m", text)  # dim styling emitted for the block
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_internal_region_dims_whole_content(self):
-        import unittest.mock as mock
-        out = FakeTTY()
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
-                r.feed("wholly internal narration\n")
-        text = out.getvalue()
-        self.assertIn("wholly internal narration", text)
-        self.assertIn("\x1b[2m", text)
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_internal_region_strips_emitted_markers(self):
-        # Even a wholly-internal region must never render literal sentinels if
-        # the reviewer/advisor happens to emit them (contract: always stripped).
-        import unittest.mock as mock
-        out = FakeTTY()
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
-                r.feed("[[internal]]\nverdict body\n[[/internal]]\n")
-        text = out.getvalue()
-        self.assertNotIn("[[internal]]", text)
-        self.assertNotIn("[[/internal]]", text)
-        self.assertIn("verdict body", text)
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_marker_split_across_chunks_no_flash(self):
-        # A marker split mid-line must not flash half-matched in the live tail,
-        # and must be fully stripped from the final output.
-        import unittest.mock as mock
-        out = FakeTTY()
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            region = ui.StreamingMarkdown(out, "scout › ")
-            region.__enter__()
-            try:
-                region.feed("before\n[[intern")   # partial marker, no newline
-                region._live.refresh()             # force a live frame
-                # The partial sentinel is held, never shown half-matched.
-                self.assertNotIn("[[intern", out.getvalue())
-                region.feed("al]]\nINSIDE\n[[/internal]]\nafter\n")
-            finally:
-                region.__exit__(None, None, None)
-        text = out.getvalue()
-        self.assertNotIn("[[internal]]", text)
-        self.assertNotIn("[[/internal]]", text)
-        self.assertIn("INSIDE", text)
-        self.assertIn("after", text)
-
-
-class RenderMarkdownChannelTest(unittest.TestCase):
-    def test_nontty_strips_markers(self):
-        out = io.StringIO()
-        ui.render_markdown(out, "a\n[[internal]]\nb\n[[/internal]]\nc",
-                           enabled=False)
+        transcript.write_reply(out, "a\n[[internal]]\nb\n[[/internal]]\nc")
         self.assertEqual(out.getvalue(), "a\nb\nc\n")
 
-    def test_nontty_marker_free_byte_identical(self):
+    def test_marker_free_byte_identical(self):
         out = io.StringIO()
-        ui.render_markdown(out, "# hi\nbody", enabled=False)
+        transcript.write_reply(out, "# hi\nbody")
         self.assertEqual(out.getvalue(), "# hi\nbody\n")
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_inline_internal_block(self):
-        out = FakeTTY()
-        ui.render_markdown(out, "user\n\n[[internal]]\nnote\n[[/internal]]\n\nmore",
-                           enabled=True)
-        text = out.getvalue()
-        self.assertNotIn("[[internal]]", text)
-        self.assertIn("note", text)
-        self.assertIn("user", text)
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_internal_true_dims_whole(self):
-        import unittest.mock as mock
-        out = FakeTTY()
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            ui.render_markdown(out, "wholly internal", enabled=True, internal=True)
-        text = out.getvalue()
-        self.assertIn("internal", text)
-        self.assertIn("\x1b[2m", text)
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_tty_internal_true_strips_emitted_markers(self):
-        out = FakeTTY()
-        ui.render_markdown(out, "[[internal]]\nbody text\n[[/internal]]",
-                           enabled=True, internal=True)
-        text = out.getvalue()
-        self.assertNotIn("[[internal]]", text)
-        self.assertNotIn("[[/internal]]", text)
-        self.assertIn("body text", text)
-
-    def test_nontty_internal_true_strips_markers(self):
-        out = io.StringIO()
-        ui.render_markdown(out, "a\n[[internal]]\nb\n[[/internal]]\nc",
-                           enabled=False, internal=True)
-        self.assertEqual(out.getvalue(), "a\nb\nc\n")
-
-
-class CodexChannelPropagationTest(unittest.TestCase):
-    def test_internal_flag_reaches_render_markdown(self):
-        import unittest.mock as mock
-
-        class FakeProc:
-            def __init__(self, lines):
-                self.stdout = iter(lines)
-
-            def wait(self, timeout=None):
-                return 0
-
-            def poll(self):
-                return 0
-
-            def terminate(self):
-                pass
-
-            def kill(self):
-                pass
-
-        lines = [
-            json.dumps({"type": "thread.started", "thread_id": "T1"}),
-            json.dumps({"type": "item.completed",
-                        "item": {"type": "agent_message", "text": "verdict"}}),
-        ]
-        captured = {}
-
-        def fake_render(io_out, text, enabled=None, internal=False):
-            captured["internal"] = internal
-            captured["text"] = text
-
-        with mock.patch.object(bridge.subprocess, "Popen",
-                               return_value=FakeProc(lines)), \
-                mock.patch.object(bridge.ui, "render_markdown", fake_render):
-            s = bridge.CodexSession("implement", True, io_out=io.StringIO(),
-                                    speaker="scout-reviewer", internal=True)
-            s.send("review")
-        self.assertTrue(captured.get("internal"))  # propagated to render
-        self.assertEqual(captured["text"], "verdict")
-
 
 # --------------------------------------------------------------------------- #
 # Caveman compression directive injection (gated on caveman availability).      #
@@ -10021,188 +9298,49 @@ class PathDisplayTest(unittest.TestCase):
 
     def test_display_path_home_to_tilde(self):
         home = os.path.expanduser("~")
-        self.assertEqual(ui.display_path(os.path.join(home, ".cowork", "x")),
+        self.assertEqual(transcript.display_path(os.path.join(home, ".cowork", "x")),
                          os.path.join("~", ".cowork", "x"))
-        self.assertEqual(ui.display_path(home), "~")
-        self.assertEqual(ui.display_path("/tmp/elsewhere/x"), "/tmp/elsewhere/x")
-        self.assertEqual(ui.display_path(""), "")
+        self.assertEqual(transcript.display_path(home), "~")
+        self.assertEqual(transcript.display_path("/tmp/elsewhere/x"), "/tmp/elsewhere/x")
+        self.assertEqual(transcript.display_path(""), "")
 
     def test_shorten_path_home_rooted_tilde(self):
         home = os.path.expanduser("~")
         p = os.path.join(home, ".cowork", "sessions", "S", "planner.plan.md")
         # Outside cwd but under home -> ~ form, NOT '…/<basename>'.
-        self.assertEqual(ui.shorten_path(p, cwd="/some/other/dir"),
+        self.assertEqual(transcript.shorten_path(p, cwd="/some/other/dir"),
                          os.path.join("~", ".cowork", "sessions", "S",
                                       "planner.plan.md"))
 
     def test_shorten_path_under_cwd_relative(self):
         self.assertEqual(
-            ui.shorten_path("/tmp/work/.cowork/x.json", cwd="/tmp/work"),
+            transcript.shorten_path("/tmp/work/.cowork/x.json", cwd="/tmp/work"),
             ".cowork/x.json")
 
     def test_shorten_path_outside_home_and_cwd_basename(self):
         self.assertEqual(
-            ui.shorten_path("/var/data/x.json", cwd="/tmp/work"), "…/x.json")
-
-    def test_render_path_osc8_on_tty_plain_off(self):
-        home = os.path.expanduser("~")
-        p = os.path.join(home, ".cowork", "x")
-        tilde = os.path.join("~", ".cowork", "x")
-        # Off a TTY: just the short ~ form, no escape sequence.
-        self.assertEqual(ui.render_path(p, enabled=False), tilde)
-        # On a TTY: an OSC 8 hyperlink to file://<abs>, visible text = ~ form.
-        on = ui.render_path(p, enabled=True)
-        self.assertIn("\033]8;;file://" + os.path.abspath(p), on)
-        self.assertIn(tilde, on)
-        self.assertTrue(on.endswith("\033]8;;\033\\"))
+            transcript.shorten_path("/var/data/x.json", cwd="/tmp/work"), "…/x.json")
 
     def test_render_path_empty_passthrough(self):
-        self.assertEqual(ui.render_path("", enabled=True), "")
+        self.assertEqual(transcript.render_path(""), "")
 
     def test_raw_start_banner_renders_tilde(self):
         home = os.path.expanduser("~")
         p = os.path.join(home, ".cowork", "sessions", "S", "scout.intel.json")
         tilde = os.path.join("~", ".cowork", "sessions", "S", "scout.intel.json")
-        off = cowork.scout_start_text(p, enabled=False)
-        self.assertIn(tilde, off)
-        self.assertNotIn(os.path.join(home, ".cowork"), off)  # not the long path
-        on = cowork.scout_start_text(p, enabled=True)
-        self.assertIn("\033]8;;file://", on)
-        self.assertIn(tilde, on)
-
-    def test_stuck_gate_raw_banner_renders_tilde(self):
-        home = os.path.expanduser("~")
-        p = os.path.join(home, ".cowork", "sessions", "S", "builder.status.json")
-        tilde = os.path.join("~", ".cowork", "sessions", "S", "builder.status.json")
-        txt = cowork._stuck_gate_text(p, "builder", enabled=False)
-        self.assertIn(tilde, txt)
+        text = cowork.scout_start_text(p)
+        self.assertIn(tilde, text)
+        self.assertNotIn(os.path.join(home, ".cowork"), text)  # not the long path
+        self.assertNotIn("\033", text)                       # never escapes
 
     def test_review_done_banners_render_tilde(self):
         home = os.path.expanduser("~")
         p = os.path.join(home, ".cowork", "sessions", "S", "planner.plan.md")
         tilde = os.path.join("~", ".cowork", "sessions", "S", "planner.plan.md")
-        self.assertIn(tilde, cowork.planner_review_text(p, enabled=False))
+        self.assertIn(tilde, cowork.planner_review_text(p))
         self.assertIn(os.path.join("~", ".cowork", "b.json"),
                       cowork.builder_done_text(
-                          os.path.join(home, ".cowork", "b.json"),
-                          enabled=False))
-
-
-class InternalLeadInTest(unittest.TestCase):
-    """Item 2b: a surfaced internal block gets a faint lead-in gap on a TTY, and
-    is a no-op (byte-identical) off a TTY — on BOTH controller render paths."""
-
-    def test_lead_in_tty_emits_gap(self):
-        out = FakeTTY()
-        ui.internal_lead_in(out, True)
-        v = out.getvalue()
-        self.assertTrue(v.startswith("\n"))
-        self.assertIn("─", v)
-
-    def test_lead_in_off_tty_noop(self):
-        out = io.StringIO()
-        ui.internal_lead_in(out)  # auto-detects: not a TTY
-        self.assertEqual(out.getvalue(), "")
-
-    def test_streaming_internal_nontty_byte_identical(self):
-        # The claude path off a TTY is unchanged (no gap) — historical contract.
-        out = io.StringIO()
-        with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
-            r.feed("verdict notes")
-        self.assertEqual(out.getvalue(), "\nrev › verdict notes\n")
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_streaming_internal_tty_has_lead_in(self):
-        import unittest.mock as mock
-        out = FakeTTY()
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
-                r.feed("note\n")
-        text = out.getvalue()
-        self.assertIn("─", text)                       # lead-in rule present
-        self.assertLess(text.index("─"), text.index("rev"))  # above the label
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_streaming_user_tty_has_no_lead_in(self):
-        import unittest.mock as mock
-        out = FakeTTY()
-        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            with ui.StreamingMarkdown(out, "scout › ") as r:
-                r.feed("hi\n")
-        head = out.getvalue().split("scout")[0]
-        self.assertNotIn("─", head)                    # no gap for a user region
-
-    def _codex_proc(self, lines):
-        class FakeProc:
-            def __init__(self, lines):
-                self.stdout = iter(lines)
-
-            def wait(self, timeout=None):
-                return 0
-
-            def poll(self):
-                return 0
-
-            def terminate(self):
-                pass
-
-            def kill(self):
-                pass
-        return FakeProc(lines)
-
-    class _FakeSpin:
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            pass
-
-        def stop(self):
-            pass
-
-        def set_label(self, _t):
-            pass
-
-    def test_codex_internal_nontty_no_gap(self):
-        import unittest.mock as mock
-        lines = [
-            json.dumps({"type": "thread.started", "thread_id": "T1"}),
-            json.dumps({"type": "item.completed",
-                        "item": {"type": "agent_message", "text": "verdict"}}),
-        ]
-        out = io.StringIO()
-        with mock.patch.object(bridge.subprocess, "Popen",
-                               return_value=self._codex_proc(lines)), \
-                mock.patch.object(bridge, "_Spinner", self._FakeSpin):
-            s = bridge.CodexSession("implement", True, io_out=out,
-                                    speaker="rev", internal=True)
-            s.send("go")
-        # Off a TTY there is no lead-in rule; the label is written plainly.
-        self.assertNotIn("─", out.getvalue())
-        self.assertIn("rev › ", out.getvalue())
-
-    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
-    def test_codex_internal_tty_has_lead_in(self):
-        import unittest.mock as mock
-        lines = [
-            json.dumps({"type": "thread.started", "thread_id": "T1"}),
-            json.dumps({"type": "item.completed",
-                        "item": {"type": "agent_message", "text": "verdict"}}),
-        ]
-        out = FakeTTY()
-        with mock.patch.object(bridge.subprocess, "Popen",
-                               return_value=self._codex_proc(lines)), \
-                mock.patch.object(bridge, "_Spinner", self._FakeSpin), \
-                mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
-            s = bridge.CodexSession("implement", True, io_out=out,
-                                    speaker="rev", internal=True)
-            s.send("go")
-        text = out.getvalue()
-        self.assertIn("─", text)                       # lead-in rule present
-        self.assertLess(text.index("─"), text.index("rev"))  # above the label
+                          os.path.join(home, ".cowork", "b.json")))
 
 
 class IsReviewFailureTest(unittest.TestCase):
@@ -10225,263 +9363,6 @@ class IsReviewFailureTest(unittest.TestCase):
         self.assertFalse(F({"verdict": "revise"}))
         self.assertFalse(F({"verdict": "revise", "findings": ["x"]}))
         self.assertFalse(F({"verdict": "needs_user", "user_question": "which?"}))
-
-
-class ReviewerFailureGateTest(unittest.TestCase):
-    """Item 3: a reviewer/advisor that returns no usable verdict twice running
-    surfaces the retry/skip-review/end gate (driven against the shared
-    _role_loop, so all three paired reviewers inherit the behavior)."""
-
-    def _path(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        return os.path.join(d, ".cowork", "scout.intel.json")
-
-    def _trace(self, path):
-        return trace_store.Trace(
-            os.path.join(os.path.dirname(path), "trace.X.jsonl"),
-            session_uuid="X", run_id="R")
-
-    def _events(self, path):
-        tpath = os.path.join(os.path.dirname(path), "trace.X.jsonl")
-        with open(tpath, "r") as fh:
-            return [json.loads(line) for line in fh if line.strip()]
-
-    def _session(self, path, statuses):
-        class FakeSession:
-            def __init__(self):
-                self.sent = []
-                self.closed = False
-
-            def send(self, text):
-                self.sent.append(text)
-                st = statuses.pop(0) if statuses else "ready_for_review"
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as fh:
-                    json.dump({"status": st}, fh)
-
-            def close(self):
-                self.closed = True
-        return FakeSession()
-
-    def _review_fn(self, verdicts):
-        calls = {"n": 0}
-
-        def review_fn(_p, _round):
-            calls["n"] += 1
-            return verdicts.pop(0) if verdicts else None
-        review_fn.calls = calls
-        return review_fn
-
-    def _run(self, path, statuses, review_fn, io_in, trace=None):
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            self._session(path, statuses), "seed", path, context="",
-            io_in=io.StringIO(io_in), io_out=out, review_fn=review_fn,
-            trace=trace)
-        return rc, outcome, out.getvalue()
-
-    def test_build_readiness_gate_does_not_block_scout_or_planner(self):
-        # The invariant this test protects: builder promotion is now gated by
-        # the OWNED verification transaction
-        # (`_run_owned_verification_transaction` /
-        # `_record_readiness_from_transaction`), never the legacy
-        # controller-log-derived `_record_readiness`; scout/planner promotion
-        # is completely untouched by any of this wiring and never calls
-        # readiness in any form.
-        import unittest.mock as mock
-
-        for role in ("scout", "planner"):
-            path = self._path()
-            trace = self._trace(path)
-            reviewer = self._review_fn([{"verdict": "approve"}])
-            with self.subTest(role=role), \
-                    mock.patch.object(
-                        cowork, "_record_readiness",
-                        side_effect=AssertionError(
-                            "build readiness reached a pre-build role")) as legacy_gate, \
-                    mock.patch.object(
-                        cowork, "_run_owned_verification_transaction",
-                        side_effect=AssertionError(
-                            "owned verification transaction reached a "
-                            "pre-build role")) as txn_gate, \
-                    mock.patch.object(
-                        cowork, "_record_readiness_from_transaction",
-                        side_effect=AssertionError(
-                            "owned readiness reached a pre-build role")
-                    ) as txn_readiness:
-                rc, outcome, _ = cowork._role_loop(
-                    self._session(path, ["ready_for_review"]),
-                    "seed", path, context="", io_in=io.StringIO(""),
-                    io_out=io.StringIO(), role=role, review_fn=reviewer,
-                    trace=trace, session_uuid="S")
-            self.assertEqual((rc, outcome), (0, "approved"))
-            self.assertEqual(reviewer.calls["n"], 1)
-            legacy_gate.assert_not_called()
-            txn_gate.assert_not_called()
-            txn_readiness.assert_not_called()
-            events = self._events(path)
-            self.assertFalse(any(
-                e.get("event") == "role.milestone"
-                and e.get("milestone_phase") == "verification"
-                for e in events))
-
-        # Builder: the owned-transaction path is used INSTEAD OF
-        # `_record_readiness` — the legacy function is never called for
-        # builder either, only the new transaction-backed pair is.
-        path = self._path()
-        trace = self._trace(path)
-        reviewer = self._review_fn([{"verdict": "approve"}])
-        # The red transaction below is now durably recorded `rejected`
-        # (ORCH-050 dispositions): point the sessions root at a throwaway dir
-        # so the sidecar write lands in the fixture, not the real home dir.
-        _sessions_tmp = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(_sessions_tmp, ignore_errors=True))
-        _prior_root = os.environ.get("COWORK_SESSIONS_ROOT")
-        os.environ["COWORK_SESSIONS_ROOT"] = _sessions_tmp
-
-        def _restore_root():
-            if _prior_root is None:
-                os.environ.pop("COWORK_SESSIONS_ROOT", None)
-            else:
-                os.environ["COWORK_SESSIONS_ROOT"] = _prior_root
-        self.addCleanup(_restore_root)
-        with mock.patch.object(
-                cowork, "_record_readiness",
-                side_effect=AssertionError(
-                    "builder promotion must use the owned verification "
-                    "transaction, not the legacy controller-log gate")
-        ) as legacy_gate, \
-                mock.patch.object(
-                    cowork, "_run_owned_verification_transaction",
-                    return_value=(
-                        {"transaction_id": "T", "verdict": "red"},
-                        None)) as txn_gate, \
-                mock.patch.object(
-                    cowork, "_record_readiness_from_transaction",
-                    return_value={"state": "unverified", "reason": "missing",
-                                  "event_id": "E"}) as txn_readiness:
-            rc, outcome, _ = cowork._role_loop(
-                self._session(
-                    path, ["ready_for_review", "needs_input"]),
-                "seed", path, context="", io_in=io.StringIO("/quit\n"),
-                io_out=io.StringIO(), role="builder", review_fn=reviewer,
-                trace=trace, session_uuid="S")
-        self.assertEqual((rc, outcome), (0, "ended"))
-        legacy_gate.assert_not_called()
-        txn_gate.assert_called_once()
-        txn_readiness.assert_called_once()
-        self.assertEqual(reviewer.calls["n"], 0)
-        events = self._events(path)
-        self.assertTrue(any(
-            e.get("event") == "role.milestone"
-            and e.get("milestone_phase") == "verification"
-            and e.get("role") == "builder" for e in events))
-
-    def test_gate_fires_at_two_consecutive_failures_then_end(self):
-        path = self._path()
-        rfn = self._review_fn([])  # always None -> always a failure
-        trace = self._trace(path)
-        rc, outcome, out = self._run(
-            path, ["ready_for_review"], rfn, "end\n", trace=trace)
-        self.assertEqual((rc, outcome), (0, "ended"))
-        # one silent auto-retry then the gate: exactly FAIL_CAP reviewer calls.
-        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
-        self.assertIn("could not return a usable verdict", out)
-        ev = [e for e in self._events(path) if e["event"] == "review.failure"]
-        self.assertEqual([e["consecutive"] for e in ev], [1, 2])
-
-    def test_off_tty_default_is_skip_review(self):
-        # Blank input at the gate -> skip-review (never trap a scripted run);
-        # skip-review then reaches the user gate, which reads blank=approve.
-        path = self._path()
-        rfn = self._review_fn([])
-        rc, outcome, out = self._run(path, ["ready_for_review"], rfn, "")
-        self.assertEqual((rc, outcome), (0, "approved"))
-        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
-        self.assertIn("could not return a usable verdict", out)
-        self.assertIn("scout finished", out)
-
-    def test_retry_reruns_reviewer_counter_not_reset(self):
-        path = self._path()
-        rfn = self._review_fn([])  # never recovers
-        trace = self._trace(path)
-        # gate1 -> retry -> gate2 -> end. Retry does NOT consume the role; it
-        # re-runs the reviewer in place.
-        rc, outcome, out = self._run(
-            path, ["ready_for_review"], rfn, "retry\nend\n", trace=trace)
-        self.assertEqual((rc, outcome), (0, "ended"))
-        # silent retry (2 calls) + the gate retry (1 more) = 3 reviewer calls.
-        self.assertEqual(rfn.calls["n"], 3)
-        # gate shown twice; the role was never bounced (only the seed sent).
-        self.assertEqual(out.count("could not return a usable verdict"), 2)
-        actions = [e["action"] for e in self._events(path)
-                   if e["event"] == "user.action"]
-        self.assertIn("review_fail_retry", actions)
-        self.assertIn("review_fail_end", actions)
-
-    def test_skip_review_is_sticky_and_reaches_user_gate(self):
-        path = self._path()
-        rfn = self._review_fn([])  # would fail if ever called again
-        # gate -> skip -> user gate revises -> 2nd ready bypasses the reviewer
-        # entirely -> user approves.
-        rc, outcome, out = self._run(
-            path, ["ready_for_review", "ready_for_review"], rfn,
-            "skip\nchange this\n\n")
-        self.assertEqual((rc, outcome), (0, "approved"))
-        # reviewer ran only in round 1 (FAIL_CAP calls); round 2 bypassed it.
-        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
-        self.assertEqual(out.count("could not return a usable verdict"), 1)
-
-    def test_legit_revise_never_trips_the_gate(self):
-        path = self._path()
-        rfn = self._review_fn([
-            {"verdict": "revise", "findings": ["a"]},
-            {"verdict": "revise", "findings": ["b"]},
-            {"verdict": "approve"},
-        ])
-        rc, outcome, out = self._run(
-            path, ["ready_for_review"] * 3, rfn, "")
-        self.assertEqual((rc, outcome), (0, "approved"))
-        self.assertNotIn("could not return a usable verdict", out)
-        self.assertIn("reviewed: changes requested", out)
-
-    def test_usable_verdict_resets_failure_counter(self):
-        # A failure, then a usable revise (resets), then on the next round a
-        # single failure must NOT immediately trip the gate — proving the
-        # counter reset. Sequence: None, revise, None, approve.
-        path = self._path()
-        rfn = self._review_fn([
-            None, {"verdict": "revise", "findings": ["x"]},
-            None, {"verdict": "approve"},
-        ])
-        trace = self._trace(path)
-        rc, outcome, out = self._run(
-            path, ["ready_for_review"] * 2, rfn, "", trace=trace)
-        self.assertEqual((rc, outcome), (0, "approved"))
-        # The gate never fired: each round saw one failure (silent retry) then a
-        # usable verdict; the counter reset, so 2 never accrued.
-        self.assertNotIn("could not return a usable verdict", out)
-        fails = [e["consecutive"] for e in self._events(path)
-                 if e["event"] == "review.failure"]
-        self.assertEqual(fails, [1, 1])  # never reached 2
-
-    def test_tty_gate_select_skip_reaches_user_gate(self):
-        # The TTY path wires questionary select -> skip-review -> user gate.
-        import unittest.mock as mock
-        path = self._path()
-        rfn = self._review_fn([])
-        out = FakeTTY()
-
-        with mock.patch.object(cowork.ui, "select", return_value="skip-review"), \
-                mock.patch.object(cowork, "_read_review",
-                                  return_value=cowork._END):
-            rc, outcome, _ = cowork._role_loop(
-                self._session(path, ["ready_for_review"]), "seed", path,
-                context="", io_in=FakeTTY(), io_out=out, review_fn=rfn)
-        self.assertEqual((rc, outcome), (0, "approved"))
-        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
 
 
 class ScoutIntelMdHelperTest(unittest.TestCase):
@@ -10565,7 +9446,7 @@ class ScoutIntelMdHelperTest(unittest.TestCase):
         plain = cowork.assemble_reviewer_resume_context(intel)
         self.assertIn(intel, plain)
         self.assertNotIn(intel_md, plain)
-        self.assertNotIn("New user context was provided", plain)
+        self.assertNotIn("New orchestrator context was provided", plain)
 
     def test_scout_gate_text_points_at_md_when_wired(self):
         # _scout_loop repoints the review/done surfaces at the intel markdown.
@@ -10589,7 +9470,8 @@ class ScoutIntelMdHelperTest(unittest.TestCase):
         out = io.StringIO()
         rc = cowork._scout_loop(
             FakeSession(), "seed", intel, context="",
-            io_in=io.StringIO(""), io_out=out, intel_md_path=intel_md)
+            io_out=out, intel_md_path=intel_md,
+            review_fn=lambda p, r: {"verdict": "approve"})
         self.assertEqual(rc, 0)
         text = out.getvalue()
         self.assertIn("ready for review", text)
@@ -10848,7 +9730,7 @@ class ReviewerHashGateLoopTest(unittest.TestCase):
         out = io.StringIO()
         rc = cowork._scout_loop(
             self._session(intel), "seed", intel, context="",
-            io_in=io.StringIO(user_in), io_out=out, review_fn=review_fn,
+            io_out=out, review_fn=review_fn,
             intel_md_path=intel_md, skip_baseline=bundle,
             evaluate_fn=evaluate_fn)
         return rc, out.getvalue()
@@ -11010,7 +9892,7 @@ class RunLevelGateSurfaceTest(unittest.TestCase):
         config["scout"]["controller"] = "codex"
         out = io.StringIO()
         rc = cowork.run_scout(
-            config, "seed", ["scout"], io_in=io.StringIO(""), io_out=out,
+            config, "seed", ["scout"], io_out=out,
             intel_path=intel, intel_md_path=intel_md,
             session_factory=lambda *a, **k: sess)
         self.assertEqual(rc, 0)
@@ -11030,12 +9912,14 @@ class RunLevelGateSurfaceTest(unittest.TestCase):
             with open(p, "w") as fh:
                 fh.write(body)
         sess = self._codex_session(status)
-        config = cowork.default_config(["builder"])
+        config = cowork.default_config(["builder", "build-reviewer"])
         config["builder"]["controller"] = "codex"
         out = io.StringIO()
         rc = cowork.run_builder(
-            config, "seed", ["builder"], io_in=io.StringIO(""), io_out=out,
+            config, "seed", ["builder", "build-reviewer"], io_out=out,
             build_status_path=status, build_summary_path=summary,
+            build_review_path=os.path.join(d, "builder-review.json"),
+            reviewer_runner=lambda *a, **k: {"verdict": "approve"},
             plan_json_path=pj, plan_md_path=pm,
             session_factory=lambda *a, **k: sess,
             on_outcome=lambda o, p: None)
@@ -11107,7 +9991,7 @@ class PlannerHashGateRunTest(unittest.TestCase):
         config["planner"]["controller"] = "codex"
         rc = cowork.run_planner(
             config, "seed", ["planner", "planning-advisor"],
-            io_in=io.StringIO(""), io_out=out,
+            io_out=out,
             plan_json_path=plan_json, plan_md_path=plan_md, review_path=review,
             session_factory=lambda *a, **k: self._session(plan_json),
             reviewer_runner=runner, skip_baseline=bundle,
@@ -11686,7 +10570,7 @@ class TurnMetaWiringTest(unittest.TestCase):
 
         cowork._role_loop(
             Fake(), "seed", status, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="planner", phase="planning", is_resume=False,
             seed_artifact_paths=[intel], context_revision=3)
         m = captured[0]
@@ -11722,7 +10606,7 @@ class TurnMetaWiringTest(unittest.TestCase):
 
         cowork._role_loop(
             Fake(), "seed", status, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="scout", phase="scouting", is_resume=True)
         self.assertFalse(captured[0]["fresh"])
         self.assertTrue(captured[0]["resume"])
@@ -11988,12 +10872,15 @@ class WorktreeFlagTest(unittest.TestCase):
             self._args(["--wt-controller", "codex", "--context", "x"])
             .wt_controller, "codex")
 
-    def test_headless_flag_and_alias_and_non_interactive(self):
-        a = self._args(["--headless", "--context", "x"])
-        self.assertTrue(a.headless)
-        self.assertTrue(cowork._is_non_interactive(a))
-        a = self._args(["--auto", "--context", "x"])
-        self.assertTrue(a.headless)
+    def test_removed_human_mode_flags_are_rejected(self):
+        import contextlib
+        for flag in ("--headless", "--auto"):
+            with self.subTest(flag=flag):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        self._args([flag, "--context", "x"])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertNotIn(flag, cowork.build_parser().format_help())
 
     def test_default_worktree_name(self):
         self.assertEqual(cowork.default_worktree_name("abcdef0123456789"),
@@ -12233,11 +11120,11 @@ class WorktreeFlowTest(unittest.TestCase):
             return 0
         rc = cowork.run_flow(
             self._args(["--worktree", "feat", "--wt-controller", "codex",
-                        "--team", "scout", "--context", "x", "--no-session"]),
+                        "--team", "scout,scout-reviewer", "--context", "x", "--no-session"]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         # the role ran once, with the single base toplevel and explicit name
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["base"], repo)
@@ -12273,12 +11160,12 @@ class WorktreeFlowTest(unittest.TestCase):
 
         rc = cowork.run_flow(
             self._args(["--worktree", "feat", "--wt-controller", "codex",
-                        "--team", "scout", "--context", "x",
+                        "--team", "scout,scout-reviewer", "--context", "x",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=scout_capture,
             run_worktree_fn=self._creating_fn_sibling(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)
         sibling_path = os.path.realpath(os.path.join(
             os.path.dirname(repo), os.path.basename(repo) + "-worktrees",
@@ -12332,41 +11219,79 @@ class WorktreeFlowTest(unittest.TestCase):
         self.assertEqual(os.path.realpath(os.getcwd()), before)  # no chdir
         self.assertEqual(scout_calls, [])
 
+    def test_failed_worktree_agent_is_a_failed_run_not_an_invalid_invocation(self):
+        repo = self._repo()
+        os.chdir(repo)
+        before = os.path.realpath(os.getcwd())
+        box = {}
+
+        def unscripted(*_a, **_k):
+            raise AssertionError("no lead may run after a failed worktree")
+        rc = cowork.run_flow(
+            self._args(["--worktree", "--team", "scout,scout-reviewer",
+                        "--context", "x", "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=unscripted, run_planner_fn=unscripted,
+            run_builder_fn=unscripted,
+            run_worktree_fn=lambda *a, **k: {
+                "status": "failed", "result": {"error": "boom"}},
+            result_box=box)
+        self.assertEqual((rc, box["reason"]), (1, "worktree_failed"))
+        self.assertEqual(cowork.build_run_result(rc, box)["outcome"],
+                         "failed")
+        self.assertEqual(os.path.realpath(os.getcwd()), before)  # no chdir
+
     def test_auto_name_default(self):
         repo = self._repo()
         os.chdir(repo)
         calls = []
         rc = cowork.run_flow(
-            self._args(["--worktree", "--team", "scout", "--context", "x",
+            self._args(["--worktree", "--team", "scout,scout-reviewer", "--context", "x",
                         "--no-session"]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=lambda *a, **k: 0,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         # auto name = cowork-<short session id>; controller defaults to claude
         self.assertTrue(calls[0]["name"].startswith("cowork-"))
         self.assertFalse(calls[0]["explicit"])
         self.assertEqual(calls[0]["controller"], "claude")
 
-    def test_worktree_and_headless_compose(self):
+    def test_undispatchable_reviewer_is_refused_before_the_worktree_agent(self):
+        repo = self._repo()
+        os.chdir(repo)
+        calls = []
+        box = {}
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--team", "scout,scout-reviewer",
+                        "--config", "scout-reviewer=codex", "--context", "x",
+                        "--no-session"]),
+            io_out=io.StringIO(),
+            which=lambda c: None if c == "codex" else "/bin/" + c,
+            run_scout_fn=lambda *a, **k: self.fail("scout must not run"),
+            run_worktree_fn=self._creating_fn(calls), result_box=box)
+        self.assertEqual((rc, box["reason"]), (1, "reviewer_not_dispatchable"))
+        self.assertEqual(calls, [])
+
+    def test_worktree_and_agent_note_compose(self):
         repo = self._repo()
         os.chdir(repo)
         calls = []
         seen = {}
 
-        def fake_scout(config, context, selected, headless=False, **kw):
+        def fake_scout(config, context, selected, **kw):
             seen["cwd"] = os.path.realpath(os.getcwd())
-            seen["headless"] = headless
+            seen["agent_note"] = cowork.AGENT_LEAD_NOTE in str(context)
             return 0
         rc = cowork.run_flow(
-            self._args(["--worktree", "feat", "--headless", "--team", "scout",
+            self._args(["--worktree", "feat", "--team", "scout,scout-reviewer",
                         "--context", "x", "--no-session"]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)  # worktree provisioned first
-        self.assertTrue(seen["headless"])  # then the flow runs headless inside
+        self.assertTrue(seen["agent_note"])  # then the flow runs inside it
         self.assertEqual(seen["cwd"],
                          os.path.realpath(os.path.join(repo, ".worktrees",
                                                        "feat")))
@@ -12378,24 +11303,24 @@ class WorktreeFlowTest(unittest.TestCase):
         calls = []
         # run 1: creates + records the worktree
         rc = cowork.run_flow(
-            self._args(["--worktree", "feat", "--team", "scout",
+            self._args(["--worktree", "feat", "--team", "scout,scout-reviewer",
                         "--context", "x", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=lambda *a, **k: 0,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)
         saved = state_store.load(spath)
         self.assertIsNotNone(state_store.get_worktree(saved))
         os.chdir(repo)  # run 1 redirected us into the worktree; back to launch
         # run 2 (resume): reuses the recorded worktree, role NOT re-run
         rc = cowork.run_flow(
-            self._args(["--worktree", "feat", "--team", "scout",
+            self._args(["--worktree", "feat", "--team", "scout,scout-reviewer",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=lambda *a, **k: 0,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)  # no second creation
 
     def test_resume_recreates_when_recorded_worktree_is_stale(self):
@@ -12404,12 +11329,12 @@ class WorktreeFlowTest(unittest.TestCase):
         spath = os.path.join(repo, ".cowork", "session.json")
         calls = []
         rc = cowork.run_flow(
-            self._args(["--worktree", "feat", "--team", "scout",
+            self._args(["--worktree", "feat", "--team", "scout,scout-reviewer",
                         "--context", "x", "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=lambda *a, **k: 0,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)
         # make the recorded worktree STALE: deregister it from git
         wtpath = os.path.join(repo, ".worktrees", "feat")
@@ -12421,15 +11346,15 @@ class WorktreeFlowTest(unittest.TestCase):
         # run 2: recorded path no longer validates -> re-create, never a blind
         # chdir into the stale/unregistered path
         rc = cowork.run_flow(
-            self._args(["--worktree", "feat", "--team", "scout",
+            self._args(["--worktree", "feat", "--team", "scout,scout-reviewer",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=lambda *a, **k: 0,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 2)  # re-created, not reused
 
-    def test_headless_runtime_note_in_lead_seed_and_reviewer_context(self):
+    def test_agent_runtime_note_in_lead_seed_and_reviewer_context(self):
         repo = self._repo()
         os.chdir(repo)
         seen = {}
@@ -12439,190 +11364,26 @@ class WorktreeFlowTest(unittest.TestCase):
             seen["reviewer_context"] = reviewer_context
             return 0
         rc = cowork.run_flow(
-            self._args(["--worktree", "feat", "--headless", "--team", "scout",
+            self._args(["--worktree", "feat", "--team", "scout,scout-reviewer",
                         "--context", "GOALTEXT", "--no-session"]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout,
             run_worktree_fn=self._creating_fn([]))
-        self.assertEqual(rc, 0)
-        self.assertIn("[headless mode]", seen["context"])
-        self.assertIn("[headless mode]", seen["reviewer_context"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[agent session]", seen["context"])
+        self.assertIn("[agent session]", seen["reviewer_context"])
         # the lead seed still carries the original goal
         self.assertIn("GOALTEXT", seen["context"])
 
-    def test_missing_controller_headless_fails_without_prompt(self):
+    def test_missing_controller_fails_before_launch(self):
         repo = self._repo()
         os.chdir(repo)
         rc = cowork.run_flow(
-            self._args(["--headless", "--team", "scout", "--context", "x",
+            self._args(["--team", "scout,scout-reviewer", "--context", "x",
                         "--no-session"]),
             io_out=io.StringIO(), which=lambda c: None,  # controller missing
             run_scout_fn=lambda *a, **k: self.fail("should not launch scout"))
         self.assertEqual(rc, 1)  # ensure_controller_available returns False
-
-
-class HeadlessRoleLoopTest(unittest.TestCase):
-    """Drive _role_loop with headless=True and NO human input — every gate must
-    auto-resolve and the loop must never hang."""
-
-    def _path(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        return os.path.join(d, ".cowork", "x.json")
-
-    def _session(self, path, writes):
-        class ScriptedSession:
-            def __init__(self):
-                self.sent = []
-                self.closed = False
-
-            def send(self, text):
-                self.sent.append(text)
-                w = writes.pop(0) if writes else None
-                if w is not None:
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "w") as fh:
-                        json.dump(w, fh)
-
-            def close(self):
-                self.closed = True
-        return ScriptedSession()
-
-    def _review_fn(self, verdicts):
-        def fn(status_path, round_index):
-            return verdicts.pop(0) if verdicts else {"verdict": "approve"}
-        return fn
-
-    _READY = {"status": "ready_for_review", "result": {}}
-
-    def test_needs_input_nudged_then_ready(self):
-        path = self._path()
-        sess = self._session(
-            path, [{"status": "needs_input", "result": {}}, dict(self._READY)])
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(), headless=True)
-        self.assertEqual(outcome, "approved")
-        self.assertEqual(len(sess.sent), 2)
-        self.assertIn("headless", sess.sent[1].lower())
-
-    def test_needs_input_loop_bounded(self):
-        path = self._path()
-        # always a DIFFERENT needs_input (defeats the byte-level no-op detector)
-        writes = [{"status": "needs_input", "result": {"n": i}}
-                  for i in range(20)]
-        sess = self._session(path, writes)
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(), headless=True)
-        self.assertEqual(outcome, "ended")  # HEADLESS_NUDGE_CAP backstop
-        self.assertLessEqual(len(sess.sent), cowork.HEADLESS_NUDGE_CAP + 1)
-
-    def test_ready_auto_approves_without_input(self):
-        path = self._path()
-        sess = self._session(path, [dict(self._READY)])
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(), headless=True)
-        self.assertEqual(outcome, "approved")
-        self.assertEqual(len(sess.sent), 1)
-
-    def test_reviewer_approve_consensus_advances(self):
-        path = self._path()
-        sess = self._session(path, [dict(self._READY)])
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(), headless=True,
-            review_fn=self._review_fn([{"verdict": "approve"}]))
-        self.assertEqual(outcome, "approved")
-
-    def test_reviewer_needs_user_downgraded_to_revise(self):
-        path = self._path()
-        sess = self._session(path, [dict(self._READY), dict(self._READY)])
-        rfn = self._review_fn([
-            {"verdict": "needs_user", "user_question": "Support legacy X?"},
-            {"verdict": "approve"}])
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=out, headless=True, review_fn=rfn)
-        self.assertEqual(outcome, "approved")
-        # the question reached the LEAD via review-file path (not the user), and
-        # is never inlined into the lead prompt or the user channel.
-        self.assertIn("[reviewer handoff]", sess.sent[1])
-        self.assertNotIn("Support legacy X?", sess.sent[1])
-        self.assertNotIn("Support legacy X?", out.getvalue())
-
-    def test_reviewer_failure_skips_under_headless(self):
-        path = self._path()
-        sess = self._session(path, [dict(self._READY)])
-        # every verdict is unusable -> failure; headless skips after the cap
-        rfn = self._review_fn([{}, {}, {}, {}])
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(), headless=True, review_fn=rfn)
-        self.assertEqual(outcome, "approved")
-
-    def test_round_cap_accepts_with_dissent(self):
-        path = self._path()
-        sess = self._session(path, [dict(self._READY) for _ in range(8)])
-        rfn = self._review_fn([{"verdict": "revise", "findings": ["nit"]}
-                               for _ in range(8)])
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=out, headless=True, review_fn=rfn)
-        self.assertEqual(outcome, "approved")
-        self.assertIn("cap reached", out.getvalue())
-
-    def test_handoff_back_auto_declined(self):
-        path = self._path()
-        sess = self._session(path, [
-            {"status": "handoff_back", "handoff": "re-scope", "result": {}},
-            dict(self._READY)])
-        rc, outcome, payload = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(), headless=True, handoff_enabled=True)
-        self.assertEqual(outcome, "approved")  # NOT "handoff"
-        self.assertEqual(len(sess.sent), 2)
-
-    def test_controller_failure_ends_under_headless_no_prompt(self):
-        # A send failure with no status write: headless ends cleanly instead of
-        # showing the interactive retry/switch/end controller-failure gate.
-        path = self._path()
-
-        class FailSession:
-            def __init__(self):
-                self.sent = []
-                self.closed = False
-
-            def send(self, text):
-                self.sent.append(text)
-                return {"ok": False, "result": "error",
-                        "error_type": "usage_limit"}
-
-            def close(self):
-                self.closed = True
-        sess = FailSession()
-        out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=out, headless=True)
-        self.assertEqual(outcome, "ended")
-        self.assertNotIn("cannot make progress", out.getvalue())
-        self.assertTrue(sess.closed)
-
-    def test_without_headless_does_not_auto_progress(self):
-        # Regression guard: same needs_input write, but WITHOUT headless and no
-        # input -> the loop ends (EOF) instead of nudging. No bypass.
-        path = self._path()
-        sess = self._session(path, [{"status": "needs_input", "result": {}}])
-        rc, outcome, _ = cowork._role_loop(
-            sess, "seed", path, context="", io_in=io.StringIO(""),
-            io_out=io.StringIO(), headless=False)
-        self.assertEqual(outcome, "ended")
-        self.assertEqual(sess.sent, ["seed"])  # no nudge sent
 
 
 class WorktreeStateTest(unittest.TestCase):
@@ -12658,23 +11419,24 @@ class WorktreeStateTest(unittest.TestCase):
         self.assertEqual(state_store.discover_session_files(worktree), [])
 
 
-class HeadlessFlowContextTest(unittest.TestCase):
+class NewSessionContextFlowTest(unittest.TestCase):
     def _args(self, argv):
         return cowork.build_parser().parse_args(argv)
 
-    def test_headless_without_context_is_rc2(self):
+    def test_missing_context_is_rc2(self):
         out = io.StringIO()
         rc = cowork.run_flow(
-            self._args(["--headless", "--team", "scout", "--no-session"]),
+            self._args(["--team", "scout,scout-reviewer", "--no-session"]),
             io_out=out, which=lambda c: "/bin/" + c,
             run_scout_fn=lambda *a, **k: self.fail("should not reach scout"))
         self.assertEqual(rc, 2)
         self.assertIn("requires initial context", out.getvalue())
 
 
-class HeadlessReviewerResumeTest(unittest.TestCase):
-    """A RESUMED reviewer's first headless turn uses context_update (not
-    reviewer_context), so the headless note must ride context_update too."""
+class AgentReviewerResumeTest(unittest.TestCase):
+    """A RESUMED reviewer's first turn uses context_update (not
+    reviewer_context), so the agent-session note must ride context_update
+    too."""
 
     def setUp(self):
         import tempfile
@@ -12699,7 +11461,7 @@ class HeadlessReviewerResumeTest(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         return os.path.join(d, ".cowork", "session.json")
 
-    def test_resumed_reviewer_context_update_carries_headless_note(self):
+    def test_resumed_reviewer_context_update_carries_agent_note(self):
         spath = self._tmp_session()
         team = ["scout", "scout-reviewer"]
         state = state_store.ensure_session(spath, None, "S")
@@ -12717,26 +11479,155 @@ class HeadlessReviewerResumeTest(unittest.TestCase):
             seen["ctx"] = reviewer_context
             return 0
         rc = cowork.run_flow(
-            self._args(["--headless", "--context", "x",
+            self._args(["--context", "x",
                         "--session-file", spath]),
             io_out=io.StringIO(), which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         # the resumed reviewer's first-turn context_update carries the note...
         self.assertIsNotNone(seen["cu"])
-        self.assertIn("[headless mode]", seen["cu"])
+        self.assertIn("[agent session]", seen["cu"])
         # ...and fresh reviewers still get it via reviewer_context
-        self.assertIn("[headless mode]", seen["ctx"])
+        self.assertIn("[agent session]", seen["ctx"])
 
 
-class RolePromptHeadlessDirectiveTest(unittest.TestCase):
-    def test_every_role_prompt_carries_headless_directive(self):
-        roles_dir = os.path.join(_HERE, "..", "roles")
-        for name in ("scout", "planner", "builder", "scout-reviewer",
-                     "planning-advisor", "build-reviewer"):
-            with open(os.path.join(roles_dir, name + ".md")) as fh:
-                text = fh.read()
-            self.assertIn("Headless mode", text, name)
+class RolePromptAgentContractTest(unittest.TestCase):
+    def _role_text(self, name):
+        with open(os.path.join(_HERE, "..", "roles", name + ".md")) as fh:
+            return fh.read()
+
+    def test_lead_prompts_state_the_authority_request_contract(self):
+        for name in ("scout", "planner", "builder"):
+            with self.subTest(role=name):
+                text = self._role_text(name)
+                self.assertIn("Authority requests", text)
+                self.assertIn("## Your reply", text)
+                self.assertIn("needs_input", text)
+
+    def test_reviewer_prompts_state_approval_and_authority(self):
+        for name in ("scout-reviewer", "planning-advisor", "build-reviewer"):
+            with self.subTest(role=name):
+                self.assertIn("## Approval and authority",
+                              self._role_text(name))
+
+    _TERMINAL_MODULES = ("fileinput", "getpass", "readline", "termios", "tty")
+
+    @classmethod
+    def _terminal_input_uses(cls, source):
+        """`{(function, what)}` for every real interactive-input path in
+        `source`: the input() builtin, an isatty() probe, ANY use of the
+        process stdin (sys.stdin / sys.__stdin__ -- read, readline,
+        iteration, json.load(...), passing it on), `from sys import stdin`,
+        terminal-input modules, and opening or reading file descriptor 0.
+        Attribute names and domain words are not policed: `obj.input(...)`,
+        `proc.stdin.write(...)` and `stdin=subprocess.PIPE` are not input."""
+        import ast as _ast_mod
+        found = set()
+
+        def scan(owner, root):
+            for node in _ast_mod.walk(root):
+                if (isinstance(node, _ast_mod.Call)
+                        and isinstance(node.func, _ast_mod.Name)
+                        and node.func.id == "input"):
+                    found.add((owner, "input()"))
+                if (isinstance(node, _ast_mod.Attribute)
+                        and node.attr == "isatty"):
+                    found.add((owner, "isatty"))
+                if (isinstance(node, _ast_mod.Attribute)
+                        and node.attr in ("stdin", "__stdin__")
+                        and isinstance(node.value, _ast_mod.Name)
+                        and node.value.id == "sys"):
+                    found.add((owner, "sys.stdin"))
+                if isinstance(node, _ast_mod.ImportFrom):
+                    if node.module == "sys" and any(
+                            a.name in ("stdin", "__stdin__")
+                            for a in node.names):
+                        found.add((owner, "sys.stdin"))
+                    if node.module in cls._TERMINAL_MODULES:
+                        found.add((owner, "import " + node.module))
+                if isinstance(node, _ast_mod.Import):
+                    for alias in node.names:
+                        if alias.name in cls._TERMINAL_MODULES:
+                            found.add((owner, "import " + alias.name))
+                if (isinstance(node, _ast_mod.Call) and node.args
+                        and isinstance(node.args[0], _ast_mod.Constant)
+                        and node.args[0].value == 0):
+                    func = node.func
+                    name = (func.id if isinstance(func, _ast_mod.Name)
+                            else func.attr if isinstance(
+                                func, _ast_mod.Attribute) else None)
+                    if name in ("open", "fdopen", "read"):
+                        found.add((owner, "fd 0"))
+
+        tree = _ast_mod.parse(source)
+        scan("<module>", _ast_mod.Module(
+            body=[stmt for stmt in tree.body if not isinstance(
+                stmt, (_ast_mod.FunctionDef, _ast_mod.AsyncFunctionDef,
+                       _ast_mod.ClassDef))], type_ignores=[]))
+        for fn in _ast_mod.walk(tree):
+            if isinstance(fn, (_ast_mod.FunctionDef,
+                               _ast_mod.AsyncFunctionDef)):
+                scan(fn.name, fn)
+        return found
+
+    def test_the_input_detector_finds_real_stdin_paths_only(self):
+        forbidden = (
+            "import sys, json, os\n"
+            "def a():\n    return input('?')\n"
+            "def b():\n    return sys.stdin.readline()\n"
+            "def c():\n    return [line for line in sys.stdin]\n"
+            "def d():\n    return json.load(sys.stdin)\n"
+            "def e():\n    return sys.stdout.isatty()\n"
+            "def f():\n    from sys import stdin\n    return stdin\n"
+            "def g():\n    return os.read(0, 10)\n"
+            "def h():\n    import getpass\n    return getpass.getpass()\n"
+            "def i():\n    return sys.__stdin__.read()\n")
+        self.assertEqual(
+            {owner for owner, _what in self._terminal_input_uses(forbidden)},
+            set("abcdefghi"))
+        benign = (
+            "import subprocess\n"
+            "def a(obj, proc):\n"
+            "    obj.input('the user asked for this')\n"
+            "    proc.stdin.write(b'x')\n"
+            "    return subprocess.Popen(['x'], stdin=subprocess.PIPE)\n"
+            "def b(user_input):\n    return 'ask the user: ' + user_input\n")
+        self.assertEqual(self._terminal_input_uses(benign), set())
+
+    def test_runtime_never_reads_input_or_probes_a_terminal(self):
+        # Behavioural contract, not wording: the runtime modules take no
+        # interactive input and probe no terminal; the process stdin is read
+        # only where --context-file - asks for it.
+        for module in ("cowork.py", "cowork_bridge.py", "cowork_transcript.py",
+                       "cowork_handoff.py", "cowork_state.py"):
+            with self.subTest(module=module):
+                with open(os.path.join(_HERE, module)) as fh:
+                    uses = self._terminal_input_uses(fh.read())
+                allowed = ({("resolve_context", "sys.stdin")}
+                           if module == "cowork.py" else set())
+                self.assertEqual(uses - allowed, set())
+
+    def test_rendered_runtime_text_addresses_agents_not_a_live_user(self):
+        # Only text the runtime itself renders is checked (the notes and every
+        # registered transport edge rendered with placeholder artifacts);
+        # task content reaches roles by path and may discuss users freely.
+        rendered = [cowork.AGENT_LEAD_NOTE, cowork.AGENT_REVIEWER_NOTE,
+                    cowork.HANDOFF_DECLINED_NOTE % "scout"]
+        helper = TransportChokePointTests("test_every_edge_resolves_and_"
+                                          "supplies_its_required_sources")
+        for edge_id, spec in handoff.EDGES.items():
+            rendered.append(str(handoff.render_handoff(
+                edge_id, artifacts=helper._edge_artifacts(spec),
+                facts=helper._edge_facts(spec), ctx=helper._edge_ctx(spec))))
+        for text in rendered:
+            lowered = text.lower()
+            for phrase in ("ask the user", "to the user", "with the user",
+                           "the user approved", "user's review surface"):
+                with self.subTest(phrase=phrase, text=text[:60]):
+                    self.assertNotIn(phrase, lowered)
+        # The decision contract is stated where the runtime renders it.
+        self.assertIn("needs_input", cowork.AGENT_LEAD_NOTE)
+        self.assertIn("orchestrator", cowork.AGENT_LEAD_NOTE)
 
     def test_worktree_role_prompt_exists(self):
         path = os.path.join(_HERE, "..", "roles", "worktree.md")
@@ -12744,166 +11635,6 @@ class RolePromptHeadlessDirectiveTest(unittest.TestCase):
             text = fh.read()
         self.assertIn("worktree", text.lower())
         self.assertIn("status", text.lower())
-
-
-class AssembleUserQuestionTest(unittest.TestCase):
-    """The harness-boundary prompt for a gate-time question."""
-
-    def test_carries_question_and_no_edit_instruction(self):
-        out = cowork.assemble_user_question("why mongo?", artifact="plan")
-        self.assertIn("why mongo?", out)
-        self.assertIn("answer", out.lower())
-        self.assertIn("plan", out)
-        self.assertIn("ready_for_review", out)
-        self.assertIn("Do NOT edit", out)
-        self.assertIn("not a request to change", out.lower())
-
-
-class ReadReviewThreeWayTest(unittest.TestCase):
-    """The 3-way review gate: Ask a question / Request changes / Approve &
-    finish on a TTY; the unchanged blank=finish / text=revise contract off
-    one."""
-
-    def _tty(self):
-        return FakeTTY(), FakeTTY()
-
-    def test_off_tty_blank_finishes(self):
-        self.assertIs(cowork._read_review(io.StringIO("\n"), io.StringIO()),
-                      cowork._END)
-        self.assertIs(cowork._read_review(io.StringIO(""), io.StringIO()),
-                      cowork._END)
-
-    def test_off_tty_text_revises(self):
-        self.assertEqual(
-            cowork._read_review(io.StringIO("change x\n"), io.StringIO()),
-            "change x")
-
-    def test_tty_approve_ends(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", return_value="approve"):
-            self.assertIs(cowork._read_review(i, o), cowork._END)
-
-    def test_tty_ask_returns_marker(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", return_value="ask"), \
-                mock.patch.object(ui, "prompt_user", return_value="why this?"):
-            out = cowork._read_review(i, o)
-        self.assertIsInstance(out, tuple)
-        self.assertIs(out[0], cowork._ASK)
-        self.assertEqual(out[1], "why this?")
-
-    def test_tty_ask_blank_reshows_gate_never_approves(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        sel = mock.Mock(side_effect=["ask", "approve"])
-        with mock.patch.object(ui, "select", sel), \
-                mock.patch.object(ui, "prompt_user", return_value="   "):
-            self.assertIs(cowork._read_review(i, o), cowork._END)
-        # A blank question re-showed the select rather than approving.
-        self.assertEqual(sel.call_count, 2)
-
-    def test_tty_changes_returns_text(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", return_value="changes"), \
-                mock.patch.object(ui, "prompt_user",
-                                  return_value="tighten scope"):
-            self.assertEqual(cowork._read_review(i, o), "tighten scope")
-
-    def test_tty_changes_blank_reshows_gate_never_approves(self):
-        # Blank feedback re-opens the gate; it is never a sign-off (D4).
-        import unittest.mock as mock
-        i, o = self._tty()
-        sel = mock.Mock(side_effect=["changes", "approve"])
-        with mock.patch.object(ui, "select", sel), \
-                mock.patch.object(ui, "prompt_user", return_value=""):
-            self.assertIs(cowork._read_review(i, o), cowork._END)
-        self.assertEqual(sel.call_count, 2)
-
-    def test_tty_dismissed_select_stops(self):
-        # Cancelling a menu is never an approval — it takes the Stop path even
-        # on the preview-less compatibility gate.
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", return_value=None), \
-                mock.patch.object(ui, "prompt_user", return_value="") as pu:
-            self.assertIs(cowork._read_review(i, o), cowork._STOP)
-        pu.assert_not_called()
-
-    def test_tty_no_ask_uses_binary_confirm(self):
-        # allow_ask=False (the builder gate) keeps the binary confirm contract:
-        # no select, no ask path — but constructed with default=False (D3).
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "confirm", return_value=True) as conf, \
-                mock.patch.object(ui, "select") as sel:
-            self.assertIs(cowork._read_review(i, o, allow_ask=False),
-                          cowork._END)
-        conf.assert_called_once()
-        self.assertIs(conf.call_args.kwargs["default"], False)
-        sel.assert_not_called()
-
-    def test_tty_no_ask_decline_revises(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "confirm", return_value=False), \
-                mock.patch.object(ui, "prompt_user", return_value="fix it"), \
-                mock.patch.object(ui, "select") as sel:
-            self.assertEqual(cowork._read_review(i, o, allow_ask=False),
-                             "fix it")
-        sel.assert_not_called()
-
-    def test_tty_no_ask_decline_blank_reasks_confirm(self):
-        # A declined confirm with blank feedback loops back to the confirm
-        # instead of finishing.
-        import unittest.mock as mock
-        i, o = self._tty()
-        conf = mock.Mock(side_effect=[False, True])
-        with mock.patch.object(ui, "confirm", conf), \
-                mock.patch.object(ui, "prompt_user", return_value="  "):
-            self.assertIs(cowork._read_review(i, o, allow_ask=False),
-                          cowork._END)
-        self.assertEqual(conf.call_count, 2)
-
-
-class _SelectRecorder:
-    """A ui.select stand-in that records the (key, label) choices it was shown
-    and returns a scripted key, so gate-label previews can be asserted verbatim
-    without a live terminal."""
-
-    def __init__(self, *keys):
-        self._keys = list(keys)
-        self.calls = []
-
-    def __call__(self, prompt, choices, ask_fn=None, **kwargs):
-        # **kwargs absorbs the activation handles (io_in / io_out / gate /
-        # on_discard / on_drain_fail) the protected gate readers now pass.
-        pairs = list(choices)
-        self.calls.append({
-            "prompt": prompt,
-            "keys": [k for k, _l in pairs],
-            "labels": [l for _k, l in pairs],
-            "kwargs": dict(kwargs),
-        })
-        return self._keys.pop(0) if self._keys else None
-
-    @property
-    def keys(self):
-        return self.calls[-1]["keys"]
-
-    @property
-    def labels(self):
-        return self.calls[-1]["labels"]
-
-    @property
-    def prompt(self):
-        return self.calls[-1]["prompt"]
-
-    def label_for(self, key):
-        last = self.calls[-1]
-        return dict(zip(last["keys"], last["labels"]))[key]
 
 
 class _GateSession:
@@ -12933,473 +11664,6 @@ def _gate_status_path():
     return os.path.join(d, ".cowork", "x.json"), d
 
 
-class GatePreviewLabelTest(unittest.TestCase):
-    """Every normal review gate renders the pinned, phase- and team-aware
-    consequence previews. Covers all three gates named in criterion 1 (scout
-    ±planner, planner ±builder, and the builder approve label), plus a
-    run_scout->_scout_loop plumbing guard so scout previews are never silently
-    preview=None."""
-
-    def _render(self, allow_ask, preview, first_key="approve"):
-        import unittest.mock as mock
-        rec = _SelectRecorder(first_key)
-        with mock.patch.object(cowork.ui, "select", rec):
-            cowork._read_review(FakeTTY(), FakeTTY(),
-                                allow_ask=allow_ask, preview=preview)
-        return rec
-
-    def test_scout_gate_with_planner(self):
-        rec = self._render(True, cowork.make_gate_preview("scout", True, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve — continue to planning")
-        self.assertNotIn("finish", rec.label_for("approve"))
-        self.assertEqual(
-            rec.label_for("ask"),
-            "Ask a question — answered in chat; the intel stays as-is")
-        self.assertEqual(
-            rec.label_for("changes"),
-            "Request changes — the scout revises; you'll be asked for feedback")
-
-    def test_scout_gate_terminal_no_planner(self):
-        rec = self._render(True, cowork.make_gate_preview("scout", False, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish — intel is the deliverable")
-
-    def test_planner_gate_with_builder(self):
-        rec = self._render(True, cowork.make_gate_preview("planner", True, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve — continue to building")
-        self.assertNotIn("finish", rec.label_for("approve"))
-        self.assertEqual(
-            rec.label_for("ask"),
-            "Ask a question — answered in chat; the plan stays as-is")
-        self.assertEqual(
-            rec.label_for("changes"),
-            "Request changes — the planner revises; you'll be asked for "
-            "feedback")
-
-    def test_planner_gate_terminal_no_builder(self):
-        rec = self._render(True, cowork.make_gate_preview("planner", False, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish — plan is the deliverable")
-
-    def test_builder_gate_approve_label(self):
-        rec = self._render(False, cowork.make_gate_preview("builder", False, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish — review your working tree")
-
-    def test_scout_preview_threads_through_scout_loop(self):
-        # Plumbing guard: drive the gate through _scout_loop (not the reader in
-        # isolation) and assert the rendered approve label is the phase-truthful
-        # preview — i.e. the descriptor actually threads through _scout_loop's
-        # loop_kwargs and is NOT silently preview=None.
-        import unittest.mock as mock
-        path, d = _gate_status_path()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        sess = _GateSession(path, ["ready_for_review"])
-        rec = _SelectRecorder("approve")
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select", rec):
-            cowork._scout_loop(
-                sess, "seed", path, context="",
-                io_in=FakeTTY(), io_out=FakeTTY(),
-                gate_preview=cowork.make_gate_preview("scout", True, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve — continue to planning")
-
-    def test_planner_preview_threads_through_role_loop(self):
-        # Lighter mirror for the planner path: _role_loop forwards gate_preview
-        # into the reader exactly as run_planner's loop_kwargs supply it.
-        import unittest.mock as mock
-        path, d = _gate_status_path()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        sess = _GateSession(path, ["ready_for_review"])
-        rec = _SelectRecorder("approve")
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select", rec):
-            cowork._role_loop(
-                sess, "seed", path, context="",
-                io_in=FakeTTY(), io_out=FakeTTY(), role="planner",
-                artifact_noun="plan",
-                gate_preview=cowork.make_gate_preview("planner", True, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve — continue to building")
-
-    def test_builder_preview_threads_through_role_loop(self):
-        import unittest.mock as mock
-        path, d = _gate_status_path()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        sess = _GateSession(path, ["ready_for_review"])
-        rec = _SelectRecorder("approve")
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(cowork.ui, "select", rec):
-            cowork._role_loop(
-                sess, "seed", path, context="",
-                io_in=FakeTTY(), io_out=FakeTTY(), role="builder",
-                artifact_noun="build", review_allow_ask=False,
-                gate_preview=cowork.make_gate_preview("builder", False, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish — review your working tree")
-
-
-class BuilderGateSelectTest(unittest.TestCase):
-    """The builder gate is a 3-way select on a TTY (Request changes / Approve &
-    finish / Stop) with Request changes highlighted; off a TTY it keeps
-    blank=finish / text=revise with no Stop."""
-
-    def test_tty_three_way_labels_and_default(self):
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        rec = _SelectRecorder("approve")
-        with mock.patch.object(cowork.ui, "select", rec):
-            out = cowork._read_review(FakeTTY(), FakeTTY(),
-                                      allow_ask=False, preview=preview)
-        self.assertIs(out, cowork._END)
-        self.assertEqual(rec.keys, ["changes", "approve", "stop"])
-        self.assertEqual(rec.labels, [
-            "Request changes — the builder revises; you'll be asked for feedback",
-            "Approve & finish — review your working tree",
-            "Stop — session remains resumable"])
-        # Approve is NOT the highlighted default; Stop is still last.
-        self.assertNotEqual(rec.keys[0], "approve")
-        self.assertEqual(rec.keys[-1], "stop")
-
-    def test_tty_changes_returns_feedback(self):
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        with mock.patch.object(cowork.ui, "select", return_value="changes"), \
-                mock.patch.object(cowork.ui, "prompt_user",
-                                  return_value="tighten it"):
-            out = cowork._read_review(FakeTTY(), FakeTTY(),
-                                      allow_ask=False, preview=preview)
-        self.assertEqual(out, "tighten it")
-
-    def test_tty_stop_returns_stop(self):
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        with mock.patch.object(cowork.ui, "select", return_value="stop"):
-            out = cowork._read_review(FakeTTY(), FakeTTY(),
-                                      allow_ask=False, preview=preview)
-        self.assertIs(out, cowork._STOP)
-
-    def test_off_tty_unchanged_no_stop(self):
-        # Off a TTY the builder contract is byte-for-byte: blank=finish /
-        # text=revise, and no Stop is reachable (select is never consulted).
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        with mock.patch.object(cowork.ui, "select",
-                               side_effect=AssertionError("select off TTY")):
-            self.assertIs(
-                cowork._read_review(io.StringIO("\n"), io.StringIO(),
-                                    allow_ask=False, preview=preview),
-                cowork._END)
-            self.assertEqual(
-                cowork._read_review(io.StringIO("do X\n"), io.StringIO(),
-                                    allow_ask=False, preview=preview),
-                "do X")
-
-
-class DissentGateVariantTest(unittest.TestCase):
-    """The dissent gate renders four preview-labelled choices across the full
-    five-case phase/topology matrix; terminality (and thus the word 'finish')
-    depends on downstream team membership. Enter returns _ITERATE; cancelling a
-    preview-enabled menu follows the explicit Stop path."""
-
-    def _render(self, preview, first_key="iterate"):
-        import unittest.mock as mock
-        rec = _SelectRecorder(first_key)
-        with mock.patch.object(cowork.ui, "select", rec):
-            out = cowork._read_review_dissent(FakeTTY(), FakeTTY(),
-                                              preview=preview)
-        return rec, out
-
-    def _assert_roles(self, rec, role):
-        self.assertEqual(
-            rec.label_for("iterate"),
-            "Keep iterating — hand the reviewer's findings back to the %s" % role)
-        self.assertEqual(
-            rec.label_for("tell"),
-            "Tell it what to do — your instructions go to the %s" % role)
-
-    def test_scout_planner_non_terminal(self):
-        rec, _ = self._render(cowork.make_gate_preview("scout", True, True))
-        self._assert_roles(rec, "scout")
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve anyway — continue to planning")
-        self.assertNotIn("finish", rec.label_for("approve"))
-
-    def test_scout_no_planner_terminal(self):
-        rec, _ = self._render(cowork.make_gate_preview("scout", False, True))
-        self._assert_roles(rec, "scout")
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish anyway — accept despite the reviewer")
-
-    def test_planner_builder_non_terminal(self):
-        rec, _ = self._render(cowork.make_gate_preview("planner", True, True))
-        self._assert_roles(rec, "planner")
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve anyway — continue to building")
-        self.assertNotIn("finish", rec.label_for("approve"))
-
-    def test_planner_no_builder_terminal(self):
-        rec, _ = self._render(cowork.make_gate_preview("planner", False, True))
-        self._assert_roles(rec, "planner")
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish anyway — accept despite the reviewer")
-
-    def test_builder_terminal(self):
-        rec, _ = self._render(cowork.make_gate_preview("builder", False, True))
-        self._assert_roles(rec, "builder")
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish anyway — accept despite the reviewer")
-
-    def test_iterate_is_default_first_choice(self):
-        rec, out = self._render(cowork.make_gate_preview("scout", True, True))
-        self.assertEqual(rec.keys[0], "iterate")
-        self.assertIs(out, cowork._ITERATE)
-
-    def test_dismissed_returns_stop(self):
-        # Questionary returns None for a single Ctrl-C.  Cancellation must not
-        # silently resume iteration.
-        import unittest.mock as mock
-        with mock.patch.object(cowork.ui, "select", return_value=None):
-            out = cowork._read_review_dissent(
-                FakeTTY(), FakeTTY(),
-                preview=cowork.make_gate_preview("builder", False, True))
-        self.assertIs(out, cowork._STOP)
-
-
-class StopOutcomeTest(unittest.TestCase):
-    """The non-default Stop choice at every interactive gate returns _STOP and
-    drives a clean phase end (outcome 'ended') — no approval, no revise/iterate
-    turn, saved anchor untouched, and run_flow does not advance."""
-
-    def test_stop_present_and_non_default_all_gates(self):
-        import unittest.mock as mock
-        # scout/planner normal gate
-        rec = _SelectRecorder("stop")
-        with mock.patch.object(cowork.ui, "select", rec):
-            out = cowork._read_review(
-                FakeTTY(), FakeTTY(), allow_ask=True,
-                preview=cowork.make_gate_preview("scout", True, True))
-        self.assertIs(out, cowork._STOP)
-        self.assertIn("stop", rec.keys)
-        self.assertNotEqual(rec.keys[0], "stop")  # never the default
-        # builder gate
-        rec = _SelectRecorder("stop")
-        with mock.patch.object(cowork.ui, "select", rec):
-            out = cowork._read_review(
-                FakeTTY(), FakeTTY(), allow_ask=False,
-                preview=cowork.make_gate_preview("builder", False, True))
-        self.assertIs(out, cowork._STOP)
-        self.assertIn("stop", rec.keys)
-        self.assertNotEqual(rec.keys[0], "stop")
-        # dissent gate
-        rec = _SelectRecorder("stop")
-        with mock.patch.object(cowork.ui, "select", rec):
-            out = cowork._read_review_dissent(
-                FakeTTY(), FakeTTY(),
-                preview=cowork.make_gate_preview("scout", True, True))
-        self.assertIs(out, cowork._STOP)
-        self.assertIn("stop", rec.keys)
-        self.assertNotEqual(rec.keys[0], "stop")
-
-    def test_dismissed_preview_menus_follow_stop(self):
-        """A single Ctrl-C is surfaced by Questionary as None."""
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("scout", True, True)
-        with mock.patch.object(cowork.ui, "select", return_value=None), \
-                mock.patch.object(
-                    cowork.ui, "prompt_user",
-                    side_effect=AssertionError("cancel became feedback")):
-            self.assertIs(
-                cowork._read_review(FakeTTY(), FakeTTY(), allow_ask=True,
-                                    preview=preview),
-                cowork._STOP)
-
-        preview = cowork.make_gate_preview("builder", False, True)
-        with mock.patch.object(cowork.ui, "select", return_value=None), \
-                mock.patch.object(
-                    cowork.ui, "prompt_user",
-                    side_effect=AssertionError("cancel became feedback")):
-            self.assertIs(
-                cowork._read_review(FakeTTY(), FakeTTY(), allow_ask=False,
-                                    preview=preview),
-                cowork._STOP)
-
-    def test_role_loop_stop_ends_cleanly(self):
-        import unittest.mock as mock
-        path, d = _gate_status_path()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        sess = _GateSession(path, ["ready_for_review"])
-        banners = []
-        with mock.patch.object(
-                cowork.ui, "banner",
-                side_effect=lambda _io, text, kind="info", **kw:
-                banners.append(kind)), \
-                mock.patch.object(cowork.ui, "select", return_value="stop"):
-            rc, outcome, _ = cowork._role_loop(
-                sess, "seed", path, context="",
-                io_in=FakeTTY(), io_out=FakeTTY(), role="scout",
-                gate_preview=cowork.make_gate_preview("scout", True, True))
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
-        # No approval: only the seed was sent, no revise/iterate turn queued.
-        self.assertEqual(sess.sent, ["seed"])
-        # No done banner.
-        self.assertNotIn("done", banners)
-        # The status on disk is left as the role wrote it (anchor untouched).
-        with open(path) as fh:
-            self.assertEqual(json.load(fh)["status"], "ready_for_review")
-
-    def test_run_flow_stop_does_not_advance(self):
-        # Genuine integration: run_flow -> a scout that drives the REAL role loop
-        # where the user picks Stop. The 'ended' outcome must not chain into
-        # planning, and the saved phase anchor must stay 'scouting'.
-        import unittest.mock as mock
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        spath = os.path.join(d, ".cowork", "session.json")
-        seen = {}
-
-        def stop_scout(config, context, selected, on_outcome=None,
-                       on_session=None, resume_id=None, intel_path=None,
-                       gate_preview=None, **kw):
-            seen["preview"] = gate_preview
-            sess = _GateSession(intel_path, ["ready_for_review"])
-            with mock.patch.object(cowork.ui, "banner"), \
-                    mock.patch.object(cowork.ui, "select", return_value="stop"):
-                rc, outcome, _ = cowork._role_loop(
-                    sess, "seed", intel_path, context="",
-                    io_in=FakeTTY(), io_out=FakeTTY(), role="scout",
-                    gate_preview=gate_preview)
-            if on_session and resume_id is None:
-                on_session("claude", "scout-1")
-            if on_outcome:
-                on_outcome(outcome)
-            return rc
-
-        planner_calls = []
-
-        def fake_planner(config, context, selected, on_outcome=None, **kw):
-            planner_calls.append(context)
-            if on_outcome:
-                on_outcome("approved", None)
-            return 0
-
-        rc = cowork.run_flow(
-            cowork.build_parser().parse_args(
-                ["--team", "scout,planner", "--context", "x",
-                 "--session-file", spath]),
-            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
-            run_scout_fn=stop_scout, run_planner_fn=fake_planner)
-        self.assertEqual(rc, 0)
-        # Stop -> 'ended' -> planning never entered.
-        self.assertEqual(planner_calls, [])
-        self.assertEqual(state_store.get_phase(state_store.load(spath)),
-                         "scouting")
-        # run_flow computed a phase-truthful, team-aware descriptor (planner on
-        # team -> non-terminal 'continue to planning').
-        self.assertIsNotNone(seen["preview"])
-        self.assertFalse(seen["preview"].terminal)
-        self.assertEqual(seen["preview"].approve_suffix, "continue to planning")
-
-
-class StopLabelMatrixTest(unittest.TestCase):
-    """All three readers x session_enabled in {True, False} render the correct
-    Stop label variant and return _STOP; no gate text mentions Ctrl-C."""
-
-    def _stop_label(self, reader, allow_ask, preview):
-        import unittest.mock as mock
-        rec = _SelectRecorder("stop")
-        with mock.patch.object(cowork.ui, "select", rec):
-            if reader == "dissent":
-                out = cowork._read_review_dissent(FakeTTY(), FakeTTY(),
-                                                  preview=preview)
-            else:
-                out = cowork._read_review(FakeTTY(), FakeTTY(),
-                                          allow_ask=allow_ask, preview=preview)
-        self.assertIs(out, cowork._STOP)
-        return rec.label_for("stop"), rec.labels + [rec.prompt]
-
-    def test_matrix_labels_and_stop_outcome(self):
-        saved = "Stop — session remains resumable"
-        nosess = "Stop — end this run without approving"
-        specs = [
-            ("normal", True, "scout"),   # scout/planner select
-            ("builder", False, "builder"),
-            ("dissent", None, "scout"),
-        ]
-        all_text = []
-        for reader, allow_ask, role in specs:
-            for enabled, expected in ((True, saved), (False, nosess)):
-                downstream = True if role != "builder" else False
-                preview = cowork.make_gate_preview(role, downstream, enabled)
-                label, texts = self._stop_label(reader, allow_ask, preview)
-                self.assertEqual(label, expected)
-                all_text.extend(texts)
-        # No gate/finish text claims Ctrl-C stops.
-        joined = " ".join(all_text).lower()
-        self.assertNotIn("ctrl-c", joined)
-        self.assertNotIn("ctrl+c", joined)
-
-
-class OffTtyHeadlessContractTest(unittest.TestCase):
-    """Criterion 5: off-TTY and headless behavior is unchanged. Directly asserts
-    the observable contracts, not just aggregate green."""
-
-    def test_read_review_off_tty_both_allow_ask(self):
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("scout", True, True)
-        with mock.patch.object(cowork.ui, "select",
-                               side_effect=AssertionError("select off TTY")):
-            for allow_ask in (True, False):
-                self.assertIs(
-                    cowork._read_review(io.StringIO("\n"), io.StringIO(),
-                                        allow_ask=allow_ask, preview=preview),
-                    cowork._END)
-                self.assertIs(
-                    cowork._read_review(io.StringIO(""), io.StringIO(),
-                                        allow_ask=allow_ask, preview=preview),
-                    cowork._END)
-                self.assertEqual(
-                    cowork._read_review(io.StringIO("revise this\n"),
-                                        io.StringIO(),
-                                        allow_ask=allow_ask, preview=preview),
-                    "revise this")
-
-    def test_read_review_dissent_off_tty(self):
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        with mock.patch.object(cowork.ui, "select",
-                               side_effect=AssertionError("select off TTY")):
-            self.assertIs(
-                cowork._read_review_dissent(io.StringIO("\n"), io.StringIO(),
-                                            preview=preview),
-                cowork._END)
-            self.assertEqual(
-                cowork._read_review_dissent(io.StringIO("my note\n"),
-                                            io.StringIO(), preview=preview),
-                "my note")
-
-    def test_headless_approves_without_calling_readers(self):
-        import unittest.mock as mock
-        path, d = _gate_status_path()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        sess = _GateSession(path, ["ready_for_review"])
-        with mock.patch.object(cowork, "_read_review") as rr, \
-                mock.patch.object(cowork, "_read_review_dissent") as rrd:
-            rc, outcome, _ = cowork._role_loop(
-                sess, "seed", path, context="",
-                io_in=io.StringIO(""), io_out=io.StringIO(),
-                headless=True, role="scout",
-                gate_preview=cowork.make_gate_preview("scout", True, True))
-        self.assertEqual(outcome, "approved")
-        rr.assert_not_called()
-        rrd.assert_not_called()
-
-
 class NeedsInputQuestionContractTest(unittest.TestCase):
     """Real wrappers never show an unexplained blank needs_input gate."""
 
@@ -13427,44 +11691,43 @@ class NeedsInputQuestionContractTest(unittest.TestCase):
                 pass
         return ScriptedSession()
 
-    def test_missing_question_gets_one_repair_then_surfaces_question(self):
+    def test_missing_question_gets_one_repair_then_stops_with_question(self):
         path = self._path()
         writes = [
             {"status": "needs_input", "result": {}},
             {"status": "needs_input",
              "result": {"pending_question": "Ship behind a flag?"}},
-            {"status": "ready_for_review", "result": {}},
         ]
         session = self._session(path, writes)
         out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
+        rc, outcome, payload = cowork._role_loop(
             session, "seed", path, context="",
-            io_in=io.StringIO("yes\n\n"), io_out=out, role="planner",
+            io_out=out, role="planner",
             needs_input_text=cowork.planner_needs_input_text,
             artifact_noun="plan", require_pending_question=True)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
+        self.assertEqual((rc, outcome), (0, "stopped"))
         self.assertEqual(session.sent[0], "seed")
         self.assertIn("result.pending_question", session.sent[1])
-        self.assertEqual(session.sent[2], "yes")
-        self.assertIn("Ship behind a flag?", out.getvalue())
+        self.assertEqual(len(session.sent), 2)
+        self.assertEqual(payload["question"], "Ship behind a flag?")
         self.assertIn("No question was recorded", out.getvalue())
 
-    def test_second_missing_question_is_explicit_not_an_empty_gate(self):
+    def test_second_missing_question_stops_without_a_question(self):
         path = self._path()
         session = self._session(path, [
             {"status": "needs_input", "result": {"revision": 1}},
             {"status": "needs_input", "result": {"revision": 2}},
         ])
         out = io.StringIO()
-        rc, outcome, _ = cowork._role_loop(
+        rc, outcome, payload = cowork._role_loop(
             session, "seed", path, context="",
-            io_in=io.StringIO("/stop\n"), io_out=out, role="planner",
+            io_out=out, role="planner",
             needs_input_text=cowork.planner_needs_input_text,
             artifact_noun="plan", require_pending_question=True)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
+        self.assertEqual((rc, outcome), (0, "stopped"))
         self.assertEqual(len(session.sent), 2)
+        self.assertEqual(payload["kind"], "needs_input")
+        self.assertNotIn("question", payload)
         self.assertIn("No question was provided after an automatic repair",
                       out.getvalue())
 
@@ -13489,7 +11752,8 @@ class ControllerSwitchSurfaceTest(unittest.TestCase):
                   "<artifact path='secret'>INTERNAL PAYLOAD</artifact>")
         rc, outcome, _ = cowork._role_loop(
             session, "seed", path, context=packet,
-            io_in=io.StringIO("\n"), io_out=out, role="planner")
+            io_out=out, role="planner",
+            review_fn=lambda p, r: {"verdict": "approve"})
         self.assertEqual(rc, 0)
         self.assertEqual(outcome, "approved")
         self.assertNotIn("INTERNAL PAYLOAD", out.getvalue())
@@ -13502,314 +11766,8 @@ class ControllerSwitchSurfaceTest(unittest.TestCase):
         out = io.StringIO()
         cowork._role_loop(
             session, "seed", path, context="normal shared context",
-            io_in=io.StringIO("\n"), io_out=out, role="planner")
+            io_out=out, role="planner")
         self.assertIn("normal shared context", out.getvalue())
-
-
-class GateWrapperPlumbingTest(unittest.TestCase):
-    """Drive the REAL run_scout / run_planner / run_builder wrappers (not the
-    inner loops directly) to the gate reader and assert the rendered approve
-    label matches the supplied GatePreview. These fail if the gate_preview
-    forwarding is deleted from any wrapper's _scout_loop/_role_loop call — the
-    label would silently fall back to the plain 'Approve & finish'. The scout
-    case covers both topology variants (planner on and off the team)."""
-
-    def _tmp(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        return d
-
-    def _session(self, status_path, role):
-        class FakeSession:
-            def __init__(self):
-                self.sent = []
-
-            def send(self, text, *a, **k):
-                self.sent.append(text)
-                os.makedirs(os.path.dirname(status_path), exist_ok=True)
-                with open(status_path, "w") as fh:
-                    json.dump({"session": "X", "role": role,
-                               "status": "ready_for_review", "result": {}}, fh)
-
-            def close(self):
-                pass
-        return FakeSession()
-
-    def _render_approve(self, run, status_path, role, gate_preview, **kw):
-        import unittest.mock as mock
-        sess = self._session(status_path, role)
-        rec = _SelectRecorder("approve")
-        # If the preview failed to thread through, the builder gate would fall
-        # back to ui.confirm (which would block on real input); fail fast and
-        # loud instead of hanging so the guard stays a clean assertion.
-        with mock.patch.object(cowork.ui, "banner"), \
-                mock.patch.object(
-                    cowork.ui, "confirm",
-                    side_effect=AssertionError("gate fell back to confirm — "
-                                               "preview not forwarded")), \
-                mock.patch.object(cowork.ui, "select", rec):
-            rc = run(io_in=FakeTTY(), io_out=FakeTTY(),
-                     session_factory=lambda *a, **k: sess,
-                     gate_preview=gate_preview,
-                     on_outcome=lambda *a, **k: None, **kw)
-        self.assertEqual(rc, 0)
-        return rec
-
-    def test_run_scout_wrapper_forwards_preview_planner_on_team(self):
-        d = self._tmp()
-        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
-        config = cowork.default_config(["scout"])
-        config["scout"]["controller"] = "codex"
-        rec = self._render_approve(
-            lambda **kw: cowork.run_scout(config, "seed", ["scout"],
-                                          intel_path=intel, **kw),
-            intel, "scout", cowork.make_gate_preview("scout", True, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve — continue to planning")
-
-    def test_run_scout_wrapper_forwards_preview_no_planner(self):
-        d = self._tmp()
-        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
-        config = cowork.default_config(["scout"])
-        config["scout"]["controller"] = "codex"
-        rec = self._render_approve(
-            lambda **kw: cowork.run_scout(config, "seed", ["scout"],
-                                          intel_path=intel, **kw),
-            intel, "scout", cowork.make_gate_preview("scout", False, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish — intel is the deliverable")
-
-    def test_run_planner_wrapper_forwards_preview(self):
-        d = self._tmp()
-        pj = os.path.join(d, ".cowork", "planner.plan.X.json")
-        pm = os.path.join(d, ".cowork", "planner.plan.X.md")
-        config = cowork.default_config(["planner"])
-        config["planner"]["controller"] = "codex"
-        rec = self._render_approve(
-            lambda **kw: cowork.run_planner(config, "seed", ["planner"],
-                                            plan_json_path=pj, plan_md_path=pm,
-                                            **kw),
-            pj, "planner", cowork.make_gate_preview("planner", True, True))
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve — continue to building")
-
-    def test_run_builder_wrapper_forwards_preview(self):
-        d = self._tmp()
-        base = os.path.join(d, ".cowork")
-        os.makedirs(base, exist_ok=True)
-        status = os.path.join(base, "builder.status.X.json")
-        pj = os.path.join(base, "planner.plan.X.json")
-        pm = os.path.join(base, "planner.plan.X.md")
-        with open(pj, "w") as fh:
-            json.dump({"status": "ready_for_review"}, fh)
-        with open(pm, "w") as fh:
-            fh.write("# PLAN")
-        config = cowork.default_config(["builder"])
-        config["builder"]["controller"] = "codex"
-        rec = self._render_approve(
-            lambda **kw: cowork.run_builder(config, "seed", ["builder"],
-                                            build_status_path=status,
-                                            plan_json_path=pj, plan_md_path=pm,
-                                            **kw),
-            status, "builder",
-            cowork.make_gate_preview("builder", False, True))
-        # The builder gate is a preview-enabled 3-way select in the wrapper.
-        self.assertEqual(rec.keys, ["changes", "approve", "stop"])
-        self.assertEqual(rec.label_for("approve"),
-                         "Approve & finish — review your working tree")
-
-
-class ReviewGateQuestionTest(unittest.TestCase):
-    """The "Ask a question" path end-to-end through the shared role loop: a
-    non-reopen turn that answers in chat, leaves the artifact byte-identical,
-    and lets the hash-gate auto-skip the paired advisor — no invalidate, no
-    stale-no-op, no re-review. Covered for both the planner/_role_loop generic
-    path and the scout loop."""
-
-    def _dir(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        os.makedirs(os.path.join(d, ".cowork"), exist_ok=True)
-        # The skip-baseline state lives in a SEPARATE session file, never the
-        # reviewed status artifact.
-        spath = os.path.join(d, "session.json")
-        state_store.save(spath, {"team": [], "config": {}, "sessions": {}})
-        self._spath = spath
-        return d
-
-    def _trace(self, d):
-        return trace_store.Trace(os.path.join(d, ".cowork", "trace.X.jsonl"),
-                                 session_uuid="X", run_id="R")
-
-    def _events(self, d):
-        tpath = os.path.join(d, ".cowork", "trace.X.jsonl")
-        with open(tpath) as fh:
-            return [json.loads(line) for line in fh if line.strip()]
-
-    def _raw_trace(self, d):
-        with open(os.path.join(d, ".cowork", "trace.X.jsonl")) as fh:
-            return fh.read()
-
-    _READY = {"status": "ready_for_review", "result": {}}
-
-    def _session(self, path, writes):
-        """`writes` is a per-send list: a dict is written as the status
-        artifact, None means the turn writes nothing (the question turn)."""
-        class ScriptedSession:
-            def __init__(self):
-                self.sent = []
-                self.closed = False
-
-            def send(self, text):
-                self.sent.append(text)
-                w = writes.pop(0) if writes else None
-                if w is not None:
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "w") as fh:
-                        json.dump(w, fh)
-
-            def close(self):
-                self.closed = True
-        return ScriptedSession()
-
-    def _review_fn(self, verdicts):
-        calls = {"n": 0}
-
-        def review_fn(status_path, round_index):
-            calls["n"] += 1
-            return verdicts.pop(0) if verdicts else {"verdict": "approve"}
-        review_fn.calls = calls
-        return review_fn
-
-    def _bundle(self, spath, covered, reviewer_role):
-        # Mirrors run_flow.make_skip_baseline (see HashGateSkipTest._bundle).
-        holder = {"state": state_store.load(spath)}
-
-        def compute():
-            return state_store.composite_artifact_hash(covered)
-
-        def eligible(h):
-            return state_store.review_skip_eligible(
-                holder["state"], reviewer_role, 0, 0, h)
-
-        def record(h):
-            holder["state"] = state_store.record_review_baseline(
-                spath, reviewer_role, 0, 0, h, prior=holder["state"])
-        return cowork.SkipBaseline(compute, eligible, record)
-
-    def _assert_question_was_free(self, d, rfn, status_path,
-                                  question="why this approach?"):
-        events = self._events(d)
-        # The role artifact was never invalidated (no reopen).
-        self.assertFalse(any(e["event"] == "status.invalidated"
-                             for e in events))
-        # No stale-no-op fired even though the question turn wrote nothing.
-        self.assertFalse(any(e["event"] == "stale_noop" for e in events))
-        self.assertFalse(any(e["event"] == "stale_noop.unresolved"
-                             for e in events))
-        # The advisor ran exactly once (the original approve), then was skipped
-        # on the unchanged follow-up.
-        self.assertEqual(rfn.calls["n"], 1)
-        self.assertTrue(any(e["event"] == "review.skipped" for e in events))
-        # The question is recorded as a distinct, content-free user action.
-        q = [e for e in events if e["event"] == "user.action"
-             and e.get("action") == "question"]
-        self.assertEqual(len(q), 1)
-        self.assertEqual(q[0]["gate"], "ready_for_review")
-        self.assertIn("input_sha256", q[0])
-        self.assertIn("input_bytes", q[0])
-        # The raw question text never lands in the trace (privacy).
-        self.assertNotIn(question, self._raw_trace(d))
-        # The gate was shown before AND after the question (re-shown).
-        gate_shows = [e for e in events if e["event"] == "gate.show"
-                      and e.get("gate") == "ready_for_review"]
-        self.assertGreaterEqual(len(gate_shows), 2)
-        # The status artifact is byte-identical to the approved READY bytes.
-        with open(status_path) as fh:
-            self.assertEqual(json.load(fh)["status"], "ready_for_review")
-
-    def test_question_gate_planner_role_loop(self):
-        import unittest.mock as mock
-        d = self._dir()
-        path = os.path.join(d, ".cowork", "planner.plan.X.json")
-        sess = self._session(path, [dict(self._READY)])  # only the seed writes
-        rfn = self._review_fn([{"verdict": "approve"}])
-        bundle = self._bundle(self._spath, [path], "planning-advisor")
-        trace = self._trace(d)
-        out = io.StringIO()
-        with mock.patch.object(
-                cowork, "_read_review",
-                side_effect=[(cowork._ASK, "why this approach?"), cowork._END]):
-            rc, outcome, _ = cowork._role_loop(
-                sess, "seed", path, context="",
-                io_in=io.StringIO(""), io_out=out,
-                review_fn=rfn, skip_baseline=bundle, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
-        # The question turn was tagged user_question (per-turn accounting).
-        starts = [e for e in self._events(d) if e["event"] == "role.send.start"]
-        self.assertIn("user_question",
-                      [e.get("prompt_kind") for e in starts])
-        self.assertIn("review skipped", out.getvalue())
-        self._assert_question_was_free(d, rfn, path)
-
-    def test_question_gate_scout_loop(self):
-        import unittest.mock as mock
-        d = self._dir()
-        intel = os.path.join(d, ".cowork", "scout.intel.X.json")
-        intel_md = os.path.join(d, ".cowork", "scout.intel.X.md")
-        with open(intel, "w") as fh:
-            json.dump(dict(self._READY), fh)
-        with open(intel_md, "w") as fh:
-            fh.write("# intel markdown")
-        sess = self._session(intel, [dict(self._READY)])
-        rfn = self._review_fn([{"verdict": "approve"}])
-        bundle = self._bundle(self._spath, [intel, intel_md], "scout-reviewer")
-        trace = self._trace(d)
-        out = io.StringIO()
-        with mock.patch.object(
-                cowork, "_read_review",
-                side_effect=[(cowork._ASK, "why this approach?"), cowork._END]):
-            rc = cowork._scout_loop(
-                sess, "seed", intel, context="",
-                io_in=io.StringIO(""), io_out=out, review_fn=rfn,
-                intel_md_path=intel_md, skip_baseline=bundle, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertIn("review skipped", out.getvalue())
-        self._assert_question_was_free(d, rfn, intel)
-
-    def test_request_changes_still_reopens_as_revise(self):
-        # Regression: the 3-way "Request changes" path (a plain string from
-        # _read_review) still reopens work exactly like today's revise.
-        import unittest.mock as mock
-        d = self._dir()
-        path = os.path.join(d, ".cowork", "planner.plan.X.json")
-        sess = self._session(path, [
-            dict(self._READY),
-            {"status": "ready_for_review", "result": {"v": 2}}])  # revised bytes
-        rfn = self._review_fn([{"verdict": "approve"}, {"verdict": "approve"}])
-        bundle = self._bundle(self._spath, [path], "planning-advisor")
-        trace = self._trace(d)
-        with mock.patch.object(
-                cowork, "_read_review",
-                side_effect=["please tighten scope", cowork._END]):
-            rc, outcome, _ = cowork._role_loop(
-                sess, "seed", path, context="",
-                io_in=io.StringIO(""), io_out=io.StringIO(),
-                review_fn=rfn, skip_baseline=bundle, trace=trace)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
-        events = self._events(d)
-        revise = [e for e in events if e["event"] == "user.action"
-                  and e.get("action") == "revise"]
-        self.assertEqual(len(revise), 1)
-        self.assertEqual(revise[0]["gate"], "ready_for_review")
-        # Work was reopened: the artifact was invalidated and the advisor re-ran.
-        self.assertTrue(any(e["event"] == "status.invalidated"
-                            and e["changed"] for e in events))
-        self.assertEqual(rfn.calls["n"], 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -13881,18 +11839,6 @@ class ModelConfigTest(unittest.TestCase):
         self.assertTrue(ok, err)
         self.assertEqual(config["scout"]["controller"], "codex")
         self.assertEqual(config["scout"]["model"], "gpt-5-codex")
-
-    def test_summary_shows_model_column(self):
-        config = {"scout": {"controller": "claude", "model": None,
-                            "effort": None, "yolo": True,
-                            "mode": "implement"}}
-        plain = cowork.format_config_summary(config)
-        self.assertIn("model", plain)
-        self.assertIn("default", plain)
-        config["scout"]["model"] = "claude-opus-4-8"
-        pinned = cowork.format_config_summary(config)
-        self.assertIn("claude-opus-4-8", pinned)
-
 
 class ModelCaptureTest(unittest.TestCase):
     def test_parse_claude_system_event_carries_model(self):
@@ -14022,7 +11968,7 @@ class RoleIdentityRegistryTest(_EvalEnvMixin, unittest.TestCase):
             def send(self, text):
                 return {"ok": True, "result": "ok", "session_id": "SID-1"}
         cowork._send(
-            FakeSession(), cowork._user_lead_delivery("hello"))
+            FakeSession(), cowork._initial_user_delivery("hello"))
         data = state_store.read_role_identities(
             os.path.join(d, "identities.json"))
         self.assertEqual(data["scout"], {"tool": "claude",
@@ -14394,7 +12340,7 @@ _HANDOFF_SRC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _CROSS_ROLE_PROSE = [
     "[reviewer handoff]",
     "[controller switch handoff]",
-    "New user context was provided",
+    "New orchestrator context was provided",
     "handed the work back",
     "handed the work back to you",
     "APPROVED the scout intel",
@@ -14734,7 +12680,7 @@ class TransportChokePointTests(unittest.TestCase):
         # it was not merely deleted).
         hsrc = Path(_HANDOFF_SRC_PATH).read_text()
         for phrase in ("[reviewer handoff]", "[controller switch handoff]",
-                       "New user context was provided"):
+                       "New orchestrator context was provided"):
             self.assertIn(phrase, hsrc)
 
     # Every `handoff.<attr>` that cowork.py is ALLOWED to reference. Contains
@@ -14750,7 +12696,7 @@ class TransportChokePointTests(unittest.TestCase):
         "is_content_free_token", "_write_file", "SWITCH_HANDOFF_MARKER",
         "HandoffBlock", "DeliveryEnvelope", "cross_role_delivery",
         "direct_delivery", "_initial_user_text", "_static_role_text",
-        "_user_lead_reply", "STATIC_SEPARATOR", "FULL_REREAD_INSTRUCTION", "EDGES",
+        "STATIC_SEPARATOR", "FULL_REREAD_INSTRUCTION", "EDGES",
         "ROLE_REGISTRY", "selectable_roles", "reviewer_pairs",
         "validate_role_topology",
         "MissingSourceError", "ContentFreeError", "ContextError",
@@ -14950,13 +12896,12 @@ class TransportChokePointTests(unittest.TestCase):
             "_initial_user_text": {"_initial_user_delivery"},
             "_static_role_text": {
                 "_closed_static_delivery", "_codex_static_prefix_fragment",
-                "_cross_delivery", "_headless_lead_fragment",
-                "_repo_discovery_fragment",
+                "_cross_delivery", "_agent_lead_fragment",
+                "_agent_reviewer_fragment",
+                "_handoff_declined_fragment", "_repo_discovery_fragment",
             },
-            "_user_lead_reply": {"_user_lead_delivery"},
             "direct_delivery": {
                 "_initial_user_delivery", "_closed_static_delivery",
-                "_user_lead_delivery",
             },
             "cross_role_delivery": {"_cross_delivery"},
         }
@@ -14994,8 +12939,7 @@ class TransportChokePointTests(unittest.TestCase):
         wrapper_callers = {
             "_closed_static_delivery": {
                 "_worktree_seed_delivery", "_repair_delivery",
-                "_missing_question_delivery", "_headless_nudge_delivery",
-                "_handoff_declined_delivery",
+                "_missing_question_delivery",
                 # The unverified-readiness hand-back: a static template with a
                 # normalized reason code substituted in. The reason comes from
                 # a closed set computed by _record_readiness, never from role
@@ -15006,10 +12950,9 @@ class TransportChokePointTests(unittest.TestCase):
             "_worktree_seed_delivery": {"run_worktree"},
             "_repair_delivery": {"_role_loop"},
             "_missing_question_delivery": {"_role_loop"},
-            "_headless_nudge_delivery": {"_role_loop"},
-            "_handoff_declined_delivery": {"_role_loop"},
             "_codex_static_prefix_fragment": {"assemble_codex_prompt"},
-            "_headless_lead_fragment": {"run_flow", "with_headless_lead"},
+            "_agent_lead_fragment": {"run_flow", "with_agent_lead_note"},
+            "_agent_reviewer_fragment": {"run_flow", "reviewer_gap"},
             "_repo_discovery_fragment": {"run_flow"},
         }
         actual = {name: set() for name in wrapper_callers}
@@ -15025,10 +12968,9 @@ class TransportChokePointTests(unittest.TestCase):
         boundary_callers = {
             "_initial_user_delivery": {
                 "_role_seed_delivery", "_role_loop",
-                # M3 Package E: the headless resume-trigger's typed seed
+                # M3 Package E: the resume-trigger's typed seed
                 # wrapper (issue #57 -- never an untyped seed).
                 "_resume_seed_delivery"},
-            "_user_lead_delivery": {"_role_loop"},
             "_role_seed_delivery": {
                 "assemble_codex_prompt", "run_scout", "run_planner",
                 "run_builder",
@@ -15053,7 +12995,7 @@ class TransportChokePointTests(unittest.TestCase):
         self.assertEqual(boundary_actual, boundary_callers)
 
         known_wrappers = set(wrapper_callers) | {
-            "_initial_user_delivery", "_user_lead_delivery",
+            "_initial_user_delivery",
             "_cross_delivery", "_eval_delivery", "_lead_turn_delivery",
             "_role_seed_delivery", "_resume_seed_delivery",
         }
@@ -15083,7 +13025,7 @@ class TransportChokePointTests(unittest.TestCase):
         boundary_synthetic = (
             Path(_COWORK_SRC_PATH).read_text()
             + "\n\ndef new_role(shared_context_or_artifact_body):\n"
-              "    _user_lead_delivery(shared_context_or_artifact_body)\n"
+              "    _lead_turn_delivery(shared_context_or_artifact_body)\n"
               "    _role_seed_delivery('brief', "
               "shared_context_or_artifact_body)\n")
         boundary_tree = _ast.parse(boundary_synthetic)
@@ -15097,8 +13039,8 @@ class TransportChokePointTests(unittest.TestCase):
                         and call.func.id in boundary_seen):
                     boundary_seen[call.func.id].add(fn.name)
         self.assertIn("new_role",
-                      boundary_seen["_user_lead_delivery"]
-                      - boundary_callers["_user_lead_delivery"])
+                      boundary_seen["_lead_turn_delivery"]
+                      - boundary_callers["_lead_turn_delivery"])
         self.assertIn("new_role",
                       boundary_seen["_role_seed_delivery"]
                       - boundary_callers["_role_seed_delivery"])
@@ -15144,7 +13086,7 @@ class SentinelTransportTests(unittest.TestCase):
         review = self._f("scout-review.json",
                          json.dumps({"findings": ["MARK_FINDING"],
                                      "user_question": "MARK_QUESTION"}))
-        for verdict in ("revise", "needs_user"):
+        for verdict in ("revise",):
             out = cowork.assemble_reviewer_handoff(
                 verdict, {"findings": ["MARK_FINDING"],
                           "user_question": "MARK_QUESTION"},
@@ -15596,7 +13538,7 @@ class AccountingDerivationTests(unittest.TestCase):
         sess1 = FakeBridgeSession(trace, writes=[{"status": "ready_for_review", "result": {"v": 1}}])
         rc1, outcome1, _ = cowork._role_loop(
             sess1, seed, status_path, context="", seed_artifact_paths=[plan_json, plan_md],
-            io_in=io.StringIO(""), io_out=io.StringIO(), role="builder", trace=trace,
+            io_out=io.StringIO(), role="builder", trace=trace,
             is_resume=False)
         self.assertEqual(rc1, 0)
 
@@ -15605,7 +13547,7 @@ class AccountingDerivationTests(unittest.TestCase):
         sess2 = FakeBridgeSession(trace, writes=[{"status": "ready_for_review", "result": {"v": 2}}])
         rc2, outcome2, _ = cowork._role_loop(
             sess2, seed_res, status_path, context="", seed_artifact_paths=[plan_json, plan_md],
-            io_in=io.StringIO(""), io_out=io.StringIO(), role="builder", trace=trace,
+            io_out=io.StringIO(), role="builder", trace=trace,
             is_resume=True)
         self.assertEqual(rc2, 0)
 
@@ -15628,9 +13570,16 @@ class AccountingDerivationTests(unittest.TestCase):
 
     def test_genuine_process_boundary_end_exit_replay_once_and_clear_on_success(self):
         # Requirement: Real Python subprocess boundary test verifying:
-        # Failure -> choose End/exit -> new process resume -> replay once -> subsequent resume does not replay.
+        # Failure -> the phase ends -> new process resume -> replay once -> subsequent resume does not replay.
         d = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        # The three subprocesses inherit an isolated session-assets root, so
+        # durable per-session records never leak between test runs.
+        import unittest.mock as mock
+        env_patch = mock.patch.dict(
+            os.environ, {"COWORK_SESSIONS_ROOT": os.path.join(d, "sessions")})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         spath = os.path.join(d, ".cowork", "session.json")
         suid = "subprocess-boundary-uuid"
         state_store.ensure_session(spath, None, suid)
@@ -15672,19 +13621,19 @@ def fake_run_builder(config, context, selected, **kwargs):
     save_pending_turn_fn = kwargs.get("save_pending_turn_fn")
     rc, outcome, payload = cowork._role_loop(
         sess, direct_request, build_status, context="",
-        io_in=io.StringIO("end\\n"), io_out=io.StringIO(),
+        io_out=io.StringIO(),
         role="builder", save_pending_turn_fn=save_pending_turn_fn,
         spath=spath)
     if on_outcome:
         on_outcome(outcome, payload)
     return rc
 
-args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+args = cowork.build_parser().parse_args(["--team", "builder,build-reviewer", "--session-file", spath, "--context", "go"])
 rc = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
 sys.exit(rc)
 """
         proc1 = subprocess.run([sys.executable, "-c", p1_code], capture_output=True, text=True)
-        self.assertEqual(proc1.returncode, 0)
+        self.assertEqual(proc1.returncode, 1, proc1.stderr)  # failed, not approved
 
         # VERIFY PROCESS 1 DISK STATE: pending_turn was persisted BEFORE process exit on choosing End!
         disk_state_p1 = state_store.load(spath)
@@ -15718,7 +13667,7 @@ def fake_run_builder(config, context, selected, **kwargs):
     save_pending_turn_fn = kwargs.get("save_pending_turn_fn")
     rc, outcome, payload = cowork._role_loop(
         sess, context, build_status, context="",
-        io_in=io.StringIO(""), io_out=io.StringIO(),
+        io_out=io.StringIO(),
         role="builder", on_first_send_accepted=on_first_send_accepted,
         save_pending_turn_fn=save_pending_turn_fn,
         spath=spath)
@@ -15726,12 +13675,13 @@ def fake_run_builder(config, context, selected, **kwargs):
         on_outcome(outcome, payload)
     return rc
 
-args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+args = cowork.build_parser().parse_args(["--team", "builder,build-reviewer", "--session-file", spath])
 rc = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
 sys.exit(rc)
 """
         proc2 = subprocess.run([sys.executable, "-c", p2_code], capture_output=True, text=True)
-        self.assertEqual(proc2.returncode, 0)
+        # the replayed turn is accepted; the status still needs input -> stop
+        self.assertEqual(proc2.returncode, 4, proc2.stderr)
 
         # VERIFY PROCESS 2 REPLAY BY PATH:
         self.assertTrue(os.path.exists(p2_log))
@@ -15768,26 +13718,27 @@ def fake_run_builder(config, context, selected, **kwargs):
     on_outcome = kwargs.get("on_outcome")
     rc, outcome, payload = cowork._role_loop(
         sess, context, build_status, context="",
-        io_in=io.StringIO(""), io_out=io.StringIO(),
+        io_out=io.StringIO(),
         role="builder", spath=spath)
     if on_outcome:
         on_outcome(outcome, payload)
     return rc
 
-args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
+args = cowork.build_parser().parse_args(["--team", "builder,build-reviewer", "--session-file", spath])
 rc = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
 sys.exit(rc)
 """
         proc3 = subprocess.run([sys.executable, "-c", p3_code], capture_output=True, text=True)
-        self.assertEqual(proc3.returncode, 0)
+        self.assertEqual(proc3.returncode, 4, proc3.stderr)
 
         if os.path.exists(p3_log):
             with open(p3_log, "r") as fh:
                 p3_sent_text = fh.read()
             self.assertNotIn("switch.pending_turn.builder.txt", p3_sent_text)
 
-    def test_failure_retry_failure_performs_two_failed_sends_and_retains(self):
-        # Requirement: failure->retry->failure performs TWO failed sends and retains pending_turn.
+    def test_failed_send_ends_the_phase_once_and_retains_pending_turn(self):
+        # A failed send ends the phase after exactly ONE send (no in-process
+        # retry exists) and retains the pending turn for a later resume.
         d = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         spath = os.path.join(d, ".cowork", "session.json")
@@ -15817,196 +13768,20 @@ sys.exit(rc)
 
         rc, outcome, payload = cowork._role_loop(
             FailingSession(), direct_request, build_status, context="",
-            io_in=io.StringIO("retry\nend\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", spath=spath)
 
         self.assertEqual(rc, 0)
         self.assertEqual(outcome, "ended")
-        # ASSERT SEND COUNT IS EXACTLY TWO
-        self.assertEqual(len(sends), 2)
+        self.assertEqual(payload["kind"], "controller_failure")
+        self.assertEqual(len(sends), 1)
         self.assertEqual(str(sends[0]), direct_request)
-        self.assertEqual(str(sends[1]), direct_request)
 
         # ASSERT DISK RETAINS PENDING TURN
         disk_state = state_store.load(spath)
         pending = state_store.read_pending_switch(disk_state, "builder")
         self.assertIsNotNone(pending)
         self.assertEqual(pending.get("pending_turn"), direct_request)
-
-    def test_initial_success_later_failure_retry_success_performs_three_sends_and_clears(self):
-        # Requirement: initial success -> later failure -> retry success performs THREE sends total
-        # and clears pending_turn; a following process does not replay it.
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        spath = os.path.join(d, ".cowork", "session.json")
-        suid = "three-sends-uuid"
-        state_store.ensure_session(spath, None, suid)
-        intel_dir = state_store.session_assets_dir(suid)
-        os.makedirs(intel_dir, exist_ok=True)
-        build_status = os.path.join(intel_dir, "builder.status.json")
-        with open(build_status, "w") as fh:
-            json.dump({"status": "ready_for_review", "result": {}}, fh)
-
-        sends = []
-
-        class SequenceSession:
-            controller = "claude"
-            def __init__(self):
-                self.count = 0
-            def send(self, text, meta=None):
-                sends.append(text)
-                self.count += 1
-                if self.count == 1:
-                    # Send 1: Initial turn succeeds
-                    return {"ok": True, "result": "ok"}
-                elif self.count == 2:
-                    # Send 2: Later direct turn fails. M3 Package E: a token
-                    # outside every Package C classifier table (never
-                    # quota/overload/authentication) -- retry MECHANICS, not
-                    # capacity classification, are under test here.
-                    return {"ok": False, "result": "error",
-                            "error_type": "flaky_stream"}
-                else:
-                    # Send 3: Retry send succeeds and writes ready_for_review
-                    with open(build_status, "w") as fh:
-                        json.dump({"status": "ready_for_review", "result": {"v": 2}}, fh)
-                    return {"ok": True, "result": "ok"}
-            def close(self): pass
-
-        sess = SequenceSession()
-        # Simulated user interaction:
-        # 1. Initial turn runs (succeeds). Status is ready_for_review.
-        # 2. User inputs "later direct request" -> sends (fails).
-        # 3. Failure gate: user selects "retry".
-        # 4. Retry sends "later direct request" -> succeeds.
-        # 5. Review gate off-TTY: blank line ("\n") approves -> finish.
-        inputs = "later direct request\nretry\n\n"
-
-        rc, outcome, payload = cowork._role_loop(
-            sess, "initial turn", build_status, context="",
-            io_in=io.StringIO(inputs), io_out=io.StringIO(),
-            role="builder", spath=spath)
-
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "approved")
-        # ASSERT SEND COUNT IS EXACTLY THREE
-        self.assertEqual(len(sends), 3)
-
-        # ASSERT DISK CLEARS PENDING TURN
-        disk_state = state_store.load(spath)
-        pending = state_store.read_pending_switch(disk_state, "builder")
-        self.assertIsNone(pending)
-
-        # FOLLOWING PROCESS RESUME: does not replay
-        p2_sends = []
-        class ResumeSession:
-            controller = "claude"
-            def send(self, text, meta=None):
-                p2_sends.append(text)
-                return {"ok": True, "result": "ok"}
-            def close(self): pass
-
-        def fake_run_builder(config, context, selected, **kwargs):
-            r_sess = ResumeSession()
-            return cowork._role_loop(
-                r_sess, context, build_status, context="",
-                io_in=io.StringIO("approve\n"), io_out=io.StringIO(),
-                role="builder", spath=spath)[0]
-
-        args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
-        state_store.save_phase(spath, "building")
-        rc2 = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
-        self.assertEqual(rc2, 0)
-
-        if p2_sends:
-            self.assertNotIn("switch.pending_turn.builder.txt", str(p2_sends[0]))
-
-    def test_failure_retry_success_leaves_needs_input_and_eof_returns_ended_and_clears(self):
-        # Requirement: failure -> Retry -> successful send leaves needs_input (or reaches input gate) -> EOF:
-        # Asserts exact send count (2 sends), outcome == "ended" (NOT None),
-        # pending_turn cleared from disk after successful retry send, and no replay on subsequent process resume.
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        spath = os.path.join(d, ".cowork", "session.json")
-        suid = "retry-needs-input-uuid"
-        state_store.ensure_session(spath, None, suid)
-        intel_dir = state_store.session_assets_dir(suid)
-        os.makedirs(intel_dir, exist_ok=True)
-        build_status = os.path.join(intel_dir, "builder.status.json")
-        with open(build_status, "w") as fh:
-            json.dump({"status": "needs_input"}, fh)
-
-        direct_request = "Incomplete task needing user input"
-        sends = []
-
-        class SequenceSession:
-            controller = "claude"
-            def __init__(self):
-                self.count = 0
-            def send(self, text, meta=None):
-                sends.append(text)
-                self.count += 1
-                if self.count == 1:
-                    # Send 1: Fails. M3 Package E: a token outside every
-                    # Package C classifier table (never quota/overload/
-                    # authentication) -- retry MECHANICS, not capacity
-                    # classification, are under test here.
-                    return {"ok": False, "result": "error",
-                            "error_type": "flaky_stream"}
-                else:
-                    # Send 2: Retry send succeeds (status file remains needs_input)
-                    return {"ok": True, "result": "ok"}
-            def close(self): pass
-
-        sess = SequenceSession()
-        # Input sequence:
-        # 1. Failure gate: user inputs "retry\n".
-        # 2. Retry send runs and succeeds. Status is needs_input.
-        # 3. needs_input gate: user inputs EOF ("\n" or "") -> _read_turn returns _END.
-        inputs = "retry\n\n"
-
-        rc, outcome, payload = cowork._role_loop(
-            sess, direct_request, build_status, context="",
-            io_in=io.StringIO(inputs), io_out=io.StringIO(),
-            role="builder", spath=spath)
-
-        # 1. Assert return code and outcome is "ended" (NOT None)
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
-
-        # 2. Assert exact send count is TWO (Send 1 failed, Send 2 retry succeeded)
-        self.assertEqual(len(sends), 2)
-        self.assertEqual(str(sends[0]), direct_request)
-        self.assertEqual(str(sends[1]), direct_request)
-
-        # 3. Assert pending_turn was CLEARED from disk after successful accepted retry send
-        disk_state = state_store.load(spath)
-        pending = state_store.read_pending_switch(disk_state, "builder")
-        self.assertIsNone(pending)
-
-        # 4. Assert following process resume does NOT replay the accepted turn
-        p2_sends = []
-        class ResumeSession:
-            controller = "claude"
-            def send(self, text, meta=None):
-                p2_sends.append(text)
-                return {"ok": True, "result": "ok"}
-            def close(self): pass
-
-        def fake_run_builder(config, context, selected, **kwargs):
-            r_sess = ResumeSession()
-            return cowork._role_loop(
-                r_sess, context, build_status, context="",
-                io_in=io.StringIO(""), io_out=io.StringIO(),
-                role="builder", spath=spath)[0]
-
-        args = cowork.build_parser().parse_args(["--team", "builder", "--session-file", spath])
-        state_store.save_phase(spath, "building")
-        rc2 = cowork.run_flow(args, io_out=io.StringIO(), which=lambda c: "/bin/" + c, run_builder_fn=fake_run_builder)
-        self.assertEqual(rc2, 0)
-
-        if p2_sends:
-            self.assertNotIn("switch.pending_turn.builder.txt", str(p2_sends[0]))
 
     def test_e2e_switch_plus_seed_preserves_provenance(self):
         # Requirement: switch+seed composition preserves HandoffBlock provenance,
@@ -16068,7 +13843,7 @@ sys.exit(rc)
 
         rc, outcome, _ = cowork._role_loop(
             FakeSess(), envelope, build_status, context="",
-            io_in=io.StringIO(""), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", trace=trace)
 
         self.assertEqual(rc, 0)
@@ -16124,9 +13899,9 @@ sys.exit(rc)
         self.assertNotIn(os.path.join(intel_dir, "context.rev0.md"), build_paths)
         self.assertEqual(len(build_paths), len(set(build_paths)))
 
-    def test_e2e_headless_seed_and_discovery_handback_provenance(self):
-        # Requirement: headless seed and discovery+handback composition preserve cross_role envelope provenance.
-        suid = "headless-disc-uuid"
+    def test_e2e_agent_seed_and_discovery_handback_provenance(self):
+        # Requirement: agent-note seed and discovery+handback composition preserve cross_role envelope provenance.
+        suid = "agent-disc-uuid"
         intel_dir = state_store.session_assets_dir(suid)
         os.makedirs(intel_dir, exist_ok=True)
         plan_json = os.path.join(intel_dir, "planner.plan.json")
@@ -16134,13 +13909,13 @@ sys.exit(rc)
         for p, b in ((plan_json, '{"result": {}}'), (plan_md, '# plan')):
             with open(p, "w") as fh: fh.write(b)
 
-        # Headless seed
+        # Agent-note seed
         builder_seed = cowork.assemble_builder_seed(plan_json, plan_md, "Goal", assets_dir=intel_dir, context_revision=1)
-        composed_headless = handoff.compose_handoff_blocks(
-            cowork._headless_lead_fragment(),
+        composed_lead = handoff.compose_handoff_blocks(
+            cowork._agent_lead_fragment(),
             handoff.STATIC_SEPARATOR,
             builder_seed)
-        env1 = cowork._role_seed_delivery("brief", composed_headless)
+        env1 = cowork._role_seed_delivery("brief", composed_lead)
         self.assertEqual(env1.delivery_class, "cross_role")
         self.assertIn("planner->builder:seed", env1.edge_ids)
 
@@ -16269,6 +14044,56 @@ class _RecordingClaudeSpawn:
         return [{"type": "result", "subtype": "success"}]
 
 
+def _hermetic_claude_probe(test):
+    """Per-test hermetic seams for the production claude probe path.
+
+    Production call sites probe with `cache_enabled=True` and no `version_fn`,
+    so an unmocked test executes `claude --version`. For the duration of
+    `test` only:
+    - COWORK_PROBE_CACHE points at a fresh, never-populated file, so a probe
+      stored by one test cannot cache-skip the live probe in a later one while
+      hit/miss/store semantics stay the production ones;
+    - the version resolver returns a constant offline string (still None for an
+      unresolved CLI path, exactly like the real resolver), so a cache key is
+      computed with no subprocess;
+    - `bridge._real_claude_spawn` is a fail-closed double: a probe the test did
+      not script is recorded and fails the test at cleanup instead of launching
+      a provider (the probe swallows spawn exceptions into an alert, so raising
+      alone would not surface it). A test that expects a probe injects its own
+      spawn (`claude_spawn=` or a nested patch), which takes precedence.
+    Policy guards are untouched: `policy.guard` still runs before any spawn."""
+    import unittest.mock as mock
+    cache_dir = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, cache_dir, True)
+    unexpected = []
+
+    def unexpected_spawn(command, stdin_text):
+        unexpected.append(list(command))
+        raise AssertionError(
+            "unscripted live claude probe spawn: %r" % (command,))
+
+    test.addCleanup(lambda: test.assertEqual(
+        unexpected, [], "a claude probe reached the real spawn seam"))
+    old_cache = os.environ.get("COWORK_PROBE_CACHE")
+    os.environ["COWORK_PROBE_CACHE"] = os.path.join(
+        cache_dir, "probe_cache.json")
+
+    def restore_cache():
+        if old_cache is None:
+            os.environ.pop("COWORK_PROBE_CACHE", None)
+        else:
+            os.environ["COWORK_PROBE_CACHE"] = old_cache
+    test.addCleanup(restore_cache)
+    for patcher in (
+            mock.patch.object(
+                bridge.probe_cache, "claude_version",
+                lambda path: "claude 0.0.0-offline" if path else None),
+            mock.patch.object(bridge, "_real_claude_spawn",
+                              unexpected_spawn)):
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+
 class ControllerPolicyTestBase(unittest.TestCase):
     """Isolated sessions root + an unconditional active-policy reset, so the
     process-global holder never leaks between tests (or into the pre-existing
@@ -16278,23 +14103,6 @@ class ControllerPolicyTestBase(unittest.TestCase):
     def setUp(self):
         policy.deactivate()
         self.addCleanup(policy.deactivate)
-        # FAIL FAST, NEVER BLOCK. cowork.gather_context_interactive reads the
-        # REAL sys.stdin (via ui.prompt_user), not the io_in handed to run_flow,
-        # so any test that reaches the goal prompt would hang the whole suite on
-        # a terminal read instead of failing. Stub it so that path raises
-        # immediately and names itself; tests that need context must pass
-        # --context (or resume a session that already has a lead session id).
-        import unittest.mock as mock
-        def _no_prompt(*a, **kw):
-            raise AssertionError(
-                "run_flow reached the interactive goal prompt "
-                "(gather_context_interactive). A controller-policy test must "
-                "never depend on real stdin: pass --context, or resume a "
-                "session whose lead role already has a saved session id.")
-        patcher = mock.patch.object(
-            cowork, "gather_context_interactive", _no_prompt)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         root = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         old = os.environ.get("COWORK_SESSIONS_ROOT")
@@ -16531,20 +14339,6 @@ class ControllerPolicyProposalTest(ControllerPolicyTestBase):
         self.assertEqual(policy.effective_allowed(("codex",), saved),
                          ("codex",))
 
-    def test_interactive_mapping_rule(self):
-        saved = ("claude", "codex")
-        # PRESERVE is checked FIRST: an untouched pre-checked set is a no-op.
-        self.assertIs(cowork.interactive_proposal_policy(
-            ["codex", "claude"], saved), policy.PRESERVE)
-        self.assertIs(cowork.interactive_proposal_policy(
-            list(policy.CONTROLLERS), saved), policy.ALL)
-        self.assertEqual(cowork.interactive_proposal_policy(["codex"], saved),
-                         ("codex",))
-        # Unrestricted session: both rules would fire on "all three"; the
-        # PRESERVE rule needs a saved set, so this is unambiguously ALL.
-        self.assertIs(cowork.interactive_proposal_policy(
-            list(policy.CONTROLLERS), None), policy.ALL)
-
     def test_is_allowed_and_eligible(self):
         self.assertTrue(policy.is_allowed(None, "opencode"))
         self.assertFalse(policy.is_allowed(("claude",), "opencode"))
@@ -16715,21 +14509,21 @@ class ControllerPolicyGuardStructureTest(ControllerPolicyTestBase):
 
 class ControllerPolicyDispatchTest(ControllerPolicyTestBase):
     """Every launch path fails closed: lead, paired reviewer, resume, recovery
-    relaunch, and the worktree agent — plus headless."""
+    relaunch, and the worktree agent."""
 
     def _run(self, spath, argv=None, **kwargs):
         out = io.StringIO()
         rc = cowork.run_flow(
             self._args((argv or [])
                        + ["--session-file", spath, "--context", "policy test"]),
-            io_in=kwargs.pop("io_in", io.StringIO()), io_out=out,
+            io_out=out,
             which=lambda c: "/bin/" + c, **kwargs)
         return rc, out.getvalue()
 
     def test_lead_launch_is_blocked_with_zero_processes(self):
         spath = self._session(
             "DISPATCH-LEAD", "scouting", {"scout": "opencode"},
-            team=["scout"],
+            team=["scout", "scout-reviewer"],
             policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
                           "source": "cli"})
         popen = _RecordingPopen()
@@ -16751,7 +14545,7 @@ class ControllerPolicyDispatchTest(ControllerPolicyTestBase):
     def test_resume_of_a_restricted_session_is_blocked(self):
         spath = self._session(
             "DISPATCH-RESUME", "planning",
-            {"planner": "opencode"}, team=["scout", "planner"],
+            {"planner": "opencode", "planning-advisor": "codex"}, team=["scout", "scout-reviewer", "planner", "planning-advisor"],
             policy_value={"allowed": ["codex"], "updated": 1.0,
                           "source": "cli"})
         state_store.save_role_session(spath, "planner", "opencode", "ses_x",
@@ -16793,72 +14587,15 @@ class ControllerPolicyDispatchTest(ControllerPolicyTestBase):
                      "yolo": True, "mode": "implement"},
                     os.path.join(self._dir(), "worktree.status.json"),
                     self._dir(), "wt-name", False,
-                    io_in=io.StringIO(), io_out=out)
+                    io_out=out)
         self.assertIsNone(artifact)
         self.assertIn("does not allow", out.getvalue())
         self.assertEqual(popen.calls, [])
 
-    def test_recovery_relaunch_offers_only_allowed_controllers(self):
-        spath = self._session(
-            "DISPATCH-RECOVER", "scouting", {"scout": "codex"},
-            team=["scout"],
-            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
-                          "source": "cli"})
-        # A saved lead session id makes this a RESUME: resolve_context returns ""
-        # without ever reaching the interactive goal prompt.
-        state_store.save_role_session(spath, "scout", "codex", "codex-thread",
-                                      prior=state_store.load(spath))
-        calls = []
-
-        def fake_scout(config, context, selected, on_session=None,
-                       on_outcome=None, **kw):
-            calls.append(config["scout"]["controller"])
-            if kw.get("on_first_send_accepted"):
-                kw["on_first_send_accepted"]()
-            if on_outcome:
-                on_outcome("ended", None)
-            return 0
-
-        def which(cmd):
-            return None if cmd == "codex" else "/bin/" + cmd
-
-        claude_spawn = _RecordingClaudeSpawn()
-        import unittest.mock as mock
-        out = io.StringIO()
-        with mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
-            rc = cowork.run_flow(
-                self._args(["--session-file", spath]),
-                io_in=io.StringIO("switch claude\n"), io_out=out,
-                which=which, run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
-        self.assertEqual(calls, ["claude"])
-        # The gate named the permitted controller instead of "the alternate".
-        self.assertIn("move this role to claude", out.getvalue())
-        self.assertNotIn("the alternate controller", out.getvalue())
-
-    def test_recovery_gate_states_when_no_controller_is_eligible(self):
-        spath = self._session(
-            "DISPATCH-NOELIGIBLE", "scouting", {"scout": "codex"},
-            team=["scout"],
-            policy_value={"allowed": ["codex"], "updated": 1.0,
-                          "source": "cli"})
-
-        def which(cmd):
-            return None if cmd == "codex" else "/bin/" + cmd
-
-        out = io.StringIO()
-        rc = cowork.run_flow(
-            self._args(["--session-file", spath, "--context", "policy test"]),
-            io_in=io.StringIO("\n"), io_out=out, which=which,
-            run_scout_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 1)
-        self.assertIn("leaves no other controller available", out.getvalue())
-        self.assertNotIn("the alternate controller", out.getvalue())
-
-    def test_headless_block_exits_without_rendering_a_gate(self):
+    def test_policy_block_exits_without_dispatch(self):
         spath = self._session(
             "DISPATCH-HEADLESS", "scouting", {"scout": "opencode"},
-            team=["scout"],
+            team=["scout", "scout-reviewer"],
             policy_value={"allowed": ["claude"], "updated": 1.0,
                           "source": "cli"})
         popen = _RecordingPopen()
@@ -16866,9 +14603,9 @@ class ControllerPolicyDispatchTest(ControllerPolicyTestBase):
         out = io.StringIO()
         with patch_bridge_popen(popen):
             rc = cowork.run_flow(
-                self._args(["--session-file", spath, "--headless",
+                self._args(["--session-file", spath,
                             "--context", "go"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+                io_out=out, which=lambda c: "/bin/" + c)
         self.assertNotEqual(rc, 0)
         self.assertIn("does not allow", out.getvalue())
         self.assertNotIn("what now?", out.getvalue())
@@ -16900,22 +14637,21 @@ class ControllerPolicyDispatchTest(ControllerPolicyTestBase):
             team=["scout", cowork.SCOUT_REVIEWER],
             policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
                           "source": "cli"})
-        captured = {}
+        launched = []
 
         def fake_scout(config, context, selected, on_outcome=None, **kw):
-            check_fn = kw.get("reviewer_controller_check_fn")
-            captured["alerts"] = check_fn(cowork.SCOUT_REVIEWER)
-            if on_outcome:
-                on_outcome("ended", None)
+            launched.append(1)
             return 0
 
         popen = _RecordingPopen()
         with patch_bridge_popen(popen):
             rc, out = self._run(spath, run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        # The undispatchable reviewer is refused before the lead is launched:
+        # no lead spend for work nobody could approve.
+        self.assertEqual(rc, 1)
+        self.assertEqual(launched, [])
         self.assertEqual(popen.calls, [])
-        self.assertEqual(len(captured["alerts"]), 1)
-        self.assertIn("does not allow", captured["alerts"][0])
+        self.assertIn("does not allow", out)
         blocked = [e for e in self._events(spath)
                    if e["event"] == "review.controller_policy_blocked"]
         self.assertEqual(len(blocked), 1)
@@ -16942,18 +14678,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         # so without an explicit per-test override a live probe in one test
         # can cache-skip the live probe in a LATER test. Point it at a fresh,
         # never-populated file so every probe call in this class is live.
-        cache_path = os.path.join(tempfile.mkdtemp(), "probe_cache.json")
-        self.addCleanup(lambda: shutil.rmtree(os.path.dirname(cache_path),
-                                              ignore_errors=True))
-        old = os.environ.get("COWORK_PROBE_CACHE")
-        os.environ["COWORK_PROBE_CACHE"] = cache_path
-
-        def restore():
-            if old is None:
-                os.environ.pop("COWORK_PROBE_CACHE", None)
-            else:
-                os.environ["COWORK_PROBE_CACHE"] = old
-        self.addCleanup(restore)
+        _hermetic_claude_probe(self)
 
     def _role_config(self, role, controller, mode="plan", yolo=True):
         return {role: {"controller": controller, "mode": mode, "yolo": yolo,
@@ -16989,7 +14714,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         with policy.restricted(("opencode",)):
             rc = cowork.run_scout(
                 self._role_config("scout", "claude"), "goal", ["scout"],
-                io_in=io.StringIO(""), io_out=out,
+                io_out=out,
                 intel_path=os.path.join(self._dir(), "scout.intel.json"),
                 claude_spawn=spawn, trace=trace)
         self.assertEqual(rc, 1)
@@ -17013,7 +14738,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         with policy.restricted(("opencode",)):
             rc = cowork.run_planner(
                 self._role_config("planner", "claude"), "goal", ["planner"],
-                io_in=io.StringIO(""), io_out=out, claude_spawn=spawn,
+                io_out=out, claude_spawn=spawn,
                 trace=trace, on_outcome=lambda o, p=None: outcomes.append(o))
         self.assertEqual(rc, 1)
         self.assertIn("does not allow", out.getvalue())
@@ -17037,7 +14762,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         with policy.restricted(("opencode",)):
             rc = cowork.run_builder(
                 self._role_config("builder", "claude"), "goal", ["builder"],
-                io_in=io.StringIO(""), io_out=out, claude_spawn=spawn,
+                io_out=out, claude_spawn=spawn,
                 trace=trace, on_outcome=lambda o, p=None: outcomes.append(o))
         self.assertEqual(rc, 1)
         self.assertIn("does not allow", out.getvalue())
@@ -17058,7 +14783,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         # entrypoint before any process is spawned.
         spath = self._session(
             "PRELAUNCH-UNIFORM", "scouting", {"scout": "opencode"},
-            team=["scout"],
+            team=["scout", "scout-reviewer"],
             policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
                           "source": "cli"})
         popen = _RecordingPopen()
@@ -17066,7 +14791,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         with patch_bridge_popen(popen):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath, "--context", "policy"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+                io_out=out, which=lambda c: "/bin/" + c)
         self.assertEqual(rc, 1)
         self.assertIn("scout is configured for opencode", out.getvalue())
         self.assertEqual(popen.calls, [])
@@ -17080,45 +14805,6 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0]["outcome"], "refuse")
 
-    def test_switch_controller_uniform_refusal(self):
-        # Site 5: run_flow.switch_controller, exercised via the
-        # switch_controller_fn threaded into run_scout — the real production
-        # closure, not a stand-in.
-        spath = self._session(
-            "SWITCH-UNIFORM", "scouting", {"scout": "claude"},
-            team=["scout"],
-            policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
-                          "source": "cli"})
-        captured = {}
-
-        def fake_scout(config, context, selected, on_outcome=None, **kw):
-            switch_fn = kw.get("switch_controller_fn")
-            captured["result"] = switch_fn("scout", target="opencode")
-            if on_outcome:
-                on_outcome("ended", None)
-            return 0
-
-        popen = _RecordingPopen()
-        out = io.StringIO()
-        with patch_bridge_popen(popen):
-            rc = cowork.run_flow(
-                self._args(["--session-file", spath, "--context", "policy"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
-                run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
-        self.assertEqual(popen.calls, [])
-        self.assertIs(captured["result"], False)
-        self.assertIn("does not allow", out.getvalue())
-        events = self._events(spath)
-        ends = [e for e in events if e["event"] == "controller.switch.end"]
-        self.assertEqual(len(ends), 1)
-        self.assertEqual(ends[0]["result"], "policy_blocked")
-        self.assertEqual(ends[0]["controller"], "opencode")
-        decisions = [e for e in events if e["event"] == "dispatch.decision"
-                    and e.get("site") == "run_flow.switch_controller"]
-        self.assertEqual(len(decisions), 1)
-        self.assertEqual(decisions[0]["outcome"], "refuse")
-
     def test_reviewer_pre_check_uniform_refusal(self):
         # Site 6: run_flow's reviewer_controller_check closure, exercised via
         # the reviewer_controller_check_fn it threads into run_scout — the
@@ -17129,25 +14815,23 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
             team=["scout", cowork.SCOUT_REVIEWER],
             policy_value={"allowed": ["claude", "codex"], "updated": 1.0,
                           "source": "cli"})
-        captured = {}
+        launched = []
 
         def fake_scout(config, context, selected, on_outcome=None, **kw):
-            check_fn = kw.get("reviewer_controller_check_fn")
-            captured["alerts"] = check_fn(cowork.SCOUT_REVIEWER)
-            if on_outcome:
-                on_outcome("ended", None)
+            launched.append(1)
             return 0
 
         popen = _RecordingPopen()
         with patch_bridge_popen(popen):
+            out = io.StringIO()
             rc = cowork.run_flow(
                 self._args(["--session-file", spath, "--context", "policy"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=out,
                 which=lambda c: "/bin/" + c, run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
+        self.assertEqual(launched, [])
         self.assertEqual(popen.calls, [])
-        self.assertEqual(len(captured["alerts"]), 1)
-        self.assertIn("does not allow", captured["alerts"][0])
+        self.assertIn("does not allow", out.getvalue())
         events = self._events(spath)
         blocked = [e for e in events
                    if e["event"] == "review.controller_policy_blocked"]
@@ -17176,7 +14860,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         out = io.StringIO()
         rc = cowork.run_scout(
             self._role_config("scout", "claude"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=out,
+            io_out=out,
             intel_path=os.path.join(self._dir(), "scout.intel.json"),
             claude_spawn=spawn, trace=trace, session_factory=raising_factory)
         self.assertEqual(rc, 1)
@@ -17210,7 +14894,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
                 with policy.restricted(("opencode",)):
                     rc = runner(
                         self._role_config(role, "claude"), "goal", [role],
-                        io_in=io.StringIO(""), io_out=io.StringIO(),
+                        io_out=io.StringIO(),
                         **kwargs)
                 self.assertEqual(rc, 1)
                 self.assertEqual(calls, [],
@@ -17240,7 +14924,7 @@ class DispatchContractAdapterTest(ControllerPolicyTestBase):
         out = io.StringIO()
         rc = cowork.run_scout(
             self._role_config("scout", "claude"), "goal", ["scout"],
-            io_in=io.StringIO("end\n"), io_out=out,
+            io_out=out,
             intel_path=os.path.join(self._dir(), "scout.intel.json"),
             claude_spawn=spawn, trace=trace, session_factory=factory)
         self.assertEqual(len(calls), 1)                  # probe ran, allowed
@@ -17269,14 +14953,14 @@ class ControllerPolicyMalformedTest(ControllerPolicyTestBase):
             with self.subTest(raw=raw):
                 spath = self._session(
                     "MALFORMED-%d" % index, "scouting", {"scout": "claude"},
-                    team=["scout"], policy_value=raw)
+                    team=["scout", "scout-reviewer"], policy_value=raw)
                 before = self._sha(spath)
                 popen = _RecordingPopen()
                 out = io.StringIO()
                 with patch_bridge_popen(popen):
                     rc = cowork.run_flow(
                         self._args(["--session-file", spath]),
-                        io_in=io.StringIO(), io_out=out,
+                        io_out=out,
                         which=lambda c: "/bin/" + c)
                 self.assertEqual(rc, 2)
                 self.assertIn("unreadable", out.getvalue())
@@ -17295,10 +14979,31 @@ class ControllerPolicyMalformedTest(ControllerPolicyTestBase):
                 self.assertEqual(invalid[0]["session_file"], spath)
                 self.assertTrue(invalid[0]["repairable"])
 
+    def test_policy_refusals_report_their_reason_in_the_run_result(self):
+        spath = self._session(
+            "MALFORMED-REASON", "scouting", {"scout": "claude"},
+            team=["scout", "scout-reviewer"], policy_value={"allowed": []})
+        box = {}
+
+        def unscripted(*_a, **_k):
+            raise AssertionError("no role may run on an unreadable policy")
+        popen = _RecordingPopen()
+        with patch_bridge_popen(popen):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath]), io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, result_box=box,
+                run_scout_fn=unscripted, run_planner_fn=unscripted,
+                run_builder_fn=unscripted, run_worktree_fn=unscripted)
+        self.assertEqual((rc, box["reason"]), (2, "controller_policy_invalid"))
+        result = cowork.build_run_result(rc, box)
+        self.assertEqual((result["outcome"], result["reason"]),
+                         ("invalid_invocation", "controller_policy_invalid"))
+        self.assertEqual(popen.calls, [])
+
     def test_a_lone_switch_cannot_repair_and_takes_the_same_abort(self):
         spath = self._session(
             "MALFORMED-PRESERVE", "planning", {"planner": "claude"},
-            team=["scout", "planner"], policy_value={"allowed": []})
+            team=["scout", "scout-reviewer", "planner", "planning-advisor"], policy_value={"allowed": []})
         before = self._sha(spath)
         popen = _RecordingPopen()
         claude_spawn = _RecordingClaudeSpawn()
@@ -17309,7 +15014,7 @@ class ControllerPolicyMalformedTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                             "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+                io_out=out, which=lambda c: "/bin/" + c)
         self.assertEqual(rc, 2)
         self.assertIn("unreadable", out.getvalue())
         self.assertEqual(popen.calls, [])
@@ -17319,7 +15024,7 @@ class ControllerPolicyMalformedTest(ControllerPolicyTestBase):
     def test_allow_controllers_repairs_and_resumes(self):
         spath = self._session(
             "MALFORMED-REPAIR", "planning", {"planner": "codex"},
-            team=["scout", "planner"], policy_value="garbage")
+            team=["scout", "scout-reviewer", "planner", "planning-advisor"], policy_value="garbage")
         calls = []
 
         def fake_planner(config, context, selected, on_outcome=None, **kw):
@@ -17348,9 +15053,9 @@ class ControllerPolicyMalformedTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath, "--context", "policy test",
                             "--allow-controllers", "claude,codex"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                io_out=out, which=lambda c: "/bin/" + c,
                 run_planner_fn=fake_planner)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(calls, ["codex"])
         self.assertEqual(
             state_store.read_controller_policy(state_store.load(spath)),
@@ -17385,8 +15090,12 @@ class ControllerPolicyTransitionTest(ControllerPolicyTestBase):
     """The update is atomic: rejected leaves the file untouched with nothing
     resumed; accepted persists as one write that completes before any dispatch."""
 
+    def setUp(self):
+        super().setUp()
+        _hermetic_claude_probe(self)
+
     def _planning(self, uuid_str, controllers=None, policy_value=""):
-        team = ["scout", "planner", cowork.PLANNING_ADVISOR]
+        team = ["scout", "scout-reviewer", "planner", cowork.PLANNING_ADVISOR]
         return self._session(
             uuid_str, "planning",
             controllers or {"planner": "claude",
@@ -17404,7 +15113,7 @@ class ControllerPolicyTransitionTest(ControllerPolicyTestBase):
                 mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
             rc = cowork.run_flow(
                 self._args(argv + ["--session-file", spath]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                io_out=out, which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: dispatched.append(1) or 0)
         self.assertNotEqual(rc, 0)
         self.assertIn(expected, out.getvalue())
@@ -17514,9 +15223,9 @@ class ControllerPolicyTransitionTest(ControllerPolicyTestBase):
                             "--allow-controllers", "claude,codex",
                             "--switch-controller",
                             "%s=claude" % cowork.PLANNING_ADVISOR]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(timeline.count("write"), 1)
         write_at = timeline.index("write")
         self.assertTrue(all(t == "probe" for t in timeline[:write_at]),
@@ -17541,7 +15250,7 @@ class ControllerPolicyTransitionTest(ControllerPolicyTestBase):
                     cowork.run_flow(
                         self._args(argv + ["--session-file", spath,
                                            "--context", "policy test"]),
-                        io_in=io.StringIO(), io_out=io.StringIO(),
+                        io_out=io.StringIO(),
                         which=lambda c: "/bin/" + c,
                         run_planner_fn=lambda *a, **k: 0)
                 self.assertNotIn("opencode", popen.controllers())
@@ -17552,9 +15261,9 @@ class ControllerPolicyTransitionTest(ControllerPolicyTestBase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath, "--context", "policy test",
                         "--allow-controllers", "claude,codex"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(state_store.load(spath)["config"], before)
         self.assertEqual(
             state_store.load(spath)["controller_policy"]["allowed"],
@@ -17564,11 +15273,15 @@ class ControllerPolicyTransitionTest(ControllerPolicyTestBase):
 class ControllerPolicyCliTest(ControllerPolicyTestBase):
     """The non-interactive surface."""
 
+    def setUp(self):
+        super().setUp()
+        _hermetic_claude_probe(self)
+
     def _planning(self, uuid_str, **kw):
         return self._session(
             uuid_str, "planning",
             {"planner": "claude", cowork.PLANNING_ADVISOR: "codex"},
-            team=["scout", "planner", cowork.PLANNING_ADVISOR], **kw)
+            team=["scout", "scout-reviewer", "planner", cowork.PLANNING_ADVISOR], **kw)
 
     def test_switch_controller_is_repeatable(self):
         args = self._args(["--switch-controller", "planner=codex",
@@ -17623,10 +15336,10 @@ class ControllerPolicyCliTest(ControllerPolicyTestBase):
                             "--switch-controller", "planner=codex",
                             "--switch-controller",
                             "%s=claude" % cowork.PLANNING_ADVISOR]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         saved = state_store.load(spath)
         self.assertEqual(saved["controller_policy"]["allowed"],
                          ["claude", "codex"])
@@ -17641,26 +15354,28 @@ class ControllerPolicyCliTest(ControllerPolicyTestBase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath, "--context", "policy test",
                         "--allow-controllers", "all"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertNotIn("controller_policy", state_store.load(spath))
 
     def test_allow_controllers_conflicts_with_session_shape_flags(self):
         spath = self._planning("CLI-CONFLICT")
         before = self._sha(spath)
-        for extra in (["--no-session"], ["--new"], ["--team", "planner"],
+        for extra in (["--no-session"], ["--new"], ["--team", "planner,planning-advisor"],
                       ["--config", "planner=codex"]):
             with self.subTest(extra=extra):
                 out = io.StringIO()
                 rc = cowork.run_flow(
                     self._args(["--session-file", spath,
                                 "--allow-controllers", "claude"] + extra),
-                    io_in=io.StringIO(), io_out=out,
+                    io_out=out,
                     which=lambda c: "/bin/" + c,
                     run_planner_fn=lambda *a, **k: 0)
                 self.assertEqual(rc, 2)
-                self.assertIn("--allow-controllers cannot be combined", out.getvalue())
+                self.assertRegex(out.getvalue(),
+                                 "--allow-controllers cannot be combined"
+                                 "|conflicting session selectors")
                 self.assertEqual(self._sha(spath), before)
 
     def test_allow_controllers_needs_a_loadable_session_with_config(self):
@@ -17672,7 +15387,7 @@ class ControllerPolicyCliTest(ControllerPolicyTestBase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                         "--allow-controllers", "claude"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+            io_out=out, which=lambda c: "/bin/" + c)
         self.assertEqual(rc, 2)
         self.assertIn("--allow-controllers: session file is not a loadable",
                       out.getvalue())
@@ -17683,7 +15398,7 @@ class ControllerPolicyCliTest(ControllerPolicyTestBase):
         rc = cowork.run_flow(
             self._args(["--session-file", bare,
                         "--allow-controllers", "claude"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+            io_out=out, which=lambda c: "/bin/" + c)
         self.assertEqual(rc, 2)
         self.assertIn("--allow-controllers requires a saved session",
                       out.getvalue())
@@ -17699,307 +15414,17 @@ class ControllerPolicyCliTest(ControllerPolicyTestBase):
                               % flag, err.getvalue())
 
 
-class ControllerPolicyInteractiveTest(ControllerPolicyTestBase):
-    """The interactive action and the flags must agree, byte for byte."""
-
-    def _planning(self, uuid_str, cwd=None, **kw):
-        spath = (state_store.new_session_path(cwd, uuid_str) if cwd
-                 else self._tmp_session())
-        return self._session(
-            uuid_str, "planning",
-            {"planner": "claude", cowork.PLANNING_ADVISOR: "codex"},
-            team=["scout", "planner", cowork.PLANNING_ADVISOR],
-            spath=spath, **kw)
-
-    @contextlib.contextmanager
-    def _chdir(self, d):
-        prev = os.getcwd()
-        os.chdir(d)
-        try:
-            yield
-        finally:
-            os.chdir(prev)
-
-    def test_select_session_returns_the_action_and_asks_nothing_else(self):
-        cwd = self._dir()
-        self._planning("INTERACTIVE-PICK", cwd=cwd)
-        asked = []
-
-        def select_fn(prompt, choices):
-            asked.append(prompt)
-            keys = [k for k, _l in choices]
-            if "controllers" in keys:
-                return "controllers"
-            return keys[0]
-
-        with self._chdir(cwd):
-            choice = cowork.select_session(
-                self._args([]), FakeTTY(), FakeTTY(), select_fn=select_fn)
-        self.assertEqual(choice.action, "edit_controllers")
-        self.assertIsNotNone(choice.path)
-        # Two prompts only: the menu and the picker — no controller questions.
-        self.assertEqual(len(asked), 2)
-        self.assertTrue(all("controller" not in p.lower()
-                            or "Change" in p or "Switch" in p for p in asked))
-
-    def test_third_entry_is_absent_off_a_tty_and_under_flags(self):
-        cwd = self._dir()
-        self._planning("INTERACTIVE-REACH", cwd=cwd)
-        seen = []
-
-        def select_fn(prompt, choices):
-            seen.append([k for k, _l in choices])
-            return choices[0][0]
-
-        with self._chdir(cwd):
-            # Piped/scripted: no menu at all.
-            choice = cowork.select_session(
-                self._args([]), io.StringIO(), io.StringIO(),
-                select_fn=select_fn)
-            self.assertIsNone(choice.action)
-            self.assertEqual(seen, [])
-            for argv in (["--new"], ["--no-session"],
-                         ["--headless", "--context", "x"]):
-                choice = cowork.select_session(
-                    self._args(argv), FakeTTY(), FakeTTY(),
-                    select_fn=select_fn)
-                self.assertIsNone(choice.action)
-            self.assertTrue(all("controllers" not in keys for keys in seen))
-
-    def _drive(self, spath, chosen, moves, confirms):
-        """Run the guided flow at run_flow's call site with scripted prompts."""
-        import unittest.mock as mock
-        picks = list(moves)
-        answers = list(confirms)
-        out = io.StringIO()
-
-        def multiselect_fn(prompt, choices, selected=(), ask_fn=None, **kwargs):
-            return list(chosen.pop(0)) if chosen else None
-
-        def select_fn(prompt, choices, ask_fn=None, **kwargs):
-            return picks.pop(0) if picks else None
-
-        def confirm_fn(prompt, ask_fn=None, **kwargs):
-            return answers.pop(0) if answers else False
-
-        def fake_select_session(args, io_in, io_out, select_fn=None, now=None):
-            return cowork.SessionChoice(path=spath, action="edit_controllers")
-
-        claude_spawn = _RecordingClaudeSpawn()
-        self.dispatched = []
-
-        def fake_planner(*a, **k):
-            self.dispatched.append(1)
-            return 0
-
-        with mock.patch.object(cowork, "select_session", fake_select_session), \
-                mock.patch.object(ui, "multiselect", multiselect_fn), \
-                mock.patch.object(ui, "select", select_fn), \
-                mock.patch.object(ui, "confirm", confirm_fn), \
-                mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
-            rc = cowork.run_flow(
-                self._args(["--context", "policy test"]),
-                io_in=io.StringIO(), io_out=out,
-                which=lambda c: "/bin/" + c,
-                run_planner_fn=fake_planner)
-        return rc, out.getvalue()
-
-    def test_interactive_and_cli_produce_identical_state(self):
-        interactive = self._planning("INTERACTIVE-EQ-A")
-        cli = self._planning("INTERACTIVE-EQ-B")
-        rc, _ = self._drive(interactive, [["claude", "codex"]], [], [True])
-        self.assertEqual(rc, 0)
-        self.assertEqual(self.dispatched, [1])  # resumed, and only after the write
-        rc = cowork.run_flow(
-            self._args(["--session-file", cli, "--context", "policy test",
-                        "--allow-controllers", "claude,codex"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
-            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
-        left = state_store.load(interactive)
-        right = state_store.load(cli)
-        self.assertEqual(left["controller_policy"]["allowed"],
-                         right["controller_policy"]["allowed"])
-        self.assertEqual(left["config"], right["config"])
-
-    def test_preserve_parity_untouched_set_matches_a_lone_switch(self):
-        saved = {"allowed": ["claude", "codex"], "updated": 3.0,
-                 "source": "cli"}
-        # The planner sits OUTSIDE the saved allowed set, so both surfaces have
-        # the same job: move it, and leave the policy exactly as it is.
-        interactive = self._session(
-            "INTERACTIVE-PRESERVE-A", "planning",
-            {"planner": "opencode", cowork.PLANNING_ADVISOR: "codex"},
-            team=["scout", "planner", cowork.PLANNING_ADVISOR],
-            policy_value=dict(saved))
-        cli = self._session(
-            "INTERACTIVE-PRESERVE-B", "planning",
-            {"planner": "opencode", cowork.PLANNING_ADVISOR: "codex"},
-            team=["scout", "planner", cowork.PLANNING_ADVISOR],
-            policy_value=dict(saved))
-        # Leaving the pre-checked boxes untouched must NOT rewrite the policy.
-        rc, _ = self._drive(interactive, [["claude", "codex"]], ["codex"],
-                            [True])
-        self.assertEqual(rc, 0)
-        rc = cowork.run_flow(
-            self._args(["--session-file", cli,
-                        "--switch-controller", "planner=codex"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
-            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
-        left, right = state_store.load(interactive), state_store.load(cli)
-        self.assertEqual(left["controller_policy"], saved)
-        self.assertEqual(right["controller_policy"], saved)
-        self.assertEqual(left["controller_policy"],
-                         right["controller_policy"])
-        self.assertEqual(left["config"], right["config"])
-        self.assertEqual(left["config"]["planner"]["controller"], "codex")
-
-    def test_all_parity_checking_every_controller_matches_allow_all(self):
-        saved = {"allowed": ["claude", "codex"], "updated": 3.0,
-                 "source": "cli"}
-        interactive = self._planning("INTERACTIVE-ALL-A",
-                                     policy_value=dict(saved))
-        cli = self._planning("INTERACTIVE-ALL-B", policy_value=dict(saved))
-        rc, _ = self._drive(interactive, [list(policy.CONTROLLERS)], [], [True])
-        self.assertEqual(rc, 0)
-        rc = cowork.run_flow(
-            self._args(["--session-file", cli, "--context", "policy test",
-                        "--allow-controllers", "all"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
-            which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
-        self.assertNotIn("controller_policy", state_store.load(interactive))
-        self.assertNotIn("controller_policy", state_store.load(cli))
-
-    def test_decline_reopens_the_allowed_set_prompt_once(self):
-        spath = self._planning("INTERACTIVE-DECLINE")
-        rc, out = self._drive(
-            spath, [["codex"], ["claude", "codex"]],
-            ["codex", "codex"], [False, True])
-        self.assertEqual(rc, 0)
-        self.assertEqual(
-            state_store.load(spath)["controller_policy"]["allowed"],
-            ["claude", "codex"])
-
-    def test_dismissing_a_prompt_cancels_cleanly_with_no_write(self):
-        spath = self._planning("INTERACTIVE-CANCEL")
-        before = self._sha(spath)
-        rc, out = self._drive(spath, [], [], [])
-        self.assertEqual(rc, 0)
-        self.assertIn("cancelled; nothing to do.", out)
-        self.assertEqual(self._sha(spath), before)
-        self.assertEqual(self.dispatched, [])
-
-    def test_guided_flow_remaps_a_now_disallowed_current_phase_role(self):
-        spath = self._planning("INTERACTIVE-REMAP")
-        rc, out = self._drive(spath, [["codex"]], ["codex"], [True])
-        self.assertEqual(rc, 0)
-        saved = state_store.load(spath)
-        self.assertEqual(saved["controller_policy"]["allowed"], ["codex"])
-        self.assertEqual(saved["config"]["planner"]["controller"], "codex")
-
-
-class ControllerPolicyGateOptionsTest(ControllerPolicyTestBase):
-    """The recovery gates under a policy — and byte-identical without one."""
-
-    def test_policy_free_text_and_sentinels_are_unchanged(self):
-        text = cowork._stuck_gate_text("/tmp/s.json", "planner")
-        self.assertIn("switch-controller (move this role to the alternate "
-                      "controller)", text)
-        self.assertIn(", or end (end this phase cleanly).", text)
-        self.assertIs(
-            cowork._read_stuck_gate(io.StringIO("switch\n"), io.StringIO()),
-            cowork._STUCK_SWITCH)
-        self.assertIs(
-            cowork._read_controller_failure_gate(
-                io.StringIO("switch\n"), io.StringIO()), cowork._CTRL_SWITCH)
-        self.assertIs(
-            cowork._read_reviewer_fail_gate(
-                io.StringIO("switch\n"), io.StringIO()), cowork._REVFAIL_SWITCH)
-        self.assertIn("the alternate controller",
-                      cowork._controller_failure_text("planner", "codex", "x"))
-        self.assertIn("the alternate controller",
-                      cowork._reviewer_fail_gate_text("planning-advisor",
-                                                      "planner"))
-
-    def test_restricted_gates_offer_exactly_allowed_minus_current(self):
-        eligible = cowork.eligible_controllers(
-            "codex", ("claude", "codex"))
-        self.assertEqual(eligible, ["claude"])
-        for text in (cowork._stuck_gate_text("/tmp/s.json", "planner",
-                                             eligible=eligible),
-                     cowork._controller_failure_text("planner", "codex", "x",
-                                                     eligible=eligible),
-                     cowork._reviewer_fail_gate_text("planning-advisor",
-                                                     "planner",
-                                                     eligible=eligible)):
-            self.assertIn("claude", text)
-            self.assertNotIn("the alternate controller", text)
-            self.assertNotIn("opencode", text)
-        for reader in (cowork._read_stuck_gate,
-                       cowork._read_controller_failure_gate,
-                       cowork._read_reviewer_fail_gate):
-            for token in ("switch claude", "switch-controller=claude",
-                          "switch"):
-                with self.subTest(reader=reader.__name__, token=token):
-                    action = reader(io.StringIO(token + "\n"), io.StringIO(),
-                                    eligible=eligible)
-                    self.assertEqual(action, cowork._SwitchTo("claude"))
-
-    def test_no_eligible_controller_drops_the_switch_option(self):
-        for text in (cowork._stuck_gate_text("/tmp/s.json", "planner",
-                                             eligible=[]),
-                     cowork._controller_failure_text("planner", "codex", "x",
-                                                     eligible=[]),
-                     cowork._reviewer_fail_gate_text("planning-advisor",
-                                                     "planner", eligible=[])):
-            self.assertNotIn("switch-controller", text)
-            self.assertIn("leaves no other controller available", text)
-        self.assertIs(
-            cowork._read_stuck_gate(io.StringIO("switch\n"), io.StringIO(),
-                                    eligible=[]), cowork._STUCK_END)
-
-    def test_gate_eligible_for_reads_the_active_policy(self):
-        self.assertIsNone(cowork.gate_eligible_for("claude"))
-        with policy.restricted(("claude", "codex")):
-            self.assertEqual(cowork.gate_eligible_for("claude"), ["codex"])
-        policy.activate_invalid("garbage")
-        self.assertEqual(cowork.gate_eligible_for("claude"), [])
-
-    def test_gate_switch_on_a_restricted_session_preserves_the_policy(self):
-        saved = {"allowed": ["claude", "codex"], "updated": 9.0,
-                 "source": "cli"}
-        spath = self._session(
-            "GATE-PRESERVE", "scouting", {"scout": "codex"}, team=["scout"],
-            policy_value=dict(saved))
-        # Resume (saved lead session id), so no interactive goal prompt.
-        state_store.save_role_session(spath, "scout", "codex", "codex-thread",
-                                      prior=state_store.load(spath))
-
-        def which(cmd):
-            return None if cmd == "codex" else "/bin/" + cmd
-
-        claude_spawn = _RecordingClaudeSpawn()
-        import unittest.mock as mock
-        with mock.patch.object(bridge, "_real_claude_spawn", claude_spawn):
-            rc = cowork.run_flow(
-                self._args(["--session-file", spath]),
-                io_in=io.StringIO("switch claude\n"), io_out=io.StringIO(),
-                which=which, run_scout_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
-        after = state_store.load(spath)
-        self.assertEqual(after["controller_policy"], saved)
-        self.assertEqual(after["config"]["scout"]["controller"], "claude")
-
-
 class ControllerPolicyOrch023Test(ControllerPolicyTestBase):
     """ORCH-023 end to end: builder AND its reviewer both on opencode, one
     command restricts the session and moves both, then the session resumes —
     and no opencode process is ever started."""
 
+    def setUp(self):
+        super().setUp()
+        _hermetic_claude_probe(self)
+
     def _building_session(self):
-        team = ["scout", "planner", "builder", cowork.BUILD_REVIEWER]
+        team = ["scout", "scout-reviewer", "planner", "planning-advisor", "builder", cowork.BUILD_REVIEWER]
         spath = self._session(
             "ORCH-023", "building",
             {"builder": "opencode", cowork.BUILD_REVIEWER: "opencode"},
@@ -18040,11 +15465,11 @@ class ControllerPolicyOrch023Test(ControllerPolicyTestBase):
                             "--switch-controller", "builder=codex",
                             "--switch-controller",
                             "%s=claude" % cowork.BUILD_REVIEWER]),
-                io_in=io.StringIO(), io_out=out,
+                io_out=out,
                 which=lambda c: "/bin/" + c,
                 run_builder_fn=lambda *a, **k: 0)
 
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 1)
             saved = state_store.load(spath)
             self.assertEqual(saved["controller_policy"]["allowed"],
                              ["claude", "codex"])
@@ -18056,7 +15481,7 @@ class ControllerPolicyOrch023Test(ControllerPolicyTestBase):
             # runner), so the spawn recorder sees what a resume actually starts.
             cowork.run_flow(
                 self._args(["--session-file", spath, "--context", "policy test"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c)
 
         # The resume really did launch the builder — on codex, not opencode.
@@ -18078,7 +15503,7 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
         return self._session(
             uuid_str, "planning",
             {"planner": "claude", cowork.PLANNING_ADVISOR: "codex"},
-            team=["scout", "planner", cowork.PLANNING_ADVISOR], **kw)
+            team=["scout", "scout-reviewer", "planner", cowork.PLANNING_ADVISOR], **kw)
 
     def test_policy_free_resume_activates_nothing_and_dispatches_freely(self):
         spath = self._planning("BACKCOMPAT-FREE")
@@ -18094,9 +15519,9 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
 
         rc = cowork.run_flow(
             self._args(["--session-file", spath, "--context", "policy test"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=fake_planner)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(seen, ["unrestricted"])
         self.assertNotIn("controller_policy", state_store.load(spath))
         self.assertEqual(
@@ -18108,12 +15533,9 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
     def test_resume_never_reads_interactive_stdin(self):
         """A resume must not touch real stdin.
 
-        `gather_context_interactive` reads the process's REAL stdin (through
-        `ui.prompt_user`), NOT the `io_in` handed to run_flow — so a resume that
-        fell through to the goal prompt would block on a terminal read rather
-        than fail. This pins the resume branch shut for BOTH a policy-free and a
+        This pins the resume branch shut for BOTH a policy-free and a
         restricted session: sys.stdin is replaced with an object that raises on
-        any access, and the prompt itself is stubbed to raise."""
+        any access."""
         import unittest.mock as mock
 
         class ExplodingStdin:
@@ -18145,29 +15567,14 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
                         on_outcome("ended", None)
                     return 0
 
-                # The base class already stubs gather_context_interactive to
-                # raise; this additionally proves nothing else reads stdin.
                 with mock.patch.object(sys, "stdin", ExplodingStdin()):
                     rc = cowork.run_flow(
                         self._args(["--session-file", spath]),
-                        io_in=io.StringIO(), io_out=io.StringIO(),
+                        io_out=io.StringIO(),
                         which=lambda c: "/bin/" + c,
                         run_planner_fn=fake_planner)
-                self.assertEqual(rc, 0)
+                self.assertEqual(rc, 1)
                 self.assertEqual(len(seen), 1)
-
-    def test_the_prompt_stub_would_catch_a_regression(self):
-        """The stub above is only meaningful if it actually fires: a NON-resume
-        with no --context does reach the goal prompt, and must fail loudly
-        instead of blocking on a terminal read."""
-        spath = self._planning("STDIN-NONRESUME")  # no saved lead session id
-        with self.assertRaises(AssertionError) as ctx:
-            cowork.run_flow(
-                self._args(["--session-file", spath]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
-                which=lambda c: "/bin/" + c,
-                run_planner_fn=lambda *a, **k: 0)
-        self.assertIn("interactive goal prompt", str(ctx.exception))
 
     def test_lone_switch_under_policy_keeps_the_allowed_set_byte_identical(self):
         saved = {"allowed": ["claude", "codex"], "updated": 11.0,
@@ -18176,9 +15583,9 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                         "--switch-controller", "planner=codex"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         after = state_store.load(spath)
         self.assertEqual(after["controller_policy"], saved)
         self.assertEqual(after["config"]["planner"]["controller"], "codex")
@@ -18202,7 +15609,7 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                             "--switch-controller", "planner=opencode"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+                io_out=out, which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: dispatched.append(1) or 0)
         self.assertEqual(rc, 2)
         self.assertIn("this session allows only claude, codex", out.getvalue())
@@ -18234,7 +15641,7 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                             "--switch-controller", "planner=opencode"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
         self.assertEqual(rc, 2)
@@ -18255,9 +15662,9 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
             self._args(["--session-file", spath2,
                         "--allow-controllers", "claude,codex,opencode",
                         "--switch-controller", "planner=opencode"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc2, 0)
+        self.assertEqual(rc2, 1)
         self.assertEqual(
             [e for e in self._events(spath2)
              if e["event"] == "dispatch.escalation"], [])
@@ -18268,7 +15675,7 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
         cowork.run_flow(
             self._args(["--session-file", spath, "--context", "policy test",
                         "--allow-controllers", "claude,codex"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
         change = [e for e in self._events(spath)
                   if e["event"] == "controller.policy.change"][-1]
@@ -18281,7 +15688,7 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
         cowork.run_flow(
             self._args(["--session-file", spath,
                         "--switch-controller", "planner=opencode"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            io_out=out, which=lambda c: "/bin/" + c,
             run_planner_fn=lambda *a, **k: 0)
         rejected = [e for e in self._events(spath)
                     if e["event"] == "controller.policy.rejected"][-1]
@@ -18293,7 +15700,7 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
         bad = self._planning("BACKCOMPAT-TRACE-BAD", policy_value=[])
         cowork.run_flow(
             self._args(["--session-file", bad, "--context", "policy test"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
         invalid = [e for e in self._events(bad)
                    if e["event"] == "controller.policy.invalid"][-1]
@@ -18304,13 +15711,13 @@ class ControllerPolicyBackCompatTest(ControllerPolicyTestBase):
         # blocked
         blocked_session = self._session(
             "BACKCOMPAT-TRACE-BLOCK", "scouting", {"scout": "opencode"},
-            team=["scout"],
+            team=["scout", "scout-reviewer"],
             policy_value={"allowed": ["claude"], "updated": 1.0,
                           "source": "cli"})
         cowork.run_flow(
             self._args(["--session-file", blocked_session,
                         "--context", "policy test"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c)
         blocked = [e for e in self._events(blocked_session)
                    if e["event"] == "controller.dispatch.blocked"][-1]
@@ -18345,11 +15752,6 @@ class ControllerPolicyDocsTest(unittest.TestCase):
     @classmethod
     def _switching_section(cls):
         return cls._section("### Controller switching")
-
-    def test_the_existing_controller_switching_section_is_intact(self):
-        self.assertIn("### Controller switching", self.text)
-        self.assertIn("./cowork --switch-controller planner=codex", self.text)
-        self.assertIn("V1 is manual only.", self.text)
 
     def test_switching_section_describes_the_file_only_handoff(self):
         """The handoff packet is file-only: bodies ride by PATH and only
@@ -18387,9 +15789,6 @@ class ControllerPolicyDocsTest(unittest.TestCase):
     def test_section_states_a_switch_never_changes_the_allowed_set(self):
         self.assertIn("never changes the allowed set", self.section)
 
-    def test_section_covers_the_interactive_equivalent(self):
-        self.assertIn("Change this session's controllers", self.section)
-
     def test_section_covers_the_ordering_and_all_or_nothing_guarantee(self):
         for phrase in ("all-or-nothing", "before anything resumes",
                        "single write"):
@@ -18399,2462 +15798,9 @@ class ControllerPolicyDocsTest(unittest.TestCase):
         self.assertIn("current phase", self.section)
         self.assertIn("warning", self.section.lower())
 
-    def test_section_covers_recovery_gates_including_no_eligible(self):
-        self.assertIn("recovery", self.section.lower())
-        self.assertIn("no eligible controller", self.section.lower())
-
     def test_section_covers_the_unreadable_policy_repair_route(self):
         self.assertIn("unreadable", self.section.lower())
         self.assertIn("controller_policy", self.section)
-
-    def test_flag_reference_mentions_both_flags(self):
-        self.assertIn("- `--allow-controllers LIST`", self.text)
-        self.assertIn("repeatable", self.text)
-
-
-# --------------------------------------------------------------------------- #
-# UX-011 — the gate input activation boundary.                                 #
-# --------------------------------------------------------------------------- #
-
-_PTY_OK = hasattr(os, "openpty") and sys.platform != "win32"
-
-# Every pty rendezvous is bounded so a hang fails loudly at a NAMED step instead
-# of blocking the suite.
-_PTY_STEP_TIMEOUT = 25.0
-
-
-def _fionread(fd):
-    """Bytes waiting on `fd` — the same primitive the boundary uses, so the
-    tests can wait for a payload to really be queued instead of sleeping."""
-    buf = array.array("i", [0])
-    fcntl.ioctl(fd, termios.FIONREAD, buf, True)
-    return int(buf[0])
-
-
-def _raw_no_echo(fd):
-    """Put a pty into byte-at-a-time, no-echo mode.
-
-    No ECHO so the captured transcript contains ONLY what cowork itself wrote.
-    That is deliberate and is what the leak assertions are about: cowork does
-    not read, keep, record or replay discarded input, and terminal-local echo of
-    the user's own keystrokes is the terminal's doing, not a cowork leak. A real
-    terminal DOES echo type-ahead while a role turn runs — cowork never touches
-    the ECHO flag — and README's 'Gates ignore input typed before they were
-    ready' says so explicitly; `test_cowork_never_promises_to_suppress_echo`
-    below pins the two together. Leaving echo on here would mix the user's own
-    keystrokes into the transcript and make the leak probes meaningless.
-
-    No ICANON so bytes reach the input queue immediately and FIONREAD counts are
-    exact. And no CR/NL translation, so a typed Return stays a Return whether or
-    not an application has entered raw mode yet — prompt_toolkit clears the same
-    input flags, so this only removes a start-up race the real terminal does not
-    have."""
-    attrs = termios.tcgetattr(fd)
-    attrs[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)   # iflag
-    attrs[3] &= ~(termios.ECHO | termios.ICANON)                   # lflag
-    attrs[6][termios.VMIN] = 0
-    attrs[6][termios.VTIME] = 0
-    termios.tcsetattr(fd, termios.TCSANOW, attrs)
-
-
-class _PtyStream:
-    """A stream backed by a REAL pty fd: `is_tty()` is true and `fileno()` is a
-    genuine terminal, so the activation boundary fully engages without spawning
-    a subprocess. Captures everything cowork writes."""
-
-    def __init__(self, fd):
-        self._fd = fd
-        self.chunks = []
-
-    def fileno(self):
-        return self._fd
-
-    def isatty(self):
-        return True
-
-    def write(self, text):
-        self.chunks.append(text)
-        return len(text)
-
-    def flush(self):
-        pass
-
-    @property
-    def text(self):
-        return "".join(self.chunks)
-
-
-class _Handlers(list):
-    """The minimal shape of prompt_toolkit's `after_render` Event: `+=` to
-    subscribe, `fire()` to run."""
-
-    def __iadd__(self, handler):
-        self.append(handler)
-        return self
-
-    def fire(self):
-        for handler in list(self):
-            handler(None)
-
-
-class _StubApp:
-    """A stand-in for a widget's prompt_toolkit Application: running it fires
-    the first render (where arm_activation drains) and then returns either the
-    STALE sentinel it was exited with, or its scripted result."""
-
-    def __init__(self, result=None, renders=1):
-        self.after_render = _Handlers()
-        self.result = result
-        self.renders = renders
-        self.exits = []
-        self.ran = 0
-
-    def exit(self, result=None):
-        self.exits.append(result)
-
-    def run(self):
-        self.ran += 1
-        for _ in range(self.renders):
-            self.after_render.fire()
-        if self.exits:
-            return self.exits[-1]
-        return self.result
-
-
-class GateBoundaryFixture(unittest.TestCase):
-    """Shared pty-fd plumbing for the in-process boundary tests."""
-
-    def pty_pair(self):
-        master, slave = os.openpty()
-        self.addCleanup(self._close, master)
-        self.addCleanup(self._close, slave)
-        _raw_no_echo(slave)
-        return master, slave
-
-    @staticmethod
-    def _close(fd):
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-    def queue(self, master, slave, payload):
-        """Write `payload` to the terminal and BLOCK until it is really sitting
-        on the input queue, so nothing downstream races the write."""
-        data = payload.encode() if isinstance(payload, str) else payload
-        os.write(master, data)
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if _fionread(slave) >= len(data):
-                return len(data)
-            time.sleep(0.005)
-        self.fail("payload never reached the terminal input queue")
-
-    def streams(self):
-        master, slave = self.pty_pair()
-        return master, slave, _PtyStream(slave), _PtyStream(slave)
-
-
-class GateDrainPrimitiveTest(GateBoundaryFixture):
-    """_gate_fd / _pending_input / _drop_terminal_input against a bare pty."""
-
-    def test_gate_fd_is_none_off_a_terminal(self):
-        self.assertIsNone(ui._gate_fd(io.StringIO()))
-        self.assertIsNone(ui._gate_fd(FakeTTY()))     # claims isatty, no fileno
-        self.assertIsNone(ui._gate_fd(object()))
-
-    def test_gate_fd_is_the_descriptor_on_a_real_terminal(self):
-        _master, slave = self.pty_pair()
-        self.assertEqual(ui._gate_fd(_PtyStream(slave)), slave)
-
-    def test_pending_counts_without_reading_and_flush_clears(self):
-        master, slave = self.pty_pair()
-        self.assertEqual(ui._pending_input(slave), (False, 0))
-        self.queue(master, slave, "hello there")
-        pending, count = ui._pending_input(slave)
-        self.assertTrue(pending)
-        self.assertEqual(count, 11)
-        # Counting must not consume: the bytes are still queued.
-        self.assertEqual(_fionread(slave), 11)
-        result = ui._drop_terminal_input(slave)
-        self.assertTrue(result.ok)
-        self.assertTrue(result.pending)
-        self.assertEqual(result.count, 11)
-        self.assertEqual(_fionread(slave), 0)
-
-    def test_pending_is_zero_on_a_missing_fd(self):
-        self.assertEqual(ui._pending_input(None), (False, 0))
-        empty = ui._drop_terminal_input(None)
-        self.assertTrue(empty.ok)
-        self.assertFalse(empty.pending)
-
-    def test_select_fallback_reports_pending_without_a_count(self):
-        import unittest.mock as mock
-        master, slave = self.pty_pair()
-        self.queue(master, slave, "abc")
-        with mock.patch.object(ui.fcntl, "ioctl",
-                               side_effect=OSError(errno.ENOTTY, "nope")):
-            pending, count = ui._pending_input(slave)
-            self.assertTrue(pending)
-            self.assertIsNone(count)
-            # …and the flush still runs, so the bytes are still discarded.
-            result = ui._drop_terminal_input(slave)
-        self.assertTrue(result.ok)
-        self.assertIsNone(result.count)
-        self.assertEqual(_fionread(slave), 0)
-
-    def test_tcflush_failure_is_reported_not_swallowed(self):
-        import unittest.mock as mock
-        master, slave = self.pty_pair()
-        self.queue(master, slave, "abc")
-        with mock.patch.object(ui.termios, "tcflush",
-                               side_effect=OSError(errno.ENOTTY, "nope")):
-            result = ui._drop_terminal_input(slave)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.errno_name, "ENOTTY")
-        # The bytes really are still queued — which is why the caller must not
-        # proceed as if they were gone.
-        self.assertEqual(_fionread(slave), 3)
-
-    def test_no_discard_path_helper_ever_reads_the_bytes(self):
-        """Reading discarded content — even to measure it — would materialize it
-        in Python. Assert os.read is never reachable from the discard path."""
-        import unittest.mock as mock
-        master, slave = self.pty_pair()
-        self.queue(master, slave, "secret-payload")
-        with mock.patch.object(ui.os, "read",
-                               side_effect=AssertionError("os.read on the "
-                                                          "discard path")):
-            act = ui.begin_gate(_PtyStream(slave), _PtyStream(slave),
-                                gate="g")
-        self.assertTrue(act.safe)
-        self.assertTrue(act.pending)
-
-    def test_count_is_clamped(self):
-        master, slave = self.pty_pair()
-        # Just over the cap, but inside the tty's own buffer.
-        self.queue(master, slave, "x" * (ui.GATE_DISCARD_CAP + 10))
-        act = ui.begin_gate(_PtyStream(slave), _PtyStream(slave), gate="g")
-        self.assertEqual(act.count, ui.GATE_DISCARD_CAP)
-
-    def test_clamp_helper(self):
-        self.assertIsNone(ui._clamp_count(None))
-        self.assertEqual(ui._clamp_count(3), 3)
-        self.assertEqual(ui._clamp_count(ui.GATE_DISCARD_CAP * 10),
-                         ui.GATE_DISCARD_CAP)
-
-
-@unittest.skipUnless(HAS_UI_DEPS, "prompt_toolkit not installed")
-class DropTypeaheadTest(unittest.TestCase):
-    """The second stale-input channel: prompt_toolkit's process-global typeahead
-    bucket, which replays leftover key presses into the NEXT application before
-    it draws."""
-
-    @contextlib.contextmanager
-    def _session(self):
-        from prompt_toolkit.application.current import create_app_session
-        from prompt_toolkit.input.defaults import create_pipe_input
-        from prompt_toolkit.output import DummyOutput
-        with create_pipe_input() as pipe_in:
-            with create_app_session(input=pipe_in, output=DummyOutput()):
-                yield pipe_in
-
-    def _presses(self, *datas):
-        from prompt_toolkit.key_binding.key_processor import KeyPress
-        return [KeyPress("x", data) for data in datas]
-
-    def test_counts_characters_and_empties_the_bucket(self):
-        from prompt_toolkit.input import typeahead as pt_typeahead
-        with self._session() as pipe_in:
-            pt_typeahead.store_typeahead(pipe_in, self._presses("\r", "abc"))
-            self.assertEqual(ui._drop_typeahead(), (True, 4))
-            self.assertEqual(pt_typeahead.get_typeahead(pipe_in), [])
-
-    def test_second_call_is_a_no_op(self):
-        from prompt_toolkit.input import typeahead as pt_typeahead
-        with self._session() as pipe_in:
-            pt_typeahead.store_typeahead(pipe_in, self._presses("\r"))
-            self.assertEqual(ui._drop_typeahead(), (True, 1))
-            self.assertEqual(ui._drop_typeahead(), (True, 0))
-
-    def test_a_bucket_that_cannot_be_emptied_reports_failure(self):
-        """Fail closed: those key presses would be replayed into the next
-        application before it draws."""
-        import unittest.mock as mock
-        from prompt_toolkit.input import typeahead as pt_typeahead
-        with self._session() as pipe_in:
-            pt_typeahead.store_typeahead(pipe_in, self._presses("\r"))
-            with mock.patch.object(pt_typeahead, "clear_typeahead",
-                                   side_effect=RuntimeError("wedged")):
-                self.assertEqual(ui._drop_typeahead(), (False, 0))
-
-    def test_begin_gate_clears_the_bucket_before_a_widget_opens(self):
-        from prompt_toolkit.input import typeahead as pt_typeahead
-        master, slave = os.openpty()
-        self.addCleanup(lambda: os.close(master))
-        self.addCleanup(lambda: os.close(slave))
-        _raw_no_echo(slave)
-        with self._session() as pipe_in:
-            pt_typeahead.store_typeahead(pipe_in, self._presses("\r\r"))
-            act = ui.begin_gate(_PtyStream(slave), _PtyStream(slave), gate="g")
-        self.assertTrue(act.safe)
-        self.assertTrue(act.pending)
-        self.assertEqual(act.count, 2)
-
-
-class GateNoticeTest(unittest.TestCase):
-    """The notices are short, content-free and never carry payload text."""
-
-    def test_discard_notice_with_and_without_a_count(self):
-        out = FakeTTY()
-        ui.discard_notice(out, 12)
-        text = out.getvalue()
-        self.assertIn("12", text)
-        self.assertIn("ignored", text.lower())
-        self.assertIn("again", text.lower())
-        out2 = FakeTTY()
-        ui.discard_notice(out2, None)
-        self.assertNotRegex(out2.getvalue(), r"\d")
-        self.assertIn("ignored", out2.getvalue().lower())
-
-    def test_discard_notice_clamps(self):
-        out = FakeTTY()
-        ui.discard_notice(out, ui.GATE_DISCARD_CAP)
-        self.assertIn("%d+" % ui.GATE_DISCARD_CAP, out.getvalue())
-
-    def test_failure_notices_say_the_gate_will_not_run(self):
-        out = FakeTTY()
-        ui.drain_failed_notice(out)
-        self.assertIn("not be run", out.getvalue())
-        out2 = FakeTTY()
-        ui.gate_abandoned_notice(out2)
-        self.assertIn("without approving", out2.getvalue())
-
-
-class GateOffTerminalNoOpTest(unittest.TestCase):
-    """Off a real terminal, and with ask_fn injected, the boundary is inert and
-    every existing call shape behaves exactly as it always has."""
-
-    def test_begin_gate_is_a_no_op_off_a_terminal(self):
-        act = ui.begin_gate(FakeTTY(), FakeTTY(), gate="g")
-        self.assertTrue(act.safe)
-        self.assertFalse(act.pending)
-        self.assertFalse(act.active)
-
-    def test_arm_activation_tolerates_a_missing_app_and_fd(self):
-        act = ui.begin_gate(FakeTTY(), FakeTTY(), gate="g")
-        ui.arm_activation(None, act, None)              # no app
-        ui.arm_activation(object(), act, None)          # no fd
-        ui.arm_activation(object(), act, 1)             # no after_render
-        self.assertFalse(act.active)
-
-    def test_select_and_confirm_keep_the_legacy_call_shape(self):
-        self.assertEqual(ui.select("p", [("a", "A")], ask_fn=lambda: "a"), "a")
-        self.assertIs(ui.confirm("p", ask_fn=lambda: True), True)
-        self.assertIs(ui.confirm("p", ask_fn=lambda: None), False)
-
-    def test_ask_fn_wins_even_with_terminal_handles(self):
-        calls = []
-        ui.select("p", [("a", "A")], ask_fn=lambda: calls.append(1) or "a",
-                  io_in=FakeTTY(), io_out=FakeTTY(), gate="g")
-        self.assertEqual(calls, [1])
-
-    def test_prompt_user_off_tty_is_byte_identical(self):
-        self.assertIs(ui.prompt_user(io.StringIO(""), io.StringIO()), ui.EOF)
-        self.assertEqual(ui.prompt_user(io.StringIO("\n"), io.StringIO()), "")
-        self.assertEqual(ui.prompt_user(io.StringIO("hi\n"), io.StringIO()),
-                         "hi")
-
-
-@unittest.skipUnless(HAS_UI_DEPS, "questionary not installed")
-class ConfirmDefaultTest(unittest.TestCase):
-    """ui.confirm's new `default` parameter (D3)."""
-
-    def test_defaults_to_true_and_forwards(self):
-        import unittest.mock as mock
-        import questionary
-        with mock.patch.object(questionary, "confirm") as qc:
-            qc.return_value.ask.return_value = True
-            ui.confirm("Approve & finish?")
-            self.assertIs(qc.call_args.kwargs["default"], True)
-            qc.reset_mock()
-            qc.return_value.ask.return_value = False
-            ui.confirm("Approve & finish?", default=False)
-            self.assertIs(qc.call_args.kwargs["default"], False)
-
-
-class DrainFailedSentinelTest(unittest.TestCase):
-    """The sentinel makes 'an unmapped caller fails loudly' true rather than
-    aspirational."""
-
-    def test_bool_raises(self):
-        with self.assertRaises(TypeError):
-            bool(ui.DRAIN_FAILED)
-        with self.assertRaises(TypeError):
-            if ui.DRAIN_FAILED:      # the `if ui.confirm(...)` hazard
-                pass
-
-    def test_has_no_strip(self):
-        self.assertFalse(hasattr(ui.DRAIN_FAILED, "strip"))
-
-    def test_is_outside_every_other_return_domain(self):
-        for other in (ui.CANCEL, ui.EOF, ui.STALE, None, "", True, False):
-            self.assertIsNot(ui.DRAIN_FAILED, other)
-
-
-class _GateWrapperFixture(GateBoundaryFixture):
-    """Recording callbacks matching cowork_ui's single declared signature."""
-
-    def _record(self):
-        discards, failures = [], []
-
-        def on_discard(gate, epoch, phase, count):
-            discards.append({"gate": gate, "epoch": epoch, "phase": phase,
-                             "count": count})
-
-        def on_drain_fail(gate, epoch, phase, reason, errno_name,
-                          typeahead_cleared, reopens):
-            failures.append({"gate": gate, "epoch": epoch, "phase": phase,
-                             "reason": reason, "errno_name": errno_name,
-                             "typeahead_cleared": typeahead_cleared,
-                             "reopens": reopens})
-
-        return discards, failures, on_discard, on_drain_fail
-
-
-class GateWrapperLoopTest(_GateWrapperFixture):
-    """The single wrapper loop: exactly one notice and one callback per gate
-    open, from this layer only."""
-
-    def test_clean_queue_produces_no_notice_and_no_event(self):
-        """The no-routine-false-warnings half of the contract: a warning always
-        means real observed input."""
-        _master, _slave, io_in, io_out = self.streams()
-        discards, failures, on_d, on_f = self._record()
-        app = _StubApp(result="approve")
-        out = ui._run_gate(io_in, io_out, "g", on_d, on_f,
-                           lambda: (app, app.run))
-        self.assertEqual(out, "approve")
-        self.assertEqual(discards, [])
-        self.assertEqual(failures, [])
-        self.assertEqual(io_out.text, "")
-
-    def test_observed_queue_produces_exactly_one_notice_and_one_event(self):
-        master, slave, io_in, io_out = self.streams()
-        self.queue(master, slave, "typed ahead")
-        discards, failures, on_d, on_f = self._record()
-        app = _StubApp(result="approve")
-        out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
-                           lambda: (app, app.run))
-        self.assertEqual(out, "approve")
-        self.assertEqual(len(discards), 1)
-        self.assertEqual(discards[0]["phase"], "pre_render")
-        self.assertEqual(discards[0]["count"], 11)
-        self.assertEqual(discards[0]["gate"], "ready_for_review")
-        self.assertEqual(failures, [])
-        self.assertEqual(io_out.text.count("ignored"), 1)
-
-
-class GateReopenTest(_GateWrapperFixture):
-    """Re-opening after a post-render discard: a full gate open every time —
-    drain, a new Activation, a fresh widget, exactly one handler — bounded by
-    GATE_REOPEN_LIMIT so a stuck key cannot livelock the gate."""
-
-    def test_post_render_arrival_reopens_once_with_one_notice(self):
-        """Input landing while the gate draws: the widget exits STALE, the
-        wrapper reports ONCE and re-opens a live gate."""
-        master, slave, io_in, io_out = self.streams()
-        discards, failures, on_d, on_f = self._record()
-        built = []
-
-        def build():
-            app = _StubApp(result="approve")
-            if not built:
-                # First attempt only: bytes land while it is drawing.
-                original = app.run
-
-                def run():
-                    self.queue(master, slave, "\r")
-                    return original()
-
-                built.append(app)
-                return app, run
-            built.append(app)
-            return app, app.run
-
-        out = ui._run_gate(io_in, io_out, "g", on_d, on_f, build)
-        self.assertEqual(out, "approve")
-        self.assertEqual(len(built), 2)
-        self.assertEqual(len(discards), 1, discards)
-        self.assertEqual(discards[0]["phase"], "post_render")
-        self.assertEqual(io_out.text.count("ignored"), 1)
-        # Each attempt is armed exactly once — no handler accumulation.
-        self.assertEqual(len(built[0].after_render), 1)
-        self.assertEqual(len(built[1].after_render), 1)
-        # Every re-open is a FULL gate open, so the epoch advances.
-        self.assertNotEqual(built[0], built[1])
-
-    def test_arm_activation_is_one_shot(self):
-        """Later redraws never drain, so a genuine in-box paste is never
-        over-discarded."""
-        master, slave, io_in, io_out = self.streams()
-        act = ui.begin_gate(io_in, io_out, gate="g")
-        app = _StubApp(result="typed")
-        ui.arm_activation(app, act, slave)
-        app.after_render.fire()                    # the first render: drains
-        self.assertTrue(act.active)
-        # Now the user pastes into the OPEN, activated editor.
-        self.queue(master, slave, "in-box paste")
-        app.after_render.fire()                    # a cursor-move redraw…
-        app.after_render.fire()                    # …and the render_as_done one
-        self.assertEqual(_fionread(slave), len("in-box paste"))
-        self.assertEqual(app.exits, [])
-
-    def test_reopen_limit_fails_closed_without_a_discard_event(self):
-        master, slave, io_in, io_out = self.streams()
-        discards, failures, on_d, on_f = self._record()
-
-        def build():
-            app = _StubApp(result="approve")
-            original = app.run
-
-            def run():
-                self.queue(master, slave, "\r")
-                return original()
-
-            return app, run
-
-        out = ui._run_gate(io_in, io_out, "g", on_d, on_f, build)
-        self.assertIs(out, ui.DRAIN_FAILED)
-        # The final attempt reports the abandonment and NOTHING else.
-        self.assertEqual(len(discards), ui.GATE_REOPEN_LIMIT - 1)
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["reason"], "reopen_limit")
-        self.assertEqual(failures[0]["reopens"], ui.GATE_REOPEN_LIMIT)
-        self.assertIsNone(failures[0]["errno_name"])
-        self.assertIsNone(failures[0]["typeahead_cleared"])
-        self.assertEqual(io_out.text.count("without approving"), 1)
-
-
-class DrainFailedTraceOrderingTest(_GateWrapperFixture):
-    """A failed drain emits input.drain_failed and NEVER input.discarded; a
-    recovered drain emits the inverse; a successful post-render drop emits
-    exactly one event and one notice (the double-emit regression guard)."""
-
-    def test_pre_render_drain_failure_fails_closed(self):
-        import unittest.mock as mock
-        master, slave, io_in, io_out = self.streams()
-        self.queue(master, slave, "\r")
-        discards, failures, on_d, on_f = self._record()
-        opened = []
-
-        def build():
-            opened.append(1)
-            app = _StubApp(result="approve")
-            return app, app.run
-
-        with mock.patch.object(ui.termios, "tcflush",
-                               side_effect=OSError(errno.ENOTTY, "nope")) as tf:
-            out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
-                               build)
-        self.assertIs(out, ui.DRAIN_FAILED)
-        self.assertEqual(opened, [])            # the gate never ran
-        self.assertEqual(discards, [])          # nothing was really discarded
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["reason"], "tcflush")
-        self.assertEqual(failures[0]["errno_name"], "ENOTTY")
-        self.assertIs(failures[0]["typeahead_cleared"], True)
-        self.assertIsNone(failures[0]["reopens"])
-        self.assertEqual(io_out.text.count("could not clear"), 1)
-        # It retried before giving up.
-        self.assertEqual(tf.call_count, ui.GATE_DRAIN_RETRIES)
-
-    def test_transient_failure_then_success_proceeds_with_no_banner(self):
-        import unittest.mock as mock
-        master, slave, io_in, io_out = self.streams()
-        self.queue(master, slave, "abc")
-        discards, failures, on_d, on_f = self._record()
-        real = ui.termios.tcflush
-        calls = []
-
-        def flaky(fd, queue):
-            calls.append(1)
-            if len(calls) == 1:
-                raise OSError(errno.EINTR, "interrupted")
-            return real(fd, queue)
-
-        app = _StubApp(result="approve")
-        with mock.patch.object(ui.termios, "tcflush", flaky):
-            out = ui._run_gate(io_in, io_out, "g", on_d, on_f,
-                               lambda: (app, app.run))
-        self.assertEqual(out, "approve")
-        self.assertEqual(failures, [])
-        self.assertEqual(len(discards), 1)
-        self.assertNotIn("could not clear", io_out.text)
-
-    def test_post_render_drain_failure_fails_closed(self):
-        import unittest.mock as mock
-        master, slave, io_in, io_out = self.streams()
-        discards, failures, on_d, on_f = self._record()
-        real = ui.termios.tcflush
-        state = {"opened": False}
-
-        def build():
-            app = _StubApp(result="approve")
-            original = app.run
-
-            def run():
-                state["opened"] = True
-                return original()
-
-            return app, run
-
-        def only_fail_after_open(fd, queue):
-            if state["opened"]:
-                raise OSError(errno.EIO, "gone")
-            return real(fd, queue)
-
-        with mock.patch.object(ui.termios, "tcflush", only_fail_after_open):
-            out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
-                               build)
-        self.assertIs(out, ui.DRAIN_FAILED)
-        self.assertEqual(discards, [])
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["phase"], "post_render")
-        self.assertEqual(failures[0]["reason"], "tcflush")
-        self.assertEqual(failures[0]["errno_name"], "EIO")
-        # post-render failures did NOT clear the typeahead bucket.
-        self.assertIs(failures[0]["typeahead_cleared"], False)
-        self.assertEqual(io_out.text.count("could not clear"), 1)
-
-
-class DrainSamplingWindowTest(GateBoundaryFixture):
-    """The amended criterion 2 contract (user decision D5), pinned from both
-    sides so it can drift back to neither a false promise nor a noisy warning."""
-
-    def test_gap_arrival_is_discarded_but_unmentioned(self):
-        import unittest.mock as mock
-        master, slave, io_in, io_out = self.streams()
-        events = []
-        real = ui.termios.tcflush
-        injected = {"done": False}
-
-        def inject_then_flush(fd, queue):
-            # EXACTLY the gap: after _pending_input sampled, before tcflush.
-            if not injected["done"]:
-                injected["done"] = True
-                self.queue(master, slave, "\r\r\r")
-            return real(fd, queue)
-
-        app = _StubApp(result="ask")
-        with mock.patch.object(ui.termios, "tcflush", inject_then_flush):
-            out = ui._run_gate(
-                io_in, io_out, "g",
-                lambda **kw: events.append(kw), None,
-                lambda: (app, app.run))
-        self.assertEqual(out, "ask")
-        # Discarded: the bytes are gone and selected nothing.
-        self.assertEqual(_fionread(slave), 0)
-        # …and, as documented, unmentioned.
-        self.assertEqual(events, [])
-        self.assertEqual(io_out.text, "")
-
-    def test_empty_queue_never_warns(self):
-        _master, _slave, io_in, io_out = self.streams()
-        events = []
-        app = _StubApp(result="ask")
-        ui._run_gate(io_in, io_out, "g", lambda **kw: events.append(kw), None,
-                     lambda: (app, app.run))
-        self.assertEqual(events, [])
-        self.assertEqual(io_out.text, "")
-
-    def test_observed_input_warns_exactly_once(self):
-        master, slave, io_in, io_out = self.streams()
-        self.queue(master, slave, "hello")
-        events = []
-        app = _StubApp(result="ask")
-        ui._run_gate(io_in, io_out, "g", lambda **kw: events.append(kw), None,
-                     lambda: (app, app.run))
-        self.assertEqual(len(events), 1)
-        self.assertEqual(io_out.text.count("ignored"), 1)
-
-
-class GateTraceClosureTest(unittest.TestCase):
-    """run_flow's closures match cowork_ui's single declared signature, and the
-    emitted field sets are exactly what the plan declares."""
-
-    def _trace(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        path = os.path.join(d, "trace.jsonl")
-        return trace_store.Trace(path, session_uuid="s", run_id="r"), path
-
-    def _records(self, path):
-        if not os.path.exists(path):
-            return []
-        with open(path) as fh:
-            return [json.loads(line) for line in fh if line.strip()]
-
-    def _fields(self, record):
-        return {k: v for k, v in record.items()
-                if k not in ("ts", "event", "event_id", "run_id",
-                             "session_uuid")}
-
-    def test_no_trace_means_no_callbacks(self):
-        self.assertEqual(cowork._gate_trace_callbacks(None, "scout"),
-                         (None, None))
-
-    def test_discard_event_fields(self):
-        trace, path = self._trace()
-        on_discard, _fail = cowork._gate_trace_callbacks(trace, "planner")
-        on_discard(gate="ready_for_review", epoch=7, phase="pre_render",
-                   count=12)
-        rec = self._records(path)[0]
-        self.assertEqual(rec["event"], "input.discarded")
-        self.assertEqual(self._fields(rec),
-                         {"role": "planner", "gate": "ready_for_review",
-                          "epoch": 7, "phase": "pre_render", "chars": 12})
-
-    def test_discard_event_omits_chars_when_unknown(self):
-        trace, path = self._trace()
-        on_discard, _fail = cowork._gate_trace_callbacks(trace, "scout")
-        on_discard(gate="g", epoch=1, phase="pre_render", count=None)
-        rec = self._records(path)[0]
-        self.assertNotIn("chars", rec)
-        self.assertEqual(self._fields(rec),
-                         {"role": "scout", "gate": "g", "epoch": 1,
-                          "phase": "pre_render"})
-
-    def test_drain_failed_event_fields(self):
-        trace, path = self._trace()
-        _d, on_drain_fail = cowork._gate_trace_callbacks(trace, "builder")
-        on_drain_fail(gate="ready_for_review", epoch=3, phase="pre_render",
-                      reason="tcflush", errno_name="ENOTTY",
-                      typeahead_cleared=True, reopens=None)
-        rec = self._records(path)[0]
-        self.assertEqual(rec["event"], "input.drain_failed")
-        self.assertEqual(self._fields(rec),
-                         {"role": "builder", "gate": "ready_for_review",
-                          "epoch": 3, "phase": "pre_render",
-                          "reason": "tcflush", "errno": "ENOTTY",
-                          "typeahead_cleared": True})
-
-    def test_gate_abandoned_event_fields(self):
-        trace, path = self._trace()
-        _d, on_drain_fail = cowork._gate_trace_callbacks(trace, "builder")
-        on_drain_fail(gate="ready_for_review", epoch=4, phase="post_render",
-                      reason="reopen_limit", errno_name=None,
-                      typeahead_cleared=None, reopens=3)
-        rec = self._records(path)[0]
-        self.assertEqual(rec["event"], "input.gate_abandoned")
-        self.assertEqual(self._fields(rec),
-                         {"role": "builder", "gate": "ready_for_review",
-                          "epoch": 4, "phase": "post_render",
-                          "reason": "reopen_limit", "reopens": 3})
-
-    def test_closures_take_the_declared_keyword_arity(self):
-        import inspect
-        trace, _path = self._trace()
-        on_discard, on_drain_fail = cowork._gate_trace_callbacks(trace, "scout")
-        self.assertEqual(
-            list(inspect.signature(on_discard).parameters),
-            ["gate", "epoch", "phase", "count"])
-        self.assertEqual(
-            list(inspect.signature(on_drain_fail).parameters),
-            ["gate", "epoch", "phase", "reason", "errno_name",
-             "typeahead_cleared", "reopens"])
-
-    def test_no_content_derived_field_is_ever_emitted(self):
-        trace, path = self._trace()
-        on_discard, on_drain_fail = cowork._gate_trace_callbacks(trace, "scout")
-        on_discard(gate="g", epoch=1, phase="pre_render", count=5)
-        on_drain_fail(gate="g", epoch=1, phase="pre_render", reason="tcflush",
-                      errno_name="EIO", typeahead_cleared=True, reopens=None)
-        blob = json.dumps(self._records(path))
-        for banned in ("sha256", "prompt_bytes", "text", "data"):
-            self.assertNotIn(banned, blob)
-
-
-class DrainFailedMappingTest(unittest.TestCase):
-    """Every protected call site in every reader maps ui.DRAIN_FAILED to a named
-    non-approving constant, BEFORE any other test on the value."""
-
-    def _tty(self):
-        return FakeTTY(), FakeTTY()
-
-    def _failing(self):
-        import unittest.mock as mock
-        return mock.Mock(return_value=ui.DRAIN_FAILED)
-
-    def test_read_review_select_site(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        pu = mock.Mock()
-        with mock.patch.object(ui, "select", self._failing()), \
-                mock.patch.object(ui, "prompt_user", pu):
-            self.assertIs(cowork._read_review(i, o), cowork._STOP)
-        pu.assert_not_called()
-
-    def test_read_review_changes_feedback_site(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        sel = mock.Mock(return_value="changes")
-        with mock.patch.object(ui, "select", sel), \
-                mock.patch.object(ui, "prompt_user", self._failing()):
-            self.assertIs(cowork._read_review(i, o), cowork._STOP)
-        self.assertEqual(sel.call_count, 1)
-
-    def test_read_review_question_site(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", mock.Mock(return_value="ask")), \
-                mock.patch.object(ui, "prompt_user", self._failing()):
-            self.assertIs(cowork._read_review(i, o), cowork._STOP)
-
-    def test_read_review_preview_less_confirm_site(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        pu = mock.Mock()
-        with mock.patch.object(ui, "confirm", self._failing()), \
-                mock.patch.object(ui, "prompt_user", pu):
-            self.assertIs(cowork._read_review(i, o, allow_ask=False),
-                          cowork._STOP)
-        pu.assert_not_called()
-
-    def test_read_review_preview_less_feedback_site(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        conf = mock.Mock(return_value=False)
-        with mock.patch.object(ui, "confirm", conf), \
-                mock.patch.object(ui, "prompt_user", self._failing()):
-            self.assertIs(cowork._read_review(i, o, allow_ask=False),
-                          cowork._STOP)
-        self.assertEqual(conf.call_count, 1)
-
-    def test_read_review_builder_preview_sites(self):
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", self._failing()):
-            self.assertIs(cowork._read_review(i, o, allow_ask=False,
-                                              preview=preview), cowork._STOP)
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", mock.Mock(return_value="changes")), \
-                mock.patch.object(ui, "prompt_user", self._failing()):
-            self.assertIs(cowork._read_review(i, o, allow_ask=False,
-                                              preview=preview), cowork._STOP)
-
-    def test_read_review_dissent_sites(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", self._failing()):
-            self.assertIs(cowork._read_review_dissent(i, o), cowork._STOP)
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", mock.Mock(return_value="tell")), \
-                mock.patch.object(ui, "prompt_user", self._failing()):
-            self.assertIs(cowork._read_review_dissent(i, o), cowork._STOP)
-
-    def test_recovery_gates_map_to_their_own_safe_constants(self):
-        import unittest.mock as mock
-        cases = [
-            (cowork._read_stuck_gate, cowork._STUCK_END),
-            (cowork._read_controller_failure_gate, cowork._CTRL_END),
-            (cowork._read_reviewer_fail_gate, cowork._REVFAIL_END),
-        ]
-        for reader, expected in cases:
-            with self.subTest(reader=reader.__name__):
-                i, o = self._tty()
-                with mock.patch.object(ui, "select", self._failing()):
-                    self.assertIs(reader(i, o), expected)
-
-    def test_reviewer_failure_never_maps_to_skip(self):
-        """_REVFAIL_SKIP would advance the work past a review that never
-        happened."""
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", self._failing()):
-            self.assertIsNot(cowork._read_reviewer_fail_gate(i, o),
-                             cowork._REVFAIL_SKIP)
-
-    def test_handoff_confirm_declines(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        with mock.patch.object(ui, "confirm", self._failing()):
-            self.assertIs(cowork._read_handoff_confirm(i, o), False)
-
-    def test_free_form_sites_intercept_before_strip(self):
-        """cowork.py's three feedback sites call fb.strip(); the sentinel has no
-        .strip(), so an unmapped site would raise AttributeError."""
-        import unittest.mock as mock
-        for kwargs in ({}, {"allow_ask": False},
-                       {"allow_ask": False,
-                        "preview": cowork.make_gate_preview("builder", False,
-                                                            True)}):
-            with self.subTest(kwargs=sorted(kwargs)):
-                i, o = self._tty()
-                sel = mock.Mock(return_value="changes")
-                conf = mock.Mock(return_value=False)
-                with mock.patch.object(ui, "select", sel), \
-                        mock.patch.object(ui, "confirm", conf), \
-                        mock.patch.object(ui, "prompt_user", self._failing()):
-                    self.assertIs(cowork._read_review(i, o, **kwargs),
-                                  cowork._STOP)
-
-
-class ReviewApprovalPathsTest(unittest.TestCase):
-    """D3 + D4: no approval by omission. Every route that could finish the run
-    is enumerated, and every loop still has a working way out."""
-
-    def _tty(self):
-        return FakeTTY(), FakeTTY()
-
-    def _preview(self, role="builder"):
-        return cowork.make_gate_preview(role, False, True)
-
-    EMPTY = ["", "   ", "\t\n ", ui.CANCEL, ui.EOF]
-
-    def test_ask_menu_blank_feedback_never_approves(self):
-        import unittest.mock as mock
-        for blank in self.EMPTY:
-            with self.subTest(blank=repr(blank)):
-                i, o = self._tty()
-                sel = mock.Mock(side_effect=["changes", "stop"])
-                with mock.patch.object(ui, "select", sel), \
-                        mock.patch.object(ui, "prompt_user",
-                                          return_value=blank):
-                    self.assertIs(cowork._read_review(i, o), cowork._STOP)
-                self.assertEqual(sel.call_count, 2)
-
-    def test_builder_preview_menu_blank_feedback_never_approves(self):
-        import unittest.mock as mock
-        for blank in self.EMPTY:
-            with self.subTest(blank=repr(blank)):
-                i, o = self._tty()
-                sel = mock.Mock(side_effect=["changes", "stop"])
-                with mock.patch.object(ui, "select", sel), \
-                        mock.patch.object(ui, "prompt_user",
-                                          return_value=blank):
-                    self.assertIs(
-                        cowork._read_review(i, o, allow_ask=False,
-                                            preview=self._preview()),
-                        cowork._STOP)
-                self.assertEqual(sel.call_count, 2)
-
-    def test_preview_less_confirm_blank_feedback_never_approves(self):
-        import unittest.mock as mock
-        for blank in self.EMPTY:
-            with self.subTest(blank=repr(blank)):
-                i, o = self._tty()
-                conf = mock.Mock(side_effect=[False, True])
-                with mock.patch.object(ui, "confirm", conf), \
-                        mock.patch.object(ui, "prompt_user",
-                                          return_value=blank):
-                    self.assertIs(cowork._read_review(i, o, allow_ask=False),
-                                  cowork._END)
-                # It re-asked instead of finishing on the blank answer.
-                self.assertEqual(conf.call_count, 2)
-
-    def test_preview_less_confirm_is_built_with_default_false(self):
-        import unittest.mock as mock
-        i, o = self._tty()
-        conf = mock.Mock(return_value=True)
-        with mock.patch.object(ui, "confirm", conf):
-            cowork._read_review(i, o, allow_ask=False)
-        self.assertIs(conf.call_args.kwargs["default"], False)
-
-    def test_dismissed_menu_stops_everywhere(self):
-        import unittest.mock as mock
-        cases = [
-            ({}, cowork._STOP),
-            ({"preview": cowork.make_gate_preview("scout", True, False)},
-             cowork._STOP),
-            ({"allow_ask": False, "preview": cowork.make_gate_preview(
-                "builder", False, True)}, cowork._STOP),
-        ]
-        for kwargs, expected in cases:
-            with self.subTest(kwargs=sorted(kwargs)):
-                i, o = self._tty()
-                pu = mock.Mock()
-                with mock.patch.object(ui, "select", return_value=None), \
-                        mock.patch.object(ui, "prompt_user", pu):
-                    self.assertIs(cowork._read_review(i, o, **kwargs), expected)
-                pu.assert_not_called()
-
-    def test_every_loop_still_has_an_escape(self):
-        import unittest.mock as mock
-        # Menu: explicit Stop.
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", return_value="stop"):
-            self.assertIs(cowork._read_review(i, o), cowork._STOP)
-        # Menu: non-empty feedback.
-        i, o = self._tty()
-        with mock.patch.object(ui, "select", return_value="changes"), \
-                mock.patch.object(ui, "prompt_user", return_value="do x"):
-            self.assertEqual(cowork._read_review(i, o), "do x")
-        # Confirm loop: Yes.
-        i, o = self._tty()
-        with mock.patch.object(ui, "confirm", return_value=True):
-            self.assertIs(cowork._read_review(i, o, allow_ask=False),
-                          cowork._END)
-        # Confirm loop: non-empty feedback.
-        i, o = self._tty()
-        with mock.patch.object(ui, "confirm", return_value=False), \
-                mock.patch.object(ui, "prompt_user", return_value="do x"):
-            self.assertEqual(cowork._read_review(i, o, allow_ask=False), "do x")
-
-    def test_off_tty_blank_finish_contract_is_untouched(self):
-        self.assertIs(cowork._read_review(io.StringIO("\n"), io.StringIO()),
-                      cowork._END)
-        self.assertIs(cowork._read_review(io.StringIO(""), io.StringIO()),
-                      cowork._END)
-        self.assertIs(cowork._read_review(io.StringIO("   \n"), io.StringIO()),
-                      cowork._END)
-        self.assertIs(
-            cowork._read_review(io.StringIO("\n"), io.StringIO(),
-                                allow_ask=False), cowork._END)
-        self.assertIs(
-            cowork._read_review_dissent(io.StringIO("\n"), io.StringIO()),
-            cowork._END)
-
-
-class GateDefaultsTest(unittest.TestCase):
-    """'Approve & finish' is never the highlighted default at any consequential
-    gate, and Stop is never first."""
-
-    TERMINAL = ("approve", "stop", "end")
-
-    def _assert_safe_order(self, keys):
-        self.assertTrue(keys, "the menu showed no choices")
-        self.assertNotIn(keys[0], self.TERMINAL,
-                         "the highlighted choice is consequential: %r" % keys)
-        self.assertNotEqual(keys[0], "stop")
-
-    def test_scout_and_planner_gates(self):
-        import unittest.mock as mock
-        for role, terminal in (("scout", False), ("planner", False),
-                               ("scout", True), ("planner", True)):
-            with self.subTest(role=role, terminal=terminal):
-                preview = cowork.make_gate_preview(role, not terminal, False)
-                rec = _SelectRecorder("stop")
-                with mock.patch.object(cowork.ui, "select", rec):
-                    cowork._read_review(FakeTTY(), FakeTTY(), preview=preview)
-                self._assert_safe_order(rec.keys)
-                self.assertEqual(rec.keys[0], "ask")
-                self.assertEqual(rec.keys[-1], "stop")
-
-    def test_scout_gate_without_preview(self):
-        import unittest.mock as mock
-        rec = _SelectRecorder("changes")
-        with mock.patch.object(cowork.ui, "select", rec), \
-                mock.patch.object(cowork.ui, "prompt_user", return_value="x"):
-            cowork._read_review(FakeTTY(), FakeTTY())
-        self._assert_safe_order(rec.keys)
-        self.assertEqual(rec.keys, ["ask", "changes", "approve"])
-
-    def test_builder_gate(self):
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        rec = _SelectRecorder("stop")
-        with mock.patch.object(cowork.ui, "select", rec):
-            cowork._read_review(FakeTTY(), FakeTTY(), allow_ask=False,
-                                preview=preview)
-        self.assertEqual(rec.keys, ["changes", "approve", "stop"])
-        self._assert_safe_order(rec.keys)
-
-    def test_dissent_gate(self):
-        import unittest.mock as mock
-        for preview in (None, cowork.make_gate_preview("planner", True, False)):
-            with self.subTest(preview=bool(preview)):
-                rec = _SelectRecorder("iterate")
-                with mock.patch.object(cowork.ui, "select", rec):
-                    cowork._read_review_dissent(FakeTTY(), FakeTTY(),
-                                                preview=preview)
-                self._assert_safe_order(rec.keys)
-                self.assertEqual(rec.keys[0], "iterate")
-
-    def test_recovery_gates(self):
-        import unittest.mock as mock
-        readers = [cowork._read_stuck_gate,
-                   cowork._read_controller_failure_gate,
-                   cowork._read_reviewer_fail_gate]
-        for reader in readers:
-            for eligible in (None, ["claude"], []):
-                with self.subTest(reader=reader.__name__, eligible=eligible):
-                    rec = _SelectRecorder("retry")
-                    with mock.patch.object(cowork.ui, "select", rec):
-                        reader(FakeTTY(), FakeTTY(), eligible=eligible)
-                    self._assert_safe_order(rec.keys)
-                    self.assertEqual(rec.keys[0], "retry")
-                    self.assertEqual(rec.keys[-1], "end")
-
-
-class NegativeControlOracleTest(unittest.TestCase):
-    """ADJUDICATION RECORD for the adapted negative-control oracle.
-
-    The approved plan (user decision D2) required the 'it still breaks without
-    the fix' proof to positively assert `cowork._END`. That literal oracle is
-    UNSATISFIABLE once the same plan's D3 and D4 are applied, and this class
-    proves why rather than asserting it in prose:
-
-      * D4 reorders both review menus so 'approve' is never first, and
-      * D3 builds the preview-less confirm with default=False,
-
-    so the recorded incident's leftover — a single Return — can no longer reach
-    approve even with the boundary completely neutralised. The failure the
-    ticket exists to prevent is 'stale input drives a consequential gate'; on
-    today's menus a bare Return expresses that as a SELECTION, not as an
-    approval.
-
-    The adapted oracle is therefore: with the boundary neutralised, stale input
-    alone must produce a SELECTION at the later gate. That is strictly weaker as
-    an assertion but strictly WIDER as a detector — every _END is a selection,
-    so anything the original oracle would have caught, this one catches too (see
-    test_adapted_oracle_is_a_superset). The _END case is not abandoned either:
-    GateActivationIncidentPtyTest.test_approval_reproduces_without_the_boundary
-    asserts the outcome IS _END using a leftover that navigates onto approve,
-    which shows the boundary alone still gates a full approval.
-
-    REVIEWER ADJUDICATION: this substitution was escalated in the build status
-    as a deviation from a user-approved requirement and reviewed; the review
-    approved the build with the adapted oracle in place. These tests exist so
-    the adjudication is enforced by the suite rather than resting on a verdict
-    recorded in a session artifact — if a future change makes the literal _END
-    oracle satisfiable again, test_literal_end_oracle_is_unsatisfiable FAILS and
-    forces the substitution to be revisited."""
-
-    def _tty(self):
-        return FakeTTY(), FakeTTY()
-
-    def test_literal_end_oracle_is_unsatisfiable(self):
-        """A bare Return cannot reach approve at ANY review gate, so a negative
-        control replaying the recorded leftover cannot assert _END."""
-        import unittest.mock as mock
-        # Menu gates: a bare Return takes the highlighted choice, which D4
-        # guarantees is not approve.
-        for kwargs in ({}, {"preview": cowork.make_gate_preview("scout", True,
-                                                                False)},
-                       {"allow_ask": False,
-                        "preview": cowork.make_gate_preview("builder", False,
-                                                            True)}):
-            with self.subTest(kwargs=sorted(kwargs)):
-                rec = _SelectRecorder("stop")
-                with mock.patch.object(cowork.ui, "select", rec):
-                    cowork._read_review(*self._tty(), **kwargs)
-                self.assertNotEqual(
-                    rec.keys[0], "approve",
-                    "D4 regressed: a stray Return would approve again")
-        # The preview-less confirm: a bare Return takes the default, which D3
-        # guarantees is No.
-        conf = mock.Mock(return_value=True)
-        with mock.patch.object(cowork.ui, "confirm", conf):
-            cowork._read_review(*self._tty(), allow_ask=False)
-        self.assertIs(conf.call_args.kwargs["default"], False,
-                      "D3 regressed: a stray Return would approve again")
-
-    def test_adapted_oracle_is_a_superset(self):
-        """Every outcome the literal oracle would flag is also flagged by the
-        adapted one, so widening the oracle cannot hide a reproduction."""
-        # _END is only reachable through an explicit approve selection (or an
-        # explicit Yes at the confirm) — i.e. a selection always happened first.
-        import unittest.mock as mock
-        rec = _SelectRecorder("approve")
-        with mock.patch.object(cowork.ui, "select", rec):
-            out = cowork._read_review(*self._tty())
-        self.assertIs(out, cowork._END)
-        self.assertEqual(len(rec.calls), 1,
-                         "an _END outcome implies exactly one selection")
-
-    def test_both_oracles_are_still_exercised_by_the_pty_suite(self):
-        """The adaptation must not quietly become 'we stopped checking'."""
-        names = set(dir(GateActivationIncidentPtyTest))
-        adapted = {n for n in names
-                   if n.startswith("test_variant_")
-                   and n.endswith("_reproduces_without_the_boundary")}
-        self.assertEqual(
-            sorted(adapted),
-            ["test_variant_a_reproduces_without_the_boundary",
-             "test_variant_b_reproduces_without_the_boundary",
-             "test_variant_c_reproduces_without_the_boundary"],
-            "expected one adapted-oracle negative control per variant A/B/C")
-        self.assertIn("test_approval_reproduces_without_the_boundary", names,
-                      "the positive _END reproduction must remain")
-        self.assertIn("test_the_same_payload_approves_nothing_when_protected",
-                      names, "the protected mirror must remain")
-
-    def test_the_adapted_oracle_asserts_a_real_selection(self):
-        """The adapted oracle's signal is the nested feedback editor opening,
-        which can only follow a menu selection — not merely 'no exception'."""
-        import unittest.mock as mock
-        preview = cowork.make_gate_preview("builder", False, True)
-        headers = []
-
-        def record(io_in, io_out, header=None, **kwargs):
-            headers.append(header)
-            return "feedback from stale bytes"
-
-        with mock.patch.object(cowork.ui, "select", return_value="changes"), \
-                mock.patch.object(cowork.ui, "prompt_user", record):
-            out = cowork._read_review(*self._tty(), allow_ask=False,
-                                      preview=preview)
-        self.assertEqual(out, "feedback from stale bytes")
-        self.assertEqual(headers, ["Request changes — your feedback"],
-                         "the pty oracle keys on this exact header")
-
-
-class PromptUserGateOptInTest(GateBoundaryFixture):
-    """The boundary is opt-in and keyed on `gate`. Ordinary context and turn
-    prompts (gate=None) keep legacy behavior and must NEVER see DRAIN_FAILED —
-    their callers consume the result as text, so a sentinel they never asked for
-    would raise instead of re-prompting."""
-
-    class _StubSession:
-        def __init__(self, text="typed"):
-            self.text = text
-            self.calls = 0
-            self.app = None
-
-        def prompt(self, *a, **kw):
-            self.calls += 1
-            return self.text
-
-    def _factory(self, session):
-        return lambda: session
-
-    def test_gate_none_runs_no_drain_and_no_notice(self):
-        import unittest.mock as mock
-        master, slave, io_in, io_out = self.streams()
-        self.queue(master, slave, "typed ahead")
-        session = self._StubSession("answer")
-        with mock.patch.object(ui, "begin_gate") as begun, \
-                mock.patch.object(ui, "arm_activation") as armed:
-            out = ui.prompt_user(io_in, io_out, header="your answer",
-                                 session_factory=self._factory(session))
-        self.assertEqual(out, "answer")
-        begun.assert_not_called()
-        armed.assert_not_called()
-        self.assertEqual(io_out.text, "")
-
-    def test_gate_none_never_returns_drain_failed(self):
-        """Even with every stale-input channel failing."""
-        import unittest.mock as mock
-        _master, _slave, io_in, io_out = self.streams()
-        session = self._StubSession("answer")
-        with mock.patch.object(ui.termios, "tcflush",
-                               side_effect=OSError(errno.ENOTTY, "nope")), \
-                mock.patch.object(ui, "_drop_typeahead",
-                                  return_value=(False, 0)):
-            out = ui.prompt_user(io_in, io_out, header="your answer",
-                                 session_factory=self._factory(session))
-        self.assertEqual(out, "answer")
-        self.assertIsNot(out, ui.DRAIN_FAILED)
-        self.assertEqual(session.calls, 1)
-
-    def test_gate_none_still_returns_eof_and_text_unchanged(self):
-        _master, _slave, io_in, io_out = self.streams()
-        session = self._StubSession("  trailing\n")
-        self.assertEqual(
-            ui.prompt_user(io_in, io_out, session_factory=self._factory(session)),
-            "  trailing")
-
-    def test_named_gate_does_run_the_boundary(self):
-        master, slave, io_in, io_out = self.streams()
-        self.queue(master, slave, "typed ahead")
-        session = self._StubSession("answer")
-        out = ui.prompt_user(io_in, io_out, header="Your question",
-                             session_factory=self._factory(session),
-                             gate="review_question")
-        self.assertEqual(out, "answer")
-        self.assertIn("ignored", io_out.text)
-
-    def test_named_gate_can_return_drain_failed(self):
-        import unittest.mock as mock
-        _master, _slave, io_in, io_out = self.streams()
-        session = self._StubSession("answer")
-        with mock.patch.object(ui.termios, "tcflush",
-                               side_effect=OSError(errno.ENOTTY, "nope")):
-            out = ui.prompt_user(io_in, io_out, header="Your question",
-                                 session_factory=self._factory(session),
-                                 gate="review_question")
-        self.assertIs(out, ui.DRAIN_FAILED)
-        self.assertEqual(session.calls, 0)
-
-    def test_only_gate_readers_name_a_gate(self):
-        """The non-gate prompts in cowork.py must not acquire a `gate=` by
-        accident, and every gate reader's prompt must keep one."""
-        with open(os.path.join(_HERE, "cowork.py")) as fh:
-            tree = ast.parse(fh.read())
-        seen = {}
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for call in ast.walk(node):
-                if not isinstance(call, ast.Call):
-                    continue
-                func = call.func
-                if getattr(func, "attr", None) != "prompt_user":
-                    continue
-                if getattr(getattr(func, "value", None), "id", None) != "ui":
-                    continue
-                gated = any(kw.arg == "gate" for kw in call.keywords)
-                seen.setdefault(node.name, set()).add(gated)
-        self.assertTrue(seen, "no ui.prompt_user call sites found")
-        # Legacy, must stay unprotected: _read_turn does reply.strip() and
-        # gather_context_interactive returns the text straight to the caller,
-        # so neither can survive being handed a sentinel.
-        for name in ("_read_turn", "gather_context_interactive"):
-            self.assertIn(name, seen)
-            self.assertEqual(seen[name], {False},
-                             "%s must not name a gate" % name)
-        # Every gate reader's free-form prompt must be protected.
-        for name in ("_read_review", "_read_review_dissent"):
-            self.assertIn(name, seen)
-            self.assertEqual(seen[name], {True},
-                             "%s has an unprotected prompt_user" % name)
-
-
-class GateFailClosedChannelsTest(_GateWrapperFixture):
-    """Every stale-input channel fails CLOSED. A channel that cannot be cleared
-    leaves replayable keys armed, which is the incident mechanism — so it must
-    never be swallowed."""
-
-    def test_typeahead_failure_fails_closed(self):
-        import unittest.mock as mock
-        _master, _slave, io_in, io_out = self.streams()
-        discards, failures, on_d, on_f = self._record()
-        opened = []
-        with mock.patch.object(ui, "_drop_typeahead", return_value=(False, 0)):
-            out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f,
-                               lambda: opened.append(1) or (None, lambda: "x"))
-        self.assertIs(out, ui.DRAIN_FAILED)
-        self.assertEqual(opened, [])            # the gate never ran
-        self.assertEqual(discards, [])
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["reason"], "typeahead")
-        self.assertIs(failures[0]["typeahead_cleared"], False)
-        self.assertIsNone(failures[0]["errno_name"])
-        self.assertIn("could not clear", io_out.text)
-
-    def test_typeahead_import_absence_is_not_a_failure(self):
-        ok, count = ui._drop_typeahead()
-        self.assertIs(ok, True)
-        self.assertEqual(count, 0)
-
-    def test_tcflush_failure_reports_whether_typeahead_was_cleared(self):
-        import unittest.mock as mock
-        _master, _slave, io_in, io_out = self.streams()
-        _d, failures, on_d, on_f = self._record()
-        with mock.patch.object(ui.termios, "tcflush",
-                               side_effect=OSError(errno.ENOTTY, "x")), \
-                mock.patch.object(ui, "_drop_typeahead",
-                                  return_value=(False, 0)):
-            ui._run_gate(io_in, io_out, "g", on_d, on_f,
-                         lambda: (None, lambda: "x"))
-        self.assertEqual(failures[0]["reason"], "tcflush")
-        # BOTH channels failed, so the flag must not claim the bucket was clear.
-        self.assertIs(failures[0]["typeahead_cleared"], False)
-
-    def test_key_queue_failure_fails_closed(self):
-        _master, slave, io_in, io_out = self.streams()
-        discards, failures, on_d, on_f = self._record()
-
-        class _Boom:
-            def empty_queue(self):
-                raise RuntimeError("key processor is wedged")
-
-        def build():
-            app = _StubApp(result="approve")
-            app.key_processor = _Boom()
-            return app, app.run
-
-        out = ui._run_gate(io_in, io_out, "ready_for_review", on_d, on_f, build)
-        self.assertIs(out, ui.DRAIN_FAILED)
-        self.assertEqual(discards, [])
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["reason"], "key_queue")
-        self.assertEqual(failures[0]["phase"], "post_render")
-        self.assertIs(failures[0]["typeahead_cleared"], False)
-        self.assertIn("could not clear", io_out.text)
-
-    def test_flush_keys_failure_fails_closed(self):
-        _master, slave, io_in, io_out = self.streams()
-        _d, failures, on_d, on_f = self._record()
-
-        class _BoomInput:
-            def flush_keys(self):
-                raise RuntimeError("input is wedged")
-
-        def build():
-            app = _StubApp(result="approve")
-            app.input = _BoomInput()
-            return app, app.run
-
-        out = ui._run_gate(io_in, io_out, "g", on_d, on_f, build)
-        self.assertIs(out, ui.DRAIN_FAILED)
-        self.assertEqual(failures[0]["reason"], "key_queue")
-
-    def test_missing_queues_are_tolerated_not_failed(self):
-        """A stub app with no key_processor/input has nothing to drop, which is
-        not the same as failing to drop it."""
-        _master, _slave, io_in, io_out = self.streams()
-        _d, failures, on_d, on_f = self._record()
-        app = _StubApp(result="approve")
-        out = ui._run_gate(io_in, io_out, "g", on_d, on_f,
-                           lambda: (app, app.run))
-        self.assertEqual(out, "approve")
-        self.assertEqual(failures, [])
-
-    def test_every_failure_reason_traces_as_drain_failed_not_abandoned(self):
-        """Routing is by outcome: only reopen_limit is an abandonment."""
-        trace_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, trace_dir, ignore_errors=True)
-        path = os.path.join(trace_dir, "trace.jsonl")
-        trace = trace_store.Trace(path, session_uuid="s", run_id="r")
-        _d, on_drain_fail = cowork._gate_trace_callbacks(trace, "builder")
-        for reason in ("tcflush", "typeahead", "key_queue"):
-            on_drain_fail(gate="g", epoch=1, phase="pre_render", reason=reason,
-                          errno_name=None, typeahead_cleared=False,
-                          reopens=None)
-        on_drain_fail(gate="g", epoch=2, phase="post_render",
-                      reason="reopen_limit", errno_name=None,
-                      typeahead_cleared=None, reopens=3)
-        with open(path) as fh:
-            events = [json.loads(line)["event"] for line in fh if line.strip()]
-        self.assertEqual(events, ["input.drain_failed"] * 3
-                         + ["input.gate_abandoned"])
-
-
-class GateDocumentedContractTest(unittest.TestCase):
-    """The README's boundary section must describe what the code ACTUALLY
-    guarantees. The discard guarantee is about cowork: it never reads, keeps,
-    records or replays type-ahead. It is NOT a promise that the characters stay
-    off your screen — while a role turn runs no prompt_toolkit application is
-    attached, so the terminal driver echoes them itself."""
-
-    @classmethod
-    def setUpClass(cls):
-        readme = os.path.join(os.path.dirname(_HERE), "README.md")
-        with open(readme, "r") as fh:
-            cls.text = fh.read()
-        start = cls.text.index("### Gates ignore input typed before they were")
-        section = cls.text[start:cls.text.index("###", start + 10)]
-        # Collapse the prose wrapping so phrase assertions are about wording,
-        # not about where a line happens to break.
-        cls.section = " ".join(section.lower().split())
-
-    def test_cowork_never_touches_the_terminal_echo_flag(self):
-        """The premise of the documented wording: no shipped module suppresses
-        echo, so the README must not claim type-ahead goes unechoed."""
-        for name in sorted(os.listdir(_HERE)):
-            if not name.endswith(".py") or name.startswith("test_"):
-                continue
-            with open(os.path.join(_HERE, name)) as fh:
-                source = fh.read()
-            for token in ("ECHO", "tcsetattr", "cfmakeraw", "tty.setraw"):
-                self.assertNotIn(
-                    token, source,
-                    "%s touches the terminal mode; the README's echo wording "
-                    "would need revisiting" % name)
-
-    def test_cowork_never_promises_to_suppress_echo(self):
-        self.assertNotIn("echoed", self.section)
-        self.assertNotIn("never echo", self.section)
-        # …and it says plainly what really happens instead.
-        self.assertIn("terminal echoes your", self.section)
-        self.assertIn("does not mean cowork received it", self.section)
-
-    def test_the_narrow_guarantee_is_stated(self):
-        for promise in ("never reads", "never keeps", "never records",
-                        "never replays"):
-            self.assertIn(promise, self.section)
-
-    def test_the_observation_bound_notice_contract_is_stated(self):
-        self.assertIn("discarding is absolute", self.section)
-        self.assertIn("best-effort", self.section)
-        self.assertIn("cannot select anything", self.section)
-        self.assertIn("never warns", self.section)
-
-    def test_the_notice_exposes_at_most_a_count(self):
-        """The strongest claim the implementation supports: FIONREAD may be
-        unavailable, in which case the notice has no number at all."""
-        self.assertIn("at most a count", self.section)
-        self.assertIn("without a number", self.section)
-        # …and it must not promise a count unconditionally.
-        self.assertNotIn("always shows how many", self.section)
-
-    def test_the_count_is_obtained_without_reading_the_input(self):
-        self.assertIn("asks the operating system how many bytes", self.section)
-        self.assertIn("rather than looking at them", self.section)
-
-    def test_fail_closed_covers_every_channel(self):
-        for channel in ("terminal's own queue", "replay buffer",
-                        "key buffers"):
-            self.assertIn(channel, self.section)
-
-    def test_the_fail_closed_and_no_switch_contract_is_stated(self):
-        self.assertIn("refuses to run the gate", self.section)
-        self.assertIn("without approving", self.section)
-        self.assertIn("no environment variable and no flag", self.section)
-
-
-class NoGateKillSwitchTest(unittest.TestCase):
-    """D2: no production switch may disable the safety boundary."""
-
-    SOURCES = ("cowork_ui.py", "cowork.py")
-    # Every shipped module, so a switch cannot be smuggled in via a helper.
-    ALL_SOURCES = tuple(sorted(
-        name for name in os.listdir(_HERE)
-        if name.endswith(".py") and not name.startswith("test_")))
-
-    def _env_names(self, filename):
-        """Every environment-variable name the module reads."""
-        with open(os.path.join(_HERE, filename)) as fh:
-            tree = ast.parse(fh.read())
-        names = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                attr = getattr(func, "attr", None)
-                # ONLY genuine environment reads: `os.environ.get(...)` and
-                # `os.getenv(...)`. A bare `.get("...")` on any dict used to
-                # count, which made every ordinary dict lookup look like an
-                # environment variable — `summary.get("drained")` tripped the
-                # DRAIN ban with no environment variable anywhere in sight.
-                # Narrowing this makes the guard sharper, not weaker: every real
-                # env read still goes through one of these two forms.
-                is_environ_get = (
-                    attr == "get"
-                    and getattr(getattr(func, "value", None), "attr", None)
-                    == "environ")
-                if (is_environ_get or attr == "getenv") and node.args:
-                    if isinstance(node.args[0], ast.Constant) and \
-                            isinstance(node.args[0].value, str):
-                        names.add(node.args[0].value)
-            if isinstance(node, ast.Subscript):
-                value = node.value
-                if getattr(value, "attr", None) == "environ":
-                    idx = node.slice
-                    if isinstance(idx, ast.Constant) and \
-                            isinstance(idx.value, str):
-                        names.add(idx.value)
-        return names
-
-    def test_no_boundary_disabling_environment_variable(self):
-        banned = ("GATE", "ACTIVATION", "BOUNDARY", "DISCARD", "DRAIN",
-                  "TYPEAHEAD", "FLUSH", "UNSAFE", "NO_GUARD")
-        for filename in self.ALL_SOURCES:
-            for name in self._env_names(filename):
-                for token in banned:
-                    self.assertNotIn(
-                        token, name.upper(),
-                        "%s reads %s, which looks like a boundary switch"
-                        % (filename, name))
-
-    def test_production_env_surface_is_unchanged(self):
-        """The COWORK_* environment surface is a closed, reviewed set.
-
-        Every entry is a ROOT REDIRECT — it points a reader at a different
-        directory or file. None of them changes behaviour, relaxes a boundary or
-        turns a check off, which is what the surrounding tests exist to prevent.
-        Adding one is a deliberate act that has to be made here.
-
-        - COWORK_PROBE_CACHE / COWORK_SESSIONS_ROOT: pre-existing.
-        - COWORK_CLAUDE_PROJECTS_ROOT / COWORK_CODEX_SESSIONS_ROOT (P9): where
-          controller-log ingestion looks. Fixtures point these at fake logs, so
-          a test never reads — or even opens — a real controller session.
-        - COWORK_PRICING_SNAPSHOT (P8): where the pricing snapshot is read from,
-          so an operator can supply captured prices without editing the repo
-          copy (which would be stale by construction).
-        """
-        seen = set()
-        for filename in self.ALL_SOURCES:
-            seen |= {n for n in self._env_names(filename)
-                     if n.startswith("COWORK")}
-        self.assertEqual(seen, {
-            "COWORK_PROBE_CACHE", "COWORK_SESSIONS_ROOT",
-            "COWORK_CLAUDE_PROJECTS_ROOT", "COWORK_CODEX_SESSIONS_ROOT",
-            "COWORK_PRICING_SNAPSHOT",
-        })
-
-    def test_the_ui_module_reads_only_term(self):
-        """cowork_ui carries the whole boundary and reads exactly one
-        environment variable — TERM, for colour detection."""
-        self.assertEqual(self._env_names("cowork_ui.py"), {"TERM"})
-
-    def test_no_conditional_bypass_in_the_wrapper_loop(self):
-        """`_run_gate` must call begin_gate unconditionally — no `if` guarding
-        the boundary itself."""
-        import inspect
-        src = inspect.getsource(ui._run_gate)
-        self.assertIn("begin_gate(io_in, io_out, gate=gate)", src)
-        self.assertNotIn("environ", src)
-        self.assertNotIn("getenv", src)
-
-
-class _PtyGateDriver:
-    """Drives cowork's REAL gate functions in a child process attached to a real
-    pseudo-terminal (user decision D1 — no reimplementation, no stand-ins for
-    the code under test).
-
-    Two side channels keep every step deterministic instead of timed:
-      * a CONTROL pipe (child -> parent) carrying JSON step markers, and
-      * a GO pipe (parent -> child) so the child only advances once the parent
-        has finished setting up (e.g. queued a payload on the tty).
-
-    The pty itself carries only what a real user would type."""
-
-    def __init__(self, testcase, body, env=None):
-        self.tc = testcase
-        self.dir = tempfile.mkdtemp()
-        testcase.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
-        self.script = os.path.join(self.dir, "driver.py")
-        with open(self.script, "w") as fh:
-            fh.write(_DRIVER_PREAMBLE % {"scripts": _HERE} + body)
-        self._closed = False
-        self.master, self.slave = os.openpty()
-        _raw_no_echo(self.slave)
-        # A real window size, so prompt_toolkit lays the menu out deterministically
-        # instead of against openpty's default 0x0.
-        fcntl.ioctl(self.slave, termios.TIOCSWINSZ,
-                    array.array("h", [24, 100, 0, 0]))
-        self.ctrl_r, ctrl_w = os.pipe()
-        go_r, self.go_w = os.pipe()
-        child_env = dict(os.environ)
-        child_env.update({
-            "TERM": "xterm",
-            # Deterministic rendering under a pty: no cursor-position requests.
-            "PROMPT_TOOLKIT_NO_CPR": "1",
-            "COWORK_SESSIONS_ROOT": os.path.join(self.dir, "sessions"),
-            "PYTHONPATH": _HERE,
-            "PYTHONUNBUFFERED": "1",
-            "COWORK_CTRL_FD": str(ctrl_w),
-            "COWORK_GO_FD": str(go_r),
-        })
-        child_env.update(env or {})
-        self.proc = subprocess.Popen(
-            [sys.executable, self.script],
-            stdin=self.slave, stdout=self.slave, stderr=self.slave,
-            env=child_env, pass_fds=(ctrl_w, go_r), cwd=self.dir)
-        os.close(ctrl_w)
-        os.close(go_r)
-        self._buf = b""
-        self._out = bytearray()
-        self._out_lock = threading.Lock()
-        self._pump = threading.Thread(target=self._read_master, daemon=True)
-        self._pump.start()
-        testcase.addCleanup(self.close)
-
-    # -- terminal ---------------------------------------------------------- #
-
-    def _read_master(self):
-        while True:
-            try:
-                chunk = os.read(self.master, 4096)
-            except OSError:
-                return
-            if not chunk:
-                return
-            with self._out_lock:
-                self._out.extend(chunk)
-
-    @property
-    def output(self):
-        with self._out_lock:
-            return bytes(self._out).decode("utf-8", "replace")
-
-    def queue(self, payload):
-        """Type `payload` and block until it is really on the tty input queue,
-        so nothing downstream races the write."""
-        data = payload.encode() if isinstance(payload, str) else payload
-        os.write(self.master, data)
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if _fionread(self.slave) >= len(data):
-                return
-            time.sleep(0.005)
-        self.tc.fail("payload never reached the terminal input queue")
-
-    def send(self, payload):
-        """Fresh, post-activation input: written and NOT waited on, because an
-        activated gate consumes it immediately."""
-        data = payload.encode() if isinstance(payload, str) else payload
-        os.write(self.master, data)
-
-    # -- control channels -------------------------------------------------- #
-
-    def go(self):
-        os.write(self.go_w, b"go\n")
-
-    def event(self, expected=None, timeout=_PTY_STEP_TIMEOUT, step=""):
-        deadline = time.time() + timeout
-        while b"\n" not in self._buf:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                self.tc.fail(
-                    "timed out at step %r waiting for %r.\nterminal:\n%s"
-                    % (step or expected, expected, self.output[-2000:]))
-            readable, _w, _x = select_mod.select([self.ctrl_r], [], [],
-                                                 min(remaining, 0.5))
-            if not readable:
-                if self.proc.poll() is not None:
-                    self.tc.fail(
-                        "driver exited (rc=%s) at step %r before %r.\n"
-                        "terminal:\n%s"
-                        % (self.proc.returncode, step or expected, expected,
-                           self.output[-2000:]))
-                continue
-            chunk = os.read(self.ctrl_r, 4096)
-            if not chunk:
-                self.tc.fail(
-                    "driver closed the control pipe at step %r before %r.\n"
-                    "terminal:\n%s"
-                    % (step or expected, expected, self.output[-2000:]))
-            self._buf += chunk
-        line, self._buf = self._buf.split(b"\n", 1)
-        record = json.loads(line.decode())
-        if record.get("kind") == "error":
-            self.tc.fail("driver raised at step %r: %s"
-                         % (step or expected, record.get("detail")))
-        if expected is not None:
-            self.tc.assertEqual(record.get("kind"), expected,
-                                "unexpected step marker: %r" % (record,))
-        return record
-
-    def no_event(self, window=1.5):
-        """Assert NOTHING is reported for `window` seconds — the gate consumed
-        nothing and is still waiting."""
-        readable, _w, _x = select_mod.select([self.ctrl_r], [], [], window)
-        if readable:
-            chunk = os.read(self.ctrl_r, 4096)
-            self._buf += chunk
-            self.tc.fail("the gate produced an outcome with no fresh input: %r"
-                         % (self._buf.decode(errors="replace"),))
-
-    def wait_for_output(self, needle, timeout=_PTY_STEP_TIMEOUT):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if needle in self.output:
-                return True
-            time.sleep(0.02)
-        self.tc.fail("never saw %r on the terminal.\nterminal:\n%s"
-                     % (needle, self.output[-2000:]))
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        self._shut(self.go_w)
-        if self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-            except OSError:
-                pass
-        try:
-            self.proc.wait(timeout=5)
-        except Exception:
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
-            except Exception:
-                pass
-        # The parent's own copy of the slave keeps the master from EVER seeing
-        # EOF, so it must be closed FIRST — otherwise the pump thread stays
-        # blocked in os.read and closing the master blocks behind it on macOS.
-        self._shut(self.slave)
-        self._pump.join(timeout=5)
-        self._shut(self.master)
-        self._shut(self.ctrl_r)
-
-    @staticmethod
-    def _shut(fd):
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
-# The driver runs in its own process, attached to the pty. Everything it needs
-# lives here; each test appends only its own body.
-_DRIVER_PREAMBLE = '''\
-import json, os, sys, traceback
-
-sys.path.insert(0, %(scripts)r)
-
-_CTRL = int(os.environ["COWORK_CTRL_FD"])
-_GO = int(os.environ["COWORK_GO_FD"])
-
-
-def emit(kind, **fields):
-    fields["kind"] = kind
-    os.write(_CTRL, (json.dumps(fields) + "\\n").encode())
-
-
-def wait_go():
-    """Block until the parent says the terminal is set up as the step needs."""
-    buf = b""
-    while b"\\n" not in buf:
-        chunk = os.read(_GO, 1)
-        if not chunk:
-            return
-        buf += chunk
-
-
-import cowork_ui as ui
-import cowork
-
-
-def no_boundary_begin_gate(io_in, io_out, gate=None):
-    """TEST-OWNED negative control (D2). It PRESERVES the wrapper contract —
-    a real, valid Activation — while performing no terminal drain and no
-    typeahead clear, so the wrapper renders no notice, emits no callback, and
-    runs the widget exactly as the pre-fix code did. A plain no-op stub is not
-    valid: the wrapper reads act.safe immediately and would raise instead of
-    reproducing the bug. Production ships no such switch."""
-    act = ui.Activation(gate=gate, epoch=0)
-    act.pending = False
-    act.count = 0
-    act.safe = True
-    act.errno_name = None
-    act.typeahead_cleared = False
-    return act
-
-
-def no_boundary_arm_activation(app, activation, fd):
-    """Installs no after_render handler, so the widget never exits STALE."""
-    return None
-
-
-def disable_boundary():
-    ui.begin_gate = no_boundary_begin_gate
-    ui.arm_activation = no_boundary_arm_activation
-
-
-def announce_activation():
-    """Emit 'activated' once the REAL first-render drain has run for a widget,
-    so the parent knows fresh input will now be honoured. This is the rendezvous
-    that replaces sleeping. Test-owned: production has no such hook."""
-    real = ui.arm_activation
-
-    def arm_and_announce(app, activation, fd):
-        real(app, activation, fd)
-        after = getattr(app, "after_render", None)
-        if after is None:
-            return
-        state = {"done": False}
-
-        def announce(_sender=None):
-            if state["done"]:
-                return
-            state["done"] = True
-            emit("activated")
-
-        after += announce
-
-    ui.arm_activation = arm_and_announce
-
-
-def watch_gate_prompts():
-    """Emit 'gate-prompt' whenever the REVIEW gate opens a nested editor. That
-    can only happen once a choice has been selected at the menu, so it is a
-    positive signal that something drove the gate."""
-    real = ui.prompt_user
-
-    def traced(io_in, io_out, header=None, **kwargs):
-        if header and header != "your answer":
-            emit("gate-prompt", header=header)
-        return real(io_in, io_out, header=header, **kwargs)
-
-    ui.prompt_user = traced
-
-
-def setup_mode():
-    """Negative control (no boundary) or the protected rendezvous."""
-    watch_gate_prompts()
-    if os.environ.get("COWORK_TEST_NO_BOUNDARY"):
-        disable_boundary()
-        return False
-    announce_activation()
-    return True
-
-
-def answer_event(answer):
-    if answer is ui.EOF:
-        emit("answer-returned", answer=None, release="eof")
-    elif answer is ui.CANCEL:
-        emit("answer-returned", answer=None, release="cancel")
-    else:
-        emit("answer-returned", answer=answer, release="text")
-
-
-def review_gate(allow_ask=False, role="builder"):
-    preview = cowork.make_gate_preview(role, False, True)
-    return cowork._read_review(sys.stdin, sys.stdout, allow_ask=allow_ask,
-                               preview=preview)
-
-
-def name_of(outcome):
-    for label in ("_END", "_STOP", "_ITERATE"):
-        if outcome is getattr(cowork, label):
-            return label
-    if isinstance(outcome, tuple):
-        return "ask"
-    return "feedback"
-
-'''
-
-_DRIVER_EPILOGUE = '''
-
-if __name__ == "__main__":
-    try:
-        main()
-    except BaseException:
-        emit("error", detail=traceback.format_exc())
-        raise
-'''
-
-# The recorded incident's shape: a multi-line answer whose first LF submits a
-# partial answer, leaving the remainder to be replayed into a much later gate.
-# The marker exists only so the leak assertions have something unmistakable to
-# look for.
-_LEAK_MARKER = "ZQX-LEAK-MARKER-7731"
-_INCIDENT_SEGMENT_1 = "the first part of my answer %s" % _LEAK_MARKER
-_INCIDENT_TAIL = "\r"
-_INCIDENT_PAYLOAD = _INCIDENT_SEGMENT_1 + "\r" + _INCIDENT_TAIL
-
-
-@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
-class GateActivationIncidentPtyTest(unittest.TestCase):
-    """Criterion 1: the recorded incident cannot recur for ANY plausible
-    delivery of the original payload.
-
-    Variant A — the whole payload queued before the editor opens.
-    Variant B — an unframed payload split across the live editor and its
-                teardown (the recorded shape: a partial answer IS recorded).
-    Variant C — a real bracketed paste plus a stray Return during teardown.
-
-    Each variant also runs with the boundary neutralised in test code, where the
-    failure MUST still reproduce."""
-
-    # -- protected mode ---------------------------------------------------- #
-
-    def _assert_gate_consumed_nothing(self, driver):
-        """The review gate is protected, so whatever the editor left behind was
-        cleared before the menu drew. The gate is still awaiting input, and a
-        FRESH Ctrl-C proves it is live while taking the non-approving path."""
-        driver.event("intervening-turn", step="intervening turn")
-        driver.event("gate-open", step="review gate")
-        driver.event("activated", step="gate activated")
-        driver.no_event(window=1.5)
-        driver.send("\x03")
-        outcome = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(outcome["outcome"], "_STOP")
-
-    def test_variant_a_queued_before_the_editor(self):
-        driver = _PtyGateDriver(self, _INCIDENT_BODY)
-        # Type ahead while NO application is attached: the bytes sit in the tty
-        # queue and the unprotected turn editor reads them when it opens, just
-        # as it does in production.
-        driver.event("ready", step="startup")
-        driver.queue(_INCIDENT_PAYLOAD)
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        answer = driver.event("answer-returned", step="editor release")
-        # The partial answer IS recorded — the recorded incident's own shape.
-        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
-        self.assertEqual(answer["release"], "text")
-        # …and the tail it left in the typeahead bucket reaches the gate, where
-        # begin_gate clears it. This is THE production defense path.
-        #
-        # (No leak probe here: the payload was genuinely typed into the editor,
-        # so the editor legitimately renders it. Leak probes belong to
-        # GateDiscardLeakPtyTest, which queues the payload straight at a gate
-        # where nothing may echo it.)
-        self._assert_gate_consumed_nothing(driver)
-
-    def test_variant_b_split_across_the_editor_and_teardown(self):
-        driver = _PtyGateDriver(self, _INCIDENT_BODY)
-        driver.event("ready", step="startup")
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        # The payload arrives at a LIVE editor: its own first LF submits segment
-        # one, and the remainder is left unprocessed at teardown — the exact
-        # recorded shape, where a partial answer IS kept.
-        driver.send(_INCIDENT_PAYLOAD)
-        answer = driver.event("answer-returned", step="editor release")
-        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
-        self._assert_gate_consumed_nothing(driver)
-
-    def test_variant_c_framed_paste_plus_stray_return(self):
-        driver = _PtyGateDriver(self, _INCIDENT_BODY)
-        driver.event("ready", step="startup")
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        # A REAL bracketed paste lands whole in the open editor, an explicit
-        # Enter submits it, and the trailing Return is the teardown leftover.
-        driver.send("\x1b[200~" + _PASTE_BODY + "\x1b[201~" + "\r" + "\r")
-        answer = driver.event("answer-returned", step="editor release")
-        self.assertEqual(answer["answer"], _PASTE_BODY)
-        self._assert_gate_consumed_nothing(driver)
-
-    def test_a_gated_editor_also_discards_type_ahead(self):
-        """The gate-scoped prompts that DO name a gate — the review gate's
-        question and feedback editors — discard type-ahead at the editor itself
-        rather than relying on the next gate. Covered separately because the
-        per-turn editor above is deliberately unprotected in production."""
-        driver = _PtyGateDriver(self, _GATED_EDITOR_BODY)
-        driver.event("ready", step="startup")
-        driver.queue(_INCIDENT_PAYLOAD)
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        driver.event("activated", step="editor activated")
-        driver.wait_for_output("ignored")
-        driver.no_event(window=1.0)
-        # A FRESH Ctrl-D is the only input allowed to have an effect here.
-        driver.send("\x04")
-        answer = driver.event("answer-returned", step="editor release")
-        self.assertIsNone(answer["answer"])
-        self.assertEqual(answer["release"], "eof")
-        self.assertNotIn(_LEAK_MARKER, driver.output)
-
-    # -- negative control -------------------------------------------------- #
-    #
-    # The protected control sequence is NOT executable here: no notice is ever
-    # emitted and no Ctrl-D is needed, because the payload's own LF submits.
-
-    def _assert_stale_input_drove_the_gate(self, driver):
-        """The positive reproduction: with the boundary neutralised the leftover
-        Return SELECTS a choice at the later gate, which opens the nested
-        feedback editor — all with no fresh input whatsoever. A negative control
-        that raises, hangs, or produces nothing fails here as a broken harness
-        rather than passing as a reproduction."""
-        selected = driver.event("gate-prompt", step="stale selection")
-        self.assertEqual(selected["header"], "Request changes — your feedback")
-        driver.send("driven by stale input\r")
-        outcome = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(outcome["outcome"], "feedback")
-
-    def test_variant_a_reproduces_without_the_boundary(self):
-        driver = _PtyGateDriver(self, _INCIDENT_BODY,
-                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
-        driver.event("ready", step="startup")
-        driver.queue(_INCIDENT_PAYLOAD)
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        # The stale payload drives the editor with no fresh input at all.
-        answer = driver.event("answer-returned", step="editor release")
-        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
-        self.assertEqual(answer["release"], "text")
-        driver.event("intervening-turn", step="intervening turn")
-        driver.event("gate-open", step="review gate")
-        self._assert_stale_input_drove_the_gate(driver)
-
-    def test_variant_b_reproduces_without_the_boundary(self):
-        driver = _PtyGateDriver(self, _INCIDENT_BODY,
-                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
-        driver.event("ready", step="startup")
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        driver.send(_INCIDENT_PAYLOAD)
-        answer = driver.event("answer-returned", step="editor release")
-        self.assertEqual(answer["answer"], _INCIDENT_SEGMENT_1)
-        driver.event("intervening-turn", step="intervening turn")
-        driver.event("gate-open", step="review gate")
-        self._assert_stale_input_drove_the_gate(driver)
-
-    def test_variant_c_reproduces_without_the_boundary(self):
-        driver = _PtyGateDriver(self, _INCIDENT_BODY,
-                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
-        driver.event("ready", step="startup")
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        driver.send("\x1b[200~" + _PASTE_BODY + "\x1b[201~" + "\r" + "\r")
-        answer = driver.event("answer-returned", step="editor release")
-        self.assertEqual(answer["answer"], _PASTE_BODY)
-        driver.event("intervening-turn", step="intervening turn")
-        driver.event("gate-open", step="review gate")
-        self._assert_stale_input_drove_the_gate(driver)
-
-    def test_approval_reproduces_without_the_boundary(self):
-        """The positive half: with the boundary neutralised, stale bytes drive
-        the gate all the way to APPROVAL with no fresh input at all.
-
-        The leftover carries the arrow key that lands on approve. That is
-        needed because the menu reorder (D4) and the default=False confirm (D3)
-        are a SECOND, independent line of defense that the negative control
-        deliberately does NOT disable — so a bare Return, which is what the
-        recorded incident replayed into an approve-first menu, no longer
-        reaches approve on its own. Neutralising the boundary alone is enough
-        to let stale input select an approval; that is what this asserts."""
-        driver = _PtyGateDriver(self, _INCIDENT_BODY,
-                                env={"COWORK_TEST_NO_BOUNDARY": "1"})
-        driver.event("ready", step="startup")
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        # Segment one + submit, then the leftover: down-arrow onto 'approve'
-        # and a Return. All of it is one unframed burst into the live editor.
-        driver.send(_INCIDENT_SEGMENT_1 + "\r" + "\x1b[B" + "\r")
-        driver.event("answer-returned", step="editor release")
-        driver.event("intervening-turn", step="intervening turn")
-        driver.event("gate-open", step="review gate")
-        outcome = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(outcome["outcome"], "_END")
-
-    def test_the_same_payload_approves_nothing_when_protected(self):
-        """The mirror of the case above with the boundary in place."""
-        driver = _PtyGateDriver(self, _INCIDENT_BODY)
-        driver.event("ready", step="startup")
-        driver.go()
-        driver.event("editor-open", step="editor open")
-        driver.send(_INCIDENT_SEGMENT_1 + "\r" + "\x1b[B" + "\r")
-        driver.event("answer-returned", step="editor release")
-        self._assert_gate_consumed_nothing(driver)
-
-
-# PRODUCTION FIDELITY. cowork._read_turn opens the per-turn answer editor with
-# NO gate (cowork.py:3503), so the editor is deliberately unprotected here too.
-# That is what makes this a replay of the real incident rather than of a
-# configuration cowork does not ship: the editor CONSUMES the payload, leaves
-# its tail in prompt_toolkit's cross-application typeahead bucket exactly as the
-# recorded incident did, and the only thing standing between that tail and the
-# later review gate is begin_gate's typeahead clear at the gate itself.
-_INCIDENT_BODY = '''
-def main():
-    setup_mode()
-    emit("ready")
-    wait_go()
-    emit("editor-open")
-    answer = ui.prompt_user(sys.stdin, sys.stdout, header="your answer")
-    answer_event(answer)
-    # The intervening role / reviewer / evaluation turns. Only these are
-    # simulated: this repo has no controller-command override, which is why the
-    # driver calls the gate functions directly (user decision D1).
-    emit("intervening-turn")
-    emit("gate-open")
-    outcome = review_gate()
-    emit("gate-outcome", outcome=name_of(outcome))
-''' + _DRIVER_EPILOGUE
-
-# The gate-scoped editor: what the review gate's own question/feedback prompts
-# do. Unlike the per-turn editor above, these DO name a gate, so the boundary
-# runs at the editor itself.
-_GATED_EDITOR_BODY = '''
-def main():
-    # Only the activation rendezvous — no gate-prompt watcher, which exists for
-    # the review-menu oracle and would fire on this editor's own header.
-    announce_activation()
-    emit("ready")
-    wait_go()
-    emit("editor-open")
-    answer = ui.prompt_user(sys.stdin, sys.stdout,
-                            header="Request changes — your feedback",
-                            gate="review_feedback")
-    answer_event(answer)
-''' + _DRIVER_EPILOGUE
-
-_PASTE_BODY = ("first paragraph of the pasted answer\n"
-               "\n"
-               "second paragraph, still one paste\n"
-               "third line of the second paragraph")
-
-
-@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
-class GateActivationBoundaryPtyTest(unittest.TestCase):
-    """Criterion 2: a gate becomes active only after it is fully rendered."""
-
-    def test_bytes_queued_before_the_gate_draws(self):
-        driver = _PtyGateDriver(self, _GATE_ONLY_BODY)
-        driver.event("ready", step="startup")
-        driver.queue("\r\r\r")
-        driver.go()
-        driver.event("gate-open", step="review gate")
-        driver.wait_for_output("ignored")
-        driver.wait_for_output("what now?")
-        driver.no_event(window=1.5)
-        driver.send("\x03")
-        outcome = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(outcome["outcome"], "_STOP")
-
-    def test_bytes_injected_while_the_gate_is_drawing(self):
-        driver = _PtyGateDriver(self, _GATE_DURING_RENDER_BODY)
-        driver.event("ready", step="startup")
-        driver.go()
-        # A deterministic rendezvous, not a sleep: the driver's own render hook
-        # signals, the parent queues, and only then does the drain run.
-        driver.event("rendering", step="first render")
-        driver.queue("\r\r")
-        driver.go()
-        driver.wait_for_output("ignored")
-        driver.wait_for_output("what now?")
-        driver.no_event(window=1.5)
-        driver.send("\x03")
-        outcome = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(outcome["outcome"], "_STOP")
-
-
-_GATE_ONLY_BODY = '''
-def main():
-    emit("ready")
-    wait_go()
-    emit("gate-open")
-    outcome = review_gate()
-    emit("gate-outcome", outcome=name_of(outcome))
-''' + _DRIVER_EPILOGUE
-
-# The during-render rendezvous lives HERE, in test-owned code, not in
-# production: it wraps the real arm_activation and pauses between installing the
-# handler and letting the drain run.
-_GATE_DURING_RENDER_BODY = '''
-_real_arm = ui.arm_activation
-# Fires for the FIRST render of the FIRST attempt only: the gate that follows
-# the STALE re-open must proceed normally, with nothing left to rendezvous on.
-_rendezvous = {"done": False}
-
-
-def arm_with_rendezvous(app, activation, fd):
-    if getattr(app, "after_render", None) is None:
-        return _real_arm(app, activation, fd)
-
-    def announce(_sender=None):
-        if _rendezvous["done"]:
-            return
-        _rendezvous["done"] = True
-        emit("rendering")
-        wait_go()
-
-    app.after_render += announce
-    return _real_arm(app, activation, fd)
-
-
-def main():
-    emit("ready")
-    wait_go()
-    ui.arm_activation = arm_with_rendezvous
-    outcome = review_gate()
-    emit("gate-outcome", outcome=name_of(outcome))
-''' + _DRIVER_EPILOGUE
-
-
-@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
-class GateDiscardLeakPtyTest(unittest.TestCase):
-    """Criterion 3: discarded input is never retained or exposed."""
-
-    def _probes(self, payload):
-        probes = [payload, _LEAK_MARKER]
-        probes += [_LEAK_MARKER[i:i + 6]
-                   for i in range(0, len(_LEAK_MARKER) - 6, 4)]
-        probes.append(hashlib.sha256(payload.encode()).hexdigest())
-        return probes
-
-    def test_nothing_leaks_to_the_terminal_or_the_trace(self):
-        driver = _PtyGateDriver(self, _LEAK_BODY)
-        driver.event("ready", step="startup")
-        driver.queue(_INCIDENT_PAYLOAD)
-        driver.go()
-        driver.event("gate-open", step="review gate")
-        driver.event("activated", step="gate activated")
-        driver.wait_for_output("ignored")
-        driver.send("\x03")
-        record = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(record["outcome"], "_STOP")
-        blob = driver.output + json.dumps(record["events"])
-        for probe in self._probes(_INCIDENT_PAYLOAD):
-            self.assertNotIn(probe, blob, "leaked %r" % probe)
-
-    def test_discard_event_field_set(self):
-        driver = _PtyGateDriver(self, _LEAK_BODY)
-        driver.event("ready", step="startup")
-        driver.queue(_INCIDENT_PAYLOAD)
-        driver.go()
-        driver.event("gate-open", step="review gate")
-        driver.event("activated", step="gate activated")
-        driver.wait_for_output("ignored")
-        driver.send("\x03")
-        record = driver.event("gate-outcome", step="gate outcome")
-        discards = [e for e in record["events"]
-                    if e["event"] == "input.discarded"]
-        self.assertEqual(len(discards), 1, record["events"])
-        fields = {k: v for k, v in discards[0].items()
-                  if k not in ("ts", "event", "event_id", "run_id",
-                             "session_uuid")}
-        self.assertEqual(set(fields),
-                         {"role", "gate", "epoch", "phase", "chars"})
-        self.assertEqual(fields["chars"], len(_INCIDENT_PAYLOAD))
-
-    def test_discard_event_omits_chars_when_fionread_fails(self):
-        driver = _PtyGateDriver(self, _LEAK_BODY,
-                                env={"COWORK_TEST_NO_FIONREAD": "1"})
-        driver.event("ready", step="startup")
-        driver.queue(_INCIDENT_PAYLOAD)
-        driver.go()
-        driver.event("gate-open", step="review gate")
-        driver.event("activated", step="gate activated")
-        driver.wait_for_output("ignored")
-        driver.send("\x03")
-        record = driver.event("gate-outcome", step="gate outcome")
-        discards = [e for e in record["events"]
-                    if e["event"] == "input.discarded"]
-        self.assertEqual(len(discards), 1, record["events"])
-        fields = {k: v for k, v in discards[0].items()
-                  if k not in ("ts", "event", "event_id", "run_id",
-                             "session_uuid")}
-        self.assertEqual(set(fields), {"role", "gate", "epoch", "phase"})
-
-
-_TRACE_SETUP = '''
-import cowork_trace as trace_store
-
-_TRACE_PATH = os.path.join(os.environ["COWORK_SESSIONS_ROOT"], "trace.jsonl")
-_trace = trace_store.Trace(_TRACE_PATH, session_uuid="pty", run_id="pty")
-_on_discard, _on_drain_fail = cowork._gate_trace_callbacks(_trace, "builder")
-
-
-def traced_review_gate(allow_ask=False, role="builder"):
-    preview = cowork.make_gate_preview(role, False, True)
-    return cowork._read_review(sys.stdin, sys.stdout, allow_ask=allow_ask,
-                               preview=preview, on_discard=_on_discard,
-                               on_drain_fail=_on_drain_fail)
-
-
-def trace_records():
-    if not os.path.exists(_TRACE_PATH):
-        return []
-    with open(_TRACE_PATH) as fh:
-        return [json.loads(line) for line in fh if line.strip()]
-'''
-
-_LEAK_BODY = _TRACE_SETUP + '''
-
-def _no_fionread(*args, **kwargs):
-    raise OSError("FIONREAD unavailable")
-
-
-def main():
-    if os.environ.get("COWORK_TEST_NO_FIONREAD"):
-        ui.fcntl.ioctl = _no_fionread
-    setup_mode()
-    emit("ready")
-    wait_go()
-    emit("gate-open")
-    outcome = traced_review_gate()
-    emit("gate-outcome", outcome=name_of(outcome), events=trace_records())
-''' + _DRIVER_EPILOGUE
-
-
-@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
-class GateFramedPastePtyTest(unittest.TestCase):
-    """Criterion 4: the boundary must not over-discard genuine in-box input."""
-
-    def test_framed_paste_into_an_activated_editor_is_recorded_whole(self):
-        driver = _PtyGateDriver(self, _FRAMED_PASTE_BODY)
-        driver.event("ready", step="startup")
-        driver.event("editor-open", step="first editor")
-        driver.event("activated", step="first editor activated")
-        driver.send("\x1b[200~" + _PASTE_BODY + "\x1b[201~" + "\r")
-        first = driver.event("answer-returned", step="first answer")
-        self.assertEqual(first["answer"], _PASTE_BODY)
-        # …and nothing is left over for the NEXT prompt.
-        driver.event("editor-open", step="second editor")
-        driver.event("activated", step="second editor activated")
-        self.assertNotIn("ignored", driver.output)
-        driver.send("second\r")
-        second = driver.event("answer-returned", step="second answer")
-        self.assertEqual(second["answer"], "second")
-
-
-# A GATED editor on purpose: over-discarding is only possible where the boundary
-# actually runs, so this uses a real gate name from the review gate's own
-# prompts rather than the unprotected per-turn editor.
-_FRAMED_PASTE_BODY = '''
-def main():
-    setup_mode()
-    emit("ready")
-    for _ in range(2):
-        emit("editor-open")
-        answer = ui.prompt_user(sys.stdin, sys.stdout, header="your answer",
-                                gate="review_feedback")
-        answer_event(answer)
-''' + _DRIVER_EPILOGUE
-
-
-@unittest.skipUnless(_PTY_OK and HAS_UI_DEPS, "needs a pty and the UI stack")
-class GateDrainFailurePtyTest(unittest.TestCase):
-    """Fail-closed at a REAL protected gate, with a Return already queued."""
-
-    def test_pre_open_failure_refuses_to_run_the_gate(self):
-        driver = _PtyGateDriver(self, _DRAIN_FAIL_BODY,
-                                env={"COWORK_TEST_FAIL_TCFLUSH": "pre"})
-        driver.event("ready", step="startup")
-        driver.queue("\r")
-        driver.go()
-        driver.event("gate-open", step="review gate")
-        record = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(record["outcome"], "_STOP")
-        self.assertIn("could not clear", driver.output)
-        failures = [e for e in record["events"]
-                    if e["event"] == "input.drain_failed"]
-        self.assertEqual(len(failures), 1, record["events"])
-        self.assertIs(failures[0]["typeahead_cleared"], True)
-        self.assertEqual(failures[0]["phase"], "pre_render")
-        self.assertEqual(
-            [e for e in record["events"] if e["event"] == "input.discarded"],
-            [])
-        # No selection was ever made from the queued Return.
-        self.assertNotIn("user.action", json.dumps(record["events"]))
-
-    def test_post_render_failure_refuses_to_run_the_gate(self):
-        driver = _PtyGateDriver(self, _DRAIN_FAIL_BODY,
-                                env={"COWORK_TEST_FAIL_TCFLUSH": "post"})
-        driver.event("ready", step="startup")
-        driver.go()
-        driver.event("gate-open", step="review gate")
-        record = driver.event("gate-outcome", step="gate outcome")
-        self.assertEqual(record["outcome"], "_STOP")
-        # The post-render case is the one that would otherwise end the phase
-        # silently, so the banner must be visible.
-        self.assertIn("could not clear", driver.output)
-        failures = [e for e in record["events"]
-                    if e["event"] == "input.drain_failed"]
-        self.assertEqual(len(failures), 1, record["events"])
-        self.assertIs(failures[0]["typeahead_cleared"], False)
-        self.assertEqual(failures[0]["phase"], "post_render")
-        self.assertEqual(
-            [e for e in record["events"] if e["event"] == "input.discarded"],
-            [])
-
-
-_DRAIN_FAIL_BODY = _TRACE_SETUP + '''
-import errno as _errno
-
-_real_tcflush = ui.termios.tcflush
-_state = {"opened": False}
-
-
-def failing_tcflush(fd, queue):
-    mode = os.environ.get("COWORK_TEST_FAIL_TCFLUSH")
-    if mode == "pre":
-        raise OSError(_errno.ENOTTY, "forced")
-    if mode == "post" and _state["opened"]:
-        raise OSError(_errno.ENOTTY, "forced")
-    return _real_tcflush(fd, queue)
-
-
-_real_arm = ui.arm_activation
-
-
-def arm_marking_open(app, activation, fd):
-    _state["opened"] = True
-    return _real_arm(app, activation, fd)
-
-
-def main():
-    ui.termios.tcflush = failing_tcflush
-    ui.arm_activation = arm_marking_open
-    emit("ready")
-    wait_go()
-    emit("gate-open")
-    outcome = traced_review_gate()
-    emit("gate-outcome", outcome=name_of(outcome), events=trace_records())
-''' + _DRIVER_EPILOGUE
-
 
 
 if __name__ == "__main__":
@@ -22726,12 +17672,45 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
                  "evidence_state": state}, "m1",
                 cowork_measure.SourceClock(1.0)))
 
+    def _controlled_source_inventory(self):
+        """Point the readiness source clock at a controlled temp inventory
+        (one source file last changed in 2017) instead of the live checkout,
+        so these adjudication tests do not depend on the worktree's own
+        uncommitted deletions. Returns the inventory's file path."""
+        import unittest.mock as mock
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        src = os.path.join(d, "module.py")
+        with open(src, "w") as fh:
+            fh.write("x = 1\n")
+        os.utime(src, (1_500_000_000, 1_500_000_000))
+        patcher = mock.patch.object(cowork, "_source_paths_for_manifest",
+                                    return_value=[src])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return src
+
+    def test_a_deleted_source_in_the_inventory_still_fails_closed(self):
+        # The controlled inventory keeps the product's fail-closed behaviour:
+        # a listed source that no longer exists blocks readiness.
+        src = self._controlled_source_inventory()
+        os.remove(src)
+        fresh = {"id": "V-1", "pipeline": False, "adjudication": "pass",
+                 "started_at": "2099-01-01T00:00:00Z"}
+        state, _m, why = cowork._adjudicate_readiness(
+            [{"label": "a", "ok": True, "source_manifest": "m1",
+              "claim_state": "corroborated",
+              "corroborating_attempts": [fresh]}], "m1", {"a": None})
+        self.assertEqual(state, "unverified")
+        self.assertIn("missing_sources", why)
+
     def test_only_a_fresh_unpiped_corroborated_run_promotes(self):
         """Nothing weaker than positive corroboration promotes readiness.
 
         Old failures stay on the record — that is what "a failure is never
         erased" requires — but they are not the evidence a promotion runs on.
         """
+        self._controlled_source_inventory()
         # `started_at` AFTER the sources last changed is what makes a run
         # fresh. A manifest supplied by the claim proves nothing about it.
         fresh = {"id": "V-1", "pipeline": False, "adjudication": "pass",
@@ -22806,6 +17785,7 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
         self.assertIn("fail", claims[0]["log_adjudications"])
 
     def test_a_relabelled_command_does_not_satisfy_the_inventory(self):
+        self._controlled_source_inventory()
         # A matching label SET proves only that the names line up; without
         # checking the command a role could satisfy the inventory by
         # relabelling something cheaper.
@@ -22822,6 +17802,7 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
             "verified")
 
     def test_readiness_requires_the_plans_whole_inventory(self):
+        self._controlled_source_inventory()
         required = {"full suite": None, "preflight": None, "lint": None}
         def _ok(label):
             return {"label": label, "ok": True, "source_manifest": "m1",
@@ -23051,13 +18032,64 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
         self.assertEqual(claims["unverified"], 1)
 
     def test_the_source_manifest_covers_untracked_files(self):
-        # `git ls-files` alone was blind to every module this build ADDED,
-        # because a new file is untracked until someone commits it.
-        paths = cowork._source_paths_for_manifest()
-        self.assertTrue(paths)
-        for added in ("scripts/cowork_measure.py", "scripts/cowork_ingest.py",
-                      "scripts/cowork_eval.py", "roles/evaluator.md"):
-            self.assertIn(added, paths)
+        # `git ls-files` alone was blind to every module a build ADDED, because
+        # a new file is untracked until someone commits it. Proven against a
+        # throwaway real repository, never this checkout's own history.
+        import unittest.mock as mock
+        git_env = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, git_env):
+            for leaked in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                           "GIT_OBJECT_DIRECTORY"):
+                os.environ.pop(leaked, None)
+            root = os.path.realpath(root)
+            # Stop discovery at the fixture root so a temp dir that happens to
+            # sit inside some repository cannot make `not-a-repo` look tracked.
+            os.environ["GIT_CEILING_DIRECTORIES"] = root
+            repo = os.path.join(root, "repo")
+            elsewhere = os.path.join(root, "not-a-repo")
+            os.mkdir(repo)
+            os.mkdir(elsewhere)
+
+            def git(*args):
+                subprocess.run(
+                    ["git", "-C", repo, "-c", "user.email=fixture@example.invalid",
+                     "-c", "user.name=Fixture", "-c", "commit.gpgsign=false"]
+                    + list(args), stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=True, timeout=30)
+
+            def write(relative, content="x\n"):
+                path = os.path.join(repo, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                Path(path).write_text(content)
+
+            git("init", "-q")
+            write(".gitignore", "build/\n*.pyc\n")
+            write("pkg/tracked.py")
+            write("roles/tracked.md")
+            git("add", ".")
+            git("commit", "-q", "-m", "fixture")
+            write("pkg/added_module.py")          # untracked, not ignored
+            write("tests/fixtures/added.json")    # fixtures are source truth
+            write("build/product.bin")            # ignored directory
+            write("pkg/cache.pyc")                # ignored pattern
+
+            expected = [".gitignore", "pkg/added_module.py", "pkg/tracked.py",
+                        "roles/tracked.md", "tests/fixtures/added.json"]
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(repo)
+                from_cwd = cowork._source_paths_for_manifest()
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(os.getcwd(), original_cwd)
+            # Tracked AND untracked-but-not-ignored; .gitignore still excludes
+            # build products and caches, and git internals never appear.
+            self.assertEqual(from_cwd, expected)
+            self.assertEqual(cowork._source_paths_for_manifest(repo), expected)
+            # Outside any repository the manifest cannot be listed: fail
+            # closed with None rather than an empty (vacuously clean) tree.
+            self.assertIsNone(cowork._source_paths_for_manifest(elsewhere))
 
     def test_milestones_and_readiness_are_recorded(self):
         milestones = cowork_measure.build_milestones([
@@ -25703,7 +20735,7 @@ class OwnedOverlayRenderTests(_OwnedVerificationTestBase):
             verification_receipt_path=receipt_path,
             verification_overlay=overlay)
         banner = cowork.builder_review_text(
-            status_path, False, overlay=overlay, receipt_path=receipt_path,
+            status_path, overlay=overlay, receipt_path=receipt_path,
             agent_status_path=status_path)
         return overlay, ctx, resumed, banner
 
@@ -25888,16 +20920,20 @@ class SupersessionReopenBlockTests(unittest.TestCase):
                 mock.patch.object(
                     cowork.verification, "current_candidate_identity",
                     return_value=(self.MANIFEST, self.INDEX)):
-            rc, outcome, _ = cowork._role_loop(
+            rc, outcome, payload = cowork._role_loop(
                 sess, "seed", self.status_path, context="",
-                io_in=io.StringIO(""), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 role="builder", review_fn=review_fn, trace=trace,
                 reviewer_role=cowork.BUILD_REVIEWER, artifact_noun="build",
                 phase="building", session_uuid=self.session_uuid)
+        self.payload = payload
         return rc, outcome, sess, calls
 
     def _assert_suppressed(self, rc, outcome, sess, calls):
-        self.assertEqual((rc, outcome), (0, "approved"))
+        # Supersession removes the reopen, never the approval requirement: the
+        # reviewer did not approve, so the phase stops unapproved.
+        self.assertEqual((rc, outcome), (0, "stopped"))
+        self.assertEqual(self.payload["kind"], "review_not_approved")
         self.assertEqual(calls["n"], 1)
         # NO builder reopen: the seed is the only send, and no revise handoff
         # was ever assembled or recorded.
@@ -25919,15 +20955,13 @@ class SupersessionReopenBlockTests(unittest.TestCase):
         self.assertEqual(findings[0].get("closure"), "superseded")
         self.assertEqual(findings[0].get("superseded_by_transaction"),
                          self.TXN_ID)
-        # The transaction SURVIVED as pending_review, and the fall-through
-        # user-gate approve then ACCEPTED it (D-0004/D-0005 gate grant).
+        # The transaction SURVIVES as pending_review: nothing accepted it.
         dispositions = [e for e in events
                         if e.get("event") == "verification.disposition"]
-        self.assertEqual([d.get("disposition") for d in dispositions],
-                         ["accepted"])
-        self.assertEqual(
-            state_store.read_verification_dispositions(
-                self.session_uuid)[self.TXN_ID]["disposition"], "accepted")
+        self.assertEqual(dispositions, [])
+        self.assertNotEqual(
+            (state_store.read_verification_dispositions(self.session_uuid)
+             .get(self.TXN_ID) or {}).get("disposition"), "accepted")
 
     def test_uncited_verification_challenge_does_not_reopen(self):
         verdicts = [{"verdict": "revise", "corrective_findings": [
@@ -25947,7 +20981,9 @@ class SupersessionReopenBlockTests(unittest.TestCase):
         self._assert_suppressed(rc, outcome, sess, calls)
 
     def _assert_genuine_revise_reopened(self, rc, outcome, sess, calls):
-        self.assertEqual((rc, outcome), (0, "approved"))
+        # The re-review then has no usable verdict: the phase ends failed.
+        self.assertEqual((rc, outcome), (0, "ended"))
+        self.assertEqual(self.payload["kind"], "reviewer_unavailable")
         # The builder WAS handed back for another pass: seed + revise handoff.
         self.assertEqual(len(sess.sent), 2)
         self.assertEqual(calls["n"], 1 + cowork.REVIEW_FAIL_CAP)
@@ -26535,7 +21571,7 @@ class KernelWriteBoundaryTests(unittest.TestCase):
     def test_linux_preflight_truthfully_reports_no_governed_controller(self):
         ok, alerts = preflight.preflight(
             {"builder": {"controller": "claude"}},
-            which=lambda _name: "/usr/bin/fake", interactive=False,
+            which=lambda _name: "/usr/bin/fake",
             platform="linux")
         self.assertFalse(ok)
         self.assertTrue(any(
@@ -26636,11 +21672,15 @@ class ControllerCapabilityMatrixTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as base, \
                     tempfile.TemporaryDirectory() as assets, \
                     tempfile.TemporaryDirectory() as sessions_root, \
+                    tempfile.TemporaryDirectory() as data_home, \
                     mock.patch.dict(os.environ,
-                                    {"COWORK_SESSIONS_ROOT": sessions_root}):
+                                    {"COWORK_SESSIONS_ROOT": sessions_root,
+                                     # Keep opencode's controller state
+                                     # (auth/sqlite) in test scratch.
+                                     "XDG_DATA_HOME": data_home}):
                 trace = RecordingTrace()
                 session = bridge.OpencodeSession(
-                    "roles/scout.md", "plan", False, trace=trace,
+                    cowork.SCOUT_PROMPT_PATH, "plan", False, trace=trace,
                     agent_base_dir=base, extra_writable_dir=assets)
                 agent_path = os.path.join(
                     base, ".opencode", "agents",
@@ -29198,10 +24238,6 @@ class _EvalQueueFixture(unittest.TestCase):
     def never_started(self, *_args, **_kwargs):
         self.fail("an evaluator session started when none should have")
 
-    def never_asked(self, *_args, **_kwargs):
-        self.fail("a blocking gate opened when none should have")
-
-
 class EvalPolicyOffDrainTests(_EvalQueueFixture):
     """Criterion 1: with policy `off`, no evaluator turn starts at ANY drain
     boundary — and the work is still on disk afterwards, reported as held."""
@@ -29262,7 +24298,7 @@ class EvalPolicyOffDrainTests(_EvalQueueFixture):
         out = io.StringIO()
         cowork.run_evaluation_transition(
             self.session_uuid, "off", io_out=out, at="session.start",
-            ask_fn=self.never_asked, session_factory=self.never_started)
+            session_factory=self.never_started)
         rendered = out.getvalue()
         self.assertIn("Evaluation drain", rendered)
         self.assertIn("Governing policy: off", rendered)
@@ -29329,25 +24365,6 @@ class EvalReenableTests(_EvalQueueFixture):
         self.assertNotIn("term", pending)
         self.assertNotIn("ret", pending)
 
-    def test_eval_reenable_explicit_retry_links_history(self):
-        self.seed("a")
-        evaluation.drain(self.queue_path,
-                         lambda *_a: {"ok": False, "error_class": "permanent"},
-                         verify_fn=lambda _e: {"state": "unknown"},
-                         effective_policy="all_rounds")
-        terminal = self.markers("a", "terminal")
-        self.assertEqual(len(terminal), 1)
-        self.assertEqual(cowork.retry_terminal_evaluations(self.session_uuid),
-                         1)
-        retried = self.markers("a", "retried")
-        self.assertEqual(len(retried), 1)
-        self.assertEqual(retried[0]["prior_attempt_ref"],
-                         terminal[0]["marker_id"])
-        # The earlier terminal record is still readable VERBATIM.
-        self.assertEqual(self.markers("a", "terminal")[0], terminal[0])
-        self.assertEqual(self.fold("a")["state"], "pending")
-        self.assertEqual(self.fold("a")["attempts"], 0)
-
     def test_eval_reenable_final_round_candidate_still_held_after_flip(self):
         # The phase stays OPEN across the policy flip, so the candidate hold
         # must survive it: this is the composition case, not a policy hold.
@@ -29379,7 +24396,6 @@ class EvalReenableTests(_EvalQueueFixture):
         cowork.run_evaluation_transition(
             self.session_uuid, "all_rounds", io_out=io.StringIO(),
             at="session.end", closed_phases=["building"],
-            ask_fn=lambda: "continue",
             session_factory=lambda *a, **k: None)
         self.assertEqual(self.fold("old")["state"], "retired")
         pending = [e.get("entry_id")
@@ -29389,7 +24405,6 @@ class EvalReenableTests(_EvalQueueFixture):
         cowork.run_evaluation_transition(
             self.session_uuid, "all_rounds", io_out=io.StringIO(),
             at="session.end", closed_phases=["building"],
-            ask_fn=lambda: "continue",
             session_factory=lambda *a, **k: None)
         self.assertEqual(len(self.markers("old", "retired")), 1)
 
@@ -29610,7 +24625,7 @@ class EvalForegroundTests(_EvalQueueFixture):
         evaluation.mark_drained(self.queue_path, "unver", unverifiable=True)
         summary = self._preview()
         out = io.StringIO()
-        ui.render_drain_state(out, "all_rounds", summary, blocking=True)
+        transcript.render_drain_state(out, "all_rounds", summary)
         rendered = out.getvalue()
         self.assertIn("Governing policy: all_rounds", rendered)
         self.assertIn("Pending/running: 1", rendered)
@@ -29626,7 +24641,7 @@ class EvalForegroundTests(_EvalQueueFixture):
         evaluation.mark_retired(self.queue_path, "retired_one")
         summary = self._preview()
         out = io.StringIO()
-        ui.render_drain_state(out, "all_rounds", summary, blocking=True)
+        transcript.render_drain_state(out, "all_rounds", summary)
         rendered = out.getvalue()
         self.assertIn("Held/skipped: 1 (1 superseded)", rendered)
         self.assertIn("Completed: 0", rendered)
@@ -29643,39 +24658,10 @@ class EvalForegroundTests(_EvalQueueFixture):
     def test_eval_foreground_no_phase_approval_wording(self):
         self.seed("a")
         out = io.StringIO()
-        ui.render_drain_state(out, "all_rounds", self._preview(),
-                              blocking=True)
+        transcript.render_drain_state(out, "all_rounds", self._preview())
         rendered = out.getvalue().lower()
         self.assertNotIn("approved", rendered)
         self.assertNotIn("phase approved", rendered)
-
-    def test_eval_foreground_hold_and_end_preserve_queue(self):
-        for action in ("hold", "end"):
-            with self.subTest(action=action):
-                entry_id = "keep-%s" % action
-                self.seed(entry_id)
-                before = self.entry_ids_on_disk()
-                cowork.run_evaluation_transition(
-                    self.session_uuid, "all_rounds", io_out=io.StringIO(),
-                    ask_fn=lambda: action,
-                    session_factory=self.never_started)
-                self.assertEqual(self.entry_ids_on_disk(), before)
-                self.assertEqual(self.markers(entry_id, "drained"), [])
-
-    def test_eval_foreground_leave_preserves_queue(self):
-        # Walking away, in both of its shapes: an EOF and a dismissal.
-        def _eof():
-            raise EOFError
-
-        for ask in (_eof, lambda: None):
-            with self.subTest(ask=ask):
-                self.seed("walk")
-                before = self.entry_ids_on_disk()
-                cowork.run_evaluation_transition(
-                    self.session_uuid, "all_rounds", io_out=io.StringIO(),
-                    ask_fn=ask, session_factory=self.never_started)
-                self.assertEqual(self.entry_ids_on_disk(), before)
-                self.assertEqual(self.markers("walk", "drained"), [])
 
     def test_eval_foreground_non_tty_never_prompts(self):
         # Off a real terminal there is nobody to answer, so the gate must not
@@ -29683,28 +24669,9 @@ class EvalForegroundTests(_EvalQueueFixture):
         # No ask_fn here on purpose: if this opened a gate it would block.
         self.seed("a")
         cowork.run_evaluation_transition(
-            self.session_uuid, "all_rounds", io_in=io.StringIO(),
-            io_out=io.StringIO(), session_factory=lambda *a, **k: None)
+            self.session_uuid, "all_rounds", io_out=io.StringIO(), session_factory=lambda *a, **k: None)
         # It continued rather than prompting: the attempt was actually made.
         self.assertEqual(len(self.markers("a", "attempt_started")), 1)
-
-    def test_eval_foreground_retry_action_dispatches_terminal_once(self):
-        self.seed("dead")
-        evaluation.mark_terminal(self.queue_path, "dead", "permanent", 1, 1)
-        # Count DISPATCHES (one isolated evaluator session per attempt), which
-        # is the thing "exactly once" is about.
-        dispatched = []
-
-        def factory(*_a, **_k):
-            dispatched.append(1)
-            return None
-
-        cowork.run_evaluation_transition(
-            self.session_uuid, "all_rounds", io_out=io.StringIO(),
-            ask_fn=lambda: "retry", session_factory=factory)
-        self.assertEqual(len(dispatched), 1)
-        self.assertEqual(len(self.markers("dead", "retried")), 1)
-
 
 class EvalReportLegacyTests(_EvalQueueFixture):
     """Criteria 5/6: dispositions reach the record and the report, and files
@@ -34789,6 +29756,7 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
         self._orig_sessions_root = os.environ.get("COWORK_SESSIONS_ROOT")
         os.environ["COWORK_SESSIONS_ROOT"] = os.path.join(self._td, "sessions")
         self.addCleanup(self._restore_sessions_root)
+        _hermetic_claude_probe(self)
 
     def _restore_sessions_root(self):
         if self._orig_sessions_root is None:
@@ -35072,10 +30040,10 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
                             "effort": None, "yolo": True, "mode": "implement"}}
         tpath, trace = self._trace("SCOUT-RESUME-BIND")
         cowork.run_scout(
-            config, "", ["scout"], io_in=io.StringIO("end\n"),
-            io_out=io.StringIO(),
+            config, "", ["scout"], io_out=io.StringIO(),
             intel_path=os.path.join(self._td, "scout.intel.json"),
             session_factory=self._scripted_factory(),
+            claude_spawn=_RecordingClaudeSpawn(),
             resume_id="resumed-thread", trace=trace,
             session_uuid=self._session_uuid)
 
@@ -35101,8 +30069,8 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
                               "mode": "implement"}}
         tpath, trace = self._trace("PLANNER-RESUME-BIND")
         cowork.run_planner(
-            config, "", ["planner"], io_in=io.StringIO("end\n"),
-            io_out=io.StringIO(), session_factory=self._scripted_factory(),
+            config, "", ["planner"], io_out=io.StringIO(), session_factory=self._scripted_factory(),
+            claude_spawn=_RecordingClaudeSpawn(),
             resume_id="resumed-thread", trace=trace,
             session_uuid=self._session_uuid)
 
@@ -35128,8 +30096,8 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
                               "mode": "implement"}}
         tpath, trace = self._trace("BUILDER-RESUME-BIND")
         cowork.run_builder(
-            config, "", ["builder"], io_in=io.StringIO("end\n"),
-            io_out=io.StringIO(), session_factory=self._scripted_factory(),
+            config, "", ["builder"], io_out=io.StringIO(), session_factory=self._scripted_factory(),
+            claude_spawn=_RecordingClaudeSpawn(),
             resume_id="resumed-thread", trace=trace,
             session_uuid=self._session_uuid)
 
@@ -35159,8 +30127,7 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
             self.fail("scout must not spawn when the manifest compile raises")
 
         rc = cowork.run_scout(
-            config, "goal", ["scout"], io_in=io.StringIO(""),
-            io_out=io.StringIO(),
+            config, "goal", ["scout"], io_out=io.StringIO(),
             intel_path=os.path.join(self._td, "scout.intel.json"),
             session_factory=factory, trace=trace,
             session_uuid=self._session_uuid)
@@ -35188,8 +30155,7 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
                       "raises")
 
         rc = cowork.run_planner(
-            config, "goal", ["planner"], io_in=io.StringIO(""),
-            io_out=io.StringIO(), session_factory=factory, trace=trace,
+            config, "goal", ["planner"], io_out=io.StringIO(), session_factory=factory, trace=trace,
             session_uuid=self._session_uuid)
         self.assertEqual(rc, 1)
 
@@ -35215,8 +30181,7 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
                       "raises")
 
         rc = cowork.run_builder(
-            config, "goal", ["builder"], io_in=io.StringIO(""),
-            io_out=io.StringIO(), session_factory=factory, trace=trace,
+            config, "goal", ["builder"], io_out=io.StringIO(), session_factory=factory, trace=trace,
             session_uuid=self._session_uuid)
         self.assertEqual(rc, 1)
 
@@ -35246,8 +30211,7 @@ class ManifestBindingProductionPathTest(unittest.TestCase):
         with mock.patch.object(cowork.bridge.probe_cache, "cache_hit",
                                return_value=False):
             rc = cowork.run_scout(
-                config, "goal", ["scout"], io_in=io.StringIO(""),
-                io_out=io.StringIO(),
+                config, "goal", ["scout"], io_out=io.StringIO(),
                 intel_path=os.path.join(self._td, "scout.intel.json"),
                 claude_spawn=bad_spawn, trace=trace,
                 session_uuid=self._session_uuid)
@@ -35484,70 +30448,10 @@ class ManifestBindingFlowGateTest(ControllerPolicyTestBase):
     """P4-v5: switch and the pre-launch retry gate — driven through the real
     `run_flow` closures, never fabricated."""
 
-    def test_switch_controller_manifest_refusal_binds_digest_zero_switch(self):
-        spath = self._session(
-            "SWITCH-MANIFEST-BIND", "scouting", {"scout": "claude"},
-            team=["scout"])
-        orig_preflight = preflight.run_manifest_preflight
-
-        def refusing(manifest, *a, **kw):
-            import cowork_dispatch_manifest as _mm
-            checks = [{"capability": "runtime_roots", "ok": False,
-                      "reason": "forced_test_refusal", "repair_hint": ""}]
-            return _mm.manifest_refused(
-                manifest, checks, refusal_code="runtime_roots",
-                refusal_message="forced_test_refusal")
-
-        captured = {}
-
-        def fake_scout(config, context, selected, on_outcome=None, **kw):
-            switch_fn = kw.get("switch_controller_fn")
-            preflight.run_manifest_preflight = refusing
-            try:
-                captured["result"] = switch_fn("scout", target="codex")
-            finally:
-                preflight.run_manifest_preflight = orig_preflight
-            if on_outcome:
-                on_outcome("ended", None)
-            return 0
-
-        out = io.StringIO()
-        rc = cowork.run_flow(
-            self._args(["--session-file", spath, "--context", "policy"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
-            run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
-        self.assertIs(captured["result"], False)
-        after = state_store.load(spath)
-        self.assertEqual(after["config"]["scout"]["controller"], "claude",
-                         "a refused manifest must not commit the switch")
-
-        session_uuid = state_store.get_session_uuid(after)
-        events = self._events(spath)
-        refusals = [e for e in events
-                    if e.get("event") == "dispatch.decision"
-                    and e.get("site") == "run_flow.switch_controller"
-                    and e.get("outcome") == "refuse"]
-        manifest_refusals = [e for e in refusals
-                             if e.get("refusal_code") == "capability_missing"]
-        self.assertEqual(len(manifest_refusals), 1,
-                         "switch must not be a vacuous absence of decisions")
-        self.assertIsNotNone(manifest_refusals[0].get("trace_event_id"))
-
-        # Read back the persisted (refused) manifest directly — recompiling
-        # after `preflight.run_manifest_preflight` is restored would retry
-        # and re-prove it, masking the digest actually bound above.
-        manifest = manifest_mod.load_manifest(
-            state_store.manifest_path_for(session_uuid, "scout"))
-        self.assertEqual((manifest.get("status") or {}).get("phase"),
-                         "refused")
-        self.assertEqual(manifest_refusals[0].get("trace_event_id"),
-                         manifest["digest"])
-
     def test_pre_launch_manifest_refusal_binds_digest_zero_launch(self):
         spath = self._session(
             "PRELAUNCH-MANIFEST-BIND", "scouting", {"scout": "claude"},
-            team=["scout"])
+            team=["scout", "scout-reviewer"])
         orig_preflight = preflight.run_manifest_preflight
 
         def refusing(manifest, *a, **kw):
@@ -35566,7 +30470,7 @@ class ManifestBindingFlowGateTest(ControllerPolicyTestBase):
                 rc = cowork.run_flow(
                     self._args(["--session-file", spath,
                                "--context", "policy"]),
-                    io_in=io.StringIO(), io_out=out,
+                    io_out=out,
                     which=lambda c: "/bin/" + c)
         finally:
             preflight.run_manifest_preflight = orig_preflight
@@ -35596,58 +30500,10 @@ class ManifestBindingFlowGateTest(ControllerPolicyTestBase):
                          "refused")
         self.assertEqual(refusals[0].get("trace_event_id"), manifest["digest"])
 
-    def test_switch_controller_compile_raise_binds_a_refusal_and_zero_switch(
-            self):
-        spath = self._session(
-            "SWITCH-COMPILE-RAISE-BIND", "scouting", {"scout": "claude"},
-            team=["scout"])
-        orig_compile = cowork._compile_role_manifest
-
-        def raising(*a, **kw):
-            raise OSError("forced_test_persist_failure")
-
-        captured = {}
-
-        def fake_scout(config, context, selected, on_outcome=None, **kw):
-            switch_fn = kw.get("switch_controller_fn")
-            cowork._compile_role_manifest = raising
-            try:
-                captured["result"] = switch_fn("scout", target="codex")
-            finally:
-                cowork._compile_role_manifest = orig_compile
-            if on_outcome:
-                on_outcome("ended", None)
-            return 0
-
-        out = io.StringIO()
-        rc = cowork.run_flow(
-            self._args(["--session-file", spath, "--context", "policy"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
-            run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
-        self.assertIs(captured["result"], False)
-        after = state_store.load(spath)
-        self.assertEqual(after["config"]["scout"]["controller"], "claude",
-                         "a compile-raise must not commit the switch")
-
-        events = self._events(spath)
-        refusals = [e for e in events
-                    if e.get("event") == "dispatch.decision"
-                    and e.get("site") == "run_flow.switch_controller"
-                    and e.get("outcome") == "refuse"]
-        manifest_refusals = [e for e in refusals
-                             if e.get("refusal_code") == "capability_missing"]
-        self.assertEqual(len(manifest_refusals), 1,
-                         "a compile-raise must still bind a decision")
-        self.assertEqual(manifest_refusals[0].get("source"), "preflight")
-        self.assertEqual(
-            [e for e in events if e.get("event") == "role.prompt.bytes"], [],
-            "zero full-prompt bytes when compile raises")
-
     def test_pre_launch_compile_raise_binds_a_refusal_and_zero_launch(self):
         spath = self._session(
             "PRELAUNCH-COMPILE-RAISE-BIND", "scouting", {"scout": "claude"},
-            team=["scout"])
+            team=["scout", "scout-reviewer"])
         orig_compile = cowork._compile_role_manifest
 
         def raising(*a, **kw):
@@ -35661,7 +30517,7 @@ class ManifestBindingFlowGateTest(ControllerPolicyTestBase):
                 rc = cowork.run_flow(
                     self._args(["--session-file", spath,
                                "--context", "policy"]),
-                    io_in=io.StringIO(), io_out=out,
+                    io_out=out,
                     which=lambda c: "/bin/" + c)
         finally:
             cowork._compile_role_manifest = orig_compile
@@ -35714,6 +30570,7 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
         self._orig_sessions_root = os.environ.get("COWORK_SESSIONS_ROOT")
         os.environ["COWORK_SESSIONS_ROOT"] = os.path.join(self._td, "sessions")
         self.addCleanup(self._restore_sessions_root)
+        _hermetic_claude_probe(self)
 
     def _restore_sessions_root(self):
         if self._orig_sessions_root is None:
@@ -35870,8 +30727,8 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
             return _S()
 
         cowork.run_planner(
-            config, "", ["planner"], io_in=io.StringIO("end\n"),
-            io_out=io.StringIO(), session_factory=factory,
+            config, "", ["planner"], io_out=io.StringIO(), session_factory=factory,
+            claude_spawn=_RecordingClaudeSpawn(),
             resume_id="resumed-thread", session_uuid=self._session_uuid,
             intel_path=intel_path)
 
@@ -35980,8 +30837,8 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
             return _S()
 
         cowork.run_builder(
-            config, "", ["builder"], io_in=io.StringIO("end\n"),
-            io_out=io.StringIO(), session_factory=factory,
+            config, "", ["builder"], io_out=io.StringIO(), session_factory=factory,
+            claude_spawn=_RecordingClaudeSpawn(),
             resume_id="resumed-thread", session_uuid=self._session_uuid,
             baseline_repos=[{"path": self._td, "has_head": True}])
 
@@ -36040,8 +30897,8 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
             return _S()
 
         cowork.run_builder(
-            config, "", ["builder"], io_in=io.StringIO("end\n"),
-            io_out=io.StringIO(), session_factory=factory,
+            config, "", ["builder"], io_out=io.StringIO(), session_factory=factory,
+            claude_spawn=_RecordingClaudeSpawn(),
             resume_id=None, session_uuid=self._session_uuid,
             plan_json_path=plan_json_path,
             baseline_repos=[{"path": self._td, "has_head": True}])
@@ -36075,8 +30932,8 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
             return _S()
 
         cowork.run_builder(
-            config, "", ["builder"], io_in=io.StringIO("end\n"),
-            io_out=io.StringIO(), session_factory=factory,
+            config, "", ["builder"], io_out=io.StringIO(), session_factory=factory,
+            claude_spawn=_RecordingClaudeSpawn(),
             resume_id="resumed-thread", session_uuid=self._session_uuid,
             baseline_repos=[])
 
@@ -36469,7 +31326,7 @@ class FaultInjectionPolicyTest(ControllerPolicyTestBase):
         saved = {"allowed": ["claude", "codex"], "updated": 11.0,
                  "source": "cli"}
         spath = self._session("FAULT-POLICY-BROADEN", "planning",
-                              {"planner": "claude"}, team=["scout", "planner"],
+                              {"planner": "claude"}, team=["scout", "scout-reviewer", "planner", "planning-advisor"],
                               policy_value=dict(saved))
         before = self._sha(spath)
         popen = _RecordingPopen()
@@ -36480,7 +31337,7 @@ class FaultInjectionPolicyTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                             "--switch-controller", "planner=opencode"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
         self.assertEqual(rc, 2)
@@ -36501,15 +31358,15 @@ class FaultInjectionPolicyTest(ControllerPolicyTestBase):
         # never be blocked or escalated by this fence.
         spath2 = self._session("FAULT-POLICY-WIDEN-OK", "planning",
                                {"planner": "claude"},
-                               team=["scout", "planner"],
+                               team=["scout", "scout-reviewer", "planner", "planning-advisor"],
                                policy_value=dict(saved))
         rc2 = cowork.run_flow(
             self._args(["--session-file", spath2,
                         "--allow-controllers", "claude,codex,opencode",
                         "--switch-controller", "planner=opencode"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc2, 0)
+        self.assertEqual(rc2, 1)
         self.assertEqual(
             [e for e in self._events(spath2)
              if e["event"] == "dispatch.escalation"], [])
@@ -36629,7 +31486,7 @@ class RevalidationControllerSwitchTest(ControllerPolicyTestBase):
 
     def test_controller_switch_invalidates_and_next_dispatch_recompiles(self):
         spath = self._session("REVALIDATE-SWITCH", "scouting",
-                              {"scout": "claude"}, team=["scout"])
+                              {"scout": "claude"}, team=["scout", "scout-reviewer"])
         saved = state_store.load(spath)
         session_uuid = state_store.get_session_uuid(saved)
 
@@ -36641,39 +31498,32 @@ class RevalidationControllerSwitchTest(ControllerPolicyTestBase):
             force_recompile=False)
         self.assertEqual((m0.get("status") or {}).get("phase"), "proven")
 
-        captured = {}
-
         def fake_scout(config, context, selected, on_outcome=None, **kw):
-            switch_fn = kw.get("switch_controller_fn")
-            captured["result"] = switch_fn("scout", target="codex")
             if on_outcome:
                 on_outcome("ended", None)
             return 0
 
         out = io.StringIO()
         rc = cowork.run_flow(
-            self._args(["--session-file", spath, "--context", "go"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
+            self._args(["--session-file", spath,
+                        "--switch-controller", "scout=codex"]),
+            io_out=out, which=lambda c: "/bin/" + c,
             run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
-        self.assertIs(captured["result"], True)
+        self.assertEqual(rc, 1)  # the fake scout ends unapproved
 
         after = state_store.load(spath)
         self.assertEqual(after["config"]["scout"]["controller"], "codex")
-        self.assertIsNone(
-            state_store.current_manifest_status(session_uuid, "scout"),
-            "the real CLI switch must invalidate the switched role's "
-            "manifest")
-
-        m1, was_recompiled = cowork._compile_role_manifest(
-            role="scout", session_uuid=session_uuid, work_id="scout",
-            controller="codex", mode="implement", model=None,
-            instruction_paths=[cowork.SCOUT_PROMPT_PATH],
-            sessions_dir=state_store.session_assets_dir(session_uuid),
-            force_recompile=False)
-        self.assertTrue(was_recompiled,
-                        "a switched controller must recompile UNFORCED")
+        # The CLI switch invalidated the old manifest, so the next dispatch
+        # recompiled UNFORCED for the new controller.
+        events = [json.loads(line) for line in open(
+            trace_store.trace_path_for(session_uuid)) if line.strip()]
+        self.assertTrue(any(e["event"] == "controller.switch.commit"
+                            and e.get("to_controller") == "codex"
+                            for e in events))
+        m1 = manifest_mod.load_manifest(
+            state_store.manifest_path_for(session_uuid, "scout"))
         self.assertEqual((m1.get("status") or {}).get("phase"), "proven")
+        self.assertEqual(m1["binding"]["controller"], "codex")
         self.assertNotEqual(m0["digest"], m1["digest"])
 
 
@@ -36713,7 +31563,7 @@ class RevalidationRuntimeRootTest(ControllerPolicyTestBase):
         os.chdir(repo)
         spath = self._session(
             "REVALIDATE-RUNTIME-ROOT", "scouting", {"scout": "claude"},
-            team=["scout"],
+            team=["scout", "scout-reviewer"],
             spath=os.path.join(repo, ".cowork", "session.json"))
         saved = state_store.load(spath)
         session_uuid = state_store.get_session_uuid(saved)
@@ -36728,10 +31578,10 @@ class RevalidationRuntimeRootTest(ControllerPolicyTestBase):
         rc = cowork.run_flow(
             self._args(["--worktree", "feat", "--context", "x",
                         "--session-file", spath]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_scout,
             run_worktree_fn=self._creating_fn(calls))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(calls, ["feat"])
         first_wt_path = os.path.realpath(
             os.path.join(repo, ".worktrees", "feat"))
@@ -36770,10 +31620,10 @@ class RevalidationRuntimeRootTest(ControllerPolicyTestBase):
         rc2 = cowork.run_flow(
             self._args(["--worktree", "feat2", "--context", "x",
                         "--session-file", spath]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_scout,
             run_worktree_fn=self._creating_fn(calls2))
-        self.assertEqual(rc2, 0)
+        self.assertEqual(rc2, 1)
         self.assertEqual(
             calls2, ["feat2"],
             "the stale recorded worktree must really be rejected and a "
@@ -36834,11 +31684,6 @@ class M1ExitAuditTest(unittest.TestCase):
             "run_flow.reviewer_controller_check: a policy-only pre-check "
             "ahead of the real reviewer dispatch; run_reviewer_once compiles "
             "and binds its own manifest"),
-        ("switch_controller", 1): (
-            "run_flow.switch_controller: the policy decision for the switch "
-            "TARGET runs before any manifest exists for it; the "
-            "manifest-bound decision for an allowed target follows "
-            "immediately after (ordinal 2 in the same function)"),
         ("ensure_controller_dispatchable", 1): (
             "run_flow_pre_launch: the policy gate runs before the manifest "
             "is compiled for the launch attempt; the manifest-bound decision "
@@ -37122,7 +31967,7 @@ class PhaseTruthAtomicPolicyFaultInjectionTest(ControllerPolicyTestBase):
 
     def test_rejected_atomic_transition_zero_dispatch_byte_identical(self):
         spath = self._session("PT-ATOMIC-1", "planning", {"planner": "claude"},
-                              team=["scout", "planner"])
+                              team=["scout", "scout-reviewer", "planner", "planning-advisor"])
         before_bytes = self._sha(spath)
         before_active = policy.active_meta()
 
@@ -37138,7 +31983,7 @@ class PhaseTruthAtomicPolicyFaultInjectionTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                             "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
 
@@ -37159,7 +32004,7 @@ class PhaseTruthAtomicPolicyFaultInjectionTest(ControllerPolicyTestBase):
 
     def test_committed_atomic_transition_matches_both_stores(self):
         spath = self._session("PT-ATOMIC-2", "planning", {"planner": "claude"},
-                              team=["scout", "planner"])
+                              team=["scout", "scout-reviewer", "planner", "planning-advisor"])
         popen = _RecordingPopen()
         claude_spawn = _RecordingClaudeSpawn()
         import unittest.mock as mock
@@ -37168,10 +32013,10 @@ class PhaseTruthAtomicPolicyFaultInjectionTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                             "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         saved = state_store.load(spath)
         session_uuid = state_store.get_session_uuid(saved)
         self.assertEqual(saved["config"]["planner"]["controller"], "codex")
@@ -37218,7 +32063,7 @@ class PhaseTruthExternalKillTest(unittest.TestCase):
             return 0  # unreachable: SIGTERM raises SystemExit first
 
         args = cowork.build_parser().parse_args(
-            ["--team", "scout", "--config", "scout=claude,yolo,plan",
+            ["--team", "scout,scout-reviewer", "--config", "scout=claude,yolo,plan",
              "--context", "hello", "--session-file", spath])
         with self.assertRaises(SystemExit) as ctx:
             cowork.run_flow(args, io_out=io.StringIO(),
@@ -37276,9 +32121,12 @@ class PhaseTruthCompletionBindingTest(unittest.TestCase):
             return FakeScout()
 
         out = io.StringIO()
+        config["scout-reviewer"] = dict(config["scout"], controller="claude")
         rc = cowork.run_scout(
-            config, "goal", ["scout"], io_in=io.StringIO("\n"),
-            io_out=out, intel_path=intel, session_factory=factory,
+            config, "goal", ["scout", "scout-reviewer"], io_out=out,
+            intel_path=intel, session_factory=factory,
+            review_path=intel + ".review.json",
+            reviewer_runner=lambda *a, **k: {"verdict": "approve"},
             session_uuid=session_uuid)
         self.assertEqual(rc, 0)
 
@@ -37300,94 +32148,6 @@ class PhaseTruthCompletionBindingTest(unittest.TestCase):
         self.assertEqual(work_unit["candidate_manifest_digest"],
                          manifest["digest"])
         self.assertEqual(work_unit["lifecycle_state"], "completed")
-
-
-class PhaseTruthRecoveryBreakerTest(unittest.TestCase):
-    """D's durable recovery breaker (trip/no_trip) integrated into the live
-    controller-failure retry gate: the (threshold+1)th identical-cause retry
-    request is refused BEFORE another dispatch, with a stable, distinct
-    reason code."""
-
-    def setUp(self):
-        root = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
-        old = os.environ.get("COWORK_SESSIONS_ROOT")
-        os.environ["COWORK_SESSIONS_ROOT"] = root
-
-        def restore():
-            if old is None:
-                os.environ.pop("COWORK_SESSIONS_ROOT", None)
-            else:
-                os.environ["COWORK_SESSIONS_ROOT"] = old
-        self.addCleanup(restore)
-
-    def _path(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        return os.path.join(d, ".cowork", "scout.intel.X.json")
-
-    def test_tripped_breaker_blocks_retry_with_execution_failed(self):
-        path = self._path()
-        session_uuid = str(uuid.uuid4())
-        manifest_dir = os.path.dirname(
-            state_store.manifest_path_for(session_uuid, "scout"))
-        os.makedirs(manifest_dir, exist_ok=True)
-        manifest = manifest_mod.compile_manifest(
-            "scout",
-            {"inputs": [], "outputs": [], "runtime_roots": [],
-             "private_paths": [], "guard_required": False, "socket": None,
-             "kernel_boundary": {"crosses": []}, "artifact_writes": [],
-             "action_classes": [], "command_adapters": {}},
-            {"work_id": "scout", "controller": "claude", "model": None,
-             "effort": None, "config_digest": "d" * 64,
-             "instruction_digests": {}, "policy_snapshot": {},
-             "worktree": None, "candidate_snapshot": None,
-             "guard_snapshot": None})
-        manifest = manifest_mod.manifest_proven(manifest, [])
-        manifest_mod.persist_manifest(
-            state_store.manifest_path_for(session_uuid, "scout"), manifest)
-
-        class FailingSession:
-            controller = "claude"
-
-            def send(self, text, meta=None):
-                return {"ok": False, "result": "error",
-                       "error_type": "ProviderError"}
-
-            def close(self):
-                pass
-
-        trace = trace_store.Trace(
-            trace_store.trace_path_for(session_uuid),
-            session_uuid=session_uuid, run_id="R")
-        # Three prior identical-cause attempts already recorded: the very
-        # next retry request must be refused BEFORE a fourth dispatch.
-        for _ in range(3):
-            recovery_breaker.attempt(
-                state_store.ledger_path_for(session_uuid), "scout",
-                "d" * 64, "claude", manifest["digest"], "controller_failure")
-
-        rc, outcome, _ = cowork._role_loop(
-            FailingSession(), "seed", path, context="",
-            io_in=io.StringIO("retry\n"), io_out=io.StringIO(),
-            trace=trace, session_uuid=session_uuid, role_work_id="scout-wu",
-            role="scout", phase="scouting")
-        self.assertEqual(rc, 0)
-        self.assertEqual(outcome, "ended")
-        events = [e for e in self._events(session_uuid)]
-        blocked = [e for e in events
-                  if e.get("event") == "user.action"
-                  and e.get("action") == "controller_failure_retry_blocked"]
-        self.assertEqual(len(blocked), 1)
-        tripped_decisions = [e for e in events
-                             if e.get("event") == "recovery.breaker.decision"
-                             and e.get("tripped")]
-        self.assertGreaterEqual(len(tripped_decisions), 1)
-
-    def _events(self, session_uuid):
-        tpath = trace_store.trace_path_for(session_uuid)
-        with open(tpath, "r") as fh:
-            return [json.loads(line) for line in fh if line.strip()]
 
 
 # =============================================================================
@@ -37466,6 +32226,10 @@ class ContextAckFirstSendGateTest(ControllerPolicyTestBase):
     rode it -- and a resumed session redelivers BOTH the unseen context and
     the saved pending role request."""
 
+    def setUp(self):
+        super().setUp()
+        _hermetic_claude_probe(self)
+
     class _ScriptedSession:
         controller = "claude"
 
@@ -37490,16 +32254,17 @@ class ContextAckFirstSendGateTest(ControllerPolicyTestBase):
         def fake_run_scout_1(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: failing, **kw)
+                session_factory=lambda *a, **k: failing,
+                claude_spawn=_RecordingClaudeSpawn(), **kw)
 
         rc = cowork.run_flow(
-            self._args(["--team", "scout",
+            self._args(["--team", "scout,scout-reviewer",
                        "--config", "scout=claude,yolo,plan",
                        "--context", "ORIGINAL-CONTEXT-TEXT",
-                       "--session-file", spath, "--headless"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+                       "--session-file", spath]),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_1)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
 
         events = self._events(spath)
         self.assertEqual(
@@ -37518,13 +32283,14 @@ class ContextAckFirstSendGateTest(ControllerPolicyTestBase):
         def fake_run_scout_2(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: succeeding, **kw)
+                session_factory=lambda *a, **k: succeeding,
+                claude_spawn=_RecordingClaudeSpawn(), **kw)
 
         rc2 = cowork.run_flow(
             self._args(["--session-file", spath]),
-            io_in=io.StringIO("\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_2)
-        self.assertEqual(rc2, 0)
+        self.assertEqual(rc2, 1)  # delivered, but the turn wrote no status
 
         first_sent_text = succeeding.sent[0]
         referenced_paths = re.findall(
@@ -37568,7 +32334,7 @@ class ControllerSwitchAtomicityInterruptionTest(ControllerPolicyTestBase):
         import unittest.mock as mock
         spath = self._session(
             "PT-ATOMIC-INTERRUPT", "planning", {"planner": "claude"},
-            team=["scout", "planner"])
+            team=["scout", "scout-reviewer", "planner", "planning-advisor"])
         state = state_store.load(spath)
         state["config"]["planner"]["model"] = "opus"
         state["config"]["planner"]["effort"] = "high"
@@ -37592,7 +32358,7 @@ class ControllerSwitchAtomicityInterruptionTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                            "--switch-controller", "planner=codex"]),
-                io_in=io.StringIO(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c,
                 run_planner_fn=lambda *a, **k: 0)
 
@@ -37642,15 +32408,15 @@ class ControllerSwitchAtomicityInterruptionTest(ControllerPolicyTestBase):
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                        "--context", "post-recovery continuation"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c,
             run_planner_fn=lambda *a, **k: 0)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
 
 
 class PhaseTruthGateSigtermTest(ControllerPolicyTestBase):
-    """E-COV-004: a real SIGTERM striking the interactive `ready_for_review`
-    GATE read -- not mid-turn (v1's own control) -- durably records
+    """E-COV-004: a real SIGTERM striking the `ready_for_review` GATE -- the
+    paired reviewer's pass, not mid-turn (v1's own control) -- durably records
     `aborted` for the live WorkUnit engagement through the SAME production
     `run_flow` SIGTERM handler, distinguishable from a live `running` record
     and never `completed`."""
@@ -37670,10 +32436,6 @@ class PhaseTruthGateSigtermTest(ControllerPolicyTestBase):
         def close(self):
             pass
 
-    class _KillOnReadline(io.StringIO):
-        def readline(self, *a, **kw):
-            os.kill(os.getpid(), signal.SIGTERM)
-            return super().readline(*a, **kw)
 
     def test_sigterm_at_gate_durable_aborted_never_completed(self):
         # A real UUID: `cowork_workunit.validate_work_unit` requires a
@@ -37681,22 +32443,28 @@ class PhaseTruthGateSigtermTest(ControllerPolicyTestBase):
         # test also asserts on the durable WorkUnit lifecycle mirror (MJ-4).
         session_uuid = str(uuid.uuid4())
         spath = self._session(
-            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "opencode"},
+            team=["scout", "scout-reviewer"])
         intel_path = os.path.join(
             state_store.session_assets_dir(session_uuid), "scout.intel.json")
         os.makedirs(os.path.dirname(intel_path), exist_ok=True)
         session = self._GateSession(intel_path)
 
+        def kill_at_review(*a, **k):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return {"verdict": "approve"}
+
         def fake_run_scout(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: session, **kw)
+                session_factory=lambda *a, **k: session,
+                reviewer_runner=kill_at_review, **kw)
 
         with self.assertRaises(SystemExit) as ctx:
             cowork.run_flow(
                 self._args(["--session-file", spath,
                            "--context", "gate sigterm context"]),
-                io_in=self._KillOnReadline(), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
         self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
 
@@ -37765,9 +32533,9 @@ class PhaseTruthNonCompletionMatrixTest(ControllerPolicyTestBase):
         def close(self):
             pass
 
-    def _run_row(self, uuid_str, session, headless, io_in=None):
+    def _run_row(self, uuid_str, session):
         spath = self._session(
-            uuid_str, "scouting", {"scout": "opencode"}, team=["scout"])
+            uuid_str, "scouting", {"scout": "opencode"}, team=["scout", "scout-reviewer"])
 
         def fake_run_scout(config, context, selected, **kw):
             return cowork.run_scout(
@@ -37775,12 +32543,9 @@ class PhaseTruthNonCompletionMatrixTest(ControllerPolicyTestBase):
                 session_factory=lambda *a, **k: session, **kw)
 
         argv = ["--session-file", spath, "--context", "matrix row context"]
-        if headless:
-            argv += ["--headless"]
         try:
             cowork.run_flow(
-                self._args(argv), io_in=(io_in or io.StringIO()),
-                io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+                self._args(argv), io_out=io.StringIO(), which=lambda c: "/bin/" + c,
                 run_scout_fn=fake_run_scout)
         except SystemExit as exc:
             self.assertEqual(exc.code, 128 + signal.SIGTERM)
@@ -37790,20 +32555,19 @@ class PhaseTruthNonCompletionMatrixTest(ControllerPolicyTestBase):
     def test_every_named_cause_lands_on_an_explicit_non_completion_terminal(self):
         rows = (
             ("guard-disappearance",
-             self._RefusingSession("guard_unavailable"), True, None,
-             "failed"),
-            ("controller-abort", self._KeyboardInterruptSession(), True, None,
-             "aborted"),
-            ("eof", self._NoStatusSession(), False, io.StringIO(""),
-             "cancelled"),
-            ("external-kill", self._SigtermSession(), True, None, "aborted"),
+             self._RefusingSession("guard_unavailable"), "failed"),
+            ("controller-abort", self._KeyboardInterruptSession(), "aborted"),
+            # A turn that ends without a status is a failed turn, not an
+            # authority wait.
+            ("eof", self._NoStatusSession(), "failed"),
+            ("external-kill", self._SigtermSession(), "aborted"),
             ("controller-failure",
-             self._RefusingSession("ProviderError"), True, None, "failed"),
+             self._RefusingSession("ProviderError"), "failed"),
         )
-        for label, session, headless, io_in, expected_state in rows:
+        for label, session, expected_state in rows:
             with self.subTest(cause=label):
                 uuid_str = "e-cov-005-%s" % label
-                current = self._run_row(uuid_str, session, headless, io_in)
+                current = self._run_row(uuid_str, session)
                 self.assertIsNotNone(current)
                 self.assertEqual(current["state"], expected_state)
                 self.assertIn(current["state"],
@@ -37943,7 +32707,7 @@ class SignalHandlerLockContentionTest(ControllerPolicyTestBase):
     def test_sigterm_while_phase_state_lock_already_held_does_not_deadlock(self):
         session_uuid = "bl1-lock-contention"
         spath = self._session(
-            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout", "scout-reviewer"])
         work_id = cowork._role_work_id(session_uuid, "scout", 0)
         lock_path = state_store.phase_state_history_path_for(
             session_uuid, work_id) + ".lock"
@@ -37983,7 +32747,7 @@ class SignalHandlerLockContentionTest(ControllerPolicyTestBase):
                 cowork.run_flow(
                     self._args(["--session-file", spath,
                                "--context", "lock contention context"]),
-                    io_in=io.StringIO(), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
         finally:
             signal.alarm(0)
@@ -38014,7 +32778,7 @@ class WorkUnitLockContentionSigtermTest(ControllerPolicyTestBase):
         # whole point is to exercise the durable WorkUnit lifecycle mirror.
         session_uuid = str(uuid.uuid4())
         spath = self._session(
-            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout", "scout-reviewer"])
         work_id = cowork._role_work_id(session_uuid, "scout", 0)
         lock_path = state_store.work_unit_history_path_for(
             session_uuid, work_id) + ".lock"
@@ -38054,7 +32818,7 @@ class WorkUnitLockContentionSigtermTest(ControllerPolicyTestBase):
                 cowork.run_flow(
                     self._args(["--session-file", spath,
                                "--context", "workunit lock contention"]),
-                    io_in=io.StringIO(), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
         finally:
             signal.alarm(0)
@@ -38085,7 +32849,8 @@ class TerminalResumeAttemptIdentityTest(ControllerPolicyTestBase):
         # session_id), and this test asserts on WorkUnit state throughout.
         session_uuid = str(uuid.uuid4())
         spath = self._session(
-            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "opencode"},
+            team=["scout", "scout-reviewer"])
 
         class EOFSession:
             controller = "opencode"
@@ -38102,20 +32867,20 @@ class TerminalResumeAttemptIdentityTest(ControllerPolicyTestBase):
                 session_factory=lambda *a, **k: EOFSession(), **kw)
 
         # First process: the scout's WorkUnit is minted and reaches
-        # `running`, then the user hits EOF at the first turn read --
-        # `cancelled`, a terminal, non-completed PhaseState/WorkUnit.
+        # `running`, then its turn ends without writing a status -- the phase
+        # fails (`failed`), a terminal, non-completed PhaseState/WorkUnit.
         rc = cowork.run_flow(
             self._args(["--session-file", spath,
                        "--context", "first attempt, ends on eof"]),
-            io_in=io.StringIO(""), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout_eof)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
 
         attempt0_work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
         attempt0_state = state_store.current_phase_state(
             session_uuid, attempt0_work_id)
         self.assertIsNotNone(attempt0_state)
-        self.assertEqual(attempt0_state["state"], "cancelled")
+        self.assertEqual(attempt0_state["state"], "failed")
 
         intel_path = os.path.join(
             state_store.session_assets_dir(session_uuid), "scout.intel.json")
@@ -38133,19 +32898,23 @@ class TerminalResumeAttemptIdentityTest(ControllerPolicyTestBase):
             def close(self):
                 pass
 
+        def approving_reviewer(*a, **k):
+            return {"verdict": "approve", "findings": []}
+
         def fake_run_scout_approve(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: ApprovingSession(), **kw)
+                session_factory=lambda *a, **k: ApprovingSession(),
+                reviewer_runner=approving_reviewer, **kw)
 
         # Second process (a fresh `run_flow` call reloading the SAME
-        # session file): a plain resume, headless so the ready_for_review
-        # gate auto-approves without a TTY prompt. The real dispatch-manifest
-        # pipeline runs exactly as it would for a genuinely fresh attempt.
+        # session file): a plain resume whose paired reviewer approves. The
+        # real dispatch-manifest pipeline runs exactly as it would for a
+        # genuinely fresh attempt.
         rc = cowork.run_flow(
-            self._args(["--session-file", spath, "--headless",
+            self._args(["--session-file", spath,
                        "--context", "plain resume after eof"]),
-            io_in=io.StringIO(""), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c,
             run_scout_fn=fake_run_scout_approve)
         self.assertEqual(rc, 0)
@@ -38169,14 +32938,171 @@ class TerminalResumeAttemptIdentityTest(ControllerPolicyTestBase):
                          digest)
 
         # The original terminal attempt-0 WorkUnit was never touched again:
-        # still `cancelled`, still candidate-free.
+        # still `failed`, still candidate-free.
         attempt0_work_unit = state_store.current_work_unit_state(
             session_uuid, attempt0_work_id)
-        self.assertEqual(attempt0_work_unit["lifecycle_state"], "cancelled")
+        self.assertEqual(attempt0_work_unit["lifecycle_state"], "failed")
         self.assertIsNone(attempt0_work_unit["candidate_manifest_digest"])
         attempt0_state_after = state_store.current_phase_state(
             session_uuid, attempt0_work_id)
-        self.assertEqual(attempt0_state_after["state"], "cancelled")
+        self.assertEqual(attempt0_state_after["state"], "failed")
+
+
+
+class AgentAuthorityGateTest(ControllerPolicyTestBase):
+    """Agent-only gate truth: an authority request is `needs_authority`, an
+    approval binds to the reviewed bytes and to current verification, and the
+    recovery budget refuses a spent cause before any send."""
+
+    def _status(self, name="scout.intel.json"):
+        path = os.path.join(self._dir(), name)
+        return path
+
+    @staticmethod
+    def _writing_session(path, payload, controller="opencode"):
+        class Session:
+            sent = []
+
+            def send(self, text, meta=None):
+                Session.sent.append(text)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as fh:
+                    json.dump(payload, fh)
+                return {"ok": True, "result": "ok"}
+
+            def close(self):
+                pass
+        Session.controller = controller
+        return Session()
+
+    def test_authority_request_is_needs_authority_with_an_open_request(self):
+        session_uuid = str(uuid.uuid4())
+        spath = self._session(session_uuid, "scouting", {"scout": "opencode"},
+                              team=["scout", "scout-reviewer"])
+        intel = os.path.join(state_store.session_assets_dir(session_uuid),
+                             "scout.intel.json")
+        sess = self._writing_session(intel, {
+            "status": "needs_input",
+            "result": {"pending_question": "per-device or per-account?"}})
+
+        def fake_run_scout(config, context, selected, **kw):
+            return cowork.run_scout(config, context, selected,
+                                    session_factory=lambda *a, **k: sess, **kw)
+        box = {}
+        rc = cowork.run_flow(
+            self._args(["--session-file", spath, "--context", "goal"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_run_scout, result_box=box)
+        self.assertEqual(rc, cowork.AGENT_STOP_EXIT_CODE)
+        work_id = cowork._role_work_id(session_uuid, "scout", 0)
+        self.assertEqual(
+            state_store.current_phase_state(session_uuid, work_id)["state"],
+            "needs_authority")
+        request = state_store.read_decision_request(session_uuid)
+        self.assertEqual((request["state"], request["kind"]),
+                         ("open", "needs_input"))
+        self.assertEqual(request["question"], "per-device or per-account?")
+        result = cowork.build_run_result(rc, box)
+        self.assertEqual(result["stop"]["request_id"], request["request_id"])
+
+    def test_approval_of_bytes_that_changed_under_review_is_refused(self):
+        path = self._status()
+        sess = self._writing_session(path, {"status": "ready_for_review",
+                                            "result": {"v": 1}})
+
+        def review_fn(status_path, round_index):
+            with open(status_path, "w") as fh:
+                json.dump({"status": "ready_for_review", "result": {"v": 2}},
+                          fh)
+            return {"verdict": "approve"}
+        out = io.StringIO()
+        rc, outcome, payload = cowork._role_loop(
+            sess, "seed", path, context="", io_out=out, review_fn=review_fn)
+        self.assertEqual((rc, outcome), (0, "ended"))
+        self.assertEqual(payload["kind"], "review_candidate_changed")
+        self.assertFalse(payload["approved"])
+        self.assertNotIn("scout finished", out.getvalue())
+
+    def test_builder_approval_needs_current_verification(self):
+        import unittest.mock as mock
+        path = self._status("builder.status.json")
+        sess = self._writing_session(path, {"status": "ready_for_review",
+                                            "result": {}})
+        granted = []
+        with mock.patch.object(
+                cowork.state_store, "read_current_receipt_pointer",
+                return_value={"transaction_id": "T-STALE"}), \
+                mock.patch.object(cowork, "_accepted_manifest_matches",
+                                  return_value=False), \
+                mock.patch.object(cowork, "_grant_gate_acceptance",
+                                  side_effect=lambda *a: granted.append(a)):
+            rc, outcome, payload = cowork._role_loop(
+                sess, "seed", path, context="", io_out=io.StringIO(),
+                role="builder", reviewer_role=cowork.BUILD_REVIEWER,
+                review_fn=lambda p, r: {"verdict": "approve"},
+                session_uuid=str(uuid.uuid4()))
+        self.assertEqual(outcome, "ended")
+        self.assertEqual(payload["kind"], "verification_not_current")
+        self.assertEqual(payload["transaction_id"], "T-STALE")
+        self.assertEqual(len(granted), 1)
+
+    def _manifest_patch(self):
+        import unittest.mock as mock
+        return mock.patch.object(
+            cowork.dispatch_manifest, "load_manifest",
+            return_value={"binding": {"config_digest": "CFG"},
+                          "digest": "CANDIDATE"})
+
+    def test_spent_recovery_budget_refuses_before_any_send(self):
+        import unittest.mock as mock
+        path = self._status()
+        sess = self._writing_session(path, {"status": "ready_for_review"})
+        type(sess).sent = []
+        spent = [{}] * cowork.recovery_breaker.TRIP_THRESHOLD
+        with self._manifest_patch(), \
+                mock.patch.object(cowork.recovery_breaker, "history",
+                                  return_value=spent):
+            rc, outcome, payload = cowork._role_loop(
+                sess, "seed", path, context="", io_out=io.StringIO(),
+                session_uuid=str(uuid.uuid4()))
+        self.assertEqual(type(sess).sent, [])
+        self.assertEqual(outcome, "ended")
+        self.assertEqual(payload["kind"], "recovery_budget_exhausted")
+        self.assertEqual(payload["requires"], "operator")
+        self.assertEqual(payload["attempts"],
+                         cowork.recovery_breaker.TRIP_THRESHOLD)
+
+    def test_controller_failure_is_counted_against_the_budget(self):
+        import unittest.mock as mock
+
+        class Failing:
+            controller = "claude"
+
+            def send(self, text, meta=None):
+                return {"ok": False, "result": "error",
+                        "error_type": "ProviderError"}
+
+            def close(self):
+                pass
+        recorded = []
+
+        def attempt(*args):
+            recorded.append(args)
+            return {"fingerprint": "F", "attempt_count": 1, "threshold": 3,
+                    "tripped": False}
+        with self._manifest_patch(), \
+                mock.patch.object(cowork.recovery_breaker, "history",
+                                  return_value=[]), \
+                mock.patch.object(cowork.recovery_breaker, "attempt",
+                                  side_effect=attempt):
+            rc, outcome, payload = cowork._role_loop(
+                Failing(), "seed", self._status(), context="",
+                io_out=io.StringIO(), session_uuid=str(uuid.uuid4()))
+        self.assertEqual(outcome, "ended")
+        self.assertEqual(payload["kind"], "controller_failure")
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0][-1], "controller_failure")
+        self.assertEqual(recorded[0][2:5], ("CFG", "claude", "CANDIDATE"))
 
 
 class PreflightRejectionOrderingTest(ControllerPolicyTestBase):
@@ -38191,7 +33117,7 @@ class PreflightRejectionOrderingTest(ControllerPolicyTestBase):
     def test_session_start_failure_reaches_rejected_preflight_not_stuck_running(self):
         session_uuid = "bl2-preflight-ordering"
         spath = self._session(
-            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout", "scout-reviewer"])
 
         def raising_factory(*a, **k):
             raise RuntimeError("boom")
@@ -38202,9 +33128,9 @@ class PreflightRejectionOrderingTest(ControllerPolicyTestBase):
                 **kw)
 
         rc = cowork.run_flow(
-            self._args(["--session-file", spath, "--headless",
+            self._args(["--session-file", spath,
                        "--context", "bl2 context"]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
         self.assertEqual(rc, 1)
         work_id = cowork._role_work_id(session_uuid, "scout", 0)
@@ -38216,7 +33142,7 @@ class PreflightRejectionOrderingTest(ControllerPolicyTestBase):
 
 
 class RetryAttemptScopedWorkUnitTest(ControllerPolicyTestBase):
-    """BL-3: a launch-time retry after a REJECTED dispatch reuses the SAME
+    """BL-3: a re-invoked launch after a REJECTED dispatch reuses the SAME
     epoch but must mint a FRESH WorkUnit identity -- the reducer has no
     legal outbound edge from a terminal state, so reusing the prior
     attempt's (now-terminal) work_id would silently no-op every subsequent
@@ -38226,7 +33152,7 @@ class RetryAttemptScopedWorkUnitTest(ControllerPolicyTestBase):
     def test_retry_after_rejection_mints_a_fresh_work_id_and_reaches_its_own_terminal(self):
         session_uuid = "bl3-retry-attempt"
         spath = self._session(
-            session_uuid, "scouting", {"scout": "opencode"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "opencode"}, team=["scout", "scout-reviewer"])
 
         attempts = {"n": 0}
 
@@ -38239,12 +33165,15 @@ class RetryAttemptScopedWorkUnitTest(ControllerPolicyTestBase):
                 config, context, selected, session_factory=flaky_factory,
                 **kw)
 
-        rc = cowork.run_flow(
-            self._args(["--session-file", spath,
-                       "--context", "bl3 context"]),
-            io_in=io.StringIO("retry\nend\n"), io_out=io.StringIO(),
-            which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
-        self.assertEqual(rc, 1)
+        # There is no in-process retry: the orchestrator re-invokes. Each
+        # invocation is its own launch attempt.
+        for _ in range(2):
+            rc = cowork.run_flow(
+                self._args(["--session-file", spath,
+                           "--context", "bl3 context"]),
+                io_out=io.StringIO(),
+                which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
+            self.assertEqual(rc, 1)
         self.assertEqual(attempts["n"], 2,
                          "the retry must actually reach a second attempt")
 
@@ -38350,10 +33279,10 @@ class RealParentWorkUnitIdentityInBrokerPayloadTest(unittest.TestCase):
                 session_factory=lambda *a, **k: CapturingSession(), **kw)
 
         args = cowork.build_parser().parse_args(
-            ["--team", "scout", "--config", "scout=opencode,yolo,plan",
+            ["--team", "scout,scout-reviewer", "--config", "scout=opencode,yolo,plan",
              "--context", "mj1 context",
              "--session-file", os.path.join(spath_dir, ".cowork", "s.json")])
-        cowork.run_flow(args, io_in=io.StringIO(""), io_out=io.StringIO(),
+        cowork.run_flow(args, io_out=io.StringIO(),
                         which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
         self.assertTrue(captured)
         expected_work_id = cowork._role_work_id(
@@ -38370,6 +33299,10 @@ class InterruptFirstSendDeliveryGatingTest(ControllerPolicyTestBase):
     received or processed it before the interrupt), exactly like a refused
     first send already withholds it."""
 
+    def setUp(self):
+        super().setUp()
+        _hermetic_claude_probe(self)
+
     def test_keyboard_interrupt_on_first_send_withholds_ack_and_leaves_context_unseen(self):
         spath = self._tmp_session()
 
@@ -38385,16 +33318,17 @@ class InterruptFirstSendDeliveryGatingTest(ControllerPolicyTestBase):
         def fake_run_scout(config, context, selected, **kw):
             return cowork.run_scout(
                 config, context, selected,
-                session_factory=lambda *a, **k: InterruptingSession(), **kw)
+                session_factory=lambda *a, **k: InterruptingSession(),
+                claude_spawn=_RecordingClaudeSpawn(), **kw)
 
         rc = cowork.run_flow(
-            self._args(["--team", "scout",
+            self._args(["--team", "scout,scout-reviewer",
                        "--config", "scout=claude,yolo,plan",
                        "--context", "MJ2-ORIGINAL-CONTEXT",
                        "--session-file", spath]),
-            io_in=io.StringIO(), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             which=lambda c: "/bin/" + c, run_scout_fn=fake_run_scout)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 130)
 
         events = self._events(spath)
         self.assertEqual(
@@ -38464,7 +33398,7 @@ class UnboundFirstSendInterruptTest(ControllerPolicyTestBase):
         rc, outcome, _ = cowork._role_loop(
             UnreachedSession(), "seed context", status_path,
             context="MJ2-UNBOUND-CONTEXT",
-            io_in=io.StringIO(), io_out=self._InterruptOnFirstWrite(),
+            io_out=self._InterruptOnFirstWrite(),
             role="scout", session_uuid=session_uuid, role_work_id=work_id,
             on_first_send_rejected=on_first_send_rejected)
 
@@ -38592,9 +33526,12 @@ class LiveGraphWiringTest(unittest.TestCase):
                     pass
             return FakeScout()
 
+        config["scout-reviewer"] = dict(config["scout"], controller="claude")
         rc = cowork.run_scout(
-            config, "goal", ["scout"], io_in=io.StringIO("\n"),
-            io_out=io.StringIO(), intel_path=intel, session_factory=factory,
+            config, "goal", ["scout", "scout-reviewer"], io_out=io.StringIO(),
+            intel_path=intel, session_factory=factory,
+            review_path=intel + ".review.json",
+            reviewer_runner=lambda *a, **k: {"verdict": "approve"},
             session_uuid=session_uuid)
         self.assertEqual(rc, 0)
 
@@ -38640,9 +33577,12 @@ class LiveGraphWiringTest(unittest.TestCase):
                     pass
             return _NeverSend()
 
+        config["scout-reviewer"] = dict(config["scout"], controller="claude")
         rc = cowork.run_scout(
-            config, "goal", ["scout"], io_in=io.StringIO("\n"),
-            io_out=io.StringIO(), intel_path=intel, session_factory=factory,
+            config, "goal", ["scout", "scout-reviewer"], io_out=io.StringIO(),
+            intel_path=intel, session_factory=factory,
+            review_path=intel + ".review.json",
+            reviewer_runner=lambda *a, **k: {"verdict": "approve"},
             session_uuid=session_uuid)
         self.assertEqual(rc, 1)
         self.assertEqual(calls, [], "zero dispatch: no session was ever "
@@ -38693,8 +33633,7 @@ class LiveGraphWiringTest(unittest.TestCase):
             return _NeverSend()
 
         rc = cowork.run_builder(
-            config, "goal", ["builder"], io_in=io.StringIO("\n"),
-            io_out=io.StringIO(), session_factory=factory,
+            config, "goal", ["builder"], io_out=io.StringIO(), session_factory=factory,
             session_uuid=session_uuid)
         self.assertEqual(rc, 1)
         self.assertEqual(calls, [], "zero dispatch: no session was ever "
@@ -38737,9 +33676,12 @@ class LiveGraphWiringTest(unittest.TestCase):
                     pass
             return FakeScout()
 
+        config["scout-reviewer"] = dict(config["scout"], controller="claude")
         rc = cowork.run_scout(
-            config, "goal", ["scout"], io_in=io.StringIO("\n"),
-            io_out=io.StringIO(), intel_path=intel, session_factory=factory,
+            config, "goal", ["scout", "scout-reviewer"], io_out=io.StringIO(),
+            intel_path=intel, session_factory=factory,
+            review_path=intel + ".review.json",
+            reviewer_runner=lambda *a, **k: {"verdict": "approve"},
             session_uuid=session_uuid)
         self.assertEqual(rc, 0)
 
@@ -38799,8 +33741,7 @@ class LiveGraphWiringTest(unittest.TestCase):
             return _NeverSend()
 
         rc = cowork.run_scout(
-            config, "goal", ["scout"], io_in=io.StringIO("\n"),
-            io_out=io.StringIO(), session_factory=factory,
+            config, "goal", ["scout"], io_out=io.StringIO(), session_factory=factory,
             session_uuid=session_uuid)
         self.assertEqual(rc, 1)
         self.assertEqual(calls, [], "zero dispatch: no session was ever "
@@ -38831,7 +33772,7 @@ class GraphDeclarationPreLaunchAndSwitchSeamTest(ControllerPolicyTestBase):
     def test_pre_launch_graph_declaration_rejects_before_any_dispatch(self):
         session_uuid = str(uuid.uuid4())
         spath = self._session(
-            session_uuid, "scouting", {"scout": "claude"}, team=["scout"])
+            session_uuid, "scouting", {"scout": "claude"}, team=["scout", "scout-reviewer"])
         role_work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
         other_work_id = str(uuid.uuid4())
         state_store.append_graph_revision(session_uuid, [{
@@ -38859,7 +33800,7 @@ class GraphDeclarationPreLaunchAndSwitchSeamTest(ControllerPolicyTestBase):
             rc = cowork.run_flow(
                 self._args(["--session-file", spath,
                            "--context", "m1 pre-launch"]),
-                io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c)
+                io_out=out, which=lambda c: "/bin/" + c)
         self.assertEqual(rc, 1)
         self.assertEqual(popen.calls, [], "zero controller spawns when the "
                          "graph declaration is rejected")
@@ -38886,80 +33827,13 @@ class GraphDeclarationPreLaunchAndSwitchSeamTest(ControllerPolicyTestBase):
                          "pre-launch rejection must not be a vacuous "
                          "absence of trace events")
 
-    def test_switch_controller_graph_declaration_rejects_zero_switch(self):
-        session_uuid = str(uuid.uuid4())
-        spath = self._session(
-            session_uuid, "scouting", {"scout": "claude"}, team=["scout"])
-        role_work_id = cowork._role_work_id(session_uuid, "scout", 0, 0)
-        orig_graph_check = preflight.check_dependency_graph_declaration
-
-        def rejecting(work_unit, session_id, state_module=None):
-            return preflight.capability_check_result(
-                "dependency_graph_declaration", False,
-                reason="graph declaration rejected: self_edge")
-
-        captured = {}
-
-        def fake_scout(config, context, selected, on_outcome=None, **kw):
-            switch_fn = kw.get("switch_controller_fn")
-            preflight.check_dependency_graph_declaration = rejecting
-            try:
-                captured["result"] = switch_fn("scout", target="codex")
-            finally:
-                preflight.check_dependency_graph_declaration = orig_graph_check
-            if on_outcome:
-                on_outcome("ended", None)
-            return 0
-
-        out = io.StringIO()
-        rc = cowork.run_flow(
-            self._args(["--session-file", spath, "--context", "m1 switch"]),
-            io_in=io.StringIO(), io_out=out, which=lambda c: "/bin/" + c,
-            run_scout_fn=fake_scout)
-        self.assertEqual(rc, 0)
-        self.assertIs(captured["result"], False)
-        after = state_store.load(spath)
-        self.assertEqual(after["config"]["scout"]["controller"], "claude",
-                         "a rejected graph declaration must not commit the "
-                         "switch")
-
-        current = state_store.current_phase_state(session_uuid, role_work_id)
-        self.assertIsNotNone(current)
-        self.assertEqual(current["state"], "rejected_preflight")
-        self.assertEqual(current["reason_code"], "preflight_rejected")
-        self.assertIn("self_edge",
-                      current["evidence"]["dependency_graph_declaration"])
-
-        # The pre-launch gate already compiled/persisted a manifest for the
-        # ORIGINAL "claude" controller before `fake_scout` ever ran (its own
-        # graph check was untouched then); a rejected switch's OWN compile
-        # attempt for the "codex" target must never overwrite it -- the
-        # persisted manifest.binding.controller staying "claude" proves the
-        # switch's compile/persist never ran.
-        manifest = manifest_mod.load_manifest(
-            state_store.manifest_path_for(session_uuid, "scout"))
-        self.assertIsNotNone(manifest)
-        self.assertEqual(manifest["binding"]["controller"], "claude",
-                         "a rejected switch must never compile/persist a "
-                         "manifest for the target controller")
-
-        events = self._events(spath)
-        switch_ends = [e for e in events
-                      if e.get("event") == "controller.switch.end"
-                      and e.get("role") == "scout"]
-        self.assertTrue(
-            any(e.get("result") == "graph_declaration_rejected"
-               for e in switch_ends),
-            "switch rejection must not be a vacuous absence of trace events")
-
-
 # =========================================================================== #
 # M3 Package E — orchestration-resume wiring: focused named tests.            #
 #                                                                             #
 # Covers the frozen brief's non-vacuous live-fault list: trustworthy         #
 # scheduled resume exact binding; unknown reset manual signed-only;          #
 # persist-before-ack and exactly-once consumption; post-wake send failure    #
-# retains pending turn; both headless resume forms; InvalidationRecord      #
+# retains pending turn; both resume-trigger forms; InvalidationRecord      #
 # no-replay; wrong-role supervision stop; malformed classification writes   #
 # unknown ProviderHealth; zero same-provider auto-retry for quota/overload/  #
 # authentication; and issue #57 (typed-seed TypeError avoidance).           #
@@ -39050,7 +33924,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
                 sess = self._FailingSession("claude", error_type)
                 rc, outcome, payload = cowork._role_loop(
                     sess, "do the thing", status_path, context="",
-                    io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     role="builder", session_uuid=suid, role_work_id=work_id)
                 self.assertEqual(rc, 0)
                 health = state_store.read_provider_health(
@@ -39065,7 +33939,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         sess = self._FailingSession("claude", "totally-made-up-shape")
         cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", session_uuid=suid, role_work_id=work_id)
         health = state_store.read_provider_health(suid, "builder", "claude")
         self.assertEqual(health["last_outcome"], "unknown_provider_failure")
@@ -39090,7 +33964,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
 
         rc, outcome, payload = cowork._role_loop(
             DeniedSession(), "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", session_uuid=suid, role_work_id=work_id)
         self.assertNotEqual(outcome, "awaiting_capacity")
         health = state_store.read_provider_health(suid, "builder", "claude")
@@ -39103,7 +33977,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         sess = self._FailingSession("claude", "rate_limit_error")
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", session_uuid=suid, role_work_id=work_id)
         self.assertEqual(rc, 0)
         self.assertEqual(outcome, "awaiting_capacity")
@@ -39146,7 +34020,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         sess = self._FailingSession("claude", "overloaded_error")
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity")
         self.assertEqual(payload["controller_outcome"], "overloaded")
@@ -39167,7 +34041,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         sess = self._FailingSession("claude", "rate_limit_error")
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", session_uuid=suid, role_work_id=None)
         self.assertNotEqual(outcome, "awaiting_capacity")
         self.assertEqual(outcome, "ended")
@@ -39177,15 +34051,14 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         sess = self._FailingSession("claude", "authentication_failed")
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("retry\nend\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "ended")
-        # A forced "retry" choice at the gate must never actually resend.
+        # No in-process retry exists: the failed send is never resent.
         self.assertEqual(len(sess.sends), 1)
         ps = state_store.current_phase_state(suid, work_id)
         self.assertEqual(ps["state"], "failed")
-        self.assertEqual(ps["evidence"].get("reason"),
-                         "same_provider_retry_blocked")
+        self.assertEqual(ps["evidence"].get("reason"), "send_failed")
 
     def test_quota_overload_bypass_interactive_gate_entirely(self):
         # A capacity-eligible outcome never even reaches the interactive
@@ -39195,7 +34068,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         out = io.StringIO()
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO(""), io_out=out,
+            io_out=out,
             role="builder", session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity")
         self.assertNotIn("choose: retry", out.getvalue())
@@ -39228,7 +34101,7 @@ def _m3e_signed_manual_signal(payload, role, key_id="authority-key-1",
 
 
 class M3PackageEResumeTriggerTests(unittest.TestCase):
-    """The headless resume-trigger CLI: both resume forms, binding-preserving
+    """The resume-trigger CLI: both resume forms, binding-preserving
     wake preflight, InvalidationRecord no-replay, wrong-role supervision
     stop, and post-wake send-failure retention."""
 
@@ -39264,7 +34137,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
             controller, error_type)
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity")
 
@@ -39666,7 +34539,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
             controller, error_type)
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity")
         state = state_store.load(
@@ -39797,7 +34670,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
 
         rc, outcome, payload = cowork._role_loop(
             StaleAttrSession(), "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role="builder", session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity")
         self.assertEqual(payload["provider_session_id"],
@@ -39874,7 +34747,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
         try:
             rc, outcome, payload = cowork._role_loop(
                 RetryEvidenceSession(), "do the thing", status_path,
-                context="", io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                context="", io_out=io.StringIO(),
                 role="builder", session_uuid=suid, role_work_id=work_id)
         finally:
             cowork._synthesize_raw_failure_evidence = real_synth
@@ -39892,7 +34765,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
     # -- PRODUCTION bridge seam, live): exercises the REAL
     # -- `bridge.ClaudeSession`/`parse_claude_event`/`send()` machinery
     # -- (only the OS-level subprocess boundary is faked, the same
-    # -- convention `ClaudeSessionTtyTest` already uses -- never a
+    # -- convention `ClaudeSessionTranscriptTest` already uses -- never a
     # -- monkeypatch of E's own evidence-synthesis seam) against a
     # -- genuine claude rate-limit event shape, proving the full C->E
     # -- evidence chain runs on REAL production code end to end. This
@@ -40119,7 +34992,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
                 io_out=io.StringIO(), session_id="prov-sess-1")
             rc, outcome, payload = cowork._role_loop(
                 session, "do the thing", status_path, context="",
-                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 role="builder", session_uuid=suid, role_work_id=work_id)
 
         self.assertEqual(outcome, "awaiting_capacity")
@@ -40192,7 +35065,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
                 io_out=io.StringIO(), session_id="prov-sess-1")
             rc, outcome, payload = cowork._role_loop(
                 session, "do the thing", status_path, context="",
-                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 role="builder", session_uuid=suid, role_work_id=work_id)
 
         # Genuinely refused -- never a durable, out-of-horizon pause, and
@@ -40539,7 +35412,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
                 io_out=io.StringIO(), session_id="prov-sess-1")
             rc, outcome, payload = cowork._role_loop(
                 session, "do the thing", status_path, context="",
-                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 role="builder", session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity")
 
@@ -40620,3 +35493,239 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
         self.assertEqual(
             d_exit, capacity_scheduler.WAKE_TRIGGER_EXIT_CODES["attempts_exhausted"])
         self.assertIn("attempts_exhausted", d_lines[0])
+
+
+class DecisionCapacityResumeTriggerTest(M3PackageEResumeTriggerTests):
+    """MJ2: an orchestrator decision block that rode a capacity-paused first
+    send is bound to that pending turn, never rebuilt by a plain run while
+    the pause is live, and acknowledged by exactly the resume-trigger send
+    that delivers it; a failed or refused wake keeps it pending."""
+
+    TURN = "turn carrying the orchestrator answer"
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def _paused_with_decision(self):
+        d = self._session_dir()
+        suid = str(uuid.uuid4())
+        spath = os.path.join(d, ".cowork", "session.json")
+        state = state_store.ensure_session(spath, None, suid)
+        work_id, _manifest, _binding = _m3e_bind_capacity_candidate(
+            suid, "builder")
+        status_path = os.path.join(
+            state_store.session_assets_dir(suid), "builder.status.json")
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path, "w") as fh:
+            json.dump({"status": "needs_input"}, fh)
+        # A consumed, orchestrator-recorded answer owed to the builder.
+        request = state_store.open_decision_request(suid, {
+            "kind": "needs_input", "role": "builder", "phase": "building"})
+        rid = request["request_id"]
+        path, sha = state_store.write_decision_answer(suid, rid,
+                                                      "USE-POSTGRES")
+        state = state_store.record_trusted_decision_response(
+            spath, rid, "answer", answer_sha256=sha, targets=["builder"],
+            prior=state)
+        state_store.consume_decision_request(
+            suid, rid, "answer", response_digest=sha, delivery={
+                "response_kind": "answer", "role": "builder",
+                "targets": ["builder"], "answer_path": path,
+                "answer_sha256": sha})
+        # run_flow bound the block to this launch; its first send is refused
+        # for provider capacity.
+        cowork._bind_decision_launch(
+            suid, "builder", [{"request_id": rid, "target": "builder"}])
+        self.addCleanup(cowork._bind_decision_launch, suid, "builder", None)
+        sess = M3PackageECapacityWiringTests._FailingSession(
+            "claude", "rate_limit_error")
+        _rc, outcome, payload = cowork._role_loop(
+            sess, self.TURN, status_path, context="", io_out=io.StringIO(),
+            role="builder", session_uuid=suid, role_work_id=work_id)
+        self.assertEqual(outcome, "awaiting_capacity")
+        state = state_store.load(spath)
+        state.setdefault("config", {})["builder"] = {
+            "controller": "claude", "model": None, "effort": None,
+            "mode": "implement", "yolo": True}
+        state.setdefault("sessions", {})["builder"] = {
+            "controller": "claude", "id": "prov-sess-1"}
+        state_store.save(spath, state)
+        return d, spath, suid, rid, payload
+
+    def _trigger(self, d, suid, payload, factory, extra=(), lines=None):
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = self._write_json(d, "manual.json", record)
+        pinned_path = self._write_json(d, "pinned.json", pinned)
+        return cowork.run_resume_trigger([
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ] + list(extra), output=(lines if lines is not None else []).append,
+            session_factory=factory)
+
+    def _delivery(self, suid):
+        return state_store.read_decision_request(suid)["delivery"]
+
+    def test_the_paused_turn_names_its_decision_and_holds_it(self):
+        _d, spath, suid, rid, _payload = self._paused_with_decision()
+        pending = state_store.read_pending_turn_before_pause(suid, "builder")
+        self.assertEqual(pending["turn_text"], self.TURN)
+        self.assertEqual(pending["decision_bindings"],
+                         [{"request_id": rid, "target": "builder"}])
+        self.assertEqual(self._delivery(suid)["state"], "pending")
+        # While the pause is live a plain run must not rebuild the block.
+        self.assertTrue(
+            cowork._capacity_turn_holds_decision(suid, "builder", rid))
+
+    def test_accepted_resume_send_acknowledges_the_bound_decision(self):
+        d, spath, suid, rid, payload = self._paused_with_decision()
+        sent = []
+        rc = self._trigger(d, suid, payload, self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual(sent, [self.TURN])
+        self.assertEqual(self._delivery(suid)["targets"],
+                         {"builder": "delivered"})
+        self.assertEqual(self._delivery(suid)["state"], "delivered")
+        self.assertEqual(state_store.read_pending_decision_deliveries(
+            suid, trusted_state=state_store.load(spath)), [])
+        self.assertFalse(
+            cowork._capacity_turn_holds_decision(suid, "builder", rid))
+
+    def test_failed_resume_send_keeps_the_decision_pending(self):
+        d, spath, suid, rid, payload = self._paused_with_decision()
+        sent = []
+        rc = self._trigger(d, suid, payload, self._fake_factory(
+            sent, ok=False, error_type="connection_error"))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SEND_FAILED)
+        self.assertEqual(self._delivery(suid)["state"], "pending")
+        # The wake is terminal, so the plain resume delivers it again.
+        self.assertFalse(
+            cowork._capacity_turn_holds_decision(suid, "builder", rid))
+        self.assertEqual(
+            [e["request_id"] for e in state_store.
+             read_pending_decision_deliveries(
+                 suid, trusted_state=state_store.load(spath))], [rid])
+
+    def test_a_tampered_answer_is_not_resent_under_orchestrator_authority(self):
+        d, _spath, suid, rid, payload = self._paused_with_decision()
+        with open(state_store.decision_answer_path_for(suid, rid), "w") as fh:
+            fh.write("DROP EVERY TABLE")
+        sent, lines = [], []
+        rc = self._trigger(d, suid, payload, self._fake_factory(sent),
+                           lines=lines)
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+        self.assertEqual(sent, [])
+        self.assertEqual(self._delivery(suid)["state"], "pending")
+        # m-3: the result names exactly what to restore.
+        line = json.loads(lines[-1])
+        expected = hashlib.sha256(b"USE-POSTGRES").hexdigest()
+        self.assertEqual(
+            (line["reason"], line["request_id"], line["answer_path"],
+             line["expected_sha256"]),
+            ("decision_answer_tampered", rid,
+             state_store.decision_answer_path_for(suid, rid), expected))
+        self.assertIn("restore the exact bytes", line["recovery"])
+
+    # -- MJ-A: a decision-bound turn is never redirected ------------------ #
+
+    def test_a_redirected_wake_of_a_decision_bound_turn_is_refused_before_claiming(self):
+        d, _spath, suid, rid, payload = self._paused_with_decision()
+        sent, lines = [], []
+        rc = self._trigger(d, suid, payload, self._fake_factory(sent),
+                           extra=["--redirected-context", "X"], lines=lines)
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS)
+        self.assertEqual(sent, [])
+        line = json.loads(lines[-1])
+        self.assertEqual(
+            (line["reason"], line["lease_id"], line["request_ids"]),
+            ("decision_bound_turn_not_redirectable", payload["lease_id"],
+             [rid]))
+        # Nothing claimed, no wake attempt charged, the decision still held.
+        lease = state_store.read_pause_lease(suid, payload["lease_id"])
+        self.assertEqual(
+            (lease["consumption_state"], lease["failed_wake_attempts"]),
+            ("unclaimed", 0))
+        self.assertEqual(self._delivery(suid)["state"], "pending")
+        self.assertTrue(
+            cowork._capacity_turn_holds_decision(suid, "builder", rid))
+        # The verbatim wake then sends the turn with its decision, once.
+        rc = self._trigger(d, suid, payload, self._fake_factory(sent))
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual(sent, [self.TURN])
+        self.assertEqual(self._delivery(suid)["state"], "delivered")
+
+    # -- MJ-B / S3: a crash after the accepted send ----------------------- #
+
+    def test_a_crash_after_the_accepted_send_holds_only_until_the_horizon(self):
+        import datetime
+        import unittest.mock as mock
+        d, spath, suid, rid, payload = self._paused_with_decision()
+        lease_id = payload["lease_id"]
+        sent = []
+        with mock.patch.object(state_store, "mark_decision_delivered",
+                               side_effect=SystemExit(143)):
+            with self.assertRaises(SystemExit):
+                self._trigger(d, suid, payload, self._fake_factory(sent))
+        self.assertEqual(sent, [self.TURN])
+        # Killed between the accepted send and the acknowledgment: the lease
+        # is not consumed and the delivery is still pending.
+        self.assertEqual(state_store.read_pause_lease(
+            suid, lease_id)["consumption_state"], "claimed")
+        self.assertEqual(self._delivery(suid)["state"], "pending")
+        state = state_store.load(spath)
+        # Within the retry horizon the claimed lease still holds it (a plain
+        # run refuses with decision_held_by_capacity_pause)...
+        self.assertEqual(
+            cowork._capacity_held_decisions(suid, state),
+            [{"request_id": rid, "role": "builder", "lease_id": lease_id}])
+        # ...but not forever: past the horizon it holds nothing, is durably
+        # expired, and the delivery is left for ordinary plain delivery.
+        later = (datetime.datetime.now(datetime.timezone.utc)
+                 + datetime.timedelta(
+                     seconds=cowork.capacity_contracts
+                     .MAX_RETRY_HORIZON_SECONDS + 3600)).isoformat().replace(
+                         "+00:00", "Z")
+        with mock.patch.object(cowork, "_capacity_now", return_value=later):
+            self.assertEqual(cowork._capacity_held_decisions(suid, state), [])
+        self.assertEqual(state_store.read_pause_lease(
+            suid, lease_id)["consumption_state"], "expired")
+        self.assertFalse(
+            cowork._capacity_turn_holds_decision(suid, "builder", rid))
+        self.assertEqual(
+            [e["request_id"] for e in state_store.
+             read_pending_decision_deliveries(suid, trusted_state=state)],
+            [rid])
+
+    def test_a_failed_acknowledgment_is_reported_not_claimed(self):
+        import unittest.mock as mock
+        d, _spath, suid, rid, payload = self._paused_with_decision()
+        sent, lines = [], []
+        with mock.patch.object(state_store, "mark_decision_delivered",
+                               side_effect=OSError("disk gone")):
+            rc = self._trigger(d, suid, payload, self._fake_factory(sent),
+                               lines=lines)
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        line = json.loads(lines[-1])
+        self.assertEqual((line["outcome"], line["decision_ack_failed"]),
+                         ("success", [rid]))
+        self.assertEqual(self._delivery(suid)["state"], "pending")
+
+
+# The inherited resume-trigger tests run once, in their own class.
+for _name in [n for n in dir(M3PackageEResumeTriggerTests)
+              if n.startswith("test")]:
+    if _name not in DecisionCapacityResumeTriggerTest.__dict__:
+        setattr(DecisionCapacityResumeTriggerTest, _name, None)

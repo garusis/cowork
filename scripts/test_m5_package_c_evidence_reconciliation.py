@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""Focused suite for M5 Package C: the truthful `should_defer_teardown`
-reconciliation-pending predicate and the `reconcile_pending_evidence`
-resume-time reconciliation entry point -- garusis/cowork-internal#51, closed
-on the exact signed post-Package-A base `eae4276d07a887a041177817221bf1b0
-bcdf99f0`.
-
-Writable scope for this package is EXACTLY `scripts/cowork_verification_
-evidence.py` and this file -- an "independent C allowlist", distinct from
-`scripts/test_m5_package_a_contracts.py`'s own frozen five-path allowlist,
-which structurally cannot know about this candidate's own new file (see
-`AllowlistBaseHashIntegrityTests`).
+"""The truthful `should_defer_teardown` reconciliation-pending predicate
+and the `reconcile_pending_evidence` resume-time reconciliation entry point
+in `cowork_verification_evidence.py`.
 
 Never invokes a real Claude/Codex/opencode session. Real, short-lived
 `python3` subprocesses (own process group via `start_new_session=True`) are
@@ -23,7 +15,6 @@ Run standalone:
 """
 
 import datetime
-import hashlib
 import json
 import os
 import shutil
@@ -40,51 +31,11 @@ import uuid
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
 
 import cowork_state as state_store  # noqa: E402
 import cowork_ledger as ledger  # noqa: E402
 import cowork_verification as verification  # noqa: E402
 import cowork_verification_evidence as evidence_module  # noqa: E402
-
-
-# This package's true immediate parent commit -- rebound from the stale
-# "eae4276..." pin (Package A's own commit, two commits further back),
-# which swept Package B's own changes (scripts/cowork_verification.py,
-# scripts/cowork_verification_worker.py, scripts/test_cowork.py,
-# scripts/test_m5_package_b_worker_capture.py) into this package's
-# allowlist/scope proofs below. scripts/cowork_verification_evidence.py is
-# byte-identical between the old and new BASE_SHA, so this rebind changes
-# no content-based assertion.
-BASE_SHA = "ff6c0e43ef893bffe752e96b55d9e8d73aee1ad2"
-
-# This package's own signed commit.
-CANDIDATE_SHA = "6b9f28fef01f9b80e59b4b4701fb13579f29f4af"
-
-# The exact, frozen TWO-path allowlist THIS package may change -- distinct
-# from (and a strict subset unrelated to) test_m5_package_a_contracts.py's
-# own five-path allowlist.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork_verification_evidence.py",
-    "scripts/test_m5_package_c_evidence_reconciliation.py",
-})
-
-
-def _git_changed_paths():
-    # Commit-pinned, not live-working-tree: this package's own changed-
-    # paths and untouched-scope claims are properties of ITS OWN committed
-    # diff (BASE_SHA..CANDIDATE_SHA), not of whatever a later, unrelated
-    # package's own uncommitted test-only edits also happen to add to the
-    # same worktree.
-    return set(subprocess.run(
-        ["git", "diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.splitlines())
-
-
-def _sha256_file(rel_path):
-    with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
-        return hashlib.sha256(fh.read()).hexdigest()
 
 
 def _spawn_sleeper(seconds):
@@ -205,71 +156,6 @@ class _SessionFixture(unittest.TestCase):
         key = ledger.owned_attempt_key(self.transaction_id, label)
         return [r for r in ledger.read_ledger(ledger_path)
                if r.get("attempt_key") == key]
-
-
-# =========================================================================== #
-# Independent C allowlist / base / hash integrity (deterministic gate #3).    #
-# =========================================================================== #
-
-
-class AllowlistBaseHashIntegrityTests(unittest.TestCase):
-
-    def test_changed_paths_are_within_the_two_path_allowlist(self):
-        offenders = _git_changed_paths() - ALLOWED_CHANGED_PATHS
-        self.assertFalse(
-            offenders,
-            "paths changed outside the frozen two-path Package C "
-            "allowlist: %s" % sorted(offenders))
-
-    def test_both_owned_paths_py_compile(self):
-        import py_compile
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            path = os.path.join(_REPO_ROOT, rel)
-            self.assertTrue(os.path.exists(path), "missing owned path: %s"
-                            % rel)
-            py_compile.compile(path, doraise=True)
-
-    def test_candidate_hashes_are_well_formed_and_distinct(self):
-        hashes = {}
-        for rel in sorted(ALLOWED_CHANGED_PATHS):
-            digest = _sha256_file(rel)
-            self.assertRegex(digest, r"^[0-9a-f]{64}$")
-            hashes[rel] = digest
-        self.assertNotEqual(
-            hashes["scripts/cowork_verification_evidence.py"],
-            hashes["scripts/test_m5_package_c_evidence_reconciliation.py"])
-
-    def test_base_commit_is_the_exact_signed_post_package_a_base(self):
-        result = subprocess.run(
-            ["git", "cat-file", "-e", BASE_SHA + "^{commit}"],
-            cwd=_REPO_ROOT)
-        self.assertEqual(
-            result.returncode, 0,
-            "the frozen base commit %s must exist and be reachable" % BASE_SHA)
-        ancestor = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", BASE_SHA, "HEAD"],
-            cwd=_REPO_ROOT)
-        self.assertEqual(
-            ancestor.returncode, 0,
-            "HEAD must descend from the exact signed base %s" % BASE_SHA)
-        parent = subprocess.run(
-            ["git", "rev-parse", "%s^" % CANDIDATE_SHA],
-            cwd=_REPO_ROOT, capture_output=True, text=True, check=True)
-        self.assertEqual(
-            parent.stdout.strip(), BASE_SHA,
-            "CANDIDATE_SHA must be exactly one commit on top of BASE_SHA")
-
-    def test_main_spine_worker_seam_and_package_a_suite_are_untouched(self):
-        changed = _git_changed_paths()
-        for rel in ("scripts/cowork_verification.py", "scripts/cowork_state.py",
-                   "scripts/cowork_verification_worker.py",
-                   "scripts/cowork_ledger.py", "scripts/cowork.py",
-                   "scripts/cowork_handoff.py", "scripts/cowork_measure.py",
-                   "scripts/test_cowork.py",
-                   "scripts/test_m5_package_a_contracts.py"):
-            self.assertNotIn(rel, changed,
-                             "%s is outside Package C's writable scope and "
-                             "must remain untouched" % rel)
 
 
 # =========================================================================== #
@@ -1232,19 +1118,34 @@ class CancellationDeadlineSemanticsPreservedTests(_RealWorkerFixture):
             calls.append("terminate")
             return real_terminate(*a, **k)
 
-        marker = os.path.join(tempfile.mkdtemp(), "marker")
+        signal_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(signal_dir, ignore_errors=True))
+        started = os.path.join(signal_dir, "started")
+        marker = os.path.join(signal_dir, "marker")
         cmd = ["python3", "-c",
-              "import time\ntime.sleep(2)\n"
-              "open(%r, 'w').write('done')" % marker]
+              "import time\nopen(%r, 'w').write('started')\n"
+              "time.sleep(2)\n"
+              "open(%r, 'w').write('done')" % (started, marker)]
         entries = [{"label": "slow", "command": cmd,
                    "execution_mode": "isolated_snapshot",
                    "kind": verification.KIND_FINAL_SUITE}]
         cancel_event = threading.Event()
+        observed = {}
 
-        def _cancel_soon():
-            time.sleep(0.3)
+        # Cancel only once the command itself reports it is running. A fixed
+        # timer raced snapshot/worker startup: when it fired before entry 0
+        # was dispatched, the pre-dispatch cancellation gate correctly
+        # returned UNVERIFIED instead of exercising mid-flight teardown.
+        def _cancel_once_command_started():
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if os.path.exists(started):
+                    observed["started_at"] = time.monotonic()
+                    break
+                time.sleep(0.02)
             cancel_event.set()
-        threading.Thread(target=_cancel_soon, daemon=True).start()
+        threading.Thread(target=_cancel_once_command_started,
+                         daemon=True).start()
 
         with mock.patch.object(verification, "cleanup_active_command_group",
                                side_effect=spy_cleanup), \
@@ -1265,7 +1166,18 @@ class CancellationDeadlineSemanticsPreservedTests(_RealWorkerFixture):
         # never returns True here (the process is already dead by the
         # time the bounded wait gives up), so this is unaffected by the
         # deferral seam at all.
+        self.assertIn("started_at", observed,
+                      "the command never reported it started: %r" % (
+                          {k: result.get(k) for k in (
+                              "verdict", "attempts", "startup_failure",
+                              "worker_identity_verified",
+                              "ledger_failure")},))
         self.assertEqual(result["verdict"], verification.VERDICT_RED)
+        # Outlive the command's own 2s sleep so a surviving, un-torn-down
+        # command would have written its marker by now.
+        remaining = observed["started_at"] + 2.5 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
         self.assertFalse(os.path.exists(marker),
                          "the command must have been torn down before it "
                          "could finish and write its marker")

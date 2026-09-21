@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Focused suite for issue #64 implementation package **P4** -- owner
-visibility and the recovery surface -- on the frozen P3 candidate
-`c7aa5e7a57f3ca81b0a33e3f481cb650d0c1fd94`.
-
-P1 proved the store, P2 wired the gate, P3 added provider-session
-exclusivity. All three REFUSE. P4 adds no refusal at all: it makes ownership
-VISIBLE on three surfaces and tells an operator what to do about it. So what
-has to be proven here is INERTNESS and CONTAINMENT, not enforcement.
+"""Owner visibility and the recovery surface. The owner store, gate and
+provider-session exclusivity REFUSE; the visibility surfaces add no refusal at
+all: they make ownership VISIBLE on three surfaces and state what to do about
+it. So what has to be proven here is INERTNESS and CONTAINMENT, not
+enforcement.
 
   - **Criterion 1 (`--session-owner` is a read-only report).** Five lease
     states -- unowned, a live same-host owner, a crashed owner, an owner whose
@@ -29,13 +26,6 @@ has to be proven here is INERTNESS and CONTAINMENT, not enforcement.
     identical before and after a `--report` run, asserted explicitly for the
     absence of an `owner/` directory and of a `lease.json.lock`.
 
-  - **Criterion 4 (scope confinement).** The changed-path set is exactly P4's
-    four allowed paths; every excluded production file is byte-identical to
-    the frozen base; every excluded SYMBOL is AST- and docstring-identical
-    through the module AST; and each of the three edited files is pinned
-    SYMBOLICALLY -- only the named functions differ and the set of new
-    module-level names is exactly the declared one.
-
   - **Criterion 5 (the picker is safe and compatible).** The suffix is right
     for each verdict and absent for unowned/missing/malformed; every legacy
     session-row shape still lists without raising; and `owner` is present on
@@ -51,7 +41,6 @@ written inside the worktree), drives the REAL production functions rather than
 fakes of them, and spawns no provider and no network client.
 """
 
-import ast
 import contextlib
 import datetime
 import hashlib
@@ -78,93 +67,8 @@ import cowork_owner as owner  # noqa: E402
 import cowork_report  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 
-# The frozen base this package is bound to: P3's accepted candidate. G6's
-# per-package `<base>` rule -- never the accredited base, for P2 onward.
-BASE_SHA = "c7aa5e7a57f3ca81b0a33e3f481cb650d0c1fd94"
-
-# P4's OWN signed candidate commit -- the other end of this package's interval.
-# The scope class below measures the CLOSED interval BASE_SHA..CANDIDATE_SHA,
-# never the live working tree, so what it asserts is a permanent fact about a
-# finished piece of history that no later commit can enter or turn red.
-CANDIDATE_SHA = "fc7ff676e173a6b6e02246abbaee6c2cb41e5a06"
-
-# P4's write authority, exactly.
-ALLOWED_CHANGED_PATHS = frozenset({
-    "scripts/cowork.py",
-    "scripts/cowork_report.py",
-    "scripts/cowork_state.py",
-    "scripts/test_m55_owner_visibility.py",
-})
-
-# Production and test paths P4 must leave byte-identical to the frozen base.
-# P2's list MINUS `cowork_state.py` and `cowork_report.py` (P4 legitimately
-# edits both), PLUS the three files P2/P3 were allowed to edit and P4 is not,
-# and the two historical owner suites this package must not touch -- their
-# scope gates FAIL on this candidate by design, and editing them to pass would
-# be the exact failure they exist to prevent.
-EXCLUDED_PATHS = tuple(sorted({
-    "scripts/cowork_bridge.py",
-    "scripts/cowork_capacity.py",
-    "scripts/cowork_capacity_scheduler.py",
-    "scripts/cowork_control_plane.py",
-    "scripts/cowork_dispatch.py",
-    "scripts/cowork_eval.py",
-    "scripts/cowork_ledger.py",
-    "scripts/cowork_owner.py",
-    "scripts/cowork_ui.py",
-    "scripts/cowork_verification.py",
-    "scripts/cowork_verification_evidence.py",
-    "scripts/test_cowork.py",
-    "scripts/test_cowork_state_m3.py",
-    "scripts/test_dispatch_contract_characterization.py",
-    "scripts/test_m3_negative_controls.py",
-    "scripts/test_m55_owner_gate.py",
-    "scripts/test_m55_owner_store.py",
-}))
-
-# The excluded-SYMBOL set for P4: P2's list with `run_report` REMOVED, because
-# P4's own allowed-symbol list names it (plan.md:1947-1958 -- P2/P3 keep it,
-# P4/P5 drop it).
-EXCLUDED_MODULE_SYMBOLS = (
-    "_emit_activity_record", "_run_activity_tick_loop", "_role_loop",
-    "run_scout", "run_planner", "run_builder", "run_reviewer_once",
-    "run_worktree", "_send", "_record_role_identity",
-    "_isolated_evaluator_session", "_score_queued_entry", "drain_evaluations",
-    "run_evaluation_transition", "_make_enqueue_eval_fn",
-    "_enqueue_reviewer_eval", "_construct_resume_session",
-)
-# Closures nested in `run_flow`, unchanged from P2. They are NOT module
-# attributes, so `inspect.getsource` cannot reach them by name without
-# executing `run_flow`; the gate resolves them by name through the module AST
-# instead, which also asserts the parent is unchanged and is strictly stronger.
-EXCLUDED_RUN_FLOW_CLOSURES = (
-    "measurement_checkpoint", "role_saver", "_measurement_ingest",
-    "_measurement_rebuild", "set_phase", "reviewer_controller_check",
-    "switch_controller", "ensure_controller_dispatchable",
-)
-
-# D-P4-07: authority pinned SYMBOLICALLY, not merely by path. P2's byte
-# identity check no longer protects `cowork_report.py` or `cowork_state.py`,
-# because P4 legitimately edits both -- a file-level gate would let an
-# unrelated change ride along inside an allowed file. For each edited file:
-# the ONLY pre-existing top-level symbols that may differ, and the EXACT set of
-# new module-level names that may appear.
-ALLOWED_SYMBOL_CHANGES = {
-    "scripts/cowork.py": frozenset({
-        "build_parser", "main", "run_report", "_session_picker_label"}),
-    "scripts/cowork_report.py": frozenset(),
-    "scripts/cowork_state.py": frozenset({"list_sessions"}),
-}
-ALLOWED_NEW_SYMBOLS = {
-    "scripts/cowork.py": frozenset({"run_session_owner"}),
-    "scripts/cowork_report.py": frozenset({
-        "render_owner_status", "_section_owner_status"}),
-    "scripts/cowork_state.py": frozenset(),
-}
-
 # The closed reason vocabulary the owner block may print: the five
-# `OWNER_VERDICTS` plus `foreign_host` for the refused-takeover case
-# (plan.md:2013-2018). Never free prose, never a sixth verdict.
+# `OWNER_VERDICTS` plus `foreign_host` for the refused-takeover case. Never free prose, never a sixth verdict.
 OWNER_REASON_TOKENS = frozenset(owner.OWNER_VERDICTS) | {"foreign_host"}
 
 # The labels the owner block must carry for every state that HAS an owner.
@@ -185,140 +89,12 @@ _FIXTURES_ROOT = os.path.join(_HERE, "fixtures", "measurement")
 
 
 # --------------------------------------------------------------------------- #
-# Shared helpers. Modelled on test_m55_owner_gate.py's, with every git call    #
-# carrying `--no-optional-locks` so no gate invocation can refresh             #
-# `.git/index`: this suite's scope class runs as a LIVE-CANDIDATE preflight,   #
-# and the verification transaction fails closed on a live-candidate git-index  #
-# change.                                                                      #
+# Shared helpers.                                                              #
 # --------------------------------------------------------------------------- #
-
-
-def _git(args, check=False):
-    return subprocess.run(
-        ["git", "--no-optional-locks"] + list(args),
-        cwd=_REPO_ROOT, capture_output=True, check=check)
-
-
-def _git_show_bytes(rev, rel_path):
-    return _git(["show", "%s:%s" % (rev, rel_path)], check=True).stdout
-
-
-def _git_merge_base_is_ancestor(ancestor, descendant):
-    """True when `ancestor` really is an ancestor of `descendant`.
-
-    Guards the two frozen endpoint literals against a typo: a mistyped hash
-    would otherwise point this gate at an unrelated piece of history and go on
-    reporting green. `merge-base --is-ancestor` only -- deliberately NOT the
-    adjacency half of the precedent at test_m5_package_e_integration.py, since
-    a package need not be exactly one commit above its base."""
-    return _git(["merge-base", "--is-ancestor", ancestor,
-                 descendant]).returncode == 0
-
-
-def _read_local_bytes(rel_path):
-    with open(os.path.join(_REPO_ROOT, rel_path), "rb") as fh:
-        return fh.read()
 
 
 def _sha256(payload):
     return hashlib.sha256(payload).hexdigest()
-
-
-def _top_level(tree):
-    return {n.name: n for n in tree.body
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
-                              ast.ClassDef))}
-
-
-def _module_level_names(tree):
-    """Every name a module BINDS at top level -- functions, classes AND plain
-    assignments.
-
-    Deliberately wider than `_top_level`: P4's authority names SYMBOLS, so a
-    new module-level constant, import or helper alias smuggled into an allowed
-    file would be exactly the widening D-P4-07 exists to catch, and a
-    def/class-only scan would never see any of them.
-    """
-    names = set(_top_level(tree))
-    for node in tree.body:
-        targets = ()
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            targets = (node.target,)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update(alias.asname or alias.name.split(".")[0]
-                         for alias in node.names)
-        for target in targets:
-            for sub in ast.walk(target):
-                if isinstance(sub, ast.Name):
-                    names.add(sub.id)
-    return names
-
-
-def _closures_of(parent):
-    """Every `FunctionDef` whose nearest enclosing `FunctionDef` is `parent`,
-    resolved BY NAME through the module AST rather than by line -- so a `try`
-    wrapper introduced between the parent and the closure does not hide it,
-    and a duplicate name is detected rather than silently mis-pinned."""
-    found = {}
-
-    def walk(node, nearest):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if nearest is parent:
-                    found.setdefault(child.name, []).append(child)
-                walk(child, child)
-            else:
-                walk(child, nearest)
-
-    walk(parent, parent)
-    return found
-
-
-def _dump(node):
-    return ast.dump(node, include_attributes=False)
-
-
-def _live_candidate_repo():
-    """`_REPO_ROOT` when this suite is running in the LIVE git candidate, else
-    None (the scope class skips).
-
-    TWO conditions, and the second is the load-bearing one. The obvious check
-    is that `git rev-parse --show-toplevel` resolves to this checkout's own
-    root. The non-obvious one is that the frozen base commit must actually
-    EXIST here, and it is what makes the skip correct inside the verification
-    transaction: an `isolated_snapshot` command does NOT run in a git-free
-    copy. `cowork_verification.materialize_command_checkout` gives every
-    per-command checkout functional local git semantics of its own -- a real
-    `git init` plus the transaction's captured raw index bytes written to
-    `.git/index` -- so `--show-toplevel` there resolves happily to the checkout
-    root, which IS that copy's own `_REPO_ROOT`. A toplevel test alone would
-    therefore NOT skip in the snapshot; it would fall through to
-    `git show <BASE>:...` against a repository holding no objects and ERROR the
-    class. Requiring the base OBJECT is what distinguishes the live candidate
-    from a freshly-initialised copy of it.
-
-    This corrects plan assumption `snapshot_has_no_git`, which the planner
-    recorded as UNVERIFIED. The verified answer is that the snapshot has git
-    but no history, so the gate is guarded against what is actually there.
-    Criterion 4 is still measured -- by the `candidate_read_only` preflight
-    entry, which runs in the live worktree.
-    """
-    try:
-        toplevel = _git(["rev-parse", "--show-toplevel"]).stdout.decode(
-            "utf-8", "replace").strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if not toplevel:
-        return None
-    if os.path.realpath(toplevel) != os.path.realpath(_REPO_ROOT):
-        return None
-    try:
-        found = _git(["cat-file", "-e", "%s^{commit}" % BASE_SHA])
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return _REPO_ROOT if found.returncode == 0 else None
 
 
 class _Raises(object):
@@ -514,7 +290,7 @@ class OwnerVisibilityTestCase(unittest.TestCase):
             now=stale)
 
     def seed_corrupt_lease(self, session_uuid):
-        """The ONE fixture written directly rather than through the P1 API:
+        """The ONE fixture written directly rather than through the store API:
         there is no supported way to ASK the store for an unreadable record,
         and a plausible-but-valid stand-in would not exercise the corrupt path
         at all."""
@@ -620,7 +396,7 @@ class OwnerStatusRenderTests(unittest.TestCase):
         self.assertNotIn("--take-over", text)
 
     def test_the_none_view_and_a_real_unowned_view_render_identically(self):
-        """D-P4-02. One renderer serves the gated ambient path and the
+        """One renderer serves the gated ambient path and the
         always-on explicit query, so the gate cannot drift into a second,
         divergent "unowned" rendering."""
         self.assertEqual(cowork_report.render_owner_status(None),
@@ -691,10 +467,10 @@ class OwnerStatusRenderTests(unittest.TestCase):
         self.assertNotIn("--take-over", recovery)
 
     def test_a_corrupt_lease_never_advertises_a_takeover(self):
-        """D-P4-05, verified against the store rather than assumed:
+        """Verified against the store rather than assumed:
         `acquire_owner_lease` raises `OwnerLeaseCorrupt` for an unreadable
         record, so a takeover cannot repair one. Telling an operator to run a
-        command guaranteed to refuse is exactly the failure P4 removes."""
+        command guaranteed to refuse would be a misleading recovery hint."""
         text = cowork_report.render_owner_status(
             _view("corrupt", detail="not a readable SessionOwnerLease"),
             "/repo/session.json")
@@ -853,7 +629,7 @@ class SessionOwnerCliTests(OwnerVisibilityTestCase):
                          {"lease": None, "history": None})
 
     def test_the_json_form_is_the_raw_owner_status_view(self):
-        """Not a wrapper, not a look-alike: the same projection P1 owns. Two
+        """Not a wrapper, not a look-alike: the same projection the owner store owns. Two
         keys are compared for PRESENCE rather than value, because both are
         clock-derived and would differ between any two calls -- pinning them
         would be testing the clock, not the contract."""
@@ -914,7 +690,7 @@ class SessionOwnerCliTests(OwnerVisibilityTestCase):
 
     def test_a_directory_with_no_sessions_exits_zero(self):
         """`run_report` returns 1 for this case. That is deliberately NOT
-        copied: P4's contract is exit 0 always, because a diagnostic that
+        copied: the owner query's contract is exit 0 always, because a diagnostic that
         signals failure when there is simply nothing to diagnose is unusable
         from the scripts that need it most."""
         cwd = tempfile.mkdtemp(prefix="cowork-owner-p4-empty-")
@@ -1079,7 +855,7 @@ class TrackedFixtureReadOnlyTests(unittest.TestCase):
             cowork._session_assets_are_tracked(TRACKED_FIXTURE),
             "criterion 3's premise: %s must be detected as git-TRACKED, or "
             "the report is entitled to persist a record into it for reasons "
-            "that have nothing to do with P4" % TRACKED_FIXTURE)
+            "that have nothing to do with owner visibility" % TRACKED_FIXTURE)
         before = _tree_digests(self.target)
         self.assertIn("trace.jsonl", before)
         self.addCleanup(self._undo_any_mutation, before)
@@ -1092,7 +868,7 @@ class TrackedFixtureReadOnlyTests(unittest.TestCase):
 
     def test_no_owner_directory_and_no_lock_file_appear(self):
         """Named explicitly rather than left to the digest comparison, because
-        these two are the artifacts P4 could have introduced and a reader
+        these two are the artifacts owner visibility could introduce and a reader
         should be able to see them asserted by name."""
         before = _tree_digests(self.target)
         self.addCleanup(self._undo_any_mutation, before)
@@ -1122,54 +898,9 @@ class TrackedFixtureReadOnlyTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PickerOwnerSuffixTests(OwnerVisibilityTestCase):
-    """The picker shows a contested session BEFORE it is picked, and
-    `list_sessions` stays total for every legacy row shape."""
-
-    NOW = 1_000_000_000
-
-    def label(self, **row):
-        base = {"id": "abc123", "path": "/tmp/s.json", "summary": "a goal",
-                "phase": "building", "created": self.NOW,
-                "last_active": self.NOW}
-        base.update(row)
-        return cowork._session_picker_label(base, self.NOW)
-
-    def test_a_live_owner_gets_the_pid_suffix(self):
-        label = self.label(owner=_view("live_owner"))
-        self.assertTrue(label.endswith(" · owned (pid 41287)"), label)
-        self.assertIn("a goal", label)
-
-    def test_every_non_live_lease_state_gets_the_stale_suffix(self):
-        for verdict in ("stale_dead_owner", "stale_unproven", "corrupt"):
-            with self.subTest(verdict):
-                self.assertTrue(
-                    self.label(owner=_view(verdict)).endswith(
-                        " · stale owner (%s)" % verdict))
-
-    def test_an_unowned_or_absent_or_malformed_owner_adds_no_suffix(self):
-        plain = self.label()
-        self.assertNotIn(" · owned", plain)
-        self.assertNotIn(" · stale owner", plain)
-        for value in (None, _view("unowned"), "live_owner", 7, [],
-                      {"verdict": "something_new"}):
-            with self.subTest(repr(value)):
-                self.assertEqual(self.label(owner=value), plain)
-
-    def test_a_live_owner_with_no_readable_pid_still_labels(self):
-        self.assertTrue(
-            self.label(owner=_view("live_owner", lease={})).endswith(
-                " · owned (pid None)"))
-
-    def test_the_suffix_reason_is_always_closed_vocabulary(self):
-        for verdict in sorted(owner.OWNER_VERDICTS):
-            label = self.label(owner=_view(verdict))
-            if " · stale owner (" not in label:
-                continue
-            token = label.rsplit("(", 1)[1].rstrip(")")
-            self.assertIn(token, OWNER_REASON_TOKENS)
-
-    # -- `list_sessions` compatibility ------------------------------------- #
+class ListSessionsOwnerTests(OwnerVisibilityTestCase):
+    """`list_sessions` (what `--resume` selects from) stays total for every
+    legacy row shape and carries each row's owner view."""
 
     def _write(self, cwd, suid=None, legacy=False, context=None, phase=None):
         path = (state_store.session_path(cwd) if legacy
@@ -1187,7 +918,7 @@ class PickerOwnerSuffixTests(OwnerVisibilityTestCase):
         return path
 
     def test_every_legacy_row_shape_still_lists_and_carries_owner(self):
-        """Replicates the pre-P4 `list_sessions` characterizations: a legacy
+        """Replicates the legacy `list_sessions` characterizations: a legacy
         `session.json`, an unreadable file, an id-less file, and an id derived
         from a filename. None of them may raise, all five pre-existing keys
         must survive, and `owner` must be present on every row."""
@@ -1220,13 +951,11 @@ class PickerOwnerSuffixTests(OwnerVisibilityTestCase):
                    if r["id"] == session_uuid)
         self.assertIsInstance(row["owner"], dict)
         self.assertEqual(row["owner"]["verdict"], "live_owner")
-        self.assertIn(" · owned (pid %s)" % os.getpid(),
-                      cowork._session_picker_label(row, self.NOW))
 
     def test_an_id_that_is_not_a_safe_identifier_never_raises(self):
         """A filename-derived id can be anything on disk.
         `owner_lease_path_for` refuses an unsafe one with a ValueError, and a
-        listing that propagated it would take the picker down with it."""
+        listing that propagated it would take `--resume` down with it."""
         cwd = tempfile.mkdtemp(prefix="cowork-owner-p4-unsafe-")
         self.addCleanup(shutil.rmtree, cwd, True)
         state_store.save(state_store.new_session_path(cwd, "-unsafe"),
@@ -1234,11 +963,9 @@ class PickerOwnerSuffixTests(OwnerVisibilityTestCase):
         rows = state_store.list_sessions(cwd)
         self.assertEqual([r["id"] for r in rows], ["-unsafe"])
         self.assertIsNone(rows[0]["owner"])
-        self.assertIsInstance(
-            cowork._session_picker_label(rows[0], self.NOW), str)
 
     def test_listing_an_unowned_session_writes_nothing(self):
-        """The existence gate again, on the picker's side: merely listing a
+        """The existence gate again, on the listing side: merely listing a
         directory must not create an `owner/` directory for every row in it."""
         session_uuid = "unleased1"
         self._write(self.project, suid=session_uuid, context="a goal")
@@ -1373,142 +1100,6 @@ class FixtureRestorationTests(unittest.TestCase):
         self.assertEqual(os.environ.get("COWORK_SESSIONS_ROOT"), before)
 
 
-# --------------------------------------------------------------------------- #
-# Criterion 4 -- scope confinement, against the frozen base.                    #
-# --------------------------------------------------------------------------- #
-
-
-class ScopeConfinementTests(unittest.TestCase):
-    """G6 for P4, bound to P4's own `<base>`: P3's accepted candidate.
-
-    Measures the CLOSED interval `BASE_SHA..CANDIDATE_SHA` -- P4's own finished
-    history -- rather than the live working tree, so every claim below is a
-    permanent fact about that interval that no later commit can enter. It
-    still needs a repository where BOTH endpoint objects exist, so it skips
-    itself everywhere else (see `_live_candidate_repo`), and the verification
-    inventory measures it through a dedicated `candidate_read_only` preflight
-    entry rather than inside the isolated snapshot.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        if _live_candidate_repo() is None:
-            raise unittest.SkipTest(
-                "not the live git candidate (or base %s is absent here): "
-                "criterion 4 is measured by the candidate_read_only preflight"
-                % BASE_SHA[:12])
-
-    def _changed_paths(self):
-        """The change set of the CLOSED interval `BASE_SHA..CANDIDATE_SHA`.
-
-        Two frozen endpoints, named explicitly, so this is neither the
-        working-tree form (`git diff --name-only <BASE>`, which measured
-        whatever happened to be on disk at run time) nor the `<BASE>..` form
-        (which means `<BASE>..HEAD` and follows a moving ref).
-
-        The `git ls-files --others --exclude-standard` branch that used to be
-        unioned in here is GONE, and that is not a loosening: it existed solely
-        to catch files P4 had added but not yet committed while P4 was the live
-        candidate. `CANDIDATE_SHA` is P4's finished commit, so it already
-        CONTAINS every file P4 added -- including this module -- and the
-        commit-to-commit diff reports them anyway.
-        """
-        tracked = _git(["diff", "--name-only", BASE_SHA, CANDIDATE_SHA],
-                       check=True).stdout.decode("utf-8").split()
-        return {p for p in tracked if "__pycache__" not in p}
-
-    def test_changed_paths_are_exactly_the_four_allowed(self):
-        self.assertEqual(self._changed_paths(), set(ALLOWED_CHANGED_PATHS))
-
-    def test_the_base_is_an_ancestor_of_the_candidate(self):
-        """Both endpoints are frozen literals, so a single mistyped character
-        would silently point every claim in this class at an unrelated piece of
-        history. This fails loudly instead."""
-        self.assertTrue(
-            _git_merge_base_is_ancestor(BASE_SHA, CANDIDATE_SHA),
-            "%s is not an ancestor of %s"
-            % (BASE_SHA[:12], CANDIDATE_SHA[:12]))
-
-    def test_every_excluded_path_is_byte_identical_to_the_base(self):
-        for rel in EXCLUDED_PATHS:
-            with self.subTest(rel):
-                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
-                                 _sha256(_git_show_bytes(BASE_SHA, rel)))
-
-    def test_every_excluded_module_symbol_is_ast_and_docstring_identical(self):
-        base = _top_level(ast.parse(_git_show_bytes(BASE_SHA,
-                                                    "scripts/cowork.py")))
-        cand = _top_level(ast.parse(_git_show_bytes(CANDIDATE_SHA,
-                                                    "scripts/cowork.py")))
-        for name in EXCLUDED_MODULE_SYMBOLS:
-            with self.subTest(name):
-                self.assertIn(name, cand)
-                self.assertEqual(_dump(cand[name]), _dump(base[name]))
-                self.assertEqual(ast.get_docstring(cand[name]),
-                                 ast.get_docstring(base[name]))
-
-    def test_every_excluded_run_flow_closure_is_ast_identical(self):
-        """The nested half, resolved by name through the module AST -- never
-        `inspect.getsource`, which cannot reach a closure without executing its
-        parent, and never a byte digest, which a legitimate re-indentation
-        would break on a CORRECT candidate."""
-        base_tree = ast.parse(_git_show_bytes(BASE_SHA, "scripts/cowork.py"))
-        cand_tree = ast.parse(_git_show_bytes(CANDIDATE_SHA,
-                                              "scripts/cowork.py"))
-        base = _closures_of(_top_level(base_tree)["run_flow"])
-        cand = _closures_of(_top_level(cand_tree)["run_flow"])
-        for name in EXCLUDED_RUN_FLOW_CLOSURES:
-            with self.subTest(name):
-                self.assertEqual(len(base.get(name, [])), 1, name)
-                self.assertEqual(len(cand.get(name, [])), 1, name)
-                self.assertEqual(_dump(cand[name][0]), _dump(base[name][0]))
-                self.assertEqual(ast.get_docstring(cand[name][0]),
-                                 ast.get_docstring(base[name][0]))
-
-    def test_each_edited_file_changes_only_its_named_symbols(self):
-        """D-P4-07. The authority names SYMBOLS, so the gate pins symbols:
-        nothing removed, only the declared names added, and every other
-        pre-existing top-level symbol AST- and docstring-identical."""
-        for rel in sorted(ALLOWED_SYMBOL_CHANGES):
-            base_tree = ast.parse(_git_show_bytes(BASE_SHA, rel))
-            cand_tree = ast.parse(_git_show_bytes(CANDIDATE_SHA, rel))
-            base, cand = _top_level(base_tree), _top_level(cand_tree)
-            with self.subTest(rel=rel, check="nothing removed"):
-                self.assertEqual(set(base) - set(cand), set())
-            with self.subTest(rel=rel, check="only declared additions"):
-                self.assertEqual(
-                    _module_level_names(cand_tree)
-                    - _module_level_names(base_tree),
-                    set(ALLOWED_NEW_SYMBOLS[rel]))
-            for name, node in sorted(base.items()):
-                if name in ALLOWED_SYMBOL_CHANGES[rel]:
-                    continue
-                with self.subTest(rel=rel, name=name):
-                    self.assertEqual(_dump(cand[name]), _dump(node))
-                    self.assertEqual(ast.get_docstring(cand[name]),
-                                     ast.get_docstring(node))
-
-    def test_the_two_historical_owner_suites_are_untouched(self):
-        """Their scope gates pin `cowork_report.py` and `cowork_state.py` to
-        THEIR bases, so both fail on this candidate -- which is correct, and is
-        exactly why editing them to pass would be the failure they exist to
-        prevent. Neither is in P4's allowed set.
-
-        Read from `CANDIDATE_SHA`, so the claim stays TRUE and HONEST: it says
-        P4 left those two files alone across P4's own interval, which no later
-        package editing them can retroactively falsify."""
-        for rel in ("scripts/test_m55_owner_store.py",
-                    "scripts/test_m55_owner_gate.py"):
-            with self.subTest(rel):
-                self.assertNotIn(rel, ALLOWED_CHANGED_PATHS)
-                self.assertEqual(_sha256(_git_show_bytes(CANDIDATE_SHA, rel)),
-                                 _sha256(_git_show_bytes(BASE_SHA, rel)))
-
-    def test_the_owner_module_is_not_a_p4_path_at_all(self):
-        """P4 is visibility only: nothing about how ownership is acquired,
-        refused, taken over or released may move."""
-        self.assertNotIn("scripts/cowork_owner.py", ALLOWED_CHANGED_PATHS)
-        self.assertIn("scripts/cowork_owner.py", EXCLUDED_PATHS)
 
 
 if __name__ == "__main__":

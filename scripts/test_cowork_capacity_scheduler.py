@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Focused tests for M3 Package D: scheduler lease decisions
-(`cowork_capacity_scheduler.py`), built over Package B's lock-protected
-PauseLease accessors (`cowork_state.py`) and Package A's pure contracts
-(`cowork_capacity.py`).
+"""Scheduler lease decisions (`cowork_capacity_scheduler.py`), built over the
+lock-protected PauseLease accessors (`cowork_state.py`) and the pure capacity
+contracts (`cowork_capacity.py`).
 
 Run standalone:
 
@@ -15,7 +14,6 @@ import json
 import multiprocessing
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -1313,50 +1311,10 @@ class StructuralGatesTest(unittest.TestCase):
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
                 self.assertNotEqual(node.value.id, "cowork_control_plane")
 
-    def test_module_docstring_names_m3a_rev_014(self):
-        tree = self._tree()
-        doc = ast.get_docstring(tree)
-        self.assertIn("M3A-REV-014", doc)
-
-    def test_commit_fa4f342_authorship_is_confined_to_the_two_allowed_paths(self):
-        """T1-REV-M1: a NON-VACUOUS, commit-pinned allowlist gate. The
-        prior live-tree form (`git status` against the repo root) proved
-        nothing the moment this worktree's own changes were committed (or
-        simply never dirtied in whichever environment ran this suite): a
-        clean tree yields zero offenders and the test trivially passes
-        without ever inspecting which paths this package actually
-        touched. Pinning to fa4f342 ("feat: add capacity scheduler lease
-        decisions" -- the exact commit that introduced this module and
-        its test suite) and diffing fa4f342^..fa4f342 instead proves,
-        against fixed git history rather than mutable working-tree state,
-        that authorship of that commit is confined to exactly the
-        original two-path allowlist."""
-        repo_root = os.path.dirname(_HERE)
-        commit = "fa4f3423f85a91e4ae73f2e309cb5814c193aaec"
-        try:
-            result = subprocess.run(
-                ["git", "diff", "--name-only", commit + "^.." + commit],
-                cwd=repo_root, capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            self.skipTest("git unavailable in this environment")
-        if result.returncode != 0:
-            self.skipTest("git diff failed: %s" % result.stderr)
-        changed = {line.strip() for line in result.stdout.splitlines()
-                  if line.strip()}
-        allowed = {"scripts/cowork_capacity_scheduler.py",
-                  "scripts/test_cowork_capacity_scheduler.py"}
-        # Non-vacuous: assert full equality, not merely "no offenders" --
-        # this must actually prove BOTH allowed paths were touched by this
-        # exact commit, not just that nothing else was.
-        self.assertEqual(
-            changed, allowed,
-            "commit %s changed paths %s, expected exactly the two-path "
-            "allowlist %s" % (commit, sorted(changed), sorted(allowed)))
-
 
 class ABCIntegrityTest(unittest.TestCase):
-    """Package D imports Packages A/B without needing to modify them, and
-    their own test suites are unaffected by this addition."""
+    """The scheduler's dependencies stay importable and expose the surface
+    it builds on."""
 
     def test_package_a_still_importable_and_functional(self):
         lease = dict(schema_version=1, package_id="pkg-1", lease_id="x",

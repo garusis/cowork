@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """cowork preflight helpers.
 
-Normal runs check Python/UI dependencies globally and check controller CLIs
-on-demand when a role launches, so missing active controllers can reach the
-switch-controller recovery gate. `cowork --check` still uses this module to
-diagnose all controller CLIs in one shot.
+Normal runs check the interpreter globally and check controller CLIs on-demand
+when a role launches (a missing controller ends the run with a structured
+failure). `cowork --check` uses this module to diagnose all controller CLIs in
+one shot.
 
 Python 3.9+, stdlib only.
 """
 
-import importlib.util
 import os
 import shutil
 import socket as _socket_mod
@@ -32,16 +31,6 @@ INSTALL_HINTS = {
         "    or: npm install -g opencode-ai / brew install sst/tap/opencode"
     ),
 }
-
-# Python packages powering the interactive UX: prompt_toolkit (conversation
-# input), rich (streaming markdown + banners), questionary (menus + confirm).
-# Checked by import, not on PATH. Map import-name -> pip-name (identical here).
-PY_PACKAGES = ["rich", "prompt_toolkit", "questionary"]
-PY_PACKAGE_HINT = (
-    "pip install -r requirements.txt\n"
-    "    (or: pip install rich prompt_toolkit questionary)"
-)
-
 
 def check_python(version_info=sys.version_info):
     """Return (ok, alert_or_None) for the interpreter floor."""
@@ -108,33 +97,10 @@ def check_governed_runtime(controllers, platform=sys.platform):
 check_controllers = check_tools
 
 
-def check_python_packages(packages, find_spec=importlib.util.find_spec):
-    """Return (ok, [alerts]) for importable Python packages. `find_spec` is
-    injectable for tests (return None to simulate a missing package)."""
-    alerts = []
-    for pkg in packages:
-        try:
-            missing = find_spec(pkg) is None
-        except (ImportError, ValueError):
-            missing = True
-        if missing:
-            alerts.append(
-                "Required Python package %r not installed.\n    Install it with: %s"
-                % (pkg, PY_PACKAGE_HINT)
-            )
-    return (len(alerts) == 0), alerts
-
-
 def preflight(role_config, version_info=sys.version_info, which=shutil.which,
-              interactive=True, find_spec=importlib.util.find_spec,
               platform=sys.platform):
-    """Run all preflight checks. Return (ok, [alerts]).
-
-    The rich UX packages (rich/prompt_toolkit/questionary) are required only for
-    the interactive flow; the non-interactive args path (--team/--config/--context)
-    uses the plain readline fallback and needs none of them. Every alert is
-    collected so the user sees all problems at once.
-    """
+    """Run all preflight checks. Return (ok, [alerts]). Every alert is
+    collected so every problem is reported at once."""
     alerts = []
     py_ok, py_alert = check_python(version_info)
     if not py_ok:
@@ -147,12 +113,7 @@ def preflight(role_config, version_info=sys.version_info, which=shutil.which,
         tools, platform=platform)
     alerts.extend(runtime_alerts)
 
-    pkg_ok = True
-    if interactive:
-        pkg_ok, pkg_alerts = check_python_packages(PY_PACKAGES, find_spec=find_spec)
-        alerts.extend(pkg_alerts)
-
-    return (py_ok and tools_ok and runtime_ok and pkg_ok), alerts
+    return (py_ok and tools_ok and runtime_ok), alerts
 
 
 def main(argv=None):
@@ -165,7 +126,7 @@ def main(argv=None):
         "_claude": {"controller": "claude"},
         "_codex": {"controller": "codex"},
     }
-    ok, alerts = preflight(role_config, interactive=True)
+    ok, alerts = preflight(role_config)
     opencode_ok, _ = check_tools(["opencode"])
     if ok:
         print("cowork preflight: OK")

@@ -20,7 +20,7 @@ Coverage map (the six required gaps):
   gap 3  SwitchNoteConsumptionTest          switch note + pending turn, once
   gap 4  EvaluatorDispatchContractTest      fresh/internal/read-only/muted
   gap 5  RetryLinkageTest                   attempt <-> prior-attempt linkage
-  gap 6  HeadlessInteractiveParityTest      same decision, different adapter
+  gap 6  (retired: the interactive/headless surfaces it compared are gone)
 
 Missing-contract witnesses live in `MissingDispatchContractTest`. Each
 `expectedFailure` there names exactly one absent contract and is paired with a
@@ -38,10 +38,12 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -102,9 +104,27 @@ class _DispatchEnv(_EvalEnvMixin):
     def setUp(self):
         super().setUp()
         self._scores_root()  # relocates COWORK_SESSIONS_ROOT
+        self.hermetic_version_resolver()
         self.cold_probe_cache()
         policy.deactivate()
         self.addCleanup(policy.deactivate)
+
+    def hermetic_version_resolver(self):
+        """Replace the probe cache's `claude --version` exec for this test only.
+
+        Live launch sites probe with `cache_enabled=True` and no `version_fn`,
+        so the cache key resolves the CLI version by exec'ing the resolved
+        binary. That exec is a provider launch this harness must never make.
+        A constant version keeps the real cache semantics (key computed, store
+        on a successful live probe, hit on a matching relaunch) so the probe
+        counts characterized here are unchanged; an unresolved CLI path still
+        yields no version, exactly like the real resolver."""
+        def offline_version(claude_path):
+            return "claude 0.0.0-offline" if claude_path else None
+        patcher = mock.patch.object(
+            bridge.probe_cache, "claude_version", offline_version)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def cold_probe_cache(self):
         """Point the global probe cache at a fresh file: the next probe is live."""
@@ -197,7 +217,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
         records, factory = self.recording_factory([self.ready()], intel)
         rc = cowork.run_scout(
             self.role_config("scout", "codex"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=io.StringIO(), intel_path=intel,
+            io_out=io.StringIO(), intel_path=intel,
             session_factory=factory)
         self.assertEqual(rc, 0)
         probes, spawn = self.recording_spawn()
@@ -218,7 +238,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
         probes, spawn = self.recording_spawn()
         rc = cowork.run_scout(
             self.role_config("scout", "claude"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=io.StringIO(), intel_path=intel,
+            io_out=io.StringIO(), intel_path=intel,
             session_factory=factory, claude_spawn=spawn,
             resume_id="RESUME-ID")
         self.assertEqual(rc, 0)
@@ -249,7 +269,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
             try:
                 cowork.run_scout(
                     self.role_config("scout", controller), "goal", ["scout"],
-                    io_in=io.StringIO(""), io_out=out,
+                    io_out=out,
                     intel_path=self.intel_path(), claude_spawn=spawn)
             except policy.DispatchBlocked:
                 pass
@@ -261,7 +281,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
             try:
                 rc = cowork.run_scout(
                     self.role_config("scout", controller), "goal", ["scout"],
-                    io_in=io.StringIO(""), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     intel_path=self.intel_path(), claude_spawn=spawn,
                     resume_id=resume_id)
             except policy.DispatchBlocked as exc:
@@ -401,7 +421,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
             return _Wt()
         artifact = cowork.run_worktree(
             self._worktree_config(), status, "/tmp", "name", False,
-            io_in=io.StringIO(""), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             session_factory=factory, claude_spawn=factory_spawn)
         self.assertEqual((artifact or {}).get("status"), "ready")
 
@@ -409,7 +429,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
         live_probes, bad_spawn = self.recording_spawn([{"type": "other"}])
         cowork.run_worktree(
             self._worktree_config(), status, "/tmp", "name", False,
-            io_in=io.StringIO(""), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             claude_spawn=bad_spawn)
 
         self.cold_probe_cache()
@@ -418,7 +438,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
         with policy.restricted(("opencode",)):
             blocked = cowork.run_worktree(
                 self._worktree_config(), status, "/tmp", "name", False,
-                io_in=io.StringIO(""), io_out=out, claude_spawn=guard_spawn)
+                io_out=out, claude_spawn=guard_spawn)
         return {
             "controller": "claude",
             "probe_spawns_with_factory": len(factory_probes),
@@ -435,7 +455,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
     def _saved_switch_session(self, pending_turn):
         spath = os.path.join(self._tmpdir(), ".cowork", "session.json")
         os.makedirs(os.path.dirname(spath), exist_ok=True)
-        team = ["scout", "planner", cowork.PLANNING_ADVISOR]
+        team = ["scout", cowork.SCOUT_REVIEWER, "planner", cowork.PLANNING_ADVISOR]
         state = state_store.ensure_session(spath, None, "SWITCH-CHAR")
         state = state_store.save_config(
             spath, team, cowork.default_config(team), prior=state)
@@ -470,7 +490,7 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
         args = cowork.build_parser().parse_args(
             ["--session-file", spath] + list(argv_extra))
         rc = cowork.run_flow(
-            args, io_in=io.StringIO(), io_out=io.StringIO(),
+            args, io_out=io.StringIO(),
             which=lambda tool: "/bin/" + tool, run_planner_fn=fake_planner)
         return rc, calls
 
@@ -491,38 +511,6 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
             "pending_turn_inlined": marker in context,
             "pending_switch_after": state_store.read_pending_switch(
                 state_store.load(spath), "planner"),
-        }
-
-    def _terminal_eval_queue(self, session_uuid="RETRY-CHAR"):
-        queue_path = state_store.evaluation_queue_path_for(session_uuid)
-        os.makedirs(os.path.dirname(queue_path), exist_ok=True)
-        evaluation.enqueue(queue_path, {
-            "entry_id": "E1", "seat": "scout", "phase": "scouting",
-            "round": 1, "scratch_path": os.path.join(
-                self._tmpdir(), "eval.scratch.json")})
-        evaluation.mark_attempt_started(queue_path, "E1", 1)
-        evaluation.mark_terminal(queue_path, "E1", "permanent", 1, 1,
-                                 transition_history=["attempt_started",
-                                                     "terminal"])
-        return queue_path
-
-    def _source_retry(self):
-        queue_path = self._terminal_eval_queue()
-        reopened = cowork.retry_terminal_evaluations("RETRY-CHAR")
-        records = evaluation.read_queue(queue_path)
-        retried = [r for r in records if r.get("state") == "retried"]
-        fold = evaluation.read_entry_lifecycle(records, "E1")
-        terminal = [r for r in records if r.get("state") == "terminal"]
-        return {
-            "reopened": reopened,
-            "state_after": retried[-1]["state"] if retried else fold.get(
-                "state"),
-            "prior_attempt_ref_present": bool(
-                retried and retried[-1].get("prior_attempt_ref")),
-            "prior_attempt_ref_points_at_terminal_marker": bool(
-                retried and terminal
-                and retried[-1].get("prior_attempt_ref")
-                in {t.get("marker_id") or t.get("id") for t in terminal}),
         }
 
     def _source_probe(self):
@@ -550,32 +538,12 @@ class DispatchSourceInventoryTest(_DispatchEnv, unittest.TestCase):
             "policy_block": outcome,
         }
 
-    def _source_headless(self):
-        intel = self.intel_path()
-        records, factory = self.recording_factory([self.ready()], intel)
-        rc = cowork.run_scout(
-            self.role_config("scout", "codex"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=io.StringIO(), intel_path=intel,
-            session_factory=factory, headless=True)
-        self.assertEqual(rc, 0)
-        probes, spawn = self.recording_spawn()
-        rec = records[0]
-        return {
-            "controller": rec["controller"],
-            "factory_kwargs": sorted(rec["kwargs"]),
-            "resume_value": rec["kwargs"]["resume_thread_id"],
-            "probe_spawns": len(probes),
-            "pre_dispatch_guard": self._has_pre_dispatch_guard_scout(
-                "codex", spawn),
-            "policy_block": self._policy_block_scout("codex", spawn),
-        }
-
     # -- the fixture-driven assertions -------------------------------------- #
 
     def test_fixture_covers_every_named_dispatch_source(self):
-        """The nine dispatch sources the brief enumerates each have a driver."""
+        """Every dispatch source the fixture pins has a driver."""
         required = {"fresh", "resume", "reviewer", "evaluator", "worktree",
-                    "switch", "retry", "probe", "headless"}
+                    "switch", "probe"}
         sources = set(_fixture()["sources"])
         self.assertEqual(sources, required)
         for name in sorted(required):
@@ -632,7 +600,7 @@ class DispatchOrderingTest(_DispatchEnv, unittest.TestCase):
                 calls, spawn = self.recording_spawn()
                 rc = cowork.run_scout(
                     self.role_config("scout", "claude"), "goal", ["scout"],
-                    io_in=io.StringIO(""), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     intel_path=intel, session_factory=factory,
                     claude_spawn=spawn, resume_id=resume_id)
                 self.assertEqual(rc, 0)
@@ -671,7 +639,7 @@ class DispatchOrderingTest(_DispatchEnv, unittest.TestCase):
                 calls, spawn = self.recording_spawn()
                 rc = cowork.run_scout(
                     self.role_config("scout", controller), "goal", ["scout"],
-                    io_in=io.StringIO(""), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     intel_path=intel, session_factory=factory,
                     claude_spawn=spawn)
                 self.assertEqual(rc, 0)
@@ -700,8 +668,7 @@ class DispatchOrderingTest(_DispatchEnv, unittest.TestCase):
         cowork.run_worktree(
             {"controller": "claude", "mode": "implement", "yolo": True,
              "model": None, "effort": None},
-            status, "/tmp", "name", False, io_in=io.StringIO(""),
-            io_out=io.StringIO(), session_factory=wt_factory,
+            status, "/tmp", "name", False, io_out=io.StringIO(), session_factory=wt_factory,
             claude_spawn=wt_spawn)
         self.assertEqual(wt_calls, [])
 
@@ -711,7 +678,7 @@ class DispatchOrderingTest(_DispatchEnv, unittest.TestCase):
         scout_calls, scout_spawn = self.recording_spawn()
         cowork.run_scout(
             self.role_config("scout", "claude"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=io.StringIO(), intel_path=intel,
+            io_out=io.StringIO(), intel_path=intel,
             session_factory=factory, claude_spawn=scout_spawn)
         self.assertEqual(len(scout_calls), 1)
 
@@ -724,7 +691,7 @@ class DispatchOrderingTest(_DispatchEnv, unittest.TestCase):
                          ["claude", "codex"])
         with policy.restricted(("opencode",)):
             ok, alerts = preflight.preflight(
-                cfg, which=lambda tool: "/bin/" + tool, interactive=False,
+                cfg, which=lambda tool: "/bin/" + tool,
                 platform="darwin")
         self.assertTrue(ok, alerts)
         self.assertEqual(alerts, [])
@@ -737,8 +704,7 @@ class DispatchOrderingTest(_DispatchEnv, unittest.TestCase):
             result = cowork.run_worktree(
                 {"controller": "claude", "mode": "implement", "yolo": True,
                  "model": None, "effort": None},
-                status, "/tmp", "name", False, io_in=io.StringIO(""),
-                io_out=out, claude_spawn=spawn)
+                status, "/tmp", "name", False, io_out=out, claude_spawn=spawn)
         self.assertIsNone(result)
         self.assertEqual(calls, [])
         self.assertNotIn("creating a git worktree", out.getvalue())
@@ -753,7 +719,7 @@ class SwitchNoteConsumptionTest(_DispatchEnv, unittest.TestCase):
     def _session_with_pending_switch(self, pending_turn):
         spath = os.path.join(self._tmpdir(), ".cowork", "session.json")
         os.makedirs(os.path.dirname(spath), exist_ok=True)
-        team = ["scout", "planner", cowork.PLANNING_ADVISOR]
+        team = ["scout", cowork.SCOUT_REVIEWER, "planner", cowork.PLANNING_ADVISOR]
         state = state_store.ensure_session(spath, None, "SWITCH-ONCE")
         state = state_store.save_config(
             spath, team, cowork.default_config(team), prior=state)
@@ -787,7 +753,7 @@ class SwitchNoteConsumptionTest(_DispatchEnv, unittest.TestCase):
         args = cowork.build_parser().parse_args(
             ["--session-file", spath] + list(argv_extra))
         rc = cowork.run_flow(
-            args, io_in=io.StringIO(), io_out=io.StringIO(),
+            args, io_out=io.StringIO(),
             which=lambda tool: "/bin/" + tool, run_planner_fn=fake_planner)
         return rc, calls
 
@@ -959,22 +925,6 @@ class RetryLinkageTest(_DispatchEnv, unittest.TestCase):
                                                      "terminal"])
         return queue_path
 
-    def test_evaluator_retry_links_to_the_terminal_marker_it_reopened(self):
-        queue_path = self._terminal_queue()
-        self.assertEqual(cowork.retry_terminal_evaluations("RETRY-LINK"), 1)
-        records = evaluation.read_queue(queue_path)
-        retried = [r for r in records if r.get("state") == "retried"]
-        self.assertEqual(len(retried), 1)
-        terminal = [r for r in records if r.get("state") == "terminal"]
-        self.assertEqual(len(terminal), 1)
-        ids = {terminal[0].get(key) for key in ("marker_id", "id")}
-        self.assertIn(retried[0]["prior_attempt_ref"], ids,
-                      "the retry must name the terminal marker it reopened")
-        # The earlier records survive verbatim: a retry links, never overwrites.
-        self.assertTrue(any(r.get("state") == "terminal" for r in records))
-        self.assertTrue(any(r.get("state") == "attempt_started"
-                            for r in records))
-
     def test_evaluator_attempts_are_recorded_before_they_run(self):
         queue_path = self._terminal_queue("RETRY-ORDER")
         states = [r.get("state") for r in evaluation.read_queue(queue_path)]
@@ -1022,106 +972,6 @@ class RetryLinkageTest(_DispatchEnv, unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# gap 6 — headless and interactive make the same dispatch decision.            #
-# --------------------------------------------------------------------------- #
-
-class HeadlessInteractiveParityTest(_DispatchEnv, unittest.TestCase):
-    def _dispatch(self, controller, headless, statuses, resume_id=None):
-        self.cold_probe_cache()
-        intel = self.intel_path()
-        records, factory = self.recording_factory(statuses, intel)
-        probes, spawn = self.recording_spawn()
-        out = io.StringIO()
-        rc = cowork.run_scout(
-            self.role_config("scout", controller), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=out, intel_path=intel,
-            session_factory=factory, claude_spawn=spawn, headless=headless,
-            resume_id=resume_id)
-        return {"rc": rc, "records": [self._normalize(r) for r in records],
-                "probes": len(probes), "out": out.getvalue()}
-
-    @staticmethod
-    def _normalize(record):
-        """Blank the freshly minted claude session UUID: the DECISION to pin an
-        id up front is the fact under test, not the random value."""
-        record = {"controller": record["controller"],
-                  "positional": record["positional"],
-                  "kwargs": dict(record["kwargs"])}
-        if record["kwargs"].get("session_id"):
-            record["kwargs"]["session_id"] = "<minted-uuid>"
-        return record
-
-    def test_same_dispatch_facts_fresh_and_resumed_across_both_surfaces(self):
-        for controller, resume_id in (("codex", None), ("codex", "T1"),
-                                      ("claude", None), ("claude", "R1"),
-                                      ("opencode", None)):
-            with self.subTest(controller=controller, resume=bool(resume_id)):
-                interactive = self._dispatch(
-                    controller, False, [self.ready()], resume_id)
-                headless = self._dispatch(
-                    controller, True, [self.ready()], resume_id)
-                self.assertEqual(interactive["records"], headless["records"])
-                self.assertEqual(interactive["probes"], headless["probes"])
-
-    def test_same_policy_refusal_on_both_surfaces(self):
-        for headless in (False, True):
-            with self.subTest(headless=headless):
-                self.cold_probe_cache()
-                out = io.StringIO()
-                with policy.restricted(("claude",)):
-                    rc = cowork.run_scout(
-                        self.role_config("scout", "codex"), "goal", ["scout"],
-                        io_in=io.StringIO(""), io_out=out,
-                        intel_path=self.intel_path(), headless=headless)
-                self.assertEqual(rc, 1)
-                self.assertIn("does not allow", out.getvalue())
-
-    def test_only_the_gate_adapter_differs(self):
-        """Identical dispatch, divergent gate handling.
-
-        The dispatch decision is made before the loop; the loop is the adapter.
-        Driven through `_role_loop` (the same seam the existing headless tests
-        use) so the difference is unambiguous: headless auto-nudges a
-        `needs_input` and reaches approval with NO input, while the interactive
-        surface hands the same status to the user and ends on EOF.
-        """
-        statuses = [self.needs_input(0), self.ready()]
-
-        def scripted(path, writes):
-            class _Scripted:
-                def __init__(self):
-                    self.sent = []
-
-                def send(self, text):
-                    self.sent.append(text)
-                    if writes:
-                        os.makedirs(os.path.dirname(path), exist_ok=True)
-                        with open(path, "w", encoding="utf-8") as fh:
-                            json.dump(writes.pop(0), fh)
-
-                def close(self):
-                    pass
-            return _Scripted()
-
-        path = self.intel_path()
-        headless_session = scripted(path, list(statuses))
-        _, headless_outcome, _ = cowork._role_loop(
-            headless_session, "seed", path, context="",
-            io_in=io.StringIO(""), io_out=io.StringIO(), headless=True)
-
-        path = self.intel_path()
-        interactive_session = scripted(path, list(statuses))
-        _, interactive_outcome, _ = cowork._role_loop(
-            interactive_session, "seed", path, context="",
-            io_in=io.StringIO(""), io_out=io.StringIO(), headless=False)
-
-        self.assertEqual(headless_outcome, "approved")
-        self.assertEqual(interactive_outcome, "ended")
-        self.assertEqual(len(headless_session.sent), 2)
-        self.assertEqual(len(interactive_session.sent), 1)
-
-
-# --------------------------------------------------------------------------- #
 # The contract that does not exist yet.                                        #
 # --------------------------------------------------------------------------- #
 
@@ -1140,7 +990,7 @@ class MissingDispatchContractTest(_DispatchEnv, unittest.TestCase):
             try:
                 rc = cowork.run_scout(
                     self.role_config("scout", controller), "goal", ["scout"],
-                    io_in=io.StringIO(""), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     intel_path=self.intel_path(), claude_spawn=spawn)
             except policy.DispatchBlocked as exc:
                 return ("raised", exc.kind)
@@ -1202,11 +1052,11 @@ class MissingDispatchContractTest(_DispatchEnv, unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# M1 backend criterion 1 — non-vacuous across all nine characterization       #
+# M1 backend criterion 1 — non-vacuous across every characterization         #
 # sources.                                                                     #
 #                                                                               #
 # Each source method drives BOTH a real allowed dispatch and a real refused   #
-# one (or, for retry/probe, the one real production mechanism that source     #
+# one (or, for probe, the one real production mechanism that source          #
 # actually has) and runs three checks against concrete, captured evidence:    #
 #   C1 shape    — every decision observed is a manifest-bound allow or a real #
 #                 production refusal (refusal_code/source drawn from          #
@@ -1294,7 +1144,7 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
         _, factory = self.recording_factory([self.ready()], intel)
         rc = cowork.run_scout(
             self.role_config("scout", "codex"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=io.StringIO(), intel_path=intel,
+            io_out=io.StringIO(), intel_path=intel,
             session_factory=factory, trace=trace, session_uuid=session_uuid)
         self.assertEqual(rc, 0)
         events = self._trace_events(tpath)
@@ -1313,40 +1163,8 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
         with policy.restricted(("opencode",)):
             rc2 = cowork.run_scout(
                 self.role_config("scout", "codex"), "goal", ["scout"],
-                io_in=io.StringIO(""), io_out=out,
+                io_out=out,
                 intel_path=self.intel_path(),
-                session_uuid=str(uuid.uuid4()))
-        self.assertEqual(rc2, 1)
-        self.assertIn("does not allow", out.getvalue())
-
-    @_covers('headless')
-    def test_c1_headless_manifest_bound_allow_and_real_policy_veto(self):
-        """`headless` shares fresh's dispatch facts (M0-B fixture note); the
-        gate adapter differs, the fence does not."""
-        session_uuid = str(uuid.uuid4())
-        tpath, trace = self._trace("C1-HEADLESS")
-        intel = self.intel_path()
-        _, factory = self.recording_factory([self.ready()], intel)
-        rc = cowork.run_scout(
-            self.role_config("scout", "codex"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=io.StringIO(), intel_path=intel,
-            session_factory=factory, headless=True, trace=trace,
-            session_uuid=session_uuid)
-        self.assertEqual(rc, 0)
-        events = self._trace_events(tpath)
-        allows = self._decisions(events, "run_scout", "allow")
-        self.assertEqual(len(allows), 1, "C1: headless has no allow to check")
-        manifest = manifest_mod.load_manifest(
-            state_store.manifest_path_for(session_uuid, "scout"))
-        self._assert_manifest_bound("headless", allows[0], manifest)  # C2
-
-        self.cold_probe_cache()
-        out = io.StringIO()
-        with policy.restricted(("opencode",)):
-            rc2 = cowork.run_scout(
-                self.role_config("scout", "codex"), "goal", ["scout"],
-                io_in=io.StringIO(""), io_out=out,
-                intel_path=self.intel_path(), headless=True,
                 session_uuid=str(uuid.uuid4()))
         self.assertEqual(rc2, 1)
         self.assertIn("does not allow", out.getvalue())
@@ -1364,7 +1182,7 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
         _, spawn = self.recording_spawn()
         rc = cowork.run_scout(
             self.role_config("scout", "claude"), "goal", ["scout"],
-            io_in=io.StringIO(""), io_out=io.StringIO(), intel_path=intel,
+            io_out=io.StringIO(), intel_path=intel,
             session_factory=factory, claude_spawn=spawn,
             resume_id="RESUME-ID", trace=trace, session_uuid=session_uuid)
         self.assertEqual(rc, 0)
@@ -1384,7 +1202,7 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
             with self.assertRaises(policy.DispatchBlocked) as ctx:
                 cowork.run_scout(
                     self.role_config("scout", "claude"), "goal", ["scout"],
-                    io_in=io.StringIO(""), io_out=io.StringIO(),
+                    io_out=io.StringIO(),
                     intel_path=self.intel_path(), claude_spawn=spawn2,
                     resume_id="RESUME-ID", trace=trace2,
                     session_uuid=session_uuid2)
@@ -1450,11 +1268,19 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
         session_uuid = str(uuid.uuid4())
         tpath, trace = self._trace("C1-EVALUATOR")
         scratch = os.path.join(self._tmpdir(), "eval.scratch.json")
-        session = cowork._isolated_evaluator_session(
-            {"scratch_path": scratch}, {"tool": "claude", "model": "m",
-                                        "effort": None},
-            trace=trace, io_out=io.StringIO(), session_uuid=session_uuid)
+        # Fake only the lowest process boundary: the real `ClaudeSession`
+        # (and its `policy.guard` veto) still runs; only its `claude -p`
+        # process is replaced, so no provider is launched.
+        spawned = []
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               side_effect=self._fake_claude_popen(spawned)):
+            session = cowork._isolated_evaluator_session(
+                {"scratch_path": scratch}, {"tool": "claude", "model": "m",
+                                            "effort": None},
+                trace=trace, io_out=io.StringIO(), session_uuid=session_uuid)
         self.addCleanup(session.close)
+        self.assertIsInstance(session, bridge.ClaudeSession)
+        self.assertEqual(len(spawned), 1, "allow path spawns exactly once")
         events = self._trace_events(tpath)
         allows = self._decisions(events, "_isolated_evaluator_session",
                                  "allow")
@@ -1463,14 +1289,59 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
             state_store.manifest_path_for(session_uuid, "evaluator"))
         self._assert_manifest_bound("evaluator", allows[0], manifest)  # C2
 
-        with policy.restricted(("opencode",)):
-            with self.assertRaises(policy.DispatchBlocked) as ctx:
-                cowork._isolated_evaluator_session(
-                    {"scratch_path": scratch},
-                    {"tool": "claude", "model": "m", "effort": None},
-                    io_out=io.StringIO(), session_uuid=str(uuid.uuid4()))
+        denied_spawns = []
+        with mock.patch.object(
+                bridge.subprocess, "Popen",
+                side_effect=self._fake_claude_popen(denied_spawns)):
+            with policy.restricted(("opencode",)):
+                with self.assertRaises(policy.DispatchBlocked) as ctx:
+                    cowork._isolated_evaluator_session(
+                        {"scratch_path": scratch},
+                        {"tool": "claude", "model": "m", "effort": None},
+                        io_out=io.StringIO(), session_uuid=str(uuid.uuid4()))
         self.assertEqual(ctx.exception.kind, "dispatch")  # C3: real
         self.assertEqual(ctx.exception.role, "evaluator")
+        self.assertEqual(denied_spawns, [], "veto must precede any Popen")
+
+    @staticmethod
+    def _fake_claude_popen(calls):
+        """A `subprocess.Popen` stand-in for the `claude` CLI only.
+
+        A claude argv is recorded and answered with an idle, already-exited
+        process (enough for construct + close); it never reaches the real
+        `Popen`. Any other argv (non-provider local tooling) is delegated to
+        the real `Popen` unchanged, since patching `bridge.subprocess` patches
+        the process-wide module."""
+        real_popen = subprocess.Popen
+        class _FakeProc:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = iter(())
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        def is_claude(command):
+            if isinstance(command, (str, bytes)):
+                return False
+            return any(os.path.basename(str(part)) == "claude"
+                       for part in command)
+
+        def fake_popen(command, *args, **kwargs):
+            if not is_claude(command):
+                return real_popen(command, *args, **kwargs)
+            calls.append(list(command))
+            return _FakeProc()
+        return fake_popen
 
     # -- worktree: the policy fact and the manifest are decided TOGETHER;   #
     # a policy veto short-circuits before any manifest compile, so its      #
@@ -1496,7 +1367,7 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
             return _Wt()
         cowork.run_worktree(
             self._worktree_config(), status_path, "/tmp", "name", False,
-            io_in=io.StringIO(""), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             session_factory=factory, trace=trace, session_uuid=session_uuid,
             extra_writable_dir=self._tmpdir())
         events = self._trace_events(tpath)
@@ -1513,7 +1384,7 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
             result = cowork.run_worktree(
                 self._worktree_config(),
                 os.path.join(self._tmpdir(), "wt2.status.json"), "/tmp",
-                "name", False, io_in=io.StringIO(""), io_out=out,
+                "name", False, io_out=out,
                 trace=trace2, session_uuid=session_uuid2,
                 extra_writable_dir=self._tmpdir())
         self.assertIsNone(result)  # C3: real clean refusal, no artifact
@@ -1531,7 +1402,7 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
     def _saved_switch_session(self, session_uuid, pending_turn):
         spath = os.path.join(self._tmpdir(), session_uuid, "session.json")
         os.makedirs(os.path.dirname(spath), exist_ok=True)
-        team = ["scout", "planner", cowork.PLANNING_ADVISOR]
+        team = ["scout", cowork.SCOUT_REVIEWER, "planner", cowork.PLANNING_ADVISOR]
         state = state_store.ensure_session(spath, None, session_uuid)
         state = state_store.save_config(
             spath, team, cowork.default_config(team), prior=state)
@@ -1565,7 +1436,7 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
 
         args = cowork.build_parser().parse_args(["--session-file", spath])
         rc = cowork.run_flow(
-            args, io_in=io.StringIO(), io_out=io.StringIO(),
+            args, io_out=io.StringIO(),
             which=lambda tool: "/bin/" + tool, run_planner_fn=fake_planner)
         self.assertEqual(rc, 0)
 
@@ -1593,35 +1464,6 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
         after = state_store.load(spath)
         self.assertEqual(after["config"]["planner"]["controller"], "codex")
 
-    # -- retry: no manifest concept — the meaningful production evidence is #
-    # real prior-attempt linkage to the terminal marker it reopened.       #
-
-    @_covers('retry')
-    def test_c1_retry_real_prior_attempt_linkage(self):
-        session_uuid = "CRITERION1-RETRY-%s" % uuid.uuid4()
-        queue_path = state_store.evaluation_queue_path_for(session_uuid)
-        os.makedirs(os.path.dirname(queue_path), exist_ok=True)
-        evaluation.enqueue(queue_path, {
-            "entry_id": "E1", "seat": "scout", "phase": "scouting",
-            "round": 1})
-        evaluation.mark_attempt_started(queue_path, "E1", 1)
-        evaluation.mark_terminal(queue_path, "E1", "permanent", 1, 1,
-                                 transition_history=["attempt_started",
-                                                     "terminal"])
-        reopened = cowork.retry_terminal_evaluations(session_uuid)
-        self.assertEqual(reopened, 1, "C1: retry has nothing to check")
-        records = evaluation.read_queue(queue_path)
-        retried = [r for r in records if r.get("state") == "retried"]
-        terminal = [r for r in records if r.get("state") == "terminal"]
-        self.assertEqual(len(retried), 1)
-        # C3: the linkage is REAL — it names the actual terminal marker this
-        # session produced, not a synthetic/random work id.
-        marker_ids = {t.get("marker_id") or t.get("id") for t in terminal}
-        self.assertIn(retried[0].get("prior_attempt_ref"), marker_ids)
-        self.assertNotEqual(retried[0].get("prior_attempt_ref"), "")
-        # the entry_id is the real production seat identity, never invented.
-        self.assertEqual(retried[0].get("entry_id"), "E1")
-
     # -- probe: itself a guarded dispatch (kind="probe"), decided BEFORE    #
     # argv reaches the spawn — the refusal IS the real DispatchBlocked.    #
 
@@ -1646,19 +1488,19 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
         self.assertEqual(blocked_calls, [],
                          "the guard must decide before argv reaches spawn")
 
-    # -- non-vacuity witness: the fixture's nine sources are exactly the    #
-    # nine this class exercises.                                            #
+    # -- non-vacuity witness: the fixture's sources are exactly the ones    #
+    # this class exercises.                                                 #
 
-    def test_fixture_sources_exactly_match_the_nine_exercised_here(self):
+    def test_fixture_sources_exactly_match_the_ones_exercised_here(self):
         required = {"fresh", "resume", "reviewer", "evaluator", "worktree",
-                    "switch", "retry", "probe", "headless"}
+                    "switch", "probe"}
         self.assertEqual(set(_fixture()["sources"]), required)
 
         # "exercised" is DERIVED from the actual test methods discovered on
         # this class (never a hardcoded literal disconnected from reality):
         # every real `test_c1_*` method must carry an `@_covers(source)`
         # marker, and the sources those markers name must be exactly the
-        # required nine — a renamed/removed test or a source that lost its
+        # required set — a renamed/removed test or a source that lost its
         # marker fails this loudly instead of leaving a stale literal green.
         covered = collections.defaultdict(list)
         for name in dir(type(self)):

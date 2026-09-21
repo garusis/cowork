@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — set up cowork so it runs from any folder.
 #
-# Creates a dedicated virtualenv for the interactive UX deps, makes the
+# Creates a dedicated virtualenv for cowork's Python deps, makes the
 # `cowork` launcher available on your PATH (via ~/.zshrc), and verifies the
 # controller CLIs. Idempotent — safe to re-run.
 set -euo pipefail
@@ -48,8 +48,8 @@ else
     fi
 fi
 
-# 3. Install the interactive UX deps into the venv.
-info "Installing deps (rich, prompt_toolkit, questionary)"
+# 3. Install the Python deps into the venv.
+info "Installing deps (requirements.txt)"
 "$VENV_PY" -m pip install --upgrade --quiet pip
 "$VENV_PY" -m pip install --quiet -r "$APP_DIR/requirements.txt"
 ok "Deps installed"
@@ -151,5 +151,6 @@ fi
 if [ "$path_action" = "reload" ]; then
     echo
     info "Open a new terminal (or run: source ~/.zshrc), then from any folder:"
-    info "  cowork            # .cowork/ session lands in the current directory"
+    info "  cowork --help    # agent invocation contract"
+    info "  cowork --team scout,scout-reviewer --context-file ./brief.md    # scouting-only session; .cowork/ anchor lands in the current directory"
 fi

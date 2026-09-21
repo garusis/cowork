@@ -181,7 +181,7 @@ class _M3E2EBase(unittest.TestCase):
                                     retry_evidence=retry_evidence)
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity",
                          "fixture precondition: capacity entry must succeed")
@@ -297,7 +297,7 @@ class RetryEvidenceNegativeControlsTest(_M3E2EBase):
                             "value": _far_future_rfc3339()})
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         # Refused: never durably entered awaiting_capacity on a stale/
         # implausible horizon.
@@ -360,7 +360,7 @@ class LocalGuardAndUnknownProviderNegativeControlsTest(_M3E2EBase):
 
         rc, outcome, payload = cowork._role_loop(
             _DeniedSession(), "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         self.assertNotEqual(outcome, "awaiting_capacity")
         health = state_store.read_provider_health(suid, role, "claude")
@@ -377,7 +377,7 @@ class LocalGuardAndUnknownProviderNegativeControlsTest(_M3E2EBase):
         sess = self._FailingSession("claude", "a-token-nobody-recognizes")
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         self.assertNotEqual(outcome, "awaiting_capacity")
         health = state_store.read_provider_health(suid, role, "claude")
@@ -889,14 +889,14 @@ class ZeroSameProviderAutoRetryNegativeControlsTest(_M3E2EBase):
                 out = io.StringIO()
                 rc, outcome, payload = cowork._role_loop(
                     sess, "do the thing", status_path, context="",
-                    io_in=io.StringIO(""), io_out=out,
+                    io_out=out,
                     role=role, session_uuid=suid, role_work_id=work_id)
                 self.assertEqual(outcome, "awaiting_capacity")
                 self.assertNotIn("choose: retry", out.getvalue())
                 self.assertEqual(len(sess.sends), 1,
                                  "must never auto-retry the same provider")
 
-    def test_authentication_failed_user_retry_choice_refused_at_gate(self):
+    def test_authentication_failed_is_never_resent(self):
         spath, suid = self._session()
         role = "builder"
         work_id, manifest, binding = self._bind_capacity_candidate(suid, role)
@@ -904,15 +904,15 @@ class ZeroSameProviderAutoRetryNegativeControlsTest(_M3E2EBase):
         sess = self._FailingSession("claude", "authentication_failed")
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("retry\nend\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         self.assertEqual(len(sess.sends), 1,
-                         "a user-forced retry choice must never be honored "
-                         "for a same-provider-retry-blocked outcome")
+                         "an authentication failure is never resent to the "
+                         "same provider")
+        self.assertEqual(outcome, "ended")
         ps = state_store.current_phase_state(suid, work_id)
         self.assertEqual(ps["state"], "failed")
-        self.assertEqual(ps["evidence"].get("reason"),
-                         "same_provider_retry_blocked")
+        self.assertEqual(ps["evidence"].get("reason"), "send_failed")
 
 
 # =============================================================================
@@ -940,7 +940,7 @@ class ProviderHealthMalformedInputNegativeControlsTest(_M3E2EBase):
         sess = self._FailingSession("claude", "totally-made-up-shape")
         cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         health = state_store.read_provider_health(suid, role, "claude")
         self.assertEqual(health["last_outcome"], "unknown_provider_failure")
@@ -961,7 +961,7 @@ class LegacyCompatibilitySmokeTest(_M3E2EBase):
         sess = self._AcceptingSession()
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
-            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            io_out=io.StringIO(),
             role=role, session_uuid=suid, role_work_id=work_id)
         self.assertNotEqual(outcome, "awaiting_capacity")
         self.assertIsNone(state_store.read_capacity_packet(suid, "no-such-package"))
@@ -1331,7 +1331,7 @@ class GenuineChainReachesAttemptsExhaustedTest(_M3E2EBase):
                 io_out=io.StringIO(), session_id="prov-sess-1")
             rc, outcome, payload = cowork._role_loop(
                 session, "do the thing", status_path, context="",
-                io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+                io_out=io.StringIO(),
                 role=role, session_uuid=suid, role_work_id=work_id)
         self.assertEqual(outcome, "awaiting_capacity")
         packet = state_store.read_capacity_packet(suid, payload["package_id"])
