@@ -10356,6 +10356,8 @@ import cowork_pricing  # noqa: E402
 import cowork_probe_cache as probe_cache  # noqa: E402
 import cowork_handoff as handoff  # noqa: E402
 import cowork_verification as verification  # noqa: E402
+import cowork_verification_evidence as evidence_module  # noqa: E402
+import unittest.mock as mock  # noqa: E402
 
 
 def _render_summary(summary, session_uuid=None):
@@ -13407,8 +13409,12 @@ class TransportChokePointTests(unittest.TestCase):
                 # a closed set computed by _record_readiness, never from role
                 # output, so nothing free-form rides this boundary.
                 "_unverified_readiness_delivery",
+                # Issue #51: the deferred-evidence hand-back — a static
+                # template with only the transaction id and plan labels.
+                "_deferred_verification_delivery",
             },
             "_unverified_readiness_delivery": {"_role_loop"},
+            "_deferred_verification_delivery": {"_role_loop"},
             "_worktree_seed_delivery": {"run_worktree"},
             "_repair_delivery": {"_role_loop"},
             "_missing_question_delivery": {"_role_loop"},
@@ -22089,6 +22095,878 @@ class ReuseAvoidedCostTests(_OwnedVerificationTestBase):
         self.assertEqual(avoided["reused"][0]["transaction_id"],
                          txn1["transaction_id"])
         self.assertEqual(avoided["reused"][0]["reuse_count"], 1)
+
+
+class _QuickJoinThread(object):
+    """Test-only proxy for a worker's startup-capture thread whose `join`
+    is bounded to a short wait (see `_defer_first_run`)."""
+
+    def __init__(self, thread):
+        self._thread = thread
+
+    def join(self, timeout=None):
+        if self._thread is not None:
+            self._thread.join(timeout=0.1)
+
+    def __getattr__(self, name):
+        return getattr(self._thread, name)
+
+
+class _DeferredEvidenceMixin(object):
+    """Shared fixture for issue #51: a REAL final-suite command that outlives
+    the first bounded evidence poll (only that first poll is faked, exactly as
+    test_m5_package_c does), then a later continuation through the production
+    single-flight path. Every deferred transaction's command group and worker
+    are killed in cleanup so nothing leaks past the test."""
+
+    LABEL = "final"
+
+    def _write_plan(self, entries):
+        assets = state_store.session_assets_dir(self.session_uuid)
+        os.makedirs(assets, exist_ok=True)
+        plan = {"result": {"verification": [dict(e) for e in entries],
+                           "verification_schema": 2}}
+        with open(os.path.join(assets, "planner.plan.json"), "w") as fh:
+            json.dump(plan, fh)
+
+    def _gated_cmd(self, launch_marker, release_path, exit_code=0,
+                   max_s=120):
+        """A real command that records its launch, then stays alive until
+        the test creates `release_path` (bounded by `max_s`), then exits
+        `exit_code`. Gating instead of sleeping keeps the suite's wall time
+        small while still letting the command outlive the first poll."""
+        return ["python3", "-c",
+                "import os, sys, time\n"
+                "open(%r, 'a').write('launch' + chr(10))\n"
+                "t0 = time.time()\n"
+                "while not os.path.exists(%r) and time.time() - t0 < %r:\n"
+                "    time.sleep(0.05)\n"
+                "sys.exit(%d)\n"
+                % (launch_marker, release_path, max_s, exit_code)]
+
+    def _release(self, release_path):
+        with open(release_path, "w") as fh:
+            fh.write("go\n")
+
+    def _final_entries(self, command):
+        return [{"label": self.LABEL, "command": command,
+                 "execution_mode": "isolated_snapshot",
+                 "kind": verification.KIND_FINAL_SUITE}]
+
+    @contextlib.contextmanager
+    def _defer_first_run(self):
+        def fake_wait(session_uuid, transaction_id, labels, poll_attempts,
+                      poll_delay_s):
+            # A short REAL delay so the worker has started the command and
+            # published its pgid before should_defer_teardown's own (real)
+            # liveness check runs.
+            time.sleep(0.3)
+            return {label: {"evidence_state":
+                            evidence_module.EVIDENCE_UNRESOLVED}
+                    for label in labels}
+        real_spawn = verification.spawn_worker
+
+        def spawn_quick_join(*args, **kwargs):
+            # The deferring run deliberately keeps the worker alive, so the
+            # finally block's bounded `startup_capture_thread.join(5)` is a
+            # guaranteed 5s idle wait (the pipe cannot EOF). Bound it to a
+            # short join; the daemon capture thread keeps running as-is.
+            started = real_spawn(*args, **kwargs)
+            proc, fd, thread = started
+            return verification.WorkerStartupResult(
+                proc, fd, _QuickJoinThread(thread),
+                getattr(started, "classification", None))
+        with mock.patch.object(evidence_module, "bounded_evidence_wait",
+                               side_effect=fake_wait), \
+                mock.patch.object(verification, "spawn_worker",
+                                  side_effect=spawn_quick_join):
+            yield
+
+    @contextlib.contextmanager
+    def _short_reconcile_poll(self):
+        """Shorten ONLY the reconciler's own default bounded poll (it calls
+        `bounded_evidence_wait` without poll arguments); a fresh
+        transaction's primary wait passes explicit arguments and is left
+        untouched. Same real function, same liveness logic."""
+        real = evidence_module.bounded_evidence_wait
+
+        def short(session_uuid, transaction_id, labels, **kwargs):
+            if "poll_attempts" not in kwargs:
+                kwargs["poll_attempts"] = 2
+                kwargs["poll_delay_s"] = 0.1
+            return real(session_uuid, transaction_id, labels, **kwargs)
+        with mock.patch.object(evidence_module, "bounded_evidence_wait",
+                               short):
+            yield
+
+    def _run(self, command):
+        """An ordinary continuation: run_transaction with the identical
+        inventory (a fresh copy), under the shortened reconciler poll."""
+        with self._short_reconcile_poll():
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, self._final_entries(command))
+        self._track(result.get("transaction_id"))
+        return result
+
+    def _track(self, transaction_id):
+        if transaction_id:
+            self.addCleanup(self._kill_transaction_processes, transaction_id)
+
+    def _kill_transaction_processes(self, transaction_id):
+        if not transaction_id:
+            return
+        active = state_store.read_json_tolerant(
+            state_store.verification_active_pgid_path_for(
+                self.session_uuid, transaction_id))
+        if isinstance(active, dict) and active.get("pgid"):
+            try:
+                os.killpg(active["pgid"], signal.SIGKILL)
+            except OSError:
+                pass
+        identity = state_store.read_json_tolerant(
+            state_store.verification_worker_identity_path_for(
+                self.session_uuid, transaction_id))
+        if isinstance(identity, dict) and identity.get("pid"):
+            try:
+                os.killpg(os.getpgid(identity["pid"]), signal.SIGKILL)
+            except OSError:
+                pass
+
+    def _wait_for_terminal_event(self, transaction_id, label, timeout=60):
+        path = state_store.verification_attempt_events_path_for(
+            self.session_uuid, transaction_id)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for ev in state_store.read_jsonl_tolerant(path):
+                if ev.get("label") == label and ev.get("event") == "terminal":
+                    return ev
+            time.sleep(0.2)
+        self.fail("no terminal event for %s within %ss" % (label, timeout))
+
+    def _ledger_records(self, transaction_id, label):
+        key = cowork_ledger.owned_attempt_key(transaction_id, label)
+        return [rec for rec in cowork_ledger.read_ledger(
+                    state_store.ledger_path_for(self.session_uuid))
+                if rec.get("kind") == "attempt" and not rec.get("marker")
+                and rec.get("attempt_key") == key]
+
+    def _launches(self, marker):
+        if not os.path.exists(marker):
+            return 0
+        with open(marker) as fh:
+            return fh.read().split().count("launch")
+
+    def _marker_file(self, transaction_id):
+        return state_store.verification_deferred_reconciliation_path_for(
+            self.session_uuid, transaction_id)
+
+    def _result_on_disk(self, transaction_id):
+        return state_store.read_json_tolerant(
+            state_store.verification_result_path_for(
+                self.session_uuid, transaction_id))
+
+    def _lock_meta_path(self, request_key):
+        return state_store.verification_lock_path_for(
+            self.session_uuid, request_key) + ".meta"
+
+    def _bytes(self, path):
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    @contextlib.contextmanager
+    def _killpg_signals_spy(self):
+        """Record every NON-ZERO signal sent through os.killpg. Signal 0 is
+        the reconciler's own liveness probe (`_pgid_alive`), a legitimate
+        read that is never counted."""
+        sent = []
+        real = os.killpg
+
+        def spy(pgid, sig):
+            if sig != 0:
+                sent.append((pgid, sig))
+            return real(pgid, sig)
+        with mock.patch.object(os, "killpg", side_effect=spy):
+            yield sent
+
+    @contextlib.contextmanager
+    def _teardown_call_spies(self):
+        calls = []
+        real_cleanup = verification.cleanup_active_command_group
+        real_terminate = verification.terminate_worker
+        real_teardown = evidence_module._teardown_worker_process_group
+
+        def spy(name, real):
+            def _spy(*a, **k):
+                calls.append(name)
+                return real(*a, **k)
+            return _spy
+        with mock.patch.object(verification, "cleanup_active_command_group",
+                               side_effect=spy("cleanup", real_cleanup)), \
+             mock.patch.object(verification, "terminate_worker",
+                               side_effect=spy("terminate", real_terminate)), \
+             mock.patch.object(evidence_module,
+                               "_teardown_worker_process_group",
+                               side_effect=spy("teardown", real_teardown)):
+            yield calls
+
+    def _defer(self, command, **kwargs):
+        """Run the deferring first transaction through run_transaction."""
+        entries = self._final_entries(command)
+        with self._defer_first_run():
+            result = verification.run_transaction(
+                self.repo, self.session_uuid, entries, **kwargs)
+        self._track(result.get("transaction_id"))
+        return entries, result
+
+
+class DeferredEvidenceContinuationTests(_DeferredEvidenceMixin,
+                                        _OwnedVerificationTestBase):
+    """Issue #51 SC1/SC2: a full suite that outlives the first bounded poll
+    becomes truthfully terminal under the SAME transaction through the real
+    builder gate's next ready_for_review, with exactly one command launch."""
+
+    def test_late_success_resolves_same_transaction_through_builder_continuation(
+            self):
+        launch = self._marker_path()
+        release = self._marker_path()
+        self._write_plan(self._final_entries(
+            self._gated_cmd(launch, release, 0)))
+        trace = trace_store.Trace(
+            trace_store.trace_path_for(self.session_uuid),
+            session_uuid=self.session_uuid, run_id="R")
+        with self._defer_first_run():
+            txn1, reason1 = cowork._run_owned_verification_transaction(
+                self.session_uuid, "builder", 1, trace, repo=self.repo)
+        self.assertIsNone(reason1)
+        txn_id = txn1["transaction_id"]
+        self._track(txn_id)
+        self.assertEqual(txn1["verdict"], verification.VERDICT_RED)
+        # The command outlived the first poll and only now finishes (0).
+        self.assertEqual(self._launches(launch), 1)
+        self._release(release)
+        self._wait_for_terminal_event(txn_id, self.LABEL)
+
+        # The builder re-promotes the unchanged tree: ordinary continuation.
+        txn2, reason2 = cowork._run_owned_verification_transaction(
+            self.session_uuid, "builder", 2, trace, repo=self.repo)
+        self.assertIsNone(reason2)
+        # PRIMARY: the SAME transaction became green (base re-serves RED).
+        self.assertEqual(txn2["transaction_id"], txn_id)
+        self.assertEqual(txn2["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(txn2["final_suite_binding"], "ran_once")
+        self.assertEqual(txn1["deferred_reconciliation"]["state"], "pending")
+        self.assertEqual(txn1["deferred_reconciliation"]["still_pending"],
+                         [self.LABEL])
+        records = self._ledger_records(txn_id, self.LABEL)
+        latest = records[-1]
+        self.assertEqual(latest["attempt_state"], "terminal")
+        self.assertEqual(latest["evidence_state"],
+                         verification.EVIDENCE_PRESENT)
+        self.assertEqual(latest["id"], txn1["attempts"][0]["ledger_attempt_id"])
+        self.assertFalse(os.path.exists(self._marker_file(txn_id)))
+        on_disk = self._result_on_disk(txn_id)
+        self.assertEqual(on_disk["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(on_disk["deferred_reconciliation"]["state"],
+                         "reconciled")
+        readiness = cowork._record_readiness_from_transaction(
+            self.session_uuid, "builder", 2, trace, txn2, repo=self.repo)
+        self.assertEqual(readiness["state"], "verified")
+        self.assertEqual(readiness["transaction_id"], txn_id)
+        # Reconciled in THIS call: nothing was reused.
+        self.assertFalse(txn2.get("reused_lock_result"))
+        self.assertEqual(self._launches(launch), 1)
+
+        # A repeat continuation reuses the settled result untouched.
+        record_count = len(records)
+        txn3, _reason3 = cowork._run_owned_verification_transaction(
+            self.session_uuid, "builder", 3, trace, repo=self.repo)
+        self.assertEqual(txn3["transaction_id"], txn_id)
+        self.assertEqual(txn3["verdict"], verification.VERDICT_GREEN)
+        self.assertTrue(txn3.get("reused_lock_result"))
+        self.assertEqual(len(self._ledger_records(txn_id, self.LABEL)),
+                         record_count)
+        self.assertEqual(self._launches(launch), 1)
+
+
+class DeferredEvidenceFailClosedTests(_DeferredEvidenceMixin,
+                                      _OwnedVerificationTestBase):
+    """Issue #51 SC3: late failure, still-running, absent, repeated
+    continuation, candidate mismatch and unowned/productive safety, all
+    through `run_transaction` with the identical inventory."""
+
+    def _wait_pgid_gone(self, pgid, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline and verification._pgid_alive(pgid):
+            time.sleep(0.1)
+
+    def _defer_then_finish(self, exit_code=0):
+        """Defer a gated command, then let it finish with `exit_code` and
+        wait for its real terminal event."""
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release, exit_code)
+        _entries, r1 = self._defer(cmd)
+        self._release(release)
+        self._wait_for_terminal_event(r1["transaction_id"], self.LABEL)
+        return launch, cmd, r1
+
+    def test_late_failure_resolves_terminal_red_with_true_exit_code(self):
+        launch, cmd, r1 = self._defer_then_finish(exit_code=3)
+        txn_id = r1["transaction_id"]
+        r2 = self._run(cmd)
+        self.assertEqual(r2["transaction_id"], txn_id)
+        self.assertEqual(r2["verdict"], verification.VERDICT_RED)
+        self.assertEqual(r2["attempts"][0]["exit_code"], 3)
+        self.assertEqual(r2["attempts"][0]["evidence_state"],
+                         verification.EVIDENCE_PRESENT)
+        latest = self._ledger_records(txn_id, self.LABEL)[-1]
+        self.assertEqual(latest["attempt_state"], "terminal")
+        self.assertEqual(latest["evidence_state"],
+                         verification.EVIDENCE_PRESENT)
+        self.assertEqual(latest["exit_code"], 3)
+        self.assertEqual(self._launches(launch), 1)
+
+    def test_still_running_stays_deferred_without_teardown_or_relaunch(self):
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        _entries, r1 = self._defer(cmd)
+        txn_id = r1["transaction_id"]
+        watched = [self._marker_file(txn_id),
+                   state_store.verification_result_path_for(
+                       self.session_uuid, txn_id),
+                   self._lock_meta_path(r1["request_key"])]
+        before = [self._bytes(p) for p in watched]
+        self.assertIsNotNone(before[0])
+        active = state_store.read_json_tolerant(
+            state_store.verification_active_pgid_path_for(
+                self.session_uuid, txn_id))
+        with self._teardown_call_spies() as calls, \
+                self._killpg_signals_spy() as sent:
+            r2 = self._run(cmd)
+        self.assertEqual(r2["transaction_id"], txn_id)
+        self.assertEqual(r2["verdict"], verification.VERDICT_UNVERIFIED)
+        stamp = r2["deferred_reconciliation"]
+        self.assertEqual(stamp["state"], "pending")
+        self.assertEqual(stamp["still_pending"], [self.LABEL])
+        self.assertTrue(stamp.get("next_action"))
+        self.assertEqual([self._bytes(p) for p in watched], before)
+        self.assertEqual(calls, [])
+        self.assertEqual(sent, [])
+        self.assertFalse(r2.get("reused_lock_result"))
+        self.assertEqual(self._launches(launch), 1)
+        self.assertTrue(verification._pgid_alive(active["pgid"]))
+
+    def test_missing_process_resolves_absent_never_pass(self):
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        _entries, r1 = self._defer(cmd)
+        txn_id = r1["transaction_id"]
+        active = state_store.read_json_tolerant(
+            state_store.verification_active_pgid_path_for(
+                self.session_uuid, txn_id))
+        self._kill_transaction_processes(txn_id)
+        self._wait_pgid_gone(active["pgid"])
+        r2 = self._run(cmd)
+        self.assertEqual(r2["transaction_id"], txn_id)
+        self.assertNotEqual(r2["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(r2["attempts"][0]["evidence_state"],
+                         verification.EVIDENCE_ABSENT)
+        latest = self._ledger_records(txn_id, self.LABEL)[-1]
+        self.assertEqual(latest["attempt_state"], "terminal")
+        self.assertEqual(latest["evidence_state"],
+                         verification.EVIDENCE_ABSENT)
+        self.assertIn("absent_diagnostics", latest)
+        self.assertFalse(os.path.exists(self._marker_file(txn_id)))
+        self.assertEqual(self._launches(launch), 1)
+
+    def test_repeated_continuation_is_idempotent(self):
+        launch, cmd, r1 = self._defer_then_finish()
+        txn_id = r1["transaction_id"]
+        r2 = self._run(cmd)
+        self.assertEqual(r2["verdict"], verification.VERDICT_GREEN)
+        record_count = len(self._ledger_records(txn_id, self.LABEL))
+        real = verification.reconcile_pending_evidence
+        with mock.patch.object(verification, "reconcile_pending_evidence",
+                               wraps=real) as recon, \
+                self._teardown_call_spies() as calls, \
+                self._killpg_signals_spy() as sent:
+            r3 = self._run(cmd)
+            r4 = self._run(cmd)
+        for r in (r3, r4):
+            self.assertEqual(r["transaction_id"], txn_id)
+            self.assertEqual(r["verdict"], verification.VERDICT_GREEN)
+            self.assertTrue(r.get("reused_lock_result"))
+        self.assertEqual(recon.call_count, 0)
+        self.assertEqual(len(self._ledger_records(txn_id, self.LABEL)),
+                         record_count)
+        self.assertEqual(calls, [])
+        self.assertEqual(sent, [])
+        self.assertEqual(self._launches(launch), 1)
+
+    def test_candidate_mismatch_never_certifies_new_candidate(self):
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        _entries, r1 = self._defer(cmd)
+        txn_id = r1["transaction_id"]
+        result_path = state_store.verification_result_path_for(
+            self.session_uuid, txn_id)
+        old_bytes = self._bytes(result_path)
+        with open(os.path.join(self.repo, "moved.txt"), "w") as fh:
+            fh.write("the candidate moved\n")
+        # The moved candidate is legitimately NEW verification (a fresh
+        # transaction); release the gate so it completes promptly.
+        self._release(release)
+        r2 = self._run(cmd)
+        self.assertNotEqual(r2["transaction_id"], txn_id)
+        readiness = cowork._record_readiness_from_transaction(
+            self.session_uuid, "builder", 2, None, r1, repo=self.repo)
+        self.assertEqual(readiness["state"], "unverified")
+        self.assertEqual(self._bytes(result_path), old_bytes)
+        self.assertNotEqual(self._result_on_disk(txn_id)["verdict"],
+                            verification.VERDICT_GREEN)
+
+    def _live_sleeper(self):
+        sleeper = subprocess.Popen(
+            ["python3", "-c", "import time; time.sleep(120)"],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def kill():
+            try:
+                os.killpg(sleeper.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            sleeper.wait(timeout=10)
+        self.addCleanup(kill)
+        return sleeper
+
+    def test_productive_other_label_is_never_signalled(self):
+        _launch, cmd, r1 = self._defer_then_finish()
+        txn_id = r1["transaction_id"]
+        sleeper = self._live_sleeper()
+        active_path = state_store.verification_active_pgid_path_for(
+            self.session_uuid, txn_id)
+        active = state_store.read_json_tolerant(active_path)
+        state_store.write_json_atomic(active_path, dict(
+            active if isinstance(active, dict) else {},
+            label="other", pgid=sleeper.pid))
+        with self._killpg_signals_spy() as sent:
+            r2 = self._run(cmd)
+        self.assertEqual(r2["transaction_id"], txn_id)
+        self.assertEqual(r2["verdict"], verification.VERDICT_GREEN)
+        self.assertFalse(os.path.exists(self._marker_file(txn_id)))
+        self.assertIsNone(sleeper.poll())
+        self.assertEqual([s for s in sent if s[0] == sleeper.pid], [])
+
+    def test_uncorroborated_worker_pid_is_never_signalled(self):
+        import datetime
+        _launch, cmd, r1 = self._defer_then_finish()
+        txn_id = r1["transaction_id"]
+        identity_path = state_store.verification_worker_identity_path_for(
+            self.session_uuid, txn_id)
+        identity = state_store.read_json_tolerant(identity_path)
+        worker_pgid = None
+        try:
+            worker_pgid = os.getpgid(identity["pid"])
+        except OSError:
+            pass
+        an_hour_ago = (datetime.datetime.now(datetime.timezone.utc)
+                       - datetime.timedelta(hours=1)).isoformat().replace(
+                           "+00:00", "Z")
+        state_store.write_json_atomic(
+            identity_path, dict(identity, reported_at=an_hour_ago))
+        with self._killpg_signals_spy() as sent:
+            r2 = self._run(cmd)
+        self.assertEqual(r2["transaction_id"], txn_id)
+        self.assertEqual(r2["verdict"], verification.VERDICT_GREEN)
+        if worker_pgid is not None:
+            self.assertEqual([s for s in sent if s[0] == worker_pgid], [])
+
+    def test_eperm_on_teardown_degrades_without_crash(self):
+        _launch, cmd, r1 = self._defer_then_finish()
+        txn_id = r1["transaction_id"]
+        real = os.killpg
+
+        def eperm(pgid, sig):
+            if sig != 0:
+                raise PermissionError(1, "Operation not permitted")
+            return real(pgid, sig)
+        with mock.patch.object(os, "killpg", side_effect=eperm):
+            r2 = self._run(cmd)
+        self.assertEqual(r2["transaction_id"], txn_id)
+        self.assertEqual(r2["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(r2["deferred_reconciliation"]["state"], "reconciled")
+
+
+_DEFERRING_SUPERVISOR_SCRIPT = r"""
+import contextlib, json, os, sys, time
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+import cowork_verification as v
+import cowork_verification_evidence as e
+repo, session_uuid, entries_json, mode = sys.argv[2:6]
+
+
+def fake_wait(session_uuid, transaction_id, labels, poll_attempts,
+              poll_delay_s):
+    time.sleep(0.3)
+    return {label: {"evidence_state": e.EVIDENCE_UNRESOLVED}
+            for label in labels}
+
+
+def die_before_persist(session_uuid, transaction_id, request_key, result):
+    sys.stdout.write(json.dumps({"transaction_id": transaction_id,
+                                 "request_key": request_key}) + "\n")
+    sys.stdout.flush()
+    os._exit(0)
+
+
+class QuickJoin(object):
+    def __init__(self, thread):
+        self._thread = thread
+
+    def join(self, timeout=None):
+        if self._thread is not None:
+            self._thread.join(timeout=0.1)
+
+
+real_spawn = v.spawn_worker
+
+
+def spawn_quick_join(*args, **kwargs):
+    started = real_spawn(*args, **kwargs)
+    proc, fd, thread = started
+    return v.WorkerStartupResult(proc, fd, QuickJoin(thread),
+                                 getattr(started, "classification", None))
+
+
+with contextlib.ExitStack() as stack:
+    stack.enter_context(mock.patch.object(
+        e, "bounded_evidence_wait", side_effect=fake_wait))
+    stack.enter_context(mock.patch.object(
+        v, "spawn_worker", side_effect=spawn_quick_join))
+    if mode == "die_before_persist":
+        stack.enter_context(mock.patch.object(
+            v, "_persist_terminal_result", side_effect=die_before_persist))
+    result = v.run_transaction(repo, session_uuid, json.loads(entries_json))
+sys.stdout.write(json.dumps({"transaction_id": result["transaction_id"],
+                             "request_key": result["request_key"]}) + "\n")
+"""
+
+
+class DeferredEvidenceCrashRecoveryTests(_DeferredEvidenceMixin,
+                                         _OwnedVerificationTestBase):
+    """Issue #51 SC6: a deferring supervisor that really dies (a child
+    process) never lets its stale or abandoned transaction certify anything;
+    its evidence is reconciled fail-closed under the ORIGINAL ledger attempt
+    id, with no double teardown and no signal to an uncorroborated pid."""
+
+    def _deferring_supervisor(self, command, mode="normal"):
+        proc = subprocess.run(
+            [sys.executable, "-c", _DEFERRING_SUPERVISOR_SCRIPT, _HERE,
+             self.repo, self.session_uuid,
+             json.dumps(self._final_entries(command)), mode],
+            capture_output=True, text=True, timeout=180,
+            stdin=subprocess.DEVNULL)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        self.assertTrue(lines, "supervisor child printed nothing: %r"
+                        % (proc.stderr[-2000:],))
+        info = json.loads(lines[-1])
+        self._track(info["transaction_id"])
+        return info
+
+    def _wait_command_gone(self, transaction_id, timeout=30):
+        active = state_store.read_json_tolerant(
+            state_store.verification_active_pgid_path_for(
+                self.session_uuid, transaction_id))
+        pgid = active.get("pgid") if isinstance(active, dict) else None
+        deadline = time.time() + timeout
+        while pgid and time.time() < deadline and verification._pgid_alive(
+                pgid):
+            time.sleep(0.2)
+
+    def test_dead_supervisor_with_persisted_result_resolves_fail_closed(self):
+        # The gate is never released: the supervisor child's exit (liveness
+        # EOF -> the worker's watchdog) is what ends the command.
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        info = self._deferring_supervisor(cmd)
+        txn_id = info["transaction_id"]
+        self.assertIsNotNone(self._result_on_disk(txn_id))
+        minted_id = self._ledger_records(txn_id, self.LABEL)[0]["id"]
+        self._wait_command_gone(txn_id)
+        r2 = self._run(cmd)
+        self.assertEqual(r2["transaction_id"], txn_id)
+        self.assertNotEqual(r2["verdict"], verification.VERDICT_GREEN)
+        records = self._ledger_records(txn_id, self.LABEL)
+        self.assertEqual(records[-1]["attempt_state"], "terminal")
+        self.assertEqual(records[-1]["id"], minted_id)
+        self.assertFalse(os.path.exists(self._marker_file(txn_id)))
+        with self._teardown_call_spies() as calls, \
+                self._killpg_signals_spy() as sent:
+            r3 = self._run(cmd)
+        self.assertEqual(r3["transaction_id"], txn_id)
+        self.assertNotEqual(r3["verdict"], verification.VERDICT_GREEN)
+        self.assertEqual(len(self._ledger_records(txn_id, self.LABEL)),
+                         len(records))
+        self.assertEqual(calls, [])
+        self.assertEqual(sent, [])
+
+    def test_dead_supervisor_before_persist_reconciles_abandoned_then_runs_fresh(
+            self):
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        info = self._deferring_supervisor(cmd, mode="die_before_persist")
+        old_id = info["transaction_id"]
+        meta = state_store.read_json_tolerant(
+            self._lock_meta_path(info["request_key"]))
+        self.assertEqual(meta["state"], "running")
+        self.assertFalse(verification._pid_alive(meta["pid"]))
+        self.assertIsNone(self._result_on_disk(old_id))
+        self.assertTrue(os.path.exists(self._marker_file(old_id)))
+        minted_id = self._ledger_records(old_id, self.LABEL)[0]["id"]
+        self._wait_command_gone(old_id)
+        # Once the abandoned work is resolved, the same key runs as NEW
+        # verification; release the gate so that fresh run ends promptly.
+        self._release(release)
+        r2 = self._run(cmd)
+        records = self._ledger_records(old_id, self.LABEL)
+        self.assertEqual(records[-1]["attempt_state"], "terminal")
+        self.assertEqual(records[-1]["id"], minted_id)
+        self.assertFalse(os.path.exists(self._marker_file(old_id)))
+        # A fresh transaction: the abandoned one never certifies anything.
+        self.assertNotEqual(r2["transaction_id"], old_id)
+        self.assertIsNone(self._result_on_disk(old_id))
+
+    def test_abandoned_owner_with_live_deferred_work_launches_nothing(self):
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        _entries, r1 = self._defer(cmd)
+        old_id = r1["transaction_id"]
+        request_key = r1["request_key"]
+        exited = subprocess.Popen(["true"])
+        exited.wait()
+        meta_path = self._lock_meta_path(request_key)
+        state_store.write_json_atomic(meta_path, {
+            "state": "running", "pid": exited.pid,
+            "transaction_id": old_id, "request_key": request_key,
+            "start_time": time.time()})
+        os.remove(state_store.verification_result_path_for(
+            self.session_uuid, old_id))
+        marker_before = self._bytes(self._marker_file(old_id))
+        for _round in range(2):
+            with self._teardown_call_spies() as calls, \
+                    self._killpg_signals_spy() as sent:
+                r2 = self._run(cmd)
+            self.assertEqual(r2["transaction_id"], old_id)
+            self.assertEqual(r2["verdict"], verification.VERDICT_UNVERIFIED)
+            self.assertEqual(r2["deferred_reconciliation"]["state"],
+                             "pending")
+            self.assertIn("crash_recovery", r2)
+            self.assertFalse(r2.get("reused_lock_result"))
+            self.assertEqual(self._launches(launch), 1)
+            self.assertEqual(self._bytes(self._marker_file(old_id)),
+                             marker_before)
+            self.assertEqual(
+                state_store.read_json_tolerant(meta_path)["state"],
+                "abandoned")
+            self.assertEqual(calls, [])
+            self.assertEqual(sent, [])
+
+
+class DeferredEvidenceHandbackTests(_DeferredEvidenceMixin,
+                                    _OwnedVerificationTestBase):
+    """Issue #51 SC7 + receipt: a deferred result reaches the builder through
+    its own closed template (still running, re-promote unchanged, nothing
+    re-run) — never the fix-it / new-transaction wording — while the
+    non-deferred hand-back stays byte-identical."""
+
+    FORBIDDEN = ("Fix the underlying cause",
+                 "starts a new owned verification transaction")
+
+    def _assert_deferred_text(self, text, txn_id, labels):
+        self.assertIn("still running", text)
+        for label in labels:
+            self.assertIn(label, text)
+        self.assertIn(txn_id, text)
+        for phrase in self.FORBIDDEN:
+            self.assertNotIn(phrase, text)
+
+    def _deferred_handback_markers(self, text):
+        self.assertIn("Set `ready_for_review` again", text)
+        self.assertIn("nothing is re-run", text)
+
+    def _session_file_bytes(self, txn_id, request_key):
+        return [self._bytes(p) for p in (
+            self._marker_file(txn_id),
+            state_store.ledger_path_for(self.session_uuid),
+            state_store.verification_result_path_for(
+                self.session_uuid, txn_id),
+            self._lock_meta_path(request_key))]
+
+    def _red_result(self):
+        return {"transaction_id": "T-red", "verdict": "red",
+                "worker_identity_verified": True, "mutation": None,
+                "attempts": [{"label": "final", "evidence_state": "present",
+                              "exit_code": 1}],
+                "snapshot": {"manifest_digest": "ab" * 32,
+                             "index_digest": "cd" * 32}}
+
+    def test_deferred_results_use_the_deferred_template(self):
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        _entries, deferring = self._defer(cmd)
+        txn_id = deferring["transaction_id"]
+        still_running = self._run(cmd)
+        self.assertEqual(still_running["transaction_id"], txn_id)
+        red = self._red_result()
+        before = self._session_file_bytes(txn_id, deferring["request_key"])
+        boom = mock.Mock(side_effect=AssertionError("reconciler called"))
+        with mock.patch.object(verification, "reconcile_pending_evidence",
+                               boom), \
+                mock.patch.object(evidence_module,
+                                  "reconcile_pending_evidence", boom):
+            for result in (deferring, still_running):
+                labels = result["deferred_reconciliation"]["still_pending"]
+                self.assertEqual(labels, [self.LABEL])
+                delivered = cowork._deferred_verification_delivery(
+                    result["transaction_id"], labels)
+                self._assert_deferred_text(delivered, txn_id, labels)
+                self._deferred_handback_markers(delivered)
+                notice = cowork.deferred_verification_text(
+                    result["transaction_id"], labels)
+                self._assert_deferred_text(notice, txn_id, labels)
+                self.assertTrue(cowork._owned_transaction_reason(
+                    result).startswith("evidence deferred:"))
+            reason = cowork._owned_transaction_reason(red)
+            control = cowork._unverified_readiness_delivery(
+                cowork._owned_transaction_reason_text(red, reason))
+            self.assertEqual(
+                str(control),
+                cowork.UNVERIFIED_READINESS_HANDBACK
+                % cowork._owned_transaction_reason_text(red, reason))
+            # Receipt: a deferred transaction is not recorded rejected.
+            trace = trace_store.Trace(
+                trace_store.trace_path_for(self.session_uuid),
+                session_uuid=self.session_uuid, run_id="R")
+            readiness = {"state": "unverified", "reason": "deferred"}
+            self.assertIsNone(cowork._update_receipt_pointer_for_readiness(
+                self.session_uuid, "builder", 1, trace, deferring, readiness,
+                os.path.join(self.sessions_root, "builder.status.json")))
+        self.assertEqual(boom.call_count, 0)
+        self.assertIsNone(cowork._latest_verification_disposition(
+            self.session_uuid, txn_id))
+        self.assertEqual(self._session_file_bytes(txn_id,
+                                                  deferring["request_key"]),
+                         before)
+
+    def _drive_gate(self, txn_result):
+        status_path = os.path.join(self.sessions_root, "builder.status.json")
+        statuses = ["ready_for_review", "needs_input"]
+
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                st = statuses.pop(0) if statuses else "needs_input"
+                with open(status_path, "w") as fh:
+                    json.dump({"status": st}, fh)
+
+            def close(self):
+                pass
+        sess = FakeSession()
+        trace_path = trace_store.trace_path_for(self.session_uuid)
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        trace = trace_store.Trace(trace_path, session_uuid=self.session_uuid,
+                                  run_id="R")
+        out = io.StringIO()
+
+        def review_fn(_p, _round):
+            raise AssertionError("an unverified promotion is never reviewed")
+        with mock.patch.object(
+                cowork, "_run_owned_verification_transaction",
+                return_value=(txn_result, None)), \
+                mock.patch.object(
+                    cowork.verification, "current_candidate_identity",
+                    return_value=("ab" * 32, "cd" * 32)):
+            cowork._role_loop(
+                sess, "seed", status_path, context="", io_out=out,
+                role="builder", review_fn=review_fn, trace=trace,
+                reviewer_role=cowork.BUILD_REVIEWER, artifact_noun="build",
+                phase="building", session_uuid=self.session_uuid)
+        return sess, out.getvalue()
+
+    def test_role_loop_gate_selects_deferred_delivery(self):
+        txn_id = "T-deferred"
+        deferred = {"transaction_id": txn_id, "verdict": "red",
+                    "worker_identity_verified": True, "mutation": None,
+                    "attempts": [{"label": self.LABEL,
+                                  "evidence_state": "unresolved"}],
+                    "snapshot": {"manifest_digest": "ab" * 32,
+                                 "index_digest": "cd" * 32},
+                    "deferred_reconciliation": {
+                        "state": "pending", "transaction_id": txn_id,
+                        "still_pending": [self.LABEL],
+                        "next_action": verification.DEFERRED_NEXT_ACTION}}
+        sess, transcript_text = self._drive_gate(deferred)
+        self.assertGreaterEqual(len(sess.sent), 2)
+        handback = str(sess.sent[1])
+        self._assert_deferred_text(handback, txn_id, [self.LABEL])
+        self._deferred_handback_markers(handback)
+        self.assertIn(cowork.deferred_verification_text(txn_id, [self.LABEL]),
+                      transcript_text)
+
+    def test_role_loop_gate_keeps_the_unverified_template_for_red(self):
+        red = self._red_result()
+        sess, _transcript_text = self._drive_gate(red)
+        self.assertGreaterEqual(len(sess.sent), 2)
+        reason = cowork._owned_transaction_reason(red)
+        self.assertEqual(
+            str(sess.sent[1]),
+            cowork.UNVERIFIED_READINESS_HANDBACK
+            % cowork._owned_transaction_reason_text(red, reason))
+
+
+class DeferredEvidenceReadOnlyReportTests(_DeferredEvidenceMixin,
+                                          _OwnedVerificationTestBase):
+    """Issue #51 SC4: `--report` on a session holding a deferred transaction
+    performs no mutation, cleanup, reconciliation or rerun."""
+
+    def test_report_never_reconciles_or_mutates_deferred_state(self):
+        launch, release = self._marker_path(), self._marker_path()
+        cmd = self._gated_cmd(launch, release)
+        _entries, r1 = self._defer(cmd)
+        txn_id = r1["transaction_id"]
+        trace = trace_store.Trace(
+            trace_store.trace_path_for(self.session_uuid),
+            session_uuid=self.session_uuid, run_id="R")
+        trace.event("verification.transaction", role="builder", round=1,
+                    transaction_id=txn_id, verdict=r1["verdict"])
+        watched = [self._marker_file(txn_id),
+                   state_store.ledger_path_for(self.session_uuid),
+                   state_store.verification_result_path_for(
+                       self.session_uuid, txn_id),
+                   self._lock_meta_path(r1["request_key"])]
+        before = [self._bytes(p) for p in watched]
+        self.assertTrue(all(b is not None for b in before))
+        active = state_store.read_json_tolerant(
+            state_store.verification_active_pgid_path_for(
+                self.session_uuid, txn_id))
+        boom = mock.Mock(side_effect=AssertionError("reconciler called"))
+        args = cowork.build_parser().parse_args(
+            ["--report", self.session_uuid])
+        with mock.patch.object(verification, "reconcile_pending_evidence",
+                               boom), \
+                mock.patch.object(evidence_module,
+                                  "reconcile_pending_evidence", boom):
+            cowork.run_report(args, io_out=io.StringIO())
+        self.assertEqual(boom.call_count, 0)
+        self.assertEqual([self._bytes(p) for p in watched], before)
+        self.assertTrue(verification._pgid_alive(active["pgid"]))
+        self.assertEqual(self._launches(launch), 1)
 
 
 class ActionPolicyDecisionTests(unittest.TestCase):

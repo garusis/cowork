@@ -866,6 +866,15 @@ inventory as **one owned, hermetic, manifest-bound transaction**:
   of attempts; past that bound the attempt is recorded `unresolved`/`absent`
   and polling stops — delayed evidence is never resolved by launching a
   replacement command.
+- **Deferred evidence is reconciled, not re-run.** When a final-suite command
+  outlives the bounded poll while still alive, the transaction is recorded
+  deferred and the builder is told to set `ready_for_review` again with the
+  tree unchanged. That next promotion for the same candidate reconciles the
+  *same* transaction from its own evidence under the single-flight lock:
+  still running stays deferred, finished becomes a terminal pass or fail, and
+  gone with no evidence is `absent` — never a pass. A dead supervisor's
+  abandoned deferred transaction is reconciled fail-closed before anything
+  new launches. `--report` and `--check` never reconcile.
 
 Legacy (schema-1) plans — `{label, command}` only, no `execution_mode`/`kind`
 — are still accepted: they run isolated, keep their historical

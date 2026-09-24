@@ -3008,6 +3008,57 @@ def _unverified_readiness_delivery(reason):
     return _closed_static_delivery(unverified_readiness_handback_text(reason))
 
 
+# Issue #51: the hand-back for a transaction whose command outlived the first
+# bounded evidence poll. Nothing failed, so it must not tell the builder to
+# fix anything or promise a new transaction: the SAME transaction is
+# reconciled from its own evidence on the next ready_for_review. Static
+# template; the transaction id and the approved plan's labels are the only
+# substitutions, neither of which comes from role output.
+DEFERRED_VERIFICATION_HANDBACK = (
+    "Your `ready_for_review` is not yet accepted: owned verification "
+    "transaction %s is still running %s, so its evidence is deferred, not "
+    "failed.\n\n"
+    "Nothing needs fixing. Do not edit the tree and do not run any "
+    "verification command yourself. Set `ready_for_review` again with the "
+    "tree unchanged: the same transaction is then reconciled from its own "
+    "evidence, and nothing is re-run.")
+
+
+def _deferred_labels_text(labels):
+    return ", ".join(str(label) for label in (labels or ())) \
+        or "its deferred command"
+
+
+def deferred_verification_handback_text(transaction_id, labels):
+    return DEFERRED_VERIFICATION_HANDBACK % (
+        transaction_id, _deferred_labels_text(labels))
+
+
+def _deferred_verification_delivery(transaction_id, labels):
+    """The hand-back sent to a builder whose owned transaction is deferred."""
+    return _closed_static_delivery(
+        deferred_verification_handback_text(transaction_id, labels))
+
+
+def deferred_verification_text(transaction_id, labels):
+    """The transcript notice when readiness waits on deferred evidence."""
+    return ("Readiness was not accepted yet: owned verification transaction "
+            "%s is still running %s. Nothing failed; the same transaction "
+            "is reconciled on the next ready_for_review, not re-run."
+            % (transaction_id, _deferred_labels_text(labels)))
+
+
+def _deferred_pending(result):
+    """The result's `deferred_reconciliation` stamp when it is still
+    pending, else None. A pure read of the result dict."""
+    if not isinstance(result, dict):
+        return None
+    stamp = result.get("deferred_reconciliation")
+    if isinstance(stamp, dict) and stamp.get("state") == "pending":
+        return stamp
+    return None
+
+
 def _current_tree_digest(cwd=None):
     """The digest of every source file as it is right now, or None."""
     paths = _source_paths_for_manifest(cwd)
@@ -3091,6 +3142,12 @@ def _owned_transaction_reason(result):
     derived entirely from the result dict — never from role-authored prose."""
     if not isinstance(result, dict):
         return "the transaction produced no result"
+    deferred = _deferred_pending(result)
+    if deferred:
+        return ("evidence deferred: %s still running in owned verification "
+                "transaction %s"
+                % (", ".join(deferred.get("still_pending") or ())
+                   or "a command", result.get("transaction_id")))
     if not result.get("worker_identity_verified"):
         return ("the verification worker's self-reported source did not "
                 "match the immutable snapshot, so nothing it ran can be "
@@ -3718,7 +3775,9 @@ def _update_receipt_pointer_for_readiness(session_uuid, role, round_index,
     every overlay field plus the ONCE-computed contradiction flag (D-0008).
 
     RED/UNVERIFIED transaction: recorded `rejected` immediately (a red or
-    unverified transaction can never later be accepted). A GREEN transaction
+    unverified transaction can never later be accepted). A DEFERRED one
+    (evidence still pending, issue #51) is not: the same transaction can
+    still reconcile green on the next continuation. A GREEN transaction
     whose candidate already moved is left untouched — single-flight reuse can
     still bind it to a later, identical promotion.
 
@@ -3737,6 +3796,8 @@ def _update_receipt_pointer_for_readiness(session_uuid, role, round_index,
     if not transaction_id:
         return None
     if readiness.get("state") != "verified":
+        if _deferred_pending(txn_result):
+            return None
         if txn_result.get("verdict") != verification.VERDICT_GREEN:
             _emit_verification_disposition(
                 session_uuid, trace, transaction_id,
@@ -7305,17 +7366,33 @@ def _role_loop(session, first, status_path, context, io_out,
                         # reason is expanded to name the transaction id
                         # BEFORE crossing that boundary, never by adding a
                         # second delivery path.
-                        handback_reason = readiness.get("reason")
-                        if txn_result is not None:
-                            handback_reason = _owned_transaction_reason_text(
-                                txn_result, handback_reason)
-                        pending = _unverified_readiness_delivery(
-                            handback_reason)
+                        deferred = _deferred_pending(txn_result)
+                        if deferred:
+                            # Issue #51: evidence is deferred, not failed —
+                            # its own closed template says so, with the
+                            # bounded next action (re-promote unchanged).
+                            deferred_txn = txn_result.get("transaction_id")
+                            deferred_labels = (
+                                deferred.get("still_pending") or [])
+                            pending = _deferred_verification_delivery(
+                                deferred_txn, deferred_labels)
+                            transcript.notice(
+                                io_out, deferred_verification_text(
+                                    deferred_txn, deferred_labels))
+                        else:
+                            handback_reason = readiness.get("reason")
+                            if txn_result is not None:
+                                handback_reason = (
+                                    _owned_transaction_reason_text(
+                                        txn_result, handback_reason))
+                            pending = _unverified_readiness_delivery(
+                                handback_reason)
+                            transcript.notice(
+                                io_out, unverified_readiness_text(
+                                    readiness.get("reason") or ""))
                         pending_reopens_work = True
                         pending_reopen_reason = "unverified_readiness"
                         pending_reopen_event_id = readiness.get("event_id")
-                        transcript.notice(io_out, unverified_readiness_text(
-                            readiness.get("reason") or ""))
                         continue
                 reviewer_approved = False
                 # Hash-gate (scout + planner): when the lead's reviewed artifact

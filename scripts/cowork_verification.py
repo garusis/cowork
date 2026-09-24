@@ -147,6 +147,14 @@ EVIDENCE_PRESENT = "present"
 EVIDENCE_UNRESOLVED = "unresolved"
 EVIDENCE_ABSENT = "absent"
 
+# The bounded next action carried by a deferred transaction (issue #51): a
+# command outlived the first evidence poll, so the SAME transaction is
+# reconciled from its own evidence on the next continuation for the same
+# candidate -- nothing is re-run to recover it.
+DEFERRED_NEXT_ACTION = (
+    "leave the tree unchanged and set ready_for_review again; the same "
+    "transaction is reconciled from its own evidence and nothing is re-run")
+
 # --------------------------------------------------------------------------- #
 # Timeout / retry policy defaults. All overridable per-request; these are the
 # fallbacks a caller that does not specify a policy gets.                     #
@@ -230,7 +238,8 @@ try:
     from cowork_verification_evidence import (  # noqa: E402
         bounded_evidence_wait, _poll_attempt_events, _revise_attempt_ledger,
         _revise_attempt_ledger_with_retry, _wait_for_attempt_and_revise_ledger,
-        should_defer_teardown,
+        should_defer_teardown, reconcile_pending_evidence,
+        _read_deferred_marker, _latest_ledger_record,
     )
 except ModuleNotFoundError as _seam_import_error:
     if _seam_import_error.name not in _SEAM_MODULE_NAMES:
@@ -264,6 +273,9 @@ except ModuleNotFoundError as _seam_import_error:
     _revise_attempt_ledger_with_retry = _seam_unavailable
     _wait_for_attempt_and_revise_ledger = _seam_unavailable
     should_defer_teardown = _seam_unavailable
+    reconcile_pending_evidence = _seam_unavailable
+    _read_deferred_marker = _seam_unavailable
+    _latest_ledger_record = _seam_unavailable
     # Drift-protected fallback (M5A minor): this literal must stay equal to
     # cowork_verification_worker.MAX_STARTUP_LOG_BYTES's own definition --
     # scripts/test_m5_package_a_contracts.py's
@@ -1180,7 +1192,8 @@ def _pid_alive(pid):
 
 def acquire_single_flight(session_uuid, request_key, transaction_id,
                           waiter_deadline_s=None, poll_delay_s=0.5,
-                          sleep=time.sleep, now=time.time):
+                          sleep=time.sleep, now=time.time,
+                          on_terminal_reuse=None, on_abandoned=None):
     """Acquire the kernel-level single-flight lock for `request_key`, or wait
     for an equivalent in-flight transaction to reach a terminal state.
 
@@ -1205,7 +1218,17 @@ def acquire_single_flight(session_uuid, request_key, transaction_id,
         already published before this returns.
       - `("reuse", result_dict, None)` — an equivalent transaction already
         reached a TERMINAL result for this exact key; the caller must not
-        run anything and there is no fd to release.
+        run anything and there is no fd to release. On the OWNER path (the
+        flock was acquired) with `on_terminal_reuse` given, the returned
+        result is `on_terminal_reuse(stored_result)`, called while the
+        flock is still held (issue #51: a deferred transaction is
+        reconciled there, serialized against concurrent continuations).
+        The waiter path never calls it.
+      - `("deferred", result_dict, None)` — only with `on_abandoned`: the
+        dead prior owner's transaction still has possibly-alive deferred
+        work (`on_abandoned(prior_owner_meta)` returned a result, under
+        the held flock). Nothing may launch; the lock `.meta` stays
+        `abandoned` so the next continuation retries reconciliation.
       - raises `LockTimeoutError` if the bounded waiter deadline elapses
         without either of the above.
 
@@ -1229,13 +1252,28 @@ def acquire_single_flight(session_uuid, request_key, transaction_id,
                     and owner.get("request_key") == request_key
                     and owner.get("state") == "terminal"
                     and owner.get("result")):
-                _release_flock(fd)
-                return "reuse", owner["result"], None
+                if on_terminal_reuse is None:
+                    _release_flock(fd)
+                    return "reuse", owner["result"], None
+                try:
+                    result = on_terminal_reuse(owner["result"])
+                finally:
+                    _release_flock(fd)
+                return "reuse", result, None
             if (isinstance(owner, dict)
                     and owner.get("state") not in (None, "terminal")):
                 owner = dict(owner)
                 owner["state"] = "abandoned"
                 state_store.write_json_atomic(lock_path + ".meta", owner)
+                if on_abandoned is not None and owner.get("transaction_id"):
+                    try:
+                        pending = on_abandoned(owner)
+                    except BaseException:
+                        _release_flock(fd)
+                        raise
+                    if pending is not None:
+                        _release_flock(fd)
+                        return "deferred", pending, None
             state_store.write_json_atomic(lock_path + ".meta", {
                 "pid": os.getpid(), "start_time": now(),
                 "transaction_id": transaction_id,
@@ -1304,6 +1342,206 @@ def publish_terminal_lock_result(session_uuid, request_key, result):
     meta["state"] = "terminal"
     meta["result"] = result
     state_store.write_json_atomic(lock_path + ".meta", meta)
+
+
+def _deferred_state(result):
+    stamp = result.get("deferred_reconciliation") if isinstance(
+        result, dict) else None
+    return stamp.get("state") if isinstance(stamp, dict) else None
+
+
+def reconcile_deferred_transaction(repo, session_uuid, stored_result):
+    """Continuation-time reconciliation of a DEFERRED transaction (issue
+    #51), called from `run_transaction`'s owner-path single-flight reuse
+    while the request_key's flock is held.
+
+    A transaction whose command outlived the first bounded evidence poll was
+    persisted with `deferred_reconciliation.state == "pending"`. Instead of
+    re-serving that stale result, this resolves the SAME transaction from
+    its own durable evidence through `reconcile_pending_evidence` -- never
+    by relaunching anything -- and:
+
+      * still running -> returns an in-memory, non-green copy (verdict
+        `unverified`, refreshed `still_pending`); nothing is persisted, so
+        the next continuation reconciles again;
+      * resolved -> rebuilds the unresolved attempts from the ledger's
+        terminal revisions, recomputes the verdict with the same rules as
+        `_run_owned_transaction`, and re-persists it under the ORIGINAL
+        transaction id stamped `reconciled`.
+
+    A result that is not pending (never deferred, or already reconciled) is
+    returned as-is: no reconciler call, no ledger write, no teardown.
+
+    Returns `(TransactionResult, outcome)`, outcome one of `not_deferred`,
+    `still_pending`, `reconciled` (reconciled IN THIS CALL).
+    """
+    if not (isinstance(stored_result, dict)
+            and "deferred_reconciliation" in stored_result):
+        # Never deferred: exactly the pre-#51 reuse, untouched.
+        return stored_result, "not_deferred"
+    transaction_id = stored_result.get("transaction_id")
+    on_disk = state_store.read_json_tolerant(
+        state_store.verification_result_path_for(
+            session_uuid, transaction_id)) if transaction_id else None
+    base = (on_disk if isinstance(on_disk, dict)
+            and on_disk.get("transaction_id") == transaction_id
+            else stored_result)
+    if _deferred_state(base) != "pending":
+        if base != stored_result and base.get("request_key"):
+            # The best-effort lock publish lagged the durable result: heal
+            # it so later continuations see the settled result directly.
+            publish_terminal_lock_result(
+                session_uuid, base["request_key"], base)
+        return TransactionResult(base), "not_deferred"
+
+    stamp = base["deferred_reconciliation"]
+    recon = reconcile_pending_evidence(session_uuid, transaction_id, None)
+    remaining = _read_deferred_marker(session_uuid, transaction_id)["labels"]
+    if recon.get("still_pending") or remaining:
+        pending = sorted(set(recon.get("still_pending") or ())
+                         | set(remaining))
+        return TransactionResult(dict(
+            base, verdict=VERDICT_UNVERIFIED,
+            deferred_reconciliation=dict(
+                stamp, state="pending", still_pending=pending,
+                next_action=DEFERRED_NEXT_ACTION,
+                checked_at=_utc_now()))), "still_pending"
+
+    request = state_store.read_json_tolerant(
+        state_store.verification_request_path_for(
+            session_uuid, transaction_id))
+    inventory = (request.get("inventory")
+                 if isinstance(request, dict) else None)
+    label_by_attempt_id = {
+        entry.get("ledger_attempt_id"): entry.get("label")
+        for entry in (inventory if isinstance(inventory, list) else ())
+        if isinstance(entry, dict)}
+    ledger_path = state_store.ledger_path_for(session_uuid)
+    final_suite_label = base.get("final_suite_label")
+    final_suite_binding = base.get("final_suite_binding")
+    rebuilt = []
+    resolved = []
+    for attempt in base.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            rebuilt.append(attempt)
+            continue
+        label = attempt.get("label") or label_by_attempt_id.get(
+            attempt.get("ledger_attempt_id"))
+        if attempt.get("evidence_state") != EVIDENCE_PRESENT and label:
+            rec = _latest_ledger_record(ledger_path, transaction_id, label)
+            if isinstance(rec, dict) and rec.get(
+                    "attempt_state") == "terminal":
+                attempt = dict(
+                    attempt, label=label,
+                    exit_code=rec.get("exit_code"),
+                    evidence_state=rec.get("evidence_state"),
+                    timed_out=bool(rec.get("timed_out")),
+                    wall_time_s=rec.get("wall_time_s"),
+                    exit_status=rec.get("exit_status"),
+                    adjudication=rec.get("adjudication"),
+                    reconciled_at=rec.get("reconciled_at"))
+                resolved.append(label)
+        if (label == final_suite_label
+                and attempt.get("evidence_state") == EVIDENCE_PRESENT):
+            final_suite_binding = "ran_once"
+        rebuilt.append(attempt)
+
+    # Same verdict rules as `_run_owned_transaction`, including a fresh
+    # mutation check against the ORIGINAL snapshot.
+    mutation = base.get("mutation")
+    snapshot = base.get("snapshot") or {}
+    if not base.get("worker_identity_verified"):
+        verdict = VERDICT_UNVERIFIED
+    elif base.get("ledger_failure") is not None:
+        verdict = VERDICT_UNVERIFIED
+    elif stamp.get("deadline_hit"):
+        verdict = VERDICT_UNVERIFIED
+    elif mutation is not None:
+        verdict = VERDICT_RED
+    elif not isinstance(inventory, list):
+        verdict = VERDICT_UNVERIFIED
+    else:
+        manifest_doc = state_store.read_json_tolerant(
+            state_store.verification_snapshot_manifest_path_for(
+                session_uuid, transaction_id))
+        final_mutation = detect_mutation(
+            repo, snapshot.get("manifest_digest"),
+            snapshot.get("index_digest"),
+            expected_manifest=(manifest_doc or {}).get("files"))
+        if final_mutation is not None:
+            mutation = final_mutation
+            verdict = VERDICT_RED
+        elif len(rebuilt) == len(inventory) and all(
+                isinstance(a, dict)
+                and a.get("evidence_state") == EVIDENCE_PRESENT
+                and a.get("exit_code") == 0 and not a.get("timed_out")
+                for a in rebuilt):
+            verdict = VERDICT_GREEN
+            if final_suite_label != FINAL_SUITE_LEGACY_UNKNOWN:
+                final_suite_binding = "ran_once"
+        else:
+            verdict = VERDICT_RED
+
+    reconciled_at = _utc_now()
+    result = TransactionResult(dict(
+        base, attempts=rebuilt, verdict=verdict,
+        final_suite_binding=final_suite_binding, mutation=mutation,
+        reused_lock_result=False,
+        deferred_reconciliation={
+            "state": "reconciled", "transaction_id": transaction_id,
+            "reconciled": sorted(resolved),
+            "reconciled_at": reconciled_at}))
+    return (_persist_terminal_result(
+        session_uuid, transaction_id, base["request_key"], result),
+        "reconciled")
+
+
+def _recover_abandoned_transaction(session_uuid, owner):
+    """Crash recovery at the dead-owner abandonment branch of
+    `acquire_single_flight` (issue #51). The prior owner died before
+    persisting a terminal result; if its transaction left deferred work on
+    the durable marker, reconcile it fail-closed under the held flock
+    BEFORE anything new launches. Returns None when nothing of it may still
+    be alive (the caller then runs a fresh transaction), or a non-green
+    deferred result for the ABANDONED transaction while any of its work may
+    still be running (the caller launches nothing)."""
+    prior = owner.get("transaction_id")
+    if not prior:
+        return None
+    if not _read_deferred_marker(session_uuid, prior)["labels"]:
+        return None
+    recon = reconcile_pending_evidence(session_uuid, prior, None)
+    remaining = _read_deferred_marker(session_uuid, prior)["labels"]
+    if not (remaining or recon.get("still_pending")):
+        return None
+    request = state_store.read_json_tolerant(
+        state_store.verification_request_path_for(session_uuid, prior))
+    final_suite_label = (request.get("final_suite_label")
+                         if isinstance(request, dict) else None)
+    now = _utc_now()
+    return TransactionResult({
+        "transaction_id": prior,
+        "request_key": owner.get("request_key"),
+        "verdict": VERDICT_UNVERIFIED,
+        "final_suite_label": final_suite_label,
+        "final_suite_binding": "not_reached",
+        "attempts": [],
+        "mutation": None,
+        "worker_identity_verified": False,
+        "startup_failure": None,
+        "ledger_failure": None,
+        "reused_lock_result": False,
+        "snapshot": None,
+        "crash_recovery": {"state": "abandoned_owner",
+                           "prior_owner_pid": owner.get("pid")},
+        "deferred_reconciliation": {
+            "state": "pending", "transaction_id": prior,
+            "still_pending": sorted(set(recon.get("still_pending") or ())
+                                    | set(remaining)),
+            "next_action": DEFERRED_NEXT_ACTION,
+            "checked_at": now},
+        "finished_at": now,
+    })
 
 
 # =========================================================================== #
@@ -2049,13 +2287,32 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
         evidence_poll_delay_s=evidence_poll_delay_s, work_id=work_id)
     request_key = request["request_key"]
 
+    # Issue #51: the owner-path reuse of a DEFERRED transaction reconciles
+    # it from its own evidence (under the held flock) instead of
+    # re-serving the stale result; a dead owner's deferred work is
+    # reconciled before anything new may launch.
+    continuation = {"outcome": "not_deferred"}
+
+    def _on_terminal_reuse(stored_result):
+        result, continuation["outcome"] = reconcile_deferred_transaction(
+            repo, session_uuid, stored_result)
+        return result
+
     lock_state, reused_result, lock_fd = acquire_single_flight(
         session_uuid, request_key, transaction_id,
-        waiter_deadline_s=waiter_deadline_s)
-    if lock_state == "reuse":
+        waiter_deadline_s=waiter_deadline_s,
+        on_terminal_reuse=_on_terminal_reuse,
+        on_abandoned=lambda owner: _recover_abandoned_transaction(
+            session_uuid, owner))
+    if lock_state in ("reuse", "deferred"):
         _delete_partial_snapshot(session_uuid, transaction_id)
         result = TransactionResult(reused_result)
-        result["reused_lock_result"] = True
+        # Only a settled result that was actually reused counts as reuse:
+        # the continuation that reconciles a deferred transaction (or finds
+        # it still pending) reused nothing -- the deferring run paid for it.
+        result["reused_lock_result"] = (
+            lock_state == "reuse"
+            and continuation["outcome"] == "not_deferred")
         return result
 
     # The OS-level flock (`lock_fd`) is held from here through the
@@ -2480,6 +2737,7 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
     started_labels = set()
     terminalized_labels = set()
     deadline_hit = False
+    _defer_teardown = False
 
     try:
         if worker_verified:
@@ -2734,7 +2992,7 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         # `finally` is propagating.
         reclaim_tool_snapshot_checkout(session_uuid, transaction_id)
 
-    return TransactionResult({
+    result = TransactionResult({
         "transaction_id": transaction_id,
         "request_key": request.get("request_key"),
         "verdict": verdict,
@@ -2752,6 +3010,34 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         "created_at": request.get("created_at"),
         "finished_at": _utc_now(),
     })
+    if _defer_teardown:
+        # Issue #51: teardown was deferred because a command is still
+        # possibly alive. The verdict above is unchanged (evidence is not
+        # yet present); this additive stamp is what lets the NEXT
+        # continuation for the same request_key reconcile THIS transaction
+        # from its own evidence instead of re-serving it (see
+        # `reconcile_deferred_transaction`).
+        result["deferred_reconciliation"] = _deferred_reconciliation_stamp(
+            session_uuid, transaction_id, deadline_hit)
+    return result
+
+
+def _deferred_reconciliation_stamp(session_uuid, transaction_id,
+                                   deadline_hit):
+    """The `deferred_reconciliation` field a deferring run attaches to its
+    result: which labels are still pending on the durable marker, whether
+    the run hit its deadline (not otherwise persisted, but needed to
+    recompute the verdict with the same rules later), and the bounded next
+    action."""
+    labels = _read_deferred_marker(session_uuid, transaction_id)["labels"]
+    return {
+        "state": "pending",
+        "transaction_id": transaction_id,
+        "still_pending": sorted(labels),
+        "deadline_hit": bool(deadline_hit),
+        "next_action": DEFERRED_NEXT_ACTION,
+        "deferred_at": _utc_now(),
+    }
 
 
 def _execution_wait_budget_s(timeout_policy):
