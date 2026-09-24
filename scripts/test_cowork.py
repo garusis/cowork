@@ -3808,7 +3808,7 @@ class FramingTest(unittest.TestCase):
             "content_block": {"type": "tool_use", "name": "Bash"}}}
         self.assertEqual(bridge.parse_claude_event(ev),
                          {"kind": "tool", "name": "Bash"})
-        # a missing tool name falls back to 'tool' (never 'using …')
+        # a missing tool name falls back to 'tool'
         ev2 = {"type": "stream_event", "event": {
             "type": "content_block_start", "content_block": {"type": "tool_use"}}}
         self.assertEqual(bridge.parse_claude_event(ev2)["name"], "tool")
@@ -3817,6 +3817,89 @@ class FramingTest(unittest.TestCase):
             "type": "content_block_start", "content_block": {"type": "text"}}}
         self.assertEqual(bridge.parse_claude_event(ev3),
                          {"kind": "partial", "text": ""})
+
+    def test_parse_claude_content_block_stop(self):
+        # `--include-partial-messages` brackets every block; the stop event
+        # itself does not say whether the block was a tool or text.
+        ev = {"type": "stream_event", "event": {"type": "content_block_stop",
+                                                "index": 1}}
+        self.assertEqual(bridge.parse_claude_event(ev), {"kind": "block_stop"})
+        # A bare block_stop is alive-but-not-productive evidence, never silence.
+        self.assertEqual(bridge.classify_claude_activity({"kind": "block_stop"}),
+                         "provider_wait")
+
+
+class ToolActivityTraceTest(unittest.TestCase):
+    """Observable long-turn progress: a content-free start/end pair per tool
+    call, taken from the controller's own stream."""
+
+    class FakeTrace:
+        def __init__(self):
+            self.events = []
+
+        def event(self, name, **fields):
+            self.events.append((name, fields))
+
+    def _recorder(self, controller="claude", role="scout"):
+        trace = self.FakeTrace()
+        return trace, bridge.ToolActivityTrace(trace, controller, role)
+
+    def test_label_reads_controller_fields_only(self):
+        self.assertEqual(bridge.tool_activity_label({"name": "Bash"}), "Bash")
+        self.assertEqual(
+            bridge.tool_activity_label({"label": "running a command"}),
+            "running a command")
+        self.assertEqual(bridge.tool_activity_label({"tool": "grep"}), "grep")
+        self.assertEqual(bridge.tool_activity_label({}), "tool")
+        self.assertEqual(bridge.tool_activity_label({"name": ""}), "tool")
+
+    def test_claude_tool_block_is_bracketed(self):
+        trace, rec = self._recorder()
+        rec.observe({"kind": "tool", "name": "Bash"})
+        rec.observe({"kind": "block_stop"})
+        self.assertEqual([n for n, _f in trace.events],
+                         ["controller.tool.start", "controller.tool.end"])
+        for _name, fields in trace.events:
+            self.assertEqual(fields, {"controller": "claude", "role": "scout",
+                                      "tool": "Bash"})
+
+    def test_text_block_stop_emits_nothing(self):
+        trace, rec = self._recorder()
+        rec.observe({"kind": "block_stop"})
+        rec.observe({"kind": "partial", "text": "hello"})
+        self.assertEqual(trace.events, [])
+
+    def test_codex_tool_done_closes_the_pair(self):
+        trace, rec = self._recorder(controller="codex", role="builder")
+        rec.observe({"kind": "tool", "label": "running a command"})
+        rec.observe({"kind": "tool_done", "item_type": "command_execution"})
+        names = [n for n, _f in trace.events]
+        self.assertEqual(names, ["controller.tool.start", "controller.tool.end"])
+        self.assertEqual(trace.events[0][1]["controller"], "codex")
+        self.assertEqual(trace.events[0][1]["tool"], "running a command")
+
+    def test_consecutive_starts_close_the_previous_tool(self):
+        trace, rec = self._recorder(controller="opencode")
+        rec.observe({"kind": "tool", "label": "using read"})
+        rec.observe({"kind": "tool", "label": "using grep"})
+        self.assertEqual([n for n, _f in trace.events],
+                         ["controller.tool.start", "controller.tool.end",
+                          "controller.tool.start"])
+        self.assertEqual(trace.events[1][1]["tool"], "using read")
+        self.assertEqual(trace.events[2][1]["tool"], "using grep")
+
+    def test_turn_dying_mid_tool_leaves_the_start_unmatched(self):
+        trace, rec = self._recorder()
+        rec.observe({"kind": "tool", "name": "Bash"})
+        self.assertEqual([n for n, _f in trace.events],
+                         ["controller.tool.start"])
+        self.assertEqual(rec.open_tool, "Bash")
+
+    def test_no_trace_handle_is_a_noop(self):
+        rec = bridge.ToolActivityTrace(None, "claude", "scout")
+        rec.observe({"kind": "tool", "name": "Bash"})
+        rec.observe({"kind": "block_stop"})
+        self.assertIsNone(rec.open_tool)
 
     def test_speaker_label(self):
         self.assertEqual(bridge.speaker_label("scout"), "scout › ")
@@ -5386,6 +5469,11 @@ class WriteReplyTest(unittest.TestCase):
         transcript.write_reply(out, "# hi\nbody")
         self.assertEqual(out.getvalue(), "# hi\nbody\n")
 
+    def test_existing_trailing_newline_is_not_doubled(self):
+        out = io.StringIO()
+        transcript.write_reply(out, "done\n")
+        self.assertEqual(out.getvalue(), "done\n")
+
 class TranscriptStreamTest(unittest.TestCase):
     class RecTrace:
         def __init__(self):
@@ -5402,6 +5490,21 @@ class TranscriptStreamTest(unittest.TestCase):
         region.feed("world")
         region.__exit__(None, None, None)
         self.assertEqual(out.getvalue(), "\nscout › hello world\n")
+
+    def test_no_text_is_channel_control(self):
+        # Nothing in a reply is interpreted as a marker: no role is asked to
+        # narrate itself, so there is no channel to switch.
+        out = io.StringIO()
+        with transcript.TranscriptStream(out, "scout › ") as region:
+            region.feed("before\n[[internal]]\nkept\n")
+        self.assertEqual(out.getvalue(),
+                         "\nscout › before\n[[internal]]\nkept\n\n")
+
+    def test_empty_stream_writes_only_the_terminator(self):
+        out = io.StringIO()
+        with transcript.TranscriptStream(out, "scout › "):
+            pass
+        self.assertEqual(out.getvalue(), "\n")
 
     def test_traces_stream_metadata_without_content(self):
         trace = self.RecTrace()
@@ -8974,148 +9077,91 @@ class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Channel delineation: user-facing vs. internal (self-narration / reviewer).    #
+# Role and reviewer prompts never ask for internal reasoning.                   #
 # --------------------------------------------------------------------------- #
 
 
-class ChannelParserTest(unittest.TestCase):
-    def test_happy_path_splits_and_strips_markers(self):
-        text = "before\n[[internal]]\nnote\n[[/internal]]\nafter\n"
-        segs, end = transcript.split_channel_segments(text)
-        self.assertEqual([c for c, _ in segs], ["user", "internal", "user"])
-        joined = "".join(s for _c, s in segs)
-        self.assertNotIn("[[internal]]", joined)
-        self.assertNotIn("[[/internal]]", joined)
-        self.assertIn("note", segs[1][1])     # the internal segment holds 'note'
-        self.assertIn("before", segs[0][1])
-        self.assertIn("after", segs[2][1])
-        self.assertFalse(end)  # closed block -> ends on the user channel
+class PromptNoReasoningExtractionTest(unittest.TestCase):
+    """Regression guard for the provider `reasoning_extraction` refusal class.
 
-    def test_marker_free_is_byte_identical(self):
-        for text in ("", "plain text", "a\n\nb\n", "line1\nline2"):
-            segs, end = transcript.split_channel_segments(text)
-            self.assertEqual("".join(s for _c, s in segs), text)
-            self.assertFalse(end)
+    Every prompt cowork sends -- the static role contracts and every
+    dynamically assembled brief -- is checked for phrasing that asks a model
+    to reveal, narrate or externalize its own reasoning."""
 
-    def test_unclosed_block_reports_internal_end(self):
-        segs, end = transcript.split_channel_segments("u\n[[internal]]\nstill open\n")
-        self.assertTrue(end)  # force-close is the caller's job (end of turn)
-        self.assertEqual(segs[-1][0], "internal")
+    FORBIDDEN = (
+        "self-narration",
+        "self narration",
+        "thinking out loud",
+        "think out loud",
+        "notes-to-self",
+        "note-to-self",
+        "narration to yourself",
+        "[[internal]]",
+        "[[/internal]]",
+        "internal channel",
+        "internal-channel",
+        "your internal reasoning",
+        "reveal your reasoning",
+        "chain of thought",
+        "chain-of-thought",
+        "caveman",
+    )
 
-    def test_stray_close_and_double_open_are_noops(self):
-        # stray close with no open: dropped, stays user.
-        segs, end = transcript.split_channel_segments("[[/internal]]\nplain\n")
-        self.assertEqual([c for c, _ in segs], ["user"])
-        self.assertNotIn("[[/internal]]", "".join(s for _c, s in segs))
-        self.assertFalse(end)
-        # second open while already open: no-op (depth-1 boolean).
-        segs2, _ = transcript.split_channel_segments(
-            "[[internal]]\na\n[[internal]]\nb\n[[/internal]]\n")
-        self.assertEqual([c for c, _ in segs2], ["internal"])
-        self.assertIn("a", "".join(s for _c, s in segs2))
-        self.assertIn("b", "".join(s for _c, s in segs2))
+    def _assert_clean(self, label, text):
+        lowered = text.lower()
+        for phrase in self.FORBIDDEN:
+            self.assertNotIn(
+                phrase, lowered,
+                "%s asks for internal reasoning: %r" % (label, phrase))
 
-    def test_literal_marker_mid_line_is_verbatim(self):
-        # Only a full line equal to the marker is control; mid-line is content.
-        text = "talk about [[internal]] inline\n"
-        segs, _ = transcript.split_channel_segments(text)
-        self.assertEqual(segs, [("user", text)])
+    def test_role_contracts_are_clean(self):
+        roles_dir = os.path.join(cowork.SKILL_ROOT, "roles")
+        names = sorted(n for n in os.listdir(roles_dir) if n.endswith(".md"))
+        self.assertTrue(names, "no role contracts found")
+        for name in names:
+            with open(os.path.join(roles_dir, name), encoding="utf-8") as fh:
+                self._assert_clean("roles/" + name, fh.read())
 
-    def test_internal_start_seeds_state(self):
-        segs, end = transcript.split_channel_segments("carried\n", internal_start=True)
-        self.assertEqual(segs[0][0], "internal")
-        self.assertTrue(end)
+    def _briefs(self):
+        return {
+            "scout brief": cowork.assemble_scout_brief(
+                ["scout", "planner"], "/i.json", "/i.md"),
+            "scout brief (no planner)": cowork.assemble_scout_brief(
+                ["scout"], "/i.json"),
+            "reviewer brief": cowork.assemble_reviewer_brief("/r.json"),
+            "planner brief": cowork.assemble_planner_brief("/p.json", "/p.md"),
+            "builder brief": cowork.assemble_builder_brief("/s.json", "/s.md"),
+            "builder brief (no summary)": cowork.assemble_builder_brief(
+                "/s.json"),
+        }
 
+    def test_assembled_briefs_are_clean(self):
+        for label, text in self._briefs().items():
+            self._assert_clean(label, text)
 
-class StreamingChannelTest(unittest.TestCase):
-    def test_strips_marker_lines_plain(self):
-        out = io.StringIO()
-        with transcript.TranscriptStream(out, "scout › ") as r:
-            r.feed("hi\n[[internal]]\nsecret\n[[/internal]]\nbye\n")
-        self.assertEqual(out.getvalue(), "\nscout › hi\nsecret\nbye\n\n")
+    def test_every_brief_is_its_own_stripped_form(self):
+        # `_role_seed_delivery` matches a brief against `brief.strip()` when it
+        # mints the static fragment, so a stray leading/trailing newline makes
+        # a cross-role seed unrepresentable. Guarded here because removing the
+        # trailing compression directive once reintroduced exactly that.
+        for label, text in self._briefs().items():
+            self.assertEqual(text, text.strip(),
+                             "%s is not its own stripped form" % label)
 
-    def test_marker_split_across_chunks(self):
-        out = io.StringIO()
-        with transcript.TranscriptStream(out, "scout › ") as r:
-            r.feed("before\n[[intern")          # marker split mid-line
-            r.feed("al]]\nINSIDE\n[[/internal]]\nafter\n")
-        text = out.getvalue()
-        self.assertNotIn("[[internal]]", text)
-        self.assertNotIn("[[/internal]]", text)
-        self.assertIn("INSIDE", text)
-        self.assertIn("before", text)
-        self.assertIn("after", text)
-
-    def test_marker_free_byte_identical(self):
-        out = io.StringIO()
-        with transcript.TranscriptStream(out, "scout › ") as r:
-            r.feed("a\n\n")
-            r.feed("b")
-        self.assertEqual(out.getvalue(), "\nscout › a\n\nb\n")
-
-    def test_fresh_region_starts_on_user_channel(self):
-        # Channel state never carries across turns: a new region is fresh.
-        r = transcript.TranscriptStream(io.StringIO(), "scout › ")
-        self.assertEqual(r._pending, "")
-
-class WriteReplyChannelTest(unittest.TestCase):
-    def test_strips_markers(self):
-        out = io.StringIO()
-        transcript.write_reply(out, "a\n[[internal]]\nb\n[[/internal]]\nc")
-        self.assertEqual(out.getvalue(), "a\nb\nc\n")
-
-    def test_marker_free_byte_identical(self):
-        out = io.StringIO()
-        transcript.write_reply(out, "# hi\nbody")
-        self.assertEqual(out.getvalue(), "# hi\nbody\n")
-
-# --------------------------------------------------------------------------- #
-# Caveman compression directive injection (gated on caveman availability).      #
-# --------------------------------------------------------------------------- #
-
-
-class CavemanDirectiveTest(unittest.TestCase):
-    def test_directive_text_gates_on_availability(self):
-        self.assertIn("IS installed", cowork.caveman_directive(True))
-        self.assertIn("NOT installed", cowork.caveman_directive(False))
-
-    def test_briefs_inject_directive(self):
-        on_scout = cowork.assemble_scout_brief(["scout"], "/x.json",
-                                               caveman_available=True)
-        off_scout = cowork.assemble_scout_brief(["scout"], "/x.json",
-                                                caveman_available=False)
-        self.assertIn("IS installed", on_scout)
-        self.assertIn("NOT installed", off_scout)
-        # the scout brief still carries its own write-target guardrail.
-        self.assertIn("ONLY write target", on_scout)
-
-        self.assertIn("IS installed", cowork.assemble_planner_brief(
-            "a.json", "a.md", caveman_available=True))
-        self.assertIn("NOT installed", cowork.assemble_planner_brief(
-            "a.json", "a.md", caveman_available=False))
-        self.assertIn("IS installed", cowork.assemble_builder_brief(
-            "s.json", caveman_available=True))
-        self.assertIn("NOT installed", cowork.assemble_builder_brief(
-            "s.json", caveman_available=False))
-        self.assertIn("IS installed", cowork.assemble_reviewer_brief(
-            "r.json", caveman_available=True))
-        self.assertIn("NOT installed", cowork.assemble_reviewer_brief(
-            "r.json", caveman_available=False))
-
-    def test_available_detects_via_env_path(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
-        marker = os.path.join(d, "caveman", "SKILL.md")
-        os.makedirs(os.path.dirname(marker), exist_ok=True)
-        open(marker, "w").close()
-        import unittest.mock as mock
-        with mock.patch.dict(os.environ, {"COPLAN_CAVEMAN_PATHS": marker}):
-            self.assertTrue(cowork._caveman_available())
+    def test_briefs_still_carry_their_write_targets(self):
+        # The guard above must not pass by emptying the briefs.
+        self.assertIn("ONLY write target",
+                      cowork.assemble_scout_brief(["scout"], "/i.json"))
+        self.assertIn("ONLY write target",
+                      cowork.assemble_reviewer_brief("/r.json"))
+        self.assertIn("ONLY write targets",
+                      cowork.assemble_planner_brief("/p.json", "/p.md"))
+        self.assertIn("/s.json",
+                      cowork.assemble_builder_brief("/s.json"))
 
 
 # --------------------------------------------------------------------------- #
-# Surfacing the reviewer/advisor REVIEW turn on the internal channel.           #
+# Surfacing the reviewer/advisor REVIEW turn to the run transcript.             #
 # --------------------------------------------------------------------------- #
 
 

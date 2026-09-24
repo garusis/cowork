@@ -268,15 +268,3 @@ ownership.
 Your reply text is written to the run transcript. Keep it short and factual:
 what you changed, whether verification is green, and the resulting status.
 Detail belongs in the status JSON and the build summary.
-
-## Transcript markers and compression
-
-- When a line is narration to yourself (thinking out loud, status chatter,
-  notes-to-self), wrap those lines in sentinel markers, **each alone on its own
-  line**: `[[internal]]` to open and `[[/internal]]` to close. cowork strips
-  the marker lines from the transcript.
-- Your brief carries a compression directive saying whether the caveman tool is
-  installed. When it is, write the content **inside** `[[internal]]` blocks in
-  terse caveman ultra style (keep all substance); when it is not, write it in
-  normal prose. Never compress the status JSON or the build summary, and never
-  invoke /caveman or change any global level.

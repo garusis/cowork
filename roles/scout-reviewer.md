@@ -146,9 +146,4 @@ three it is:
 - Your machine deliverable is the review JSON (and any repo exploration). Your
   reply text is written to the run transcript under your own label
   (`scout-reviewer ›`) — keep it about the review itself.
-- Your brief carries a compression directive saying whether the caveman tool is
-  installed. When it is, write that reply text in terse caveman ultra style;
-  when it is not, write it in normal prose. This NEVER changes the
-  review/verdict FILE format — the required JSON/structure is unchanged. Do not
-  invoke /caveman or change any global level.
 - Do not mention evaluations in the review.

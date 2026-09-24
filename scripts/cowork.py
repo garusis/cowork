@@ -25,7 +25,6 @@ import collections
 import contextlib
 import datetime
 import errno
-import glob
 import hashlib
 import inspect
 import json
@@ -1104,89 +1103,7 @@ def scout_intel_path(intel_dir, session_uuid):
     return os.path.join(intel_dir, "scout.intel.json")
 
 
-# --------------------------------------------------------------------------- #
-# Optional caveman compression: detected once on the cowork side and injected   #
-# as a one-line writing-style directive into each role's and reviewer's brief    #
-# (Q3) — deterministic, identical for claude and codex, never a role self-check. #
-# --------------------------------------------------------------------------- #
-
-
-def _caveman_available():
-    """Whether the optional caveman terse-style tool is installed.
-
-    Cheap — a few `shutil.which` lookups plus path-existence checks — and run
-    at brief assembly, i.e. effectively at session start."""
-    for command in ("caveman", "caveman-compress", "caveman-shrink"):
-        if shutil.which(command) is not None:
-            return True
-    home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, ".claude", "skills", "caveman", "SKILL.md"),
-        os.path.join(home, ".claude", "skills", "cavecrew", "SKILL.md"),
-        os.path.join(home, ".claude", "plugins", "caveman", "SKILL.md"),
-        os.path.join(home, ".claude", "plugins", "caveman",
-                     ".claude-plugin", "plugin.json"),
-        os.path.join(home, ".codex", "skills", "caveman", "SKILL.md"),
-        os.path.join(home, ".codex", "skills", "cavecrew", "SKILL.md"),
-        os.path.join(home, ".codex", "plugins", "caveman", "SKILL.md"),
-        os.path.join(home, ".codex", "plugins", "caveman",
-                     ".codex-plugin", "plugin.json"),
-        os.path.join(home, ".agents", "skills", "caveman", "SKILL.md"),
-        os.path.join(home, ".agents", "skills", "cavecrew", "SKILL.md"),
-        os.path.join(home, ".config", "caveman"),
-    ]
-    extra = os.environ.get("COPLAN_CAVEMAN_PATHS", "")
-    for value in extra.split(os.pathsep):
-        value = value.strip()
-        if value:
-            candidates.append(value)
-    if any(os.path.exists(p) for p in candidates):
-        return True
-    for base, pattern in (
-        (os.path.join(home, ".claude", "skills"), "*caveman*/SKILL.md"),
-        (os.path.join(home, ".claude", "skills"), "*cavecrew*/SKILL.md"),
-        (os.path.join(home, ".codex", "skills"), "*caveman*/SKILL.md"),
-        (os.path.join(home, ".codex", "skills"), "*cavecrew*/SKILL.md"),
-        (os.path.join(home, ".agents", "skills"), "*caveman*/SKILL.md"),
-        (os.path.join(home, ".agents", "skills"), "*cavecrew*/SKILL.md"),
-    ):
-        if glob.glob(os.path.join(base, pattern)):
-            return True
-    return False
-
-
-def caveman_directive(available=None):
-    """The one-line compression directive appended to every role/reviewer brief.
-
-    A WRITING-STYLE instruction only: it never invokes /caveman and never
-    changes any global mode. Internal/peer content is compressed only when
-    caveman is installed; reply text outside internal blocks is always full
-    prose. `available`
-    defaults to live detection; tests pass it explicitly."""
-    if available is None:
-        available = _caveman_available()
-    if available:
-        return (
-            "Compression directive: the caveman terse-style tool IS installed. "
-            "Write all INTERNAL-channel content — your `[[internal]]` "
-            "self-narration, and for reviewers your whole review narration — in "
-            "terse caveman ultra style (drop articles/filler/pleasantries, "
-            "fragments OK), preserving every bit of technical substance and any "
-            "required structure. NEVER compress reply text outside internal "
-            "blocks or any artifact file: those stay full, clear prose. Do not "
-            "invoke /caveman or change any global mode."
-        )
-    return (
-        "Compression directive: the caveman terse-style tool is NOT installed. "
-        "Write everything — reply text and internal-channel alike — in normal, "
-        "full prose. Internal-channel content still routes to the internal "
-        "channel (inside `[[internal]]` blocks, or for reviewers your whole "
-        "narration), just uncompressed."
-    )
-
-
-def assemble_scout_brief(selected, intel_path, intel_md_path=None,
-                         caveman_available=None):
+def assemble_scout_brief(selected, intel_path, intel_md_path=None):
     """Dynamic first-message brief for the scout: where to write, the JSON +
     domain guardrail, and the plan-only fallthrough for this team.
 
@@ -1224,8 +1141,7 @@ def assemble_scout_brief(selected, intel_path, intel_md_path=None,
             "delete any other file (reading/searching the repo is fine)."
             % intel_path
         )
-    return "%s\n%s\n\n%s" % (
-        target, plan_note, caveman_directive(caveman_available))
+    return "%s\n%s" % (target, plan_note)
 
 
 def read_scout_prompt(path=SCOUT_PROMPT_PATH):
@@ -1779,8 +1695,7 @@ def read_scout_reviewer_prompt(path=SCOUT_REVIEWER_PROMPT_PATH):
 
 
 def assemble_reviewer_brief(review_path,
-                            protected="the scout intel files (JSON and markdown)",
-                            caveman_available=None):
+                            protected="the scout intel files (JSON and markdown)"):
     """The reviewer's write-target instruction — its analogue of the scout brief.
     It points at the review file only (never the reviewed artifact, named by
     `protected`)."""
@@ -1790,8 +1705,8 @@ def assemble_reviewer_brief(review_path,
         "That review file is your ONLY write target. Do NOT edit %s "
         "or any other file (reading/searching the repo is fine). Use the "
         "verdict schema from your role (verdict: approve|revise|needs_user, "
-        "findings, and user_question when needs_user).\n\n%s"
-        % (review_path, protected, caveman_directive(caveman_available))
+        "findings, and user_question when needs_user)."
+        % (review_path, protected)
     )
 
 
@@ -4738,7 +4653,7 @@ def make_scout_reviewer_runner(intel_md_path, trace=None,
 # --------------------------------------------------------------------------- #
 
 
-def assemble_planner_brief(plan_json_path, plan_md_path, caveman_available=None):
+def assemble_planner_brief(plan_json_path, plan_md_path):
     """The planner's write-target instruction — its analogue of the scout brief.
     It names BOTH plan artifacts and nothing else."""
     return (
@@ -4746,8 +4661,8 @@ def assemble_planner_brief(plan_json_path, plan_md_path, caveman_available=None)
         "  JSON (machine deliverable + your status channel): %s\n"
         "  Markdown (the readable review surface, small scannable sections): %s\n"
         "Those two plan files are your ONLY write targets. Do not create, edit, "
-        "or delete any other file (reading/searching the repo is fine).\n\n%s"
-        % (plan_json_path, plan_md_path, caveman_directive(caveman_available))
+        "or delete any other file (reading/searching the repo is fine)."
+        % (plan_json_path, plan_md_path)
     )
 
 
@@ -4791,8 +4706,7 @@ def handoff_wake_block(payload, assets_dir=None):
 # --------------------------------------------------------------------------- #
 
 
-def assemble_builder_brief(build_status_path, build_summary_path=None,
-                           caveman_available=None):
+def assemble_builder_brief(build_status_path, build_summary_path=None):
     """The builder's status-file instruction. Unlike the scout/planner, the
     builder's write target is the WHOLE REPO (it edits source to execute the
     plan); the status file named here is only its status/verification channel,
@@ -4806,14 +4720,16 @@ def assemble_builder_brief(build_status_path, build_summary_path=None,
     summary_note = ""
     if build_summary_path:
         summary_note = (
-            "At your self-audit, when you mark the build ready_for_review, also "
+            "\nAt your self-audit, when you mark the build ready_for_review, also "
             "write a readable markdown summary of the build to exactly this "
             "file:\n  %s\n"
             "Cover, in small scannable sections: a TL;DR; the changes by file; "
             "the verification results; any issues & deviations from the plan; "
             "and anything left open. Keep it CONSISTENT with the actual "
-            "working-tree changes and your status JSON.\n" % build_summary_path
+            "working-tree changes and your status JSON." % build_summary_path
         )
+    # No trailing newline: the brief is delivered as an exact static fragment
+    # (`_role_seed_delivery`), which matches it against its own stripped form.
     return (
         "Write and keep current your status as a single JSON object to exactly "
         "this file:\n  %s\n"
@@ -4822,9 +4738,8 @@ def assemble_builder_brief(build_status_path, build_summary_path=None,
         "you may edit. You execute the approved plan by editing the repository "
         "itself. Do NOT run any git commit or PR/branch tooling: approval ends "
         "the run and leaves the changes in the working tree for the "
-        "orchestrator.\n%s\n%s"
-        % (build_status_path, summary_note,
-           caveman_directive(caveman_available))
+        "orchestrator.%s"
+        % (build_status_path, summary_note)
     )
 
 
@@ -8005,7 +7920,7 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
         # the grant in themselves; test runners get nothing (byte-identical).
         if reviewer_runner is None and extra_writable_dir is not None:
             kwargs["extra_writable_dir"] = extra_writable_dir
-        # Surface the review turn on the internal channel. The default
+        # Surface the review turn to the run transcript. The default
         # scout-reviewer path calls run_reviewer_once directly (reviewer_runner
         # is None); the planner/builder real runners are marked surface-capable.
         # Test-injected runners are neither, so they receive no new kwarg and

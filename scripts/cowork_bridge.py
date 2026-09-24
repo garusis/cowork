@@ -1334,8 +1334,14 @@ def parse_claude_event(obj):
         block = event.get("content_block") or {}
         if (event.get("type") == "content_block_start"
                 and block.get("type") == "tool_use"):
-            # Fallback to 'tool' so the activity line never reads 'using …'.
+            # Fallback to 'tool' so a nameless block still reports something.
             return {"kind": "tool", "name": block.get("name") or "tool"}
+        if event.get("type") == "content_block_stop":
+            # Every content block's stop, tool or text alike -- the event
+            # itself does not say which. `ToolActivityTrace.block_stop`
+            # closes it only while a tool block is actually open, exactly as
+            # the documented `--include-partial-messages` pattern does.
+            return {"kind": "block_stop"}
         return {"kind": "partial", "text": ""}
     if etype == "user":
         return {"kind": "user_replay"}
@@ -1441,6 +1447,75 @@ def parse_opencode_event(obj):
         return {"kind": "error",
                 "text": data.get("message") or err.get("name") or "error"}
     return {"kind": "other", "type": etype}
+
+
+# --------------------------------------------------------------------------- #
+# Observable tool progress.                                                   #
+#                                                                             #
+# A long turn is legible from the controller's OWN stream: each tool call     #
+# brackets a `controller.tool.start`/`controller.tool.end` trace pair. Only   #
+# the tool's name and the controller's own label are recorded -- never model  #
+# text, and never anything a role was asked to narrate about itself.          #
+# --------------------------------------------------------------------------- #
+
+
+def tool_activity_label(parsed):
+    """The controller's own name/label for a parsed `tool` event.
+
+    Reads only the fields the three parsers already produce (`label` for
+    codex/opencode, `name` for claude) and never any model text."""
+    for key in ("label", "name", "tool"):
+        value = parsed.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "tool"
+
+
+class ToolActivityTrace:
+    """Per-turn tool bracketing for one controller session.
+
+    Depth-1 and total: a `start` while a tool is open closes the previous one
+    first, and an `end` with nothing open is a no-op. A turn that dies
+    mid-tool leaves its start unmatched -- truthfully, the tool was never
+    observed to finish. No-op without a trace handle."""
+
+    def __init__(self, trace, controller, role):
+        self.trace = trace
+        self.controller = controller
+        self.role = role
+        self.open_tool = None
+
+    def _event(self, name):
+        if self.trace:
+            self.trace.event(name, controller=self.controller, role=self.role,
+                             tool=self.open_tool)
+
+    def start(self, parsed):
+        if self.open_tool is not None:
+            self.end()
+        self.open_tool = tool_activity_label(parsed)
+        self._event("controller.tool.start")
+
+    def end(self):
+        if self.open_tool is None:
+            return
+        self._event("controller.tool.end")
+        self.open_tool = None
+
+    def block_stop(self):
+        """A claude `content_block_stop`: closes the turn's open tool block,
+        and does nothing when the block that stopped was text."""
+        self.end()
+
+    def observe(self, parsed):
+        """Route one parsed event. Unrelated kinds are ignored."""
+        kind = parsed.get("kind")
+        if kind == "tool":
+            self.start(parsed)
+        elif kind == "tool_done":
+            self.end()
+        elif kind == "block_stop":
+            self.block_stop()
 
 
 def capture_opencode_session_id(events):
@@ -1986,6 +2061,7 @@ class ClaudeSession:
         controller_error = None
         parent_direct_usage = {}
         region = None
+        tool_activity = ToolActivityTrace(self.trace, "claude", self.speaker)
 
         def _feed(chunk):
             # Open the transcript stream on the first token, then stream into it.
@@ -2146,6 +2222,8 @@ class ClaudeSession:
                     broker.finalize_child(
                         child_work_id, agent_id=parsed.get("agent_id"),
                         terminal_source="subagent_stop")
+            if kind in ("tool", "block_stop"):
+                tool_activity.observe(parsed)
             if kind == "partial" and parsed.get("text"):
                 _feed(parsed["text"])
                 any_text = True
@@ -2440,6 +2518,7 @@ class CodexSession:
         self._live_proc = proc
         events = []
         wrote_label = {"done": False}
+        tool_activity = ToolActivityTrace(self.trace, "codex", self.speaker)
         no_first_token = False
         # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple):
         # several pre-existing tests subclass CodexSession and override
@@ -2497,6 +2576,7 @@ class CodexSession:
                         continue
                     events.append(obj)
                     parsed = parse_codex_event(obj)
+                    tool_activity.observe(parsed)
 
                     def _emit(text, render=True):
                         if not wrote_label["done"]:
@@ -2847,6 +2927,7 @@ class OpencodeSession:
         self._live_proc = proc
         events = []
         wrote_label = {"done": False}
+        tool_activity = ToolActivityTrace(self.trace, "opencode", self.speaker)
         no_first_token = False
         # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple),
         # matching CodexSession._run's identical contract-preservation
@@ -2901,6 +2982,7 @@ class OpencodeSession:
                         continue
                     events.append(obj)
                     parsed = parse_opencode_event(obj)
+                    tool_activity.observe(parsed)
 
                     def _emit(text, render=True):
                         if not wrote_label["done"]:
@@ -3891,9 +3973,9 @@ def _classify_controller_activity(evidence, kind_map):
 
     Every other recognized kind not named in `kind_map` (a meta/
     bookkeeping event such as `system`/`thread_started`/`turn_started`/
-    `user_replay`/`child_usage`/`other`/`step_finish`) is real, observed
-    evidence that the controller is alive and communicating -- never
-    silence -- and classifies `provider_wait`."""
+    `user_replay`/`child_usage`/`other`/`step_finish`/`block_stop`) is
+    real, observed evidence that the controller is alive and communicating
+    -- never silence -- and classifies `provider_wait`."""
     if not isinstance(evidence, dict):
         return "no_evidence_silence"
     kind = evidence.get("kind")

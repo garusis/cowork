@@ -64,70 +64,19 @@ shorten_path = render_path
 
 
 # --------------------------------------------------------------------------- #
-# Channel markers.                                                            #
-#                                                                             #
-# A lead role may wrap self-narration in sentinel lines, each ALONE on its    #
-# own line: `[[internal]]` opens a block, `[[/internal]]` closes it. Marker   #
-# lines are channel control and are never written to the transcript; the     #
-# enclosed text is written plain. For marker-free content the transcript is   #
-# byte-identical to the reply.                                                #
+# Replies.                                                                    #
 # --------------------------------------------------------------------------- #
-
-INTERNAL_OPEN = "[[internal]]"
-INTERNAL_CLOSE = "[[/internal]]"
-
-
-def split_channel_segments(text, internal_start=False):
-    """Split `text` into ordered (channel, segment_text) runs, channel in
-    {'user','internal'}, and return (segments, internal_end).
-
-    A control line is recognized ONLY when a full line's stripped content
-    equals exactly `[[internal]]` or `[[/internal]]`. Channel state is
-    depth-1: a second open while internal, or a close with no open, is a
-    no-op. Marker lines are always stripped. For marker-free text the single
-    segment is byte-identical to the input."""
-    segments = []
-    internal = bool(internal_start)
-    channel = "internal" if internal else "user"
-    buf = []
-
-    def flush():
-        if buf:
-            segments.append((channel, "".join(buf)))
-            buf.clear()
-
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped == INTERNAL_OPEN:
-            if not internal:
-                flush()
-                internal = True
-                channel = "internal"
-            continue
-        if stripped == INTERNAL_CLOSE:
-            if internal:
-                flush()
-                internal = False
-                channel = "user"
-            continue
-        buf.append(line)
-    flush()
-    return segments, internal
 
 
 def write_reply(io_out, text):
-    """Write one whole (non-streamed) reply, marker lines stripped."""
-    segments, _ = split_channel_segments(text)
-    plain = "".join(seg for _channel, seg in segments)
-    io_out.write(plain + ("\n" if not plain.endswith("\n") else ""))
+    """Write one whole (non-streamed) reply verbatim, newline-terminated."""
+    io_out.write(text + ("\n" if not text.endswith("\n") else ""))
     io_out.flush()
 
 
 class TranscriptStream:
-    """A streamed role reply: the label once, then chunks as they arrive with
-    complete marker lines stripped (a partial trailing line is held until it
-    completes or the turn ends). Content-free trace events record the stream's
-    shape."""
+    """A streamed role reply: the label once, then chunks written verbatim as
+    they arrive. Content-free trace events record the stream's shape."""
 
     def __init__(self, io_out, label_text, trace=None, trace_fields=None):
         self.io_out = io_out
@@ -135,7 +84,6 @@ class TranscriptStream:
         self.trace = trace
         self.trace_fields = trace_fields or {}
         self.buf = []
-        self._pending = ""
         self._started = False
         self._chunks = 0
         self._chars = 0
@@ -159,26 +107,10 @@ class TranscriptStream:
         if not self._started:
             self.io_out.write("\n" + self.label_text)
             self._started = True
-        self._pending += chunk
-        out = []
-        while True:
-            nl = self._pending.find("\n")
-            if nl == -1:
-                break
-            line = self._pending[:nl + 1]
-            self._pending = self._pending[nl + 1:]
-            if line.strip() in (INTERNAL_OPEN, INTERNAL_CLOSE):
-                continue
-            out.append(line)
-        if out:
-            self.io_out.write("".join(out))
-            self.io_out.flush()
+        self.io_out.write(chunk)
+        self.io_out.flush()
 
     def __exit__(self, *exc):
-        tail = self._pending
-        self._pending = ""
-        if tail and tail.strip() not in (INTERNAL_OPEN, INTERNAL_CLOSE):
-            self.io_out.write(tail)
         self.io_out.write("\n")
         full = "".join(self.buf)
         self._trace("transcript.stream.end", chunks=self._chunks,

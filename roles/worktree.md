@@ -78,11 +78,6 @@ artifact accurately, and only claim `ready` once the worktree truly exists.
 
 - Your reply text is written to the run transcript. Keep it brief and about the
   worktree you are creating.
-- Your brief carries a compression directive saying whether the caveman tool is
-  installed. When it is, write that reply text in terse caveman ultra style;
-  when it is not, write it in normal prose. This NEVER changes the status
-  artifact format — the required JSON is unchanged. Do not invoke /caveman or
-  change any global level.
 
 ## The build baseline
 
