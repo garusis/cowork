@@ -3364,10 +3364,258 @@ class DecisionDeliveryTest(AgentRunContractTest):
                     (2, "invalid_invocation", "conflicting_arguments"))
 
 
+class OrdinaryCapacityPauseHoldTest(AgentRunContractTest):
+    """Issue #85: a live PauseLease owns its role's paused turn even when no
+    orchestrator decision rides it, so a plain resume dispatches nothing."""
+
+    TEAM = "scout,scout-reviewer,planner,planning-advisor"
+
+    def _session(self):
+        return os.path.join(self.cwd, ".cowork", "session.json")
+
+    def _recording_lead(self, calls, outcome="ended"):
+        def fake(config, context, selected, on_outcome=None, **kw):
+            calls.append({"context": str(context), "kw": kw})
+            if on_outcome:
+                on_outcome(outcome, None)
+            return 0
+        return fake
+
+    @staticmethod
+    def _lease(state, issued_at=None):
+        return {"lease_id": "lease-1", "consumption_state": state,
+                "resume_mode": "manual_signal", "not_before": None,
+                "issued_at": issued_at or cowork._capacity_now()}
+
+    def _ordinary_pause(self):
+        """A scout launch that paused for capacity with an acknowledged
+        pending turn carrying NO decision bindings -- the ordinary pause. The
+        lease record itself is supplied per test through `read_pause_lease`."""
+        spath = self._session()
+        box = {}
+
+        def pausing_scout(config, context, selected, on_outcome=None, **kw):
+            # Read at call time: this fixture's session is created BY this run
+            # (run_flow ensures it before any dispatch), so unlike the
+            # decision fixtures there is no uuid to close over beforehand.
+            suid = state_store.get_session_uuid(state_store.load(spath))
+            box["suid"] = suid
+            record = state_store.write_pending_turn_before_pause(
+                suid, "scout", str(context), lease_id="lease-1")
+            state_store.acknowledge_pending_turn_before_pause(
+                suid, "scout", record["sha256"])
+            kw["on_first_send_rejected"]()
+            on_outcome("awaiting_capacity", {"lease_id": "lease-1"})
+            return 0
+        rc, _result, _ = self._run(
+            ["--session-file", spath, "--team", self.TEAM,
+             "--context", "GOAL"], run_scout_fn=pausing_scout)
+        self.assertEqual(rc, cowork.CAPACITY_WAIT_EXIT_CODE)
+        return spath, box["suid"]
+
+    def test_a_plain_resume_during_a_live_ordinary_capacity_pause_dispatches_nothing(self):
+        import unittest.mock as mock
+        spath, _suid = self._ordinary_pause()
+
+        def snapshot():
+            state = state_store.load(spath)
+            return (state.get("team"), state.get("config"),
+                    state_store.get_evaluation_policy(state),
+                    state.get("controller_policy"),
+                    state.get("decision_responses"), state.get("phase"))
+        before = snapshot()
+        drains = []
+        for lease_state in ("unclaimed", "claimed"):
+            calls = []
+            with self.subTest(lease=lease_state), \
+                    mock.patch.object(
+                        state_store, "read_pause_lease",
+                        lambda *_a, st=lease_state, **_k: self._lease(st)), \
+                    mock.patch.object(
+                        cowork, "run_evaluation_transition",
+                        lambda *a, **k: drains.append(k.get("at"))):
+                rc, result, _ = self._run(
+                    ["--session-file", spath, "--evaluation-policy", "off"],
+                    run_scout_fn=self._recording_lead(calls))
+                self.assertEqual(calls, [])
+                self.assertEqual(
+                    (rc, result["outcome"], result["reason"]),
+                    (cowork.CAPACITY_WAIT_EXIT_CODE, "awaiting_capacity",
+                     "role_held_by_capacity_pause"))
+                self.assertEqual(result["stop"]["kind"],
+                                 "role_held_by_capacity_pause")
+                self.assertEqual(
+                    (result["stop"]["role"], result["stop"]["lease_id"]),
+                    ("scout", "lease-1"))
+                # An ordinary pause carries no decision, so no request_id.
+                self.assertNotIn("request_id", result["stop"])
+                self.assertNotIn("decision_argv", result)
+                self.assertEqual(snapshot(), before)
+        self.assertEqual(drains, [])
+
+    def test_a_claimed_ordinary_hold_names_the_identities_that_recover_it(self):
+        import unittest.mock as mock
+        # NOT self.cwd: on macOS tempfile.mkdtemp() returns /var/... while the
+        # product interpolates run_cwd = os.getcwd(), the resolved /private/var.
+        launch_dir = os.getcwd()
+        spath, suid = self._ordinary_pause()
+        claimed = dict(self._lease("claimed", "2026-01-01T00:00:00Z"),
+                       claimant_ref="wake-1", automation_ref="auto-1",
+                       claimed_at="2026-01-01T00:05:00Z")
+        calls = []
+        with mock.patch.object(cowork, "_capacity_now",
+                               return_value="2026-01-02T00:00:00Z"), \
+                mock.patch.object(state_store, "read_pause_lease",
+                                  lambda *_a, **_k: dict(claimed)):
+            rc, result, out = self._run(
+                ["--session-file", spath],
+                run_scout_fn=self._recording_lead(calls))
+        self.assertEqual(calls, [])
+        self.assertEqual((rc, result["reason"]),
+                         (cowork.CAPACITY_WAIT_EXIT_CODE,
+                          "role_held_by_capacity_pause"))
+        stop = result["stop"]
+        self.assertEqual(
+            (stop["lease_state"], stop["claimant_ref"], stop["automation_ref"],
+             stop["horizon_release_at"]),
+            ("claimed", "wake-1", "auto-1", "2026-01-08T00:05:00Z"))
+        # The complete recovery invocation, --cwd included, so an agent can
+        # copy it verbatim from any directory.
+        self.assertIn(
+            "resume-trigger --session-uuid %s --lease-id lease-1 "
+            "--claimant-ref wake-1 --automation-ref auto-1 --cwd %s"
+            % (suid, launch_dir), out)
+        self.assertIn("2026-01-08T00:05:00Z", out)
+        # An unclaimed lease is still owned by its scheduled wake adapter, so
+        # its message names the mechanism, not a command to race it with.
+        later = []
+        with mock.patch.object(cowork, "_capacity_now",
+                               return_value="2026-01-02T00:00:00Z"), \
+                mock.patch.object(
+                    state_store, "read_pause_lease",
+                    lambda *_a, **_k: self._lease(
+                        "unclaimed", "2026-01-01T00:00:00Z")):
+            rc, result, out = self._run(
+                ["--session-file", spath],
+                run_scout_fn=self._recording_lead(later))
+        self.assertEqual((rc, later), (cowork.CAPACITY_WAIT_EXIT_CODE, []))
+        self.assertEqual(
+            (result["stop"]["lease_state"], result["stop"]["claimant_ref"],
+             result["stop"]["horizon_release_at"]),
+            ("unclaimed", None, "2026-01-08T00:00:00Z"))
+        self.assertIn("it is replayed by `resume-trigger --lease-id lease-1` "
+                      "(verbatim, no --redirected-context)", out)
+        self.assertNotIn("--claimant-ref", out)
+
+    def test_a_terminal_missing_or_expired_lease_releases_the_ordinary_hold(self):
+        import datetime
+        import unittest.mock as mock
+        spath, _suid = self._ordinary_pause()
+        stale = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(
+                     seconds=cowork.capacity_contracts
+                     .MAX_RETRY_HORIZON_SECONDS + 3600)).isoformat().replace(
+                         "+00:00", "Z")
+        # The four terminal states the lease lifecycle names, a missing lease,
+        # and a live-state lease already past its retry horizon.
+        cases = (("consumed", self._lease("consumed")),
+                 ("cancelled", self._lease("cancelled")),
+                 ("replaced", self._lease("replaced")),
+                 ("expired", self._lease("expired")),
+                 ("missing", None),
+                 ("past_horizon", self._lease("unclaimed", stale)))
+        for name, lease in cases:
+            calls = []
+            with self.subTest(lease=name), \
+                    mock.patch.object(
+                        state_store, "read_pause_lease",
+                        lambda *_a, ls=lease, **_k: (dict(ls) if ls else None)):
+                self._run(["--session-file", spath],
+                          run_scout_fn=self._recording_lead(calls))
+                self.assertEqual(len(calls), 1)
+
+    def test_an_unacknowledged_pending_turn_is_never_a_hold(self):
+        import unittest.mock as mock
+        spath, suid = self._ordinary_pause()
+        # A pause still mid-flight is rollback-eligible and owns nothing.
+        state_store.clear_pending_turn_before_pause(suid, "scout")
+        state_store.write_pending_turn_before_pause(
+            suid, "scout", "a turn still in flight", lease_id="lease-1")
+        calls = []
+        with mock.patch.object(state_store, "read_pause_lease",
+                               lambda *_a, **_k: self._lease("unclaimed")):
+            self.assertIsNone(cowork._capacity_turn_role_hold(suid, "scout"))
+            self._run(["--session-file", spath],
+                      run_scout_fn=self._recording_lead(calls))
+        self.assertEqual(len(calls), 1)
+
+    def test_an_unpersisted_expiry_keeps_the_ordinary_hold_and_refuses(self):
+        import unittest.mock as mock
+        spath, suid = self._ordinary_pause()
+        stale = self._lease("claimed", "2026-01-01T00:00:00Z")
+        now = "2026-02-01T00:00:00Z"                  # past the horizon
+
+        def snapshot():
+            state = state_store.load(spath)
+            return (state.get("config"), state.get("decision_responses"),
+                    state.get("phase"))
+        before = snapshot()
+        calls = []
+        with mock.patch.object(cowork, "_capacity_now", return_value=now), \
+                mock.patch.object(state_store, "read_pause_lease",
+                                  lambda *_a, **_k: dict(stale)), \
+                mock.patch.object(state_store, "mark_pause_lease_expired",
+                                  side_effect=OSError("read-only store")):
+            failures = {}
+            self.assertEqual(cowork._capacity_turn_role_hold(
+                suid, "scout", expire_stale=True,
+                expiry_failures=failures), "lease-1")
+            self.assertEqual(failures, {"lease-1": "OSError"})
+            rc, result, out = self._run(
+                ["--session-file", spath],
+                run_scout_fn=self._recording_lead(calls))
+        self.assertEqual(calls, [])
+        self.assertEqual((rc, result["reason"]),
+                         (1, "role_held_by_capacity_pause"))
+        stop = result["stop"]
+        self.assertEqual(stop["kind"], "role_held_by_capacity_pause")
+        self.assertEqual(
+            (stop["lease_id"], stop["expiry_failed"], stop["lease_path"],
+             stop["horizon_release_at"]),
+            ("lease-1", "OSError",
+             state_store.pause_lease_path_for(suid, "lease-1"),
+             "2026-01-08T00:00:00Z"))
+        self.assertEqual(stop["holds"][0]["expiry_failed"], "OSError")
+        self.assertIn("could not be durably marked expired (OSError)", out)
+        self.assertEqual(snapshot(), before)
+
+    def test_the_capacity_readme_documents_the_ordinary_pause_refusal(self):
+        with open(os.path.join(cowork.SKILL_ROOT, "README.md")) as fh:
+            text = fh.read()
+        heading = "### Provider capacity pauses (rc 5)"
+        lines = text.splitlines()
+        start = lines.index(heading) + 1
+        end = next((i for i in range(start, len(lines))
+                    if lines[i].startswith("### ")), len(lines))
+        section = "\n".join(lines[start:end])
+        # The runtime enforcement the ordinary pause now gets...
+        self.assertIn("role_held_by_capacity_pause", section)
+        self.assertIn("run-level", section)
+        # ...without disturbing the pre-existing, distinct decision refusal.
+        self.assertIn("decision_held_by_capacity_pause", section)
+        # The unqualified post-trigger guidance is gone (only the head of the
+        # sentence is matched: the original spans a line break)...
+        self.assertNotIn("After it reports `success`, continue with", section)
+        # ...and its qualified replacement stands in its place.
+        self.assertIn("only after its lease is released", section)
+
+
 # The inherited contract tests run once, in AgentRunContractTest itself.
 for _name in [n for n in dir(AgentRunContractTest) if n.startswith("test")]:
     if _name not in DecisionDeliveryTest.__dict__:
         setattr(DecisionDeliveryTest, _name, None)
+    if _name not in OrdinaryCapacityPauseHoldTest.__dict__:
+        setattr(OrdinaryCapacityPauseHoldTest, _name, None)
 
 
 class MultiSessionFlowTest(unittest.TestCase):

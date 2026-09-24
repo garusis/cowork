@@ -408,14 +408,30 @@ All four identities are required. `--cwd` names the directory whose `.cowork/`
 holds the session anchor (it defaults to the current directory); that is the
 launch directory, even for a `--worktree` run. The trigger claims the due
 lease, re-checks that its binding still matches the session, and sends the
-persisted turn; it does not drive the rest of the phase. After it reports `success`, continue with
-a plain `cowork --session-file PATH`.
+persisted turn; it does not drive the rest of the phase. A `success` report is
+not by itself permission to resume: a plain `cowork --session-file PATH`
+continues the session **only after its lease is released** (consumed,
+cancelled, or past its retry horizon), and is refused while that lease is still
+live — see the bullet below.
 
 - **Delivery is at least once, not exactly once.** Orchestrator decisions
   carried by the paused turn are acknowledged after the provider accepts it; a
   failed acknowledgment is reported (`decision_ack_failed`) and a later plain
   run re-sends the decision block. No phase or epoch transition is applied
   twice.
+- **A live lease owns its paused turn (runtime enforcement, not supervisor
+  policy).** While a PauseLease is live — `unclaimed` or `claimed` and within
+  its retry horizon — a plain `cowork --session-file PATH` is refused by cowork
+  itself with reason `role_held_by_capacity_pause` and exit code 5 (`outcome:
+  awaiting_capacity`), before anything is written, drained or dispatched. This
+  covers an ordinary pause that carries no orchestrator decision as well as a
+  decision-bound one. The refusal is **run-level**: one held role refuses the
+  whole run, including a run whose `--team` excludes that role. The stop names
+  the held `role`, its `lease_id`, `lease_state`, `claimant_ref` /
+  `automation_ref` and `horizon_release_at`, and a claimed lease's message
+  prints the full `resume-trigger` invocation including `--cwd`. Only
+  `resume-trigger` replays that turn; the hold ends when the lease is consumed,
+  cancelled, or past its retry horizon.
 - **Crashed claimant.** If a claimant stopped after claiming, a plain run is
   refused with `decision_held_by_capacity_pause`, naming the lease, its
   `claimant_ref`/`automation_ref`, and its retry-horizon release time.

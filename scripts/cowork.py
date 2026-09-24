@@ -9129,6 +9129,41 @@ def _pause_lease_past_horizon(lease, now=None):
     return now_epoch > horizon
 
 
+def _acknowledged_turn_lease_hold(session_uuid, record, expire_stale=False,
+                                  expiry_failures=None):
+    """The shared lease-liveness core of both capacity holds: the PauseLease
+    id still owning an ACKNOWLEDGED pending-turn `record`, or None.
+
+    The lease is live while it is `unclaimed` or `claimed` and not past the
+    retry horizon (`_pause_lease_past_horizon`). A terminal lease (consumed,
+    cancelled, replaced, expired), a missing lease, or a lease past the
+    horizon releases the hold. With `expire_stale`, a lease past the horizon
+    is also durably marked expired before the hold is released, so no later
+    trigger can resend its stale turn. When that expiry cannot be persisted
+    the hold is KEPT (its lease id is returned) and the error type name is
+    recorded in `expiry_failures` (a dict keyed by lease id, when given) so
+    the caller refuses with it. A `PauseLeaseConflict` means the lease is
+    already terminal or gone, which releases the hold."""
+    lease_id = record.get("lease_id")
+    lease = (state_store.read_pause_lease(session_uuid, lease_id)
+             if lease_id else None)
+    if not lease or lease.get("consumption_state") not in (
+            "unclaimed", "claimed"):
+        return None
+    if _pause_lease_past_horizon(lease):
+        if expire_stale:
+            try:
+                state_store.mark_pause_lease_expired(session_uuid, lease_id)
+            except state_store.PauseLeaseConflict:
+                pass
+            except (OSError, TimeoutError, ValueError) as exc:
+                if expiry_failures is not None:
+                    expiry_failures[lease_id] = type(exc).__name__
+                return lease_id
+        return None
+    return lease_id
+
+
 def _capacity_turn_decision_hold(session_uuid, role, request_id,
                                  expire_stale=False, expiry_failures=None):
     """The PauseLease id holding decision `request_id` for `role`, or None.
@@ -9152,24 +9187,8 @@ def _capacity_turn_decision_hold(session_uuid, role, request_id,
     if not any(b.get("request_id") == request_id
                for b in record.get("decision_bindings") or ()):
         return None
-    lease_id = record.get("lease_id")
-    lease = (state_store.read_pause_lease(session_uuid, lease_id)
-             if lease_id else None)
-    if not lease or lease.get("consumption_state") not in (
-            "unclaimed", "claimed"):
-        return None
-    if _pause_lease_past_horizon(lease):
-        if expire_stale:
-            try:
-                state_store.mark_pause_lease_expired(session_uuid, lease_id)
-            except state_store.PauseLeaseConflict:
-                pass
-            except (OSError, TimeoutError, ValueError) as exc:
-                if expiry_failures is not None:
-                    expiry_failures[lease_id] = type(exc).__name__
-                return lease_id
-        return None
-    return lease_id
+    return _acknowledged_turn_lease_hold(
+        session_uuid, record, expire_stale, expiry_failures)
 
 
 def _capacity_turn_holds_decision(session_uuid, role, request_id):
@@ -9205,6 +9224,44 @@ def _capacity_held_decisions(session_uuid, trusted_state):
                 if lease_id in expiry_failures:
                     hold["expiry_failed"] = expiry_failures[lease_id]
                 holds.append(hold)
+    return holds
+
+
+def _capacity_turn_role_hold(session_uuid, role, expire_stale=False,
+                             expiry_failures=None):
+    """The PauseLease id holding `role`'s acknowledged capacity pending turn,
+    or None. This is `_capacity_turn_decision_hold` without the
+    `decision_bindings` filter: an ORDINARY capacity pause -- one no
+    orchestrator decision rides -- is owned by its lease just the same, and
+    only the resume-trigger that sends those turn bytes may replay them. An
+    UNACKNOWLEDGED record is a pause still mid-flight and rollback-eligible,
+    so it never holds. Lease liveness, durable expiry and the fail-closed
+    unpersistable-expiry path are the shared
+    `_acknowledged_turn_lease_hold`."""
+    record = state_store.read_pending_turn_before_pause(session_uuid, role)
+    if not (isinstance(record, dict) and record.get("acknowledged")):
+        return None
+    return _acknowledged_turn_lease_hold(
+        session_uuid, record, expire_stale, expiry_failures)
+
+
+def _capacity_held_roles(session_uuid):
+    """Every role whose acknowledged capacity pending turn a live lease still
+    owns: `{"role", "lease_id"}` dicts in `ROLES` order. Leases past the retry
+    horizon are durably expired on the way (they hold nothing); one whose
+    expiry could not be persisted still holds, and its dict also carries
+    `"expiry_failed": <error type name>`."""
+    holds = []
+    expiry_failures = {}
+    for role in ROLES:
+        lease_id = _capacity_turn_role_hold(
+            session_uuid, role, expire_stale=True,
+            expiry_failures=expiry_failures)
+        if lease_id:
+            hold = {"role": role, "lease_id": lease_id}
+            if lease_id in expiry_failures:
+                hold["expiry_failed"] = expiry_failures[lease_id]
+            holds.append(hold)
     return holds
 
 
@@ -9254,6 +9311,62 @@ def _capacity_hold_refusal(session_uuid, hold):
         "is delivered by `resume-trigger --lease-id %s` (verbatim, no "
         "--redirected-context), or released when that lease is cancelled or "
         "expires" % (rid, role, lease_id, lease_id)), CAPACITY_WAIT_EXIT_CODE
+
+
+def _capacity_role_hold_refusal(session_uuid, hold, launch_dir=None):
+    """`(stop_details, message, rc)` for a run refused because `hold` (one
+    `_capacity_held_roles` entry) keeps its role's paused turn on a live
+    lease. Keyed on the role rather than a decision: an ordinary pause carries
+    none, so the details name no `request_id`. They do name the lease's state,
+    claimant/automation refs and the time its retry horizon releases it, so a
+    crashed claimant can be recovered; no reset or cancel command is
+    invented."""
+    role, lease_id = hold["role"], hold["lease_id"]
+    lease = state_store.read_pause_lease(session_uuid, lease_id) or {}
+    lease_state = lease.get("consumption_state")
+    claimant_ref = lease.get("claimant_ref")
+    automation_ref = lease.get("automation_ref")
+    release_at = _pause_lease_horizon_release_at(lease)
+    details = {
+        "kind": "role_held_by_capacity_pause",
+        "role": role, "lease_id": lease_id,
+        "lease_state": lease_state, "claimant_ref": claimant_ref,
+        "automation_ref": automation_ref,
+        "horizon_release_at": release_at}
+    if hold.get("expiry_failed"):
+        details["expiry_failed"] = hold["expiry_failed"]
+        details["lease_path"] = state_store.pause_lease_path_for(
+            session_uuid, lease_id)
+        return details, (
+            "role %s has a capacity-paused turn held by lease %s, which is "
+            "past its retry horizon (%s) but could not be durably marked "
+            "expired (%s); the hold is kept so no wake resends that stale "
+            "turn. Make the lease record at %s writable and rerun"
+            % (role, lease_id, release_at or "unknown", hold["expiry_failed"],
+               details["lease_path"])), 1
+    if lease_state == "claimed":
+        # The COMPLETE recovery invocation: an agent copying it from another
+        # directory would otherwise trip the trigger's own cwd preflight.
+        cwd_arg = (" --cwd %s" % launch_dir) if launch_dir else ""
+        return details, (
+            "role %s has a capacity-paused turn held by lease %s, claimed by "
+            "%s but never consumed (its claimant stopped after claiming). "
+            "Retrigger it with the SAME identities: `resume-trigger "
+            "--session-uuid %s --lease-id %s --claimant-ref %s "
+            "--automation-ref %s%s` (verbatim, no --redirected-context); "
+            "after the lease is released (consumed, or past its retry "
+            "horizon at %s) a plain run continues the session"
+            % (role, lease_id, claimant_ref, session_uuid, lease_id,
+               claimant_ref, automation_ref, cwd_arg,
+               release_at or "unknown")), CAPACITY_WAIT_EXIT_CODE
+    # An unclaimed lease is still owned by its scheduled wake adapter, so this
+    # names the mechanism that will replay the turn -- deliberately NOT a full
+    # four-identity command a reader might run to race that adapter.
+    return details, (
+        "role %s has a capacity-paused turn held by lease %s; it is replayed "
+        "by `resume-trigger --lease-id %s` (verbatim, no "
+        "--redirected-context), or released when that lease is cancelled or "
+        "expires" % (role, lease_id, lease_id)), CAPACITY_WAIT_EXIT_CODE
 
 
 def _acknowledge_capacity_turn_decisions(session_uuid, pending_record,
@@ -11870,6 +11983,27 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 stop["holds"] = holds
                 result_box["stop"] = stop
                 return refuse("decision_held_by_capacity_pause", message,
+                              rc=hold_rc, trace_obj=trace)
+            # An ORDINARY capacity pause -- one no orchestrator decision rides
+            # -- is owned by its PauseLease exactly as a decision-bound one is:
+            # only the resume-trigger that sends those turn bytes may replay
+            # them, so relaunching the role here would spend quota on a turn
+            # the lease still owns. This runs AFTER the decision gate so a
+            # decision-bound pause keeps its more specific refusal, and it is
+            # run-level by construction: the team is not parsed yet, which is
+            # exactly what makes "nothing written, nothing dispatched"
+            # provable.
+            role_holds = _capacity_held_roles(session_uuid)
+            if role_holds:
+                first = role_holds[0]
+                trace.event("capacity.role.held", role=first["role"],
+                            lease_id=first["lease_id"],
+                            reason="capacity_pending_turn")
+                stop, message, hold_rc = _capacity_role_hold_refusal(
+                    session_uuid, first, launch_dir=run_cwd)
+                stop["holds"] = role_holds
+                result_box["stop"] = stop
+                return refuse("role_held_by_capacity_pause", message,
                               rc=hold_rc, trace_obj=trace)
         # The caller-visible lever on measurement overhead. A CLI value is persisted
         # so the choice survives a resume; otherwise the saved value stands, and the
