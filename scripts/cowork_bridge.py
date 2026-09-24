@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -97,6 +98,165 @@ def _terminate(proc):
             proc.wait(timeout=3)
     except Exception:  # noqa: BLE001 - never raise from cleanup
         pass
+
+
+# Bounded controller cleanup (issue #89). Seconds per phase: the graceful wait
+# after stdin EOF (claude close) or for a natural exit after stdout EOF
+# (codex/opencode turn end), then SIGTERM grace, then SIGKILL confirmation.
+# A session may override any of them through a `_cleanup_bounds` dict, the same
+# pattern as `_first_token_deadline_seconds`.
+CONTROLLER_CLEANUP_BOUNDS = {"stdin_eof": 5.0, "natural_exit": 10.0,
+                             "term_grace": 3.0, "kill_confirm": 3.0}
+_CLEANUP_POLL_SECONDS = 0.05
+
+
+def _spawn_pgid(proc):
+    """The process group a controller leads, recorded at spawn, or None.
+
+    Only a group the child itself leads (pgid == pid, from start_new_session)
+    and that is not this process's own group counts: that is what proves every
+    member is the controller's descendant. Anything else (a test double, a
+    child sharing our group) degrades cleanup to the leader alone."""
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+        own = os.getpgrp()
+    except (OSError, TypeError):
+        return None
+    return pgid if pgid == pid and pgid != own else None
+
+
+def _pgid_alive(pgid):
+    """True while any member of `pgid` exists (a PermissionError counts)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _leader_wait(proc, timeout):
+    """True once the leader is reaped, False while it runs, None when the
+    handle cannot be observed at all."""
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:  # noqa: BLE001 - an unobservable handle, not an error
+        return None
+
+
+def _await_gone(proc, pgid, seconds, state):
+    """Poll up to `seconds` until the leader is reaped and (when `pgid` is
+    given) its group is empty. Returns True when both hold."""
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = max(deadline - time.monotonic(), 0.0)
+        if not state["leader_exited"]:
+            step = min(_CLEANUP_POLL_SECONDS, remaining)
+            started = time.monotonic()
+            exited = _leader_wait(proc, step)
+            if exited is None:
+                return False
+            if exited:
+                state["leader_exited"] = True
+            else:
+                # A double may raise TimeoutExpired at once: never busy-spin.
+                spent = time.monotonic() - started
+                if spent < step:
+                    time.sleep(step - spent)
+        if state["leader_exited"] and (pgid is None or not _pgid_alive(pgid)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if state["leader_exited"]:
+            time.sleep(min(_CLEANUP_POLL_SECONDS,
+                           max(deadline - time.monotonic(), 0.0)))
+
+
+def _close_owned_process(proc, pgid, graceful, bounds=None, controller=None,
+                         trigger=None):
+    """Close a controller process Cowork spawned and confirm it is gone.
+
+    `graceful` is the completion request already made or awaited:
+    'stdin_eof' (the caller closed stdin), 'natural_exit' (stdout reached EOF),
+    or 'sigterm' (no graceful wait; SIGTERM is the request). After a bounded
+    wait, SIGTERM and then SIGKILL go to the group recorded at spawn (or to the
+    leader alone when no group was verified), and the result is checked.
+    Members left in the group after the leader exits are swept the same way.
+
+    Returns an evidence dict and never raises: cleanup is secondary evidence
+    and must never replace the caller's own result or exception."""
+    limits = dict(CONTROLLER_CLEANUP_BOUNDS)
+    if isinstance(bounds, dict):
+        limits.update(bounds)
+    started = time.monotonic()
+    state = {"leader_exited": False}
+    sent = {"term": False, "kill": False}
+    try:
+        already = proc.poll() is not None
+    except Exception:  # noqa: BLE001
+        already = False
+    if already:
+        state["leader_exited"] = _leader_wait(proc, 0) is not False
+    try:
+        if not state["leader_exited"] and graceful in ("stdin_eof",
+                                                       "natural_exit"):
+            _await_gone(proc, None, limits.get(graceful, 0.0), state)
+        for sig, name, method, bound in (
+                (signal.SIGTERM, "term", "terminate", "term_grace"),
+                (signal.SIGKILL, "kill", "kill", "kill_confirm")):
+            group_alive = pgid is not None and _pgid_alive(pgid)
+            if state["leader_exited"] and not group_alive:
+                break
+            try:
+                if group_alive:
+                    os.killpg(pgid, sig)
+                elif not state["leader_exited"]:
+                    getattr(proc, method)()
+            except ProcessLookupError:
+                pass
+            except Exception:  # noqa: BLE001 - fall through to confirmation
+                pass
+            sent[name] = True
+            _await_gone(proc, pgid, limits.get(bound, 0.0), state)
+    except Exception:  # noqa: BLE001 - never raise from cleanup
+        pass
+    try:
+        confirmed = bool(state["leader_exited"]) and (
+            pgid is None or not _pgid_alive(pgid))
+    except Exception:  # noqa: BLE001
+        confirmed = False
+    if not confirmed:
+        outcome = "failed"
+    elif sent["kill"]:
+        outcome = "killed"
+    elif sent["term"]:
+        outcome = "terminated"
+    elif already:
+        outcome = "already_exited"
+    else:
+        outcome = "graceful"
+    return {"controller": controller, "trigger": trigger, "outcome": outcome,
+            "confirmed": confirmed, "group_verified": pgid is not None,
+            "term_sent": sent["term"], "kill_sent": sent["kill"],
+            "duration_ms": int((time.monotonic() - started) * 1000)}
+
+
+def _emit_cleanup(trace, role, evidence):
+    """Record a cleanup result as the `controller.cleanup` trace event and
+    return it unchanged. It never touches a turn result."""
+    if trace:
+        try:
+            trace.event("controller.cleanup", role=role, **evidence)
+        except Exception:  # noqa: BLE001 - evidence never breaks a run
+            pass
+    return evidence
 
 # --------------------------------------------------------------------------- #
 # Command assembly (verified flags, see the signed-off plan D3/D4 + Mode map). #
@@ -1745,19 +1905,27 @@ def _real_claude_spawn(command, stdin_text):
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        start_new_session=True,
     )
-    proc.stdin.write(stdin_text)
-    proc.stdin.close()
+    pgid = _spawn_pgid(proc)
     events = []
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    proc.wait()
+    try:
+        proc.stdin.write(stdin_text)
+        proc.stdin.close()
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except BaseException:
+        _close_owned_process(proc, pgid, "sigterm", controller="claude",
+                             trigger="probe")
+        raise
+    _close_owned_process(proc, pgid, "natural_exit", controller="claude",
+                         trigger="probe")
     return events
 
 
@@ -1867,7 +2035,7 @@ class ClaudeSession:
             self.proc = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                env=controller_env,
+                env=controller_env, start_new_session=True,
             )
         except Exception as exc:  # noqa: BLE001
             if self.trace:
@@ -1875,6 +2043,8 @@ class ClaudeSession:
                     "controller.spawn.end", controller="claude", role=speaker,
                     result="error", error_type=type(exc).__name__)
             raise
+        self._proc_pgid = _spawn_pgid(self.proc)
+        self.last_cleanup = None
         if self.trace:
             self.trace.event("controller.spawn.end", controller="claude",
                              role=speaker, result="ok")
@@ -2340,7 +2510,13 @@ class ClaudeSession:
             self.proc.stdin.close()
         except Exception:  # noqa: BLE001
             pass
-        _terminate(self.proc)
+        # Stdin EOF is claude's graceful completion request; the helper waits
+        # for it, escalates within its bounds, and confirms the group is gone.
+        self.last_cleanup = _emit_cleanup(
+            getattr(self, "trace", None), getattr(self, "speaker", None),
+            _close_owned_process(
+                self.proc, getattr(self, "_proc_pgid", None), "stdin_eof",
+                getattr(self, "_cleanup_bounds", None), "claude", "close"))
         if self._guard_runtime:
             _close_guard_runtime(self._guard_runtime)
 
@@ -2457,6 +2633,7 @@ class CodexSession:
                             role=speaker, thread_id=resume_thread_id,
                             state=self._baseline_state)
         self.last_work_id = None
+        self.last_cleanup = None
 
     def _identity(self):
         """The canonical identity block stamped on this session's work (P1)."""
@@ -2508,8 +2685,9 @@ class CodexSession:
         proc = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True,
-            env=self._controller_env,
+            env=self._controller_env, start_new_session=True,
         )
+        pgid = _spawn_pgid(proc)
         # live_child_handle's truthful per-turn handle (M4 Package C):
         # non-null for exactly the duration of this one-shot child, cleared
         # in the `finally` below on EVERY exit path -- a normal exit, a
@@ -2520,6 +2698,9 @@ class CodexSession:
         wrote_label = {"done": False}
         tool_activity = ToolActivityTrace(self.trace, "codex", self.speaker)
         no_first_token = False
+        # Any unwind that does not reach the clean EOF below closes the
+        # turn with SIGTERM as its completion request.
+        mode = "sigterm"
         # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple):
         # several pre-existing tests subclass CodexSession and override
         # `_run` to return a plain events list, pinning that literal
@@ -2551,57 +2732,61 @@ class CodexSession:
         first_token_deadline = time.monotonic() + getattr(
             self, "_first_token_deadline_seconds", 30.0)
         try:
-            try:
-                while True:
-                    if first_token_seen:
-                        raw_line = line_queue.get()
-                    else:
-                        remaining = first_token_deadline - time.monotonic()
-                        if remaining <= 0:
-                            no_first_token = True
-                            break
-                        try:
-                            raw_line = line_queue.get(timeout=remaining)
-                        except queue_module.Empty:
-                            continue
-                    if raw_line is None:
-                        break  # EOF
-                    first_token_seen = True
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    events.append(obj)
-                    parsed = parse_codex_event(obj)
-                    tool_activity.observe(parsed)
-
-                    def _emit(text, render=True):
-                        if not wrote_label["done"]:
-                            self.io_out.write(speaker_label(self.speaker))
-                            wrote_label["done"] = True
-                        if render:
-                            transcript.write_reply(self.io_out, text)
-                        else:
-                            self.io_out.write(text + "\n")
-                        self.io_out.flush()
-
-                    if parsed["kind"] == "message" and parsed.get("text"):
-                        _emit(parsed["text"])
-                    elif parsed["kind"] == "denied":
-                        _emit(denial_message(), render=False)
-                    elif parsed["kind"] == "error":
-                        _emit("[error] " + (parsed.get("text") or ""), render=False)
-                if no_first_token:
-                    _terminate(proc)
+            while True:
+                if first_token_seen:
+                    raw_line = line_queue.get()
                 else:
-                    proc.wait()
-            except KeyboardInterrupt:
-                _terminate(proc)
-                raise
+                    remaining = first_token_deadline - time.monotonic()
+                    if remaining <= 0:
+                        no_first_token = True
+                        break
+                    try:
+                        raw_line = line_queue.get(timeout=remaining)
+                    except queue_module.Empty:
+                        continue
+                if raw_line is None:
+                    break  # EOF
+                first_token_seen = True
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                events.append(obj)
+                parsed = parse_codex_event(obj)
+                tool_activity.observe(parsed)
+
+                def _emit(text, render=True):
+                    if not wrote_label["done"]:
+                        self.io_out.write(speaker_label(self.speaker))
+                        wrote_label["done"] = True
+                    if render:
+                        transcript.write_reply(self.io_out, text)
+                    else:
+                        self.io_out.write(text + "\n")
+                    self.io_out.flush()
+
+                if parsed["kind"] == "message" and parsed.get("text"):
+                    _emit(parsed["text"])
+                elif parsed["kind"] == "denied":
+                    _emit(denial_message(), render=False)
+                elif parsed["kind"] == "error":
+                    _emit("[error] " + (parsed.get("text") or ""), render=False)
+            # A clean EOF waits for the controller to exit by itself; a
+            # first-token timeout falls back to SIGTERM.
+            mode = "sigterm" if no_first_token else "natural_exit"
         finally:
+            # Every exit closes the turn's process group, and the handle is
+            # cleared only after that, so it stays truthful meanwhile. The
+            # original exception, if any, propagates unchanged.
+            self.last_cleanup = _emit_cleanup(
+                getattr(self, "trace", None), getattr(self, "speaker", None),
+                _close_owned_process(
+                    proc, pgid, mode, getattr(self, "_cleanup_bounds", None),
+                    "codex",
+                    "turn_end" if mode == "natural_exit" else "abnormal"))
             self._live_proc = None
             self._last_turn_no_first_token = no_first_token
         return events
@@ -2838,6 +3023,7 @@ class OpencodeSession:
         # cancelled opencode turn is joinable to its start (matching the
         # claude/codex invariant), not invisible.
         self.last_work_id = None
+        self.last_cleanup = None
         # ORCH-053: the read-only bash allowlist is glob-prefix-matched by
         # opencode and therefore injectable, so it is only emitted when the
         # run will actually be wrapped in the kernel write boundary. Off
@@ -2917,8 +3103,9 @@ class OpencodeSession:
         proc = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True,
-            env=self._controller_env,
+            env=self._controller_env, start_new_session=True,
         )
+        pgid = _spawn_pgid(proc)
         # live_child_handle's truthful per-turn handle (M4 Package C):
         # non-null for exactly the duration of this one-shot child, cleared
         # in the `finally` below on EVERY exit path -- a normal exit, a
@@ -2929,6 +3116,9 @@ class OpencodeSession:
         wrote_label = {"done": False}
         tool_activity = ToolActivityTrace(self.trace, "opencode", self.speaker)
         no_first_token = False
+        # See CodexSession._run: any unwind short of a clean EOF closes the
+        # turn with SIGTERM as its completion request.
+        mode = "sigterm"
         # `_run`'s RETURN SIGNATURE stays exactly `events` (never a tuple),
         # matching CodexSession._run's identical contract-preservation
         # note: the deadline outcome is threaded through this instance
@@ -2957,58 +3147,57 @@ class OpencodeSession:
         first_token_deadline = time.monotonic() + getattr(
             self, "_first_token_deadline_seconds", 30.0)
         try:
-            try:
-                while True:
-                    if first_token_seen:
-                        raw_line = line_queue.get()
-                    else:
-                        remaining = first_token_deadline - time.monotonic()
-                        if remaining <= 0:
-                            no_first_token = True
-                            break
-                        try:
-                            raw_line = line_queue.get(timeout=remaining)
-                        except queue_module.Empty:
-                            continue
-                    if raw_line is None:
-                        break  # EOF
-                    first_token_seen = True
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    events.append(obj)
-                    parsed = parse_opencode_event(obj)
-                    tool_activity.observe(parsed)
-
-                    def _emit(text, render=True):
-                        if not wrote_label["done"]:
-                            self.io_out.write(speaker_label(self.speaker))
-                            wrote_label["done"] = True
-                        if render:
-                            transcript.write_reply(self.io_out, text)
-                        else:
-                            self.io_out.write(text + "\n")
-                        self.io_out.flush()
-
-                    if parsed["kind"] == "message" and parsed.get("text"):
-                        _emit(parsed["text"])
-                    elif parsed["kind"] == "denied":
-                        _emit(denial_message(), render=False)
-                    elif parsed["kind"] == "error":
-                        _emit("[error] " + (parsed.get("text") or ""),
-                              render=False)
-                if no_first_token:
-                    _terminate(proc)
+            while True:
+                if first_token_seen:
+                    raw_line = line_queue.get()
                 else:
-                    proc.wait()
-            except KeyboardInterrupt:
-                _terminate(proc)
-                raise
+                    remaining = first_token_deadline - time.monotonic()
+                    if remaining <= 0:
+                        no_first_token = True
+                        break
+                    try:
+                        raw_line = line_queue.get(timeout=remaining)
+                    except queue_module.Empty:
+                        continue
+                if raw_line is None:
+                    break  # EOF
+                first_token_seen = True
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                events.append(obj)
+                parsed = parse_opencode_event(obj)
+                tool_activity.observe(parsed)
+
+                def _emit(text, render=True):
+                    if not wrote_label["done"]:
+                        self.io_out.write(speaker_label(self.speaker))
+                        wrote_label["done"] = True
+                    if render:
+                        transcript.write_reply(self.io_out, text)
+                    else:
+                        self.io_out.write(text + "\n")
+                    self.io_out.flush()
+
+                if parsed["kind"] == "message" and parsed.get("text"):
+                    _emit(parsed["text"])
+                elif parsed["kind"] == "denied":
+                    _emit(denial_message(), render=False)
+                elif parsed["kind"] == "error":
+                    _emit("[error] " + (parsed.get("text") or ""),
+                          render=False)
+            mode = "sigterm" if no_first_token else "natural_exit"
         finally:
+            self.last_cleanup = _emit_cleanup(
+                getattr(self, "trace", None), getattr(self, "speaker", None),
+                _close_owned_process(
+                    proc, pgid, mode, getattr(self, "_cleanup_bounds", None),
+                    "opencode",
+                    "turn_end" if mode == "natural_exit" else "abnormal"))
             self._live_proc = None
             self._last_turn_no_first_token = no_first_token
         return events

@@ -36132,3 +36132,386 @@ for _name in [n for n in dir(M3PackageEResumeTriggerTests)
               if n.startswith("test")]:
     if _name not in DecisionCapacityResumeTriggerTest.__dict__:
         setattr(DecisionCapacityResumeTriggerTest, _name, None)
+
+
+# =========================================================================== #
+# Issue #89: controller sessions are closed on every role and resume-trigger  #
+# path, and cleanup evidence rides beside the role's result, never over it.  #
+# =========================================================================== #
+
+
+class _ClosingSession(object):
+    """A role session double that counts close() calls."""
+
+    controller = "claude"
+    session_id = "prov-sess-1"
+    model = None
+    effort = None
+
+    def __init__(self, send_fn, last_cleanup=None, close_error=None):
+        self._send_fn = send_fn
+        self.close_count = 0
+        self.sends = []
+        self._close_error = close_error
+        if last_cleanup is not None:
+            self.last_cleanup = last_cleanup
+
+    def send(self, text, meta=None):
+        self.sends.append(text)
+        return self._send_fn(text)
+
+    def close(self):
+        self.close_count += 1
+        if self._close_error is not None:
+            raise self._close_error
+
+
+class _EventRecorder(object):
+    """Records every trace event's name and fields."""
+
+    def __init__(self):
+        self.events = []
+
+    def event(self, name, **fields):
+        self.events.append((name, fields))
+
+
+def _role_end_calls(trace):
+    return [fields for name, fields in trace.events if name == "role.end"]
+
+
+class RoleLoopCleanupEvidenceTests(unittest.TestCase):
+    """`_role_loop` closes its session on every exit path, and role.end
+    carries cleanup evidence only as extra fields beside `result`."""
+
+    def _fixture(self):
+        helper = M3PackageECapacityWiringTests(
+            "test_malformed_unrecognized_token_writes_unknown_provider_health")
+        self.addCleanup(helper.doCleanups)
+        return helper._fixture()
+
+    def _loop(self, session, trace=None):
+        d, suid, work_id, binding, status_path = self._fixture()
+        return cowork._role_loop(
+            session, "do the thing", status_path, context="",
+            io_out=io.StringIO(), role="builder", trace=trace,
+            session_uuid=suid, role_work_id=work_id)
+
+    @staticmethod
+    def _failing(error_type):
+        return lambda text: {"ok": False, "result": "error",
+                             "error_type": error_type}
+
+    def test_systemexit_mid_send_closes_session(self):
+        # SystemExit stands in for run_flow's `_terminate_run` SIGTERM.
+        def raise_exit(text):
+            raise SystemExit(143)
+
+        session = _ClosingSession(raise_exit)
+        trace = _EventRecorder()
+        with self.assertRaises(SystemExit):
+            self._loop(session, trace=trace)
+        self.assertEqual(session.close_count, 1)
+        ends = _role_end_calls(trace)
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["result"], "closed")
+
+    def test_exception_mid_send_is_controller_error(self):
+        def raise_runtime(text):
+            raise RuntimeError("controller crashed")
+
+        # `_send` turns any Exception into a controller-error turn result, so
+        # an exception mid-send is the controller-error path.
+        result = cowork._send(_ClosingSession(raise_runtime),
+                              cowork._initial_user_delivery("x"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["result"], "error")
+        self.assertEqual(result["error_type"], "RuntimeError")
+        session = _ClosingSession(raise_runtime)
+        rc, outcome, payload = self._loop(session)
+        self.assertEqual(rc, 0)
+        self.assertEqual(session.close_count, 1)
+
+    def test_capacity_pause_closes_session(self):
+        session = _ClosingSession(self._failing("rate_limit_error"))
+        rc, outcome, payload = self._loop(session)
+        self.assertEqual(outcome, "awaiting_capacity")
+        self.assertEqual(session.close_count, 1)
+
+    def test_role_end_carries_cleanup_fields(self):
+        session = _ClosingSession(
+            self._failing("rate_limit_error"),
+            last_cleanup={"controller": "claude", "trigger": "close",
+                          "outcome": "killed", "confirmed": False})
+        trace = _EventRecorder()
+        self._loop(session, trace=trace)
+        ends = _role_end_calls(trace)
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["result"], "closed")
+        self.assertEqual(ends[0]["cleanup_outcome"], "killed")
+        self.assertIs(ends[0]["cleanup_confirmed"], False)
+
+    def test_role_end_mock_session_no_cleanup_fields(self):
+        import unittest.mock as mock
+        session = _ClosingSession(self._failing("rate_limit_error"),
+                                  last_cleanup=mock.MagicMock())
+        trace = _EventRecorder()
+        self._loop(session, trace=trace)
+        ends = _role_end_calls(trace)
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0], {"role": "builder", "result": "closed"})
+
+
+class ResumeTriggerSessionCloseTests(unittest.TestCase):
+    """run_resume_trigger closes the session it constructed on every path,
+    before its owner lease is released."""
+
+    def _helper(self):
+        helper = M3PackageEResumeTriggerTests(
+            "test_exit_codes_match_d_contract_naming")
+        self.addCleanup(helper.doCleanups)
+        return helper
+
+    def _trigger(self, send_fn, close_error=None):
+        helper = self._helper()
+        d, suid, work_id, payload = helper._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = helper._write_json(d, "manual.json", record)
+        pinned_path = helper._write_json(d, "pinned.json", pinned)
+        sessions = []
+
+        def factory(controller, role, provider_session_id, model, effort):
+            session = _ClosingSession(send_fn, close_error=close_error)
+            sessions.append(session)
+            return session
+
+        out = []
+        argv = [
+            "--session-uuid", suid, "--role", "builder",
+            "--lease-id", payload["lease_id"], "--claimant-ref", "wake-1",
+            "--automation-ref", payload["automation_ref"],
+            "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+            "--manual-signal-record", manual_path,
+            "--pinned-public-keys", pinned_path,
+        ]
+        return suid, sessions, out, (
+            lambda: cowork.run_resume_trigger(
+                argv, output=out.append, session_factory=factory))
+
+    def test_success_closes_session(self):
+        suid, sessions, out, run = self._trigger(
+            lambda text: {"ok": True, "result": "ok"})
+        self.assertEqual(run(), cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual([s.close_count for s in sessions], [1])
+
+    def test_send_failed_reentered_closes_session(self):
+        suid, sessions, out, run = self._trigger(
+            lambda text: {"ok": False, "result": "error",
+                          "error_type": "rate_limit_error"})
+        self.assertEqual(run(), cowork.RESUME_TRIGGER_EXIT_SEND_FAILED)
+        self.assertEqual([s.close_count for s in sessions], [1])
+
+    def test_send_failed_cancelled_closes_session(self):
+        suid, sessions, out, run = self._trigger(
+            lambda text: {"ok": False, "result": "error",
+                          "error_type": "connection_error"})
+        self.assertEqual(run(), cowork.RESUME_TRIGGER_EXIT_SEND_FAILED)
+        self.assertEqual([s.close_count for s in sessions], [1])
+
+    def test_send_exception_closes_session_and_releases_lease(self):
+        import cowork_owner
+
+        def raise_exit(text):
+            raise SystemExit(143)
+
+        suid, sessions, out, run = self._trigger(raise_exit)
+        with self.assertRaises(SystemExit):
+            run()
+        self.assertEqual([s.close_count for s in sessions], [1])
+        self.assertEqual(cowork_owner.read_owner_lease(suid)["state"],
+                         "released")
+
+    def test_close_error_does_not_change_line_or_code(self):
+        suid, sessions, out, run = self._trigger(
+            lambda text: {"ok": True, "result": "ok"},
+            close_error=RuntimeError("close failed"))
+        self.assertEqual(run(), cowork.RESUME_TRIGGER_EXIT_SUCCESS)
+        self.assertEqual([s.close_count for s in sessions], [1])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(json.loads(out[0])["outcome"], "success")
+
+
+_RESUME_TRIGGER_SIGTERM_CHILD = r'''
+import json, os, sys
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["scripts"])
+import cowork
+import cowork_bridge as bridge
+
+fake = [sys.executable, "-c", spec["fake"], spec["pidfile"]]
+bridge.build_codex_command = lambda *a, **k: list(fake)
+bridge.build_codex_resume_command = lambda *a, **k: list(fake)
+
+
+class Closing(object):
+    def __init__(self, inner):
+        self.inner = inner
+
+    def send(self, text, meta=None):
+        return self.inner.send(text, meta=meta)
+
+    def close(self):
+        sys.stderr.write("CLOSE_RAN\n")
+        sys.stderr.flush()
+        self.inner.close()
+
+
+def factory(controller, role, provider_session_id, model, effort):
+    return Closing(bridge.CodexSession(
+        "implement", True, io_out=sys.stderr, speaker=role,
+        resume_thread_id=provider_session_id))
+
+
+entry = getattr(cowork, "_run_resume_trigger_governed",
+                cowork.run_resume_trigger)
+rc = entry(spec["argv"], output=sys.stdout.write, session_factory=factory)
+sys.stdout.flush()
+sys.exit(rc)
+'''
+
+_SILENT_FAKE = (
+    "import os, sys, time\n"
+    "with open(sys.argv[1], 'a') as fh:\n"
+    "    fh.write('leader %d\\n' % os.getpid())\n"
+    "time.sleep(60)\n")
+
+
+def _reap_fake_pid(pid):
+    """Kill one recorded fake: its group only when it leads that group and
+    the group is not this runner's own."""
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return
+    try:
+        if pgid == pid and pgid != os.getpgrp():
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _fake_pid_gone(pid, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+class ResumeTriggerSigtermTests(unittest.TestCase):
+    """A SIGTERM'd resume trigger closes its controller, releases its owner
+    lease, and still ends with exactly one result line and a contract code."""
+
+    def test_sigterm_mid_send_governed(self):
+        import cowork_owner
+        helper = M3PackageEResumeTriggerTests(
+            "test_exit_codes_match_d_contract_naming")
+        self.addCleanup(helper.doCleanups)
+        d, suid, work_id, payload = helper._enter_capacity()
+        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        manual_path = helper._write_json(d, "manual.json", record)
+        pinned_path = helper._write_json(d, "pinned.json", pinned)
+        pidfile = os.path.join(d, "fake.pids")
+        spec = {"scripts": _HERE, "fake": _SILENT_FAKE, "pidfile": pidfile,
+                "argv": [
+                    "--session-uuid", suid, "--role", "builder",
+                    "--lease-id", payload["lease_id"],
+                    "--claimant-ref", "wake-1",
+                    "--automation-ref", payload["automation_ref"],
+                    "--now", "2026-01-01T00:05:00Z", "--cwd", d,
+                    "--manual-signal-record", manual_path,
+                    "--pinned-public-keys", pinned_path]}
+        child = subprocess.Popen(
+            [sys.executable, "-c", _RESUME_TRIGGER_SIGTERM_CHILD,
+             json.dumps(spec)],
+            cwd=d, env=dict(os.environ), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(_reap_fake_pid, child.pid)
+        fake_pid = None
+        deadline = time.monotonic() + 30
+        while fake_pid is None and time.monotonic() < deadline:
+            try:
+                with open(pidfile) as fh:
+                    for line in fh:
+                        if line.startswith("leader "):
+                            fake_pid = int(line.split()[1])
+            except OSError:
+                pass
+            if child.poll() is not None:
+                break
+            time.sleep(0.02)
+        if fake_pid is not None:
+            self.addCleanup(_reap_fake_pid, fake_pid)
+        self.assertIsNotNone(fake_pid, "the controller fake never started")
+        # Let the send settle into its read loop before terminating.
+        time.sleep(0.3)
+        os.kill(child.pid, signal.SIGTERM)
+        stdout, stderr = child.communicate(timeout=30)
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, (stdout, stderr))
+        self.assertEqual(json.loads(lines[0])["outcome"], "internal_error")
+        self.assertEqual(child.returncode,
+                         cowork.RESUME_TRIGGER_EXIT_INTERNAL_ERROR)
+        self.assertTrue(_fake_pid_gone(fake_pid, 3.0 + 1.0))
+        self.assertIn("CLOSE_RAN", stderr)
+        self.assertEqual(cowork_owner.read_owner_lease(suid)["state"],
+                         "released")
+
+    def test_prior_handler_restored(self):
+        def marker_handler(signum, frame):
+            pass
+
+        prior = signal.signal(signal.SIGTERM, marker_handler)
+        self.addCleanup(signal.signal, signal.SIGTERM, prior)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = cowork._run_resume_trigger_governed([], output=[].append)
+        self.assertEqual(rc, cowork.RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS)
+        self.assertIs(signal.getsignal(signal.SIGTERM), marker_handler)
+
+    def test_signal_after_line_written_emits_single_line(self):
+        import unittest.mock as mock
+
+        def written_then_terminated(argv, output=None, session_factory=None):
+            output(json.dumps({"outcome": "success"}) + "\n")
+            raise cowork._ResumeTriggerTerminated(143)
+
+        def terminated_before_any_line(argv, output=None,
+                                       session_factory=None):
+            raise cowork._ResumeTriggerTerminated(143)
+
+        for fake, expected in ((written_then_terminated, "success"),
+                               (terminated_before_any_line,
+                                "internal_error")):
+            with self.subTest(expected=expected):
+                lines = []
+                with mock.patch.object(cowork, "run_resume_trigger",
+                                       side_effect=fake):
+                    rc = cowork._run_resume_trigger_governed(
+                        [], output=lines.append)
+                self.assertEqual(rc,
+                                 cowork.RESUME_TRIGGER_EXIT_INTERNAL_ERROR)
+                self.assertEqual(len(lines), 1)
+                self.assertEqual(json.loads(lines[0])["outcome"], expected)

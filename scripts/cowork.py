@@ -7780,7 +7780,14 @@ def _role_loop(session, first, status_path, context, io_out,
     finally:
         session.close()
         if trace:
-            trace.event("role.end", role=role, result="closed")
+            # Cleanup is secondary evidence beside the role's own result,
+            # which stays "closed" whatever the cleanup outcome was.
+            cleanup = getattr(session, "last_cleanup", None)
+            fields = {}
+            if isinstance(cleanup, dict):
+                fields = {"cleanup_outcome": cleanup.get("outcome"),
+                          "cleanup_confirmed": cleanup.get("confirmed")}
+            trace.event("role.end", role=role, result="closed", **fields)
     return 0, outcome_kind, payload
 
 
@@ -14990,81 +14997,98 @@ def run_resume_trigger(argv, output=None, session_factory=None):
                             ) + "\n")
             return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
 
-        send_result = _send(session, delivery, meta={"prompt_kind": "resume_wake"})
-        if send_result.get("ok", True):
-            # The provider accepted the exact turn bytes (never a redirected
-            # substitute: refused above): the orchestrator decision deliveries
-            # bound to them reached their target, so they are acknowledged
-            # now -- before anything else can fail -- and a later plain run
-            # never rebuilds them. A failed acknowledgment is reported in the
-            # result line and re-sent later (at least once).
-            ack_failed = []
-            _acknowledge_capacity_turn_decisions(
-                session_uuid, pending_record, failed=ack_failed)
-            # Step 8, accepted send: mark the durable lease consumed FIRST --
-            # only THEN is `consumption_state=consumed` asserted anywhere
-            # (the pending turn is cleared after) -- an accepted send consumes
-            # exactly once.
-            try:
-                capacity_scheduler.mark_consumed(
-                    session_uuid, canonical_lease["lease_id"], args.automation_ref)
-            except capacity_scheduler.SchedulerLeaseConflict as exc:
-                write(json.dumps({"outcome": "internal_error",
-                                  "detail": "post-send consume conflict: %s"
-                                  % exc.reason}) + "\n")
-                return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
-            state_store.clear_pending_turn_before_pause(session_uuid, effective_role)
-            success = {"outcome": "success",
-                       "lease_id": canonical_lease["lease_id"]}
-            if ack_failed:
-                success["decision_ack_failed"] = [
-                    b.get("request_id") for b in ack_failed]
-            write(json.dumps(success) + "\n")
-            return RESUME_TRIGGER_EXIT_SUCCESS
-
-        # Post-wake send failure: the lease is NEVER marked consumed for a
-        # failed send (it is still `claimed`), and the pending turn is RETAINED
-        # (never cleared).
-        raw_evidence = _synthesize_raw_failure_evidence(controller, send_result)
-        controller_outcome = _classify_raw_failure(controller, raw_evidence)
-        _record_provider_health(
-            session_uuid, effective_role, controller, controller_outcome,
-            _capacity_now())
-        if controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES:
-            # Re-entry via SAME-BINDING REPLACEMENT of this exact claimed
-            # lease -- never a fresh `start_new_episode`, which would silently
-            # reset the per-binding automatic-recovery chain back to 0.
-            capacity_payload = _enter_awaiting_capacity(
-                session_uuid, work_id, effective_role, controller, provider_session_id,
-                controller_outcome, seed_text, cfg.get("model"), cfg.get("effort"),
-                raw_evidence=raw_evidence, replace_lease_id=canonical_lease["lease_id"],
-                replace_automation_ref=args.automation_ref,
-                decision_bindings=pending_record.get("decision_bindings"))
-            if capacity_payload is not None:
-                write(json.dumps({
-                    "outcome": "send_failed", "lease_id": canonical_lease["lease_id"],
-                    "controller_outcome": controller_outcome,
-                    "re_entered_capacity": True}) + "\n")
-                return RESUME_TRIGGER_EXIT_SEND_FAILED
-        # Not capacity-eligible, or the replacement attempt itself failed: the
-        # claimed lease is released (never stranded) and this candidate's
-        # execution is terminally marked failed -- no further wake-ceiling
-        # accounting is meaningful for it, so a plain cancel (not a replace).
+        # The controller this trigger constructed is closed on every path
+        # below -- each return and any exception -- while the owner lease
+        # (released in the outer finally) is still held.
         try:
-            capacity_scheduler.cancel(
-                session_uuid, canonical_lease["lease_id"], args.automation_ref)
-        except capacity_scheduler.SchedulerLeaseConflict:
-            pass
-        _advance_phase(
-            session_uuid, work_id, "execution_failed",
-            evidence={"reason": "send_failed",
-                     "controller_outcome": controller_outcome},
-            source="resume_trigger")
-        write(json.dumps({
-            "outcome": "send_failed", "lease_id": canonical_lease["lease_id"],
-            "controller_outcome": controller_outcome,
-            "re_entered_capacity": False}) + "\n")
-        return RESUME_TRIGGER_EXIT_SEND_FAILED
+            send_result = _send(session, delivery,
+                                meta={"prompt_kind": "resume_wake"})
+            if send_result.get("ok", True):
+                # The provider accepted the exact turn bytes (never a
+                # redirected substitute: refused above): the orchestrator
+                # decision deliveries bound to them reached their target, so
+                # they are acknowledged now -- before anything else can fail
+                # -- and a later plain run never rebuilds them. A failed
+                # acknowledgment is reported in the result line and re-sent
+                # later (at least once).
+                ack_failed = []
+                _acknowledge_capacity_turn_decisions(
+                    session_uuid, pending_record, failed=ack_failed)
+                # Step 8, accepted send: mark the durable lease consumed
+                # FIRST -- only THEN is `consumption_state=consumed` asserted
+                # anywhere (the pending turn is cleared after) -- an accepted
+                # send consumes exactly once.
+                try:
+                    capacity_scheduler.mark_consumed(
+                        session_uuid, canonical_lease["lease_id"],
+                        args.automation_ref)
+                except capacity_scheduler.SchedulerLeaseConflict as exc:
+                    write(json.dumps({"outcome": "internal_error",
+                                      "detail": "post-send consume conflict: %s"
+                                      % exc.reason}) + "\n")
+                    return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+                state_store.clear_pending_turn_before_pause(
+                    session_uuid, effective_role)
+                success = {"outcome": "success",
+                           "lease_id": canonical_lease["lease_id"]}
+                if ack_failed:
+                    success["decision_ack_failed"] = [
+                        b.get("request_id") for b in ack_failed]
+                write(json.dumps(success) + "\n")
+                return RESUME_TRIGGER_EXIT_SUCCESS
+
+            # Post-wake send failure: the lease is NEVER marked consumed for a
+            # failed send (it is still `claimed`), and the pending turn is
+            # RETAINED (never cleared).
+            raw_evidence = _synthesize_raw_failure_evidence(
+                controller, send_result)
+            controller_outcome = _classify_raw_failure(controller, raw_evidence)
+            _record_provider_health(
+                session_uuid, effective_role, controller, controller_outcome,
+                _capacity_now())
+            if controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES:
+                # Re-entry via SAME-BINDING REPLACEMENT of this exact claimed
+                # lease -- never a fresh `start_new_episode`, which would
+                # silently reset the per-binding automatic-recovery chain
+                # back to 0.
+                capacity_payload = _enter_awaiting_capacity(
+                    session_uuid, work_id, effective_role, controller,
+                    provider_session_id, controller_outcome, seed_text,
+                    cfg.get("model"), cfg.get("effort"),
+                    raw_evidence=raw_evidence,
+                    replace_lease_id=canonical_lease["lease_id"],
+                    replace_automation_ref=args.automation_ref,
+                    decision_bindings=pending_record.get("decision_bindings"))
+                if capacity_payload is not None:
+                    write(json.dumps({
+                        "outcome": "send_failed",
+                        "lease_id": canonical_lease["lease_id"],
+                        "controller_outcome": controller_outcome,
+                        "re_entered_capacity": True}) + "\n")
+                    return RESUME_TRIGGER_EXIT_SEND_FAILED
+            # Not capacity-eligible, or the replacement attempt itself failed:
+            # the claimed lease is released (never stranded) and this
+            # candidate's execution is terminally marked failed -- no further
+            # wake-ceiling accounting is meaningful for it, so a plain cancel
+            # (not a replace).
+            try:
+                capacity_scheduler.cancel(
+                    session_uuid, canonical_lease["lease_id"],
+                    args.automation_ref)
+            except capacity_scheduler.SchedulerLeaseConflict:
+                pass
+            _advance_phase(
+                session_uuid, work_id, "execution_failed",
+                evidence={"reason": "send_failed",
+                         "controller_outcome": controller_outcome},
+                source="resume_trigger")
+            write(json.dumps({
+                "outcome": "send_failed", "lease_id": canonical_lease["lease_id"],
+                "controller_outcome": controller_outcome,
+                "re_entered_capacity": False}) + "\n")
+            return RESUME_TRIGGER_EXIT_SEND_FAILED
+        finally:
+            _close_resume_session(session)
     except cowork_owner.OwnerLeaseError as exc:
         # The same typed refusal, observed later: a lease lost mid-run (a
         # takeover while this trigger was working) reaches a governed seam
@@ -15088,10 +15112,66 @@ def run_resume_trigger(argv, output=None, session_factory=None):
         _restore_owner_context(rt_prior_owner_context)
 
 
+def _close_resume_session(session):
+    """Close the controller session a resume trigger constructed. A close
+    error never changes the trigger's one result line or its exit code."""
+    try:
+        session.close()
+    except Exception:  # noqa: BLE001 - cleanup is secondary evidence
+        pass
+
+
 def _terminate_run(signum, frame):
     """Whole-run SIGTERM handler: unwind (releasing the lease in run_flow's
     finally) and exit 128+SIGTERM with a structured result."""
     raise SystemExit(128 + int(signal.SIGTERM))
+
+
+class _ResumeTriggerTerminated(SystemExit):
+    """SIGTERM delivered to a `resume-trigger` process."""
+
+
+def _terminate_resume_trigger(signum, frame):
+    """Resume-trigger SIGTERM handler: unwind once through the session close
+    and the owner-lease release. A repeated SIGTERM is ignored for the rest
+    of the unwind so it cannot cut the cleanup short."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise _ResumeTriggerTerminated(128 + int(signal.SIGTERM))
+
+
+def _run_resume_trigger_governed(argv, output=None, session_factory=None):
+    """The `resume-trigger` CLI entry: `run_resume_trigger` with SIGTERM
+    governed, so a terminated trigger still closes its controller, releases
+    its owner lease, and keeps the contract of exactly one JSON result line
+    and one of RESUME_TRIGGER_EXIT_CODES. The line is `internal_error` unless
+    one was already written. Off the main thread, where no handler can be
+    installed, it runs unguarded."""
+    write = output if output is not None else sys.stdout.write
+    written = [0]
+
+    def counted(text):
+        written[0] += 1
+        return write(text)
+
+    try:
+        prior = signal.signal(signal.SIGTERM, _terminate_resume_trigger)
+    except (ValueError, RuntimeError):
+        return run_resume_trigger(argv, output=output,
+                                  session_factory=session_factory)
+    try:
+        return run_resume_trigger(argv, output=counted,
+                                  session_factory=session_factory)
+    except _ResumeTriggerTerminated:
+        if not written[0]:
+            write(json.dumps({"outcome": "internal_error",
+                              "detail": "terminated by SIGTERM"}) + "\n")
+        return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+    finally:
+        try:
+            signal.signal(signal.SIGTERM,
+                          prior if prior is not None else signal.SIG_DFL)
+        except (ValueError, RuntimeError, TypeError):
+            pass
 
 
 def main(argv=None):
@@ -15102,7 +15182,7 @@ def main(argv=None):
         # -- dispatched here, before the main flat argparse, exactly like D's
         # own standalone `cowork_capacity_scheduler.run_wake_trigger` never
         # shares a parser with anything else.
-        return run_resume_trigger(argv[1:])
+        return _run_resume_trigger_governed(argv[1:])
     try:
         try:
             args = build_parser().parse_args(argv)

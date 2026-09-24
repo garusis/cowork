@@ -77,6 +77,41 @@ modes differ:
   prompt like claude's) rewritten on every spawn so it always matches the
   current config.
 
+#### Controller process cleanup
+
+Every controller process starts in its own process group, and Cowork records
+that group at spawn. When the process closes, Cowork first asks it to finish,
+waits a bounded time, and then escalates. The escalation is `SIGTERM`, a grace
+period, and then `SIGKILL`, sent only to that recorded group. Cowork then
+checks that the leader and every member of the group are gone:
+
+- **claude** closes when the role or session closes: stdin EOF, then up to 5 s
+  to exit by itself. A turn that ends, or that times out waiting for its
+  first token, leaves the process running for the next turn.
+- **codex** and **opencode** close at the end of every turn. After stdout
+  reaches EOF, the process gets up to 10 s to exit by itself. An exception, an
+  interrupt, or a first-token timeout sends `SIGTERM` at once. Any process the
+  turn left behind in its group is ended too. A process that moved itself into
+  a new session is not.
+- The grace period after `SIGTERM` is 3 s, and `SIGKILL` gets 3 s to be
+  confirmed.
+
+The result is secondary evidence and never changes the turn's or the role's
+result. It is recorded in the `controller.cleanup` trace event (`outcome`:
+`already_exited`, `graceful`, `terminated`, `killed` or `failed`, plus
+`confirmed`) and in the `cleanup_outcome`/`cleanup_confirmed` fields of
+`role.end`. A `resume-trigger` process closes the controller it started on
+every path. If it receives `SIGTERM`, it still releases its owner lease and
+writes one `internal_error` line (unless it already wrote one), with the
+internal-error exit code. Unrelated processes and verification workers are
+never signalled.
+
+Known limit: if the owner process is killed together with its whole process
+group (for example `SIGKILL` or `SIGHUP` to the group), a codex or opencode
+turn that is producing no output keeps running, because it is in its own
+group. A claude process and a turn that is still writing output end on their
+own, through stdin EOF or a broken pipe.
+
 ### Cross-role handoff (one file-only transport)
 
 Every hand-off between roles — scout↔scout-reviewer, scout→planner,
