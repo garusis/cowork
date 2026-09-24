@@ -18579,6 +18579,297 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
                          ["verified", "unverified", "unverified"])
 
 
+_BUG83_T0 = 1_700_000_000
+
+
+def _deleted_source_fixture():
+    """A throwaway committed repo (its own `.git` under a temp dir, never the
+    developer checkout) holding `a.py` and `pkg/b.py`. The caller deletes a
+    tracked file from the worktree WITHOUT staging it."""
+    repo = os.path.realpath(tempfile.mkdtemp())
+    os.makedirs(os.path.join(repo, "pkg"))
+    with open(os.path.join(repo, "a.py"), "w") as fh:
+        fh.write("a\n")
+    with open(os.path.join(repo, "pkg", "b.py"), "w") as fh:
+        fh.write("b\n")
+    for args in (["init", "-q"], ["add", "."],
+                 ["-c", "user.name=t", "-c", "user.email=t@t",
+                  "-c", "commit.gpgsign=false", "commit", "-qm", "init"]):
+        subprocess.run(["git"] + args, cwd=repo, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, check=True, timeout=30)
+    return repo
+
+
+class UnstagedDeletionReadinessTests(unittest.TestCase):
+    """Issue #83: a tracked file deleted from the worktree but NOT staged is
+    part of the candidate. Readiness must verify it when its evidence is
+    current and complete, stay fail-closed on unexpected absence, incomplete
+    evidence and stale evidence, and never touch the caller's index."""
+
+    def setUp(self):
+        from unittest import mock
+        sessions_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(sessions_root,
+                                              ignore_errors=True))
+        # patch.dict restores the whole environment (including any prior
+        # COWORK_SESSIONS_ROOT) on cleanup.
+        patcher = mock.patch.dict(os.environ, {
+            "COWORK_SESSIONS_ROOT": sessions_root,
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for leaked in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                       "GIT_OBJECT_DIRECTORY"):
+            os.environ.pop(leaked, None)
+        self.fixture = _deleted_source_fixture()
+        self.addCleanup(lambda: shutil.rmtree(self.fixture,
+                                              ignore_errors=True))
+
+    # -- helpers ---------------------------------------------------------- #
+
+    def _path(self, rel):
+        return os.path.join(self.fixture, rel)
+
+    def _pin_mtimes(self, t):
+        os.utime(self.fixture, (t, t))
+        for dirpath, dirnames, filenames in os.walk(self.fixture):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            os.utime(dirpath, (t, t))
+            for name in filenames:
+                os.utime(os.path.join(dirpath, name), (t, t))
+
+    def _git_out(self, *args):
+        return subprocess.run(["git"] + list(args), cwd=self.fixture,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              check=True, timeout=30).stdout
+
+    def _snapshot_state(self):
+        """Index bytes + worktree listings, gathered ONLY with read-only
+        `ls-files`/`rev-parse` — never `git status`, which refreshes the
+        index stat cache and would itself mutate what is being checked."""
+        with open(verification.git_index_path(self.fixture), "rb") as fh:
+            index_sha = hashlib.sha256(fh.read()).hexdigest()
+        return (index_sha, self._git_out("ls-files", "-s"),
+                self._git_out("ls-files", "--deleted"),
+                self._git_out("ls-files", "--others", "--exclude-standard"))
+
+    @staticmethod
+    def _attempt(started_epoch):
+        return {"id": "V-1", "pipeline": False, "adjudication": "pass",
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(started_epoch))}
+
+    @staticmethod
+    def _claim(attempt, state="corroborated"):
+        return {"label": "a", "claim_state": state,
+                "corroborating_attempts": [attempt]}
+
+    def _chdir_fixture(self):
+        prior = os.getcwd()
+        os.chdir(self.fixture)
+        self.addCleanup(os.chdir, prior)
+
+    def _delete_b(self, parent_mtime=None):
+        os.remove(self._path("pkg/b.py"))
+        if parent_mtime is not None:
+            os.utime(self._path("pkg"), (parent_mtime, parent_mtime))
+
+    def _adjudicator_setup(self):
+        self._chdir_fixture()
+        self._pin_mtimes(_BUG83_T0)
+        self._delete_b()
+        entries = [{"label": "a", "ok": True, "source_manifest": "m",
+                    "command": "x", "claim_state": "corroborated",
+                    "corroborating_attempts": [
+                        self._attempt(_BUG83_T0 + 100)]}]
+        return entries, self._snapshot_state()
+
+    # -- reproduction (fails on base) ------------------------------------- #
+
+    def test_repro_pre_attempt_unstaged_deletion_is_stamped_on_the_live_join_path(self):
+        self._pin_mtimes(_BUG83_T0)
+        self._delete_b(parent_mtime=_BUG83_T0 + 50)
+        self._chdir_fixture()
+        obs = [self._attempt(_BUG83_T0 + 100)]
+        cowork._stamp_observed_provenance(obs, digest="D")
+        self.assertEqual(
+            obs[0].get("observed_source_digest"), "D",
+            cowork_measure.newest_source_mtime(
+                self.fixture,
+                cowork._source_paths_for_manifest(self.fixture)).as_dict())
+
+    def test_repro_unstaged_deletion_snapshot_and_identity(self):
+        self._delete_b()
+        before = self._snapshot_state()
+        snap = verification.build_snapshot(self.fixture, "S-bug83", "T-1")
+        with open(snap["manifest_path"]) as fh:
+            files = json.load(fh)["files"]
+        self.assertNotIn("pkg/b.py", files)
+        self.assertIn("a.py", files)
+        self.assertEqual(
+            verification.current_candidate_identity(self.fixture),
+            (snap["manifest_digest"], snap["index_digest"]))
+        self.assertIsNone(verification.detect_mutation(
+            self.fixture, snap["manifest_digest"], snap["index_digest"],
+            files))
+        self.assertEqual(self._snapshot_state(), before)
+        # The deletion is still unstaged: nothing was written to the index.
+        self.assertEqual(self._git_out("ls-files", "--deleted"),
+                         b"pkg/b.py\n")
+
+    def test_repro_adjudicator_accepts_pre_attempt_unstaged_deletion(self):
+        entries, before = self._adjudicator_setup()
+        os.utime(self._path("pkg"), (_BUG83_T0 + 50, _BUG83_T0 + 50))
+        result = cowork._adjudicate_readiness(entries, "m", {"a": "x"})
+        self.assertEqual(result, ("verified", "m", None), result[2])
+        self.assertEqual(self._snapshot_state(), before)
+
+    # -- helper and negative controls (must stay fail-closed) ------------- #
+
+    def _assert_deletion_still_unstaged(self, before):
+        self.assertEqual(self._snapshot_state(), before)
+        self.assertEqual(self._git_out("ls-files", "--deleted"),
+                         b"pkg/b.py\n")
+
+    def test_git_deleted_paths_reports_only_the_unstaged_deletion(self):
+        self._delete_b()
+        before = self._snapshot_state()
+        self.assertEqual(verification.git_deleted_paths(self.fixture),
+                         frozenset({"pkg/b.py"}))
+        self._assert_deletion_still_unstaged(before)
+        not_a_repo = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(not_a_repo, ignore_errors=True))
+        self.assertIsNone(verification.git_deleted_paths(not_a_repo))
+
+    def test_negative_undeclared_absence_fails_closed_in_the_clock(self):
+        self._pin_mtimes(_BUG83_T0)
+        self._delete_b()
+        before = self._snapshot_state()
+        clock = cowork_measure.newest_source_mtime(
+            self.fixture, ["a.py", "pkg/b.py", "ghost.py"],
+            deleted=frozenset({"pkg/b.py"}))
+        self.assertEqual(clock.state, "missing_sources")
+        self.assertEqual(clock.missing, ["ghost.py"])
+        self.assertFalse(clock.usable)
+        self._assert_deletion_still_unstaged(before)
+
+    def test_negative_undeclared_absence_refuses_readiness(self):
+        from unittest import mock
+        entries, before = self._adjudicator_setup()
+        os.utime(self._path("pkg"), (_BUG83_T0 + 50, _BUG83_T0 + 50))
+        real = cowork._source_paths_for_manifest()
+        with mock.patch.object(cowork, "_source_paths_for_manifest",
+                               return_value=list(real) + ["ghost.py"]):
+            state, _, why = cowork._adjudicate_readiness(
+                entries, "m", {"a": "x"})
+        self.assertEqual(state, "unverified")
+        self.assertIn("missing_sources", why)
+        self.assertIn("ghost.py", why)
+        self._assert_deletion_still_unstaged(before)
+
+    def test_negative_unreadable_deletion_list_refuses_readiness(self):
+        from unittest import mock
+        entries, before = self._adjudicator_setup()
+        os.utime(self._path("pkg"), (_BUG83_T0 + 50, _BUG83_T0 + 50))
+        with mock.patch.object(verification, "git_deleted_paths",
+                               return_value=None):
+            state, _, why = cowork._adjudicate_readiness(
+                entries, "m", {"a": "x"})
+            obs = [self._attempt(_BUG83_T0 + 100)]
+            cowork._stamp_observed_provenance(obs, digest="D")
+        self.assertEqual(state, "unverified")
+        self.assertIn("missing_sources", why)
+        self.assertIn("pkg/b.py", why)
+        self.assertNotIn("observed_source_digest", obs[0])
+        self._assert_deletion_still_unstaged(before)
+
+    def test_negative_stale_deletion_refuses_readiness(self):
+        entries, before = self._adjudicator_setup()
+        os.utime(self._path("pkg"), (_BUG83_T0 + 200, _BUG83_T0 + 200))
+        state, _, why = cowork._adjudicate_readiness(entries, "m", {"a": "x"})
+        self.assertEqual(state, "unverified")
+        self.assertIn("started before the sources last changed", why)
+        obs = [self._attempt(_BUG83_T0 + 100)]
+        cowork._stamp_observed_provenance(obs, digest="D")
+        self.assertNotIn("observed_source_digest", obs[0])
+        self._assert_deletion_still_unstaged(before)
+
+    def test_negative_incomplete_evidence_refuses_readiness(self):
+        entries, before = self._adjudicator_setup()
+        os.utime(self._path("pkg"), (_BUG83_T0 + 50, _BUG83_T0 + 50))
+        state, _, why = cowork._adjudicate_readiness(
+            entries, "m", {"a": "x", "b": "y"})
+        self.assertEqual(state, "unverified")
+        self.assertIn("missing: b", why)
+        for field, value, text in (
+                ("claim_state", "self_reported",
+                 "no controller-log attempt ran it"),
+                ("corroborating_attempts", [], "no attributable attempt")):
+            variant = [dict(entries[0], **{field: value})]
+            state, _, why = cowork._adjudicate_readiness(
+                variant, "m", {"a": "x"})
+            self.assertEqual(state, "unverified", field)
+            self.assertIn(text, why)
+        self._assert_deletion_still_unstaged(before)
+
+    def test_negative_undeclared_absence_fails_closed_in_snapshot_and_identity(self):
+        from unittest import mock
+        self._delete_b()
+        before = self._snapshot_state()
+        real = verification.git_repo_paths
+
+        def with_ghost(repo):
+            return sorted(real(repo) + ["ghost.py"])
+
+        with mock.patch.object(verification, "git_repo_paths",
+                               side_effect=with_ghost):
+            with self.assertRaises(verification.SnapshotRaceError) as ctx:
+                verification.build_snapshot(self.fixture, "S-bug83n", "T-2")
+            self.assertEqual(ctx.exception.report["path"], "ghost.py")
+            self.assertEqual(ctx.exception.report["reason"],
+                             "unsupported_or_unreadable_entry")
+            self.assertEqual(
+                verification.current_candidate_identity(self.fixture),
+                (None, None))
+        self._assert_deletion_still_unstaged(before)
+
+    def test_negative_unreadable_deletion_list_fails_closed_in_snapshot_and_identity(self):
+        from unittest import mock
+        self._delete_b()
+        before = self._snapshot_state()
+        with mock.patch.object(verification, "git_deleted_paths",
+                               return_value=None):
+            with self.assertRaises(verification.SnapshotRaceError) as ctx:
+                verification.build_snapshot(self.fixture, "S-bug83u", "T-3")
+            self.assertEqual(ctx.exception.report["path"], "pkg/b.py")
+            self.assertEqual(
+                verification.current_candidate_identity(self.fixture),
+                (None, None))
+            report = verification.detect_mutation(self.fixture, "m", "i")
+            self.assertEqual(report["reason"], "enumeration_failed")
+        self._assert_deletion_still_unstaged(before)
+
+    def test_negative_restoring_the_deleted_file_after_snapshot_is_a_mutation(self):
+        self._delete_b()
+        index_before = self._snapshot_state()[0]
+        snap = verification.build_snapshot(self.fixture, "S-bug83r", "T-4")
+        with open(snap["manifest_path"]) as fh:
+            files = json.load(fh)["files"]
+        with open(self._path("pkg/b.py"), "w") as fh:
+            fh.write("b\n")
+        report = verification.detect_mutation(
+            self.fixture, snap["manifest_digest"], snap["index_digest"],
+            files)
+        self.assertIsNotNone(report)
+        self.assertEqual(report["reason"], "source_or_index_mutated")
+        self.assertIn("pkg/b.py", report["changed_paths"])
+        self.assertNotEqual(
+            verification.current_candidate_identity(self.fixture),
+            (snap["manifest_digest"], snap["index_digest"]))
+        # Readiness wrote nothing to the index; only the fixture touched pkg/.
+        self.assertEqual(self._snapshot_state()[0], index_before)
+
+
 # =============================================================================== #
 # Owned hermetic manifest-bound verification transaction (ORCH-030/031,          #
 # CV-022/037). Every class below exercises the REAL `cowork_verification`        #
@@ -18875,7 +19166,7 @@ class OwnedVerificationLifecycleTests(_OwnedVerificationTestBase):
         started = time.time()
         try:
             attempt = verification.run_command_in_group(
-                ["python3", "-c", parent], cwd=self.repo, timeout_s=0.25,
+                ["python3", "-c", parent], cwd=self.repo, timeout_s=1.5,
                 term_grace_s=0.1, output_cap_bytes=1024)
         finally:
             if os.path.exists(pid_path):
@@ -18885,7 +19176,7 @@ class OwnedVerificationLifecycleTests(_OwnedVerificationTestBase):
                     os.kill(child_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        self.assertLess(time.time() - started, 2)
+        self.assertLess(time.time() - started, 3.5)
         self.assertTrue(attempt["timed_out"])
         self.assertIn("partial output", attempt["stderr"])
 

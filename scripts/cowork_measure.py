@@ -2197,6 +2197,12 @@ class SourceClock:
     would let a deletion pass unnoticed — the one mutation an mtime maximum
     cannot see.
 
+    The one exception is a path git itself reports as deleted from the
+    worktree (an unstaged deletion, passed as `deleted`): it is timed by its
+    nearest existing parent directory's mtime, which unlink updates, so the
+    deletion still moves the clock. Any other missing path still yields
+    `missing_sources`.
+
     FAILS CLOSED. No paths, no readable clock, or any missing file yields a
     state other than `ok`, and a non-`ok` clock refuses every promotion rather
     than waving it through. An unavailable clock is not evidence of freshness.
@@ -2217,8 +2223,25 @@ class SourceClock:
                 "missing": self.missing[:8], "files_counted": self.counted}
 
 
-def newest_source_mtime(root, paths):
-    """Read the source clock. Returns a `SourceClock`, never a bare number."""
+def _deletion_time(root, rel):
+    """The mtime of the nearest existing ancestor directory of `rel` (up to
+    `root` itself), or None when none is readable."""
+    anc = rel
+    while True:
+        anc = os.path.dirname(anc)
+        try:
+            return os.path.getmtime(os.path.join(root, anc) if root
+                                    else (anc or "."))
+        except OSError:
+            if not anc:
+                return None
+
+
+def newest_source_mtime(root, paths, deleted=None):
+    """Read the source clock. Returns a `SourceClock`, never a bare number.
+
+    `deleted` is the set of paths git reports as deleted from the worktree;
+    see `SourceClock` for how they are timed."""
     if paths is None:
         return SourceClock(state="paths_unavailable")
     paths = list(paths)
@@ -2231,6 +2254,13 @@ def newest_source_mtime(root, paths):
         try:
             stamp = os.path.getmtime(os.path.join(root, rel) if root else rel)
         except OSError:
+            stamp = (_deletion_time(root, rel)
+                     if deleted and rel in deleted else None)
+            if stamp is not None:
+                # A git-declared unstaged deletion: timed by its parent.
+                if newest is None or stamp > newest:
+                    newest = stamp
+                continue
             # DELETED or unreadable. Recorded, never skipped.
             missing.append(rel)
             continue

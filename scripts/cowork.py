@@ -2682,8 +2682,9 @@ def _stamp_observed_provenance(observations, digest=None, clock=None):
     """
     digest = digest or _current_tree_digest()
     if clock is None:
-        clock = measure.newest_source_mtime(os.getcwd(),
-                                            _source_paths_for_manifest())
+        clock = measure.newest_source_mtime(
+            os.getcwd(), _source_paths_for_manifest(),
+            deleted=verification.git_deleted_paths(None))
     if not (digest and getattr(clock, "usable", False)):
         return observations
     for attempt in observations or []:
@@ -2947,9 +2948,11 @@ def _adjudicate_readiness(entries, claimed, required=None):
     # evidence a promotion runs on.
     # The independent clock: when the sources last changed. `None` paths mean
     # the clock could not be read at all, which the adjudicator fails closed on
-    # rather than treating as "nothing has changed".
+    # rather than treating as "nothing has changed". An unstaged deletion git
+    # reports is timed by its parent directory; any other absence fails closed.
     newest_mtime = measure.newest_source_mtime(
-        os.getcwd(), _source_paths_for_manifest())
+        os.getcwd(), _source_paths_for_manifest(),
+        deleted=verification.git_deleted_paths(None))
     unsupported = []
     for entry in entries:
         if required and entry.get("label") not in required:

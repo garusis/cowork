@@ -717,6 +717,24 @@ def git_repo_paths(repo):
         return None
 
 
+def git_deleted_paths(repo):
+    """Relative paths git itself reports as deleted from the worktree but
+    still in the index (an unstaged deletion), via the read-only
+    `git ls-files --deleted` — same quoting and cwd semantics as
+    `git_repo_paths`, so the two sets compare directly. Never writes the
+    index. Returns a frozenset, or None on any git failure; None means
+    "cannot confirm any deletion" and callers must treat it as no declared
+    deletions (fail closed: every absent path stays an error)."""
+    try:
+        listed = _git(["ls-files", "--deleted"], repo)
+        if listed.returncode != 0:
+            return None
+        return frozenset(p for p in listed.stdout.decode(
+            "utf-8", "replace").splitlines() if p.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def git_index_path(repo):
     """The exact `.git/index` (or worktree-specific gitdir index) path for
     `repo`, via `git rev-parse --git-dir` — never a hardcoded `.git/index`,
@@ -788,10 +806,14 @@ class _UnsupportedEntry(RuntimeError):
                          % (path, mode))
 
 
-def _enumerate_and_hash(repo, paths):
+def _enumerate_and_hash(repo, paths, deleted=frozenset()):
     """Build `{rel_path: entry_dict}` (without `_bytes`, stripped for the
     manifest) for every path, fail-closed on anything unsupported, escaping
     the repo, or unreadable. Returns `(manifest_entries, raw_bytes_by_path)`.
+
+    A path in `deleted` (one git itself reports as deleted from the worktree,
+    see `git_deleted_paths`) that is really absent is left out of the
+    manifest; any other absence still fails closed.
     """
     manifest = {}
     raw_by_path = {}
@@ -805,6 +827,12 @@ def _enumerate_and_hash(repo, paths):
                 "reason": "path_escapes_repo", "path": rel})
         try:
             entry = _lstat_entry(full)
+        except FileNotFoundError as exc:
+            if rel in deleted:
+                continue
+            raise SnapshotRaceError({
+                "reason": "unsupported_or_unreadable_entry", "path": rel,
+                "detail": str(exc)})
         except (_UnsupportedEntry, OSError) as exc:
             raise SnapshotRaceError({
                 "reason": "unsupported_or_unreadable_entry", "path": rel,
@@ -852,7 +880,9 @@ def build_snapshot(repo, session_uuid, transaction_id):
     pre_index = read_index_bytes(repo)
     if pre_index is None:
         raise SnapshotRaceError({"reason": "git_index_unreadable"})
-    pre_manifest, raw_by_path = _enumerate_and_hash(repo, pre_paths)
+    pre_deleted = git_deleted_paths(repo) or frozenset()
+    pre_manifest, raw_by_path = _enumerate_and_hash(repo, pre_paths,
+                                                    pre_deleted)
     pre_fingerprint = _manifest_fingerprint(pre_manifest)
     pre_index_digest = index_digest(pre_index)
 
@@ -878,7 +908,9 @@ def build_snapshot(repo, session_uuid, transaction_id):
         post_index = read_index_bytes(repo)
         if post_paths is None or post_index is None:
             raise SnapshotRaceError({"reason": "git_unreadable_post_copy"})
-        post_manifest, _ = _enumerate_and_hash(repo, post_paths)
+        post_deleted = git_deleted_paths(repo) or frozenset()
+        post_manifest, _ = _enumerate_and_hash(repo, post_paths,
+                                               post_deleted)
         post_fingerprint = _manifest_fingerprint(post_manifest)
         post_index_digest = index_digest(post_index)
 
@@ -1378,9 +1410,12 @@ def run_command_in_group(argv, cwd, timeout_s, term_grace_s,
 
     if timed_out or liveness_stopped:
         term_sent = True
+        # macOS refuses (EPERM) a group whose members are all unreaped
+        # zombies. A refused signal proves nothing either way; the bounded
+        # waits below still decide.
         try:
             os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         grace_deadline = time.time() + term_grace_s
         while time.time() < grace_deadline and _pgid_alive(pgid):
@@ -1389,7 +1424,7 @@ def run_command_in_group(argv, cwd, timeout_s, term_grace_s,
             kill_sent = True
             try:
                 os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             kill_deadline = time.time() + term_grace_s
             while time.time() < kill_deadline and _pgid_alive(pgid):
@@ -1478,7 +1513,8 @@ def detect_mutation(repo, expected_manifest_digest, expected_index_digest,
                "manifest_digest_before": expected_manifest_digest,
                "manifest_digest_after": None, "changed_paths": []}
     try:
-        manifest, _ = _enumerate_and_hash(repo, paths)
+        manifest, _ = _enumerate_and_hash(
+            repo, paths, git_deleted_paths(repo) or frozenset())
     except SnapshotRaceError as exc:
         return {"reason": "enumeration_failed", "detail": exc.report,
                "manifest_digest_before": expected_manifest_digest,
@@ -1511,8 +1547,9 @@ def detect_mutation(repo, expected_manifest_digest, expected_index_digest,
 def current_candidate_identity(repo):
     """The LIVE candidate's manifest/index digest pair, computed with the
     EXACT SAME canonical algorithm `build_snapshot`/`detect_mutation` use
-    (`git_repo_paths` + `_enumerate_and_hash` + `_manifest_fingerprint` for
-    the manifest; `read_index_bytes` + `index_digest` for the index).
+    (`git_repo_paths` + `git_deleted_paths` + `_enumerate_and_hash` +
+    `_manifest_fingerprint` for the manifest; `read_index_bytes` +
+    `index_digest` for the index).
 
     This is the ONE canonical identity a caller outside this module (e.g.
     `cowork.py`'s readiness gate) must use to compare "the candidate as it
@@ -1530,7 +1567,8 @@ def current_candidate_identity(repo):
     if paths is None:
         return None, None
     try:
-        manifest, _ = _enumerate_and_hash(repo, paths)
+        manifest, _ = _enumerate_and_hash(
+            repo, paths, git_deleted_paths(repo) or frozenset())
     except SnapshotRaceError:
         return None, None
     index_bytes = read_index_bytes(repo)
