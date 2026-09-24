@@ -13,7 +13,6 @@ import os
 import shutil
 import socket as _socket_mod
 import sys
-import time
 
 # Interpreter floor. cowork targets 3.9 so it runs on the local interpreter
 # without forcing an upgrade.
@@ -397,47 +396,6 @@ def check_controller_config(capability, binding):
     return capability_check_result("controller_config", True)
 
 
-_CODEX_CONFIG_MAX_AGE = 60 * 60 * 24 * 7  # 7 days in seconds
-
-
-def _codex_config_path():
-    """Resolve the Codex config file path via CODEX_HOME or the default location."""
-    home = os.environ.get("CODEX_HOME")
-    if home:
-        base = os.path.abspath(os.path.expanduser(home))
-    else:
-        base = os.path.join(os.path.expanduser("~"), ".codex")
-    return os.path.join(base, "config.toml")
-
-
-def check_codex_config_freshness(capability, binding, stat_fn=None):
-    """Fail if the Codex config is absent or its mtime exceeds _CODEX_CONFIG_MAX_AGE.
-
-    stat_fn(path) -> os.stat_result is injectable so tests perform no real I/O.
-    Only checked when binding.controller == 'codex'.
-    """
-    if stat_fn is None:
-        stat_fn = os.stat
-    bind = binding or {}
-    if bind.get("controller") != "codex":
-        return capability_check_result("codex_config_freshness", True)
-    config_path = _codex_config_path()
-    try:
-        st = stat_fn(config_path)
-    except OSError:
-        return capability_check_result(
-            "codex_config_freshness", False,
-            reason="Codex config not found: %s" % config_path,
-            repair_hint="initialize Codex config or set CODEX_HOME")
-    age = time.time() - st.st_mtime
-    if age > _CODEX_CONFIG_MAX_AGE:
-        return capability_check_result(
-            "codex_config_freshness", False,
-            reason="Codex config is stale (age %.0fs > max %ds)" % (age, _CODEX_CONFIG_MAX_AGE),
-            repair_hint="update the Codex config to refresh its mtime")
-    return capability_check_result("codex_config_freshness", True)
-
-
 # ---------------------------------------------------------------------------
 # M2 Package C: dispatch-time dependency-graph declaration check +
 # WorkUnit-typed preflight decision.
@@ -623,7 +581,6 @@ def run_manifest_preflight(manifest, connect_fn=None, stat_fn=None, platform=Non
         lambda: check_rtk_present(cap, stat_fn=stat_fn),
         lambda: check_argv_form(cap),
         lambda: check_controller_config(cap, bind),
-        lambda: check_codex_config_freshness(cap, bind, stat_fn=stat_fn),
     ):
         result = check_fn()
         checks_run.append(result)

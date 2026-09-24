@@ -179,6 +179,13 @@ bypass approval/sandbox guards. Run `cowork` in a trusted/isolated workspace.
 
 ## Requirements
 
+- **A git work tree.** This is a prerequisite, not a runtime condition: every
+  cowork run must be launched inside a git work tree, because each role runs
+  confined to a write boundary derived from the launch directory's git
+  toplevel, and outside one there is no boundary to confine a role to. A run
+  launched outside a git work tree is refused before anything is dispatched
+  (rc 2, `reason: requires_git_work_tree`) — launch from inside a repository,
+  or run `git init` there first. There is no opt-out.
 - Python 3.9 or newer. The runtime uses only the standard library
   (`requirements.txt` lists no packages).
 - The controller CLIs you intend to use, on your `PATH`:
@@ -213,9 +220,9 @@ and `~/.codex/skills`, and runs the preflight to report any missing controller
 CLIs. It is idempotent — safe to re-run.
 
 After a new shell (or `source ~/.zshrc`), agents can invoke `cowork` from **any
-folder** — the launcher re-execs into the venv when it exists, the
-project-local `.cowork/session.<uuid>.json` store lands in the current
-directory, and the session's produced artifacts live under
+folder inside a git work tree** — the launcher re-execs into the venv when it
+exists, the project-local `.cowork/session.<uuid>.json` store lands in the
+current directory, and the session's produced artifacts live under
 `~/.cowork/sessions/<session_uuid>/`. Re-verify anytime with `cowork --check`.
 
 > Manual alternative: run `./cowork` from this directory with any Python 3.9+.
@@ -256,6 +263,11 @@ an accepted decision delivery could not be acknowledged (it is re-sent later).
 
 Only rc 0 with `approved: true` is success. A stop, a capacity pause, or a
 missing result line is never an approval.
+
+A run launched outside a git work tree is refused with rc 2 and
+`reason: requires_git_work_tree` before any session, lease, trace or dispatch
+exists; from such a directory that refusal pre-empts the session-selection and
+decision refusals described below.
 
 `--help` (exit 0) is not a run and emits no record. The read-only commands
 `--check`, `--report`, and `--session-owner` print their own output and emit no
@@ -317,6 +329,11 @@ cowork --session-file .cowork/session.<uuid>.json
   `--answer`, `--authorize-handoff`, `--decline-handoff`, `--take-over`)
   require an explicit `--session-file` or `--resume`
   (`saved_session_selector_required`).
+- Every refusal in this section assumes the launch directory is a git work
+  tree. From a directory that is not one, `requires_git_work_tree` (rc 2)
+  pre-empts them — including `session_not_found`,
+  `saved_session_selector_required`, `conflicting_session_selectors` and every
+  decision refusal — because such a directory can never have hosted a session.
 
 ### Stops and orchestrator decisions
 
@@ -418,7 +435,10 @@ a plain `cowork --session-file PATH`.
   documented setup, such as a per-worktree venv); a repo with no convention
   gets a sibling `../<repo>-worktrees/<name>` folder. `NAME` defaults to
   `cowork-<short session id>`; the branch has the same name off HEAD. It
-  requires launching inside a git work tree (`worktree_requires_git`, rc 2).
+  requires launching inside a git work tree (`worktree_requires_git`, rc 2) —
+  the flag-specific form of the general
+  [git work tree prerequisite](#requirements), which `--worktree` pre-empts
+  with its own code so the diagnosis names the flag.
   cowork validates the created worktree before switching into it. On a name
   clash, an explicit `NAME` stops (or reuses an exact match); an auto name
   picks a free numbered variant.

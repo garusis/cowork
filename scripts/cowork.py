@@ -11550,17 +11550,42 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                       "--context-file %s cannot be read (%s)"
                       % (args.context_file, type(exc).__name__))
 
-    # Deterministic --worktree git gate (D1): runs early, before session
-    # selection, so a non-git launch fails fast with rc 2 and no half-init. The
-    # base is the single launch toplevel — NOT discover_git_roots (single repo
-    # only). Carried to the worktree creation block below.
-    worktree_base = None
-    if worktree_requested:
-        worktree_base = git_worktree_toplevel(run_cwd)
-        if worktree_base is None:
+    # Deterministic git work tree gate (D1): runs early, before session
+    # selection, so a non-git launch fails fast with rc 2 and no half-init.
+    #
+    # (a) A git work tree is a PREREQUISITE, not a runtime condition: every
+    #     controller's write boundary is derived from the launch directory's
+    #     git toplevel — cowork_bridge._guard_runtime builds
+    #     action_policy.OwnedScope.repo_roots from _git_worktree_scope(
+    #     os.getcwd()) for opencode and for claude/codex alike, and raises
+    #     RuntimeError('git_toplevel_unavailable') without one. There is no
+    #     boundary to confine a role to outside a work tree, so such a run is
+    #     an unsupported environment and is refused rather than attempted.
+    # (b) It is gated HERE because this is the last point before session
+    #     selection, the owner lease, the trace, any session asset and any
+    #     dispatch — so the refusal is provably pre-dispatch and leaves
+    #     nothing behind, while the four argument validations above keep
+    #     their more specific diagnoses.
+    # (c) Precedence consequence: from a cwd that is not a work tree this
+    #     pre-empts every refusal code below it (session selection, decision,
+    #     preflight, worktree). rc stays 2 and the outcome stays
+    #     invalid_invocation in every moved case; README records the set.
+    #
+    # One toplevel lookup serves both gates. The --worktree base is that single
+    # launch toplevel — NOT discover_git_roots (single repo only) — carried to
+    # the worktree creation block below, and None when none was requested.
+    launch_toplevel = git_worktree_toplevel(run_cwd)
+    worktree_base = launch_toplevel if worktree_requested else None
+    if launch_toplevel is None:
+        if worktree_requested:
             return refuse("worktree_requires_git",
                           "--worktree requires launching inside a git work "
                           "tree; %s is not one." % run_cwd)
+        return refuse("requires_git_work_tree",
+                      "cowork must be launched inside a git work tree — "
+                      "every role runs confined to it; %s is not one. Launch "
+                      "cowork from inside a git repository, or run `git init` "
+                      "there first." % run_cwd)
     # The real worktree path this session's roles dispatch into, once
     # created/reused below — None until then (and always None when no
     # worktree was requested), never invented. Bound to every role manifest

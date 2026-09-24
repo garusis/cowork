@@ -1963,6 +1963,11 @@ class AgentRunContractTest(unittest.TestCase):
                 os.environ["COWORK_SESSIONS_ROOT"] = old
         self.addCleanup(restore)
         self.cwd = tempfile.mkdtemp()
+        # The launch directory must be a git work tree (the run_flow
+        # prerequisite). Bare init, no commit, so _git_build_baseline stays
+        # (None, None).
+        subprocess.run(["git", "init", "-q", self.cwd], check=True,
+                       capture_output=True)
         self.addCleanup(lambda: shutil.rmtree(self.cwd, ignore_errors=True))
         prev = os.getcwd()
         os.chdir(self.cwd)
@@ -3383,6 +3388,11 @@ class MultiSessionFlowTest(unittest.TestCase):
         self.addCleanup(restore)
         self.root = root
         self.cwd = tempfile.mkdtemp()
+        # The launch directory must be a git work tree (the run_flow
+        # prerequisite). Bare init, no commit, so _git_build_baseline stays
+        # (None, None).
+        subprocess.run(["git", "init", "-q", self.cwd], check=True,
+                       capture_output=True)
         self.addCleanup(lambda: shutil.rmtree(self.cwd, ignore_errors=True))
 
     def _args(self, argv):
@@ -6503,6 +6513,11 @@ class SwitchControllerFlowTest(unittest.TestCase):
     def test_cli_switch_session_discovery_errors(self):
         import tempfile
         cwd = tempfile.mkdtemp()
+        # The launch directory must be a git work tree (the run_flow
+        # prerequisite). Bare init, no commit, so _git_build_baseline stays
+        # (None, None).
+        subprocess.run(["git", "init", "-q", cwd], check=True,
+                       capture_output=True)
         self.addCleanup(lambda: shutil.rmtree(cwd, ignore_errors=True))
         prev = os.getcwd()
         os.chdir(cwd)
@@ -11430,6 +11445,159 @@ class WorktreeFlowTest(unittest.TestCase):
             io_out=io.StringIO(), which=lambda c: None,  # controller missing
             run_scout_fn=lambda *a, **k: self.fail("should not launch scout"))
         self.assertEqual(rc, 1)  # ensure_controller_available returns False
+
+
+class GitWorkTreePrerequisiteTest(unittest.TestCase):
+    """A git work tree is a prerequisite of every cowork run, not a runtime
+    condition: each role's write boundary is derived from the launch
+    directory's git toplevel, so a launch outside one is refused before any
+    session, lease, trace, session asset or dispatch exists."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+        self.sessions_root = root
+
+        def restore_env():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore_env)
+        cwd = os.getcwd()
+        self.addCleanup(lambda: os.chdir(cwd))
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _nongit(self):
+        d = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def _bare_git(self):
+        """A git work tree with no commit — enough to satisfy the gate."""
+        d = self._nongit()
+        subprocess.run(["git", "init", "-q", d], check=True,
+                       capture_output=True)
+        return d
+
+    def _no_roles(self):
+        """Runner fns that fail the test if the gate lets a run through."""
+        def fn(name):
+            return lambda *a, **k: self.fail(
+                "%s ran from a directory that is not a git work tree" % name)
+        return {"run_scout_fn": fn("scout"),
+                "run_planner_fn": fn("planner"),
+                "run_builder_fn": fn("builder"),
+                "run_worktree_fn": fn("worktree")}
+
+    def test_non_git_launch_is_refused_before_any_role(self):
+        nongit = self._nongit()
+        os.chdir(nongit)
+        for cfg in ("scout=claude,yolo,plan", "scout=codex",
+                    "scout=opencode,model=anthropic/claude-sonnet-4-5"):
+            with self.subTest(config=cfg):
+                box = {}
+                out = io.StringIO()
+                rc = cowork.run_flow(
+                    self._args(["--no-session", "--team",
+                                "scout,scout-reviewer", "--config", cfg,
+                                "--context", "x"]),
+                    io_out=out, which=lambda c: "/bin/" + c,
+                    result_box=box, **self._no_roles())
+                self.assertEqual(rc, 2)
+                self.assertEqual(box["reason"], "requires_git_work_tree")
+                result = cowork.build_run_result(rc, box)
+                self.assertEqual(result["outcome"], "invalid_invocation")
+                self.assertEqual(result["rc"], 2)
+                self.assertIs(result["approved"], False)
+                self.assertEqual(result["reason"], "requires_git_work_tree")
+                # Precise and actionable: names the directory and the remedy.
+                self.assertIn(nongit, out.getvalue())
+                self.assertIn("git init", out.getvalue())
+
+    def test_non_git_refusal_pre_empts_post_gate_refusals_and_creates_nothing(
+            self):
+        # Non-git leg: the environment diagnosis wins over session selection.
+        nongit = self._nongit()
+        os.chdir(nongit)
+        box = {}
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--resume"]), io_out=out,
+            which=lambda c: "/bin/" + c, result_box=box, **self._no_roles())
+        self.assertEqual(rc, 2)
+        self.assertEqual(box["reason"], "requires_git_work_tree")
+        # Nothing was created: the project-local session store would land in
+        # the launch directory, and the session asset dir, its trace and the
+        # owner lease all land under COWORK_SESSIONS_ROOT/<uuid>/.
+        self.assertFalse(os.path.exists(os.path.join(nongit, ".cowork")))
+        self.assertEqual(os.listdir(self.sessions_root), [])
+
+        # Git leg: the SAME invocation reaches the session-selection refusal.
+        repo = self._bare_git()
+        os.chdir(repo)
+        box = {}
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--resume"]), io_out=out,
+            which=lambda c: "/bin/" + c, result_box=box, **self._no_roles())
+        self.assertEqual(rc, 2)
+        self.assertEqual(box["reason"], "session_not_found")
+
+    def test_worktree_flag_keeps_its_own_reason_code(self):
+        os.chdir(self._nongit())
+        box = {}
+        rc = cowork.run_flow(
+            self._args(["--worktree", "--team", "scout", "--context", "x",
+                        "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            result_box=box, **self._no_roles())
+        self.assertEqual(rc, 2)
+        # The flag-specific diagnosis keeps its earlier position and its own
+        # code; the general prerequisite code must NOT replace it.
+        self.assertEqual(box["reason"], "worktree_requires_git")
+
+    def test_git_launch_reaches_scouting(self):
+        repo = _init_git_repo()
+        self.addCleanup(lambda: shutil.rmtree(repo, ignore_errors=True))
+        os.chdir(repo)
+        calls = []
+
+        def fake_scout(*a, **k):
+            calls.append(1)
+            return 0
+        box = {}
+        rc = cowork.run_flow(
+            self._args(["--no-session", "--team", "scout,scout-reviewer",
+                        "--config", "scout=claude,yolo,plan",
+                        "--context", "x"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            result_box=box, run_scout_fn=fake_scout,
+            run_worktree_fn=lambda *a, **k: self.fail("no worktree requested"))
+        self.assertEqual(calls, [1])
+        self.assertNotEqual(rc, 2)
+        self.assertNotEqual(box.get("reason"), "requires_git_work_tree")
+
+    def test_readme_documents_the_git_prerequisite(self):
+        readme = os.path.join(os.path.dirname(_HERE), "README.md")
+        with open(readme, "r") as fh:
+            text = " ".join(fh.read().split())  # collapse markdown wrapping
+        for literal in (
+                "every cowork run must be launched inside a git work tree",
+                "refused before anything is dispatched "
+                "(rc 2, `reason: requires_git_work_tree`)",
+                "**any folder inside a git work tree**",
+                "rc 2 and `reason: requires_git_work_tree`",
+                "`requires_git_work_tree` (rc 2) pre-empts them",
+                "worktree_requires_git"):
+            with self.subTest(literal=literal):
+                self.assertIn(literal, text)
+        # The uncorrected claim that cowork runs from any folder at all.
+        self.assertNotIn("**any folder**", text)
 
 
 class WorktreeStateTest(unittest.TestCase):
@@ -28957,42 +29125,6 @@ class ManifestPreflightTest(unittest.TestCase):
         self.assertFalse(r["ok"])
 
     # ------------------------------------------------------------------ #
-    # check_codex_config_freshness                                        #
-    # ------------------------------------------------------------------ #
-
-    def test_check_codex_config_freshness_pass_non_codex(self):
-        cap = _preflight_capability()
-        bind = _preflight_binding(controller="claude")
-        r = preflight.check_codex_config_freshness(cap, bind, stat_fn=os.stat)
-        self.assertTrue(r["ok"])
-
-    def test_check_codex_config_freshness_pass_fresh(self):
-        fresh = type("S", (), {"st_mtime": time.time() - 60})()
-        cap = _preflight_capability()
-        bind = _preflight_binding(controller="codex")
-        r = preflight.check_codex_config_freshness(cap, bind,
-                                                    stat_fn=lambda p: fresh)
-        self.assertTrue(r["ok"])
-
-    def test_check_codex_config_freshness_missing(self):
-        def _absent(p):
-            raise FileNotFoundError(p)
-        cap = _preflight_capability()
-        bind = _preflight_binding(controller="codex")
-        r = preflight.check_codex_config_freshness(cap, bind, stat_fn=_absent)
-        self.assertFalse(r["ok"])
-        self.assertIn("not found", r["reason"])
-
-    def test_check_codex_config_freshness_stale(self):
-        old = type("S", (), {"st_mtime": time.time() - 60 * 60 * 24 * 30})()
-        cap = _preflight_capability()
-        bind = _preflight_binding(controller="codex")
-        r = preflight.check_codex_config_freshness(cap, bind,
-                                                    stat_fn=lambda p: old)
-        self.assertFalse(r["ok"])
-        self.assertIn("stale", r["reason"])
-
-    # ------------------------------------------------------------------ #
     # check_git_operation — M1 P2-v3 successor                            #
     # ------------------------------------------------------------------ #
 
@@ -31036,7 +31168,7 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # M1 P5-v4: real fault injection through the production dispatch fence.
 #
-# All eleven named faults are driven through the REAL compiled manifest, the
+# All ten named faults are driven through the REAL compiled manifest, the
 # REAL `run_manifest_preflight`, and the REAL `run_worktree`/`run_flow`
 # dispatch fence delivered by P2-v3/P4/the capability-binding repair — never
 # a hypothetical refusal factory and never an absence-of-caller assertion.
@@ -31045,13 +31177,13 @@ class ManifestCapabilityPopulationTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class FaultInjectionManifestTest(unittest.TestCase):
-    """Faults 1-10: every one is a real capability/binding fact fed to the
+    """Faults 1-9: every one is a real capability/binding fact fed to the
     unmodified `compile_manifest` + `run_manifest_preflight` fence, driven
     through the real `run_worktree` production dispatch. `_inject` patches
     only the FACTS a real caller would supply (capability fields, binding
     fields) — the validators themselves (`validate_git_operation`,
     `validate_cwd`, `validate_rtk_present`, `validate_argv_form`,
-    `check_runtime_roots`, `check_guard_socket`, `check_codex_config_freshness`,
+    `check_runtime_roots`, `check_guard_socket`,
     `check_artifact_destinations`, `check_private_paths`) run for real."""
 
     def setUp(self):
@@ -31068,14 +31200,6 @@ class FaultInjectionManifestTest(unittest.TestCase):
         self.addCleanup(
             setattr, state_store, "manifest_path_for",
             self._orig_manifest_path)
-        old_home = os.environ.get("CODEX_HOME")
-        self.addCleanup(self._restore_codex_home, old_home)
-
-    def _restore_codex_home(self, old):
-        if old is None:
-            os.environ.pop("CODEX_HOME", None)
-        else:
-            os.environ["CODEX_HOME"] = old
 
     def _trace(self, name):
         tpath = os.path.join(self._td, name + ".trace.jsonl")
@@ -31177,22 +31301,7 @@ class FaultInjectionManifestTest(unittest.TestCase):
         self.assertEqual(refusal["code"], "runtime_roots")
         self.assertIn(missing, refusal["message"])
 
-    # -- fault 2: stale Codex config ------------------------------------ #
-
-    def test_fault_stale_codex_config_refuses_before_spawn(self):
-        home = os.path.join(self._td, "codex-home")
-        os.makedirs(home)
-        cfg_path = os.path.join(home, "config.toml")
-        with open(cfg_path, "w", encoding="utf-8") as fh:
-            fh.write("# stale\n")
-        stale_time = time.time() - 60 * 60 * 24 * 30
-        os.utime(cfg_path, (stale_time, stale_time))
-        os.environ["CODEX_HOME"] = home
-        refusal = self._fault_case("stale-codex-config", controller="codex")
-        self.assertEqual(refusal["code"], "codex_config_freshness")
-        self.assertIn("stale", refusal["message"])
-
-    # -- fault 3: dead guard --------------------------------------------- #
+    # -- fault 2: dead guard --------------------------------------------- #
 
     def test_fault_dead_guard_refuses_before_spawn(self):
         dead_socket = os.path.join(self._td, "dead-guard.sock")
@@ -31201,7 +31310,7 @@ class FaultInjectionManifestTest(unittest.TestCase):
         self.assertEqual(refusal["code"], "guard_socket")
         self.assertIn("unreachable", refusal["message"])
 
-    # -- fault 4: denied Git subcommand ----------------------------------- #
+    # -- fault 3: denied Git subcommand ----------------------------------- #
 
     def test_fault_denied_git_subcommand_refuses_before_spawn(self):
         refusal = self._fault_case(
@@ -31210,14 +31319,14 @@ class FaultInjectionManifestTest(unittest.TestCase):
         self.assertEqual(refusal["code"], "git_operation")
         self.assertIn("unconditionally refused", refusal["message"])
 
-    # -- fault 5: cwd under /tmp ------------------------------------------ #
+    # -- fault 4: cwd under /tmp ------------------------------------------ #
 
     def test_fault_cwd_under_tmp_refuses_before_spawn(self):
         refusal = self._fault_case("cwd-tmp", worktree="/tmp")
         self.assertEqual(refusal["code"], "cwd")
         self.assertIn("tmp", refusal["message"])
 
-    # -- fault 6: missing rtk ---------------------------------------------- #
+    # -- fault 5: missing rtk ---------------------------------------------- #
 
     def test_fault_missing_rtk_refuses_before_spawn(self):
         refusal = self._fault_case(
@@ -31226,7 +31335,7 @@ class FaultInjectionManifestTest(unittest.TestCase):
                 self._td, "no-such-rtk-binary")}})
         self.assertEqual(refusal["code"], "rtk_present")
 
-    # -- fault 7: unsafe shell syntax --------------------------------------- #
+    # -- fault 6: unsafe shell syntax --------------------------------------- #
 
     def test_fault_unsafe_shell_syntax_refuses_before_spawn(self):
         refusal = self._fault_case(
@@ -31236,7 +31345,7 @@ class FaultInjectionManifestTest(unittest.TestCase):
         self.assertEqual(refusal["code"], "argv_form")
         self.assertIn("metacharacter", refusal["message"])
 
-    # -- fault 8: denied artifact write --------------------------------- #
+    # -- fault 7: denied artifact write --------------------------------- #
 
     def test_fault_denied_artifact_write_refuses_before_spawn(self):
         refusal = self._fault_case(
@@ -31244,7 +31353,7 @@ class FaultInjectionManifestTest(unittest.TestCase):
         self.assertEqual(refusal["code"], "artifact_destinations")
         self.assertIn("traversal", refusal["message"])
 
-    # -- fault 9: changed manifest/config digest (on-disk tamper) -------- #
+    # -- fault 8: changed manifest/config digest (on-disk tamper) -------- #
 
     def test_fault_changed_manifest_digest_is_never_trusted(self):
         """A manifest tampered on disk (digest no longer matches its own
@@ -31291,7 +31400,7 @@ class FaultInjectionManifestTest(unittest.TestCase):
         self.assertIsNotNone(reloaded)
         self.assertNotEqual(reloaded["digest"], "0" * 64)
 
-    # -- fault 10: missing manifest file ---------------------------------- #
+    # -- fault 9: missing manifest file ---------------------------------- #
 
     def test_fault_missing_manifest_file_never_defaults_to_allow(self):
         """No manifest has EVER been compiled for this role: absence must
@@ -31364,7 +31473,7 @@ class FaultInjectionManifestTest(unittest.TestCase):
 
 
 class FaultInjectionPolicyTest(ControllerPolicyTestBase):
-    """Fault 11: disallowed policy broadening, driven through the real
+    """Fault 10: disallowed policy broadening, driven through the real
     `run_flow --switch-controller` CLI path (never `_is_policy_preserving_repair`
     called in isolation)."""
 

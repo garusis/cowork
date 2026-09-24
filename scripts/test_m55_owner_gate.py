@@ -8,8 +8,13 @@ REACHABILITY, not storage:
     ownership fact FIRST, ahead of the policy guard, so an unowned process is
     refused before any other fact can allow. A real `run_flow` against a live
     foreign owner returns rc 3 with `session_factory`, `bridge._real_claude_
-    spawn` and `subprocess.Popen` all replaced by doubles that RAISE on call
-    -- zero controller constructions, zero process creations. At the dispatch
+    spawn`, the three controller session classes, the evaluator session and
+    all four role runners replaced by doubles that RAISE on call -- zero
+    controller constructions and zero dispatched agent work. The assertion is
+    on those dispatch seams, NOT on process creation in general: `run_flow`'s
+    own preconditions legitimately run children (the owner gate's `ps`
+    liveness probe, the git work-tree prerequisite's `git rev-parse`), and
+    neither is a dispatch. At the dispatch
     seam an `owner_lease`-sourced refusal RAISES, after both trace events are
     emitted, so no call site can fall through to its local refusal branch and
     write `preflight_rejected`; asserted with `resume_session_id` SET, which
@@ -495,28 +500,37 @@ class RefusalOrderingTests(OwnerGateTestCase):
         self.assertIn("already owned by another live cowork process", out)
         self.assertIn("reason   live_owner", out)
 
-    def test_the_refusal_constructs_no_controller_and_spawns_no_process(self):
-        """G1b. Doubles that RAISE on call, on every seam a paid dispatch has
-        to cross: the role runner, the three bridge session classes, the real
-        claude spawn and process creation itself.
+    def test_a_refused_live_owner_run_constructs_and_dispatches_no_agent_work(
+            self):
+        """G1b. A run refused against a live owner must construct and dispatch
+        NO controller and NO agent work. That -- not "no child process" -- is
+        the product boundary, and the doubles below are what measure it: every
+        one RAISES on call, so reaching any of them fails the test by name.
 
-        The `Popen` assertion is scoped to CONTROLLER process creation on
-        purpose, and the scoping is named rather than silent: the ownership
-        gate's own liveness evidence comes from `ps -o lstart=`
-        (`cowork_owner._probe_pid_start`), which is a real child process by
-        design -- it is the PID-reuse defence, not a dispatch. Anything else
-        reaching `Popen` on a refused run fails here."""
+        The seams are enumerated rather than inferred, and they are the
+        complete set a paid dispatch has to cross:
+
+          * provider dispatch  -- `bridge._real_claude_spawn`
+          * controllers        -- `bridge.ClaudeSession`, `CodexSession`,
+                                  `OpencodeSession`
+          * evaluator          -- `cowork._isolated_evaluator_session`
+          * roles              -- the scout, planner, builder and worktree
+                                  runners `run_flow` dispatches through
+
+        This test deliberately does NOT assert on process creation in general.
+        An earlier revision patched `subprocess.Popen` and failed on any argv0
+        but `ps`, which coupled the ownership invariant to an executable
+        allowlist it never meant to own: the ownership gate's own liveness
+        probe (`cowork_owner._probe_pid_start`) is a real child by design, and
+        so are `run_flow`'s environment preconditions -- the git work tree
+        prerequisite asks `git rev-parse` before the lease is acquired, because
+        a launch outside a work tree has no write boundary to confine a role
+        to. Neither is a dispatch. Refusing them proved nothing about ownership
+        and made an unrelated precondition look like a violation of it, so the
+        allowlist is gone and the dispatch seams themselves are the assertion.
+        """
         session_uuid = self.establish_session()
         self.seed_live_owner(session_uuid)
-        real_popen = subprocess.Popen
-
-        def guarded_popen(command, *args, **kwargs):
-            argv0 = command[0] if isinstance(command, (list, tuple)) else command
-            if os.path.basename(str(argv0)) != "ps":
-                raise AssertionError(
-                    "a process was created on a refused run: %r" % (command,))
-            return real_popen(command, *args, **kwargs)
-
         with mock.patch.object(bridge, "_real_claude_spawn",
                                _Raises("_real_claude_spawn")), \
                 mock.patch.object(bridge, "ClaudeSession",
@@ -526,9 +540,12 @@ class RefusalOrderingTests(OwnerGateTestCase):
                 mock.patch.object(bridge, "OpencodeSession",
                                   _Raises("OpencodeSession")), \
                 mock.patch.object(cowork, "_isolated_evaluator_session",
-                                  _Raises("_isolated_evaluator_session")), \
-                mock.patch.object(subprocess, "Popen", guarded_popen):
-            rc, _out = self.run_flow(scout=_Raises("run_scout"))
+                                  _Raises("_isolated_evaluator_session")):
+            rc, _out = self.run_flow(
+                scout=_Raises("run_scout"),
+                run_planner_fn=_Raises("run_planner"),
+                run_builder_fn=_Raises("run_builder"),
+                run_worktree_fn=_Raises("run_worktree"))
         self.assertEqual(rc, 3)
 
     def test_the_refusal_reaches_no_preflight_and_no_phase_entry(self):
