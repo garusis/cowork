@@ -29,6 +29,10 @@ Public API:
     validate_controller_turn_outcome(record) -> dict or raises ValueError
     project_compact_state(activity_record, health_record, schedule_record,
                            reconciliation_record=None) -> dict (pure)
+    ROLE_STATUS_MILESTONES, ROLE_STATUS_MILESTONE_BOUNDARIES
+    validate_role_status_milestone_record(record) -> dict or raises ValueError
+    STATUS_LIVENESS_CLASSES
+    classify_status_liveness(status_age_s, controller_output_age_s) -> str (pure)
 
 Records are ordinary JSON-native dictionaries, matching the convention
 already used by the repository's other pure-schema modules
@@ -512,6 +516,100 @@ def validate_controller_turn_outcome(record):
                 % (failure_class,))
 
     return dict(record)
+
+
+# ---------------------------------------------------------------------------
+# Durable role-status milestones (issue #27)
+# ---------------------------------------------------------------------------
+#
+# A coarse, bounded, per-(role, round) progress record cowork derives from
+# boundaries it already observes (lead turn start/end, controller tool end).
+# The tuple order IS the forward order: within one round a milestone is only
+# ever recorded after every milestone with a lower index, never twice.
+
+ROLE_STATUS_MILESTONES = (
+    "started",
+    "discovery_complete",
+    "implementation_started",
+    "self_audit_started",
+    "waiting_on_orchestration",
+)
+ROLE_STATUS_MILESTONE_SET = frozenset(ROLE_STATUS_MILESTONES)
+
+ROLE_STATUS_MILESTONE_BOUNDARIES = ("turn_start", "tool_end", "turn_end")
+ROLE_STATUS_MILESTONE_BOUNDARY_SET = frozenset(ROLE_STATUS_MILESTONE_BOUNDARIES)
+
+ROLE_STATUS_MILESTONE_KEYS = frozenset({
+    "schema_version", "record", "role", "round", "milestone", "boundary",
+    "status_sha256", "recorded_at", "work_id",
+})
+
+
+def validate_role_status_milestone_record(record):
+    """Return a normalized copy of a RoleStatusMilestone record, or raise
+    ValueError.
+
+    `round` is a positive integer (one round per lead send); `milestone` and
+    `boundary` are members of their closed vocabularies; `status_sha256` is
+    null (no role status artifact yet) or the 64-hex digest of the role status
+    file at the time the milestone was recorded; `work_id` is null or a
+    nonempty string. Never mutates input; unknown keys are rejected.
+    """
+    if not isinstance(record, dict):
+        raise ValueError("RoleStatusMilestone must be a dict, got %r" % type(record))
+    _check_exact_keys(record, ROLE_STATUS_MILESTONE_KEYS, "RoleStatusMilestone")
+    _check_schema_version(record)
+    _check_record_kind(record, "RoleStatusMilestone")
+    _check_nonempty_str(record["role"], "role")
+    _check_positive_int(record["round"], "round")
+    _check_enum(record["milestone"], ROLE_STATUS_MILESTONE_SET, "milestone")
+    _check_enum(record["boundary"], ROLE_STATUS_MILESTONE_BOUNDARY_SET, "boundary")
+    if record["status_sha256"] is not None:
+        _check_hex64(record["status_sha256"], "status_sha256")
+    _check_rfc3339(record["recorded_at"], "recorded_at")
+    _check_nonempty_str_or_null(record["work_id"], "work_id")
+    return dict(record)
+
+
+# Diagnostic-only liveness split between a stale durable status and a silent
+# controller. 300s matches cowork's scheduled activity-review interval; the
+# 900s status threshold gives long turns room before calling status stale.
+STATUS_LIVENESS_CLASSES = (
+    "fresh",
+    "stale_status_active_controller",
+    "inactive_controller",
+    "unknown",
+)
+STATUS_STALE_AFTER_SECONDS = 900.0
+CONTROLLER_INACTIVE_AFTER_SECONDS = 300.0
+
+
+def _age_or_none(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def classify_status_liveness(status_age_s, controller_output_age_s):
+    """Classify durable-status freshness against controller output. Total:
+    never raises; a non-numeric or negative age is treated as unknown (None).
+
+    Rules, in order: no controller output age -> "unknown"; controller output
+    older than CONTROLLER_INACTIVE_AFTER_SECONDS -> "inactive_controller";
+    no status age, or status older than STATUS_STALE_AFTER_SECONDS ->
+    "stale_status_active_controller"; otherwise "fresh".
+    """
+    status_age_s = _age_or_none(status_age_s)
+    controller_output_age_s = _age_or_none(controller_output_age_s)
+    if controller_output_age_s is None:
+        return "unknown"
+    if controller_output_age_s > CONTROLLER_INACTIVE_AFTER_SECONDS:
+        return "inactive_controller"
+    if status_age_s is None or status_age_s > STATUS_STALE_AFTER_SECONDS:
+        return "stale_status_active_controller"
+    return "fresh"
 
 
 # ---------------------------------------------------------------------------

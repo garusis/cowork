@@ -6757,6 +6757,271 @@ def _render_activity_snapshot(io_out, activity_record, decision,
         pass
 
 
+# Durable role-status milestones (garusis/cowork-internal#27): a coarse,
+# bounded per-(role, round) progress record advanced only at boundaries cowork
+# already observes -- the lead turn start/end and a controller tool end. One
+# round is one lead send. Never a timer, never an extra model turn; the
+# in-turn activity tick does not touch it.
+_WAITING_STATUSES = frozenset({"ready_for_review", "needs_input", "handoff_back"})
+_OUTPUT_ACTIVITY_CLASSES = frozenset({"productive_model_work", "local_tool_work"})
+_TREE_FINGERPRINT_TIMEOUT_SECONDS = 5.0
+_DISCOVERY_MILESTONE_ROLES = frozenset({"scout", "planner"})
+
+
+def _working_tree_root(cwd):
+    """The git top-level containing `cwd` (porcelain paths are relative to
+    it), or `cwd` itself when it cannot be resolved."""
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", cwd, "rev-parse",
+             "--show-toplevel"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=_TREE_FINGERPRINT_TIMEOUT_SECONDS, check=False)
+    except Exception:  # noqa: BLE001 - observability never breaks a turn
+        return cwd
+    top = os.fsdecode(proc.stdout).strip()
+    return top if proc.returncode == 0 and top else cwd
+
+
+def _working_tree_fingerprint(root):
+    """Digest of `git status --porcelain=v1 -z` plus each named path's
+    (size, mtime_ns), so an edit to an already-dirty file still registers.
+    Never hashes file contents. None on any failure (no advance)."""
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", root, "status",
+             "--porcelain=v1", "-z", "--untracked-files=all"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=_TREE_FINGERPRINT_TIMEOUT_SECONDS, check=False)
+    except Exception:  # noqa: BLE001 - observability never breaks a turn
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout
+    digest = hashlib.sha256(raw)
+    paths = []
+    tokens = raw.split(b"\0")
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        paths.append(entry[3:])
+        if entry[0:1] in (b"R", b"C") or entry[1:2] in (b"R", b"C"):
+            if i < len(tokens) and tokens[i]:
+                paths.append(tokens[i])
+            i += 1
+    for path in paths:
+        name = os.fsdecode(path)
+        try:
+            st = os.lstat(os.path.join(root, name))
+            fact = "%s\0%d\0%d\n" % (name, st.st_size, st.st_mtime_ns)
+        except OSError:
+            fact = "%s\0missing\n" % name
+        digest.update(fact.encode("utf-8", "surrogateescape"))
+    return digest.hexdigest()
+
+
+def _artifact_sha(path):
+    if not path:
+        return None
+    return state_store.fingerprint_status(path)["sha256"]
+
+
+class _RoleStatusMilestones:
+    """Per-role tracker for durable status milestones. Forward-only within a
+    round by vocabulary index; every entry point is best-effort (observability
+    never breaks the turn it observes). Disabled without a session uuid."""
+
+    def __init__(self, session_uuid, role, status_path, summary_path=None,
+                 work_id=None, trace=None):
+        self.session_uuid = session_uuid
+        self.role = role
+        self.status_path = status_path
+        self.summary_path = summary_path
+        self.work_id = work_id
+        self.trace = trace
+        self.enabled = bool(session_uuid)
+        self.lock = threading.Lock()
+        self.round = None
+        self.max_index = -1
+        self.last_output_at = None
+        self.status_baseline = None
+        self.summary_baseline = None
+        self.tree_root = None
+        self.tree_baseline = None
+        self._root_cache = None  # (cwd, git top-level) resolved once per cwd
+
+    def _index(self, milestone):
+        return activity_contracts.ROLE_STATUS_MILESTONES.index(milestone)
+
+    def begin_round(self):
+        if not self.enabled:
+            return
+        with self.lock:
+            self.round = None
+            self.max_index = -1
+            self.tree_root = None
+            self.tree_baseline = None
+            try:
+                self.status_baseline = _artifact_sha(self.status_path)
+                self.summary_baseline = _artifact_sha(self.summary_path)
+                self.round = state_store.next_status_milestone_round(
+                    self.session_uuid, self.role)
+                if self.role == "builder":
+                    cwd = os.getcwd()
+                    if self._root_cache is None or self._root_cache[0] != cwd:
+                        self._root_cache = (cwd, _working_tree_root(cwd))
+                    self.tree_root = self._root_cache[1]
+                    self.tree_baseline = _working_tree_fingerprint(
+                        self.tree_root)
+                self._append("started", "turn_start")
+            except Exception:  # noqa: BLE001 - observability never breaks a turn
+                pass
+
+    def _append(self, milestone, boundary):
+        if self.round is None:
+            return
+        index = self._index(milestone)
+        if index <= self.max_index:
+            return
+        status_sha = _artifact_sha(self.status_path)
+        record = {
+            "schema_version": activity_contracts.SCHEMA_VERSION,
+            "record": "RoleStatusMilestone", "role": self.role,
+            "round": self.round, "milestone": milestone,
+            "boundary": boundary, "status_sha256": status_sha,
+            "recorded_at": _capacity_now(), "work_id": self.work_id,
+        }
+        try:
+            state_store.append_status_milestone(self.session_uuid, record)
+        except (OSError, ValueError):
+            return
+        self.max_index = index
+        if self.trace:
+            self.trace.event("role.status_milestone", role=self.role,
+                             round=self.round, milestone=milestone,
+                             boundary=boundary, status_sha256=status_sha)
+
+    def _discovery_evidence(self):
+        status_sha = _artifact_sha(self.status_path)
+        if status_sha is None or status_sha == self.status_baseline:
+            return False
+        return state_store.read_json_tolerant(self.status_path) is not None
+
+    def _evaluate_in_turn(self, boundary):
+        if self.round is None:
+            return
+        if (self.role in _DISCOVERY_MILESTONE_ROLES
+                and self.max_index < self._index("discovery_complete")
+                and self._discovery_evidence()):
+            self._append("discovery_complete", boundary)
+        if self.role != "builder":
+            return
+        if (self.max_index < self._index("implementation_started")
+                and self.tree_baseline is not None):
+            current = _working_tree_fingerprint(self.tree_root)
+            if current is not None and current != self.tree_baseline:
+                self._append("implementation_started", boundary)
+        if (self.summary_path
+                and self.max_index < self._index("self_audit_started")):
+            fp = state_store.fingerprint_status(self.summary_path)
+            if (fp["exists"] and fp["size"]
+                    and fp["sha256"] != self.summary_baseline):
+                self._append("self_audit_started", boundary)
+
+    def on_tool_end(self):
+        if not self.enabled:
+            return
+        try:
+            with self.lock:
+                self.last_output_at = _capacity_now()
+                self._evaluate_in_turn("tool_end")
+        except Exception:  # noqa: BLE001 - observability never breaks a turn
+            pass
+
+    def on_turn_end(self, send_ok):
+        if not self.enabled:
+            return
+        try:
+            with self.lock:
+                self.last_output_at = _capacity_now()
+                self._evaluate_in_turn("turn_end")
+                if (send_ok
+                        and _artifact_sha(self.status_path) != self.status_baseline
+                        and state_store.read_status(self.status_path)
+                        in _WAITING_STATUSES):
+                    self._append("waiting_on_orchestration", "turn_end")
+        except Exception:  # noqa: BLE001 - observability never breaks a turn
+            pass
+
+
+def _rfc3339_from_ns(mtime_ns):
+    return datetime.datetime.fromtimestamp(
+        mtime_ns / 1e9, datetime.timezone.utc).isoformat().replace(
+            "+00:00", "Z")
+
+
+def _youngest_age(timestamps, now):
+    ages = []
+    for ts in timestamps:
+        if not ts:
+            continue
+        try:
+            ages.append(state_store.activity_status_age_seconds(ts, now))
+        except ValueError:
+            continue
+    return min(ages) if ages else None
+
+
+def _status_milestone_diagnostics(session_uuid, role, status_path, work_id,
+                                  last_output_at=None, now=None):
+    """Recovery diagnostics for one role's durable status: the latest
+    milestone and its round, the status artifact's sha256, the status age
+    (since the newer of the latest milestone and the status file mtime), the
+    controller output age (since the newer of the in-memory last boundary and
+    the latest output-bearing ActivityRecord -- liveness ticks excluded), and
+    the `status_liveness` class. A legacy session without a milestone store
+    reads as milestone/round None. Never raises."""
+    diag = {"milestone": None, "round": None, "milestone_recorded_at": None,
+            "status_sha256": None, "status_age_s": None,
+            "controller_output_age_s": None, "status_liveness": "unknown"}
+    try:
+        now = now or _capacity_now()
+        latest = (state_store.latest_status_milestone(session_uuid, role)
+                  if session_uuid else None)
+        if latest is not None:
+            diag["milestone"] = latest["milestone"]
+            diag["round"] = latest["round"]
+            diag["milestone_recorded_at"] = latest["recorded_at"]
+        fp = state_store.fingerprint_status(status_path)
+        diag["status_sha256"] = fp["sha256"]
+        status_times = [diag["milestone_recorded_at"]]
+        if fp["mtime_ns"] is not None:
+            status_times.append(_rfc3339_from_ns(fp["mtime_ns"]))
+        diag["status_age_s"] = _youngest_age(status_times, now)
+        output_times = [last_output_at]
+        if session_uuid and work_id:
+            try:
+                history = state_store.read_activity_history(
+                    session_uuid, work_id)
+            except (state_store.CorruptRecordError, ValueError, OSError):
+                history = []
+            for entry in reversed(history):
+                if (entry.get("record") == "ActivityRecord"
+                        and entry.get("activity_class")
+                        in _OUTPUT_ACTIVITY_CLASSES):
+                    output_times.append(entry["time"])
+                    break
+        diag["controller_output_age_s"] = _youngest_age(output_times, now)
+        diag["status_liveness"] = activity_contracts.classify_status_liveness(
+            diag["status_age_s"], diag["controller_output_age_s"])
+    except Exception:  # noqa: BLE001 - diagnostics never break product flow
+        pass
+    return diag
+
+
 def _role_loop(session, first, status_path, context, io_out,
                role="scout", review_fn=None, trace=None,
                reviewer_role=SCOUT_REVIEWER,
@@ -6872,6 +7137,14 @@ def _role_loop(session, first, status_path, context, io_out,
     missing_question_repairs = 0
     outcome_kind = _OUTCOME_ENDED
     payload = None
+    milestones = _RoleStatusMilestones(
+        session_uuid, role, status_path,
+        summary_path=build_summary_path if role == "builder" else None,
+        work_id=role_work_id, trace=trace)
+    if is_resume and session_uuid and trace:
+        trace.event("role.status_milestone.resume", role=role,
+                    **_status_milestone_diagnostics(
+                        session_uuid, role, status_path, role_work_id))
 
     def _breaker_cause():
         """The durable recovery breaker's cause key for this engagement --
@@ -7059,6 +7332,12 @@ def _role_loop(session, first, status_path, context, io_out,
             # M4 Package D: the activity-emission seam's bounded in-turn
             # daemon tick, ticking ONLY while this real turn-boundary send
             # is in flight -- created/closed in try/finally, bounded join.
+            milestones.begin_round()
+            if milestones.enabled:
+                try:
+                    session.tool_boundary_hook = milestones.on_tool_end
+                except (AttributeError, TypeError):
+                    pass
             turn_started_monotonic = time.monotonic()
             tick_stop_event = threading.Event()
             tick_thread = None
@@ -7083,6 +7362,11 @@ def _role_loop(session, first, status_path, context, io_out,
                 tick_stop_event.set()
                 if tick_thread is not None:
                     tick_thread.join(timeout=2.0)
+                if milestones.enabled:
+                    try:
+                        session.tool_boundary_hook = None
+                    except (AttributeError, TypeError):
+                        pass
             if trace:
                 trace.event("role.send.end", role=role,
                             ok=bool(send_result.get("ok", True)),
@@ -7110,6 +7394,7 @@ def _role_loop(session, first, status_path, context, io_out,
                     io_out, turn_activity_record, turn_watchdog_decision,
                     turn_schedule_record)
             fp_after = state_store.fingerprint_status(status_path)
+            milestones.on_turn_end(send_ok=bool(send_result.get("ok", True)))
             if trace:
                 trace.event("role.fingerprint.after", role=role,
                             status=fp_after["status"], sha256=fp_after["sha256"],
@@ -7927,6 +8212,16 @@ def _role_loop(session, first, status_path, context, io_out,
                 fields = {"cleanup_outcome": cleanup.get("outcome"),
                           "cleanup_confirmed": cleanup.get("confirmed")}
             trace.event("role.end", role=role, result="closed", **fields)
+    if (milestones.enabled and isinstance(payload, dict)
+            and outcome_kind in (_OUTCOME_STOPPED, _OUTCOME_ENDED,
+                                 "awaiting_capacity",
+                                 _OUTCOME_PROCESS_TERMINATED)):
+        diag = _status_milestone_diagnostics(
+            session_uuid, role, status_path, role_work_id,
+            last_output_at=milestones.last_output_at)
+        payload = dict(payload, status_diagnostics=diag)
+        if trace:
+            trace.event("role.status_diagnostics", role=role, **diag)
     return 0, outcome_kind, payload
 
 

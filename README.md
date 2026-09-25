@@ -1415,6 +1415,51 @@ status artifact:
 - A turn that ends in neither state (no status written, or an in-progress one)
   ends the run as a `role_turn_incomplete` failure.
 
+#### Durable milestones
+
+The role's own status JSON can sit unchanged through a long turn, so cowork
+keeps a coarse progress record of its own. It never asks the role for it and
+never changes the status schema. Each lead send is one round. Within a round,
+cowork appends milestones in this fixed order, skipping any that do not apply:
+
+- **`started`** — the send begins.
+- **`discovery_complete`** (scout, planner) — the status file changed and
+  parses as a JSON object.
+- **`implementation_started`** (builder) — the working tree changed since the
+  round began, going by `git status` plus each listed path's size and mtime.
+  An edit to a file that was already dirty still counts.
+- **`self_audit_started`** (builder) — the build summary was first written.
+- **`waiting_on_orchestration`** — the send succeeded and changed the status
+  file, and the new status is `ready_for_review`, `needs_input` or
+  `handoff_back`.
+
+Milestones are checked only when a controller tool call ends and when the turn
+ends. There is no timer, no extra model turn, and the in-turn activity tick
+never writes one. Each round records a milestone at most once and never goes
+backwards, so a send adds at most five records. They go to
+`<session assets>/milestones/<role>.jsonl`. Each record carries the round, the
+boundary that triggered it, the status file's sha256, and `recorded_at`.
+
+Stop payloads (`stopped`, `ended`, `awaiting_capacity`, `process_terminated`)
+carry `status_diagnostics`, and a resumed role emits a
+`role.status_milestone.resume` trace event with the same fields:
+
+- `milestone`, `round` and `milestone_recorded_at`
+- `status_sha256`
+- `status_age_s` — time since the newer of the last milestone and the status
+  file's mtime
+- `controller_output_age_s` — time since the last tool end or turn end, or the
+  last productive or tool-work activity record (liveness ticks don't count)
+- `status_liveness`, one of:
+  - `fresh`
+  - `stale_status_active_controller` — status older than 900s while the
+    controller produced output in the last 300s
+  - `inactive_controller` — no output for more than 300s
+  - `unknown` — no output evidence
+
+These fields are diagnostic only: watchdog verdicts do not use them. A session
+from before this store existed reads as `milestone: null`.
+
 ## Repository layout
 
 ```text

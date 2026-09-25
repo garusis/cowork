@@ -6878,6 +6878,86 @@ def activity_status_age_seconds(since, now):
 
 
 # --------------------------------------------------------------------------- #
+# Durable role-status milestones (garusis/cowork-internal#27). One append-only #
+# jsonl per role; `cowork_activity.validate_role_status_milestone_record`     #
+# owns the record shape. Diagnostics, not verdict inputs: every READ here is  #
+# tolerant (a torn tail or an invalid line is skipped, never raised), while   #
+# the locked APPEND vetoes a duplicate or backward milestone within a round,  #
+# leaving the file untouched.                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def status_milestones_path_for(session_uuid, role):
+    """Path of one role's append-only RoleStatusMilestone history within its
+    session. Rejects unsafe session_uuid/role values."""
+    session_uuid = _lower_safe_identifier(session_uuid, "session_uuid")
+    role = _lower_safe_identifier(role, "role")
+    return os.path.join(session_assets_dir(session_uuid), "milestones",
+                        "%s.jsonl" % role)
+
+
+def _valid_status_milestones(raw_entries):
+    activity = _import_activity()
+    valid = []
+    for entry in raw_entries:
+        try:
+            valid.append(activity.validate_role_status_milestone_record(entry))
+        except ValueError:
+            continue
+    return valid
+
+
+def append_status_milestone(session_uuid, record):
+    """Durably append one RoleStatusMilestone record to its role's history.
+    Validated BEFORE anything is written. Forward-only within a round: a
+    milestone already present in `record['round']`, or one whose vocabulary
+    index does not exceed the round's highest recorded index, raises
+    ValueError and writes nothing. Returns the stored record."""
+    activity = _import_activity()
+    validated = activity.validate_role_status_milestone_record(record)
+    path = status_milestones_path_for(session_uuid, validated["role"])
+    order = activity.ROLE_STATUS_MILESTONES
+    index = order.index(validated["milestone"])
+
+    def build(existing):
+        same_round = [entry for entry in _valid_status_milestones(existing)
+                      if entry["round"] == validated["round"]]
+        if same_round:
+            recorded_max = max(order.index(entry["milestone"]) for entry in same_round)
+            if index <= recorded_max:
+                raise ValueError(
+                    "status milestone %r is not forward of round %d's recorded "
+                    "milestones" % (validated["milestone"], validated["round"]))
+        return dict(validated)
+
+    return _locked_jsonl_append(path, build)
+
+
+def read_status_milestones(session_uuid, role):
+    """Every valid RoleStatusMilestone for one role, oldest first. A missing
+    store (a session from before #27) reads as []; torn or invalid entries
+    are skipped. Never raises for a missing/unsafe/torn store."""
+    try:
+        path = status_milestones_path_for(session_uuid, role)
+    except ValueError:
+        return []
+    return _valid_status_milestones(read_jsonl_tolerant(path))
+
+
+def latest_status_milestone(session_uuid, role):
+    """The most recently appended valid milestone for one role, or None."""
+    records = read_status_milestones(session_uuid, role)
+    return records[-1] if records else None
+
+
+def next_status_milestone_round(session_uuid, role):
+    """1 + the highest round already recorded for one role, or 1 — durable,
+    so round ordinals stay monotonic across process restarts."""
+    records = read_status_milestones(session_uuid, role)
+    return 1 + max((entry["round"] for entry in records), default=0)
+
+
+# --------------------------------------------------------------------------- #
 # M5 Package E: additive resume reconstruction for checkpoints                #
 # (garusis/cowork-internal#60). `cowork_verification.py` already owns a      #
 # per-checkpoint reconstruction primitive (`reconstruct_checkpoint_state`),  #

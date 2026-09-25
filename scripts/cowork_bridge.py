@@ -1687,12 +1687,15 @@ class ToolActivityTrace:
     Depth-1 and total: a `start` while a tool is open closes the previous one
     first, and an `end` with nothing open is a no-op. A turn that dies
     mid-tool leaves its start unmatched -- truthfully, the tool was never
-    observed to finish. No-op without a trace handle."""
+    observed to finish. Trace events are no-ops without a trace handle; the
+    optional `on_tool_end` callback fires on every real tool end regardless
+    of the trace handle, and an exception it raises is swallowed."""
 
-    def __init__(self, trace, controller, role):
+    def __init__(self, trace, controller, role, on_tool_end=None):
         self.trace = trace
         self.controller = controller
         self.role = role
+        self.on_tool_end = on_tool_end
         self.open_tool = None
 
     def _event(self, name):
@@ -1711,6 +1714,11 @@ class ToolActivityTrace:
             return
         self._event("controller.tool.end")
         self.open_tool = None
+        if self.on_tool_end:
+            try:
+                self.on_tool_end()
+            except Exception:
+                pass
 
     def block_stop(self):
         """A claude `content_block_stop`: closes the turn's open tool block,
@@ -2282,7 +2290,9 @@ class ClaudeSession:
         controller_error = None
         parent_direct_usage = {}
         region = None
-        tool_activity = ToolActivityTrace(self.trace, "claude", self.speaker)
+        tool_activity = ToolActivityTrace(
+            self.trace, "claude", self.speaker,
+            on_tool_end=getattr(self, "tool_boundary_hook", None))
 
         def _feed(chunk):
             # Open the transcript stream on the first token, then stream into it.
@@ -2745,7 +2755,9 @@ class CodexSession:
         self._live_proc = proc
         events = []
         wrote_label = {"done": False}
-        tool_activity = ToolActivityTrace(self.trace, "codex", self.speaker)
+        tool_activity = ToolActivityTrace(
+            self.trace, "codex", self.speaker,
+            on_tool_end=getattr(self, "tool_boundary_hook", None))
         no_first_token = False
         # Any unwind that does not reach the clean EOF below closes the
         # turn with SIGTERM as its completion request.
@@ -3163,7 +3175,9 @@ class OpencodeSession:
         self._live_proc = proc
         events = []
         wrote_label = {"done": False}
-        tool_activity = ToolActivityTrace(self.trace, "opencode", self.speaker)
+        tool_activity = ToolActivityTrace(
+            self.trace, "opencode", self.speaker,
+            on_tool_end=getattr(self, "tool_boundary_hook", None))
         no_first_token = False
         # See CodexSession._run: any unwind short of a clean EOF closes the
         # turn with SIGTERM as its completion request.
