@@ -5269,12 +5269,18 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
               "name → %s\nbase → %s" % (name, base_toplevel))
     io_out.flush()
 
+    def _git_scope_failed(exc):
+        if trace:
+            trace.event("worktree.run.end", result="git_scope_failed",
+                        controller=controller, git_failure=exc.fact())
+        io_out.write("cowork: " + _git_failure_alert(exc) + "\n")
+        io_out.flush()
+        return None
+
     if controller == "claude":
         spawn = claude_spawn or bridge._real_claude_spawn
-        if session_factory:
-            session = session_factory("claude")
-        else:
-            ok, alert = bridge.probe_claude_stream_json(
+        if not session_factory:
+            ok, alert, git_failure = _claude_probe(
                     spawn, mode=wt_config["mode"], yolo=wt_config["yolo"],
                     role_prompt_file=WORKTREE_PROMPT_PATH, trace=trace,
                     role=WORKTREE_ROLE, extra_writable_dir=extra_writable_dir,
@@ -5288,15 +5294,23 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
                                       else None),
                     probe_result=_probe_fact(alert))
                 if trace:
-                    trace.event("worktree.run.end", result="probe_failed")
+                    trace.event("worktree.run.end", result="probe_failed",
+                                **_git_extra(git_failure))
                 io_out.write("cowork: " + alert + "\n")
                 io_out.flush()
                 return None
-            session = bridge.ClaudeSession(
-                WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
-                io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
-                extra_writable_dir=extra_writable_dir,
-                model=wt_config.get("model"), effort=wt_config.get("effort"))
+        try:
+            if session_factory:
+                session = session_factory("claude")
+            else:
+                session = bridge.ClaudeSession(
+                    WORKTREE_PROMPT_PATH, wt_config["mode"], wt_config["yolo"],
+                    io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
+                    extra_writable_dir=extra_writable_dir,
+                    model=wt_config.get("model"),
+                    effort=wt_config.get("effort"))
+        except bridge.GitWorktreeScopeError as exc:
+            return _git_scope_failed(exc)
         first = brief
     elif controller == "opencode":
         try:
@@ -5308,6 +5322,8 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
                     io_out=io_out, speaker=WORKTREE_ROLE, trace=trace,
                     extra_writable_dir=extra_writable_dir,
                     model=wt_config.get("model"), effort=wt_config.get("effort"))
+        except bridge.GitWorktreeScopeError as exc:
+            return _git_scope_failed(exc)
         except policy.DispatchBlocked as exc:
             _bwf = {"allowed": False,
                     "refusal_code": "controller_not_allowed",
@@ -5324,14 +5340,18 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
             return None
         first = brief  # role prompt rides in the generated agent file
     else:
-        if session_factory:
-            session = session_factory("codex")
-        else:
-            session = bridge.CodexSession(
-                wt_config["mode"], wt_config["yolo"], io_out=io_out,
-                speaker=WORKTREE_ROLE, trace=trace,
-                extra_writable_dir=extra_writable_dir,
-                model=wt_config.get("model"), effort=wt_config.get("effort"))
+        try:
+            if session_factory:
+                session = session_factory("codex")
+            else:
+                session = bridge.CodexSession(
+                    wt_config["mode"], wt_config["yolo"], io_out=io_out,
+                    speaker=WORKTREE_ROLE, trace=trace,
+                    extra_writable_dir=extra_writable_dir,
+                    model=wt_config.get("model"),
+                    effort=wt_config.get("effort"))
+        except bridge.GitWorktreeScopeError as exc:
+            return _git_scope_failed(exc)
         wt_role_text = _read_text(WORKTREE_PROMPT_PATH)
         first = assemble_codex_prompt(wt_role_text, "", brief)
         _emit_codex_role_prompt_bytes(trace, WORKTREE_ROLE, wt_role_text)
@@ -5897,20 +5917,48 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         "artifacts": review_artifacts,
     }
 
+    def _git_start_failed(exc, pinned_sid=None):
+        # The runtime guard raised before any provider process existed: no
+        # model turn ran, so a pinned fresh id names no conversation.
+        if pinned_sid:
+            _unpin_session(on_session, cfg["controller"], pinned_sid)
+        alert = _git_failure_alert(exc)
+        if trace:
+            trace.event("review.run.end", role=reviewer_role,
+                        result="git_scope_failed", verdict=None,
+                        controller_failure=True,
+                        controller=cfg["controller"],
+                        git_failure=exc.fact(),
+                        prompt_kind="reviewer_pass", phase=phase,
+                        context_revision=context_revision,
+                        fresh=not bool(resume_id), resume=bool(resume_id),
+                        artifacts=review_artifacts)
+        review_io.write("cowork: " + alert + "\n")
+        review_io.flush()
+        return _controller_failure_verdict(
+            {"ok": False, "result": "git_scope_failed",
+             "git_failure": exc.fact()}, alert=alert)
+
     if cfg["controller"] == "claude":
         cb = (lambda i: on_session("claude", i)) if on_session else None
         if session_factory:
-            session = session_factory("claude", review_io)
+            try:
+                session = session_factory("claude", review_io)
+            except bridge.GitWorktreeScopeError as exc:
+                return _git_start_failed(exc)
         elif resume_id:
-            session = bridge.ClaudeSession(
-                prompt_path, cfg["mode"], cfg["yolo"],
-                io_out=review_io, speaker=reviewer_role, internal=surface,
-                resume_id=resume_id, on_session_id=cb, trace=trace,
-                extra_writable_dir=extra_writable_dir,
-                model=cfg.get("model"), effort=cfg.get("effort"))
+            try:
+                session = bridge.ClaudeSession(
+                    prompt_path, cfg["mode"], cfg["yolo"],
+                    io_out=review_io, speaker=reviewer_role, internal=surface,
+                    resume_id=resume_id, on_session_id=cb, trace=trace,
+                    extra_writable_dir=extra_writable_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
+            except bridge.GitWorktreeScopeError as exc:
+                return _git_start_failed(exc)
         else:
             spawn = claude_spawn or bridge._real_claude_spawn
-            ok, alert = bridge.probe_claude_stream_json(
+            ok, alert, git_failure = _claude_probe(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=prompt_path, trace=trace,
                 role=reviewer_role, extra_writable_dir=extra_writable_dir,
@@ -5924,7 +5972,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                                       else None),
                     probe_result=_probe_fact(alert), phase=phase)
                 verdict = _controller_failure_verdict(
-                    {"ok": False, "result": "probe_failed"}, alert=alert)
+                    dict({"ok": False, "result": "probe_failed"},
+                         **_git_extra(git_failure)), alert=alert)
                 if trace:
                     trace.event("review.run.end", role=reviewer_role,
                                 result="probe_failed",
@@ -5934,18 +5983,23 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                                 context_revision=context_revision,
                                 fresh=not bool(resume_id),
                                 resume=bool(resume_id),
-                                artifacts=review_artifacts)
+                                artifacts=review_artifacts,
+                                **_git_extra(git_failure))
                 return verdict
             # Pin a known id up front so it is resumable even if killed early.
             sid = str(uuid.uuid4())
             if on_session:
                 on_session("claude", sid)
-            session = bridge.ClaudeSession(
-                prompt_path, cfg["mode"], cfg["yolo"],
-                io_out=review_io, speaker=reviewer_role, internal=surface,
-                session_id=sid, on_session_id=cb, trace=trace,
-                extra_writable_dir=extra_writable_dir,
-                model=cfg.get("model"), effort=cfg.get("effort"))
+            try:
+                session = bridge.ClaudeSession(
+                    prompt_path, cfg["mode"], cfg["yolo"],
+                    io_out=review_io, speaker=reviewer_role, internal=surface,
+                    session_id=sid, on_session_id=cb, trace=trace,
+                    extra_writable_dir=extra_writable_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
+            except bridge.GitWorktreeScopeError as exc:
+                return _git_start_failed(
+                    exc, pinned_sid=sid if on_session else None)
         prompt = (brief + "\n\n" + ctx_block).strip()
     elif cfg["controller"] == "opencode":
         # Role prompt rides in the generated agent file (system prompt, like
@@ -5961,6 +6015,8 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                     resume_session_id=resume_id, on_session_id=cb, trace=trace,
                     extra_writable_dir=extra_writable_dir,
                     model=cfg.get("model"), effort=cfg.get("effort"))
+        except bridge.GitWorktreeScopeError as exc:
+            return _git_start_failed(exc)
         except policy.DispatchBlocked as exc:
             _brf = {"allowed": False,
                     "refusal_code": "controller_not_allowed",
@@ -5987,15 +6043,18 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
             prompt = assemble_codex_prompt(reviewer_role_text, brief, ctx_block)
             _emit_codex_role_prompt_bytes(trace, reviewer_role,
                                           reviewer_role_text)
-        if session_factory:
-            session = session_factory("codex", review_io)
-        else:
-            session = bridge.CodexSession(
-                cfg["mode"], cfg["yolo"], io_out=review_io,
-                speaker=reviewer_role, internal=surface,
-                resume_thread_id=resume_id, on_thread_id=cb,
-                trace=trace, extra_writable_dir=extra_writable_dir,
-                model=cfg.get("model"), effort=cfg.get("effort"))
+        try:
+            if session_factory:
+                session = session_factory("codex", review_io)
+            else:
+                session = bridge.CodexSession(
+                    cfg["mode"], cfg["yolo"], io_out=review_io,
+                    speaker=reviewer_role, internal=surface,
+                    resume_thread_id=resume_id, on_thread_id=cb,
+                    trace=trace, extra_writable_dir=extra_writable_dir,
+                    model=cfg.get("model"), effort=cfg.get("effort"))
+        except bridge.GitWorktreeScopeError as exc:
+            return _git_start_failed(exc)
     try:
         send_result = _send(
             session, _cross_delivery(prompt, [ctx_block]),
@@ -7994,6 +8053,16 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
             if on_reviewer_session:
                 on_reviewer_session(controller, sid)
 
+        prior_resume_id = holder["resume_id"]
+
+        def unpin(controller, sid):
+            # Git isolation failed before the pinned reviewer was spawned: the
+            # retry must not resume that never-started id.
+            if holder["resume_id"] == sid:
+                holder["resume_id"] = prior_resume_id
+            _unpin_session(on_reviewer_session, controller, sid)
+        capture.unpin = unpin
+
         kwargs = {
             "resume_id": holder["resume_id"],
             "on_session": capture,
@@ -9962,6 +10031,55 @@ def _probe_fact(alert):
             "source": "probe"}
 
 
+def _git_failure_alert(exc):
+    """One-line operator message for a typed Git isolation failure."""
+    return ("git worktree isolation could not be verified (%s: kind=%s, "
+            "stage=%s); no model turn was launched."
+            % (exc.reason, exc.kind, exc.stage))
+
+
+def _claude_probe(spawn, **kwargs):
+    """Run the Claude stream-json probe; return (ok, alert, git_failure).
+
+    A typed Git inventory failure raised by the probe's runtime guard becomes
+    a not-ok probe carrying the durable fact instead of escaping as a
+    traceback. Any other exception propagates unchanged."""
+    try:
+        ok, alert = bridge.probe_claude_stream_json(spawn, **kwargs)
+    except bridge.GitWorktreeScopeError as exc:
+        return False, _git_failure_alert(exc), exc.fact()
+    return ok, alert, None
+
+
+def _git_extra(git_failure):
+    """Keyword extras carrying a typed Git fact, empty when there is none, so
+    non-Git trace/evidence shapes stay byte-for-byte unchanged."""
+    return {"git_failure": git_failure} if git_failure else {}
+
+
+def _git_scope_fact(exc):
+    """The typed Git fact of a start exception, or None for any other one."""
+    return exc.fact() if isinstance(exc, bridge.GitWorktreeScopeError) else None
+
+
+def _start_failed_text(exc):
+    """The operator-facing tail of a 'failed to start' line."""
+    if isinstance(exc, bridge.GitWorktreeScopeError):
+        return _git_failure_alert(exc)
+    return type(exc).__name__
+
+
+def _unpin_session(on_session, controller, sid):
+    """Roll back a never-started pinned session id (Git failure before spawn).
+
+    Only the GitWorktreeScopeError handlers call this: the guard raises
+    strictly before the provider process exists, so the pinned conversation
+    never existed. No-op when the saver exposes no ``unpin``."""
+    unpin = getattr(on_session, "unpin", None)
+    if unpin is not None and sid:
+        unpin(controller, sid)
+
+
 def _decide_and_trace(trace, role, controller, purpose, site, manifest=None,
                       policy_result=None, preflight_result=None,
                       probe_result=None, resume_session_id=None, phase=None,
@@ -10215,7 +10333,7 @@ def run_scout(config, context, selected, io_out=None,
                 source="policy_guard")
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = bridge.probe_claude_stream_json(
+        ok, alert, git_failure = _claude_probe(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=SCOUT_PROMPT_PATH, trace=trace, role="scout",
                 extra_writable_dir=sessions_dir, cache_enabled=True)
@@ -10226,12 +10344,15 @@ def run_scout(config, context, selected, io_out=None,
                 preflight_result=(_ALLOW_FACT if _scout_manifest else None),
                 probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
-                trace.event("role.end", role="scout", result="probe_failed")
+                trace.event("role.end", role="scout", result="probe_failed",
+                            **_git_extra(git_failure))
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
             _advance_phase(
                 session_uuid, role_work_id, "preflight_rejected",
-                evidence={"reason": "probe_failed"}, source="probe")
+                evidence=dict({"reason": "probe_failed"},
+                              **_git_extra(git_failure)),
+                source="probe")
             return 1
         if resume_id:
             session_id, rid = None, resume_id
@@ -10273,16 +10394,20 @@ def run_scout(config, context, selected, io_out=None,
                 evidence={"reason": "policy_blocked"}, source="bridge_backstop")
             return 1
         except Exception as exc:  # noqa: BLE001
+            gf = _git_scope_fact(exc)
+            if gf and session_id:
+                _unpin_session(on_session, "claude", session_id)
             if trace:
                 trace.event("role.end", role="scout", result="start_failed",
-                            error_type=type(exc).__name__)
+                            error_type=type(exc).__name__, **_git_extra(gf))
             io_out.write("cowork: failed to start scout controller: %s\n"
-                         % type(exc).__name__)
+                         % _start_failed_text(exc))
             io_out.flush()
             _advance_phase(
                 session_uuid, role_work_id, "preflight_rejected",
-                evidence={"reason": "start_failed",
-                         "error_type": type(exc).__name__},
+                evidence=dict({"reason": "start_failed",
+                               "error_type": type(exc).__name__},
+                              **_git_extra(gf)),
                 source="session_start")
             return 1
         # The claude session is genuinely live now: every preceding check
@@ -10343,16 +10468,18 @@ def run_scout(config, context, selected, io_out=None,
                 evidence={"reason": "policy_blocked"}, source="bridge_backstop")
             return 1
         except Exception as exc:  # noqa: BLE001
+            gf = _git_scope_fact(exc)
             if trace:
                 trace.event("role.end", role="scout", result="start_failed",
-                            error_type=type(exc).__name__)
+                            error_type=type(exc).__name__, **_git_extra(gf))
             io_out.write("cowork: failed to start scout controller: %s\n"
-                         % type(exc).__name__)
+                         % _start_failed_text(exc))
             io_out.flush()
             _advance_phase(
                 session_uuid, role_work_id, "preflight_rejected",
-                evidence={"reason": "start_failed",
-                         "error_type": type(exc).__name__},
+                evidence=dict({"reason": "start_failed",
+                               "error_type": type(exc).__name__},
+                              **_git_extra(gf)),
                 source="session_start")
             return 1
         # The opencode session is genuinely live now -- see the claude
@@ -10403,6 +10530,21 @@ def run_scout(config, context, selected, io_out=None,
         _advance_phase(
             session_uuid, role_work_id, "preflight_rejected",
             evidence={"reason": "policy_blocked"}, source="bridge_backstop")
+        return 1
+    except bridge.GitWorktreeScopeError as exc:
+        if trace:
+            trace.event("role.end", role="scout", result="start_failed",
+                        controller="codex", error_type=type(exc).__name__,
+                        git_failure=exc.fact())
+        io_out.write("cowork: failed to start scout controller: %s\n"
+                     % _git_failure_alert(exc))
+        io_out.flush()
+        _advance_phase(
+            session_uuid, role_work_id, "preflight_rejected",
+            evidence={"reason": "start_failed",
+                      "error_type": type(exc).__name__,
+                      "git_failure": exc.fact()},
+            source="session_start")
         return 1
     # The codex session is genuinely live now -- see the claude branch's
     # identical comment above (BL-2): this is the ONE point this branch may
@@ -10625,7 +10767,7 @@ def run_planner(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = bridge.probe_claude_stream_json(
+        ok, alert, git_failure = _claude_probe(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=PLANNER_PROMPT_PATH, trace=trace,
                 role="planner", extra_writable_dir=sessions_dir,
@@ -10637,10 +10779,11 @@ def run_planner(config, context, selected, io_out=None,
                 preflight_result=(_ALLOW_FACT if _planner_manifest else None),
                 probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
-                trace.event("role.end", role="planner", result="probe_failed")
+                trace.event("role.end", role="planner", result="probe_failed",
+                            **_git_extra(git_failure))
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
-            _reject("probe_failed", "probe")
+            _reject("probe_failed", "probe", **_git_extra(git_failure))
             report(_OUTCOME_ENDED, None)
             return 1
         if resume_id:
@@ -10682,14 +10825,17 @@ def run_planner(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
+            gf = _git_scope_fact(exc)
+            if gf and session_id:
+                _unpin_session(on_session, "claude", session_id)
             if trace:
                 trace.event("role.end", role="planner", result="start_failed",
-                            error_type=type(exc).__name__)
+                            error_type=type(exc).__name__, **_git_extra(gf))
             io_out.write("cowork: failed to start planner controller: %s\n"
-                         % type(exc).__name__)
+                         % _start_failed_text(exc))
             io_out.flush()
             _reject("start_failed", "session_start",
-                   error_type=type(exc).__name__)
+                   error_type=type(exc).__name__, **_git_extra(gf))
             report(_OUTCOME_ENDED, None)
             return 1
         # The claude session is genuinely live now (BL-2): the ONE point
@@ -10737,14 +10883,15 @@ def run_planner(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
+            gf = _git_scope_fact(exc)
             if trace:
                 trace.event("role.end", role="planner", result="start_failed",
-                            error_type=type(exc).__name__)
+                            error_type=type(exc).__name__, **_git_extra(gf))
             io_out.write("cowork: failed to start planner controller: %s\n"
-                         % type(exc).__name__)
+                         % _start_failed_text(exc))
             io_out.flush()
             _reject("start_failed", "session_start",
-                   error_type=type(exc).__name__)
+                   error_type=type(exc).__name__, **_git_extra(gf))
             report(_OUTCOME_ENDED, None)
             return 1
         # The opencode session is genuinely live now (BL-2): the ONE point
@@ -10787,6 +10934,18 @@ def run_planner(config, context, selected, io_out=None,
         io_out.write(str(exc) + "\n")
         io_out.flush()
         _reject("policy_blocked", "bridge_backstop")
+        report(_OUTCOME_ENDED, None)
+        return 1
+    except bridge.GitWorktreeScopeError as exc:
+        if trace:
+            trace.event("role.end", role="planner", result="start_failed",
+                        controller="codex", error_type=type(exc).__name__,
+                        git_failure=exc.fact())
+        io_out.write("cowork: failed to start planner controller: %s\n"
+                     % _git_failure_alert(exc))
+        io_out.flush()
+        _reject("start_failed", "session_start",
+                error_type=type(exc).__name__, git_failure=exc.fact())
         report(_OUTCOME_ENDED, None)
         return 1
     # The codex session is genuinely live now (BL-2): the ONE point this
@@ -11032,7 +11191,7 @@ def run_builder(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert = bridge.probe_claude_stream_json(
+        ok, alert, git_failure = _claude_probe(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=BUILDER_PROMPT_PATH, trace=trace,
                 role="builder", extra_writable_dir=sessions_dir,
@@ -11044,10 +11203,11 @@ def run_builder(config, context, selected, io_out=None,
                 preflight_result=(_ALLOW_FACT if _builder_manifest else None),
                 probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
-                trace.event("role.end", role="builder", result="probe_failed")
+                trace.event("role.end", role="builder", result="probe_failed",
+                            **_git_extra(git_failure))
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
-            _reject("probe_failed", "probe")
+            _reject("probe_failed", "probe", **_git_extra(git_failure))
             report(_OUTCOME_ENDED, None)
             return 1
         if resume_id:
@@ -11087,14 +11247,17 @@ def run_builder(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
+            gf = _git_scope_fact(exc)
+            if gf and session_id:
+                _unpin_session(on_session, "claude", session_id)
             if trace:
                 trace.event("role.end", role="builder", result="start_failed",
-                            error_type=type(exc).__name__)
+                            error_type=type(exc).__name__, **_git_extra(gf))
             io_out.write("cowork: failed to start builder controller: %s\n"
-                         % type(exc).__name__)
+                         % _start_failed_text(exc))
             io_out.flush()
             _reject("start_failed", "session_start",
-                   error_type=type(exc).__name__)
+                   error_type=type(exc).__name__, **_git_extra(gf))
             report(_OUTCOME_ENDED, None)
             return 1
         # The claude session is genuinely live now (BL-2): the ONE point
@@ -11143,14 +11306,15 @@ def run_builder(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         except Exception as exc:  # noqa: BLE001
+            gf = _git_scope_fact(exc)
             if trace:
                 trace.event("role.end", role="builder", result="start_failed",
-                            error_type=type(exc).__name__)
+                            error_type=type(exc).__name__, **_git_extra(gf))
             io_out.write("cowork: failed to start builder controller: %s\n"
-                         % type(exc).__name__)
+                         % _start_failed_text(exc))
             io_out.flush()
             _reject("start_failed", "session_start",
-                   error_type=type(exc).__name__)
+                   error_type=type(exc).__name__, **_git_extra(gf))
             report(_OUTCOME_ENDED, None)
             return 1
         # The opencode session is genuinely live now (BL-2): the ONE point
@@ -11194,6 +11358,18 @@ def run_builder(config, context, selected, io_out=None,
         io_out.write(str(exc) + "\n")
         io_out.flush()
         _reject("policy_blocked", "bridge_backstop")
+        report(_OUTCOME_ENDED, None)
+        return 1
+    except bridge.GitWorktreeScopeError as exc:
+        if trace:
+            trace.event("role.end", role="builder", result="start_failed",
+                        controller="codex", error_type=type(exc).__name__,
+                        git_failure=exc.fact())
+        io_out.write("cowork: failed to start builder controller: %s\n"
+                     % _git_failure_alert(exc))
+        io_out.flush()
+        _reject("start_failed", "session_start",
+                error_type=type(exc).__name__, git_failure=exc.fact())
         report(_OUTCOME_ENDED, None)
         return 1
     # The codex session is genuinely live now (BL-2): the ONE point this
@@ -12233,6 +12409,21 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 local_ids[role] = (controller, sid)
                 trace.event("role.session_saved", role=role,
                             controller=controller, session_id=sid)
+
+            def unpin(controller, sid):
+                """Compare-and-clear a pinned id whose launch failed the Git
+                isolation check strictly before the provider was spawned, so
+                the conversation it names never existed. Reached only from
+                GitWorktreeScopeError handlers (via `_unpin_session`)."""
+                if session_enabled:
+                    holder["state"] = state_store.clear_role_session(
+                        spath, role, controller, sid, prior=holder["state"])
+                if local_ids.get(role) == (controller, sid):
+                    local_ids.pop(role, None)
+                trace.event("role.session_unpinned", role=role,
+                            controller=controller, session_id=sid,
+                            reason="git_scope_failed")
+            on_sess.unpin = unpin
             return on_sess
 
         pending_switches = {}
@@ -12539,7 +12730,7 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 if target != "claude":
                     continue
                 cfg = dict(config.get(role) or {})
-                ok, alert = (lambda c=cfg, r=role: bridge.probe_claude_stream_json(
+                ok, alert, git_failure = (lambda c=cfg, r=role: _claude_probe(
                         bridge._real_claude_spawn,
                         mode=c.get("mode", "implement"),
                         yolo=c.get("yolo", True),
@@ -12550,7 +12741,8 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         cache_enabled=True))()
                 if not ok:
                     trace.event("controller.switch.probe_failed", role=role,
-                                phase=phase, target_controller=target)
+                                phase=phase, target_controller=target,
+                                **_git_extra(git_failure))
                     return reject("cannot switch %s to claude: %s" % (role, alert),
                                   1)
 

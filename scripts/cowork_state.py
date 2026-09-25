@@ -2561,6 +2561,23 @@ def save_role_session(path, role, controller, session_id, prior=None):
     return state
 
 
+def clear_role_session(path, role, controller, session_id, prior=None):
+    """Compare-and-clear a role's saved session: remove `sessions[role]` only
+    when it still names exactly (`controller`, `session_id`). Any other entry
+    (a different id or controller written since) is left alone and nothing is
+    written. Returns the resulting state."""
+    state = dict(prior or load(path) or {})
+    sessions = dict(state.get("sessions") or {})
+    entry = sessions.get(role)
+    if not (isinstance(entry, dict) and entry.get("controller") == controller
+            and entry.get("id") == session_id):
+        return state
+    sessions.pop(role)
+    state["sessions"] = sessions
+    save(path, state)
+    return state
+
+
 def save_pending_turn(path, role, text, prior=None, source=None):
     """Persist a failed direct turn for `role` so any future resume or switch replays it.
 

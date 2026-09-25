@@ -402,22 +402,51 @@ def _declared_outputs_for_role(assets_dir, role):
     return tuple(os.path.join(assets_dir, name) for name in names)
 
 
+class GitWorktreeScopeError(RuntimeError):
+    """Typed fail-closed Git isolation inventory failure.
+
+    ``kind`` is ``timeout``, ``nonzero_exit`` or ``unavailable``; ``stage`` is
+    ``toplevel`` or ``worktree_list``. ``str()`` stays the stable reason code.
+    """
+
+    def __init__(self, kind, stage, returncode=None):
+        self.kind = kind
+        self.stage = stage
+        self.returncode = returncode
+        self.reason = ("git_toplevel_unavailable" if stage == "toplevel"
+                       else "git_worktree_inventory_unavailable")
+        super().__init__(self.reason)
+
+    def fact(self):
+        return {"kind": self.kind, "stage": self.stage,
+                "returncode": self.returncode, "reason": self.reason}
+
+
+def _run_git_inventory(argv, stage):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        raise GitWorktreeScopeError("timeout", stage) from exc
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise GitWorktreeScopeError("unavailable", stage) from exc
+
+
 def _git_worktree_scope(cwd):
     """Return active root and its registered sibling worktrees, or fail closed."""
-    try:
-        top = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=10)
-        if top.returncode != 0 or not top.stdout.strip():
-            raise RuntimeError("git_toplevel_unavailable")
-        active = os.path.realpath(top.stdout.strip())
-        listed = subprocess.run(
-            ["git", "-C", active, "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=10)
-        if listed.returncode != 0:
-            raise RuntimeError("git_worktree_inventory_unavailable")
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        raise RuntimeError("git_worktree_inventory_unavailable") from exc
+    top = _run_git_inventory(
+        ["git", "-C", cwd, "rev-parse", "--show-toplevel"], "toplevel")
+    if top.returncode != 0 or not top.stdout.strip():
+        # A zero exit with no usable toplevel is still Git's own answer.
+        raise GitWorktreeScopeError("nonzero_exit", "toplevel",
+                                    top.returncode)
+    active = os.path.realpath(top.stdout.strip())
+    listed = _run_git_inventory(
+        ["git", "-C", active, "worktree", "list", "--porcelain"],
+        "worktree_list")
+    if listed.returncode != 0:
+        raise GitWorktreeScopeError("nonzero_exit", "worktree_list",
+                                    listed.returncode)
     roots = []
     for line in listed.stdout.splitlines():
         if line.startswith("worktree "):
@@ -522,7 +551,11 @@ def _guard_runtime(trace, role, assets_dir, model, effort,
     if controller == "codex":
         profile = controller_profiles.reference_codex_auth(controller_state)
     profile_protected = tuple((profile or {}).get("protected_paths") or ())
-    active_root, sibling_worktrees = _git_worktree_scope(os.getcwd())
+    try:
+        active_root, sibling_worktrees = _git_worktree_scope(os.getcwd())
+    except GitWorktreeScopeError:
+        controller_profiles.cleanup_claude_session_reference(profile)
+        raise
     if controller == "claude":
         if resume_id:
             migrate_legacy_claude_resume(controller_state, resume_id)
