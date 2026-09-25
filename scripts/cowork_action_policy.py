@@ -32,6 +32,56 @@ MUTATING_COMMANDS = frozenset(("rm", "mv", "cp", "install", "tee", "dd",
 # available so shlex can prove ordinary single-command argv.
 SHELL_META = re.compile(r"[\x00-\x1f\x7f$`*?\[\]{}()|;&!]")
 REDIRECT = re.compile(r"(?:^|[\s;|&])(?:>>?|[0-9]+>>?)\s*(\S+)")
+# Compound proof (#39).  Commands are split only at unquoted, unescaped runs
+# of operator characters; an operator character inside quotes or after a
+# backslash is denied outright, so no stage text can ever contain one.  '~'
+# joins the expansion class because _resolve does not expand it.
+_OPERATOR_CHARS = "|;&"
+_SUPPORTED_OPERATORS = ("&&", ";", "|")
+_KNOWN_OPERATORS = ("&&", ";", "|", "||", "&", "|&", ";;")
+_EXPANSION = re.compile(r"[$`*?\[\]{}()!~]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+UNPROVABLE_CONSTRUCTS = frozenset((
+    "control_character", "expansion", "quoted_operator", "escaped_operator",
+    "unsupported_operator", "empty_stage", "unbalanced_quote", "redirect",
+    "mutating_stage", "unknown_command", "unsafe_flag", "interpreter_inline",
+    "find_action", "script_path", "unresolved_target", "extra_operand"))
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,31}")
+_SAFE_FLAG_TOKEN = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9-]{0,39}")
+_FRAGMENT_MESSAGE_LIMIT = 160
+# Flags whose value is a separate argument; that argument is not a file.
+_VALUE_FLAGS = {
+    "head": ("-n", "-c", "--lines", "--bytes"),
+    "tail": ("-n", "-c", "--lines", "--bytes", "--pid", "--sleep-interval"),
+    "sort": ("-k", "-t", "--key", "--field-separator"),
+    "uniq": ("-f", "-s", "-w", "--skip-fields", "--skip-chars",
+             "--check-chars"),
+}
+# Stdout-only helpers accepted by the proof path.  Deliberately separate from
+# INERT_COMMANDS: readonly_bash_commands() feeds a prefix-injectable
+# controller allowlist and must not grow with this table.
+SINK_COMMANDS = frozenset(("cat", "sort", "uniq", "echo", "which"))
+SAFE_SINK_FLAGS = {
+    "cat": frozenset((
+        "-b", "-e", "-n", "-s", "-t", "-u", "-v", "-A", "-E", "-T",
+        "--number", "--number-nonblank", "--squeeze-blank", "--show-all",
+        "--show-ends", "--show-tabs", "--show-nonprinting")),
+    "sort": frozenset((
+        "-b", "-c", "-C", "-d", "-f", "-g", "-h", "-k", "-M", "-n", "-r",
+        "-s", "-t", "-u", "-V", "--ignore-leading-blanks", "--check",
+        "--dictionary-order", "--ignore-case", "--general-numeric-sort",
+        "--human-numeric-sort", "--key", "--month-sort", "--numeric-sort",
+        "--reverse", "--stable", "--field-separator", "--unique",
+        "--version-sort")),
+    "uniq": frozenset((
+        "-c", "-d", "-D", "-i", "-u", "-f", "-s", "-w", "--count",
+        "--repeated", "--unique", "--ignore-case", "--skip-fields",
+        "--skip-chars", "--check-chars")),
+    "which": frozenset(("-a", "-s")),
+}
+_SINK_NUMERIC_VALUES = {"sort": ("-k",), "uniq": ("-f", "-s", "-w")}
+# Verbs whose file operands become read targets (protected-path check).
+_TARGET_SINKS = frozenset(("cat", "sort", "uniq", "head", "tail", "wc"))
 SAFE_GIT_FLAGS = {
     "status": frozenset((
         "-s", "-b", "-u", "--short", "--porcelain", "--branch", "--show-stash",
@@ -85,7 +135,9 @@ SAFE_INERT_FLAGS = {
         "--invert-match", "--word-regexp", "--line-regexp",
         "--line-number", "--with-filename", "--no-filename",
         "--files-with-matches", "--files-without-match", "--count",
-        "--only-matching", "--quiet", "--recursive")),
+        "--only-matching", "--quiet", "--recursive",
+        "-A", "-B", "-C", "--after-context", "--before-context",
+        "--context")),
     "pwd": frozenset(("-L", "-P", "--logical", "--physical")),
     "wc": frozenset(("-c", "-m", "-l", "-w", "-L", "--bytes", "--chars",
                      "--lines", "--words", "--max-line-length")),
@@ -481,90 +533,302 @@ def _safe_flag(argument, allowed, numeric=False, numeric_values=()):
         ("-" + letter) in allowed for letter in argument[1:])
 
 
-def _bash_action(command, cwd):
-    if not isinstance(command, str) or not command.strip():
-        return {"class": "unknown", "targets": [],
-                "resolution_complete": False, "reason": "target_unresolved"}
-    if SHELL_META.search(command):
-        return {"class": "unknown", "targets": [],
-                "resolution_complete": False, "reason": "shell_unprovable"}
+def _unprovable(construct, stage_index, stage_count, fragment,
+                operator=None, verb=None, flag=None):
+    """In-memory stage detail; sanitize() reduces it to content-free form."""
+    return {"construct": construct, "stage_index": stage_index,
+            "stage_count": stage_count, "fragment": fragment,
+            "operator": operator, "verb": verb, "flag": flag}
+
+
+def _split_compound(command):
+    """Split at unquoted `&&`, `;` and `|`; fail closed on anything else.
+
+    Returns ({"stages": [...], "operators": [...]}, None) or (None, detail).
+    """
+    stages, operators = [], []
+    stage_flags = {}
+    current = []
+    quote = None
+    i, n = 0, len(command)
+    while i < n:
+        char = command[i]
+        stage = len(stages)
+        if quote == "'":
+            if char in _OPERATOR_CHARS:
+                stage_flags.setdefault(stage, "quoted_operator")
+            elif char == "'":
+                quote = None
+            current.append(char)
+            i += 1
+            continue
+        if quote == '"':
+            if char == "\\" and i + 1 < n:
+                if command[i + 1] in _OPERATOR_CHARS:
+                    stage_flags.setdefault(stage, "quoted_operator")
+                current.append(command[i:i + 2])
+                i += 2
+                continue
+            if char in _OPERATOR_CHARS:
+                stage_flags.setdefault(stage, "quoted_operator")
+            elif char == '"':
+                quote = None
+            current.append(char)
+            i += 1
+            continue
+        if char == "\\":
+            if i + 1 < n and command[i + 1] in _OPERATOR_CHARS:
+                stage_flags.setdefault(stage, "escaped_operator")
+            current.append(command[i:i + 2])
+            i += 2
+            continue
+        if char in ("'", '"'):
+            quote = char
+            current.append(char)
+            i += 1
+            continue
+        if char in _OPERATOR_CHARS:
+            end = i
+            while end < n and command[end] in _OPERATOR_CHARS:
+                end += 1
+            run = command[i:end]
+            before = command[i - 1] if i else ""
+            after = command[end] if end < n else ""
+            if before in ("<", ">") or (set(run) == {"&"} and after == ">"):
+                # fd duplication / clobber forms such as 2>&1, >| and &>:
+                # a redirect, kept inside the stage rather than split on.
+                stage_flags.setdefault(stage, ("redirect", run))
+                current.append(run)
+                i = end
+                continue
+            stages.append("".join(current))
+            operators.append(run)
+            current = []
+            i = end
+            continue
+        current.append(char)
+        i += 1
+    stages.append("".join(current))
+    if quote is not None:
+        stage_flags[len(stages) - 1] = "unbalanced_quote"
+    count = len(stages)
+    for index, text in enumerate(stages):
+        fragment = text.strip()
+        joining = operators[index - 1] if index else None
+        flagged = stage_flags.get(index)
+        if flagged is not None:
+            if isinstance(flagged, tuple):
+                return None, _unprovable(flagged[0], index + 1, count,
+                                         flagged[1], operator=flagged[1])
+            return None, _unprovable(flagged, index + 1, count, fragment,
+                                     operator=joining)
+        if not fragment:
+            return None, _unprovable("empty_stage", index + 1, count,
+                                     fragment, operator=joining)
+        if _CONTROL.search(text):
+            return None, _unprovable("control_character", index + 1, count,
+                                     fragment, operator=joining)
+        if _EXPANSION.search(text):
+            return None, _unprovable("expansion", index + 1, count,
+                                     fragment, operator=joining)
+        if index < len(operators) and (
+                operators[index] not in _SUPPORTED_OPERATORS):
+            return None, _unprovable("unsupported_operator", index + 1,
+                                     count, operators[index],
+                                     operator=operators[index])
+    return {"stages": stages, "operators": operators}, None
+
+
+def _sink_operands(verb, args):
+    """File operands of a sink verb: skip flags and separate flag values."""
+    value_flags = _VALUE_FLAGS.get(verb, ())
+    operands = []
+    skip_next = False
+    after_dashes = False
+    for argument in args:
+        if after_dashes:
+            operands.append(argument)
+        elif skip_next:
+            skip_next = False
+        elif argument == "--":
+            after_dashes = True
+        elif argument in value_flags:
+            skip_next = True
+        elif not argument.startswith("-"):
+            operands.append(argument)
+    return operands
+
+
+def _stage_fail(construct, reason="shell_unprovable", verb=None, flag=None):
+    return {"class": "unknown", "targets": [], "resolution_complete": False,
+            "reason": reason, "construct": construct, "verb": verb,
+            "flag": flag}
+
+
+def _check_flags(verb, args, allowed, numeric=False, numeric_values=()):
+    for argument in args:
+        if not _safe_flag(argument, allowed, numeric=numeric,
+                          numeric_values=numeric_values):
+            return _stage_fail("unsafe_flag", verb=verb, flag=argument)
+    return None
+
+
+def _bash_stage(fragment, cwd, compound):
+    """Prove one stage.  Single-stage results keep the pre-#39 classes."""
+    if "<" in fragment:
+        return _stage_fail("redirect")
+    if compound and ">" in fragment:
+        return _stage_fail("redirect")
     try:
-        parts = shlex.split(command)
+        parts = shlex.split(fragment)
     except ValueError:
-        return {"class": "unknown", "targets": [],
-                "resolution_complete": False, "reason": "shell_unprovable"}
-    if not parts or any(p.startswith("./") or p.endswith((".sh", ".py"))
-                        for p in parts[:1]):
-        return {"class": "unknown", "targets": [],
-                "resolution_complete": False, "reason": "shell_unprovable"}
+        return _stage_fail("unbalanced_quote")
+    if not parts:
+        return _stage_fail("empty_stage")
+    if any(p.startswith("=") for p in parts):
+        return _stage_fail("expansion")
     verb = os.path.basename(parts[0])
+    if parts[0].startswith("./") or parts[0].endswith((".sh", ".py")):
+        return _stage_fail("script_path", verb=verb)
     if verb in ("python", "python3", "perl", "ruby", "node") and any(
             p in ("-c", "-e") for p in parts[1:]):
-        return {"class": "unknown", "targets": [],
-                "resolution_complete": False, "reason": "shell_unprovable"}
-    if verb == "find" and any(p in ("-exec", "-execdir", "-delete")
-                              for p in parts):
-        return {"class": "unknown", "targets": [],
-                "resolution_complete": False, "reason": "shell_unprovable"}
-    redirects = [_resolve(m.group(1), cwd) for m in REDIRECT.finditer(command)]
+        return _stage_fail("interpreter_inline", verb=verb)
+    if verb == "find":
+        for p in parts:
+            if p in ("-exec", "-execdir", "-delete"):
+                return _stage_fail("find_action", verb=verb, flag=p)
+    redirects = [_resolve(m.group(1), cwd) for m in REDIRECT.finditer(fragment)]
     if any(p is None for p in redirects):
-        return {"class": "unknown", "targets": [],
-                "resolution_complete": False, "reason": "target_unresolved"}
+        return _stage_fail("unresolved_target", reason="target_unresolved",
+                           verb=verb)
     if redirects:
         return {"class": "write", "targets": redirects,
-                "resolution_complete": True, "proof": "shell_redirect"}
+                "resolution_complete": True, "proof": "shell_redirect",
+                "verb": verb}
     if verb in MUTATING_COMMANDS:
         if verb in ("mv", "dd"):
-            return {"class": "unknown", "targets": [],
-                    "resolution_complete": False, "reason": "shell_unprovable"}
+            return _stage_fail("mutating_stage", verb=verb)
         candidates = [p for p in parts[1:] if not p.startswith("-")]
         # Source operands are harmless for cp/mv/install; destination is last.
         if verb in ("cp", "mv", "install", "ln") and candidates:
             candidates = candidates[-1:]
         targets = [_resolve(p, cwd) for p in candidates]
         if not targets or any(p is None for p in targets):
-            return {"class": "unknown", "targets": [],
-                    "resolution_complete": False,
-                    "reason": "target_unresolved"}
+            return _stage_fail("unresolved_target",
+                               reason="target_unresolved", verb=verb)
         return {"class": "delete" if verb in ("rm", "rmdir") else "write",
                 "targets": targets, "resolution_complete": True,
-                "proof": "shell_argv"}
-    if verb in INERT_COMMANDS:
-        if verb == "git":
-            subcommand = parts[1] if len(parts) > 1 else None
-            safe_flags = SAFE_GIT_FLAGS.get(subcommand)
-            if safe_flags is None:
-                return {"class": "unknown", "targets": [],
-                        "resolution_complete": False,
-                        "reason": "shell_unprovable"}
-            for argument in parts[2:]:
-                if not _safe_flag(
-                        argument, safe_flags,
-                        numeric=subcommand == "log",
-                        numeric_values=("-n",) if subcommand == "log" else ()):
-                    return {"class": "unknown", "targets": [],
-                            "resolution_complete": False,
-                            "reason": "shell_unprovable"}
-        if verb == "find":
-            for argument in parts[1:]:
-                if argument.startswith("-") and argument not in SAFE_FIND_FLAGS:
-                    return {"class": "unknown", "targets": [],
-                            "resolution_complete": False,
-                            "reason": "shell_unprovable"}
-        if verb in SAFE_INERT_FLAGS:
-            for argument in parts[1:]:
-                if not _safe_flag(
-                        argument, SAFE_INERT_FLAGS[verb],
-                        numeric=verb in ("head", "tail"),
-                        numeric_values=("-n", "-c")
-                        if verb in ("head", "tail") else ()):
-                    return {"class": "unknown", "targets": [],
-                            "resolution_complete": False,
-                            "reason": "shell_unprovable"}
-        return {"class": "read", "targets": [],
-                "resolution_complete": True, "proof": "inert_verb"}
-    return {"class": "unknown", "targets": [],
-            "resolution_complete": False, "reason": "shell_unprovable"}
+                "proof": "shell_argv", "verb": verb}
+    if verb not in INERT_COMMANDS and verb not in SINK_COMMANDS:
+        return _stage_fail("unknown_command", verb=verb)
+    if verb == "git":
+        subcommand = parts[1] if len(parts) > 1 else None
+        safe_flags = SAFE_GIT_FLAGS.get(subcommand)
+        if safe_flags is None:
+            return _stage_fail("unknown_command", verb=verb)
+        failed = _check_flags(
+            verb, parts[2:], safe_flags, numeric=subcommand == "log",
+            numeric_values=("-n",) if subcommand == "log" else ())
+        if failed:
+            return failed
+    if verb == "find":
+        for argument in parts[1:]:
+            if argument.startswith("-") and argument not in SAFE_FIND_FLAGS:
+                return _stage_fail("unsafe_flag", verb=verb, flag=argument)
+    if verb in SAFE_INERT_FLAGS:
+        if verb in ("head", "tail"):
+            numeric_values = ("-n", "-c")
+        elif verb == "grep":
+            numeric_values = ("-A", "-B", "-C")
+        else:
+            numeric_values = ()
+        failed = _check_flags(verb, parts[1:], SAFE_INERT_FLAGS[verb],
+                              numeric=verb in ("head", "tail"),
+                              numeric_values=numeric_values)
+        if failed:
+            return failed
+    if verb in SAFE_SINK_FLAGS:
+        if verb == "uniq" and "--" in parts[1:]:
+            return _stage_fail("unsafe_flag", verb=verb, flag="--")
+        failed = _check_flags(
+            verb, parts[1:], SAFE_SINK_FLAGS[verb],
+            numeric_values=_SINK_NUMERIC_VALUES.get(verb, ()))
+        if failed:
+            return failed
+    targets = []
+    if verb in _TARGET_SINKS:
+        operands = _sink_operands(verb, parts[1:])
+        if verb == "uniq" and len(operands) > 1:
+            return _stage_fail("extra_operand", verb=verb)
+        targets = [_resolve(p, cwd) for p in operands]
+        if any(p is None for p in targets):
+            return _stage_fail("unresolved_target",
+                               reason="target_unresolved", verb=verb)
+    return {"class": "read", "targets": targets,
+            "resolution_complete": True, "proof": "inert_verb", "verb": verb}
+
+
+def _stage_result(result):
+    """Drop the stage-internal diagnostic keys from a proven stage."""
+    return {key: value for key, value in result.items()
+            if key not in ("construct", "verb", "flag")}
+
+
+def _bash_action(command, cwd):
+    if not isinstance(command, str) or not command.strip():
+        return {"class": "unknown", "targets": [],
+                "resolution_complete": False, "reason": "target_unresolved"}
+    split, detail = _split_compound(command)
+    if detail is not None:
+        return {"class": "unknown", "targets": [],
+                "resolution_complete": False, "reason": "shell_unprovable",
+                "unprovable": detail}
+    stages, operators = split["stages"], split["operators"]
+    count = len(stages)
+    if count == 1:
+        fragment = stages[0].strip()
+        result = _bash_stage(fragment, cwd, compound=False)
+        if result["class"] == "unknown":
+            failed = _stage_result(result)
+            failed["unprovable"] = _unprovable(
+                result["construct"], 1, 1, fragment, verb=result.get("verb"),
+                flag=result.get("flag"))
+            return failed
+        return _stage_result(result)
+    targets = []
+    for index, text in enumerate(stages):
+        fragment = text.strip()
+        result = _bash_stage(fragment, cwd, compound=True)
+        if result["class"] == "read":
+            targets.extend(result["targets"])
+            continue
+        construct = (result.get("construct")
+                     if result["class"] == "unknown" else "mutating_stage")
+        return {"class": "unknown", "targets": [],
+                "resolution_complete": False, "reason": "shell_unprovable",
+                "unprovable": _unprovable(
+                    construct, index + 1, count, fragment,
+                    operator=operators[index - 1] if index else None,
+                    verb=result.get("verb"), flag=result.get("flag"))}
+    return {"class": "read", "targets": targets, "resolution_complete": True,
+            "proof": "compound_read", "stage_count": count}
+
+
+def unprovable_message(detail):
+    """Bounded, human-readable stage detail for a hook deny reason."""
+    if not detail:
+        return ""
+    construct = detail.get("construct") or "unknown"
+    flag = detail.get("flag")
+    if isinstance(flag, str) and _SAFE_FLAG_TOKEN.fullmatch(
+            flag.split("=", 1)[0]):
+        construct = "%s %s" % (construct, flag.split("=", 1)[0])
+    fragment = detail.get("fragment") or ""
+    text = json.dumps(fragment[:_FRAGMENT_MESSAGE_LIMIT])
+    if len(fragment) > _FRAGMENT_MESSAGE_LIMIT:
+        text += "…"
+    return "(stage %s of %s, %s: %s)" % (
+        detail.get("stage_index"), detail.get("stage_count"), construct, text)
 
 
 def classify_action(tool_name, tool_input, cwd=None, installed_schema=None,
@@ -662,7 +926,7 @@ def sanitize(decision, action=None, work_id=None, parent_work_id=None,
     """Return the content-free durable representation of a decision."""
     action = action or {}
     targets = action.get("targets") or ()
-    return {
+    record = {
         "guard_attempt_id": guard_attempt_id,
         "work_id": work_id,
         "parent_work_id": parent_work_id,
@@ -676,6 +940,40 @@ def sanitize(decision, action=None, work_id=None, parent_work_id=None,
             "target_count": len(targets),
         }),
     }
+    if action.get("stage_count") is not None:
+        record["stage_count"] = action["stage_count"]
+    detail = action.get("unprovable")
+    if detail:
+        record["unprovable"] = _sanitize_unprovable(detail)
+    return record
+
+
+def _sanitize_unprovable(detail):
+    """Closed enums, regex-gated tokens and a digest; never raw text."""
+    operator = detail.get("operator")
+    construct = detail.get("construct")
+    fragment = detail.get("fragment")
+    raw = (fragment if isinstance(fragment, str) else "").encode(
+        "utf-8", "surrogatepass")
+    result = {
+        "stage_index": detail.get("stage_index"),
+        "stage_count": detail.get("stage_count"),
+        "operator": (None if operator is None else
+                     operator if operator in _KNOWN_OPERATORS else "other"),
+        "construct": (construct if construct in UNPROVABLE_CONSTRUCTS
+                      else "other"),
+        "fragment_sha256": hashlib.sha256(raw).hexdigest(),
+        "fragment_bytes": len(raw),
+    }
+    verb = detail.get("verb")
+    if isinstance(verb, str) and _SAFE_TOKEN.fullmatch(verb):
+        result["verb"] = verb
+    flag = detail.get("flag")
+    if isinstance(flag, str):
+        name = flag.split("=", 1)[0]
+        if _SAFE_FLAG_TOKEN.fullmatch(name):
+            result["flag"] = name
+    return result
 
 
 def rtk_command_forms():

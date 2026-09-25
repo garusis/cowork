@@ -728,12 +728,21 @@ def _close_guard_runtime(runtime):
         runtime.get("profile"))
 
 
-def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
+def _denial_guard_attempt_id(text):
+    """Last guard_attempt_id token in a denial: the broker appends the real
+    one last, while a quoted command fragment earlier may contain a forgery."""
+    matches = re.findall(r"guard_attempt_id=([A-Za-z0-9._:-]+)", text or "")
+    return matches[-1] if matches else None
+
+
+def kernel_write_boundary(owned_scope, argv=None, protected_paths=(),
+                          claude_cwd_tracker=False):
     """Return a generated kernel-boundary description, or fail closed.
 
     macOS seatbelt is emitted as an argv wrapper. Linux requires bubblewrap;
     unsupported platforms return an unavailable result rather than silently
-    launching without a boundary.
+    launching without a boundary. `claude_cwd_tracker` is set only for Claude
+    launches (darwin only; the Linux branch ignores it).
     """
     roots = tuple(os.path.realpath(p) for p in owned_scope.writable_roots)
     siblings = tuple(os.path.realpath(p)
@@ -772,6 +781,14 @@ def kernel_write_boundary(owned_scope, argv=None, protected_paths=()):
             lines.append('(allow file-write* (subpath "%s"))' % quote(root))
         for base in scratch_bases:
             lines.append('(allow file-write* (subpath "%s"))' % quote(base))
+        if claude_cwd_tracker:
+            # Claude's Bash tool writes a top-level per-call cwd file
+            # `/tmp/claude-<4 hex>-cwd` after every command (#50). Allow
+            # exactly that shape; never generic /tmp.
+            for prefix in ("/tmp", "/private/tmp"):
+                lines.append(
+                    '(allow file-write* (regex #"^%s/claude-[0-9a-f][0-9a-f]'
+                    '[0-9a-f][0-9a-f]-cwd$"))' % prefix)
         # Controllers persist a declared output atomically through a
         # `<path>.tmp.<rand>` sibling; a bare literal allow rejects that
         # staging file, so cover the pattern beside every declared file
@@ -1834,7 +1851,7 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         env_argv += ["%s=%s" % (key, runtime["env"][key])
                      for key in ("TMPDIR",)]
         boundary = kernel_write_boundary(
-            runtime["scope"], env_argv + command)
+            runtime["scope"], env_argv + command, claude_cwd_tracker=True)
         if not boundary["available"]:
             _close_guard_runtime(runtime)
             raise RuntimeError(boundary["reason"])
@@ -2039,7 +2056,8 @@ class ClaudeSession:
             boundary = kernel_write_boundary(
                 owned_scope, command,
                 protected_paths=(self._guard_runtime or {}).get(
-                    "protected_paths") or ())
+                    "protected_paths") or (),
+                claude_cwd_tracker=True)
             if not boundary["available"]:
                 raise RuntimeError(boundary["reason"])
             command = boundary["argv"]
@@ -2438,11 +2456,9 @@ class ClaudeSession:
                 if self.trace:
                     self.trace.event("controller.denied", controller="claude",
                                      role=self.speaker)
-                    match = re.search(
-                        r"guard_attempt_id=([A-Za-z0-9._:-]+)",
+                    attempt_id = _denial_guard_attempt_id(
                         parsed.get("text") or "")
-                    if match and self._guard_runtime:
-                        attempt_id = match.group(1)
+                    if attempt_id and self._guard_runtime:
                         if not self._guard_runtime["broker"].has_attempt(
                                 attempt_id):
                             self.trace.event(

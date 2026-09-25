@@ -382,10 +382,13 @@ class GuardBroker:
                     allow=decision.get("allow"),
                     reason=decision.get("reason"),
                     action_class=action.get("class"))
-        return self._hook_response(decision, attempt_id)
+        detail = (action.get("unprovable")
+                  if decision.get("reason") == "shell_unprovable" else None)
+        return self._hook_response(decision, attempt_id, detail=detail)
 
     @staticmethod
-    def _hook_response(decision, attempt_id, child_work_id=None):
+    def _hook_response(decision, attempt_id, child_work_id=None,
+                       detail=None):
         output = {"hookEventName": "PreToolUse"}
         if decision.get("allow"):
             output["permissionDecision"] = "allow"
@@ -393,9 +396,14 @@ class GuardBroker:
                 output["updatedInput"] = decision["updated_input"]
         else:
             output["permissionDecision"] = "deny"
+            reason = decision.get("reason") or "denied"
+            if detail:
+                # The fragment may contain arbitrary text; the real attempt
+                # id is always the last token (the bridge parses the last).
+                reason = "%s %s" % (
+                    reason, action_policy.unprovable_message(detail))
             output["permissionDecisionReason"] = (
-                "%s guard_attempt_id=%s" %
-                (decision.get("reason") or "denied", attempt_id))
+                "%s guard_attempt_id=%s" % (reason, attempt_id))
         response = {"hookSpecificOutput": output,
                     "guard_attempt_id": attempt_id}
         if child_work_id:

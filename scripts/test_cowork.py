@@ -1414,7 +1414,8 @@ class OpencodeSeatbeltWrapTest(unittest.TestCase):
         runtime = {"scope": scope, "env": {"TMPDIR": self.tmp},
                    "protected_paths": (), "broker": None, "profile": None}
 
-        def fake_boundary(owned_scope, argv=None, protected_paths=()):
+        def fake_boundary(owned_scope, argv=None, protected_paths=(),
+                          claude_cwd_tracker=False):
             return {"available": True, "platform": "darwin",
                     "profile": "", "argv": ["sandbox-exec"] + list(argv)}
 
@@ -23047,6 +23048,624 @@ class BashProofPolicyTests(unittest.TestCase):
             self.assertFalse(os.path.exists(target))
 
 
+def _git_nested_worktrees(root):
+    """<root>/repo with worktrees .worktrees/wt and .worktrees/other."""
+    repo = os.path.join(root, "repo")
+    os.mkdir(repo)
+    git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+           "-c", "commit.gpgsign=false", "-C", repo]
+    subprocess.run(git + ["init", "-q"], check=True)
+    Path(os.path.join(repo, "README.md")).write_text("x\n")
+    subprocess.run(git + ["add", "README.md"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "init"], check=True)
+    worktrees = {}
+    for name in ("wt", "other"):
+        path = os.path.join(repo, ".worktrees", name)
+        subprocess.run(git + ["worktree", "add", "-q", "-b", "br-" + name,
+                              path], check=True)
+        worktrees[name] = os.path.realpath(path)
+    return os.path.realpath(repo), worktrees["wt"], worktrees["other"]
+
+
+class CompoundShellProofTests(unittest.TestCase):
+    """#39: compound read-only Bash is allowed only when every stage proves."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo, self.wt, self.other = _git_nested_worktrees(
+            self._tmp.name)
+        for name in ("a", "b", "tools", "documentation", ".circleci"):
+            os.makedirs(os.path.join(self.wt, name), exist_ok=True)
+        Path(os.path.join(self.wt, "file")).write_text("x\n")
+        Path(os.path.join(self.wt, ".circleci", "config.yml")).write_text(
+            "documentation-validation:\n")
+        self.scope = action_policy.OwnedScope(
+            repo_roots=(self.wt,), sibling_worktrees=(self.repo, self.other))
+
+    def _examples(self):
+        abs_root = self.wt
+        return (
+            "ls a && ls b",
+            "git log --oneline -20 | head",
+            "grep -n x file -A 40 | head",
+            'ls && echo "---TOOLS---" && ls tools/ | head -50 && '
+            'echo "---DOCS---" && ls documentation/',
+            "which rtk && git log --oneline -15 && "
+            "git status --porcelain | head",
+            'ls %s/tools/ && echo "---" && ls %s/documentation/'
+            % (abs_root, abs_root),
+            'git log --oneline -20 && echo "---STATUS---" && '
+            "git status --porcelain | head -20",
+            'grep -n "documentation-validation" -A 40 '
+            "%s/.circleci/config.yml | head" % abs_root,
+        )
+
+    def test_issue39_completion_examples_allowed(self):
+        # Base APIs only (classify_action, decide, OwnedScope) so this exact
+        # method can be replayed against the pre-#39 policy module.
+        for command in self._examples():
+            with self.subTest(command=command):
+                action = action_policy.classify_action(
+                    "Bash", {"command": command}, cwd=self.wt)
+                self.assertEqual(action["class"], "read")
+                self.assertEqual(
+                    action_policy.decide(action, self.scope),
+                    {"allow": True, "reason": "read_only"})
+
+    def test_compound_proof_and_stage_count(self):
+        for command in self._examples():
+            with self.subTest(command=command):
+                action = action_policy.classify_action(
+                    "Bash", {"command": command}, cwd=self.wt)
+                self.assertEqual(action["proof"], "compound_read")
+                self.assertEqual(
+                    action["stage_count"],
+                    len(re.split(r"&&|\||;", command)))
+        grep = action_policy.classify_action(
+            "Bash", {"command": 'grep -n "documentation-validation" -A 40 '
+                     ".circleci/config.yml | head"}, cwd=self.wt)
+        self.assertEqual(grep["stage_count"], 2)
+
+    def test_single_stage_sink_verbs_read(self):
+        for command in ("cat file", "echo ---", "which rtk", "sort -n file",
+                        "uniq -c file", "uniq -f 1 file", "uniq -s 3 file",
+                        "sort -k 2 -t , file", "cat -n file"):
+            with self.subTest(command=command):
+                action = action_policy.classify_action(
+                    "Bash", {"command": command}, cwd=self.wt)
+                self.assertEqual(action["class"], "read")
+                self.assertEqual(action["proof"], "inert_verb")
+                self.assertTrue(action_policy.decide(
+                    action, self.scope)["allow"])
+
+    def test_sink_operands_become_read_targets(self):
+        action = action_policy.classify_action(
+            "Bash", {"command": "head -n 20 f"}, cwd=self.wt)
+        self.assertEqual(action["targets"], [os.path.join(self.wt, "f")])
+        action = action_policy.classify_action(
+            "Bash", {"command": "uniq -f 1 file"}, cwd=self.wt)
+        self.assertEqual(action["targets"], [os.path.join(self.wt, "file")])
+        action = action_policy.classify_action(
+            "Bash", {"command": "cat a -- -b | wc -l"}, cwd=self.wt)
+        self.assertEqual(action["targets"], [
+            os.path.join(self.wt, "a"), os.path.join(self.wt, "-b")])
+
+    def test_unsafe_stages_name_construct_and_stage(self):
+        table = (
+            ("ls && rm -rf x", "mutating_stage", 2, 2),
+            ("git log | tee out", "mutating_stage", 2, 2),
+            ("ls | sh", "unknown_command", 2, 2),
+            ("ls && cat a > b", "redirect", 2, 2),
+            ("ls 2>&1 | head", "redirect", 1, 2),
+            ("sort -o out f", "unsafe_flag", 1, 1),
+            ("sort --compress-program=sh f", "unsafe_flag", 1, 1),
+            ("uniq a b", "extra_operand", 1, 1),
+            ("uniq -f 1 in out", "extra_operand", 1, 1),
+            ("uniq -- a -b", "unsafe_flag", 1, 1),
+            ("ls | foo", "unknown_command", 2, 2),
+            ("echo $(id) | head", "expansion", 1, 2),
+            ("ls || rm x", "unsupported_operator", 1, 2),
+            ("ls & rm x", "unsupported_operator", 1, 2),
+            ("ls |& head", "unsupported_operator", 1, 2),
+            ("ls\nrm x", "control_character", 1, 1),
+            ("git status; rm -rf /tmp/victim", "mutating_stage", 2, 2),
+            ("find . -delete | head", "find_action", 1, 2),
+            ("ls;rm x", "mutating_stage", 2, 2),
+            ("ls&&rm x", "mutating_stage", 2, 2),
+            ("ls \\; rm x", "escaped_operator", 1, 1),
+            ("grep 'a|b' f", "quoted_operator", 1, 1),
+            ('echo "a\\" ; rm x"', "quoted_operator", 1, 1),
+            ("ls &&", "empty_stage", 2, 2),
+            ("&& ls", "empty_stage", 1, 2),
+            ("ls ; ; ls", "empty_stage", 2, 3),
+            ("ls 'x", "unbalanced_quote", 1, 1),
+            ("ls && pwd -P >| /tmp/claude-abcd-cwd", "redirect", 2, 2),
+            ("cat =ls", "expansion", 1, 1),
+        )
+        for command, construct, index, count in table:
+            with self.subTest(command=command):
+                action = action_policy.classify_action(
+                    "Bash", {"command": command}, cwd=self.wt)
+                self.assertEqual(action["class"], "unknown")
+                self.assertEqual(action["reason"], "shell_unprovable")
+                detail = action["unprovable"]
+                self.assertEqual(detail["construct"], construct)
+                self.assertEqual(
+                    (detail["stage_index"], detail["stage_count"]),
+                    (index, count))
+                self.assertFalse(action_policy.decide(
+                    action, self.scope)["allow"])
+
+    def test_single_stage_redirect_keeps_write_classification(self):
+        action = action_policy.classify_action(
+            "Bash", {"command": "cat a > b"}, cwd=self.wt)
+        self.assertEqual(action["class"], "write")
+        outside = action_policy.OwnedScope(repo_roots=("/private/no",))
+        self.assertFalse(action_policy.decide(action, outside)["allow"])
+
+    def test_protected_read_bypasses_are_denied(self):
+        home = os.path.join(self._tmp.name, "home")
+        protected_rel = os.path.join(".cowork", "secret.json")
+        protected = os.path.join(home, protected_rel)
+        os.makedirs(os.path.dirname(protected))
+        Path(protected).write_text("{}\n")
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            scope = action_policy.OwnedScope(
+                repo_roots=(self.wt,), protected_paths=(protected,))
+            unprovable = (
+                ("cat ~/%s" % protected_rel, "expansion"),
+                ("ls && head ~/%s" % protected_rel, "expansion"),
+                ("cat <%s" % protected, "redirect"),
+                ("head < %s" % protected, "redirect"),
+                ("ls && cat <%s" % protected, "redirect"),
+                ("cat =ls", "expansion"),
+            )
+            for command, construct in unprovable:
+                with self.subTest(command=command):
+                    action = action_policy.classify_action(
+                        "Bash", {"command": command}, cwd=self.wt)
+                    self.assertEqual(action["reason"], "shell_unprovable")
+                    self.assertEqual(
+                        action["unprovable"]["construct"], construct)
+                    self.assertFalse(
+                        action_policy.decide(action, scope)["allow"])
+            for command in ("cat %s" % protected,
+                            "ls && cat %s" % protected,
+                            "head -n 5 %s" % protected,
+                            "sort %s | uniq" % protected):
+                with self.subTest(command=command):
+                    action = action_policy.classify_action(
+                        "Bash", {"command": command}, cwd=self.wt)
+                    self.assertEqual(action["class"], "read")
+                    self.assertEqual(
+                        action_policy.decide(action, scope),
+                        {"allow": False,
+                         "reason": "protected_controller_state"})
+
+    def test_controller_allowlists_do_not_grow(self):
+        self.assertEqual(action_policy.readonly_bash_commands(), (
+            "git status", "git diff", "git log", "git show", "git ls-files",
+            "git rev-parse", "find", "grep", "head", "ls", "pwd", "rg",
+            "tail", "wc"))
+        for verb in action_policy.SINK_COMMANDS:
+            self.assertNotIn(verb, action_policy.readonly_bash_commands())
+            self.assertFalse(any(
+                form.split()[1] == verb
+                for form in action_policy.rtk_command_forms()))
+            self.assertFalse(any(
+                pattern.split()[0] == verb
+                for pattern in action_policy.readonly_bash_glob_patterns()))
+
+
+class ShellUnprovableEvidenceTests(unittest.TestCase):
+    """#39: the offending stage is named in the hook reason and persisted
+    content-free in actions.jsonl."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = os.path.realpath(self._tmp.name)
+        self.owned = os.path.join(self.root, "owned")
+        os.mkdir(self.owned)
+        self.protected = os.path.join(self.root, "state", "auth.json")
+        os.makedirs(os.path.dirname(self.protected))
+        Path(self.protected).write_text("{}\n")
+        scope = action_policy.OwnedScope(
+            repo_roots=(self.owned,), protected_paths=(self.protected,))
+        self.actions = os.path.join(self.root, "actions.jsonl")
+        parent = {
+            "controller": "claude", "controller_source": "config_pinned",
+            "model": "sonnet", "model_source": "config_pinned",
+            "effort": "high", "effort_source": "config_pinned",
+        }
+        self.broker = guard_broker.GuardBroker(
+            os.path.join(self.root, "guard.sock"), "token", scope,
+            self.actions, os.path.join(self.root, "children.jsonl"),
+            os.path.join(self.root, "trace.jsonl"), parent)
+
+    def _handle(self, command, attempt_id):
+        return self.broker.handle({
+            "guard_attempt_id": attempt_id, "token": "token",
+            "payload": {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                        "tool_input": {"command": command},
+                        "cwd": self.owned}})
+
+    def _row(self, attempt_id):
+        with open(self.actions) as fh:
+            rows = [json.loads(line) for line in fh]
+        return next(row for row in rows
+                    if row["guard_attempt_id"] == attempt_id)
+
+    def test_deny_reason_and_record_identify_offending_stage(self):
+        table = (
+            ("ls && rm -rf x", "rm -rf x", "mutating_stage", 2, 2),
+            ("git log | tee out", "tee out", "mutating_stage", 2, 2),
+            ("ls | foo", "foo", "unknown_command", 2, 2),
+            ("ls 2>&1 | head", "&", "redirect", 1, 2),
+            ("sort -o out f", "sort -o out f", "unsafe_flag", 1, 1),
+            ("echo $(id) | head", "echo $(id)", "expansion", 1, 2),
+            ("ls || rm x", "||", "unsupported_operator", 1, 2),
+            ("git status; rm -rf /tmp/victim", "rm -rf /tmp/victim",
+             "mutating_stage", 2, 2),
+            ("cat <%s" % self.protected, "cat <%s" % self.protected,
+             "redirect", 1, 1),
+            ("cat ~/x", "cat ~/x", "expansion", 1, 1),
+        )
+        for number, (command, fragment, construct, index, count) in \
+                enumerate(table):
+            attempt_id = "attempt-%d" % number
+            with self.subTest(command=command):
+                response = self._handle(command, attempt_id)
+                output = response["hookSpecificOutput"]
+                self.assertEqual(output["permissionDecision"], "deny")
+                reason = output["permissionDecisionReason"]
+                self.assertEqual(reason.split()[0], "shell_unprovable")
+                self.assertIn("stage %d of %d, %s" % (index, count, construct),
+                              reason)
+                self.assertIn(json.dumps(fragment), reason)
+                self.assertTrue(reason.endswith(
+                    "guard_attempt_id=%s" % attempt_id))
+                self.assertEqual(
+                    bridge._denial_guard_attempt_id(reason), attempt_id)
+                row = self._row(attempt_id)
+                self.assertEqual(row["reason"], "shell_unprovable")
+                detail = row["unprovable"]
+                self.assertEqual(detail["construct"], construct)
+                self.assertEqual(detail["stage_index"], index)
+                self.assertEqual(detail["stage_count"], count)
+                raw = fragment.encode("utf-8")
+                self.assertEqual(detail["fragment_sha256"],
+                                 hashlib.sha256(raw).hexdigest())
+                self.assertEqual(detail["fragment_bytes"], len(raw))
+                serialized = json.dumps(row)
+                self.assertNotIn(command, serialized)
+                if (fragment not in action_policy._KNOWN_OPERATORS
+                        and fragment != detail.get("verb")):
+                    # Operator fragments are also the persisted enum value,
+                    # and a bare-verb fragment is the persisted safe token.
+                    self.assertNotIn(json.dumps(fragment)[1:-1], serialized)
+
+    def test_allowed_compound_row_and_bounded_reason(self):
+        response = self._handle("ls && git status | head", "allowed")
+        self.assertEqual(
+            response["hookSpecificOutput"]["permissionDecision"], "allow")
+        row = self._row("allowed")
+        self.assertTrue(row["allow"])
+        self.assertEqual(row["stage_count"], 3)
+        self.assertNotIn("unprovable", row)
+        long_verb = "a" * 500
+        response = self._handle("ls | " + long_verb, "long")
+        reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("stage 2 of 2, unknown_command", reason)
+        self.assertIn("…", reason)
+        self.assertLess(len(reason), 300)
+        self.assertNotIn(long_verb, json.dumps(self._row("long")))
+
+    def test_sanitize_keeps_only_safe_tokens(self):
+        action = {
+            "class": "unknown", "targets": [], "reason": "shell_unprovable",
+            "resolution_complete": False,
+            "unprovable": {
+                "construct": "made_up", "stage_index": 1, "stage_count": 1,
+                "fragment": "/abs/path/tool --x", "operator": ">>>",
+                "verb": "/abs/path/tool", "flag": "--output=/abs/leak"},
+        }
+        record = action_policy.sanitize(
+            {"allow": False, "reason": "shell_unprovable"}, action)
+        detail = record["unprovable"]
+        self.assertEqual(detail["construct"], "other")
+        self.assertEqual(detail["operator"], "other")
+        self.assertNotIn("verb", detail)
+        self.assertEqual(detail["flag"], "--output")
+        self.assertNotIn("/abs", json.dumps(record))
+        write = action_policy.classify_action(
+            "Bash", {"command": "cat a > b"}, cwd=self.owned)
+        record = action_policy.sanitize({"allow": True}, write)
+        self.assertEqual(set(record), {
+            "guard_attempt_id", "work_id", "parent_work_id", "allow",
+            "reason", "action_class", "target_count", "path_digests",
+            "command_fingerprint"})
+
+
+class ClaudeCwdTrackerBoundaryTests(unittest.TestCase):
+    """#50: Claude's per-call /tmp/claude-<4 hex>-cwd file, nothing else."""
+
+    CWD_RULES = (
+        '(allow file-write* (regex #"^/tmp/claude-[0-9a-f][0-9a-f][0-9a-f]'
+        '[0-9a-f]-cwd$"))',
+        '(allow file-write* (regex #"^/private/tmp/claude-[0-9a-f][0-9a-f]'
+        '[0-9a-f][0-9a-f]-cwd$"))',
+    )
+
+    def _profile(self, scope, **kwargs):
+        with mock.patch.object(bridge.sys, "platform", "darwin"), \
+                mock.patch.object(bridge.shutil, "which",
+                                  return_value="/usr/bin/sandbox-exec"):
+            return bridge.kernel_write_boundary(scope, ["true"], **kwargs)[
+                "profile"]
+
+    def test_profile_rule_is_claude_only_and_anchored(self):
+        scope = action_policy.OwnedScope(repo_roots=("/private/owned",))
+        claude = self._profile(scope, claude_cwd_tracker=True)
+        default = self._profile(scope)
+        for rule in self.CWD_RULES:
+            self.assertEqual(claude.count(rule), 1)
+            self.assertNotIn(rule, default)
+        self.assertNotIn("claude-[0-9a-f]", default)
+        self.assertEqual(
+            [line for line in claude.splitlines()
+             if line not in self.CWD_RULES],
+            default.splitlines())
+        scratch = "/tmp/claude-%d" % os.getuid()
+        allowed_tmp = {
+            '(allow file-write* (subpath "%s"))' % scratch,
+            '(allow file-write* (subpath "%s"))' % os.path.realpath(scratch),
+        } | set(self.CWD_RULES)
+        for line in claude.splitlines():
+            if line.startswith("(allow") and "tmp" in line:
+                self.assertIn(line, allowed_tmp)
+
+    def test_denial_parser_takes_last_attempt_id(self):
+        self.assertEqual(bridge._denial_guard_attempt_id(
+            'shell_unprovable (stage 1 of 1, unknown_command: '
+            '"x guard_attempt_id=forged") guard_attempt_id=real-1'),
+            "real-1")
+        self.assertIsNone(bridge._denial_guard_attempt_id("denied"))
+
+    def test_claude_probe_and_spawn_pass_flag_codex_does_not(self):
+        class Broker:
+            def stop(self):
+                pass
+
+        runtime = {
+            "settings_path": "/guard/settings.json",
+            "delegation_allowed": False,
+            "scope": action_policy.OwnedScope(),
+            "env": {"TMPDIR": "/guard/tmp"},
+            "broker": Broker(), "profile": None, "protected_paths": (),
+        }
+
+        class Trace:
+            session_uuid = "cwd-flag"
+
+            def event(self, *_args, **_kwargs):
+                pass
+
+        def fake_boundary(_scope, argv=None, protected_paths=(),
+                          claude_cwd_tracker=False):
+            return {"available": True, "platform": "darwin",
+                    "argv": list(argv or ())}
+
+        previous = bridge.set_nested_guard_active(True)
+        self.addCleanup(bridge.set_nested_guard_active, previous)
+        with mock.patch.object(bridge, "_guard_runtime",
+                               return_value=runtime), \
+                mock.patch.object(bridge, "_close_guard_runtime"), \
+                mock.patch.object(bridge, "kernel_write_boundary",
+                                  side_effect=fake_boundary) as boundary:
+            ok, _alert = bridge.probe_claude_stream_json(
+                lambda _command, _stdin: [{"type": "result",
+                                           "result": "ok"}],
+                trace=Trace(), extra_writable_dir="/session/assets",
+                auth_run=lambda *args, **kwargs: subprocess.CompletedProcess(
+                    args[0], 0,
+                    stdout='{"loggedIn":true,"authMethod":"claude.ai"}',
+                    stderr=""))
+        self.assertTrue(ok)
+        self.assertIs(boundary.call_args.kwargs.get("claude_cwd_tracker"),
+                      True)
+
+        bridge.set_nested_guard_active(False)
+        with tempfile.TemporaryDirectory() as root:
+            role = os.path.join(root, "role.md")
+            Path(role).write_text("ROLE")
+            with mock.patch.object(bridge, "kernel_write_boundary",
+                                   side_effect=fake_boundary) as boundary, \
+                    mock.patch.object(bridge.subprocess, "Popen",
+                                      return_value=mock.MagicMock()):
+                bridge.ClaudeSession(
+                    role, "plan", False, io_out=io.StringIO(),
+                    owned_scope=action_policy.OwnedScope(repo_roots=(root,)))
+            self.assertIs(
+                boundary.call_args.kwargs.get("claude_cwd_tracker"), True)
+
+            class FakeCodex(bridge.CodexSession):
+                def _run(self, _command):
+                    return [{"type": "thread.started", "thread_id": "t-1"},
+                            {"type": "turn.completed"}]
+
+            context_path = os.path.join(root, "context.json")
+            Path(context_path).write_text("{}\n")
+            session = FakeCodex("plan", False, io_out=io.StringIO())
+            session._guard_runtime = {
+                "context_path": context_path,
+                "scope": action_policy.OwnedScope(),
+                "protected_paths": (), "broker": None, "profile": None,
+            }
+            with mock.patch.object(bridge, "kernel_write_boundary",
+                                   side_effect=fake_boundary) as boundary:
+                self.assertTrue(session.send("guarded")["ok"])
+            self.assertFalse(
+                boundary.call_args.kwargs.get("claude_cwd_tracker", False))
+
+    # -- real seatbelt (darwin) ------------------------------------------ #
+
+    def _seatbelt_scope(self, root):
+        repo, wt, other = _git_nested_worktrees(root)
+        active, siblings = bridge._git_worktree_scope(wt)
+        self.assertEqual(active, wt)
+        scope = action_policy.OwnedScope(
+            repo_roots=(active,), sibling_worktrees=siblings)
+        probe = bridge.kernel_write_boundary(scope)
+        if not probe["available"] or probe["platform"] != "darwin":
+            self.skipTest("real seatbelt execution is darwin-only")
+        return repo, wt, other, scope
+
+    @staticmethod
+    def _fresh_hex(upper=False):
+        while True:
+            value = uuid.uuid4().hex[:4]
+            if upper:
+                value = "ABCDEF"[int(value[0], 16) % 6] + value[1:].upper()
+            if not os.path.lexists("/tmp/claude-%s-cwd" % value.lower()) \
+                    and not os.path.lexists("/tmp/claude-%s-cwd" % value):
+                return value
+
+    def _require_unsandboxed_tmp(self, path):
+        # A nested seatbelt can only narrow its parent: when this test itself
+        # runs inside a profile without the cwd rule, the positive case is
+        # unprovable here and is reported as a skip, never as a pass.
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except PermissionError as exc:
+            self.skipTest("outer sandbox denies /tmp writes: %s" % exc)
+        os.close(fd)
+        os.unlink(path)
+
+    def _zsh(self, scope, script, cwd, **kwargs):
+        wrapped = bridge.kernel_write_boundary(
+            scope, ["/bin/zsh", "-c", script], **kwargs)
+        return subprocess.run(wrapped["argv"], cwd=cwd, capture_output=True,
+                              text=True)
+
+    def test_real_seatbelt_cwd_file_written_from_worktree(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo, wt, other, scope = self._seatbelt_scope(root)
+            name = self._fresh_hex()
+            path = "/tmp/claude-%s-cwd" % name
+            self._require_unsandboxed_tmp(path)
+            script = "ls >/dev/null && pwd -P >| %s" % path
+            try:
+                denied = self._zsh(scope, script, wt)
+                self.assertTrue(denied.returncode != 0
+                                or "operation not permitted" in denied.stderr)
+                self.assertFalse(os.path.lexists(path))
+                allowed = self._zsh(scope, script, wt,
+                                    claude_cwd_tracker=True)
+                self.assertEqual(allowed.returncode, 0, allowed.stderr)
+                self.assertNotIn("operation not permitted", allowed.stderr)
+                self.assertEqual(Path(path).read_text().strip(),
+                                 os.path.realpath(wt))
+                for target in (os.path.join(repo, "evil"),
+                               os.path.join(other, "evil")):
+                    result = self._zsh(scope, ": >| %s" % target, wt,
+                                       claude_cwd_tracker=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(os.path.lexists(target))
+            finally:
+                if os.path.lexists(path):
+                    os.unlink(path)
+
+    def test_real_seatbelt_near_miss_and_symlink_denied(self):
+        with tempfile.TemporaryDirectory() as root:
+            _repo, wt, _other, scope = self._seatbelt_scope(root)
+            outside = os.path.join(root, "outside")
+            os.mkdir(outside)
+            hexes = [self._fresh_hex() for _ in range(7)]
+            upper = "/tmp/claude-%s-cwd" % self._fresh_hex(upper=True)
+            near_misses = [
+                "/tmp/claude-%s-cwd.x" % hexes[0],
+                "/tmp/claude-%s%s-cwd" % (hexes[1], hexes[1][0]),
+                "/tmp/claude-%s-cwdx" % hexes[2],
+                "/tmp/claude-%s-cwd/x" % hexes[3],
+                "/tmp/xclaude-%s-cwd" % hexes[4],
+                "/tmp/claude-%s-cwd-evil" % hexes[5],
+            ]
+            link = "/tmp/claude-%s-cwd" % hexes[6]
+            target = os.path.join(outside, "target")
+            created = []
+            try:
+                for path in near_misses:
+                    with self.subTest(path=path):
+                        created.append(path)
+                        result = self._zsh(scope, ": >| %s" % path, wt,
+                                           claude_cwd_tracker=True)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(os.path.lexists(path))
+                with self.subTest(path=upper):
+                    # Upper-case hex is a near-miss only on a case-sensitive
+                    # /tmp. On the default case-insensitive APFS volume it
+                    # names the very same object as the lower-case slot the
+                    # anchored rule already grants, so seatbelt allows it;
+                    # that must never create a distinct file.
+                    lower = upper.lower()
+                    created.extend((upper, lower))
+                    result = self._zsh(scope, ": >| %s" % upper, wt,
+                                       claude_cwd_tracker=True)
+                    if result.returncode == 0:
+                        self.assertTrue(os.path.exists(lower))
+                        self.assertTrue(os.path.samefile(upper, lower))
+                        name = os.path.basename(lower)
+                        self.assertEqual(len([
+                            entry for entry in os.listdir("/tmp")
+                            if entry.lower() == name]), 1)
+                    else:
+                        self.assertFalse(os.path.lexists(upper))
+                        self.assertFalse(os.path.lexists(lower))
+                try:
+                    os.symlink(target, link)
+                except PermissionError as exc:
+                    self.skipTest("outer sandbox denies /tmp writes: %s" % exc)
+                created.append(link)
+                result = self._zsh(scope, ": >| %s" % link, wt,
+                                   claude_cwd_tracker=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(os.path.exists(target))
+            finally:
+                for path in created:
+                    if os.path.islink(path) or os.path.isfile(path):
+                        os.unlink(path)
+
+    def test_model_issued_writes_to_cwd_file_stay_denied_by_policy(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo, wt, other = _git_nested_worktrees(root)
+            active, siblings = bridge._git_worktree_scope(wt)
+            scope = action_policy.OwnedScope(
+                repo_roots=(active,), sibling_worktrees=siblings)
+            bash = action_policy.classify_action(
+                "Bash", {"command": "pwd > /tmp/claude-abcd-cwd"}, cwd=wt)
+            self.assertEqual(action_policy.decide(bash, scope)["reason"],
+                             "target_outside_owned_scope")
+            write = action_policy.classify_action(
+                "Write", {"file_path": "/tmp/claude-abcd-cwd"}, cwd=wt)
+            self.assertEqual(action_policy.decide(write, scope)["reason"],
+                             "target_outside_owned_scope")
+            composed = action_policy.classify_action(
+                "Bash", {"command": "ls && pwd -P >| /tmp/claude-abcd-cwd"},
+                cwd=wt)
+            self.assertEqual(action_policy.decide(composed, scope)["reason"],
+                             "shell_unprovable")
+            for path in (os.path.join(repo, "evil"),
+                         os.path.join(other, "evil")):
+                with self.subTest(path=path):
+                    action = action_policy.classify_action(
+                        "Write", {"file_path": path}, cwd=wt)
+                    self.assertIn(
+                        action_policy.decide(action, scope)["reason"],
+                        ("sibling_worktree", "target_outside_owned_scope"))
+
+
 class KernelWriteBoundaryTests(unittest.TestCase):
     def test_protected_profile_files_override_writable_state_root(self):
         with tempfile.TemporaryDirectory() as root:
@@ -23752,7 +24371,7 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
                 mock.patch.object(
                 bridge, "kernel_write_boundary",
                     side_effect=lambda _scope, argv=None,
-                    protected_paths=(): {
+                    protected_paths=(), claude_cwd_tracker=False: {
                         "available": True, "platform": "darwin",
                         "argv": ["sandbox-exec"] + list(argv or ())}):
             ok, alert = bridge.probe_claude_stream_json(
@@ -25172,7 +25791,7 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
             with mock.patch.object(
                     bridge, "kernel_write_boundary",
                     side_effect=lambda _scope, argv=None,
-                    protected_paths=(): {
+                    protected_paths=(), claude_cwd_tracker=False: {
                         "available": True, "platform": "darwin",
                         "argv": list(argv or ()),
                     }):
@@ -25360,7 +25979,7 @@ class ControllerStateIsolationTests(unittest.TestCase):
                     mock.patch.object(
                         bridge, "kernel_write_boundary",
                         side_effect=lambda _scope, argv=None,
-                        protected_paths=(): {
+                        protected_paths=(), claude_cwd_tracker=False: {
                             "available": True, "platform": "darwin",
                             "argv": list(argv or ())}), \
                     mock.patch.object(
@@ -34802,7 +35421,7 @@ class RealParentWorkUnitIdentityInBrokerPayloadTest(unittest.TestCase):
             with mock.patch.object(
                     bridge, "kernel_write_boundary",
                     side_effect=lambda _scope, argv=None,
-                    protected_paths=(): {
+                    protected_paths=(), claude_cwd_tracker=False: {
                         "available": True, "platform": "darwin",
                         "argv": list(argv or ()),
                     }):

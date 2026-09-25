@@ -1492,6 +1492,27 @@ drift denies. Durable decisions contain hashes and reason codes rather than raw
 commands, delegated prompts, or absolute paths. Child requests retain only
 controller/model/effort identity, a digest, and byte length.
 
+Bash commands may be composed only with `&&`, `;` and `|`. The command is
+split at unquoted operators and every stage must independently prove
+read-only; a compound containing any write, delete, unknown or unproven stage
+is denied as a whole, even when the write target is owned. Operator characters
+inside quotes or after a backslash, every other operator (`||`, `&`, `|&`,
+newlines), every redirect (including `2>&1`, `>|` and any `<`), and
+expansions (including `~` and zsh `=word`) stay denied. Beyond the inert
+verbs, the proof path accepts the stdout-only helpers `cat`, `sort`, `uniq`,
+`echo` and `which` with explicit flag tables (for example `sort -o` and
+`uniq`'s second operand are denied). They are not part of the OpenCode
+read-only allowlist. File operands of `cat`, `sort`, `uniq`, `head`, `tail`
+and `wc` are read targets, so protected controller state stays unreadable
+through them. A `shell_unprovable` denial names the offending stage in the
+hook reason, for example `shell_unprovable (stage 2 of 3, unknown_command:
+"foo") guard_attempt_id=…`, with the fragment JSON-escaped and truncated to
+160 characters. The attempt id is always the last token. The action record
+stores only an `unprovable` object: stage index and count, the operator and
+construct as closed enums, the verb and flag name when they are short safe
+tokens, and the fragment's sha256 and byte length. It never stores the raw
+text.
+
 Writable scope is exactly the selected worktree, the acting role's declared
 outputs, and its private temp/controller-state directories. Deletes require an
 exact owned and recoverable target. A generated operating-system sandbox
@@ -1510,6 +1531,15 @@ probe adds no role outputs at all. The probe work id is published to the hook
 context before its process launches, so any attempted action joins to the
 diagnostic work item. If discovery, the broker, or the kernel boundary is
 unavailable, the process is refused rather than silently downgraded.
+Claude's Bash tool writes its working directory to a per-call
+`/tmp/claude-<4 hex>-cwd` file after every command. The macOS profile for a
+Claude launch (role spawn and live probe only) allows writes to exactly that
+file shape through two anchored rules for `/tmp` and `/private/tmp`, and to
+nothing else in `/tmp`. Codex, OpenCode and authentication-check profiles do
+not get the rule. The file is not part of the owned scope, so a model-issued
+write to it is still denied by the hook. The accepted residual is that one
+Claude sandbox could overwrite another live Claude session's cwd file. The
+Linux bubblewrap profile does not include the rule.
 Broker sockets use a short nonce-derived `/tmp` pathname so deeply nested
 session roots cannot exceed the platform AF_UNIX limit; the random token still
 authenticates every request, permissions are owner-only, and the broker verifies
