@@ -64,6 +64,8 @@ import cowork_activity as activity_contracts  # noqa: E402
 import cowork_watchdog as watchdog  # noqa: E402
 import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 import cowork_owner  # noqa: E402
+import cowork_profiles as controller_profiles  # noqa: E402
+import cowork_action_policy as action_policy  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -344,6 +346,18 @@ def build_parser():
                         "(with --context) when it does not")
     p.add_argument("--no-session", action="store_true",
                    help="do not read or write the session store")
+    p.add_argument("--output-root", dest="output_root", action="append",
+                   default=[], metavar="DIR",
+                   help="declare an external evidence output root the "
+                        "builder may write into (repeatable). DIR must be an "
+                        "existing directory outside the repository, its "
+                        "worktrees, the cowork session directories and every "
+                        "controller's home/state directory; it is validated, "
+                        "canonicalized and bound to the session record before "
+                        "anything is created, and granted to the builder "
+                        "only. On resume: omit it to reuse the saved roots, "
+                        "repeat them exactly, or declare them for the first "
+                        "time when the session has none.")
     p.add_argument("--new", action="store_true",
                    help="start a new session (the default when no session "
                         "selector is given; requires --context)")
@@ -452,6 +466,104 @@ def build_parser():
     p.add_argument("--notes", dest="eval_notes", metavar="TEXT",
                    help="with --evaluate-role: optional free-form note")
     return p
+
+
+# --------------------------------------------------------------------------- #
+# Declared external output roots (cowork-internal #99).                        #
+#                                                                              #
+# `--output-root DIR` is the ONLY way an orchestrator widens the builder's     #
+# writable scope beyond the repository: a typed, repeatable flag, validated    #
+# and canonicalized here BEFORE any session file, lease or trace exists, then  #
+# bound to the session record (`declared_output_roots`) so every resume       #
+# reproduces exactly the authorized roots. Anything ambiguous, unsafe or       #
+# conflicting is refused with a closed reason code; nothing widens silently.   #
+# --------------------------------------------------------------------------- #
+
+# Locations refused only when a declared root EQUALS them (a root inside home
+# or /tmp is ordinary; home or /tmp themselves are never a bounded grant).
+OUTPUT_ROOT_EQUAL_ONLY = ("/", "~", "/tmp", "/private/tmp")
+
+
+def _output_root_real(path):
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def _output_root_touches(root, protected):
+    """True when `root` equals, lies inside, or contains `protected`."""
+    return (root == protected
+            or action_policy._inside(root, protected)
+            or action_policy._inside(protected, root))
+
+
+def validate_output_roots(raw_roots, launch_toplevel, registered_worktrees,
+                          sessions_root, session_file_dir, controller_dirs=(),
+                          home=None):
+    """Validate and canonicalize `--output-root` values (pure: no session
+    state is read or written).
+
+    Returns `(roots, None, None)` with `roots` a sorted tuple of realpaths,
+    or `(None, reason, message)` with one of the closed refusal codes:
+
+    - `output_root_invalid` -- not a non-empty string, a control character,
+      or not absolute after `~` expansion;
+    - `output_root_missing` -- not an existing directory (a file or a
+      dangling link included);
+    - `output_root_unsafe` -- exactly `/`, home, `/tmp` or `/private/tmp`,
+      or equal to / inside / containing the repository, a registered
+      worktree, the cowork sessions root, the session-file directory or a
+      controller's real home/state directory;
+    - `output_roots_conflict` -- a duplicate, or one declared root nested in
+      another.
+    """
+    home_real = _output_root_real("~" if home is None else home)
+    equal_only = tuple(dict.fromkeys(
+        home_real if p == "~" else _output_root_real(p)
+        for p in OUTPUT_ROOT_EQUAL_ONLY))
+    symmetric = []
+    for label, group in (
+            ("the repository", (launch_toplevel,)),
+            ("a registered worktree", tuple(registered_worktrees or ())),
+            ("the cowork sessions root", (sessions_root,)),
+            ("the session file directory", (session_file_dir,)),
+            ("a controller home/state directory",
+             tuple(controller_dirs or ()))):
+        for path in group:
+            if path:
+                symmetric.append((label, _output_root_real(path)))
+    reals = []
+    for raw in raw_roots:
+        if (not isinstance(raw, str) or not raw
+                or action_policy._CONTROL.search(raw)):
+            return (None, "output_root_invalid",
+                    "--output-root %r is not a usable directory path" % (raw,))
+        expanded = os.path.expanduser(raw)
+        if not os.path.isabs(expanded):
+            return (None, "output_root_invalid",
+                    "--output-root %s must be an absolute path" % raw)
+        if not os.path.isdir(expanded):
+            return (None, "output_root_missing",
+                    "--output-root %s is not an existing directory" % raw)
+        real = _output_root_real(expanded)
+        if not os.path.isdir(real):
+            return (None, "output_root_missing",
+                    "--output-root %s does not resolve to an existing "
+                    "directory" % raw)
+        if real in equal_only:
+            return (None, "output_root_unsafe",
+                    "--output-root %s is not a bounded location" % raw)
+        for label, protected in symmetric:
+            if _output_root_touches(real, protected):
+                return (None, "output_root_unsafe",
+                        "--output-root %s equals, lies inside or contains %s"
+                        % (raw, label))
+        reals.append(real)
+    for index, real in enumerate(reals):
+        for other in reals[:index]:
+            if real == other or _output_root_touches(real, other):
+                return (None, "output_roots_conflict",
+                        "--output-root %s duplicates or nests another "
+                        "declared root" % raw_roots[index])
+    return tuple(sorted(dict.fromkeys(reals))), None, None
 
 
 def run_report(args, io_out=None):
@@ -11276,9 +11388,13 @@ def run_builder(config, context, selected, io_out=None,
                 reviewer_controller_check_fn=None,
                 save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None,
-                checkpoint_id=None, artifact_kind=None):
+                checkpoint_id=None, artifact_kind=None,
+                external_output_roots=()):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
+
+    `external_output_roots` (#99) are the session's declared external output
+    roots; the builder is the only role that receives them, on every spawn.
 
     `context` is the seed message for this cycle: the approved-plan seed on a
     fresh chain, a plan-updated wake block after a hand-back round trip, or ""
@@ -11523,7 +11639,8 @@ def run_builder(config, context, selected, io_out=None,
                     speaker="builder", session_id=session_id, resume_id=rid,
                     on_session_id=cb, trace=trace,
                     extra_writable_dir=sessions_dir,
-                    model=cfg.get("model"), effort=cfg.get("effort"))
+                    model=cfg.get("model"), effort=cfg.get("effort"),
+                    external_output_roots=tuple(external_output_roots or ()))
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
@@ -11586,7 +11703,8 @@ def run_builder(config, context, selected, io_out=None,
                     io_out=io_out, speaker="builder",
                     resume_session_id=resume_id, on_session_id=cb, trace=trace,
                     extra_writable_dir=sessions_dir,
-                    model=cfg.get("model"), effort=cfg.get("effort"))
+                    model=cfg.get("model"), effort=cfg.get("effort"),
+                    external_output_roots=tuple(external_output_roots or ()))
         except KeyboardInterrupt:
             raise
         except policy.DispatchBlocked as exc:
@@ -11645,7 +11763,8 @@ def run_builder(config, context, selected, io_out=None,
                 cfg["mode"], cfg["yolo"], io_out=io_out, speaker="builder",
                 resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
                 extra_writable_dir=sessions_dir,
-                model=cfg.get("model"), effort=cfg.get("effort"))
+                model=cfg.get("model"), effort=cfg.get("effort"),
+                external_output_roots=tuple(external_output_roots or ()))
     except policy.DispatchBlocked as exc:
         if trace:
             trace.event("role.end", role="builder", result="policy_blocked",
@@ -12307,6 +12426,45 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                       "--%s applies to a saved session with an open decision "
                       "request; %s is not one" % (
                           decision[0].replace("_", "-"), spath))
+    # Declared external output roots (#99): validated HERE, after session
+    # selection and before team/config, so a refusal leaves nothing behind.
+    # A resumed session reproduces its saved roots; a session without any may
+    # receive a first declaration; a differing re-declaration is refused.
+    raw_roots = list(getattr(args, "output_root", None) or [])
+    if raw_roots and not session_enabled:
+        return refuse("conflicting_arguments",
+                      "--output-root binds external output roots to a saved "
+                      "session; it cannot be combined with --no-session")
+    saved_roots = (state_store.get_declared_output_roots(saved)
+                   if session_enabled else ())
+    declared_roots = saved_roots if resuming_saved else ()
+    persist_output_roots = False
+    if raw_roots:
+        try:
+            active_scope, sibling_scope = bridge._git_worktree_scope(run_cwd)
+        except bridge.GitWorktreeScopeError as exc:
+            return refuse("output_root_unsafe",
+                          "--output-root cannot be proved outside every "
+                          "registered worktree: %s" % exc.reason)
+        controller_dirs = (
+            controller_profiles.default_claude_config_dir(),
+            os.path.dirname(controller_profiles.default_codex_auth_file()),
+            controller_profiles.opencode_data_dir())
+        roots, root_reason, root_message = validate_output_roots(
+            raw_roots, launch_toplevel=launch_toplevel,
+            registered_worktrees=(active_scope,) + tuple(sibling_scope),
+            sessions_root=state_store.sessions_root(),
+            session_file_dir=os.path.dirname(os.path.realpath(spath)),
+            controller_dirs=controller_dirs)
+        if root_reason:
+            return refuse(root_reason, root_message)
+        if resuming_saved and saved_roots and roots != saved_roots:
+            return refuse("output_roots_conflict",
+                          "--output-root differs from the saved session's "
+                          "declared roots; omit the flag to reuse them or "
+                          "start a new session")
+        declared_roots = roots
+        persist_output_roots = not (resuming_saved and saved_roots)
     # Team, config and reviewer pairing are validated BEFORE any session is
     # created or lease acquired: an invalid invocation leaves nothing behind
     # for a later --resume to pick up.
@@ -13299,6 +13457,13 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
         if session_enabled and not reuse_config:
             holder["state"] = saved = state_store.save_config(
                 spath, selected, config, prior=holder["state"] or {})
+        if session_enabled and persist_output_roots:
+            # The validated set becomes the session's authority (#99); the
+            # trace records counts and flags only, never a path.
+            holder["state"] = saved = state_store.set_declared_output_roots(
+                spath, declared_roots, prior=holder["state"])
+            trace.event("output_roots.declared", count=len(declared_roots),
+                        first_declaration=bool(resuming_saved))
 
         lead_role = PHASE_LEADS[phase]
         lead_resume_id = role_resume_id(lead_role)
@@ -14640,6 +14805,7 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     save_pending_turn_fn=save_pending_turn_for,
                     clear_pending_turn_fn=clear_pending_switch_for,
                     worktree=active_worktree, worktree_base=active_worktree_root,
+                    external_output_roots=declared_roots,
                     on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
                 _bind_decision_launch(session_uuid, "builder", None)
                 record_outcome("builder", builder_box)
@@ -14963,33 +15129,38 @@ def _resume_wake_failure_kind(lease, current_binding, provider_session_id):
 
 
 def _construct_resume_session(role, controller, cfg, resume_provider_session_id,
-                              sessions_dir, trace):
+                              sessions_dir, trace, external_output_roots=()):
     """Reconstruct a live bridge session for the exactly-once resumed send,
     from the SAME durable (controller, model, effort, mode, yolo) config the
     original dispatch used (`state["config"][role]`) -- never guessed or
     defaulted differently from the engagement's own genuine identity.
-    Returns None for an unrecognized controller."""
+    `external_output_roots` (#99) reproduces the session's declared roots for
+    the builder only. Returns None for an unrecognized controller."""
     prompt_path = ROLE_PROMPT_PATHS.get(role) or SCOUT_PROMPT_PATH
     mode = cfg.get("mode", "implement")
     yolo = cfg.get("yolo", True)
     model = cfg.get("model")
     effort = cfg.get("effort")
+    roots = tuple(external_output_roots or ())
     devnull = open(os.devnull, "w")
     if controller == "claude":
         return bridge.ClaudeSession(
             prompt_path, mode, yolo, io_out=devnull, speaker=role,
             resume_id=resume_provider_session_id, trace=trace,
-            extra_writable_dir=sessions_dir, model=model, effort=effort)
+            extra_writable_dir=sessions_dir, model=model, effort=effort,
+            external_output_roots=roots)
     if controller == "codex":
         return bridge.CodexSession(
             mode, yolo, io_out=devnull, speaker=role,
             resume_thread_id=resume_provider_session_id, trace=trace,
-            extra_writable_dir=sessions_dir, model=model, effort=effort)
+            extra_writable_dir=sessions_dir, model=model, effort=effort,
+            external_output_roots=roots)
     if controller == "opencode":
         return bridge.OpencodeSession(
             prompt_path, mode, yolo, io_out=devnull, speaker=role,
             resume_session_id=resume_provider_session_id, trace=trace,
-            extra_writable_dir=sessions_dir, model=model, effort=effort)
+            extra_writable_dir=sessions_dir, model=model, effort=effort,
+            external_output_roots=roots)
     return None
 
 
@@ -15557,7 +15728,10 @@ def run_resume_trigger(argv, output=None, session_factory=None):
         else:
             session = _construct_resume_session(
                 effective_role, controller, cfg, provider_session_id, sessions_dir,
-                trace=None)
+                trace=None,
+                external_output_roots=(
+                    state_store.get_declared_output_roots(state)
+                    if effective_role == "builder" else ()))
         if session is None:
             write(json.dumps({"outcome": "internal_error",
                               "detail": "unrecognized controller %r" % controller}
@@ -15769,7 +15943,8 @@ def main(argv=None):
         mutating = [("--switch-controller", bool(args.switch_controller)),
                     ("--allow-controllers",
                      args.allow_controllers is not None),
-                    ("--take-over", bool(getattr(args, "take_over", False)))]
+                    ("--take-over", bool(getattr(args, "take_over", False))),
+                    ("--output-root", bool(args.output_root))]
         mutating += [("--" + kind.replace("_", "-"), True)
                      for kind, _rid in _decision_flags(args)]
         for flag, supplied in mutating:
@@ -15783,6 +15958,14 @@ def main(argv=None):
                     emit_run_result(sys.stdout, 2,
                                     {"reason": "conflicting_arguments"})
                     return 2
+        # A declaration never dispatches a builder from the evaluation side
+        # channel either (#99): refuse rather than silently drop it.
+        if args.output_root and getattr(args, "evaluate_role", None):
+            sys.stderr.write("cowork: --output-root cannot be combined with "
+                             "--evaluate-role.\n")
+            emit_run_result(sys.stdout, 2,
+                            {"reason": "conflicting_arguments"})
+            return 2
         if args.check:
             return preflight.main()
         if args.report:

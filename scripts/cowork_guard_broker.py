@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import threading
 import uuid
 import datetime
@@ -43,6 +44,104 @@ CHILD_LIFECYCLE_ENDED = "ended"
 # "ungoverned_terminal" — the outcome is still durably recorded and still
 # terminal, but it was never an observed, correlated child lifecycle.
 CHILD_LIFECYCLE_UNGOVERNED_TERMINAL = "ungoverned_terminal"
+
+# Per-command bound for the read-only Git facts behind a delete decision
+# (cowork-internal #99).  A timeout is a denial, never an allowance.
+GIT_FACT_TIMEOUT_S = 10
+
+
+def _no_facts(rel=None):
+    return {"rel": rel, "regular_file": False}
+
+
+def _decode_path(raw):
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def derive_delete_facts(root, target, lexical, run=None,
+                        timeout=GIT_FACT_TIMEOUT_S):
+    """Measure, from Git, whether deleting `target` (a realpath inside the
+    repository `root`) is recoverable.  `lexical` is the operand as typed.
+
+    Returns a facts dict for `cowork_action_policy.clean_tracked_delete_proof`
+    or None when Git could not be consulted (timeout, OS error, malformed
+    output).  Pre-checks that need no Git: the lexical path must be a str,
+    must not itself be a symlink (tracked or untracked -- the shell would
+    remove the link while the judged file survives), must resolve to exactly
+    the judged realpath, and the target must be a regular file inside
+    `root`.  Any pre-check failure yields `regular_file: False`, a denial.
+    Nothing here is cached: the caller derives on every attempt."""
+    run = run or subprocess.run
+    if not isinstance(lexical, str) or not lexical:
+        return _no_facts()
+    if not isinstance(root, str) or not root or not isinstance(target, str):
+        return _no_facts()
+    root = os.path.realpath(root)
+    if os.path.islink(lexical):
+        return _no_facts()
+    if os.path.realpath(lexical) != target:
+        return _no_facts()
+    if not os.path.isfile(target):
+        return _no_facts()
+    rel = os.path.relpath(target, root)
+    if rel == ".." or rel.startswith(".." + os.sep) or os.path.isabs(rel):
+        return _no_facts()
+    facts = {
+        "rel": rel, "regular_file": True,
+        "index_entries": 0, "index_mode": None, "index_blob": None,
+        "index_stage": None, "index_path": None,
+        "head_commit": None, "head_type": None, "head_blob": None,
+        "head_path": None,
+        "worktree_clean": False, "index_clean": False,
+        "worktree_blob": None,
+    }
+
+    def git(*args):
+        return run(["git", "-C", root] + list(args), stdout=subprocess.PIPE,
+                   stderr=subprocess.DEVNULL, timeout=timeout)
+
+    try:
+        listed = git("ls-files", "-s", "-z", "--error-unmatch", "--", rel)
+        if listed.returncode == 0:
+            entries = [e for e in (listed.stdout or b"").split(b"\0") if e]
+            facts["index_entries"] = len(entries)
+            if len(entries) == 1:
+                meta, _tab, path = entries[0].partition(b"\t")
+                fields = meta.split(b" ")
+                if len(fields) == 3 and _tab:
+                    facts["index_mode"] = fields[0].decode("ascii", "replace")
+                    facts["index_blob"] = fields[1].decode("ascii", "replace")
+                    try:
+                        facts["index_stage"] = int(fields[2])
+                    except ValueError:
+                        facts["index_stage"] = None
+                    facts["index_path"] = _decode_path(path)
+        head = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        if head.returncode == 0:
+            facts["head_commit"] = (head.stdout or b"").decode(
+                "ascii", "replace").strip() or None
+        tree = git("ls-tree", "-z", "HEAD", "--", rel)
+        if tree.returncode == 0:
+            entries = [e for e in (tree.stdout or b"").split(b"\0") if e]
+            if len(entries) == 1:
+                meta, _tab, path = entries[0].partition(b"\t")
+                fields = meta.split(b" ")
+                if len(fields) == 3 and _tab:
+                    facts["head_type"] = fields[1].decode("ascii", "replace")
+                    facts["head_blob"] = fields[2].decode("ascii", "replace")
+                    facts["head_path"] = _decode_path(path)
+        facts["worktree_clean"] = git(
+            "diff", "--quiet", "--", rel).returncode == 0
+        facts["index_clean"] = git(
+            "diff", "--cached", "--quiet", "--", rel).returncode == 0
+        hashed = git("hash-object", "--", rel)
+        if hashed.returncode == 0:
+            facts["worktree_blob"] = (hashed.stdout or b"").decode(
+                "ascii", "replace").strip() or None
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError,
+            ValueError, UnicodeDecodeError):
+        return None
+    return facts
 
 
 def append_once(path, record, key="guard_attempt_id", sync=True):
@@ -369,10 +468,10 @@ class GuardBroker:
             tool_name, tool_input, cwd=payload.get("cwd"),
             installed_schema=self.installed_schemas.get(tool_name),
             capability_allowlist=self.capability_allowlist)
+        # Recoverability is derived from Git for this attempt, never read
+        # from the payload (#99): no hook-supplied path list grants anything.
         decision = action_policy.decide(
-            action, self.scope,
-            created_paths=payload.get("created_paths") or (),
-            clean_tracked_paths=payload.get("clean_tracked_paths") or ())
+            action, self.scope, delete_facts=self._delete_facts(action))
         record = action_policy.sanitize(
             decision, action, work_id=acting_work_id,
             parent_work_id=parent_work_id, guard_attempt_id=attempt_id)
@@ -385,6 +484,34 @@ class GuardBroker:
         detail = (action.get("unprovable")
                   if decision.get("reason") == "shell_unprovable" else None)
         return self._hook_response(decision, attempt_id, detail=detail)
+
+    def _delete_facts(self, action):
+        """Per-attempt Git facts for every delete target inside exactly one
+        repository root.  Keyed by realpath; a target with no entry is not
+        recoverable.  Missing or misaligned lexical operands yield no facts
+        (deny by absence)."""
+        if (action.get("class") != "delete"
+                or not action.get("resolution_complete")):
+            return {}
+        targets = action.get("targets") or []
+        lexicals = action.get("lexical_targets")
+        if not isinstance(lexicals, list) or len(lexicals) != len(targets):
+            return {}
+        facts = {}
+        for target, lexical in zip(targets, lexicals):
+            if not target:
+                continue
+            real = os.path.realpath(target)
+            if self.scope.is_role_temp(real):
+                continue
+            roots = [root for root in self.scope.repo_roots
+                     if real == root or action_policy._inside(real, root)]
+            if len(roots) != 1:
+                continue
+            derived = derive_delete_facts(roots[0], real, lexical)
+            if derived is not None:
+                facts[real] = derived
+        return facts
 
     @staticmethod
     def _hook_response(decision, attempt_id, child_work_id=None,

@@ -503,6 +503,48 @@ def get_worktree(state):
 
 
 # --------------------------------------------------------------------------- #
+# Declared external output roots (cowork-internal #99).                        #
+#                                                                              #
+# An orchestrator may declare directories OUTSIDE the repository that the      #
+# builder is allowed to write evidence into (`--output-root DIR`). The         #
+# validated, canonical set is bound to the session record here so a resume     #
+# reproduces exactly the authorized roots -- never a re-derived or widened     #
+# set. Only the flag path validates; this store persists and reads back.       #
+# --------------------------------------------------------------------------- #
+
+
+def set_declared_output_roots(path, roots, prior=None):
+    """Persist the canonical declared output roots (one sorted list of
+    absolute realpath strings) on the session record, preserving the rest of
+    the state. Returns the updated state."""
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    state.setdefault("sessions", state.get("sessions") or {})
+    state["declared_output_roots"] = sorted(
+        dict.fromkeys(str(r) for r in roots))
+    save(path, state)
+    return state
+
+
+def get_declared_output_roots(state):
+    """Return the saved declared output roots as a sorted tuple of absolute
+    path strings, or `()` for an absent key or ANY malformed entry (a
+    non-list, a non-string, an empty or relative entry): a record that cannot
+    be read exactly grants nothing."""
+    roots = (state or {}).get("declared_output_roots")
+    if not isinstance(roots, list):
+        return ()
+    entries = []
+    for entry in roots:
+        if (not isinstance(entry, str) or not entry
+                or not os.path.isabs(entry)):
+            return ()
+        entries.append(entry)
+    return tuple(sorted(dict.fromkeys(entries)))
+
+
+# --------------------------------------------------------------------------- #
 # Peer evaluations.                                                            #
 #                                                                              #
 # After each review round both sides of the active pairing privately score     #
@@ -524,6 +566,14 @@ def eval_scratch_path_for(intel_dir, role, session_uuid):
     return os.path.join(intel_dir, "eval.%s.json" % role)
 
 
+def sessions_root():
+    """The root under which every session's assets live: COWORK_SESSIONS_ROOT
+    when set (tests never write to the real home dir), else
+    `~/.cowork/sessions`. The single source for that lookup."""
+    return (os.environ.get("COWORK_SESSIONS_ROOT")
+            or os.path.expanduser(os.path.join("~", ".cowork", "sessions")))
+
+
 def session_assets_dir(session_uuid):
     """Directory holding a session's produced assets (intel, reviews, plans,
     build status, eval scratch) — the home for every per-session artifact,
@@ -531,9 +581,7 @@ def session_assets_dir(session_uuid):
     root is overridable via COWORK_SESSIONS_ROOT so tests never write to the
     real home dir. (`session.json` is the one exception: it stays project-local
     as the per-directory anchor — see `session_path`.)"""
-    root = (os.environ.get("COWORK_SESSIONS_ROOT")
-            or os.path.expanduser(os.path.join("~", ".cowork", "sessions")))
-    return os.path.join(root, session_uuid)
+    return os.path.join(sessions_root(), session_uuid)
 
 
 def scores_path_for(session_uuid):

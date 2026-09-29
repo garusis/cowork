@@ -11898,6 +11898,427 @@ class NewSessionContextFlowTest(unittest.TestCase):
         self.assertIn("requires initial context", out.getvalue())
 
 
+class DeclaredOutputRootsFlowTests(unittest.TestCase):
+    """`--output-root` (cowork-internal #99): validated before anything is
+    created, persisted on the session record, reproduced exactly on resume,
+    refused when unsafe/ambiguous/conflicting, and forwarded to the builder
+    only. Hermetic: the sessions root, every controller home/state dir and
+    the launch repository all live under one temp root."""
+
+    ROOT_CODES = ("output_root_invalid", "output_root_missing",
+                  "output_root_unsafe", "output_roots_conflict",
+                  "conflicting_arguments")
+    TEAM = "scout,scout-reviewer"
+    FULL_TEAM = ("scout,scout-reviewer,planner,planning-advisor,"
+                 "builder,build-reviewer")
+
+    def setUp(self):
+        import unittest.mock as mock
+        policy.deactivate()
+        self.addCleanup(policy.deactivate)
+        self.root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        self.home = os.path.join(self.root, "home")
+        self.sessions = os.path.join(self.root, "sessions")
+        self.claude_dir = os.path.join(self.home, ".claude")
+        self.codex_home = os.path.join(self.home, ".codex")
+        self.xdg_data = os.path.join(self.home, ".local", "share")
+        self.opencode_dir = os.path.join(self.xdg_data, "opencode")
+        for path in (self.sessions, self.claude_dir, self.codex_home,
+                     self.opencode_dir):
+            os.makedirs(path)
+        env = mock.patch.dict(os.environ, {
+            "COWORK_SESSIONS_ROOT": self.sessions,
+            "CLAUDE_CONFIG_DIR": self.claude_dir,
+            "CODEX_HOME": self.codex_home,
+            "XDG_DATA_HOME": self.xdg_data,
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        self.repo = os.path.join(self.root, "repo")
+        os.mkdir(self.repo)
+        self._git("init", "-q")
+        self._git("config", "user.email", "fixture@example.invalid")
+        self._git("config", "user.name", "Fixture")
+        self._git("config", "commit.gpgsign", "false")
+        Path(os.path.join(self.repo, "f.txt")).write_text("x\n")
+        self._git("add", ".")
+        self._git("commit", "-q", "-m", "fixture")
+        cwd = os.getcwd()
+        self.addCleanup(lambda: os.chdir(cwd))
+        os.chdir(self.repo)
+
+    def _git(self, *args):
+        subprocess.run(["git", "-C", self.repo] + list(args), check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _dir(self, *parts):
+        path = os.path.join(self.root, *parts)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _spath(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "session.json")
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _scout(self, calls):
+        def fake_scout(config, context, selected, on_outcome=None,
+                       on_session=None, resume_id=None, **kw):
+            calls.append({"resume_id": resume_id})
+            if on_session and resume_id is None:
+                on_session("claude", "scout-%d" % len(calls))
+            if on_outcome:
+                on_outcome("ended")
+            return 0
+        return fake_scout
+
+    def _run(self, argv, fake_scout, **fns):
+        box = {}
+        rc = cowork.run_flow(
+            self._args(argv), io_out=io.StringIO(),
+            which=lambda c: "/bin/" + c, run_scout_fn=fake_scout,
+            result_box=box, **fns)
+        return rc, box
+
+    def _validate(self, roots, **overrides):
+        kwargs = dict(
+            launch_toplevel=self.repo, registered_worktrees=(self.repo,),
+            sessions_root=self.sessions,
+            session_file_dir=os.path.join(self.root, "proj", ".cowork"),
+            controller_dirs=(self.claude_dir, self.codex_home,
+                             self.opencode_dir),
+            home=self.home)
+        kwargs.update(overrides)
+        return cowork.validate_output_roots(roots, **kwargs)
+
+    def test_parser_collects_repeated_roots(self):
+        args = self._args(["--output-root", "a", "--output-root", "b"])
+        self.assertEqual(args.output_root, ["a", "b"])
+        self.assertEqual(self._args([]).output_root, [])
+
+    def test_state_accessors_roundtrip_and_fail_closed(self):
+        spath = self._spath()
+        state = state_store.ensure_session(spath, None, "S")
+        self.assertEqual(state_store.get_declared_output_roots(state), ())
+        self.assertEqual(state_store.get_declared_output_roots(None), ())
+        state = state_store.set_declared_output_roots(
+            spath, ["/b/two", "/a/one", "/b/two"], prior=state)
+        self.assertEqual(state["declared_output_roots"], ["/a/one", "/b/two"])
+        self.assertEqual(state_store.get_declared_output_roots(state),
+                         ("/a/one", "/b/two"))
+        self.assertEqual(
+            state_store.get_declared_output_roots(state_store.load(spath)),
+            ("/a/one", "/b/two"))
+        self.assertEqual(state_store.load(spath)["session_uuid"], "S")
+        for malformed in ("/a/one", {"x": 1}, ["relative"], ["/a", 3],
+                          ["/a", ""], [None]):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(state_store.get_declared_output_roots(
+                    {"declared_output_roots": malformed}), ())
+
+    def test_validator_table(self):
+        evidence = self._dir("evidence")
+        wt = self._dir("wt")
+        proj = self._dir("proj", ".cowork")
+        Path(os.path.join(self.root, "a-file")).write_text("x")
+        os.symlink(os.path.join(self.root, "nope"),
+                   os.path.join(self.root, "dangling"))
+        os.symlink(evidence, os.path.join(self.root, "alias"))
+        refused = [
+            (["rel/dir"], "output_root_invalid"),
+            ([""], "output_root_invalid"),
+            (["/x\x01y"], "output_root_invalid"),
+            ([None], "output_root_invalid"),
+            ([os.path.join(self.root, "nope")], "output_root_missing"),
+            ([os.path.join(self.root, "a-file")], "output_root_missing"),
+            ([os.path.join(self.root, "dangling")], "output_root_missing"),
+            (["/"], "output_root_unsafe"),
+            ([self.home], "output_root_unsafe"),
+            (["/tmp"], "output_root_unsafe"),
+            ([self.repo], "output_root_unsafe"),
+            ([self._dir("repo", "sub")], "output_root_unsafe"),
+            ([self.root], "output_root_unsafe"),
+            ([wt], "output_root_unsafe"),
+            ([self._dir("wt", "sub")], "output_root_unsafe"),
+            ([self.sessions], "output_root_unsafe"),
+            ([self._dir("sessions", "S")], "output_root_unsafe"),
+            ([proj], "output_root_unsafe"),
+            ([os.path.dirname(proj)], "output_root_unsafe"),
+            ([self.claude_dir], "output_root_unsafe"),
+            ([self.codex_home], "output_root_unsafe"),
+            ([self.opencode_dir], "output_root_unsafe"),
+            ([os.path.join(self.home, ".local")], "output_root_unsafe"),
+            ([evidence, evidence], "output_roots_conflict"),
+            ([evidence, self._dir("evidence", "sub")],
+             "output_roots_conflict"),
+            ([self._dir("evidence", "sub"), evidence],
+             "output_roots_conflict"),
+        ]
+        if os.path.isdir("/private/tmp"):
+            refused.append((["/private/tmp"], "output_root_unsafe"))
+        for roots, code in refused:
+            with self.subTest(roots=roots):
+                got, reason, message = self._validate(
+                    roots, registered_worktrees=(self.repo, wt))
+                self.assertIsNone(got)
+                self.assertEqual(reason, code)
+                self.assertTrue(message)
+        accepted = [
+            ([evidence], (evidence,)),
+            ([self._dir("home", ".local", "share", "other")],
+             (os.path.join(self.home, ".local", "share", "other"),)),
+            ([self._dir("home", ".cowork", "orchestrator")],
+             (os.path.join(self.home, ".cowork", "orchestrator"),)),
+            ([os.path.join(self.root, "alias")], (evidence,)),
+            ([self._dir("z"), evidence], (evidence, os.path.join(self.root, "z"))),
+        ]
+        for roots, expected in accepted:
+            with self.subTest(roots=roots):
+                got, reason, message = self._validate(
+                    roots, registered_worktrees=(self.repo, wt))
+                self.assertEqual((got, reason, message),
+                                 (expected, None, None))
+
+    def test_new_session_persists_canonical_roots(self):
+        evidence = self._dir("evidence")
+        alias = os.path.join(self.root, "alias")
+        os.symlink(evidence, alias)
+        spath = self._spath()
+        calls = []
+        rc, box = self._run(
+            ["--team", self.TEAM, "--context", "x", "--session-file", spath,
+             "--output-root", alias], self._scout(calls))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(box.get("reason"), self.ROOT_CODES)
+        saved = state_store.load(spath)
+        self.assertEqual(saved["declared_output_roots"], [evidence])
+        self.assertEqual(state_store.get_declared_output_roots(saved),
+                         (evidence,))
+        self.assertNotIn(alias, json.dumps(saved))
+        events = self._trace_events(saved, "output_roots.declared")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["count"], 1)
+        self.assertFalse(events[0]["first_declaration"])
+        self.assertNotIn(evidence, json.dumps(events))
+
+    def _trace_events(self, saved, name):
+        path = trace_store.trace_path_for(state_store.get_session_uuid(saved))
+        with open(path) as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        return [e for e in events if e.get("event") == name]
+
+    def test_refusals_leave_nothing_behind(self):
+        evidence = self._dir("evidence")
+        nested = self._dir("evidence", "sub")
+        inside = self._dir("repo", "sub")
+        cases = [
+            (["--output-root", os.path.join(self.root, "nope")],
+             "output_root_missing"),
+            (["--output-root", inside], "output_root_unsafe"),
+            (["--output-root", self.codex_home], "output_root_unsafe"),
+            (["--output-root", evidence, "--output-root", nested],
+             "output_roots_conflict"),
+        ]
+        for extra, code in cases:
+            with self.subTest(code=code, extra=extra):
+                spath = self._spath()
+                calls = []
+                rc, box = self._run(
+                    ["--team", self.TEAM, "--context", "x",
+                     "--session-file", spath] + extra, self._scout(calls))
+                self.assertEqual((rc, box.get("reason")), (2, code))
+                self.assertEqual(calls, [])
+                self.assertFalse(os.path.exists(spath))
+                self.assertFalse(os.path.exists(os.path.dirname(spath)))
+        calls = []
+        rc, box = self._run(
+            ["--team", self.TEAM, "--context", "x", "--no-session",
+             "--output-root", evidence], self._scout(calls))
+        self.assertEqual((rc, box.get("reason")), (2, "conflicting_arguments"))
+        self.assertEqual(calls, [])
+
+    def test_resume_reproduces_saved_roots_and_refuses_a_differing_set(self):
+        evidence = self._dir("evidence")
+        other = self._dir("other")
+        spath = self._spath()
+        calls = []
+        base = ["--team", self.TEAM, "--session-file", spath]
+        rc, box = self._run(base + ["--context", "x", "--output-root",
+                                    evidence], self._scout(calls))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(state_store.load(spath)["declared_output_roots"],
+                         [evidence])
+        # identical re-declaration: a no-op
+        rc, box = self._run(base + ["--output-root", evidence],
+                            self._scout(calls))
+        self.assertNotEqual(rc, 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["resume_id"], "scout-1")
+        self.assertEqual(state_store.load(spath)["declared_output_roots"],
+                         [evidence])
+        # a differing set against saved roots is refused and changes nothing
+        rc, box = self._run(base + ["--output-root", other],
+                            self._scout(calls))
+        self.assertEqual((rc, box.get("reason")), (2, "output_roots_conflict"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(state_store.load(spath)["declared_output_roots"],
+                         [evidence])
+        # no flag reproduces the saved set
+        rc, box = self._run(base, self._scout(calls))
+        self.assertNotEqual(rc, 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(state_store.load(spath)["declared_output_roots"],
+                         [evidence])
+
+    def test_first_declaration_on_a_session_without_roots(self):
+        evidence = self._dir("evidence")
+        other = self._dir("other")
+        spath = self._spath()
+        calls = []
+        base = ["--team", self.TEAM, "--session-file", spath]
+        rc, box = self._run(base + ["--context", "x"], self._scout(calls))
+        self.assertEqual(len(calls), 1)
+        saved = state_store.load(spath)
+        self.assertNotIn("declared_output_roots", saved)
+        self.assertEqual(self._trace_events(saved, "output_roots.declared"),
+                         [])
+        rc, box = self._run(base + ["--output-root", evidence],
+                            self._scout(calls))
+        self.assertNotEqual(rc, 2)
+        self.assertEqual(len(calls), 2)
+        saved = state_store.load(spath)
+        self.assertEqual(state_store.get_declared_output_roots(saved),
+                         (evidence,))
+        events = self._trace_events(saved, "output_roots.declared")
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["first_declaration"])
+        self.assertEqual(events[0]["count"], 1)
+        rc, box = self._run(base + ["--output-root", other],
+                            self._scout(calls))
+        self.assertEqual((rc, box.get("reason")), (2, "output_roots_conflict"))
+        self.assertEqual(state_store.load(spath)["declared_output_roots"],
+                         [evidence])
+
+    def test_builder_receives_roots_on_fresh_and_resumed_dispatch(self):
+        import unittest.mock as mock
+        evidence = self._dir("evidence")
+        spath = self._spath()
+        state_store.ensure_session(spath, None, "S")
+        assets = state_store.session_assets_dir("S")
+        os.makedirs(assets, exist_ok=True)
+        with open(os.path.join(assets, "scout.intel.json"), "w") as fh:
+            json.dump({"status": "ready_for_review", "result": {}}, fh)
+        with open(os.path.join(assets, "planner.plan.json"), "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"step": "S1"}}, fh)
+        with open(os.path.join(assets, "planner.plan.md"), "w") as fh:
+            fh.write("# PLAN MD")
+        with open(os.path.join(assets, "planner-review.json"), "w") as fh:
+            json.dump({"verdict": "approve"}, fh)
+        runtime = mock.patch.object(cowork.preflight, "check_governed_runtime",
+                                    return_value=(True, []))
+        runtime.start()
+        self.addCleanup(runtime.stop)
+        captured = []
+
+        def fake_scout(config, context, selected, on_outcome=None,
+                       on_session=None, resume_id=None, **kw):
+            if on_session and resume_id is None:
+                on_session("claude", "scout-1")
+            if on_outcome:
+                on_outcome("approved")
+            return 0
+
+        def fake_planner(config, context, selected, on_outcome=None,
+                         on_session=None, resume_id=None, **kw):
+            if on_session and resume_id is None:
+                on_session("claude", "planner-1")
+            if on_outcome:
+                on_outcome("approved", None)
+            return 0
+
+        def fake_builder(config, context, selected, on_outcome=None,
+                         on_session=None, resume_id=None, **kw):
+            captured.append((resume_id, kw.get("external_output_roots")))
+            if on_session and resume_id is None:
+                on_session("claude", "builder-1")
+            if on_outcome:
+                on_outcome("ended", None)
+            return 0
+
+        rc, box = self._run(
+            ["--team", self.FULL_TEAM, "--context", "x",
+             "--session-file", spath, "--output-root", evidence],
+            fake_scout, run_planner_fn=fake_planner,
+            run_builder_fn=fake_builder)
+        self.assertNotIn(box.get("reason"), self.ROOT_CODES)
+        self.assertEqual(captured, [(None, (evidence,))])
+        rc, box = self._run(
+            ["--session-file", spath], fake_scout,
+            run_planner_fn=fake_planner, run_builder_fn=fake_builder)
+        self.assertNotIn(box.get("reason"), self.ROOT_CODES)
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[1], ("builder-1", (evidence,)))
+
+    def test_main_refuses_read_only_and_evaluation_combinations(self):
+        evidence = self._dir("evidence")
+        for argv in (["--check", "--output-root", evidence],
+                     ["--report", "--output-root", evidence],
+                     ["--evaluate-role", "scout", "--output-root", evidence]):
+            with self.subTest(argv=argv):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    rc = cowork.main(argv)
+                self.assertEqual(rc, 2)
+                line = json.loads(out.getvalue().strip().splitlines()[-1])
+                self.assertEqual(line["reason"], "conflicting_arguments")
+                self.assertIn("--output-root", err.getvalue())
+
+    def test_resume_session_and_run_builder_forward_roots(self):
+        import unittest.mock as mock
+        evidence = self._dir("evidence")
+        cfg = {"controller": "claude", "model": None, "effort": None,
+               "yolo": True, "mode": "implement"}
+        with mock.patch.object(bridge, "ClaudeSession") as session_cls:
+            session_cls.return_value = object()
+            cowork._construct_resume_session(
+                "builder", "claude", cfg, "sid", self.sessions, trace=None,
+                external_output_roots=(evidence,))
+        self.assertEqual(session_cls.call_args.kwargs["external_output_roots"],
+                         (evidence,))
+        with mock.patch.object(bridge, "CodexSession") as codex_cls:
+            codex_cls.return_value = object()
+            cowork._construct_resume_session(
+                "planner", "codex", dict(cfg, controller="codex"), "tid",
+                self.sessions, trace=None)
+        self.assertEqual(codex_cls.call_args.kwargs["external_output_roots"],
+                         ())
+        seen = {}
+
+        def capture(*args, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("captured")
+        out = io.StringIO()
+        with mock.patch.object(bridge, "probe_claude_stream_json",
+                               return_value=(True, None)), \
+                mock.patch.object(bridge, "ClaudeSession",
+                                  side_effect=capture):
+            rc = cowork.run_builder(
+                {"builder": cfg}, "goal", ["builder"], io_out=out,
+                session_uuid=str(uuid.uuid4()),
+                claude_spawn=lambda *a, **k: [],
+                reviewer_runner=lambda *a, **k: {"verdict": "approve"},
+                external_output_roots=(evidence,))
+        self.assertEqual(rc, 1)
+        self.assertEqual(seen["external_output_roots"], (evidence,))
+        self.assertIn("failed to start builder controller", out.getvalue())
+
+
 class AgentReviewerResumeTest(unittest.TestCase):
     """A RESUMED reviewer's first turn uses context_update (not
     reviewer_context), so the agent-session note must ride context_update
@@ -24151,6 +24572,272 @@ class ChildCorrelationTests(unittest.TestCase):
                 for row in trace_rows))
 
 
+class ExternalOutputRootScopeTests(unittest.TestCase):
+    """Declared external output roots (cowork-internal #99) reach exactly the
+    builder's OwnedScope, hook policy, seatbelt profile and controller argv;
+    parents, siblings and aliases stay denied; evaluators and probes never
+    receive a root."""
+
+    def _layout(self):
+        root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        layout = {
+            "root": root,
+            "repo": os.path.join(root, "repo"),
+            "outside": os.path.join(root, "outside"),
+            "evidence": os.path.join(root, "outside", "evidence"),
+            "sibling": os.path.join(root, "outside", "sibling"),
+            "assets": os.path.join(root, "assets"),
+            "alias": os.path.join(root, "alias"),
+            "parent_alias": os.path.join(root, "parent-alias"),
+        }
+        for key in ("repo", "evidence", "sibling", "assets"):
+            os.makedirs(layout[key])
+        os.symlink(layout["evidence"], layout["alias"])
+        os.symlink(layout["outside"], layout["parent_alias"])
+        layout["scope"] = action_policy.OwnedScope(
+            repo_roots=(layout["repo"],),
+            external_output_roots=(layout["alias"],),
+            session_assets_dir=layout["assets"])
+        return layout
+
+    @staticmethod
+    def _write(path):
+        return {"class": "write", "targets": [path],
+                "resolution_complete": True}
+
+    def test_scope_field_is_canonical_and_folded_into_writable_roots(self):
+        lay = self._layout()
+        scope = lay["scope"]
+        self.assertEqual(scope.external_output_roots, (lay["evidence"],))
+        self.assertEqual(scope.writable_roots.count(lay["evidence"]), 1)
+        self.assertNotIn(lay["alias"], scope.writable_roots)
+        self.assertTrue(scope.is_external_output_root(
+            os.path.join(lay["evidence"], "x")))
+        self.assertFalse(scope.is_external_output_root(lay["outside"]))
+        self.assertEqual(scope.authority_for(os.path.join(lay["evidence"], "x")),
+                         ("external_output_root", lay["evidence"]))
+        self.assertEqual(scope.authority_for(os.path.join(lay["repo"], "x")),
+                         ("repo_root", lay["repo"]))
+        self.assertIsNone(scope.authority_for(lay["outside"]))
+        self.assertEqual(action_policy.OwnedScope().external_output_roots, ())
+
+    def test_decide_grants_exact_root_and_denies_aliases_parents_siblings(self):
+        lay = self._layout()
+        scope = lay["scope"]
+        inside = action_policy.decide(
+            self._write(os.path.join(lay["evidence"], "report.json")), scope)
+        self.assertTrue(inside["allow"])
+        self.assertEqual(inside["reason"], "owned_target")
+        self.assertEqual(inside["authorities"], [{
+            "kind": "external_output_root",
+            "root_digest": action_policy._digest(lay["evidence"])}])
+        via_alias = action_policy.decide(
+            self._write(os.path.join(lay["alias"], "report.json")), scope)
+        self.assertTrue(via_alias["allow"])
+        self.assertEqual(via_alias["authorities"][0]["root_digest"],
+                         action_policy._digest(lay["evidence"]))
+        for denied in (
+                os.path.join(lay["outside"], "x"),
+                os.path.join(lay["sibling"], "x"),
+                os.path.join(lay["evidence"], "..", "sibling", "x"),
+                os.path.join(lay["parent_alias"], "x"),
+                os.path.join(lay["root"], "x")):
+            with self.subTest(target=denied):
+                decision = action_policy.decide(self._write(denied), scope)
+                self.assertFalse(decision["allow"])
+                self.assertEqual(decision["reason"],
+                                 "target_outside_owned_scope")
+                self.assertNotIn("authorities", decision)
+        repo_write = action_policy.decide(
+            self._write(os.path.join(lay["repo"], "src.py")), scope)
+        self.assertEqual(repo_write["authorities"][0]["kind"], "repo_root")
+        delete = action_policy.decide(
+            {"class": "delete",
+             "targets": [os.path.join(lay["evidence"], "report.json")],
+             "resolution_complete": True}, scope)
+        self.assertEqual((delete["allow"], delete["reason"]),
+                         (False, "delete_not_recoverable"))
+        record = action_policy.sanitize(
+            inside, self._write(os.path.join(lay["evidence"], "report.json")),
+            guard_attempt_id="a1")
+        encoded = json.dumps(record)
+        self.assertNotIn(lay["root"], encoded)
+        self.assertEqual(record["authorities"], inside["authorities"])
+
+    def test_seatbelt_profile_allows_exactly_the_declared_root(self):
+        if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
+            self.skipTest("seatbelt profile is darwin-only")
+        lay = self._layout()
+        boundary = bridge.kernel_write_boundary(lay["scope"])
+        self.assertTrue(boundary["available"])
+        lines = boundary["profile"].splitlines()
+        self.assertEqual(lines.count(
+            '(allow file-write* (literal "%s"))' % lay["evidence"]), 1)
+        self.assertEqual(lines.count(
+            '(allow file-write* (subpath "%s"))' % lay["evidence"]), 1)
+        self.assertFalse(any(lay["alias"] in line for line in lines))
+        self.assertFalse(any('"%s"' % lay["outside"] in line
+                             for line in lines))
+        self.assertFalse(any('"%s"' % lay["sibling"] in line
+                             for line in lines))
+        self.assertFalse(any("regex" in line and lay["evidence"] in line
+                             for line in lines))
+
+    def test_argv_builders_add_one_grant_per_root(self):
+        def add_dirs(cmd):
+            return [cmd[i + 1] for i, part in enumerate(cmd)
+                    if part == "--add-dir"]
+        claude = bridge.build_claude_command(
+            "/p.md", "implement", False, extra_writable_dir="/s",
+            external_output_roots=("/e1", "/e2"))
+        self.assertEqual(add_dirs(claude), ["/s", "/e1", "/e2"])
+        resumed = bridge.build_claude_command(
+            "/p.md", "implement", False, resume_id="r1",
+            extra_writable_dir="/s", external_output_roots=("/e1",))
+        self.assertEqual(add_dirs(resumed), ["/s", "/e1"])
+        self.assertEqual(add_dirs(bridge.build_claude_command(
+            "/p.md", "implement", False, extra_writable_dir="/s")), ["/s"])
+        codex = bridge.build_codex_command(
+            "hi", "implement", False, extra_writable_dir="/s",
+            external_output_roots=("/e1", "/e2"))
+        self.assertEqual(add_dirs(codex), ["/s", "/e1", "/e2"])
+        self.assertEqual(codex[-1], "hi")
+        self.assertEqual(
+            bridge.codex_resume_mode_args(
+                "implement", False, extra_writable_dir="/s",
+                external_output_roots=("/e",)),
+            ["-c", 'sandbox_mode="workspace-write"',
+             "-c", 'sandbox_workspace_write.writable_roots=["/s","/e"]'])
+        self.assertEqual(
+            bridge.codex_resume_mode_args(
+                "implement", False, external_output_roots=("/e",)),
+            ["-c", 'sandbox_mode="workspace-write"',
+             "-c", 'sandbox_workspace_write.writable_roots=["/e"]'])
+        self.assertEqual(
+            bridge.codex_resume_mode_args(
+                "implement", False,
+                extra_writable_dir="/home/u/.cowork/sessions/S"),
+            ["-c", 'sandbox_mode="workspace-write"',
+             "-c",
+             'sandbox_workspace_write.writable_roots='
+             '["/home/u/.cowork/sessions/S"]'])
+        self.assertEqual(
+            bridge.codex_resume_mode_args("plan", False,
+                                          external_output_roots=("/e",)),
+            ["-c", 'sandbox_mode="read-only"'])
+        resume_cmd = bridge.build_codex_resume_command(
+            "thread-abc", "next", "implement", False,
+            extra_writable_dir="/s", external_output_roots=("/e",))
+        self.assertIn('sandbox_workspace_write.writable_roots=["/s","/e"]',
+                      resume_cmd)
+        self.assertNotIn("--add-dir", resume_cmd)
+        self.assertEqual(resume_cmd[-1], "next")
+
+    def test_guard_runtime_passes_roots_into_scope_and_context(self):
+        import unittest.mock as mock
+        if sys.platform.startswith("linux"):
+            self.skipTest("_guard_runtime refuses earlier on linux by design")
+
+        class RecordingTrace:
+            session_uuid = "root-guard"
+
+            def event(self, *_args, **_kwargs):
+                pass
+
+        class FakeBroker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def serve_forever(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+        lay = self._layout()
+        env = mock.patch.dict(os.environ,
+                              {"COWORK_SESSIONS_ROOT": lay["assets"]})
+        env.start()
+        self.addCleanup(env.stop)
+        assets = state_store.session_assets_dir("root-guard")
+        os.makedirs(assets)
+        real_exists = os.path.exists
+        with mock.patch.object(
+                bridge, "_git_worktree_scope",
+                return_value=(lay["repo"], ())), \
+                mock.patch.object(
+                    bridge.controller_profiles, "reference_codex_auth",
+                    return_value={"protected_paths": ()}), \
+                mock.patch.object(
+                    bridge, "kernel_write_boundary",
+                    return_value={"available": True, "platform": "darwin"}), \
+                mock.patch.object(
+                    bridge.guard_broker, "GuardBroker", FakeBroker), \
+                mock.patch.object(bridge.threading, "Thread", FakeThread), \
+                mock.patch.object(
+                    bridge.os.path, "exists",
+                    side_effect=lambda path: (
+                        True if str(path).endswith(".sock")
+                        else real_exists(path))):
+            runtime = bridge._guard_runtime(
+                RecordingTrace(), "builder", assets, None, None, False,
+                controller="codex", external_output_roots=(lay["alias"],))
+            try:
+                self.assertEqual(runtime["scope"].external_output_roots,
+                                 (lay["evidence"],))
+                self.assertIn(lay["evidence"],
+                              runtime["scope"].writable_roots)
+                with open(runtime["context_path"]) as fh:
+                    context = json.load(fh)
+                self.assertIn(lay["evidence"], context["owned_roots"])
+                self.assertNotIn(lay["alias"], context["owned_roots"])
+                self.assertNotIn(lay["outside"], context["owned_roots"])
+            finally:
+                bridge._close_guard_runtime(runtime)
+
+    def test_evaluator_session_receives_no_roots(self):
+        import unittest.mock as mock
+        lay = self._layout()
+        scratch = os.path.join(lay["assets"], "eval.builder.json")
+        seen = {}
+
+        class Trace:
+            session_uuid = "eval-roots"
+
+            def event(self, *_args, **_kwargs):
+                pass
+
+        def fake_guard(*args, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("stop before any launch")
+
+        policy.deactivate()
+        self.addCleanup(policy.deactivate)
+        previous = bridge.set_nested_guard_active(True)
+        self.addCleanup(bridge.set_nested_guard_active, previous)
+        with mock.patch.object(bridge, "_guard_runtime",
+                               side_effect=fake_guard):
+            with self.assertRaises(RuntimeError):
+                cowork._isolated_evaluator_session(
+                    {"scratch_path": scratch},
+                    {"tool": "claude", "model": "sonnet"},
+                    trace=Trace(), io_out=io.StringIO())
+        self.assertEqual(seen["declared_outputs"], (scratch,))
+        self.assertFalse(seen["repo_writable"])
+        self.assertIn(seen.get("external_output_roots", ()), (None, ()))
+
+
 class ActionBoundaryPolicyTests(unittest.TestCase):
     def test_declared_output_and_session_asset_boundary(self):
         with tempfile.TemporaryDirectory() as root:
@@ -24188,43 +24875,71 @@ class ActionBoundaryPolicyTests(unittest.TestCase):
                 sibling_worktrees=(sibling,))
             created = os.path.join(private_temp, "created.txt")
             Path(created).write_text("x")
+            # The clean delete target is a REAL tracked file: recoverability
+            # is derived from Git by the broker, never from a caller list.
             clean = os.path.join(repo, "clean-tracked.txt")
+            Path(clean).write_text("tracked\n")
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", repo] + list(args), check=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "user.name", "Fixture")
+            git("config", "commit.gpgsign", "false")
+            git("add", ".")
+            git("commit", "-q", "-m", "fixture")
+            head = git("rev-parse", "HEAD")
+            blob = git("rev-parse", "HEAD:clean-tracked.txt")
+            delete_facts = {os.path.realpath(clean):
+                            guard_broker.derive_delete_facts(
+                                os.path.realpath(repo),
+                                os.path.realpath(clean), clean)}
             cases = (
                 ({"class": "write", "targets": [output],
-                  "resolution_complete": True}, True, "owned_target"),
+                  "resolution_complete": True}, True, "owned_target",
+                 "declared_output"),
                 ({"class": "write", "targets": [
                     os.path.join(controller_state, "cache")],
-                  "resolution_complete": True}, True, "owned_target"),
+                  "resolution_complete": True}, True, "owned_target",
+                 "controller_state"),
                 ({"class": "write", "targets": [
                     os.path.join(private_temp, "scratch")],
-                  "resolution_complete": True}, True, "owned_target"),
+                  "resolution_complete": True}, True, "owned_target",
+                 "role_temp"),
                 ({"class": "delete", "targets": [created],
-                  "resolution_complete": True}, True, "owned_target"),
+                  "resolution_complete": True}, True, "owned_target",
+                 "role_temp"),
                 ({"class": "delete", "targets": [clean],
-                  "resolution_complete": True}, True, "owned_target"),
+                  "resolution_complete": True}, True, "owned_target",
+                 "repo_root"),
                 (action_policy.classify_action(
                     "Bash", {"command": "rm -f /tmp/*.py"}, cwd=repo),
-                 False, "shell_unprovable"),
+                 False, "shell_unprovable", None),
                 ({"class": "write", "targets": [
                     os.path.join(sibling, "x")],
-                  "resolution_complete": True}, False, "sibling_worktree"),
+                  "resolution_complete": True}, False, "sibling_worktree",
+                 None),
                 ({"class": "write", "targets": [
                     os.path.join(assets, "other.json")],
                   "resolution_complete": True}, False,
-                 "session_asset_not_declared_output"),
+                 "session_asset_not_declared_output", None),
                 ({"class": "delete", "targets": [
                     os.path.join(repo, "unowned-delete")],
                   "resolution_complete": True}, False,
-                 "delete_not_recoverable"),
+                 "delete_not_recoverable", None),
                 ({"class": "read", "targets": ["/etc/hosts"],
-                  "resolution_complete": True}, True, "read_only"),
+                  "resolution_complete": True}, True, "read_only", None),
             )
             for actor in ("parent", "child"):
-                for index, (action, allowed, reason) in enumerate(cases):
+                for index, (action, allowed, reason, kind) in enumerate(
+                        cases):
                     with self.subTest(actor=actor, index=index):
                         decision = action_policy.decide(
-                            action, scope, created_paths=(created,),
-                            clean_tracked_paths=(clean,))
+                            action, scope, delete_facts=delete_facts)
                         self.assertEqual(decision["allow"], allowed)
                         self.assertEqual(decision["reason"], reason)
                         record = action_policy.sanitize(
@@ -24234,6 +24949,32 @@ class ActionBoundaryPolicyTests(unittest.TestCase):
                         encoded = json.dumps(record)
                         self.assertNotIn(root, encoded)
                         self.assertNotIn("rm -f", encoded)
+                        if kind is None:
+                            self.assertNotIn("authorities", record)
+                            continue
+                        self.assertEqual(
+                            record["authorities"][0]["kind"], kind)
+                        if action["class"] == "delete" and kind == "repo_root":
+                            self.assertEqual(
+                                record["authorities"][0]["recoverability"],
+                                {"proof": "git_head_blob", "commit": head,
+                                 "blob": blob})
+                        elif action["class"] == "delete":
+                            self.assertEqual(
+                                record["authorities"][0]["recoverability"],
+                                {"proof": "role_temp"})
+            # A delete-class Bash stage carries the operand as typed beside
+            # its realpath target; a Write action never does.
+            classified = action_policy.classify_action(
+                "Bash", {"command": "rm a.txt"}, cwd=repo)
+            self.assertEqual(classified["class"], "delete")
+            self.assertEqual(classified["lexical_targets"],
+                             [os.path.join(os.path.realpath(repo), "a.txt")])
+            self.assertEqual(len(classified["lexical_targets"]),
+                             len(classified["targets"]))
+            written = action_policy.classify_action(
+                "Write", {"file_path": os.path.join(repo, "a.txt")}, cwd=repo)
+            self.assertNotIn("lexical_targets", written)
 
 
 class NestedGuardSettingsAssemblyTests(unittest.TestCase):
@@ -24396,6 +25137,9 @@ class NestedGuardSettingsAssemblyTests(unittest.TestCase):
         self.assertTrue(broker_instance.stopped)
         self.assertEqual(guarded.call_args.kwargs["declared_outputs"], ())
         self.assertFalse(guarded.call_args.kwargs["repo_writable"])
+        # The probe never receives declared external output roots (#99).
+        self.assertEqual(
+            guarded.call_args.kwargs.get("external_output_roots", ()), ())
 
     def test_probe_repo_mutation_denies_and_records_probe_work_id(self):
         import unittest.mock as mock
@@ -26296,6 +27040,315 @@ class GuardBrokerFailureRecordTests(unittest.TestCase):
             by_id = {record["guard_attempt_id"]: record for record in first}
             self.assertEqual(by_id["stale"]["evidence_channel"], "broker")
             self.assertEqual(by_id["oversize"]["evidence_channel"], "stream")
+
+
+class CleanTrackedDeleteBrokerTests(unittest.TestCase):
+    """Recoverable deletes (cowork-internal #99): the broker derives Git
+    facts per attempt and the pure rule allows only a clean, tracked,
+    regular file inside a repository root; the hook payload never grants
+    anything. Real temp git repositories, no provider processes."""
+
+    PARENT = {
+        "controller": "claude", "controller_source": "config_pinned",
+        "model": "sonnet", "model_source": "config_pinned",
+        "effort": "high", "effort_source": "config_pinned",
+    }
+
+    def _git(self, repo, *args):
+        return subprocess.run(
+            ["git", "-C", repo] + list(args), check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True).stdout.strip()
+
+    def _fixture(self, commit=True):
+        root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        fx = {"root": root}
+        for name in ("repo", "role-temp", "assets", "evidence", "outside"):
+            fx[name.replace("-", "_")] = os.path.join(root, name)
+            os.mkdir(fx[name.replace("-", "_")])
+        repo = fx["repo"]
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "fixture@example.invalid")
+        self._git(repo, "config", "user.name", "Fixture")
+        self._git(repo, "config", "commit.gpgsign", "false")
+        Path(os.path.join(repo, "keep.txt")).write_text("keep\n")
+        Path(os.path.join(repo, "with space.txt")).write_text("space\n")
+        self._git(repo, "add", ".")
+        if commit:
+            self._git(repo, "commit", "-q", "-m", "fixture")
+        fx["scope"] = action_policy.OwnedScope(
+            repo_roots=(repo,), role_temp_dir=fx["role_temp"],
+            session_assets_dir=fx["assets"],
+            external_output_roots=(fx["evidence"],))
+        fx["actions"] = os.path.join(root, "actions.jsonl")
+        fx["broker"] = guard_broker.GuardBroker(
+            os.path.join(root, "guard.sock"), "tok", fx["scope"],
+            fx["actions"], os.path.join(root, "children.jsonl"),
+            os.path.join(root, "trace.jsonl"), self.PARENT)
+        return fx
+
+    def _handle(self, fx, command, cwd=None, payload_extra=None,
+                tool_input_extra=None):
+        tool_input = {"command": command}
+        tool_input.update(tool_input_extra or {})
+        payload = {"tool_name": "Bash", "tool_input": tool_input,
+                   "cwd": cwd or fx["repo"]}
+        payload.update(payload_extra or {})
+        response = fx["broker"].handle({
+            "guard_attempt_id": str(uuid.uuid4()), "token": "tok",
+            "payload": payload})
+        return response["hookSpecificOutput"]
+
+    def _last_record(self, fx):
+        with open(fx["actions"]) as fh:
+            lines = [line for line in fh if line.strip()]
+        return json.loads(lines[-1])
+
+    def _assert_allowed(self, fx, command, cwd=None):
+        output = self._handle(fx, command, cwd=cwd)
+        self.assertEqual(output["permissionDecision"], "allow", output)
+        record = self._last_record(fx)
+        self.assertTrue(record["allow"])
+        self.assertEqual(record["reason"], "owned_target")
+        return record
+
+    def _assert_denied(self, fx, command, reason, cwd=None, **kw):
+        output = self._handle(fx, command, cwd=cwd, **kw)
+        self.assertEqual(output["permissionDecision"], "deny", output)
+        self.assertTrue(
+            output["permissionDecisionReason"].startswith(reason),
+            output["permissionDecisionReason"])
+        record = self._last_record(fx)
+        self.assertFalse(record["allow"])
+        self.assertNotIn("authorities", record)
+        return record
+
+    def _git_authority(self, fx, rel="keep.txt"):
+        return {"kind": "repo_root",
+                "root_digest": action_policy._digest(fx["repo"]),
+                "recoverability": {
+                    "proof": "git_head_blob",
+                    "commit": self._git(fx["repo"], "rev-parse", "HEAD"),
+                    "blob": self._git(fx["repo"], "rev-parse",
+                                      "HEAD:" + rel)}}
+
+    def test_clean_tracked_delete_is_allowed_from_git_facts(self):
+        fx = self._fixture()
+        record = self._assert_allowed(fx, "rm keep.txt")
+        self.assertEqual(record["authorities"], [self._git_authority(fx)])
+        encoded = json.dumps(record)
+        self.assertNotIn(fx["repo"], encoded)
+        self.assertNotIn("keep.txt", encoded)
+        # the broker judges; it never deletes
+        self.assertTrue(os.path.exists(os.path.join(fx["repo"], "keep.txt")))
+        record = self._assert_allowed(fx, 'rm "with space.txt"')
+        self.assertEqual(record["authorities"],
+                         [self._git_authority(fx, "with space.txt")])
+        record = self._assert_allowed(
+            fx, "rm %s" % os.path.join(fx["repo"], "keep.txt"),
+            cwd=fx["outside"])
+        self.assertEqual(record["authorities"], [self._git_authority(fx)])
+
+    def test_dirty_untracked_and_directory_targets_are_denied(self):
+        fx = self._fixture()
+        with open(os.path.join(fx["repo"], "keep.txt"), "a") as fh:
+            fh.write("more\n")
+        self._assert_denied(fx, "rm keep.txt", "delete_not_recoverable")
+        with open(os.path.join(fx["repo"], "with space.txt"), "w") as fh:
+            fh.write("staged\n")
+        self._git(fx["repo"], "add", "with space.txt")
+        self._assert_denied(fx, 'rm "with space.txt"',
+                            "delete_not_recoverable")
+        Path(os.path.join(fx["repo"], "new.txt")).write_text("new\n")
+        self._assert_denied(fx, "rm new.txt", "delete_not_recoverable")
+        os.mkdir(os.path.join(fx["repo"], "dir"))
+        self._assert_denied(fx, "rm -r dir", "delete_not_recoverable")
+        self._assert_denied(fx, "rmdir dir", "delete_not_recoverable")
+        self._assert_denied(fx, "rm missing.txt", "delete_not_recoverable")
+
+    def test_symlink_final_component_denied_symlinked_parent_allowed(self):
+        fx = self._fixture()
+        repo = fx["repo"]
+        os.symlink("keep.txt", os.path.join(repo, "link.txt"))
+        self._assert_denied(fx, "rm link.txt", "delete_not_recoverable")
+        self.assertTrue(os.path.exists(os.path.join(repo, "keep.txt")))
+        self._assert_denied(fx, "rm %s" % os.path.join(repo, "link.txt"),
+                            "delete_not_recoverable")
+        os.symlink("keep.txt", os.path.join(repo, "tracked-link"))
+        self._git(repo, "add", "tracked-link")
+        self._git(repo, "commit", "-q", "-m", "link")
+        self.assertTrue(self._git(
+            repo, "ls-files", "-s", "tracked-link").startswith("120000"))
+        self._assert_denied(fx, "rm tracked-link", "delete_not_recoverable")
+        # a symlinked PARENT names the same tracked object: allowed
+        alias = os.path.join(fx["root"], "alias")
+        os.symlink(repo, alias)
+        record = self._assert_allowed(fx, "rm alias/keep.txt", cwd=fx["root"])
+        self.assertEqual(record["authorities"], [self._git_authority(fx)])
+        record = self._assert_allowed(fx, "rm keep.txt", cwd=alias)
+        self.assertEqual(record["authorities"], [self._git_authority(fx)])
+
+    def test_no_head_repository_is_denied(self):
+        fx = self._fixture(commit=False)
+        self._assert_denied(fx, "rm keep.txt", "delete_not_recoverable")
+
+    def test_head_movement_is_rederived_per_attempt(self):
+        fx = self._fixture()
+        repo = fx["repo"]
+        first = self._assert_allowed(fx, "rm keep.txt")
+        old = first["authorities"][0]["recoverability"]
+        Path(os.path.join(repo, "other.txt")).write_text("other\n")
+        self._git(repo, "add", "other.txt")
+        self._git(repo, "commit", "-q", "-m", "unrelated")
+        moved = self._assert_allowed(fx, "rm keep.txt")
+        new = moved["authorities"][0]["recoverability"]
+        self.assertEqual(new["commit"], self._git(repo, "rev-parse", "HEAD"))
+        self.assertNotEqual(new["commit"], old["commit"])
+        self.assertEqual(new["blob"], old["blob"])
+        Path(os.path.join(repo, "keep.txt")).write_text("changed\n")
+        self._git(repo, "add", "keep.txt")
+        self._git(repo, "commit", "-q", "-m", "changed")
+        rewritten = self._assert_allowed(fx, "rm keep.txt")
+        self.assertEqual(rewritten["authorities"], [self._git_authority(fx)])
+        self.assertNotEqual(
+            rewritten["authorities"][0]["recoverability"]["blob"],
+            old["blob"])
+
+    def test_stale_facts_and_mutate_then_retry_are_denied(self):
+        fx = self._fixture()
+        repo = fx["repo"]
+        target = os.path.join(repo, "keep.txt")
+        facts = guard_broker.derive_delete_facts(repo, target, target)
+        self.assertIsNotNone(
+            action_policy.clean_tracked_delete_proof(facts))
+        Path(target).write_text("edited after derivation\n")
+        # the broker never reuses an earlier derivation
+        self._assert_denied(fx, "rm keep.txt", "delete_not_recoverable")
+        self._git(repo, "checkout", "--", "keep.txt")
+        self._assert_allowed(fx, "rm keep.txt")
+        with open(target, "a") as fh:
+            fh.write("retry\n")
+        self._assert_denied(fx, "rm keep.txt", "delete_not_recoverable")
+
+    def test_payload_lists_cannot_fabricate_recoverability(self):
+        fx = self._fixture()
+        untracked = os.path.join(fx["repo"], "new.txt")
+        Path(untracked).write_text("new\n")
+        self._assert_denied(
+            fx, "rm new.txt", "delete_not_recoverable",
+            payload_extra={"clean_tracked_paths": [untracked],
+                           "created_paths": [untracked]})
+        self._assert_denied(
+            fx, "rm new.txt", "delete_not_recoverable",
+            tool_input_extra={"lexical_targets": [untracked],
+                              "clean_tracked_paths": [untracked]})
+        # a resolution-complete delete action without lexical operands
+        # (or with misaligned ones) yields no facts and is denied
+        action = action_policy.classify_action(
+            "Bash", {"command": "rm keep.txt"}, cwd=fx["repo"])
+        self.assertEqual(len(action["lexical_targets"]), 1)
+        stripped = {k: v for k, v in action.items() if k != "lexical_targets"}
+        self.assertEqual(fx["broker"]._delete_facts(stripped), {})
+        self.assertEqual(fx["broker"]._delete_facts(
+            dict(action, lexical_targets=[])), {})
+        self.assertEqual(fx["broker"]._delete_facts(
+            dict(action, lexical_targets="keep.txt")), {})
+        self.assertEqual(action_policy.decide(
+            stripped, fx["scope"], delete_facts={})["reason"],
+            "delete_not_recoverable")
+        self.assertIn(os.path.join(fx["repo"], "keep.txt"),
+                      fx["broker"]._delete_facts(action))
+
+    def test_outside_scope_and_external_root_deletes_are_denied(self):
+        fx = self._fixture()
+        asset = os.path.join(fx["assets"], "trace.jsonl")
+        Path(asset).write_text("x")
+        self._assert_denied(fx, "rm %s" % asset,
+                            "session_asset_not_declared_output")
+        outside = os.path.join(fx["outside"], "x.txt")
+        Path(outside).write_text("x")
+        self._assert_denied(fx, "rm %s" % outside,
+                            "target_outside_owned_scope")
+        external = os.path.join(fx["evidence"], "report.json")
+        Path(external).write_text("{}")
+        self._assert_denied(fx, "rm %s" % external,
+                            "delete_not_recoverable")
+        self.assertTrue(os.path.exists(external))
+
+    def test_git_rm_mv_dd_and_find_delete_stay_unprovable(self):
+        fx = self._fixture()
+        for command in ("git rm keep.txt", "mv keep.txt x",
+                        "dd if=keep.txt of=x",
+                        "find . -name keep.txt -delete"):
+            with self.subTest(command=command):
+                self._assert_denied(fx, command, "shell_unprovable")
+
+    def test_git_timeout_or_failure_denies(self):
+        import unittest.mock as mock
+        fx = self._fixture()
+        target = os.path.join(fx["repo"], "keep.txt")
+
+        def timing_out(*args, **kwargs):
+            raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout"))
+        self.assertIsNone(guard_broker.derive_delete_facts(
+            fx["repo"], target, target, run=timing_out))
+
+        def failing(*args, **kwargs):
+            raise OSError("git unavailable")
+        self.assertIsNone(guard_broker.derive_delete_facts(
+            fx["repo"], target, target, run=failing))
+        with mock.patch.object(guard_broker.subprocess, "run",
+                               side_effect=timing_out):
+            self._assert_denied(fx, "rm keep.txt", "delete_not_recoverable")
+
+    def test_role_temp_delete_keeps_its_own_authority(self):
+        fx = self._fixture()
+        scratch = os.path.join(fx["role_temp"], "scratch.txt")
+        Path(scratch).write_text("x")
+        record = self._assert_allowed(fx, "rm %s" % scratch)
+        self.assertEqual(record["authorities"], [{
+            "kind": "role_temp",
+            "root_digest": action_policy._digest(fx["role_temp"]),
+            "recoverability": {"proof": "role_temp"}}])
+
+    def test_clean_tracked_delete_proof_table(self):
+        proof = action_policy.clean_tracked_delete_proof
+        good = {
+            "rel": "keep.txt", "regular_file": True,
+            "index_entries": 1, "index_mode": "100644",
+            "index_blob": "a" * 40, "index_stage": 0,
+            "index_path": "keep.txt",
+            "head_commit": "b" * 40, "head_type": "blob",
+            "head_blob": "a" * 40, "head_path": "keep.txt",
+            "worktree_clean": True, "index_clean": True,
+            "worktree_blob": "a" * 40,
+        }
+        self.assertEqual(proof(good), {"proof": "git_head_blob",
+                                       "commit": "b" * 40, "blob": "a" * 40})
+        sha256 = dict(good, index_blob="c" * 64, head_blob="c" * 64,
+                      worktree_blob="c" * 64, head_commit="d" * 64)
+        self.assertEqual(proof(sha256)["blob"], "c" * 64)
+        self.assertEqual(proof(dict(good, index_mode="100755"))["blob"],
+                         "a" * 40)
+        violations = [
+            ("index_mode", "120000"), ("index_mode", None),
+            ("index_stage", 1), ("index_entries", 2), ("index_entries", 0),
+            ("head_commit", "not-hex"), ("head_commit", None),
+            ("head_commit", "A" * 40), ("head_type", "tree"),
+            ("head_blob", "c" * 40), ("index_blob", "c" * 40),
+            ("worktree_blob", "c" * 40), ("worktree_blob", None),
+            ("worktree_clean", False), ("worktree_clean", 1),
+            ("index_clean", False), ("index_path", "other.txt"),
+            ("head_path", "other.txt"), ("regular_file", False),
+            ("rel", None), ("rel", ""),
+        ]
+        for key, value in violations:
+            with self.subTest(key=key, value=value):
+                self.assertIsNone(proof(dict(good, **{key: value})))
+        for shape in (None, [], "facts", {"rel": None, "regular_file": False}):
+            with self.subTest(shape=shape):
+                self.assertIsNone(proof(shape))
 
 
 class UnknownToolClassTests(unittest.TestCase):

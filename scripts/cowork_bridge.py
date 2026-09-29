@@ -295,7 +295,7 @@ def codex_mode_flags(mode, yolo):
 def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
                          resume_id=None, extra_writable_dir=None,
                          model=None, effort=None, guard_settings_path=None,
-                         delegation_allowed=True):
+                         delegation_allowed=True, external_output_roots=()):
     """Full argv for a persistent duplex claude scout process.
 
     Pass `session_id` to pin a known UUID on a fresh session (so it can be saved
@@ -347,6 +347,10 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         cmd += ["--disallowedTools", "Agent", "Task"]
     if extra_writable_dir:
         cmd += ["--add-dir", extra_writable_dir]
+    # Declared external output roots (#99): one grant per exact root, fresh
+    # and resume alike; the hook policy and seatbelt enforce the same set.
+    for root in external_output_roots or ():
+        cmd += ["--add-dir", root]
     if resume_id:
         cmd += ["--resume", resume_id]
     elif session_id:
@@ -490,8 +494,9 @@ def migrate_legacy_claude_resume(controller_state, resume_id,
 def _guard_runtime(trace, role, assets_dir, model, effort,
                    delegation_allowed, declared_outputs=None, resume_id=None,
                    repo_writable=True, controller="claude",
-                   controller_session_id=None):
+                   controller_session_id=None, external_output_roots=()):
     session_uuid = getattr(trace, "session_uuid", None)
+    external_output_roots = tuple(external_output_roots or ())
     if not (session_uuid and assets_dir):
         raise RuntimeError("guard_context_unavailable")
     if sys.platform.startswith("linux"):
@@ -530,6 +535,7 @@ def _guard_runtime(trace, role, assets_dir, model, effort,
                               if declared_outputs is not None
                               else _declared_outputs_for_role(
                                   assets_dir, role)),
+            external_output_roots=external_output_roots,
             role_temp_dir=role_temp, controller_state_dir=controller_state,
             session_assets_dir=assets_dir,
             sibling_worktrees=sibling_worktrees, protected_paths=())
@@ -569,6 +575,7 @@ def _guard_runtime(trace, role, assets_dir, model, effort,
         declared_outputs=(tuple(declared_outputs)
                           if declared_outputs is not None
                           else _declared_outputs_for_role(assets_dir, role)),
+        external_output_roots=external_output_roots,
         role_temp_dir=role_temp, controller_state_dir=controller_state,
         session_assets_dir=assets_dir, sibling_worktrees=sibling_worktrees,
         protected_paths=profile_protected)
@@ -886,7 +893,8 @@ def codex_mcp_override_args(guarded=False):
 
 
 def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
-                        model=None, effort=None, guarded=False):
+                        model=None, effort=None, guarded=False,
+                        external_output_roots=()):
     """argv for the first one-shot codex exec turn. The role spec is prepended
     into prompt_text by the caller (no AGENTS.md is written into the repo).
 
@@ -896,7 +904,12 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
     via `--add-dir` so a no-yolo (workspace-write) role can write its session
     artifacts outside cwd. The grant is re-applied on every codex resume too
     (see `codex_resume_mode_args` / `build_codex_resume_command`), so resumed
-    roles keep the same effective permissions as this fresh turn."""
+    roles keep the same effective permissions as this fresh turn.
+    `external_output_roots` (#99) are granted the same way, one `--add-dir`
+    per exact declared root."""
+    root_args = []
+    for root in external_output_roots or ():
+        root_args += ["--add-dir", root]
     return (
         ["codex", "exec", "--json", "--skip-git-repo-check"]
         + codex_governance_args(guarded)
@@ -904,11 +917,13 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None,
         + codex_mode_flags(mode, yolo)
         + codex_model_args(model, effort)
         + (["--add-dir", extra_writable_dir] if extra_writable_dir else [])
+        + root_args
         + [prompt_text]
     )
 
 
-def codex_resume_mode_args(mode, yolo, extra_writable_dir=None):
+def codex_resume_mode_args(mode, yolo, extra_writable_dir=None,
+                           external_output_roots=()):
     """Resume-compatible permission args mirroring `codex_mode_flags` for a
     `codex exec resume` turn (verified against codex-cli 0.139.0).
 
@@ -925,7 +940,9 @@ def codex_resume_mode_args(mode, yolo, extra_writable_dir=None):
 
     The writable-root path is encoded as a TOML basic string via `json.dumps`
     (a valid TOML basic string for filesystem paths, escaping any quotes/
-    backslashes); the array value is `[` + json.dumps(dir) + `]`.
+    backslashes); the array value is `[` + json.dumps(dir) + `]`. Declared
+    external output roots (#99) follow `extra_writable_dir` in that same
+    array, so the output is byte-identical to before when none are declared.
     """
     if mode == "plan":
         return ["-c", 'sandbox_mode="read-only"']
@@ -933,15 +950,18 @@ def codex_resume_mode_args(mode, yolo, extra_writable_dir=None):
     if yolo:
         return ["--dangerously-bypass-approvals-and-sandbox"]
     args = ["-c", 'sandbox_mode="workspace-write"']
-    if extra_writable_dir:
-        roots = "[" + json.dumps(extra_writable_dir) + "]"
-        args += ["-c", "sandbox_workspace_write.writable_roots=" + roots]
+    roots = ([extra_writable_dir] if extra_writable_dir else []) + list(
+        external_output_roots or ())
+    if roots:
+        encoded = "[" + ",".join(json.dumps(r) for r in roots) + "]"
+        args += ["-c", "sandbox_workspace_write.writable_roots=" + encoded]
     return args
 
 
 def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
                                extra_writable_dir=None, model=None,
-                               effort=None, guarded=False):
+                               effort=None, guarded=False,
+                               external_output_roots=()):
     """argv for a codex follow-up turn against an explicit thread id (never
     --last, which could grab a concurrent session in the same cwd).
 
@@ -957,7 +977,8 @@ def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
         ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
         + codex_governance_args(guarded)
         + codex_mcp_override_args(guarded)
-        + codex_resume_mode_args(mode, yolo, extra_writable_dir)
+        + codex_resume_mode_args(mode, yolo, extra_writable_dir,
+                                 external_output_roots=external_output_roots)
         + codex_model_args(model, effort)
         + [thread_id, prompt_text]
     )
@@ -2006,11 +2027,13 @@ class ClaudeSession:
                  internal=False, model=None, effort=None,
                  guard_settings_path=None, delegation_allowed=True,
                  owned_scope=None, controller_env=None,
-                 declared_outputs=None, repo_writable=True, auth_run=None):
+                 declared_outputs=None, repo_writable=True, auth_run=None,
+                 external_output_roots=()):
         policy.guard("claude", role=speaker, kind="dispatch")
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.controller = "claude"
+        self.external_output_roots = tuple(external_output_roots or ())
         self.label = speaker_label(speaker)
         # internal=True marks a reviewer/advisor/evaluator session (not a lead).
         self.internal = internal
@@ -2031,7 +2054,8 @@ class ClaudeSession:
                 trace, speaker, extra_writable_dir, model, effort,
                 delegation_allowed, declared_outputs=declared_outputs,
                 resume_id=resume_id, repo_writable=repo_writable,
-                controller_session_id=session_id or resume_id)
+                controller_session_id=session_id or resume_id,
+                external_output_roots=self.external_output_roots)
             guard_settings_path = self._guard_runtime["settings_path"]
             delegation_allowed = self._guard_runtime["delegation_allowed"]
             owned_scope = self._guard_runtime["scope"]
@@ -2054,12 +2078,14 @@ class ClaudeSession:
         self.controller_state_dir = (
             self._guard_runtime["scope"].controller_state_dir
             if self._guard_runtime else None)
-        command = build_claude_command(role_prompt_file, mode, yolo,
-                                       session_id=session_id, resume_id=resume_id,
-                                       extra_writable_dir=extra_writable_dir,
-                                       model=model, effort=effort,
-                                       guard_settings_path=guard_settings_path,
-                                       delegation_allowed=delegation_allowed)
+        command = build_claude_command(
+            role_prompt_file, mode, yolo,
+            session_id=session_id, resume_id=resume_id,
+            extra_writable_dir=extra_writable_dir,
+            model=model, effort=effort,
+            guard_settings_path=guard_settings_path,
+            delegation_allowed=delegation_allowed,
+            external_output_roots=self.external_output_roots)
         if owned_scope is not None:
             boundary = kernel_write_boundary(
                 owned_scope, command,
@@ -2624,13 +2650,14 @@ class CodexSession:
                  resume_thread_id=None, on_thread_id=None, trace=None,
                  extra_writable_dir=None, internal=False, model=None,
                  effort=None, declared_outputs=None, repo_writable=True,
-                 auth_run=None):
+                 auth_run=None, external_output_roots=()):
         policy.guard("codex", role=speaker, kind="dispatch")
         self.mode = mode
         self.yolo = yolo
         self.model = model
         self.effort = effort
         self.controller = "codex"
+        self.external_output_roots = tuple(external_output_roots or ())
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
@@ -2646,7 +2673,8 @@ class CodexSession:
                 trace, speaker, extra_writable_dir, model, effort, False,
                 declared_outputs=declared_outputs,
                 resume_id=resume_thread_id, repo_writable=repo_writable,
-                controller="codex")
+                controller="codex",
+                external_output_roots=self.external_output_roots)
             self._controller_env = self._guard_runtime["env"]
             try:
                 _require_controller_auth(
@@ -2868,7 +2896,8 @@ class CodexSession:
                 text, self.mode, self.yolo,
                 extra_writable_dir=self.extra_writable_dir,
                 model=self.model, effort=self.effort,
-                guarded=bool(self._guard_runtime))
+                guarded=bool(self._guard_runtime),
+                external_output_roots=self.external_output_roots)
             fresh = True
         else:
             if not self.thread_id:
@@ -2893,7 +2922,8 @@ class CodexSession:
                 self.thread_id, text, self.mode, self.yolo,
                 extra_writable_dir=self.extra_writable_dir,
                 model=self.model, effort=self.effort,
-                guarded=bool(self._guard_runtime))
+                guarded=bool(self._guard_runtime),
+                external_output_roots=self.external_output_roots)
             fresh = False
         self._started = True
         if self._guard_runtime:
@@ -3058,13 +3088,14 @@ class OpencodeSession:
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
                  resume_session_id=None, on_session_id=None, trace=None,
                  extra_writable_dir=None, internal=False, model=None,
-                 effort=None, agent_base_dir=None):
+                 effort=None, agent_base_dir=None, external_output_roots=()):
         policy.guard("opencode", role=speaker, kind="dispatch")
         self.mode = mode
         self.yolo = yolo
         self.model = model
         self.effort = effort
         self.controller = "opencode"
+        self.external_output_roots = tuple(external_output_roots or ())
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
@@ -3110,7 +3141,8 @@ class OpencodeSession:
             self._guard_runtime = _guard_runtime(
                 trace, speaker, extra_writable_dir, model, effort, False,
                 resume_id=None, repo_writable=(mode == "implement"),
-                controller="opencode")
+                controller="opencode",
+                external_output_roots=self.external_output_roots)
             self._controller_env = self._guard_runtime["env"]
         if nested_guard_active() and self.trace:
             self.trace.event(

@@ -356,6 +356,26 @@ cowork --session-file .cowork/session.<uuid>.json
   phase.
 - `--evaluation-policy all_rounds|final_round|sampled|off` — see
   [Scoring stays out of the way](#scoring-stays-out-of-the-way).
+- `--output-root DIR` — repeatable; declare an external evidence output root
+  the **builder only** may write into. `DIR` must be an existing directory;
+  it is canonicalized to its real path and bound to the session record before
+  anything is created. Refused (rc 2) when it is exactly `/`, your home,
+  `/tmp` or `/private/tmp` (`output_root_unsafe`); when it equals, lies
+  inside or contains the repository, any registered worktree, the cowork
+  sessions root, the session-file directory, or a controller's real
+  home/state directory (`~/.claude` or `CLAUDE_CONFIG_DIR`, `~/.codex` or
+  `CODEX_HOME`, opencode's data dir) — also `output_root_unsafe`; when it
+  is not absolute or not a usable string (`output_root_invalid`); when it
+  is not an existing directory (`output_root_missing`); or when two declared
+  roots duplicate or nest each other (`output_roots_conflict`). It cannot be
+  combined with `--no-session` (`conflicting_arguments`). On a resume, omit
+  the flag to reuse the saved roots or repeat them exactly; a saved session
+  that has no declared roots accepts a first declaration; a set that differs
+  from saved roots is refused (`output_roots_conflict`) and the record is
+  left untouched. The grant is re-applied on every builder spawn (claude
+  and codex `--add-dir`, codex resume `sandbox_workspace_write.writable_roots`)
+  and enforced by the hook policy and the OS sandbox: parents, siblings,
+  `..` and symlink aliases of a declared root stay denied.
 - `--take-over` — take over a saved session's single-writer owner lease from a
   prior process. Never implicit: a crashed owner is reclaimed only with proof
   of death, a live same-host owner is terminated first, and an owner that
@@ -514,7 +534,10 @@ live — see the bullet below.
   2 invalid arguments.
 
 `--report` and `--session-owner` without a UUID read this directory's most
-recent session; they never run a phase.
+recent session; they never run a phase. `--output-root` cannot be combined
+with `--check`, `--report`, `--session-owner` or `--evaluate-role`
+(`conflicting_arguments`): none of them dispatches a builder, so a
+declaration there would be silently dropped rather than bound.
 
 Defaults per role (model/effort default to the controller CLI's own setting):
 
@@ -569,7 +592,11 @@ discovered). It stores:
   scout, scout-reviewer, planner, planning-advisor, builder, and build-reviewer
   — so a run that is killed can be **resumed where it left off**, with the
   reviewers keeping their accumulated review context too;
-- the **current session context**, versioned (see below); and
+- the **current session context**, versioned (see below);
+- the session's **declared external output roots** (`declared_output_roots`,
+  a sorted list of canonical absolute directories declared with
+  `--output-root`) — so a resume reproduces exactly the authorized roots and
+  never a re-derived or widened set; and
 - each paired reviewer's **last-approved hash-gate baseline** (the artifact
   composite it last approved, scoped by phase epoch + acknowledged context
   revision) — so the [reviewer skip on unchanged artifacts](#reviewer-skip-on-unchanged-artifacts-hash-gate)
@@ -1559,8 +1586,20 @@ tokens, and the fragment's sha256 and byte length. It never stores the raw
 text.
 
 Writable scope is exactly the selected worktree, the acting role's declared
-outputs, and its private temp/controller-state directories. Deletes require an
-exact owned and recoverable target. A generated operating-system sandbox
+outputs, the session's declared external output roots (`--output-root`,
+builder only; parents, siblings and aliases of a root stay denied), and the
+role's private temp/controller-state directories. A delete is allowed only
+for a role-temp target, or for a tracked regular file inside the selected
+worktree whose path as typed is not a symlink and resolves to that file,
+whose index blob, HEAD blob and current on-disk hash agree, and whose
+worktree and index are clean for that path — facts the broker derives from
+Git on every attempt (`ls-files`, `rev-parse`, `ls-tree`, `diff`,
+`diff --cached`, `hash-object`); hook payload lists are ignored, and
+`git rm`, `mv`, `dd`, `find -delete`, symlink and directory deletes stay
+denied. Every allowed mutation's action record carries `authorities` (the
+authorizing root's `kind` and `root_digest`), and an allowed delete carries
+`recoverability` (`git_head_blob` with the commit and blob ids that make it
+recoverable). A generated operating-system sandbox
 independently enforces those same roots. Registered sibling worktrees are
 discovered before every Claude launch and explicitly denied in both the action
 policy and kernel profile when they sit at or below a writable root. When the

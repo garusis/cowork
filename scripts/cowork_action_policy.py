@@ -148,6 +148,19 @@ SAFE_INERT_FLAGS = {
                        "--retry", "--pid", "--sleep-interval")),
 }
 
+# Authority record (cowork-internal #99).  Every allowed mutation names the
+# kind of writable root that authorized it, in this precedence order; the
+# record carries only the kind and a digest of the root, never the path.
+AUTHORITY_KINDS = ("repo_root", "external_output_root", "declared_output",
+                   "role_temp", "controller_state")
+# A delete inside a repository root is recoverable only when Git itself
+# proves the exact current bytes are reachable from HEAD (see
+# `clean_tracked_delete_proof`).  The facts are derived by the broker on
+# every attempt; the payload can never supply them.
+GIT_DELETE_PROOF = "git_head_blob"
+_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_TRACKED_MODES = ("100644", "100755")
+
 CONTROLLER_CAPABILITY_MATRIX = {
     ("claude", "plan"): {
         "delegation": "enforceably_disabled",
@@ -250,6 +263,11 @@ def child_request_metadata(requested):
 class OwnedScope:
     repo_roots: tuple = field(default_factory=tuple)
     declared_outputs: tuple = field(default_factory=tuple)
+    # Orchestrator-declared external evidence roots (cowork-internal #99):
+    # directories outside the repository the builder may write into.  Kept
+    # distinct from `declared_outputs` so the authority record can name the
+    # kind and so role-artifact staging rules never widen to them.
+    external_output_roots: tuple = field(default_factory=tuple)
     role_temp_dir: str = None
     controller_state_dir: str = None
     session_assets_dir: str = None
@@ -261,6 +279,9 @@ class OwnedScope:
                            tuple(_real(p) for p in self.repo_roots if p))
         object.__setattr__(self, "declared_outputs",
                            tuple(_real(p) for p in self.declared_outputs if p))
+        object.__setattr__(self, "external_output_roots",
+                           tuple(_real(p) for p in self.external_output_roots
+                                 if p))
         object.__setattr__(self, "sibling_worktrees",
                            tuple(_real(p) for p in self.sibling_worktrees if p))
         object.__setattr__(self, "protected_paths",
@@ -272,7 +293,8 @@ class OwnedScope:
 
     @property
     def writable_roots(self):
-        roots = list(self.repo_roots) + list(self.declared_outputs)
+        roots = (list(self.repo_roots) + list(self.external_output_roots)
+                 + list(self.declared_outputs))
         roots += [self.role_temp_dir, self.controller_state_dir]
         return tuple(dict.fromkeys(p for p in roots if p))
 
@@ -284,6 +306,28 @@ class OwnedScope:
         path = _real(path)
         return any(path == root or _inside(path, root)
                    for root in self.declared_outputs)
+
+    def is_external_output_root(self, path):
+        path = _real(path)
+        return any(path == root or _inside(path, root)
+                   for root in self.external_output_roots)
+
+    def authority_for(self, path):
+        """`(kind, root)` naming the writable root that owns `path`, in
+        AUTHORITY_KINDS precedence, or None when nothing owns it."""
+        path = _real(path)
+        groups = (
+            ("repo_root", self.repo_roots),
+            ("external_output_root", self.external_output_roots),
+            ("declared_output", self.declared_outputs),
+            ("role_temp", (self.role_temp_dir,)),
+            ("controller_state", (self.controller_state_dir,)),
+        )
+        for kind, roots in groups:
+            for root in roots:
+                if root and (path == root or _inside(path, root)):
+                    return kind, root
+        return None
 
     def is_role_temp(self, path):
         return bool(self.role_temp_dir and _inside(path, self.role_temp_dir))
@@ -511,6 +555,18 @@ def _resolve(value, cwd):
     return _real(value if os.path.isabs(value) else os.path.join(cwd, value))
 
 
+def _lexical(value, cwd):
+    """The operand as typed, made absolute and normalized but NOT realpath'd.
+
+    A delete is judged on the realpath target, yet the shell removes the
+    lexical path: when its final component is a symlink the two differ.  The
+    broker needs both to prove they name the same object."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    return os.path.normpath(os.path.abspath(os.path.expanduser(
+        value if os.path.isabs(value) else os.path.join(cwd, value))))
+
+
 def _safe_flag(argument, allowed, numeric=False, numeric_values=()):
     """Match one option without letting an unknown bundled flag slip through."""
     if argument == "--":
@@ -716,9 +772,18 @@ def _bash_stage(fragment, cwd, compound):
         if not targets or any(p is None for p in targets):
             return _stage_fail("unresolved_target",
                                reason="target_unresolved", verb=verb)
-        return {"class": "delete" if verb in ("rm", "rmdir") else "write",
-                "targets": targets, "resolution_complete": True,
-                "proof": "shell_argv", "verb": verb}
+        if verb in ("rm", "rmdir"):
+            lexical_targets = [_lexical(p, cwd) for p in candidates]
+            if any(p is None for p in lexical_targets):
+                return _stage_fail("unresolved_target",
+                                   reason="target_unresolved", verb=verb)
+            return {"class": "delete", "targets": targets,
+                    "lexical_targets": lexical_targets,
+                    "resolution_complete": True, "proof": "shell_argv",
+                    "verb": verb}
+        return {"class": "write", "targets": targets,
+                "resolution_complete": True, "proof": "shell_argv",
+                "verb": verb}
     if verb not in INERT_COMMANDS and verb not in SINK_COMMANDS:
         return _stage_fail("unknown_command", verb=verb)
     if verb == "git":
@@ -869,8 +934,49 @@ def classify_action(tool_name, tool_input, cwd=None, installed_schema=None,
             "resolution_complete": False, "reason": "unknown_tool_class"}
 
 
-def decide(action, scope, created_paths=(), clean_tracked_paths=()):
-    """Apply ownership and recoverability rules to a classified action."""
+def clean_tracked_delete_proof(facts):
+    """Pure rule: the recoverability proof for one delete target, or None.
+
+    `facts` is what the broker measured from Git on THIS attempt (see
+    `cowork_guard_broker.derive_delete_facts`).  Every clause is a Git fact:
+    exactly one stage-0 regular-file index entry for the path, a resolvable
+    HEAD commit whose tree holds the same blob, an on-disk hash equal to that
+    blob, and a clean worktree and index for the path.  Anything else is not
+    provably recoverable and yields None."""
+    if not isinstance(facts, dict):
+        return None
+    rel = facts.get("rel")
+    if not facts.get("regular_file") or not isinstance(rel, str) or not rel:
+        return None
+    if (facts.get("index_entries") != 1 or facts.get("index_stage") != 0
+            or facts.get("index_mode") not in _TRACKED_MODES
+            or facts.get("index_path") != rel):
+        return None
+    head_commit = facts.get("head_commit")
+    head_blob = facts.get("head_blob")
+    index_blob = facts.get("index_blob")
+    worktree_blob = facts.get("worktree_blob")
+    for value in (head_commit, head_blob, index_blob, worktree_blob):
+        if not isinstance(value, str) or not _OBJECT_ID.match(value):
+            return None
+    if facts.get("head_type") != "blob" or facts.get("head_path") != rel:
+        return None
+    if not (index_blob == head_blob == worktree_blob):
+        return None
+    if facts.get("worktree_clean") is not True:
+        return None
+    if facts.get("index_clean") is not True:
+        return None
+    return {"proof": GIT_DELETE_PROOF, "commit": head_commit,
+            "blob": head_blob}
+
+
+def decide(action, scope, delete_facts=None):
+    """Apply ownership and recoverability rules to a classified action.
+
+    `delete_facts` maps a realpath delete target to the Git facts the broker
+    derived for it on this attempt; a target with no facts is not
+    recoverable.  No caller-supplied path list can grant anything."""
     action = dict(action or {})
     kind = action.get("class")
     targets = action.get("targets") or ()
@@ -883,8 +989,8 @@ def decide(action, scope, created_paths=(), clean_tracked_paths=()):
                 "reason": action.get("reason") or "target_unresolved"}
     if kind == "child":
         return {"allow": False, "reason": "child_requires_identity_policy"}
-    created = {_real(p) for p in created_paths}
-    clean = {_real(p) for p in clean_tracked_paths}
+    delete_facts = delete_facts if isinstance(delete_facts, dict) else {}
+    authorities = []
     for target in targets:
         if not target:
             return {"allow": False, "reason": "target_unresolved"}
@@ -913,12 +1019,23 @@ def decide(action, scope, created_paths=(), clean_tracked_paths=()):
                     "reason": "session_asset_not_declared_output"}
         if not scope.owns(target):
             return {"allow": False, "reason": "target_outside_owned_scope"}
-        if kind == "delete" and not (
-                scope.is_role_temp(target) or target in created
-                or target in clean):
-            return {"allow": False, "reason": "delete_not_recoverable"}
+        authority = scope.authority_for(target)
+        if authority is None:
+            return {"allow": False, "reason": "target_outside_owned_scope"}
+        authority_kind, root = authority
+        entry = {"kind": authority_kind, "root_digest": _digest(root)}
+        if kind == "delete":
+            if scope.is_role_temp(target):
+                entry["recoverability"] = {"proof": "role_temp"}
+            else:
+                proof = clean_tracked_delete_proof(delete_facts.get(target))
+                if proof is None or authority_kind != "repo_root":
+                    return {"allow": False,
+                            "reason": "delete_not_recoverable"}
+                entry["recoverability"] = proof
+        authorities.append(entry)
     return {"allow": True, "reason": "owned_target",
-            "target_count": len(targets)}
+            "target_count": len(targets), "authorities": authorities}
 
 
 def sanitize(decision, action=None, work_id=None, parent_work_id=None,
@@ -942,6 +1059,10 @@ def sanitize(decision, action=None, work_id=None, parent_work_id=None,
     }
     if action.get("stage_count") is not None:
         record["stage_count"] = action["stage_count"]
+    # Authority kinds, root digests and Git object ids only (#99); the
+    # lexical operands never enter the record.
+    if (decision or {}).get("authorities"):
+        record["authorities"] = [dict(a) for a in decision["authorities"]]
     detail = action.get("unprovable")
     if detail:
         record["unprovable"] = _sanitize_unprovable(detail)
