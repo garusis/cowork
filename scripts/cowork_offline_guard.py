@@ -14,7 +14,14 @@ unwraps known prefixes (``env``, ``sandbox-exec``, ``bwrap … --``, ``nice``,
   file under the harness temp root (the test-created fake controllers);
 * package launchers and JS runtimes (``npx``, ``node``, …) outright;
 * shells given ``-c`` text or scripts that mention a provider name, and shells
-  reading a script from stdin or from outside the temp root;
+  reading a script from stdin or from outside the temp root. One bounded
+  exception, for Claude's per-call working-directory file: in ``-c`` text a
+  whole word matching the closed ``/tmp/claude-<4-5 hex>-cwd`` grammar below,
+  with an output-redirect operator immediately in front of it, is a write
+  target rather than the program the shell runs. Command position, input
+  redirects, process substitutions, quoted targets, other path shapes and
+  every other provider token stay refused, and the exception does not extend
+  to shell *script files*, whose contents keep the plain-token rule;
 * Python children started with ``-I``/``-E``/``-S`` (they would skip this
   guard);
 * wrapper options it does not know (anything beyond the listed flags of
@@ -45,7 +52,9 @@ guard.
 Known false positives (fail closed): executables whose name or one of the
 last three real-path components contains a provider token (for example a
 repo ``.claude/hooks/x`` script or a ``codex-runtimes`` directory) outside the
-temp root, and shell text or scripts that merely mention a provider name.
+temp root, and shell text or scripts that merely mention a provider name
+(apart from the one ``-c`` redirection target described above; a script file
+holding that same text is still refused).
 Stubs always go first in PATH, so a bare-name fake ``claude`` placed on PATH
 by a test resolves to the deny stub; call fakes by absolute path.
 
@@ -53,7 +62,10 @@ Boundary: this stops accidental launches by ordinary test and product code.
 It is not a sandbox against deliberately hostile code (ctypes, direct
 ``_posixsubprocess`` calls, sqlite/C-level file access, obfuscated shell text,
 or a non-Python child that builds a provider path at runtime and ignores the
-stub PATH).
+stub PATH). What bounds the cwd-file exception is its grammar and the
+redirect operator in front of the word, not what is on disk: like every other
+filesystem lookup here, its stat of the target is taken before the launch and
+can be raced.
 """
 
 import builtins
@@ -92,6 +104,26 @@ FAKE_MAX_BYTES = 1 << 20
 _TOKEN = re.compile(r"(?<![A-Za-z0-9])(claude|codex|opencode)(?![A-Za-z0-9])",
                     re.IGNORECASE)
 _PYTHON = re.compile(r"^python(\d+(\.\d+)*)?$", re.IGNORECASE)
+# Claude writes the working directory of each call to /tmp/claude-<4 hex>-cwd
+# and the darwin write boundary grants exactly that path (product behaviour of
+# the claude controller; see kernel_write_boundary claude_cwd_tracker). The
+# grammar is closed: the product shape, plus only the concrete near misses the
+# seatbelt boundary test has to execute (a fifth hex digit, and the tails "x",
+# ".x", "/x", "-evil"). It admits no "..", no extra path segment and no other
+# punctuation, so a traversal-shaped word is rejected by its structure rather
+# than by a tail-length budget.
+_CWD_TRACKER_WORD = re.compile(
+    r"^/(?:private/)?tmp/claude-[0-9A-Fa-f]{4,5}-cwd(?:x|\.x|/x|-evil)?$")
+# Words are the runs between shell separators. Every separator character is
+# non-alphanumeric, so splitting on them leaves _TOKEN's own boundaries -- and
+# therefore its verdict on the text as a whole -- unchanged.
+_SHELL_SPLIT = re.compile(r"([\s;|&<>()\[\]{}$`\"'=!*?~#\\]+)")
+# A separator that ends in an output-redirect operator (">", ">>", ">|", ">!",
+# optionally "&>"), followed by blanks only, so the next word is the file the
+# redirect writes. "<", "<>", "<<<" and ">(" cannot reach the final ">", and a
+# closing quote or any other character after the operator breaks the match, so
+# input redirects, process substitutions and quoted targets stay refused.
+_OUTPUT_REDIRECT = re.compile(r"(?:\A|[\s;&|(){}])>[>|!]?[ \t]*\Z")
 
 _config = None
 _orig = {}
@@ -157,6 +189,40 @@ def _script_mentions_provider(path):
             return bool(_TOKEN.search(fh.read().decode("utf-8", "replace")))
     except OSError:
         return False
+
+
+def _cwd_tracker_target(word, separator):
+    """True for a whole word in Claude's cwd-file namespace that this shell
+    text redirects output into.
+
+    The bound is structural: the closed grammar of _CWD_TRACKER_WORD plus an
+    output-redirect operator immediately in front of the word, which is what
+    makes it the file the redirect writes rather than the program the shell
+    runs. The executable-file check is only a backstop for a path that should
+    hold text -- it is a stat, it can be raced, and neither the grammar nor
+    the redirect anchor depends on it.
+    """
+    if not _OUTPUT_REDIRECT.search(separator):
+        return False
+    if not _CWD_TRACKER_WORD.match(word):
+        return False
+    return not (os.path.isfile(word) and os.access(word, os.X_OK))
+
+
+def _shell_text_mentions_provider(text):
+    """Provider tokens in ``sh -c`` text. Splitting on shell separators leaves
+    detection unchanged -- they are already token boundaries -- and lets the
+    cwd-file allowance see a whole word plus the separator before it. Index 0
+    is a word with no separator before it, i.e. command position, which no
+    output-redirect operator can precede."""
+    parts = _SHELL_SPLIT.split(text)
+    for index, word in enumerate(parts):
+        if index % 2 or not _TOKEN.search(word):
+            continue
+        if _cwd_tracker_target(word, parts[index - 1] if index else ""):
+            continue
+        return True
+    return False
 
 
 def _strict_opts(tool, args, flags, valued, assignments=False):
@@ -300,7 +366,7 @@ def _decide_shell(args, config):
         if a == "-c" or (a.startswith("-") and not a.startswith("--")
                          and "c" in a[1:]):
             text = args[i + 1] if i + 1 < len(args) else ""
-            if _TOKEN.search(text):
+            if _shell_text_mentions_provider(text):
                 return "shell -c text mentions a provider"
             return None
         if a in ("-s", "-i") or a == "-":

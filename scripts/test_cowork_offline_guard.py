@@ -15,6 +15,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import uuid
 
 import cowork_offline_guard as guard
 import cowork_offline_tests as harness
@@ -100,6 +101,120 @@ class DecideTests(unittest.TestCase):
                      ["nice", "-n", "5", "/bin/sh", "-c", "true"]):
             with self.subTest(argv=argv):
                 self.assertIsNone(self.decide(argv))
+
+    # -- Claude cwd-file allowance (issue #98) --------------------------- #
+
+    @staticmethod
+    def _free_cwd_path():
+        while True:
+            path = "/tmp/claude-%s-cwd" % uuid.uuid4().hex[:4]
+            if not os.path.lexists(path):
+                return path
+
+    def zsh(self, text):
+        return self.decide(["/bin/zsh", "-c", text])
+
+    def test_claude_cwd_file_redirection_target_is_not_a_launch(self):
+        # Exactly the commands ClaudeCwdTrackerBoundaryTests hands /bin/zsh:
+        # the granted path plus the near misses it proves the seatbelt profile
+        # denies. None of them names a program, so the guard must let zsh run
+        # and leave the verdict to the kernel boundary under test.
+        for text in ("ls >/dev/null && pwd -P >| /tmp/claude-a6e9-cwd",
+                     "pwd -P >| /private/tmp/claude-a6e9-cwd",
+                     ": >| /tmp/claude-39f4-cwd.x",
+                     ": >| /tmp/claude-238e2-cwd",
+                     ": >| /tmp/claude-8312-cwdx",
+                     ": >| /tmp/claude-4d59-cwd/x",
+                     ": >| /tmp/claude-d30c-cwd-evil",
+                     ": >| /tmp/claude-D7A5-cwd",
+                     ": >| /tmp/xclaude-b1a0-cwd"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.zsh(text))
+
+    def test_traversal_shaped_tails_are_denied_structurally(self):
+        # No boundary test needs "..", and the grammar admits none, so these
+        # fail on their shape rather than on any tail-length budget. The
+        # first two tails are 15 and 16 characters, straddling the budget an
+        # earlier revision relied on.
+        tails = ("/../../a/claude", "/../../usr/bin/x", "/..", "/../x",
+                 "/./x", "/../../../bin/claude", "-cwd/../x")
+        self.assertEqual([len(tails[0]), len(tails[1])], [15, 16])
+        for tail in tails:
+            for name in ("/tmp/claude-abcd-cwd", "/tmp/claude-1-cwd"):
+                with self.subTest(tail=tail, name=name):
+                    self.assertIsNotNone(self.zsh("pwd >| %s%s" % (name, tail)))
+
+    def test_only_an_output_redirect_target_is_allowed(self):
+        path = "/tmp/claude-abcd-cwd"
+        allowed = ("pwd > %s" % path, "pwd >%s" % path, "pwd >> %s" % path,
+                   "pwd >! %s" % path, "pwd &> %s" % path)
+        denied = {
+            # Command position: no operator can precede the first word.
+            "command_position": "%s --print hi" % path,
+            "after_separator": ": >| /tmp/claude-abcd-cwd; %s" % path,
+            # Not a redirection target.
+            "plain_argument": "cat %s" % path,
+            "exec_argument": "exec %s" % path,
+            "pipe": "pwd | %s" % path,
+            # Input redirection and read-write, never an output target.
+            "input": "cat < %s" % path,
+            "input_no_space": "cat <%s" % path,
+            "here_string": "cat <<< %s" % path,
+            "read_write": "exec 3<> %s" % path,
+            # Process substitution: the word is a command, not a file.
+            "proc_sub_out": "tee >(%s)" % path,
+            "proc_sub_in": "cat <(cat %s)" % path,
+            "proc_sub_after_out": "tee >(cat) < %s" % path,
+        }
+        for text in allowed:
+            with self.subTest(allow=text):
+                self.assertIsNone(self.zsh(text))
+        for name, text in denied.items():
+            with self.subTest(name):
+                self.assertIsNotNone(self.zsh(text))
+
+    def test_quoted_targets_are_refused_deliberately(self):
+        # Neither the product nor the boundary test quotes this path, and a
+        # quote between the operator and the word would have to be balanced
+        # to mean what it looks like. The allowance therefore stops at the
+        # bare word: a quoted target costs a false positive, not a hole.
+        for text in ('pwd >| "/tmp/claude-abcd-cwd"',
+                     "pwd >| '/tmp/claude-abcd-cwd'",
+                     'pwd >| "/tmp/claude-abcd-cwd',
+                     'pwd >| /tmp/"claude-abcd-cwd"'):
+            with self.subTest(text=text):
+                self.assertIsNotNone(self.zsh(text))
+
+    def test_provider_mentions_outside_the_allowance_still_refuse(self):
+        path = "/tmp/claude-abcd-cwd"
+        cases = {
+            "launch_then_write": "claude -p hi >| %s" % path,
+            "write_then_launch": ": >| %s && codex exec hi" % path,
+            "installed_cli": "exec /usr/local/bin/claude --print",
+            "home_cli": "pwd >| ~/.claude/local/claude",
+            "other_provider": "pwd >| /tmp/opencode-abcd-cwd",
+            "not_hex": "pwd >| /tmp/claude-zzzz-cwd",
+            "short_hex": "pwd >| /tmp/claude-abc-cwd",
+            "long_hex": "pwd >| /tmp/claude-abcdef-cwd",
+            "no_cwd_marker": "pwd >| /tmp/claude-abcd",
+            "unknown_tail": "pwd >| /tmp/claude-abcd-cwd.log",
+            "not_tmp": "pwd >| /var/claude-abcd-cwd",
+            "nested_tmp": "pwd >| /x/tmp/claude-abcd-cwd",
+            "relative": "pwd >| tmp/claude-abcd-cwd",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.assertIsNotNone(self.zsh(text))
+
+    def test_executable_at_the_cwd_path_trips_the_backstop(self):
+        # Not what bounds the allowance -- the grammar and the redirect
+        # operator do that -- but a path meant to hold text should never be
+        # executable, so the guard refuses when it is.
+        path = self._free_cwd_path()
+        self.addCleanup(lambda: os.path.lexists(path) and os.unlink(path))
+        self.assertIsNone(self.zsh("pwd -P >| %s" % path))
+        _exe(path)
+        self.assertIsNotNone(self.zsh("pwd -P >| %s" % path))
 
     def test_oversized_provider_named_file_in_temp_root_is_refused(self):
         big = os.path.join(self.allow, "codex")
