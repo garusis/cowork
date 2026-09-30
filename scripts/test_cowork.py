@@ -16693,10 +16693,6 @@ class ControllerPolicyDocsTest(unittest.TestCase):
         self.assertIn("controller_policy", self.section)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # --------------------------------------------------------------------------- #
 # The five frozen measurement criteria.                                       #
 #                                                                             #
@@ -16706,18 +16702,75 @@ if __name__ == "__main__":
 # --------------------------------------------------------------------------- #
 
 _FIXTURES = os.path.join(_HERE, "fixtures", "measurement")
+# The tracked tree above is a COPY SOURCE only. No test points a session
+# root at it, deletes from it, or writes into it: every test works on a
+# private temporary copy that reproduces a clean checkout (see
+# _clean_checkout_ignore) and is git-tracked, so a report over the copy
+# takes the same read-only path a report over the checked-in tree takes.
+_FIXTURE_SESSIONS = (
+    "c1-turn-lifecycle", "c2-finding-lifecycle", "c3-controller-log",
+    "c4-multi-round-all-rounds", "c4-multi-round-final-round",
+    "c4-multi-round-off", "c4-multi-round-sampled", "c5-provenance-replay")
+
+
+def _clean_checkout_ignore(directory, names):
+    """copytree ignore callable that admits only what a clean checkout of
+    scripts/fixtures/measurement contains (its c* subset of the tracked
+    files): measurement.json is tracked ONLY for c5-provenance-replay
+    (deliberately stale) and ledger.jsonl ONLY for c2-finding-lifecycle
+    (hand-authored); every other measurement.json or ledger.jsonl is
+    generated or merely untracked and never enters a copy. This hand-lists
+    the TRACKED SET, not .gitignore (c5's ledger.jsonl, for example, is
+    not ignored there, just absent from a clean checkout), so a developer
+    tree holding stale generated files still yields a clean-checkout
+    copy."""
+    session = os.path.basename(directory)
+    ignored = {n for n in names if n == "__pycache__" or n.endswith(".pyc")}
+    if "measurement.json" in names and session != "c5-provenance-replay":
+        ignored.add("measurement.json")
+    if "ledger.jsonl" in names and session != "c2-finding-lifecycle":
+        ignored.add("ledger.jsonl")
+    return ignored
 
 
 class _MeasurementFixtureMixin:
-    """Points the session root at the fixture folder, so a report over a
-    fixture takes exactly the code path a real session takes (P10) — no
-    test-only flag, and therefore no code path the real run never exercises."""
+    """Gives each test a private, git-tracked temporary copy of the
+    measurement fixture sessions and points the session root at it, so a
+    report over a fixture takes exactly the code path a report over a
+    checked-in session takes (P10): the tracked-assets read-only path, with
+    no test-only flag. Nothing a test does can reach the tracked tree under
+    scripts/fixtures/measurement; the copy is discarded at cleanup."""
+
+    fixture_root = None
 
     def _fixture_root(self):
+        if self.fixture_root is None:
+            # realpath: on macOS the temp dir is a symlink (/var ->
+            # /private/var) and git compares real paths when deciding
+            # whether an absolute path lies inside the work tree.
+            root = os.path.realpath(tempfile.mkdtemp(prefix="cowork-fixture-"))
+            self.addCleanup(shutil.rmtree, root, True)
+            for name in _FIXTURE_SESSIONS:
+                shutil.copytree(os.path.join(_FIXTURES, name),
+                                os.path.join(root, name),
+                                ignore=_clean_checkout_ignore)
+            # Tracked, exactly like the checked-in fixtures: `git ls-files
+            # --error-unmatch` (cowork._session_assets_are_tracked) answers
+            # from the index, so no commit is needed.
+            subprocess.run(["git", "init", "-q", root], check=True)
+            subprocess.run(["git", "-C", root, "add", "-A"], check=True)
+            prior_cwd = os.getcwd()
+            os.chdir(root)
+            self.addCleanup(os.chdir, prior_cwd)
+            self.fixture_root = root
         prior = os.environ.get("COWORK_SESSIONS_ROOT")
-        os.environ["COWORK_SESSIONS_ROOT"] = _FIXTURES
+        os.environ["COWORK_SESSIONS_ROOT"] = self.fixture_root
         self.addCleanup(self._restore_root, prior)
-        return _FIXTURES
+        return self.fixture_root
+
+    def _fixture_path(self, name, *parts):
+        """A path inside this test's private copy (never the tracked tree)."""
+        return os.path.join(self._fixture_root(), name, *parts)
 
     def _restore_root(self, prior):
         if prior is None:
@@ -16726,10 +16779,9 @@ class _MeasurementFixtureMixin:
             os.environ["COWORK_SESSIONS_ROOT"] = prior
 
     def _drop_record(self, name):
-        path = os.path.join(_FIXTURES, name, "measurement.json")
+        path = self._fixture_path(name, "measurement.json")
         if os.path.exists(path):
             os.remove(path)
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
 
     def _build(self, name):
         self._fixture_root()
@@ -17198,7 +17250,7 @@ class MeasurementEvidenceLedgerTests(_MeasurementFixtureMixin,
 
     def test_building_a_report_never_mutates_the_ledger(self):
         self._fixture_root()
-        path = os.path.join(_FIXTURES, self.FIXTURE, "ledger.jsonl")
+        path = self._fixture_path(self.FIXTURE, "ledger.jsonl")
         with open(path, "rb") as fh:
             before = fh.read()
         for _ in range(10):
@@ -17217,8 +17269,8 @@ class MeasurementIngestionTests(_MeasurementFixtureMixin, unittest.TestCase):
     FIXTURE = "c3-controller-log"
 
     def _log(self, name):
-        return os.path.join(_FIXTURES, self.FIXTURE, "controller_logs",
-                            "claude", "-fixture-c3", name)
+        return self._fixture_path(self.FIXTURE, "controller_logs",
+                                  "claude", "-fixture-c3", name)
 
     def test_read_only_is_asserted_not_assumed(self):
         result = cowork_ingest.ingest_claude(self._log("S-c3.jsonl"))
@@ -17827,7 +17879,7 @@ class MeasurementEvaluationTelemetryTests(_MeasurementFixtureMixin,
             self.assertEqual(violations, [], name)
 
     def _events(self, name):
-        path = os.path.join(_FIXTURES, name, "trace.jsonl")
+        path = self._fixture_path(name, "trace.jsonl")
         with open(path) as fh:
             return [json.loads(line) for line in fh if line.strip()]
 
@@ -17929,8 +17981,8 @@ class MeasurementEvaluationTelemetryTests(_MeasurementFixtureMixin,
         self.assertTrue(selected)
 
     def test_truncated_logs_keep_the_evidence_before_the_cut(self):
-        path = os.path.join(
-            _FIXTURES, "c3-controller-log", "controller_logs", "codex",
+        path = self._fixture_path(
+            "c3-controller-log", "controller_logs", "codex",
             "sessions", "2026", "07", "28",
             "rollout-2026-07-28T12-20-00-T-trunc.jsonl")
         result = cowork_ingest.ingest_codex(path)
@@ -18008,25 +18060,9 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
 
     def test_a_rebuild_prints_the_traces_value_instead(self):
         self._fixture_root()
-        record_path = os.path.join(_FIXTURES, self.FIXTURE,
-                                   "measurement.json")
+        record_path = self._fixture_path(self.FIXTURE, "measurement.json")
         with open(record_path, "rb") as fh:
             original = fh.read()
-        def _restore():
-            # Only when the bytes actually differ. Rewriting identical content
-            # still bumps the mtime, so this cleanup moved a SOURCE file's
-            # clock on every suite run — which then made every attempt that
-            # preceded it look stale to the freshness gate.
-            try:
-                with open(record_path, "rb") as fh:
-                    if fh.read() == original:
-                        return
-            except OSError:
-                pass
-            with open(record_path, "wb") as fh:
-                fh.write(original)
-
-        self.addCleanup(_restore)
         out = io.StringIO()
         args = cowork.build_parser().parse_args(
             ["--report", self.FIXTURE, "--rebuild"])
@@ -18034,6 +18070,11 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
         # The counterpart half: rebuilding really does produce a different
         # number, so the test above is a real discriminator.
         self.assertIn("%d turns" % self.TRACE_SAYS, out.getvalue())
+        # A rebuild over a tracked session is computed in memory: the record
+        # on disk is never rewritten (the former byte-restore cleanup encoded
+        # exactly this).
+        with open(record_path, "rb") as fh:
+            self.assertEqual(fh.read(), original)
 
     def test_a_stale_record_warns_and_still_renders_the_record(self):
         self._fixture_root()
@@ -18128,7 +18169,7 @@ class MeasurementReportHonestyTests(_MeasurementFixtureMixin,
         predecessors, and the gate could never be satisfied.
         """
         self._fixture_root()
-        target = os.path.join(_FIXTURES, "c2-finding-lifecycle")
+        target = self._fixture_path("c2-finding-lifecycle")
         ledger_path = os.path.join(target, "ledger.jsonl")
         with open(ledger_path, "rb") as fh:
             before = fh.read()
@@ -21552,8 +21593,7 @@ class OwnedVerificationIntegrationTests(_OwnedVerificationTestBase,
 
     def test_c3_fixture_reproducible_without_ignored_ledger(self):
         self._fixture_root()
-        ledger_path = os.path.join(_FIXTURES, "c3-controller-log",
-                                   "ledger.jsonl")
+        ledger_path = self._fixture_path("c3-controller-log", "ledger.jsonl")
         self.assertFalse(os.path.exists(ledger_path),
                          "fixture ledger.jsonl must stay ignored/absent in "
                          "a clean checkout for this test to mean anything")
@@ -21789,28 +21829,28 @@ class OwnedTransactionCandidateBindingTests(_OwnedVerificationTestBase):
 
 
 class OwnedVerificationArtifactSelfValidationTests(unittest.TestCase):
-    """THIS plan's own `result.verification` array, loaded verbatim from a
-    checked-in fixture — not a synthetic stand-in, and not a second in-code
-    copy — must pass the REAL schema-2 inventory validator this same plan
-    requires. The fixture at scripts/fixtures/verification/plan_inventory.json
-    is the ONE authoritative, portable, tracked copy: it was captured once
-    from the approved planner.plan.json and lives in the repo, so this
-    regression neither depends on a transient session directory nor
-    duplicates the array as a Python literal that could silently drift from
-    the fixture file."""
+    """The REAL schema-2 inventory validator exercised on checked-in,
+    neutral inputs: one inventory it must accept and one controlled
+    invalid inventory it must reject for a single documented reason.
+    The fixtures under scripts/fixtures/verification/ are tracked test
+    data that name nothing in this repository; they were not captured
+    from any session or planning artifact, so the result depends only
+    on the validator's contract. (The class name is retained because the
+    repository's documented verification ids pin it.)"""
 
-    FIXTURE_PATH = os.path.join(
-        _HERE, "fixtures", "verification", "plan_inventory.json")
+    FIXTURE_DIR = os.path.join(_HERE, "fixtures", "verification")
+    ACCEPTED_FIXTURE = os.path.join(FIXTURE_DIR, "plan_inventory.json")
+    REJECTED_FIXTURE = os.path.join(FIXTURE_DIR,
+                                    "plan_inventory_rejection.json")
 
-    def _load_fixture(self):
-        self.assertTrue(
-            os.path.exists(self.FIXTURE_PATH),
-            "checked-in fixture missing: %r" % self.FIXTURE_PATH)
-        with open(self.FIXTURE_PATH) as fh:
+    def _load_fixture(self, path):
+        self.assertTrue(os.path.exists(path),
+                        "checked-in fixture missing: %r" % path)
+        with open(path) as fh:
             return json.load(fh)
 
-    def test_self_plan_verification_array_is_schema2_valid(self):
-        fixture = self._load_fixture()
+    def test_neutral_inventory_is_schema2_valid_and_argv_safe(self):
+        fixture = self._load_fixture(self.ACCEPTED_FIXTURE)
         raw = fixture.get("verification")
         declared_schema = fixture.get("verification_schema")
         self.assertTrue(raw, "fixture carries no verification array")
@@ -21832,6 +21872,21 @@ class OwnedVerificationArtifactSelfValidationTests(unittest.TestCase):
             verification.validate_argv_safety(entries, checkout_stub)
         finally:
             shutil.rmtree(checkout_stub, ignore_errors=True)
+
+    def test_inventory_with_final_suite_not_last_is_rejected(self):
+        fixture = self._load_fixture(self.REJECTED_FIXTURE)
+        raw = fixture.get("verification")
+        self.assertTrue(raw, "fixture carries no verification array")
+        # The fixture is invalid for exactly ONE reason: its single
+        # final_suite entry is not the last entry. Pin that shape first so
+        # the rejection below is demonstrably for the intended rule.
+        kinds = [e.get("kind") for e in raw]
+        self.assertEqual(kinds.count(verification.KIND_FINAL_SUITE), 1)
+        self.assertNotEqual(kinds[-1], verification.KIND_FINAL_SUITE)
+        with self.assertRaises(verification.InventoryError) as ctx:
+            verification.normalize_inventory(
+                raw, declared_schema=fixture.get("verification_schema"))
+        self.assertEqual(ctx.exception.code, "final_suite_not_last")
 
 
 class OwnedOverlayRenderTests(_OwnedVerificationTestBase):
@@ -39333,3 +39388,7 @@ class ResumeTriggerSigtermTests(unittest.TestCase):
                                  cowork.RESUME_TRIGGER_EXIT_INTERNAL_ERROR)
                 self.assertEqual(len(lines), 1)
                 self.assertEqual(json.loads(lines[0])["outcome"], expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

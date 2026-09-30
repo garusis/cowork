@@ -45,16 +45,6 @@
     },
     {
       "command": [
-        "./tool",
-        "--check"
-      ],
-      "execution_mode": "candidate_read_only",
-      "kind": "preflight",
-      "label": "CLI preflight",
-      "measures": "The installed CLI reports a green preflight without mutating the candidate."
-    },
-    {
-      "command": [
         "python3",
         "-m",
         "unittest",
@@ -66,6 +56,16 @@
       "kind": "final_suite",
       "label": "full unit suite",
       "measures": "The complete regression suite runs last and exactly once on the immutable snapshot."
+    },
+    {
+      "command": [
+        "./tool",
+        "--check"
+      ],
+      "execution_mode": "candidate_read_only",
+      "kind": "preflight",
+      "label": "CLI preflight",
+      "measures": "The installed CLI reports a green preflight without mutating the candidate."
     }
   ],
   "verification_schema": 2

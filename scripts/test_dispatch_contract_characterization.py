@@ -1523,14 +1523,19 @@ class BackendCriterion1Test(_DispatchEnv, unittest.TestCase):
                 "%s: exactly one real test method must cover this source, "
                 "found %r" % (source, methods))
 
-    def test_fixture_schema_is_rebaselined_to_v2(self):
-        """The fixture's own schema/baseline advanced to v2 for M1 P5: it now
-        pins BOTH the M0-B record shape (unchanged) AND, via this class, a
-        non-vacuous production proof per source on top of the signed
-        capability-binding repair (manifest SCHEMA_VERSION=2)."""
+    def test_fixture_version_is_bound_to_the_manifest_schema(self):
+        """The fixture's `version` is the record-shape version these
+        characterizations pin, and it is bound to the dispatch-manifest
+        schema in force: every source above dispatches through manifest-
+        bound bindings, so a manifest schema change must re-examine this
+        characterization rather than reuse it silently. Both literals are
+        pinned on purpose (the fixture's own version and the manifest
+        schema version) and the cross-equality keeps them a live
+        invariant."""
         fixture = _fixture()
         self.assertEqual(fixture["version"], 2)
         self.assertEqual(manifest_mod.SCHEMA_VERSION, 2)
+        self.assertEqual(fixture["version"], manifest_mod.SCHEMA_VERSION)
 
 
 if __name__ == "__main__":
