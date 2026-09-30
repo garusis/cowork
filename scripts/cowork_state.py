@@ -5907,6 +5907,144 @@ def read_provider_health(session_uuid, role, provider):
 
 
 # --------------------------------------------------------------------------- #
+# LiveAuthPermit (#101): one-shot admission for EXACTLY ONE same-session     #
+# continuation after a provider-accepted live authentication probe.          #
+#                                                                              #
+# A permit is minted at a lead-role launch seam only after a FORCED, uncached #
+# probe turn the provider actually accepted while ProviderHealth for the same #
+# (role, provider) still records `authentication_failed`. It is bound to the  #
+# exact recovery-breaker fingerprint of the exhausted cause AND to the        #
+# ProviderHealth record's `last_updated_at` at mint time (`failure_marker`),  #
+# and is consumed at most once (compare-and-clear under the same locked       #
+# single-record discipline as ProviderHealth). It is NEVER a breaker reset:   #
+# breaker history is neither appended nor cleared by any permit operation,   #
+# and a permit whose fingerprint or marker no longer matches is simply dead. #
+# --------------------------------------------------------------------------- #
+
+_LIVE_AUTH_PERMIT_KEYS = frozenset({
+    "role", "provider", "fingerprint", "failure_marker", "proof_work_id",
+    "proven_at", "issued_at", "consumed_at",
+})
+_LIVE_AUTH_FINGERPRINT_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def validate_live_auth_permit(record):
+    """Return a normalized copy of a LiveAuthPermit record, or raise
+    ValueError. Exact key set; `fingerprint` is a 64-char lowercase hex
+    sha256 (the breaker fingerprint); `failure_marker`, `proven_at` and
+    `issued_at` are RFC3339 timestamps; `consumed_at` is None or RFC3339."""
+    if not isinstance(record, dict):
+        raise ValueError("LiveAuthPermit must be a dict, got %r" % type(record))
+    extra = set(record) - _LIVE_AUTH_PERMIT_KEYS
+    missing = _LIVE_AUTH_PERMIT_KEYS - set(record)
+    if missing:
+        raise ValueError("LiveAuthPermit missing keys: %s" % sorted(missing))
+    if extra:
+        raise ValueError("LiveAuthPermit has extra keys: %s" % sorted(extra))
+    for key in ("role", "provider", "proof_work_id"):
+        if not isinstance(record[key], str) or not record[key]:
+            raise ValueError("LiveAuthPermit.%s must be a nonempty string" % key)
+    fingerprint = record["fingerprint"]
+    if (not isinstance(fingerprint, str)
+            or not _LIVE_AUTH_FINGERPRINT_RE.match(fingerprint)):
+        raise ValueError(
+            "LiveAuthPermit.fingerprint must be a 64-char lowercase hex "
+            "sha256, got %r" % (fingerprint,))
+    capacity = _import_capacity()
+    for key in ("failure_marker", "proven_at", "issued_at"):
+        value = record[key]
+        if (not isinstance(value, str)
+                or capacity.rfc3339_to_epoch_seconds(value) is None):
+            raise ValueError(
+                "LiveAuthPermit.%s must be an RFC3339-shaped timestamp "
+                "string, got %r" % (key, value))
+    consumed_at = record["consumed_at"]
+    if consumed_at is not None and (
+            not isinstance(consumed_at, str)
+            or capacity.rfc3339_to_epoch_seconds(consumed_at) is None):
+        raise ValueError(
+            "LiveAuthPermit.consumed_at must be null or an RFC3339-shaped "
+            "timestamp string, got %r" % (consumed_at,))
+    return dict(record)
+
+
+def live_auth_permit_path_for(session_uuid, role, provider):
+    """Path of one (role, provider) pair's durable current LiveAuthPermit
+    record, keyed exactly like `provider_health_path_for` (sha256 of a
+    `\\x1f`-delimited join, never a plain `__` join)."""
+    _assert_safe_identifier(role, "role")
+    _assert_safe_identifier(provider, "provider")
+    key = hashlib.sha256(("%s\x1f%s" % (role, provider)).encode("utf-8")).hexdigest()
+    return os.path.join(capacity_dir_for(session_uuid), "live_auth_permits",
+                        "%s.json" % key)
+
+
+def write_live_auth_permit(session_uuid, record):
+    """Durably, atomically persist a LiveAuthPermit (validated) for its own
+    `(role, provider)` key, OVERWRITING any prior permit for that key -- a
+    permit is a rolling CURRENT one-shot grant, never a history. Serialized
+    via `_locked_json_transaction`; a write failure raises OSError and leaves
+    the prior record untouched."""
+    validated = validate_live_auth_permit(record)
+    path = live_auth_permit_path_for(
+        session_uuid, validated["role"], validated["provider"])
+
+    def mutate(existing):
+        return validated
+
+    return _locked_json_transaction(path, mutate)
+
+
+def read_live_auth_permit(session_uuid, role, provider):
+    """Tolerant read of one (role, provider)'s current LiveAuthPermit, or
+    None if missing/unreadable/no-longer-schema-valid."""
+    try:
+        path = live_auth_permit_path_for(session_uuid, role, provider)
+    except ValueError:
+        return None
+    raw = read_json_tolerant(path)
+    if raw is None:
+        return None
+    try:
+        return validate_live_auth_permit(raw)
+    except ValueError:
+        return None
+
+
+def consume_live_auth_permit(session_uuid, role, provider, fingerprint,
+                             failure_marker, now):
+    """Compare-and-clear: consume the current permit for (role, provider)
+    ONLY when it validates, is not yet consumed, and its `fingerprint` AND
+    `failure_marker` both equal the caller's exactly. Returns the consumed
+    record (with `consumed_at == now`) when, and only when, a write happened;
+    None otherwise (missing, already consumed, or mismatched -- no write).
+    Runs under the same locked read-check-write discipline as ProviderHealth
+    so two racing consumers can never both be admitted. Raises
+    `CorruptRecordError` (a ValueError) for a damaged file, `OSError` for a
+    failed write, `TimeoutError` if the lock cannot be acquired."""
+    path = live_auth_permit_path_for(session_uuid, role, provider)
+    consumed = {}
+
+    def mutate(existing):
+        if existing is None:
+            return None
+        try:
+            current = validate_live_auth_permit(existing)
+        except ValueError:
+            return None
+        if current["consumed_at"] is not None:
+            return None
+        if (current["fingerprint"] != fingerprint
+                or current["failure_marker"] != failure_marker):
+            return None
+        consumed["record"] = dict(current, consumed_at=now)
+        return consumed["record"]
+
+    _locked_json_transaction(path, mutate)
+    return consumed.get("record")
+
+
+# --------------------------------------------------------------------------- #
 # Pure-Python Ed25519 signature VERIFICATION (stdlib only -- this module's   #
 # own top-of-file docstring requires "Python 3.9+, stdlib only", and no      #
 # `cryptography`/PyNaCl package is available in this deployment; see         #

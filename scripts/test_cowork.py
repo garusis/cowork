@@ -4051,6 +4051,8 @@ class FramingTest(unittest.TestCase):
         })
         self.assertEqual(system["kind"], "error")
         self.assertEqual(system["error_type"], "api_error")
+        # The token-less 401 additionally carries its status (#101).
+        self.assertEqual(system["http_status"], 401)
 
     def test_parse_claude_partial_text_delta(self):
         ev = {"type": "stream_event",
@@ -26456,11 +26458,11 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
             "claude", 0,
             '{"loggedIn":true,"authMethod":"SECRET-SENTINEL"}')
         self.assertEqual(
-            claude, {"authenticated": True, "method": "other"})
+            claude, {"login_metadata_present": True, "method": "other"})
         codex = controller_profiles.parse_auth_status(
             "codex", 0, "Logged in using ChatGPT")
         self.assertEqual(
-            codex, {"authenticated": True, "method": "chatgpt"})
+            codex, {"login_metadata_present": True, "method": "chatgpt"})
 
     def test_exact_runtime_auth_trace_is_content_free(self):
         import unittest.mock as mock
@@ -26498,11 +26500,12 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
         self.assertNotIn("SECRET-OUTPUT", encoded)
         self.assertNotIn("SECRET-ENV", encoded)
         self.assertNotIn("/global/auth.json", encoded)
-        self.assertEqual(trace.events[0]["authenticated"], True)
+        self.assertIs(trace.events[0]["login_metadata_present"], True)
+        self.assertNotIn("authenticated", trace.events[0])
         self.assertEqual(trace.events[0]["private_profile"], True)
         self.assertEqual(trace.events[0]["credential_copied"], False)
 
-    def test_guarded_probe_cache_revalidates_auth_without_model_spawn(self):
+    def test_guarded_probe_cache_hit_reports_metadata_not_revalidation(self):
         import unittest.mock as mock
 
         class Trace:
@@ -26563,7 +26566,11 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
         cache_event = next(
             event for event in trace.events
             if event["event"] == "controller.probe.cache_hit")
-        self.assertTrue(cache_event["auth_revalidated"])
+        # A cache hit carries no freshness: login metadata was consulted,
+        # but nothing was revalidated and no live proof exists.
+        self.assertIs(cache_event["auth_revalidated"], False)
+        self.assertIs(cache_event["live_auth_proven"], False)
+        self.assertIs(cache_event["login_metadata_present"], True)
 
     def test_codex_publishes_parent_work_before_guarded_turn(self):
         import unittest.mock as mock
@@ -26784,7 +26791,7 @@ class ControllerStateIsolationTests(unittest.TestCase):
                     mock.patch.object(
                         bridge, "_require_controller_auth",
                         return_value={
-                            "authenticated": True,
+                            "login_metadata_present": True,
                             "method": "claude.ai",
                         }), \
                     mock.patch.object(bridge.subprocess, "Popen",
@@ -26865,7 +26872,7 @@ class ControllerStateIsolationTests(unittest.TestCase):
                             mock.patch.object(
                                 bridge, "_require_controller_auth",
                                 return_value={
-                                    "authenticated": True,
+                                    "login_metadata_present": True,
                                     "method": "claude.ai",
                                 }), \
                             mock.patch.object(

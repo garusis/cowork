@@ -426,7 +426,14 @@ cowork --session-file PATH --decline-handoff REQUEST_ID [--context-file ./why.md
   example `reviewer_unavailable`, `reviewer_absent`, `review_not_approved`
   without an approving verdict, `controller_failure`, `stale_noop`,
   `verification_not_current`). Recovery is a machine re-invocation: a plain
-  resume, or `--switch-controller`.
+  resume, or `--switch-controller`. When the failure is a Claude
+  authentication failure (`controller_outcome: authentication_failed`), the
+  stop carries `recovery_route` and `upstream_artifacts_reusable: true`:
+  re-authenticate Claude Code, then a plain `--session-file` resume. The
+  resume pays one uncached live probe; if the provider accepts it, the role
+  continues exactly once even when the recovery budget for that cause is
+  spent, reusing the approved upstream artifacts. A still-rejected probe ends
+  at the probe seam with the same route and no role turn.
 
 ### Controller updates
 
@@ -1646,8 +1653,10 @@ Its Cowork-owned
 writes. Neither path copies tokens, setup credentials, or an entire controller
 profile. Missing, permissively readable, mismatched, or unauthenticated
 references fail before a model process starts. The trace records only the
-controller, a bounded authentication-method category, success, duration, and
-error type.
+controller, a bounded authentication-method category, login-metadata presence
+(never live authentication proof), duration, and error type. A probe-cache hit
+reports `auth_revalidated: false`; only an uncached, provider-accepted probe
+turn is live proof.
 
 Claude transcripts remain in a stable per-role controller-state directory
 recorded in `identities.json`. On the first resume of a legacy session, Cowork

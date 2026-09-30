@@ -7302,6 +7302,30 @@ def _role_loop(session, first, status_path, context, io_out,
                     "threshold": recovery_breaker.TRIP_THRESHOLD}
         return None
 
+    def _consume_live_auth_permit_once():
+        """#101: when the `controller_failure` budget is spent AND the last
+        recorded outcome for this (role, controller) is an authentication
+        failure, consume (compare-and-clear, under the store's lock) a
+        LiveAuthPermit bound to this exact cause's fingerprint and to the
+        current ProviderHealth marker. Returns the consumed record (exactly
+        one admission per provider-accepted proof) or None. Never touches
+        breaker history."""
+        cause = _breaker_cause()
+        if cause is None:
+            return None
+        controller = cause[3]
+        health = _live_auth_trigger(session_uuid, role, controller)
+        if not health:
+            return None
+        fingerprint = control_plane.fingerprint(
+            role, cause[2], controller, cause[4], "controller_failure")
+        try:
+            return state_store.consume_live_auth_permit(
+                session_uuid, role, controller, fingerprint,
+                health["last_updated_at"], _capacity_now())
+        except (ValueError, OSError, TimeoutError):
+            return None
+
     breaker_checked = False
 
     def _end_unapproved(stop):
@@ -7336,19 +7360,50 @@ def _role_loop(session, first, status_path, context, io_out,
                 breaker_checked = True
                 exhausted = _breaker_exhausted("controller_failure")
                 if exhausted:
-                    if trace:
-                        trace.event("gate.decision", decider="runtime",
-                                    role=role, gate="recovery_budget",
-                                    action="refuse", **exhausted)
-                    if on_first_send_rejected:
-                        on_first_send_rejected()
-                    outcome_kind, payload = _end_unapproved(
-                        _agent_stop_payload(
-                            "recovery_budget_exhausted", role,
-                            requires="operator",
-                            controller=getattr(session, "controller", None),
-                            **exhausted))
-                    break
+                    admitted = _consume_live_auth_permit_once()
+                    if admitted:
+                        # #101: a provider-accepted live proof postdating the
+                        # auth failures admits EXACTLY ONE send (the permit is
+                        # now consumed); the breaker is untouched, so a
+                        # failure of this send records as today and no
+                        # further continuation exists without a new proof.
+                        if trace:
+                            trace.event("gate.decision", decider="runtime",
+                                        role=role, gate="recovery_budget",
+                                        action="admit_once",
+                                        reason="live_auth_proof",
+                                        fingerprint=admitted["fingerprint"],
+                                        proof_work_id=admitted["proof_work_id"],
+                                        **exhausted)
+                        io_out.write(
+                            "cowork: %s continues once after a "
+                            "provider-accepted live authentication proof; "
+                            "upstream artifacts are reused.\n" % role)
+                        io_out.flush()
+                    else:
+                        _auth_trigger = _live_auth_trigger(
+                            session_uuid, role,
+                            getattr(session, "controller", None))
+                        if trace:
+                            trace.event(
+                                "gate.decision", decider="runtime",
+                                role=role, gate="recovery_budget",
+                                action="refuse", **exhausted,
+                                **({"reason": "authentication_failed"}
+                                   if _auth_trigger else {}))
+                        if on_first_send_rejected:
+                            on_first_send_rejected()
+                        outcome_kind, payload = _end_unapproved(
+                            _agent_stop_payload(
+                                "recovery_budget_exhausted", role,
+                                requires="operator",
+                                controller=getattr(session, "controller", None),
+                                **exhausted,
+                                **({"controller_outcome":
+                                    "authentication_failed",
+                                    **_auth_recovery_facts()}
+                                   if _auth_trigger else {})))
+                        break
             # Capture the reopen signal BEFORE the invalidate/reset block runs.
             reopened_this_turn = pending_reopen_reason is not None
             reopen_reason_this_turn = pending_reopen_reason
@@ -7663,14 +7718,33 @@ def _role_loop(session, first, status_path, context, io_out,
                     source="gate.runtime")
                 if first_send and on_first_send_rejected:
                     on_first_send_rejected()
+                # #101: an authentication failure names the safe route and
+                # that approved upstream artifacts are reused; every other
+                # controller failure keeps its exact payload shape.
+                _auth_end = controller_outcome == "authentication_failed"
+                if _auth_end:
+                    io_out.write(
+                        "cowork: %s rejected the turn: authentication "
+                        "failed. %s.\n"
+                        % (controller_name or "controller",
+                           _AUTH_RECOVERY_ROUTE))
+                    io_out.flush()
                 outcome_kind = _OUTCOME_ENDED
                 payload = _agent_stop_payload(
                     "controller_failure", role, requires="operator",
                     controller=controller_name,
                     controller_outcome=controller_outcome,
-                    status_path=status_path)
+                    status_path=status_path,
+                    **(_auth_recovery_facts() if _auth_end else {}))
                 break
             if send_result.get("ok", True):
+                if first_send:
+                    # #101: the first accepted send after an authentication
+                    # failure clears the forced-probe trigger (best-effort).
+                    _clear_live_auth_trigger(
+                        session_uuid, role,
+                        getattr(session, "controller", None),
+                        _capacity_now(), trace=trace)
                 if first_send and on_first_send_accepted:
                     on_first_send_accepted()
                     on_first_send_accepted = None
@@ -9444,7 +9518,14 @@ def _synthesize_raw_failure_evidence(controller, send_result):
     every non-provider local_guard/transport failure) leaves it absent,
     which `extract_retry_evidence` itself correctly degrades to the
     "unverified" sentinel -- this function neither invents evidence nor
-    strips genuine evidence it was actually handed."""
+    strips genuine evidence it was actually handed.
+
+    `http_status` (#101): copied ONLY when `send_result` itself carries it,
+    which (per `cowork_bridge.parse_claude_event`) happens only for a claude
+    `system`/`api_error` event that named NO `type` token -- so the rebuilt
+    `system`/`api_error` shape below is exactly the raw classifier's own
+    no-token branch, and a real token keeps today's assistant-shape
+    reconstruction with no status."""
     retry_evidence = send_result.get("retry_evidence")
 
     def _with_evidence(raw):
@@ -9467,6 +9548,11 @@ def _synthesize_raw_failure_evidence(controller, send_result):
         return _with_evidence({"type": "error", "code": error_type})
     if controller == "opencode":
         return _with_evidence({"type": "error", "error": {"name": error_type}})
+    http_status = send_result.get("http_status")
+    if (error_type == "api_error" and isinstance(http_status, int)
+            and not isinstance(http_status, bool)):
+        return _with_evidence({"type": "system", "subtype": "api_error",
+                               "error": {"status": http_status}})
     return _with_evidence({"type": "assistant", "error": error_type})
 
 
@@ -10458,6 +10544,149 @@ def _claude_probe(spawn, **kwargs):
     return ok, alert, None
 
 
+# --------------------------------------------------------------------------- #
+# #101: live Claude authentication proof and one-shot recovery continuation.  #
+#                                                                              #
+# Login METADATA (`claude auth status`) is never live proof. After a real     #
+# role turn fails authentication, ProviderHealth for (role, 'claude') records #
+# `authentication_failed` -- that record is the forced-probe TRIGGER: the     #
+# next lead-role launch pays one UNCACHED live probe. If the provider accepts  #
+# it, a LiveAuthPermit bound to the exhausted breaker cause's fingerprint and #
+# to the health record's timestamp is minted; `_role_loop`'s exhausted-budget #
+# gate consumes it exactly once and admits ONE send. The first accepted send  #
+# rewrites ProviderHealth healthy, clearing the trigger. The breaker itself   #
+# (threshold, fingerprint, history) is never touched by any of this.          #
+# --------------------------------------------------------------------------- #
+
+# Identical wording to `cowork_bridge._AUTH_RECOVERY_ROUTE_TEXT` so the probe
+# alert, the stop payload and the phase evidence all name ONE route.
+_AUTH_RECOVERY_ROUTE = (
+    "re-authenticate Claude Code (for example `claude auth login`), then "
+    "resume with a plain --session-file resume; approved upstream artifacts "
+    "(intel, plan, statuses) are reused")
+
+
+def _auth_recovery_facts():
+    """The route + artifact-reuse facts attached to every authentication
+    terminal (stop payload, phase evidence, trace)."""
+    return {"recovery_route": _AUTH_RECOVERY_ROUTE,
+            "upstream_artifacts_reusable": True}
+
+
+def _live_auth_trigger(session_uuid, role, controller):
+    """The ProviderHealth record for (role, controller) when it records
+    `authentication_failed` as the last outcome (the forced-probe trigger),
+    else None. None when there is no session or controller."""
+    if not session_uuid or not controller:
+        return None
+    try:
+        health = state_store.read_provider_health(session_uuid, role, controller)
+    except (ValueError, OSError):
+        return None
+    if not health or health.get("last_outcome") != "authentication_failed":
+        return None
+    return health
+
+
+def _breaker_fingerprint_for(session_uuid, role, controller):
+    """The recovery breaker's `controller_failure` fingerprint for this
+    engagement, computed from the SAME persisted manifest `_role_loop`'s
+    `_breaker_cause` loads (so the permit binds to exactly the cause the
+    role loop will check). None when no proven manifest/config digest
+    exists -- no permit is minted without a genuine fingerprint."""
+    if not session_uuid or not controller:
+        return None
+    manifest = dispatch_manifest.load_manifest(
+        state_store.manifest_path_for(session_uuid, role))
+    config_digest = ((manifest or {}).get("binding") or {}).get("config_digest")
+    if not config_digest:
+        return None
+    return control_plane.fingerprint(
+        role, config_digest, controller, (manifest or {}).get("digest"),
+        "controller_failure")
+
+
+def _claude_role_probe(spawn, session_uuid, role, mode, yolo,
+                       role_prompt_file, trace, extra_writable_dir):
+    """The lead-role (scout/planner/builder) Claude probe: the ordinary cached
+    probe unless the forced-probe trigger is set, in which case the probe runs
+    UNCACHED (a cache hit carries no freshness and can never prove a fresh
+    credential) and, if the provider accepts it, mints a one-shot
+    LiveAuthPermit bound to the exhausted cause. Returns
+    (ok, alert, git_failure, report) where `report` is the probe's own
+    caller-owned report dict (see `probe_claude_stream_json`)."""
+    health = _live_auth_trigger(session_uuid, role, "claude")
+    report = {}
+    if health and trace:
+        trace.event("live_auth.probe.forced", role=role,
+                    reason="authentication_failed",
+                    failure_marker=health["last_updated_at"])
+    ok, alert, git_failure = _claude_probe(
+        spawn, mode=mode, yolo=yolo, role_prompt_file=role_prompt_file,
+        trace=trace, role=role, extra_writable_dir=extra_writable_dir,
+        cache_enabled=not bool(health), report=report)
+    if ok and health and report.get("live_auth_proven"):
+        fingerprint = _breaker_fingerprint_for(session_uuid, role, "claude")
+        if fingerprint:
+            try:
+                state_store.write_live_auth_permit(session_uuid, {
+                    "role": role, "provider": "claude",
+                    "fingerprint": fingerprint,
+                    "failure_marker": health["last_updated_at"],
+                    "proof_work_id": report["probe_work_id"],
+                    "proven_at": report["proven_at"],
+                    "issued_at": _capacity_now(),
+                    "consumed_at": None,
+                })
+            except (ValueError, OSError) as exc:
+                if trace:
+                    trace.event("live_auth.permit.write_failed", role=role,
+                                error_type=type(exc).__name__)
+            else:
+                if trace:
+                    trace.event("live_auth.permit.issued", role=role,
+                                fingerprint=fingerprint,
+                                proof_work_id=report["probe_work_id"])
+        elif trace:
+            trace.event("live_auth.permit.skipped", role=role,
+                        reason="no_fingerprint")
+    return ok, alert, git_failure, report
+
+
+def _probe_failed_facts(report):
+    """Auth-conditioned facts for a `probe_failed` terminal: the route and
+    artifact-reuse facts ONLY when the probe's classified outcome is
+    `authentication_failed`; empty for every other probe failure so
+    non-auth evidence/trace shapes stay byte-identical."""
+    if (report or {}).get("controller_outcome") != "authentication_failed":
+        return {}
+    return dict(controller_outcome="authentication_failed",
+                **_auth_recovery_facts())
+
+
+def _clear_live_auth_trigger(session_uuid, role, provider, now, trace=None):
+    """On the first accepted send after an authentication failure, rewrite
+    ProviderHealth healthy so later launches return to the ordinary cached
+    probe (the forced probe is paid once per proof, not on every resume).
+    Best-effort exactly like `_record_provider_health`."""
+    if not session_uuid or not provider:
+        return
+    health = _live_auth_trigger(session_uuid, role, provider)
+    if health is None:
+        return
+    try:
+        state_store.write_provider_health(session_uuid, {
+            "role": role, "provider": provider, "status": "healthy",
+            "consecutive_failures": 0, "last_outcome": None,
+            "last_updated_at": now,
+        })
+    except (ValueError, OSError):
+        return
+    if trace:
+        trace.event("provider_health.cleared", role=role, provider=provider,
+                    previous_outcome="authentication_failed")
+
+
 def _git_extra(git_failure):
     """Keyword extras carrying a typed Git fact, empty when there is none, so
     non-Git trace/evidence shapes stay byte-for-byte unchanged."""
@@ -10740,11 +10969,11 @@ def run_scout(config, context, selected, io_out=None,
                 source="policy_guard")
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert, git_failure = _claude_probe(
-                spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-                role_prompt_file=SCOUT_PROMPT_PATH, trace=trace, role="scout",
-                extra_writable_dir=sessions_dir, cache_enabled=True)
+        ok, alert, git_failure, _probe_report = _claude_role_probe(
+            spawn, session_uuid, "scout", cfg["mode"], cfg["yolo"],
+            SCOUT_PROMPT_PATH, trace, sessions_dir)
         if not ok:
+            _facts = _probe_failed_facts(_probe_report)
             _decide_and_trace(
                 trace, "scout", cfg["controller"], "launch", "run_scout",
                 manifest=_scout_manifest, policy_result=_ALLOW_FACT,
@@ -10752,13 +10981,13 @@ def run_scout(config, context, selected, io_out=None,
                 probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
                 trace.event("role.end", role="scout", result="probe_failed",
-                            **_git_extra(git_failure))
+                            **_git_extra(git_failure), **_facts)
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
             _advance_phase(
                 session_uuid, role_work_id, "preflight_rejected",
                 evidence=dict({"reason": "probe_failed"},
-                              **_git_extra(git_failure)),
+                              **_git_extra(git_failure), **_facts),
                 source="probe")
             return 1
         if resume_id:
@@ -11174,12 +11403,11 @@ def run_planner(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert, git_failure = _claude_probe(
-                spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-                role_prompt_file=PLANNER_PROMPT_PATH, trace=trace,
-                role="planner", extra_writable_dir=sessions_dir,
-                cache_enabled=True)
+        ok, alert, git_failure, _probe_report = _claude_role_probe(
+            spawn, session_uuid, "planner", cfg["mode"], cfg["yolo"],
+            PLANNER_PROMPT_PATH, trace, sessions_dir)
         if not ok:
+            _facts = _probe_failed_facts(_probe_report)
             _decide_and_trace(
                 trace, "planner", cfg["controller"], "launch", "run_planner",
                 manifest=_planner_manifest, policy_result=_ALLOW_FACT,
@@ -11187,10 +11415,11 @@ def run_planner(config, context, selected, io_out=None,
                 probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
                 trace.event("role.end", role="planner", result="probe_failed",
-                            **_git_extra(git_failure))
+                            **_git_extra(git_failure), **_facts)
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
-            _reject("probe_failed", "probe", **_git_extra(git_failure))
+            _reject("probe_failed", "probe", **_git_extra(git_failure),
+                    **_facts)
             report(_OUTCOME_ENDED, None)
             return 1
         if resume_id:
@@ -11602,12 +11831,11 @@ def run_builder(config, context, selected, io_out=None,
             report(_OUTCOME_ENDED, None)
             return 1
         spawn = claude_spawn or bridge._real_claude_spawn
-        ok, alert, git_failure = _claude_probe(
-                spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-                role_prompt_file=BUILDER_PROMPT_PATH, trace=trace,
-                role="builder", extra_writable_dir=sessions_dir,
-                cache_enabled=True)
+        ok, alert, git_failure, _probe_report = _claude_role_probe(
+            spawn, session_uuid, "builder", cfg["mode"], cfg["yolo"],
+            BUILDER_PROMPT_PATH, trace, sessions_dir)
         if not ok:
+            _facts = _probe_failed_facts(_probe_report)
             _decide_and_trace(
                 trace, "builder", cfg["controller"], "launch", "run_builder",
                 manifest=_builder_manifest, policy_result=_ALLOW_FACT,
@@ -11615,10 +11843,11 @@ def run_builder(config, context, selected, io_out=None,
                 probe_result=_probe_fact(alert), resume_session_id=resume_id)
             if trace:
                 trace.event("role.end", role="builder", result="probe_failed",
-                            **_git_extra(git_failure))
+                            **_git_extra(git_failure), **_facts)
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
-            _reject("probe_failed", "probe", **_git_extra(git_failure))
+            _reject("probe_failed", "probe", **_git_extra(git_failure),
+                    **_facts)
             report(_OUTCOME_ENDED, None)
             return 1
         if resume_id:
