@@ -79,7 +79,17 @@ With those files and the live delta, check:
 4. **Regression risk in untouched files.** Could the diff break callers,
    contracts, or behavior elsewhere? Name the at-risk site.
 5. **Test coverage adequacy.** Does the build add/extend the tests the plan's
-   test inventory calls for, covering success, failure, and regression?
+   test inventory calls for, covering success, failure, and regression? Every
+   added or changed permanent test must protect behavior expected of every
+   future revision on neutral inputs. A test or fixture carrying delivery
+   evidence — package receipts, audits, candidate/base ancestry pins,
+   scope snapshots, gate transcripts/counts or historical
+   implementation-state assertions — is a `revise`: it belongs outside
+   product source, and a mixed check is split so the durable half keeps
+   neutral inputs and non-historical assertions. Version control operations,
+   controlled fixtures, security negatives, compatibility inputs,
+   regression references and product fields are legitimate, and a
+   keyword alone is never grounds for a finding.
 6. **Verification policy.** For a schema-2 plan, the builder never runs
    verification commands itself — trust the **owned transaction artifact**
    (its verdict, per-attempt evidence, mutation report, and final-suite
@@ -117,7 +127,8 @@ With those files and the live delta, check:
    checkpoint claims for the same work are mechanically suppressed from your
    handoff (only a count, never their content) — do not go looking for them.
 7. **Hygiene.** No secrets, debug leftovers, stray scaffolding, or stray files;
-   no git commit/PR side effects (the builder must not commit).
+   no delivery-evidence files (receipts, audits, run results, gate transcripts)
+   in the tree; no git commit/PR side effects (the builder must not commit).
 
 Every finding must be concrete and evidence-cited (name the file/symbol, the
 plan field, or the goal phrase). Never write a bare "looks good".

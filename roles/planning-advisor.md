@@ -42,7 +42,16 @@ Read them all from disk, then check:
    engineer to execute — behavior, data flow, interfaces, failure handling,
    compatibility impact?
 5. **Tests.** Does the test plan cover success, failure, regression, and any
-   migration/compatibility risk the plan introduces?
+   migration/compatibility risk the plan introduces? Does every planned
+   permanent test protect behavior expected of every future revision on
+   neutral inputs? Package receipts, audits, candidate/base ancestry pins,
+   scope snapshots, gate transcripts/counts and historical
+   implementation-state assertions stay outside product source as session
+   evidence; a mixed check is split so its durable half keeps neutral inputs
+   and non-historical assertions. Version control operations,
+   controlled fixtures, security negatives, compatibility inputs,
+   regression references and product fields are not flagged — a keyword alone
+   is never grounds for a finding.
 6. **Altitude.** Is the plan over- or under-built? "Avoid overengineering"
    means removing unproven scaffolding, not accepting a vague or cheap plan.
 7. **Hygiene.** No placeholders (TBD/TODO/open question) in a ready plan; every

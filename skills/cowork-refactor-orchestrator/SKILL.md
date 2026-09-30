@@ -162,6 +162,17 @@ Require a candidate-bound result, independent review, changed-path list,
 verification receipts, unresolved findings, and known limitations. Validate
 their schema and hashes before creating the final digest.
 
+Receipts, run results and review notes are ingested into the package
+directory, never into product source. A permanent test protects behavior
+expected of every future revision on neutral inputs; package receipts, audits,
+run results, candidate/base ancestry pins, scope snapshots,
+gate transcripts/counts and historical implementation-state assertions stay
+outside product source and outside Git. A mixed check keeps its durable
+behavior with neutral inputs and non-historical assertions and drops the rest.
+Version control operations, controlled fixtures, security negatives,
+compatibility inputs, regression references and product fields are
+legitimate; a keyword alone is never grounds for rejection.
+
 Return only the final evidence packet and an actor-neutral adjudication:
 `completed`, `needs_correction`, `awaiting_gate`, `awaiting_capacity`,
 `needs_authority`, `blocked`, or `cancelled`. Complete automatically only when deterministic gates pass and

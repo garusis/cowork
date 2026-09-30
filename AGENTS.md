@@ -21,6 +21,7 @@ operating in this repo. Keep entries factual and tool-agnostic.
 ```bash
 python3 scripts/cowork_offline_tests.py test_cowork
 python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x
+python3 scripts/cowork_offline_tests.py test_evidence_lifetime_contract
 ./cowork --check
 ```
 
@@ -54,6 +55,33 @@ Notes:
   unless `COWORK_SESSIONS_ROOT` overrides the location.
 - `cowork` does not commit or open PRs; approved build output is left in the
   working tree for the orchestrator to review.
+
+## Evidence lifetime
+
+- Permanent tests protect behavior expected of every future revision: they
+  run on neutral inputs and assert nothing about one delivery.
+- Delivery evidence stays outside product source and outside Git, in the
+  session or package directory: package receipts, audits, run results,
+  candidate/base ancestry pins (commit or tree ids, "frozen base" claims),
+  scope snapshots ("only these paths differ from base"), gate transcripts/counts
+  (unittest logs, harness summaries, "the suite ran N tests" claims) and
+  historical implementation-state assertions (what was true of one candidate
+  at delivery time).
+- A mixed check keeps its durable behavior with neutral inputs and
+  non-historical assertions and drops the rest.
+- Legitimate, and never rejected on a keyword alone: version control
+  operations in throwaway repositories, controlled fixtures (synthetic ids,
+  digests, timestamps, placeholder paths), security negatives,
+  compatibility inputs (real transcript or log shapes fed to code under
+  test), regression references (issue numbers, observed field values used as
+  inputs, package labels in prose) and product fields (`expected_test_count`,
+  receipt and transaction schemas).
+- Recurrence check: `python3 scripts/cowork_offline_tests.py
+  test_evidence_lifetime_contract` scans product source for representative
+  shapes of each forbidden category, proves itself on neutral positive and
+  negative examples, and asserts that the role contracts and orchestration
+  skills carry this rule. It detects representative shapes only; its module
+  docstring documents what it cannot infer.
 
 ## Implementation notes
 

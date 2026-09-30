@@ -92,7 +92,16 @@ your status channel. Fixed top-level shape:
   explicitly marked unverified.
 - Per-file implementation changes, concrete enough for another engineer to
   execute without re-deriving your reasoning.
-- Test inventory: unit, integration, regression, and manual checks.
+- Test inventory: unit, integration, regression, and manual checks. Every
+  planned permanent test protects behavior expected of every future revision
+  on neutral inputs. Delivery evidence — package receipts, audits,
+  candidate/base ancestry pins, scope snapshots, gate transcripts/counts and
+  historical implementation-state assertions — is planned as
+  session-directory evidence, never product source; a mixed check is split so
+  its durable half keeps neutral inputs and non-historical assertions.
+  Version control operations, controlled fixtures, security negatives,
+  compatibility inputs, regression references and product fields are
+  legitimate, and a keyword alone is never grounds for rejection.
 - Risks being accepted and the assumptions an implementer may rely on.
 - The repository set: **carry `result.repos` forward verbatim** from the scout's
   approved intel (the selected subset). When the intel spans more than one
@@ -203,6 +212,9 @@ test inventory) lives in the JSON **only** — never inflate the markdown.
   decision accepting it as residual risk.
 - "Avoid overengineering" is never permission for a vague, cheap, or
   untestable plan.
+- A plan that would pin this delivery in product source — a receipt, audit,
+  ancestry pin, scope snapshot, gate transcript/count or implementation-state
+  assertion — is not ready.
 
 ## Handing back to the scout
 

@@ -167,7 +167,16 @@ nonzero exit) through the normal reopened-work flow.
    what evidence never arrived) through the normal reopened-work flow — fix
    the underlying issue and let readiness resubmit the transaction; you never
    get to argue past a failed transaction in prose.
-4. **Hygiene** — no leftover scaffolding, debug prints, secrets, or stray files.
+4. **Hygiene** — no leftover scaffolding, debug prints, secrets, or stray files,
+   and no delivery evidence in product source: package receipts, audits,
+   candidate/base ancestry pins, scope snapshots, gate transcripts/counts and
+   historical implementation-state assertions belong to the session
+   directory. Permanent tests protect behavior expected of every
+   future revision on neutral inputs; a mixed check keeps neutral inputs and
+   non-historical assertions. Version control operations,
+   controlled fixtures, security negatives, compatibility inputs,
+   regression references and product fields stay — a keyword alone never
+   justifies removing one.
 
 `ready_for_review` is gated on verification having completed **against the exact
 source manifest you verified**. If the tree moved after your last verification
@@ -239,6 +248,9 @@ only its explicit `approve` approves the build.
   integrate. The build phase has no git side effects.
 - Do **not** install packages or change dependencies unless the plan calls for
   it.
+- Do **not** add package receipts, audits, ancestry pins, scope snapshots, gate
+  transcripts/counts or implementation-state assertions to the tree; the
+  verification transaction receipt and session artifacts already record them.
 
 ## Enforced nested-agent boundary
 

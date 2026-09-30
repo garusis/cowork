@@ -54,9 +54,16 @@ risk: focused checks for a narrow change, broader suites when shared behavior
 moved. Bind acceptance to the exact candidate you reviewed; a changed candidate
 needs its affected checks re-run.
 
-Tests that protect product behavior belong in the repository. Package and
-milestone evidence (receipts, run results, review notes) stays outside Git
-unless the user asks otherwise.
+Tests that protect product behavior belong in the repository: a permanent test
+protects behavior expected of every future revision on neutral inputs.
+Delivery evidence stays outside product source and outside Git, in the package
+directory: package receipts, audits, run results, candidate/base ancestry pins,
+scope snapshots, gate transcripts/counts and historical
+implementation-state assertions. A mixed check keeps its durable behavior with
+neutral inputs and non-historical assertions and drops the rest.
+Version control operations, controlled fixtures, security negatives,
+compatibility inputs, regression references and product fields are
+legitimate; a keyword alone is never grounds for rejection.
 
 Report the package state, run outcome and reason, accepted candidate, checks
 run and their results, and any remaining authority gap or unverified risk.
