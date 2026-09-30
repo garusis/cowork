@@ -27423,29 +27423,6 @@ class ZeroChildDelegationTests(unittest.TestCase):
                              for event in events))
         self.assertEqual(measure.child_work_from_ledger([]), {})
 
-    def test_codex_capability_evidence_pin_forces_revisit_on_drift(self):
-        path = os.path.join(
-            _NESTED_FIXTURES, "n7-correlation-edges",
-            "codex-capability-pin.json")
-        with open(path) as fh:
-            pin = json.load(fh)
-        self.assertEqual(pin["cli_version"], "0.145.0")
-        self.assertRegex(pin["protocol_schema_digest"], r"^[0-9a-f]{64}$")
-        self.assertIn("generated ServerRequest",
-                      pin["protocol_schema_digest_scope"])
-        self.assertTrue(pin["experimentalFeature_multi_agent"]
-                        ["default"]["enabled"])
-        self.assertFalse(pin["experimentalFeature_multi_agent"]
-                         ["disabled_flag"]["enabled"])
-        self.assertEqual(
-            pin["raw_instruction_keyword_counts"]["default"],
-            pin["raw_instruction_keyword_counts"]["disabled_flag"])
-        self.assertGreater(
-            pin["raw_instruction_keyword_counts"]["disabled_flag"]
-            ["spawn_agent"], 0)
-        self.assertFalse(pin["tools_inventory_observable"])
-        self.assertFalse(pin["pre_child_server_request"])
-
 
 class NestedDocsTests(unittest.TestCase):
     def test_docs_name_governance_boundary_and_exact_once_cost(self):

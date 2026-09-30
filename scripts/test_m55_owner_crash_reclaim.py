@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """Focused suite for issue #64 implementation package **P5** -- deterministic
-owner fixtures and the exit audit -- on the frozen base
-`3e3bdba12abacdf1a5fc0c9301200adc5e3171c4`.
-
-P5 adds **ZERO production delta**. Every byte of every pre-existing source and
-test file is identical to that base; this module and its sibling
-`test_m55_owner_negative_controls.py` are the only two paths that differ, and
-the last class here proves that from INSIDE the candidate, pre-commit.
+owner fixtures.
 
 What this module owns is the RUNTIME, REAL-OS-PROCESS evidence the accepted
 fixture set demands and that no in-process suite can carry -- a child that is
