@@ -39390,5 +39390,219 @@ class ResumeTriggerSigtermTests(unittest.TestCase):
                 self.assertEqual(json.loads(lines[0])["outcome"], expected)
 
 
+class JevObserverIntegrationTests(unittest.TestCase):
+    """The Jev observer never changes what review receives or decides: the
+    builder loop behaves identically with the observer disabled, enabled,
+    failing, hung or suspended, and never waits for the remote call."""
+
+    TXN_ID = "T-jev"
+    MANIFEST = "ab" * 32
+    INDEX = "cd" * 32
+    MODES = ("disabled", "enabled", "failing", "hung", "suspended")
+    UNCITED = {"verdict": "revise", "corrective_findings": [
+        {"summary": "the verification never actually ran",
+         "severity": "blocking",
+         "verification_challenge": {"reason_code": "no_evidence"}}]}
+    GENUINE = {"verdict": "revise", "corrective_findings": [
+        {"summary": "out-of-plan change in scripts/cowork.py",
+         "severity": "blocking"}]}
+
+    def setUp(self):
+        import cowork_jev_observer as obs
+        import test_cowork_jev_capture as capt
+        import test_cowork_jev_observer as ot
+        self.obs, self.ot = obs, ot
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        prior = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = self.root
+
+        def restore():
+            if prior is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = prior
+        self.addCleanup(restore)
+        self.status_path = os.path.join(self.root, "builder.status.json")
+        self.repo = os.path.join(self.root, "wt")
+        base = capt.make_repo(self.repo, {"app.py": capt.BASE_APP})
+        capt.write(self.repo, "app.py", capt.NEW_APP)
+        previous = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, previous)
+        self.pilot_root = os.path.join(self.root, "pilot")
+        os.makedirs(self.pilot_root)
+        ot.write_pilot_files(self.pilot_root, ot.entry_list(
+            {"S-%s" % m: "t-%s" % m for m in self.MODES}, self.repo, base))
+        self.transport = ot.FakeTransport()
+        obs.reset_overrides()
+        obs.configure(transport=self.transport, clock=ot.StepClock(),
+                      credential_provider=lambda: "fake-credential")
+        self.addCleanup(obs.reset_overrides)
+        self.gate = threading.Event()
+        self.addCleanup(obs.join_workers, 20)
+        self.addCleanup(self.gate.set)
+
+    def _session(self, statuses):
+        status_path = self.status_path
+
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                st = statuses.pop(0) if statuses else "ready_for_review"
+                with open(status_path, "w") as fh:
+                    json.dump({"status": st}, fh)
+
+            def close(self):
+                pass
+        return FakeSession()
+
+    def _configure_mode(self, mode):
+        self.transport.gate = self.gate if mode == "hung" else None
+        marker = os.path.join(self.pilot_root, "SUSPENDED")
+        if mode == "suspended":
+            open(marker, "a").close()
+        elif os.path.exists(marker):
+            os.remove(marker)
+        if mode == "failing":
+            def boom(url, headers, body, timeout):
+                raise ConnectionError("down")
+            self.obs.configure(transport=boom)
+        else:
+            self.obs.configure(transport=self.transport)
+
+    def _drive(self, mode, statuses, verdicts):
+        import unittest.mock as mock
+        sid = "S-%s" % mode
+        sess = self._session(statuses)
+        trace_path = trace_store.trace_path_for(sid)
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        trace = trace_store.Trace(trace_path, session_uuid=sid, run_id="R")
+        seen = []
+
+        def review_fn(p, rnd):
+            seen.append((p, rnd))
+            return verdicts.pop(0) if verdicts else None
+
+        env = {} if mode == "disabled" else {
+            self.obs.PILOT_ENV: self.pilot_root}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(
+                    cowork, "_run_owned_verification_transaction",
+                    return_value=({
+                        "transaction_id": self.TXN_ID, "verdict": "green",
+                        "final_suite_label": "full_unit_suite",
+                        "final_suite_binding": "ran_once",
+                        "attempts": [{"label": "full_unit_suite"}],
+                        "snapshot": {"manifest_digest": self.MANIFEST,
+                                     "index_digest": self.INDEX}}, None)), \
+                mock.patch.object(
+                    cowork, "_record_readiness_from_transaction",
+                    return_value={"state": "verified", "reason": None,
+                                  "event_id": "E",
+                                  "transaction_id": self.TXN_ID}), \
+                mock.patch.object(
+                    cowork.verification, "current_candidate_identity",
+                    return_value=(self.MANIFEST, self.INDEX)):
+            if mode == "disabled":
+                os.environ.pop(self.obs.PILOT_ENV, None)
+            rc, outcome, payload = cowork._role_loop(
+                sess, "seed", self.status_path, context="",
+                io_out=io.StringIO(), role="builder", review_fn=review_fn,
+                trace=trace, reviewer_role=cowork.BUILD_REVIEWER,
+                artifact_noun="build", phase="building", session_uuid=sid)
+        return {"rc": rc, "outcome": outcome,
+                "kind": payload.get("kind") if isinstance(payload, dict)
+                else payload, "review_args": seen, "sent": sess.sent}
+
+    def test_four_modes_equal(self):
+        results = {}
+        for mode in self.MODES:
+            self._configure_mode(mode)
+            results[mode] = self._drive(mode, ["ready_for_review"],
+                                        [dict(self.UNCITED)])
+        base = results["disabled"]
+        self.assertEqual(base["kind"], "review_not_approved")
+        for mode in self.MODES:
+            self.assertEqual(results[mode], base, mode)
+        blob = json.dumps([base["review_args"], base["sent"]]).lower()
+        for forbidden in ("jev", "t-enabled", "alert", "demo"):
+            self.assertNotIn(forbidden, blob)
+        self.gate.set()
+        self.obs.join_workers(20)
+        pilot = self.obs.load_pilot(self.pilot_root)
+        view = self.obs.build_view(pilot)
+        self.assertEqual(sorted(c["session_id"] for c in view["candidates"]),
+                         ["S-enabled", "S-failing", "S-hung"])
+        for cand in view["candidates"]:
+            self.assertIsNotNone(cand["ordinary"])
+        suspended = [s for s in view["sessions"]
+                     if s["session_id"] == "S-suspended"]
+        self.assertEqual(suspended[0]["exclusion_reason"],
+                         "observer_suspended")
+
+    def test_review_not_blocked_by_transport(self):
+        self._configure_mode("hung")
+        result = self._drive("hung", ["ready_for_review"],
+                             [dict(self.UNCITED)])
+        self.assertEqual(result["kind"], "review_not_approved")
+        worker = self.obs._WORKERS["t-hung@1"]
+        self.assertTrue(worker.is_alive())
+        self.assertFalse(self.gate.is_set())
+        self.gate.set()
+        self.obs.join_workers(20)
+        pilot = self.obs.load_pilot(self.pilot_root)
+        self.assertTrue(self.obs.build_view(pilot)["candidates"][0]["final"])
+
+    def test_second_promotion_is_not_recaptured(self):
+        self._configure_mode("enabled")
+        result = self._drive("enabled", ["ready_for_review",
+                                         "ready_for_review"],
+                             [dict(self.GENUINE)])
+        self.assertEqual(result["kind"], "reviewer_unavailable")
+        self.assertEqual(len(result["sent"]), 2)
+        self.obs.join_workers(20)
+        pilot = self.obs.load_pilot(self.pilot_root)
+        records = self.obs._records(pilot)
+        captured = [r for r in records
+                    if r.get("schema") == self.obs.SCHEMA_STATE
+                    and r["state"] == "captured"]
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(os.listdir(pilot.captures_dir)), 1)
+        self.assertEqual(len([r for r in records if r.get("schema")
+                              == self.obs.SCHEMA_ORDINARY]), 1)
+        self.assertEqual(len(self.transport.calls), 2)
+
+    def test_hook_exception_is_swallowed(self):
+        import unittest.mock as mock
+        self._configure_mode("disabled")
+        base = self._drive("disabled", ["ready_for_review"],
+                           [dict(self.UNCITED)])
+        self._configure_mode("enabled")
+        with contextlib.ExitStack() as stack:
+            for name in ("hook_promoted", "hook_review_start",
+                         "hook_review_sealed"):
+                stack.enter_context(mock.patch.object(
+                    self.obs, name, side_effect=RuntimeError("boom")))
+            result = self._drive("enabled", ["ready_for_review"],
+                                 [dict(self.UNCITED)])
+        self.assertEqual(result, base)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_env_constant_matches_observer(self):
+        self.assertEqual(cowork._JEV_PILOT_ENV, self.obs.PILOT_ENV)
+
+    def test_disabled_path_does_not_import_observer(self):
+        import unittest.mock as mock
+        with mock.patch.dict(sys.modules), mock.patch.dict(os.environ):
+            sys.modules.pop("cowork_jev_observer", None)
+            os.environ.pop(cowork._JEV_PILOT_ENV, None)
+            self.assertIsNone(cowork._jev_hook("hook_promoted", "S", "."))
+            self.assertNotIn("cowork_jev_observer", sys.modules)
+
+
 if __name__ == "__main__":
     unittest.main()

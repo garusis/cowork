@@ -1180,6 +1180,67 @@ quietly operating on stale assumptions. A role acknowledges a revision only afte
 it actually ran against it; a crash before that re-delivers the block on the next
 resume.
 
+## Jev observational pilot (off by default)
+
+An optional observer measures whether Jev gives useful signals on real builder
+reviews. It has **no authority**: it never changes the reviewer's packet or
+context, approval, delivery, the run result or any prompt, and a failing,
+hung or suspended observer leaves the ordinary outcome identical. Reviewer
+verdicts, Jev answers and adjudication results never reach the implementer, the
+ordinary reviewer or the adjudicator brief.
+
+**Activation.** Set `COWORK_JEV_PILOT_DIR` to a coordinator-written pilot
+directory that lives **outside** any agent workspace and outside Git. Unset,
+missing or invalid activation leaves every hook inert. The directory holds:
+
+- `cohort_activation.json` (`cohort_activation.v1`): model, question set and
+  digest, thresholds and salt exactly as in the accepted protocol, `caps.jev`
+  `{candidates_per_cohort, max_units_queried, proposed_cap_usd}`,
+  `caps.adjudication` `{cohort_caps: {tokens, tool_calls, wall_minutes},
+  units_cap, per_unit_envelope: {tokens: 400000, tool_calls: 30, minutes: 20}}`
+  and `authorizations`: `budget_ref`, `credential_source_ref` (the **name** of
+  the environment variable that holds the credential; the value is never
+  recorded), `data_scope.repositories`, `recipients` (must include `TypeSafe`
+  and the adjudicator provider), `vendor_retention_status` and `docs_recheck`
+  `{checked_at, price_usd_per_million_input: "0.042", limits_recorded: true}`.
+  `adjudicator` carries `model_id`, `provider` and the brief version, and
+  `inclusion_list_digest` is the sha256 of the canonical inclusion list. The
+  observer only checks that these records are present and consistent (it does
+  not verify human intent); any absent or mismatched record, or an inclusion
+  list edited after activation, leaves it inert before any credential is read.
+- `inclusion_list.json`: entries `{session_id, ticket_ref, objective_text,
+  requirement_text, repository, repo_root}` (optional `base_ref`). A session
+  without an entry, whose `repository` is not in `data_scope.repositories` or
+  whose `repo_root` is not the working repository is excluded as
+  `not_in_inclusion_list`; an entry without objective text is excluded as
+  `no_objective_captured`. Nothing is guessed.
+- `alias_log.jsonl` (optional, written before metrics are computed).
+
+Everything else (captures, acceptance registry, Jev records, observer registry,
+reports) is written by the observer under the same directory. No real call is
+made without an authorized activation, a credential and a budget.
+
+**Suspension and recovery.** Create `SUSPENDED` in the pilot directory (or call
+`cowork_jev_observer.suspend(pilot)`) to suspend: no new capture or query starts,
+ordinary review is unaffected and the cohort clock keeps running. Remove it (or
+call `resume(pilot)`) to resume; `resume` and `recover` never re-send a query.
+Suspension and a recorded hard stop (`record_hard_stop`: data-scope violation,
+credential exposure, budget revocation) are checked before every new paid
+attempt, reservation and adjudication start, including queued work; requests
+already started settle without retries. `resume` never clears a hard stop.
+An attempt that started without an outcome becomes `service_failure`
+(`interrupted_unknown`) with its charge unknown (null, reservation kept); units
+that were never sent are final as `not_queried_interrupted`. An adjudication
+that started without an outcome is recorded as `unknown` and is never restarted
+(`recover_adjudications`, coordinator-invoked).
+
+**Reports.** `cowork_jev_report.compute_report` renders the `jev_obs` metrics
+M1-M10 and the decision cascade; `close_cohort` writes the immutable closed
+report and `write_supplement` writes dated supplements
+(`cohort_<n>_supplement_<date>`) for results that arrive later. Adjudication is
+run by the coordinator through `select_adjudication`, `build_brief`,
+`begin_adjudication` and `submit_adjudication`; the observer starts no agent.
+
 ## The scout role
 
 `scout` doesn't gather blindly — it grounds itself, settles scope, and makes the

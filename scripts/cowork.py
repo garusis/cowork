@@ -2750,6 +2750,24 @@ def _corrective_finding_count(verdict):
     return len(findings) if isinstance(findings, list) else 0
 
 
+# Jev observational pilot (off by default). Duplicates cowork_jev_observer.
+# PILOT_ENV so a disabled run never imports the observer; a test pins equality.
+_JEV_PILOT_ENV = "COWORK_JEV_PILOT_DIR"
+
+
+def _jev_hook(name, *args, **kwargs):
+    """Call a Jev observer hook. Inert unless the pilot env var is set; never
+    raises and never writes to stdout/stderr or the run result. Return values
+    only feed the next hook, never review, approval or any prompt."""
+    if not os.environ.get(_JEV_PILOT_ENV):
+        return None
+    try:
+        import cowork_jev_observer
+        return getattr(cowork_jev_observer, name)(*args, **kwargs)
+    except Exception:  # noqa: BLE001 - observation must never alter delivery
+        return None
+
+
 def _source_paths_for_manifest(cwd=None):
     """Every file the build's result depends on: tracked AND untracked-but-not-
     ignored.
@@ -7240,6 +7258,11 @@ def _role_loop(session, first, status_path, context, io_out,
     send_start_event_id = None  # trace event ID from the most recent role.send.start
     last_send_source_ref = None  # source_ref built for the most recent send
     review_rounds = 0
+    # Jev observer state (inert unless the pilot env var is set): one capture
+    # attempt per loop, the candidate token it returned, and one seal per token.
+    jev_attempted = False
+    jev_token = None
+    jev_sealed = False
     # Consecutive reviewer turns with no usable verdict (reset by a usable
     # verdict).
     review_failures = 0
@@ -7850,6 +7873,15 @@ def _role_loop(session, first, status_path, context, io_out,
                         pending_reopen_reason = "unverified_readiness"
                         pending_reopen_event_id = readiness.get("event_id")
                         continue
+                    # Observation only (Jev pilot): capture the verified
+                    # candidate before the reviewer starts; first promotion
+                    # per loop only.
+                    if (not jev_attempted and review_fn is not None
+                            and readiness is not None
+                            and readiness.get("state") == "verified"):
+                        jev_attempted = True
+                        jev_token = _jev_hook(
+                            "hook_promoted", session_uuid, os.getcwd())
                 reviewer_approved = False
                 # Hash-gate (scout + planner): when the lead's reviewed artifact
                 # set is byte-identical to what the paired reviewer LAST APPROVED
@@ -7898,6 +7930,10 @@ def _role_loop(session, first, status_path, context, io_out,
                         # to exactly this artifact state.
                         reviewed_sha256 = state_store.fingerprint_status(
                             status_path)["sha256"]
+                        if role == "builder" and jev_token is not None \
+                                and not jev_sealed:
+                            _jev_hook("hook_review_start", jev_token,
+                                      os.getcwd())
                         verdict = _call_review_fn(
                             review_fn, status_path, review_rounds,
                             force_full_reread) or {}
@@ -7948,6 +7984,11 @@ def _role_loop(session, first, status_path, context, io_out,
                             break
                         # Usable verdict: clear the failure counter and branch.
                         review_failures = 0
+                        if role == "builder" and jev_token is not None \
+                                and not jev_sealed:
+                            jev_sealed = True
+                            _jev_hook("hook_review_sealed", jev_token,
+                                      os.getcwd(), verdict)
                         transcript.notice(io_out, scout_reviewed_text(
                             verdict, review_rounds, REVIEW_ROUND_CAP))
                         if evaluate_fn is not None:
