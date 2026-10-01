@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M2 Package F: end-to-end crash/resume suite.
+"""Workflow state: end-to-end crash/resume suite.
 
 Exercises every durable state-write boundary Package B introduced --
 PhaseState, WorkUnit (mint + transition), dependency-graph revision, and the
@@ -7,8 +7,8 @@ atomic controller policy/config transition -- through the SAME production
 functions `scripts/cowork.py` itself calls (`cowork._advance_phase`,
 `cowork._ensure_work_unit`, `cowork._bind_candidate`, the real
 `--switch-controller` `run_flow` seam), never a reimplemented or bypassed
-write path. Package B's own suite (`test_cowork_state_m2.py`) already proves
-every boundary exhaustively at the unit/primitive level; this file's job is
+write path. Package B's own suite
+(`test_cowork_state_workflow_persistence.py`) already proves every boundary exhaustively at the unit/primitive level; this file's job is
 narrower and additive: prove each boundary ALSO survives a crash when struck
 through the real integrated caller, and that resume reconstructs exactly what
 a clean run would have produced -- never a torn record, never a fabricated
@@ -26,7 +26,7 @@ Boundaries covered (one class each):
     3. WorkUnit transition (`_bind_candidate`): short write, torn-tail
        repair before the next live transition.
     4. Dependency-graph revision (Package B's real durable store -- the
-       deepest live seam that exists; see test_m2_negative_controls.py's
+       deepest live seam that exists; see test_workflow_negative_controls.py's
        module-level FINDING for why no cowork.py call site appends one):
        short write, and resume producing the correctly numbered next
        revision.
@@ -37,7 +37,7 @@ Boundaries covered (one class each):
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m2_crash_resume.py -v
+    python3 -m unittest scripts/test_workflow_state_crash_resume.py -v
 """
 
 import io
@@ -63,10 +63,11 @@ def _uuid():
     return str(uuid.uuid4())
 
 
-class _M2CrashEnvMixin:
+class _SessionsRootEnvMixin:
     """Isolated COWORK_SESSIONS_ROOT per test, matching every other M2 crash
-    suite's own isolation discipline (test_cowork_state_m2.py's own
-    `_M2EnvMixin`), reproduced independently here."""
+    suite's own isolation discipline
+    (test_cowork_state_workflow_persistence.py's own
+    `_SessionsRootEnvMixin`), reproduced independently here."""
 
     def setUp(self):
         super().setUp()
@@ -100,7 +101,7 @@ def _truncate_tail_bytes(path, n):
 #    phase advance in this file passes through".
 # =============================================================================
 
-class PhaseStateCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
+class PhaseStateCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def _seed_preflighting(self, session_uuid, work_id):
         cowork._ensure_work_unit(session_uuid, work_id, "scout", "opencode")
@@ -206,7 +207,7 @@ class PhaseStateCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
 # 2. WorkUnit mint boundary, through cowork._ensure_work_unit.
 # =============================================================================
 
-class WorkUnitMintCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
+class WorkUnitMintCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_short_write_crash_mid_mint_mints_nothing_then_resumes(self):
         session_uuid, work_id = _uuid(), _uuid()
@@ -267,7 +268,7 @@ class WorkUnitMintCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
 # 3. WorkUnit transition boundary, through cowork._bind_candidate.
 # =============================================================================
 
-class WorkUnitTransitionCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
+class WorkUnitTransitionCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def _seed_minted(self, session_uuid, work_id):
         cowork._ensure_work_unit(session_uuid, work_id, "scout", "opencode")
@@ -324,7 +325,7 @@ class WorkUnitTransitionCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
 # 4. Dependency-graph revision boundary, through B's real durable store.
 # =============================================================================
 
-class GraphRevisionCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
+class GraphRevisionCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def _node(self, work_id):
         return {
@@ -408,7 +409,7 @@ def _patch_bridge_popen(popen):
         bridge, "subprocess", _BridgeSubprocess(bridge.subprocess, popen))
 
 
-class PolicyConfigTransitionCrashResumeTest(_M2CrashEnvMixin, unittest.TestCase):
+class PolicyConfigTransitionCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def setUp(self):
         super().setUp()

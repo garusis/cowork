@@ -3711,7 +3711,7 @@ def checkpoint_gate_evidence(session_uuid, work_id, expected_candidate_digest,
     stale/cross-candidate checkpoint can never advance the live control
     plane is `advance()`'s own, unmodified `_gate_evidence_matches_candidate`
     check — see `cowork_control_plane.checkpoint_receipt_to_gate_evidence`'s
-    own docstring and `scripts/test_m5_package_e_integration.py`'s direct
+    own docstring and `scripts/test_checkpoint_gateway_integration.py`'s direct
     proof against the real reducer."""
     _overlay, pointer = checkpoint_current_overlay(session_uuid, work_id)
     if not isinstance(pointer, dict) or not pointer.get("checkpoint_id"):

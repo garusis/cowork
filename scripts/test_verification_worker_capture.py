@@ -23,7 +23,7 @@ entry point) inside a throwaway git repo / session root.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m5_package_b_worker_capture.py -v
+    python3 -m unittest scripts/test_verification_worker_capture.py -v
 """
 
 import hashlib
@@ -423,13 +423,13 @@ class IdentityMismatchTests(_SessionFixture):
 
 
 # =========================================================================== #
-# Minor dispositions M5B-R-m4/m5: symlinks excluded, checkout starts clean.   #
+# Worker source capture edge cases: symlinks excluded, checkout starts clean. #
 # =========================================================================== #
 
 
-class MinorDispositionTests(_SessionFixture):
+class WorkerSourceCaptureEdgeCaseTests(_SessionFixture):
 
-    def test_m4_a_symlinked_py_file_is_excluded_rather_than_mis_captured(self):
+    def test_symlinked_py_file_is_excluded_rather_than_mis_captured(self):
         # M5B-R-m4: `os.path.isfile` follows symlinks, so a bare isfile
         # check would silently capture a symlink's TARGET content under
         # the symlink's own name. A symlinked `cowork_verification.py`
@@ -456,7 +456,7 @@ class MinorDispositionTests(_SessionFixture):
             "build must report the same worker_source_missing condition "
             "as a directory with no entry point at all")
 
-    def test_m4_a_symlinked_non_entry_file_is_also_excluded(self):
+    def test_symlinked_non_entry_file_is_also_excluded(self):
         real_dir = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(real_dir, ignore_errors=True))
         shutil.copyfile(os.path.join(_HERE, "cowork_verification.py"),
@@ -470,7 +470,7 @@ class MinorDispositionTests(_SessionFixture):
             "a symlinked non-entry-point file must also be excluded, not "
             "mis-captured under its own name")
 
-    def test_m5_materialize_starts_from_a_clean_checkout_directory(self):
+    def test_materialize_starts_from_a_clean_checkout_directory(self):
         transaction_id = "T-clean-checkout-1"
         checkout_root = worker_module.tool_snapshot_checkout_dir(
             self.session_uuid, transaction_id)

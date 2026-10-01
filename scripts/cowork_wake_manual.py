@@ -120,7 +120,7 @@ def verify_and_record_manual_signal(session_uuid, record, pinned_public_keys):
 # read-only text classification of an exception Package B ALREADY raised,
 # never a reimplementation of Package B's own conflict decision. Pinned by
 # `test_cowork_wake_manual.py`'s `test_journal_conflict_marker_matches_
-# package_bs_actual_wording`, which triggers a REAL conflict and asserts
+# state_store_conflict_wording`, which triggers a REAL conflict and asserts
 # this marker still matches -- so any future drift in Package B's wording
 # fails this module's own test suite loudly rather than silently
 # misclassifying a conflict as `"invalid_arguments"`.

@@ -82,7 +82,7 @@ same `startup_allowance_s`/`DEFAULT_STARTUP_ALLOWANCE_S` this module already
 honors (never unbounded), teardown afterward still runs through the same
 idempotent `terminate_worker`/`cleanup_active_command_group` path regardless
 of which branch (immediate watcher vs. entry-loop check) ultimately fires
-it, and `scripts/test_m5_package_a_contracts.py` proves both the bound and
+it, and `scripts/test_checkpoint_contracts.py` proves both the bound and
 that no pre-existing M1-M4 test module references `cancel_event` (so this
 ordering change is invisible to, and does not regress, any of them). Package
 A's frozen `spawn_worker` signature is not widened with a `cancel_event`
@@ -97,7 +97,7 @@ module's symbols at its own top level (the re-export/indirection contract),
 so a plain top-level `import cowork_verification` here would be a genuine
 circular import that only resolves in ONE of the two possible load orders
 (it breaks the moment anything imports this module before
-`cowork_verification`, which `scripts/test_m5_package_a_contracts.py`'s own
+`cowork_verification`, which `scripts/test_checkpoint_contracts.py`'s own
 structural tests deliberately do). Every reference to those constants is
 therefore inside a function BODY, `import cowork_verification` done lazily
 at call time via `_spine()` -- by the time any function here is actually

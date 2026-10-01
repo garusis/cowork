@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for M4 Package D's dual-evidence watchdog decisions
+"""Tests for the dual-evidence watchdog decisions
 (`cowork_watchdog.py`)."""
 
 import io

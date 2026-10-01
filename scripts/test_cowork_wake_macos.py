@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for M3 Package F's macOS launchd wake adapter
+"""Focused tests for the macOS launchd wake adapter
 (`cowork_wake_macos.py`), built against Package D's frozen wake-trigger
 contract (`cowork_capacity_scheduler.py`).
 
@@ -648,7 +648,7 @@ class FireTest(_WakeMacosEnvMixin, unittest.TestCase):
                          scheduler.WAKE_TRIGGER_EXIT_CODES["attempts_exhausted"])
         self.assertEqual(resume_fake.calls, [])
 
-    def test_duplicate_fires_yield_exactly_one_d_claim(self):
+    def test_duplicate_fires_yield_exactly_one_scheduler_claim(self):
         """Two separate `fire` invocations for the same automation_ref (the
         real-world duplicate-launchd-fire case) each independently call
         Package D; Package D's own same-owner idempotency means the lease
@@ -695,7 +695,7 @@ class FireTest(_WakeMacosEnvMixin, unittest.TestCase):
         self.assertEqual(stored["consumption_state"], "claimed")
         self.assertNotEqual(result["outcome"], "resumed")
 
-    def test_failed_d_claim_never_invokes_resume_trigger_and_lease_stays_truthful(self):
+    def test_failed_scheduler_claim_never_invokes_resume_trigger_and_lease_stays_truthful(self):
         """A failed CLAIM (as opposed to a failed resume-trigger subprocess)
         -- simulated via a lock/I/O failure inside Package D -- never
         reaches the resume-trigger step, and never claims success."""
@@ -910,7 +910,7 @@ class StructuralGatesTest(unittest.TestCase):
         self.assertNotIn(".flock(", source)
         self.assertNotIn("import fcntl", source)
 
-    def test_f_local_exit_codes_disjoint_from_d_exit_codes(self):
+    def test_macos_wake_exit_codes_disjoint_from_scheduler_exit_codes(self):
         """F-N02: every F-local exit-code value (`FIRE_EXIT_CODES`,
         `LAUNCHCTL_EXIT_CODES`) must never collide with a Package D
         `WAKE_TRIGGER_EXIT_CODES` value -- EXCEPT the universally shared
@@ -947,17 +947,17 @@ class AdapterAbsenceIsSafeTest(unittest.TestCase):
                     names.add(node.module.split(".")[0])
         return names
 
-    def test_package_d_does_not_import_package_f(self):
+    def test_capacity_scheduler_does_not_import_wake_adapters(self):
         imported = self._imports("cowork_capacity_scheduler.py")
         self.assertNotIn("cowork_wake_macos", imported)
         self.assertNotIn("cowork_wake_manual", imported)
 
-    def test_package_b_does_not_import_package_f(self):
+    def test_state_store_does_not_import_wake_adapters(self):
         imported = self._imports("cowork_state.py")
         self.assertNotIn("cowork_wake_macos", imported)
         self.assertNotIn("cowork_wake_manual", imported)
 
-    def test_package_d_wake_decision_functions_fully_without_package_f(self):
+    def test_scheduler_wake_decision_functions_fully_without_macos_wake(self):
         """A concrete demonstration, not merely an import check: Package
         D's own wake-trigger contract works end to end with this module
         never imported into the call path at all (only Package D/A/B are

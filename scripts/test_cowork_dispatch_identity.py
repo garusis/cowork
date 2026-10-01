@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for M2 Package C: identity and dispatch primitives.
+"""Focused tests for identity and dispatch primitives.
 
 Covers, in isolation (fake callers only — nothing here wires cowork.py):
 
@@ -67,9 +67,10 @@ def _make_work_unit(**overrides):
     return base
 
 
-class _M2EnvMixin:
-    """Isolated COWORK_SESSIONS_ROOT per test (mirrors test_cowork_state_m2's
-    own mixin) so nothing here ever touches the real home dir."""
+class _SessionsRootEnvMixin:
+    """Isolated COWORK_SESSIONS_ROOT per test (mirrors
+    test_cowork_state_workflow_persistence's own mixin) so nothing here ever
+    touches the real home dir."""
 
     def setUp(self):
         super().setUp()
@@ -523,7 +524,7 @@ class WorkUnitJoinKeyResidualTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class GraphDeclarationCheckTest(_M2EnvMixin, unittest.TestCase):
+class GraphDeclarationCheckTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _append(self, session_id, nodes):
         return state_store.append_graph_revision(session_id, nodes)
 
@@ -619,7 +620,7 @@ class GraphDeclarationCheckTest(_M2EnvMixin, unittest.TestCase):
         self.assertIn("cross_policy_fan_in", result["reason"])
 
 
-class DecideWorkUnitPreflightTest(_M2EnvMixin, unittest.TestCase):
+class DecideWorkUnitPreflightTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_graph_rejection_advances_to_rejected_preflight(self):
         session_id = _uuid()
         wu = _make_work_unit(graph_revision=1)  # never stored

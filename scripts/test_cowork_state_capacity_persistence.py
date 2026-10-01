@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Focused tests for M3 Package B: crash-safe, cross-process-safe durable
-persistence for ProviderHealth, CapacityPacket, PauseLease, manual-capacity
-signals, InvalidationRecord history, and pending-turn-before-pause-ack --
-all additive to `cowork_state.py`.
+"""Focused tests for capacity state persistence: crash-safe,
+cross-process-safe durable persistence for ProviderHealth, CapacityPacket,
+PauseLease, manual-capacity signals, InvalidationRecord history, and
+pending-turn-before-pause-ack -- all additive to `cowork_state.py`.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_cowork_state_m3.py -v
+    python3 -m unittest scripts/test_cowork_state_capacity_persistence.py -v
 """
 
 import fcntl
@@ -39,16 +39,17 @@ def _wait_for_marker(marker_path, timeout=10.0):
     """Poll for a marker file's existence -- the deterministic
     cross-process synchronization primitive this suite's real-race and
     real-kill tests use instead of hoped-for timing (mirrors test_cowork_
-    state_m2.py's identical helper)."""
+    state_workflow_persistence.py's identical helper)."""
     deadline = time.time() + timeout
     while not os.path.exists(marker_path) and time.time() < deadline:
         time.sleep(0.01)
     return os.path.exists(marker_path)
 
 
-class _M3EnvMixin:
+class _SessionsRootEnvMixin:
     """Isolated COWORK_SESSIONS_ROOT per test, so nothing ever touches the
-    real home dir (mirrors test_cowork_state_m2.py's _M2EnvMixin)."""
+    real home dir (mirrors test_cowork_state_workflow_persistence.py's
+    _SessionsRootEnvMixin)."""
 
     def setUp(self):
         super().setUp()
@@ -135,7 +136,8 @@ def _signed_manual_signal(secret_key=None, key_id="key-1", **overrides):
     """Build a manual-capacity-signal record with a GENUINE Ed25519
     signature (via the module's own self-contained self-test signer --
     reaching into `state_store._ed25519_selftest_sign`/`_selftest_
-    publickey`, mirroring test_cowork_state_m2.py's established convention
+    publickey`, mirroring test_cowork_state_workflow_persistence.py's
+    established convention
     of reaching into this module's private test-control hooks, e.g.
     `state_store._utc_now`/`state_store._reconciled_phase_state_entry`).
     Returns (record, pinned_public_keys, secret_key)."""
@@ -162,7 +164,7 @@ def _signed_manual_signal(secret_key=None, key_id="key-1", **overrides):
 # --------------------------------------------------------------------------- #
 
 
-class PauseLeaseCreateTest(_M3EnvMixin, unittest.TestCase):
+class PauseLeaseCreateTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_create_persists_unclaimed_lease(self):
         session_id = _uuid()
         lease = _make_pause_lease()
@@ -251,7 +253,7 @@ class PauseLeaseCreateTest(_M3EnvMixin, unittest.TestCase):
         self.assertIsNone(state_store.read_pause_lease(_uuid(), "nope"))
 
 
-class PauseLeaseClaimCancelTest(_M3EnvMixin, unittest.TestCase):
+class PauseLeaseClaimCancelTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _fresh(self):
         session_id = _uuid()
         lease = _make_pause_lease(lease_id="lease-1")
@@ -308,7 +310,7 @@ class PauseLeaseClaimCancelTest(_M3EnvMixin, unittest.TestCase):
         self.assertEqual(ctx.exception.reason, "not_found")
 
 
-class PauseLeaseConsumeTest(_M3EnvMixin, unittest.TestCase):
+class PauseLeaseConsumeTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _claimed(self):
         session_id = _uuid()
         state_store.create_pause_lease(session_id, _make_pause_lease(lease_id="lease-1"))
@@ -352,7 +354,7 @@ class PauseLeaseConsumeTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PauseLeaseReplaceTest(_M3EnvMixin, unittest.TestCase):
+class PauseLeaseReplaceTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _lease_with_attempts(self, session_id, lease_id, attempts, **binding_overrides):
         stored = state_store.create_pause_lease(
             session_id, _make_pause_lease(lease_id=lease_id, **binding_overrides))
@@ -558,7 +560,7 @@ def _mp_replace_race(root, session_id, old_lease_id, new_lease, barrier, result_
         json.dump(out, fh)
 
 
-class PauseLeaseCrossProcessRaceTest(_M3EnvMixin, unittest.TestCase):
+class PauseLeaseCrossProcessRaceTest(_SessionsRootEnvMixin, unittest.TestCase):
     """Genuine cross-process races using REAL, separate OS processes (fork
     context) synchronized via `multiprocessing.Barrier` -- proving the real
     macOS OS-level `fcntl.flock` exclusive lock, not merely in-process
@@ -682,7 +684,7 @@ class PauseLeaseCrossProcessRaceTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class CapacityPacketTest(_M3EnvMixin, unittest.TestCase):
+class CapacityPacketTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_write_and_read_round_trip(self):
         session_id = _uuid()
         packet = _make_capacity_packet()
@@ -722,7 +724,7 @@ class CapacityPacketTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class InvalidationHistoryTest(_M3EnvMixin, unittest.TestCase):
+class InvalidationHistoryTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_append_stamps_sequence_and_ordering(self):
         session_id = _uuid()
         state_store.append_invalidation_record(session_id, _make_invalidation_record(reason="first"))
@@ -778,7 +780,7 @@ class InvalidationHistoryTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ProviderHealthTest(_M3EnvMixin, unittest.TestCase):
+class ProviderHealthTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_write_and_read_round_trip(self):
         session_id = _uuid()
         record = _make_provider_health()
@@ -821,7 +823,7 @@ class ProviderHealthTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ManualCapacitySignalTest(_M3EnvMixin, unittest.TestCase):
+class ManualCapacitySignalTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_valid_signature_verifies_and_persists(self):
         session_id = _uuid()
         record, pinned, _ = _signed_manual_signal()
@@ -891,7 +893,7 @@ class ManualCapacitySignalTest(_M3EnvMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             state_store.write_manual_capacity_signal(session_id, different, pinned)
 
-    def test_shape_invalid_record_rejected_by_package_a_first(self):
+    def test_shape_invalid_record_rejected_by_capacity_validation_first(self):
         session_id = _uuid()
         record, pinned, _ = _signed_manual_signal()
         del record["role"]
@@ -956,7 +958,7 @@ class Ed25519PrimitiveTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PendingTurnBeforePauseTest(_M3EnvMixin, unittest.TestCase):
+class PendingTurnBeforePauseTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_write_persists_bytes_and_digest_unacknowledged(self):
         session_id = _uuid()
         rec = state_store.write_pending_turn_before_pause(
@@ -1048,7 +1050,7 @@ class PendingTurnBeforePauseTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class CrashInjectionTest(_M3EnvMixin, unittest.TestCase):
+class CrashInjectionTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _inject_write_json_failure(self):
         """Every M3 Package B single-record JSON write boundary goes
         through `write_json_atomic_durable` (M3B-REV-B03's fsync-adding
@@ -1206,7 +1208,7 @@ class CrashInjectionTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PauseLeaseFailedWakeAttemptTest(_M3EnvMixin, unittest.TestCase):
+class PauseLeaseFailedWakeAttemptTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_record_increments_by_one_and_persists(self):
         session_id = _uuid()
         state_store.create_pause_lease(session_id, _make_pause_lease(lease_id="lease-1"))
@@ -1313,7 +1315,7 @@ class PauseLeaseFailedWakeAttemptTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class IdempotentDecisionCapturedInsideLockTest(_M3EnvMixin, unittest.TestCase):
+class IdempotentDecisionCapturedInsideLockTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_mark_consumed_idempotent_return_ignores_post_read_external_write(self):
         """Tampers the file (bypassing the lock entirely -- simulating an
         adversarial/buggy concurrent writer) from INSIDE the very read call
@@ -1384,7 +1386,7 @@ class IdempotentDecisionCapturedInsideLockTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class CorruptRecordExplicitConflictTest(_M3EnvMixin, unittest.TestCase):
+class CorruptRecordExplicitConflictTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _corrupt(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:
@@ -1457,7 +1459,7 @@ class CorruptRecordExplicitConflictTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class LockTimeoutTest(_M3EnvMixin, unittest.TestCase):
+class LockTimeoutTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_locked_json_transaction_times_out_when_lock_genuinely_held(self):
         session_id = _uuid()
         state_store.create_pause_lease(session_id, _make_pause_lease(lease_id="lease-1"))
@@ -1521,7 +1523,7 @@ def _mp_write_then_die_before_replace(root, target_path, data_marker):
     s.write_json_atomic_durable(target_path, {"marker": "child-write"})
 
 
-class GenuineKilledProcessCrashTest(_M3EnvMixin, unittest.TestCase):
+class GenuineKilledProcessCrashTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_binding_lock_released_by_os_after_genuine_process_kill(self):
         session_id = _uuid()
         lease_id = "kill-lock-1"
@@ -1614,7 +1616,7 @@ def read_json_tolerant_marker(path):
 # --------------------------------------------------------------------------- #
 
 
-class ManualSignalDomainSeparationTest(_M3EnvMixin, unittest.TestCase):
+class ManualSignalDomainSeparationTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_message_carries_domain_prefix(self):
         record, _pinned, _sk = _signed_manual_signal()
         message = state_store.canonical_manual_capacity_signal_message(record)
@@ -1676,14 +1678,14 @@ class ManualSignalDomainSeparationTest(_M3EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class LegacyAnchorUnchangedTest(_M3EnvMixin, unittest.TestCase):
+class LegacyAnchorUnchangedTest(_SessionsRootEnvMixin, unittest.TestCase):
     """Proves this M3 addition never disturbed M1/M2 behavior: a
     representative walk through pre-M3 exports still round-trips exactly as
     before, using a project-local `.cowork/session.json` fixture path (not
     COWORK_SESSIONS_ROOT, mirroring how those functions are actually
     used)."""
 
-    def test_m1_session_roundtrip_unaffected(self):
+    def test_session_roundtrip_unaffected_by_capacity_state(self):
         project_dir = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(project_dir, ignore_errors=True))
         path = state_store.session_path(project_dir)
@@ -1702,7 +1704,7 @@ class LegacyAnchorUnchangedTest(_M3EnvMixin, unittest.TestCase):
         reloaded = state_store.load(path)
         self.assertEqual(state_store.get_session_uuid(reloaded), session_uuid)
 
-    def test_m2_work_unit_and_phase_state_unaffected(self):
+    def test_work_unit_and_phase_state_unaffected_by_capacity_state(self):
         session_id, work_id = _uuid(), _uuid()
         record = dict(
             schema_version=1, record="WorkUnit", work_id=work_id, session_id=session_id,
@@ -1722,7 +1724,7 @@ class LegacyAnchorUnchangedTest(_M3EnvMixin, unittest.TestCase):
         current = state_store.current_phase_state(session_id, work_id)
         self.assertEqual(current["state"], "running")
 
-    def test_read_m2_state_shim_unaffected_by_m3_additions(self):
+    def test_read_m2_state_shim_unaffected_by_capacity_state(self):
         state = {"version": state_store.VERSION, "session_uuid": _uuid()}
         result = state_store.read_m2_state(state)
         self.assertIn("work_unit_state", result)
@@ -1730,7 +1732,7 @@ class LegacyAnchorUnchangedTest(_M3EnvMixin, unittest.TestCase):
         self.assertIsNone(result["work_unit_state"])
 
 
-_M1_M2_EXPECTED_EXPORTS = (
+_CORE_STATE_EXPECTED_EXPORTS = (
     # A representative (not exhaustive) sample of pre-M3 public exports,
     # each with its exact pre-M3 parameter list -- a changed signature here
     # (added/removed/reordered/renamed parameter) would break a real M1/M2
@@ -1781,7 +1783,7 @@ class PublicSignatureStabilityTest(unittest.TestCase):
     reordered, or newly-required parameter is caught."""
 
     def test_representative_exports_signatures_unchanged(self):
-        for name, expected_params in _M1_M2_EXPECTED_EXPORTS:
+        for name, expected_params in _CORE_STATE_EXPECTED_EXPORTS:
             with self.subTest(export=name):
                 self.assertTrue(hasattr(state_store, name), "missing export: %s" % name)
                 fn = getattr(state_store, name)
@@ -1789,11 +1791,11 @@ class PublicSignatureStabilityTest(unittest.TestCase):
                 actual_params = list(sig.parameters.keys())
                 self.assertEqual(actual_params, expected_params)
 
-    def test_no_pre_m3_export_was_removed(self):
-        for name, _params in _M1_M2_EXPECTED_EXPORTS:
+    def test_no_core_state_export_was_removed(self):
+        for name, _params in _CORE_STATE_EXPECTED_EXPORTS:
             self.assertTrue(callable(getattr(state_store, name, None)))
 
-    def test_m3_additions_are_new_names_not_overrides(self):
+    def test_capacity_state_exports_are_new_names_not_overrides(self):
         """Every M3 Package B function name below did not already exist as
         an M1/M2 export -- a strict namespace-collision check that this
         addition is genuinely additive, never a redefinition of a
@@ -1818,10 +1820,10 @@ class PublicSignatureStabilityTest(unittest.TestCase):
             "PauseLeaseConflict", "CrossBindingReplacementError",
             "ManualSignalSignatureError",
         )
-        pre_m3_names = {n for n, _ in _M1_M2_EXPECTED_EXPORTS}
+        core_state_names = {n for n, _ in _CORE_STATE_EXPECTED_EXPORTS}
         for name in new_names:
             self.assertTrue(hasattr(state_store, name), "expected M3 export missing: %s" % name)
-            self.assertNotIn(name, pre_m3_names)
+            self.assertNotIn(name, core_state_names)
 
 
 if __name__ == "__main__":

@@ -6362,7 +6362,7 @@ def canonical_manual_capacity_signal_message(record):
     be circular. Encoded UTF-8. Pure; no I/O; never mutates `record`.
 
     PUBLISHED TEST VECTOR for external signature producers (also asserted
-    verbatim by `scripts/test_cowork_state_m3.py`'s
+    verbatim by `scripts/test_cowork_state_capacity_persistence.py`'s
     `test_published_signing_test_vector_for_external_producers`, which
     additionally proves `verify_manual_capacity_signal` accepts it): for
     the Ed25519 secret key `hashlib.sha256(b"cowork-manual-signal-kat-

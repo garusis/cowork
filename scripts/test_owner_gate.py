@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The ownership gate, the typed refusal, and the crash-safe owner lifecycle
 wired into `cowork.py`/`cowork_dispatch.py`. The owner store itself is proven
-in `test_m55_owner_store.py`; what has to be proven here is ORDERING and
+in `test_owner_store.py`; what has to be proven here is ORDERING and
 REACHABILITY, not storage:
 
   - **G1 (refusal precedes paid dispatch).** The reducer evaluates the

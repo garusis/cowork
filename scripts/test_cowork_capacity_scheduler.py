@@ -34,8 +34,9 @@ def _uuid():
 
 
 class _SchedEnvMixin:
-    """Isolated COWORK_SESSIONS_ROOT per test (mirrors test_cowork_state_m3.py's
-    _M3EnvMixin), so nothing ever touches the real home dir."""
+    """Isolated COWORK_SESSIONS_ROOT per test (mirrors
+    test_cowork_state_capacity_persistence.py's _SessionsRootEnvMixin), so
+    nothing ever touches the real home dir."""
 
     def setUp(self):
         super().setUp()
@@ -53,7 +54,8 @@ class _SchedEnvMixin:
 
 
 # --------------------------------------------------------------------------- #
-# Fixture builders (mirror test_cowork_state_m3.py's conventions).           #
+# Fixture builders (mirror test_cowork_state_capacity_persistence.py's        #
+# conventions).                                                               #
 # --------------------------------------------------------------------------- #
 
 
@@ -87,8 +89,8 @@ def _create(session_id, **overrides):
 def _signed_manual_signal(secret_key=None, key_id="key-1", **overrides):
     """Build a manual-capacity-signal record with a GENUINE Ed25519
     signature, reaching into `cowork_state`'s own self-contained self-test
-    signer -- mirrors test_cowork_state_m3.py's `_signed_manual_signal`
-    convention exactly. Returns (record, pinned_public_keys)."""
+    signer -- mirrors test_cowork_state_capacity_persistence.py's
+    `_signed_manual_signal` convention exactly. Returns (record, pinned_public_keys)."""
     secret_key = secret_key or hashlib.sha256(os.urandom(32)).digest()
     public_key = state_store._ed25519_selftest_publickey(secret_key)
     record = dict(schema_version=1, package_id="pkg-1",
@@ -1316,7 +1318,7 @@ class ABCIntegrityTest(unittest.TestCase):
     """The scheduler's dependencies stay importable and expose the surface
     it builds on."""
 
-    def test_package_a_still_importable_and_functional(self):
+    def test_capacity_module_still_importable_and_functional(self):
         lease = dict(schema_version=1, package_id="pkg-1", lease_id="x",
                     resume_mode="scheduled", not_before="2024-01-01T00:10:00Z",
                     automation_ref="auto-1", consumption_state="unclaimed",
@@ -1324,7 +1326,7 @@ class ABCIntegrityTest(unittest.TestCase):
         lease.update(_binding())
         capacity.validate_pause_lease(lease)  # does not raise
 
-    def test_package_b_pause_lease_accessors_present(self):
+    def test_state_store_pause_lease_accessors_present(self):
         for name in ("create_pause_lease", "claim_pause_lease",
                     "cancel_pause_lease", "mark_pause_lease_consumed",
                     "replace_pause_lease", "mark_pause_lease_expired",
@@ -1333,7 +1335,7 @@ class ABCIntegrityTest(unittest.TestCase):
                     "write_manual_capacity_signal", "append_jsonl_atomic"):
             self.assertTrue(hasattr(state_store, name))
 
-    def test_package_c_control_plane_still_importable(self):
+    def test_control_plane_still_importable(self):
         import cowork_control_plane  # noqa: F401
 
 

@@ -1689,7 +1689,7 @@ Run offline tests through the provider barrier, naming explicit unittest ids
 
 ```bash
 python3 scripts/cowork_offline_tests.py test_cowork
-python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x test_m2_negative_controls
+python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x test_workflow_negative_controls
 ```
 
 The suites use fakes, but a bug can still reach a real `claude`/`codex`/

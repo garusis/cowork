@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for M4 Package D's report activity leg: `cowork_report.
+"""Tests for the report activity leg: `cowork_report.
 _section_activity`, its LINEAGE entries, and `cowork_measure.build_record`'s
 unconditional `record["activity"]` field."""
 

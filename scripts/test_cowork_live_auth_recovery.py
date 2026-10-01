@@ -19,7 +19,7 @@ Provider-free, deterministic regressions for the four layers the fix adds:
    zero sends, and non-auth / other-controller paths are byte-identical.
 
 Self-contained: own fixtures and doubles (modeled on
-`test_m3_negative_controls._M3E2EBase` and `test_cowork._hermetic_claude_probe`)
+`test_capacity_negative_controls._IsolatedE2EBase` and `test_cowork._hermetic_claude_probe`)
 rather than imports from any other test module. Every test uses injected
 fakes; no real provider is ever contacted. Run through the offline harness:
 

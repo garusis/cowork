@@ -2,7 +2,7 @@
 """Run explicit unittest ids behind the offline provider barrier (test only).
 
     python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x \
-        test_m2_negative_controls [--timeout 1800] [--scratch-base DIR]
+        test_workflow_negative_controls [--timeout 1800] [--scratch-base DIR]
 
 Layers, all built fresh in a mkdtemp scratch directory outside the repo:
 

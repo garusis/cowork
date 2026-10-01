@@ -38,7 +38,7 @@ live process handle, no in-memory state):
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m5_claim_crash_reclaim.py -v
+    python3 -m unittest scripts/test_checkpoint_claim_crash_reclaim.py -v
 """
 
 import ast

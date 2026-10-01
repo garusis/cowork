@@ -11,7 +11,7 @@ directly here rather than driven through the dispatch loop.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m5_package_d_reviewer_handoff.py -v
+    python3 -m unittest scripts/test_checkpoint_reviewer_handoff.py -v
 """
 
 import os
