@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for M2 Package C: the atomic controller policy/config
+"""Focused tests for the atomic controller policy/config
 transition primitive (issue #13), proven in isolation against a fake caller.
 
 Covers the two invariants the frozen plan names explicitly:
@@ -37,7 +37,7 @@ def _uuid():
     return str(uuid.uuid4())
 
 
-class _M2EnvMixin:
+class _SessionsRootEnvMixin:
     def setUp(self):
         super().setUp()
         self._root = tempfile.mkdtemp()
@@ -58,7 +58,7 @@ class _M2EnvMixin:
             return fh.read()
 
 
-class DecideControllerPolicyTransitionTest(_M2EnvMixin, unittest.TestCase):
+class DecideControllerPolicyTransitionTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_first_commit_activates_process_policy(self):
         session_id = _uuid()
         policy.deactivate()
@@ -221,7 +221,7 @@ class DecideControllerPolicyTransitionTest(_M2EnvMixin, unittest.TestCase):
         self.assertEqual(policy.active_allowed(), ("claude",))
 
 
-class DispatchBlockedWhilePendingTest(_M2EnvMixin, unittest.TestCase):
+class DispatchBlockedWhilePendingTest(_SessionsRootEnvMixin, unittest.TestCase):
     """Proves 'zero dispatch is possible while the transition is pending':
     a fake caller holds the SAME per-session transition lock externally
     (simulating an in-flight transition), and a concurrent dispatch guard

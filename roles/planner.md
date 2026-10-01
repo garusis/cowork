@@ -147,6 +147,13 @@ measurement metadata (`invalidation_reason`, `reuse_decision`,
   `execution_mode: candidate_read_only`), or `final_suite` (**exactly one**,
   and it must be the **last** entry) — the complete regression suite that is
   the one accepted full-suite result for the reviewed candidate.
+- Every inventory command has a Cowork-owned outer deadline of 300 seconds.
+  A larger timeout passed to the test program does not extend that deadline.
+  Size focused entries accordingly, but do not call a shard `final_suite`: the
+  single final entry must still be the complete regression suite and must fit
+  inside the outer deadline. If no honest complete-suite command can do so,
+  report the plan as blocked by that execution constraint instead of weakening
+  the meaning of `final_suite`.
 
 ```json
 "verification_schema": 2,

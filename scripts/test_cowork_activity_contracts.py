@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for cowork_activity: M4 Package A activity/status contracts.
+"""Tests for cowork_activity: activity/status contracts.
 
 Run standalone:
 
@@ -738,7 +738,7 @@ class SignatureShapeTest(unittest.TestCase):
                 for field in ("owner", "module", "params", "returns", "body_owner"):
                     self.assertIn(field, spec)
 
-    def test_project_compact_state_owned_and_bodied_by_package_a(self):
+    def test_project_compact_state_owned_and_bodied_by_activity_contracts(self):
         spec = activity.PINNED_SIGNATURES["project_compact_state"]
         self.assertEqual(spec["owner"], "A-activity-contracts")
         self.assertEqual(spec["body_owner"], "A-activity-contracts")
@@ -748,7 +748,7 @@ class SignatureShapeTest(unittest.TestCase):
             ("activity_record", "health_record", "schedule_record",
              "reconciliation_record=None"))
 
-    def test_live_child_handle_signature_pinned_by_a_body_owned_by_c(self):
+    def test_live_child_handle_signature_and_body_owned_by_controller_adapters(self):
         spec = activity.PINNED_SIGNATURES["live_child_handle"]
         self.assertEqual(spec["owner"], "C-controller-adapters")
         self.assertEqual(spec["body_owner"], "C-controller-adapters")
@@ -758,13 +758,13 @@ class SignatureShapeTest(unittest.TestCase):
         self.assertNotEqual(spec["owner"], "A-activity-contracts",
                              "Package A pins the signature only, never the body")
 
-    def test_render_activity_owned_by_package_e_in_cowork_transcript(self):
+    def test_render_activity_owned_by_cross_surface_rendering_in_cowork_transcript(self):
         spec = activity.PINNED_SIGNATURES["render_activity"]
         self.assertEqual(spec["owner"], "E-cross-surface-rendering")
         self.assertEqual(spec["module"], "cowork_transcript")
         self.assertEqual(spec["params"], ("io_out", "compact_state"))
 
-    def test_section_activity_owned_by_package_d_in_cowork_report(self):
+    def test_section_activity_owned_by_watchdog_review_in_cowork_report(self):
         spec = activity.PINNED_SIGNATURES["_section_activity"]
         self.assertEqual(spec["owner"], "D-watchdog-active-review")
         self.assertEqual(spec["module"], "cowork_report")

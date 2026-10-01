@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Focused suite for issue #64 implementation package **P5** -- deterministic
-owner fixtures.
+"""Focused suite for owner crash, reclaim and takeover -- deterministic
+real-process owner fixtures (issue #64).
 
 What this module owns is the RUNTIME, REAL-OS-PROCESS evidence the accepted
 fixture set demands and that no in-process suite can carry -- a child that is
@@ -64,7 +64,7 @@ spawns no provider and no network client. `COWORK_LIVE` is never set.
 
 Run standalone:
 
-    python3 -m unittest scripts.test_m55_owner_crash_reclaim -v
+    python3 -m unittest scripts.test_owner_crash_reclaim -v
 """
 
 import datetime
@@ -157,7 +157,7 @@ def _lease_file(session_uuid):
     new test file. A fixture that needs the lease's raw bytes therefore
     composes the path from `owner_dir_for`, which is a plain directory helper
     carrying none of the lease's single-writer contract. Precedent and reason:
-    scripts/test_m55_owner_store.py:260-269."""
+    scripts/test_owner_store.py:260-269."""
     return os.path.join(state_store.owner_dir_for(session_uuid), "lease.json")
 
 
@@ -518,13 +518,13 @@ class CrashReclaimTestCase(unittest.TestCase):
 
 class CleanRestartTests(CrashReclaimTestCase):
     """F2. The in-process halves of this fixture are already carried by
-    `test_m55_owner_gate.py::LifecycleTests::
+    `test_owner_gate.py::LifecycleTests::
     test_a_restart_after_a_clean_exit_acquires_the_next_epoch` (run-level) and
-    by `test_m55_owner_store.py` (store-level). What P5 adds is the REAL
+    by `test_owner_store.py` (store-level). What P5 adds is the REAL
     separate-process clean exit: the predecessor is a different OS process that
     really ran and really returned."""
 
-    def test_f2_a_real_child_clean_exit_releases_and_the_next_run_takes_epoch_two(self):
+    def test_a_real_child_clean_exit_releases_and_the_next_run_takes_epoch_two(self):
         proc, gate = self.spawn_flow_child(park=None)
         rc, out = self._reap(proc)
         self.assertEqual(rc, 0, out)
@@ -577,7 +577,7 @@ class CrashedOwnerTests(CrashReclaimTestCase):
         self.assertEqual(record["epoch"], 1)
         return session_uuid, gate, record
 
-    def test_f3_a_real_sigkill_leaves_a_live_lease_until_the_deadline(self):
+    def test_a_real_sigkill_leaves_a_live_lease_until_the_deadline(self):
         session_uuid, _gate, _record = self._crash_a_real_owner()
         before_deadline = _utcnow()
         self.assertEqual(
@@ -589,7 +589,7 @@ class CrashedOwnerTests(CrashReclaimTestCase):
                                       now=before_deadline)
         self.assertEqual(caught.exception.reason, "live_owner")
 
-    def test_f3_after_the_deadline_take_over_selects_proved_dead_and_bumps_the_epoch(self):
+    def test_after_the_deadline_take_over_selects_proved_dead_and_bumps_the_epoch(self):
         session_uuid, gate, record = self._crash_a_real_owner()
         after = _expired_instant()
 
@@ -619,13 +619,13 @@ class CrashedOwnerTests(CrashReclaimTestCase):
 
 
 class SigtermUnderTakeoverTests(CrashReclaimTestCase):
-    """F4. `test_m55_owner_store.py::TerminalMarkTests` already carries the
+    """F4. `test_owner_store.py::TerminalMarkTests` already carries the
     terminal-mark independence property at store level. What P5 adds is the
     full RUN-LEVEL consequence set, under a real concurrent takeover: the
     sidecar, the aborted PhaseState, the `run.external_kill` trace event, exit
     143, AND the successor's byte identity -- all from one real signal."""
 
-    def test_f4_the_predecessor_marks_terminal_and_the_successor_lease_is_byte_identical(self):
+    def test_the_predecessor_marks_terminal_and_the_successor_lease_is_byte_identical(self):
         park = os.path.join(self.root, "release-gate")
         proc, gate = self.spawn_flow_child(park=park,
                                            fabricate=FABRICATED_PID_START)
@@ -695,12 +695,12 @@ class SigtermUnderTakeoverTests(CrashReclaimTestCase):
 
 
 class PidReuseTests(CrashReclaimTestCase):
-    """F5. `test_m55_owner_store.py` carries pid reuse against a synthetic
+    """F5. `test_owner_store.py` carries pid reuse against a synthetic
     record. What P5 adds is a pid bound to a NEWLY SPAWNED, still-running
     process: the innocent inheritor of a recycled pid is a real thing that can
     really be signalled, and the assertion here is that it never is."""
 
-    def test_f5_a_live_reused_pid_classifies_stale_dead_owner_and_is_never_signalled(self):
+    def test_a_live_reused_pid_classifies_stale_dead_owner_and_is_never_signalled(self):
         proc, gate = self.spawn_light_owner(self.session_uuid,
                                             fabricate=FABRICATED_PID_START)
         self.assertIsNone(proc.poll(), "the victim must be genuinely alive")
@@ -758,7 +758,7 @@ class TakeoverPreservationTests(CrashReclaimTestCase):
     LEASE_ID = "p5-lease-1"
     BINDING = ("claude", "p5-provider-session")
 
-    def test_f11_ten_artifact_classes_are_sha256_identical_across_a_real_takeover(self):
+    def test_ten_artifact_classes_are_sha256_identical_across_a_real_takeover(self):
         rc, out = self.run_owned_flow(["--new"])
         self.assertEqual(rc, 0, out)
         session_uuid = state_store.get_session_uuid(
@@ -835,7 +835,7 @@ class TakeoverPreservationTests(CrashReclaimTestCase):
 
 
 class TakeoverAbortTests(CrashReclaimTestCase):
-    """F12. `test_m55_owner_store.py::
+    """F12. `test_owner_store.py::
     test_terminate_prior_aborts_and_leaves_the_lease_byte_identical` carries
     this at store level against a synthetic victim. What P5 adds is a REAL live
     process that really survives BOTH escalation steps.
@@ -848,7 +848,7 @@ class TakeoverAbortTests(CrashReclaimTestCase):
     polling becomes 1.5s.
     """
 
-    def test_f12_a_prior_owner_that_survives_term_and_kill_aborts_the_takeover(self):
+    def test_a_prior_owner_that_survives_term_and_kill_aborts_the_takeover(self):
         proc, gate = self.spawn_light_owner(self.session_uuid,
                                             mode="ignore_term")
         self.assertIsNone(proc.poll())
@@ -923,7 +923,7 @@ class SigtermTakeoverRaceTests(CrashReclaimTestCase):
     written for that session contains no duplicate.
     """
 
-    def test_g8_fifty_randomized_interleavings_plus_both_deterministic_orders(self):
+    def test_fifty_randomized_interleavings_plus_both_deterministic_orders(self):
         rng = random.Random(G8_SEED)
         interleavings = 0
         via_takeover = 0

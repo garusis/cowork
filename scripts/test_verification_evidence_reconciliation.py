@@ -11,7 +11,7 @@ stand in for without hollowing out the very thing this package must prove.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m5_package_c_evidence_reconciliation.py -v
+    python3 -m unittest scripts/test_verification_evidence_reconciliation.py -v
 """
 
 import datetime
@@ -1076,7 +1076,7 @@ def _seed_worker_into_repo(repo):
 class _RealWorkerFixture(unittest.TestCase):
     """A throwaway committed git repo seeded with the real, candidate
     worker modules and an isolated session root -- mirrors
-    `scripts/test_m5_package_a_contracts.py`'s own fixture of the same
+    `scripts/test_checkpoint_contracts.py`'s own fixture of the same
     shape, duplicated rather than imported so this suite stays
     self-contained (importing a sibling `test_*` module risks unittest's
     own discovery picking up ITS test classes a second time)."""

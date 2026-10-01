@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Focused tests for M3 Package F's manual/emergency verification adapter
+"""Focused tests for the manual/emergency capacity verification adapter
 (`cowork_wake_manual.py`), built against Package B's own signed-record
 verification and journal accessors (`cowork_state.py`).
 
 Signature tests use a fixture Ed25519 key pair (this file reaches into
 `cowork_state`'s own self-contained self-test signer, mirroring
-test_cowork_capacity_scheduler.py's/test_cowork_state_m3.py's established
+test_cowork_capacity_scheduler.py's/
+test_cowork_state_capacity_persistence.py's established
 `_signed_manual_signal` convention). Production code
 (`cowork_wake_manual.py`) contains no such signing path -- see
 `NoSelfSignPathTest`, an AST-level structural gate.
@@ -40,7 +41,8 @@ def _uuid():
 
 class _WakeManualEnvMixin:
     """Isolated COWORK_SESSIONS_ROOT per test (mirrors test_cowork_state_
-    m3.py's _M3EnvMixin), so nothing ever touches the real home dir."""
+    capacity_persistence.py's _SessionsRootEnvMixin), so nothing ever
+    touches the real home dir."""
 
     def setUp(self):
         super().setUp()
@@ -67,7 +69,7 @@ class _WakeManualEnvMixin:
 
 # --------------------------------------------------------------------------- #
 # Fixture builder (mirrors test_cowork_capacity_scheduler.py's/test_cowork_ #
-# state_m3.py's _signed_manual_signal convention exactly).                   #
+# state_capacity_persistence.py's _signed_manual_signal convention exactly).  #
 # --------------------------------------------------------------------------- #
 
 
@@ -242,7 +244,7 @@ class ClassifyManualSignalErrorTest(unittest.TestCase):
         self.assertEqual(wake_manual.classify_manual_signal_error(exc),
                          "invalid_arguments")
 
-    def test_journal_conflict_marker_matches_package_bs_actual_wording(self):
+    def test_journal_conflict_marker_matches_state_store_conflict_wording(self):
         """Pins `_JOURNAL_CONFLICT_MESSAGE_MARKER` against a REAL conflict
         Package B raises -- if Package B's own wording ever drifts, this
         test fails loudly instead of `classify_manual_signal_error` silently
@@ -479,7 +481,7 @@ class StructuralGatesTest(unittest.TestCase):
         imported = self._top_level_imports()
         self.assertEqual(imported, {"argparse", "json", "os", "sys", "cowork_state"})
 
-    def test_never_imports_package_d_scheduler(self):
+    def test_never_imports_capacity_scheduler(self):
         """The manual adapter's own scope is verify-then-journal only; it
         never claims a PauseLease itself, so it never needs Package D."""
         self.assertNotIn("cowork_capacity_scheduler", self._top_level_imports())
@@ -492,16 +494,16 @@ class ABDIntegrityTest(unittest.TestCase):
     """Package F imports Package B without needing to modify it, and their
     own test suites are unaffected by this addition."""
 
-    def test_package_b_manual_signal_accessors_present(self):
+    def test_state_store_manual_signal_accessors_present(self):
         for name in ("verify_manual_capacity_signal", "write_manual_capacity_signal",
                     "read_manual_capacity_signal", "ManualSignalSignatureError",
                     "canonical_manual_capacity_signal_message"):
             self.assertTrue(hasattr(state_store, name))
 
-    def test_package_a_still_importable_and_functional(self):
+    def test_capacity_module_still_importable_and_functional(self):
         import cowork_capacity as capacity  # noqa: F401
 
-    def test_package_d_scheduler_still_importable(self):
+    def test_capacity_scheduler_still_importable(self):
         import cowork_capacity_scheduler  # noqa: F401
 
 

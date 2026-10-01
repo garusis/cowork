@@ -11,7 +11,7 @@ fixtures.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m5_package_a_contracts.py -v
+    python3 -m unittest scripts/test_checkpoint_contracts.py -v
 """
 
 import ast
@@ -700,7 +700,7 @@ class TimeoutAndCancellationDispositionTests(unittest.TestCase):
 # =========================================================================== #
 
 
-class ZeroBehaviorChangeSeamTests(_RealWorkerFixture):
+class TeardownSeamDefaultBehaviorTests(_RealWorkerFixture):
 
     def test_should_defer_teardown_stub_returns_false_unconditionally(self):
         self.assertIs(verification.should_defer_teardown(
@@ -732,7 +732,7 @@ class ZeroBehaviorChangeSeamTests(_RealWorkerFixture):
                 self.repo, self.session_uuid, entries)
         return result, calls
 
-    def test_false_default_still_tears_down_every_time_zero_behavior_change(self):
+    def test_false_default_still_tears_down_every_time(self):
         result, calls = self._run_green_transaction_with_teardown_spies()
         self.assertEqual(result["verdict"], verification.VERDICT_GREEN)
         self.assertEqual(calls, ["cleanup", "terminate"],

@@ -62,7 +62,7 @@ circular import. These two constants (plus `EVIDENCE_PRESENT`/
 `EVIDENCE_UNRESOLVED`/`EVIDENCE_ABSENT`, used in function bodies here too)
 are therefore small, frozen, local DUPLICATES of `cowork_verification`'s
 own module-level constants of the same name and value --
-`scripts/test_m5_package_a_contracts.py` asserts the shared subset stays
+`scripts/test_checkpoint_contracts.py` asserts the shared subset stays
 equal, so any future drift is caught immediately rather than silently
 producing two different poll bounds. `_execution_wait_budget_s`,
 `_pgid_alive`, and `cleanup_active_command_group`, by contrast, are only

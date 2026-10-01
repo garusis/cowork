@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for cowork_capacity: M3 Package A provider-capacity contracts.
+"""Tests for cowork_capacity: provider-capacity contracts.
 
 Run standalone:
 
@@ -523,7 +523,7 @@ class PauseLeaseTest(unittest.TestCase):
         self.assertEqual(normalized["not_before"], boundary_timestamp)
 
 
-class M3RN06FailedWakeAttemptsTest(unittest.TestCase):
+class PauseLeaseFailedWakeAttemptsTest(unittest.TestCase):
     """M3R-N06: durable failed-wake-attempt counter/ceiling contract."""
 
     def test_initial_value_is_zero(self):

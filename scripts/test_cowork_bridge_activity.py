@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixture-driven tests for M4 Package C: real-evidence controller-adapter
+"""Fixture-driven tests for controller-adapter activity: real-evidence
 activity classification, typed OpenCode refusal/error extraction, the
 bounded first-token deadline (SIGTERM then SIGKILL/reap) mechanism, and
 `live_child_handle` in cowork_bridge.py.

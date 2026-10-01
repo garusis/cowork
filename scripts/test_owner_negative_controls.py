@@ -62,8 +62,8 @@ it must not let through anonymously. That is what lives here:
 
 **N10's mapped span, disclosed.** N10's accepted definition also spans F8's
 provider-exclusivity arms. Those are already carried by
-`scripts/test_m55_owner_exclusivity.py::TypedPropagationTests::
-test_n10_nothing_anonymous_reaches_the_send_gateway`; they are not re-driven
+`scripts/test_owner_exclusivity.py::TypedPropagationTests::
+test_nothing_anonymous_reaches_the_send_gateway`; they are not re-driven
 here, and are stated so they are not silently dropped.
 
 Every fixture redirects `COWORK_SESSIONS_ROOT` into a fresh `tempfile.mkdtemp`,
@@ -73,7 +73,7 @@ and registers every child it spawns. `COWORK_LIVE` is never set.
 
 Run standalone:
 
-    python3 -m unittest scripts.test_m55_owner_negative_controls -v
+    python3 -m unittest scripts.test_owner_negative_controls -v
 """
 
 import ast
@@ -103,8 +103,8 @@ import cowork_owner as owner  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 
-# The persistence seam frozen by `test_cowork_state_m3.py`'s characterization
-# suite: the EXACT parameter list, in order.
+# The persistence seam frozen by `test_cowork_state_capacity_persistence.py`'s
+# characterization suite: the EXACT parameter list, in order.
 SAVE_ROLE_SESSION_PARAMETERS = ["path", "role", "controller", "session_id",
                                 "prior"]
 
@@ -155,7 +155,7 @@ def _lease_file(session_uuid):
     """Composed from `owner_dir_for`, never from `owner_lease_path_for` and
     never from the literal `"owner/lease.json"`: G3d's repo-wide sweep asserts
     that neither spelling ever reaches an `open(...)` anywhere in the
-    repository, including in a new test file (test_m55_owner_store.py:260-269).
+    repository, including in a new test file (test_owner_store.py:260-269).
     """
     return os.path.join(state_store.owner_dir_for(session_uuid), "lease.json")
 
@@ -513,7 +513,7 @@ class NegativeControlTestCase(unittest.TestCase):
 
 
 class NoSessionTests(NegativeControlTestCase):
-    """N1. `test_m55_owner_gate.py::NegativeControlTests::
+    """N1. `test_owner_gate.py::NegativeControlTests::
     test_no_session_never_leases_and_never_raises` carries the scout-only
     version. This suite adds a THREE-PHASE flow that really reaches all four
     measurement boundaries and all their evaluation drains, plus the zero-bind
@@ -529,7 +529,7 @@ class NoSessionTests(NegativeControlTestCase):
         "release_provider_bindings", "mark_owner_terminal_unlocked",
     )
 
-    def test_n1_a_full_flow_with_no_session_never_leases_and_never_refuses(self):
+    def test_a_full_flow_with_no_session_never_leases_and_never_refuses(self):
         refusals = []
         binds = _Counter(owner.bind_provider_session)
         contexts = {"advance": [], "evaluation": []}
@@ -617,7 +617,7 @@ class ReadOnlySurfaceTests(NegativeControlTestCase):
                          "live_owner")
         return session_uuid
 
-    def test_n2_the_four_read_only_surfaces_succeed_lease_free_under_a_live_owner(self):
+    def test_the_four_read_only_surfaces_succeed_lease_free_under_a_live_owner(self):
         session_uuid = self._established_session_under_a_live_owner()
         preflight_calls = _Counter(lambda: 0)
 
@@ -665,7 +665,7 @@ class ReadOnlySurfaceTests(NegativeControlTestCase):
         self.assertEqual(preflight_calls.count, 1,
                          "--check never reached the preflight surface")
 
-    def test_n2_evaluate_role_reaches_no_drain_frame(self):
+    def test_evaluate_role_reaches_no_drain_frame(self):
         """`--evaluate-role` is a read-mostly side channel dispatched beside
         `--check`/`--report`, above `run_flow` entirely. It must therefore not
         reach ANY drain frame -- not the transition, not the drain itself."""
@@ -690,13 +690,13 @@ class ReadOnlySurfaceTests(NegativeControlTestCase):
 
 
 class SingleOwnerTests(NegativeControlTestCase):
-    """N3, the converse of N1. `test_m55_owner_gate.py::NegativeControlTests::
+    """N3, the converse of N1. `test_owner_gate.py::NegativeControlTests::
     test_an_owned_run_is_enforced_at_every_governed_seam` carries the
     scout-only version. This suite adds the NON-VACUITY assertion -- both counters
     strictly greater than zero, so a flow that never reached a seam cannot pass
     -- and the release-exactly-once arm."""
 
-    def test_n3_every_governed_seam_and_every_evaluation_transition_is_enforced(self):
+    def test_every_governed_seam_and_every_evaluation_transition_is_enforced(self):
         advance_ctx = []
         eval_ctx = []
         require_ctx = []
@@ -777,7 +777,7 @@ class LegacySessionTests(NegativeControlTestCase):
         "scores.json": '{"entries": []}\n',
     }
 
-    def test_n4_a_legacy_session_acquires_at_epoch_one_with_no_migration_artifact(self):
+    def test_a_legacy_session_acquires_at_epoch_one_with_no_migration_artifact(self):
         session_uuid = str(uuid.uuid4())
         assets = state_store.session_assets_dir(session_uuid)
         os.makedirs(assets, exist_ok=True)
@@ -895,7 +895,7 @@ class ParkedOwnerTests(NegativeControlTestCase):
                                % (proc.returncode, err))
         return json.loads(out.strip())
 
-    def test_n5_a_parked_owner_stays_live_across_three_deadlines_for_a_separate_observer_process(self):
+    def test_a_parked_owner_stays_live_across_three_deadlines_for_a_separate_observer_process(self):
         session_uuid = str(uuid.uuid4())
         # ZERO sends in flight: `_send` is a raise-on-call double for the whole
         # fixture, so nothing here can be mistaken for a turn keeping the lease
@@ -916,7 +916,7 @@ class ParkedOwnerTests(NegativeControlTestCase):
             "separate-process probes=%d\n"
             % (int(elapsed), N5_DEADLINE_S, len(probes)))
 
-    def test_n5_a_foreign_host_observer_still_reads_live_owner(self):
+    def test_a_foreign_host_observer_still_reads_live_owner(self):
         """The same probe from a simulated FOREIGN host, where the pid-alive
         OR-clause is unavailable by construction. A renewed lease is still
         inside its own deadline, and `_classify_record` decides the deadline
@@ -941,14 +941,14 @@ class ParkedOwnerTests(NegativeControlTestCase):
 
 class PersistenceSeamTests(NegativeControlTestCase):
     """N6. `save_role_session` is the seam #64 must not have moved, and
-    `test_cowork_state_m3.py` is what froze it. The signature arm restates that
+    `test_cowork_state_capacity_persistence.py` is what froze it. The signature arm restates that
     freeze; the remaining arms assert the durable OUTPUT of the real `role_saver` closure, unenforced and enforced,
     asserted byte-for-byte."""
 
     SID_UNENFORCED = "p5-n6-unenforced"
     SID_ENFORCED = "p5-n6-enforced"
 
-    def test_n6_save_role_session_signature_is_frozen(self):
+    def test_save_role_session_signature_is_frozen(self):
         parameters = list(inspect.signature(
             state_store.save_role_session).parameters.keys())
         self.assertEqual(parameters, SAVE_ROLE_SESSION_PARAMETERS)
@@ -1006,7 +1006,7 @@ class PersistenceSeamTests(NegativeControlTestCase):
             refreshed["sessions"]["scout"]["last_context_revision_seen"], 7)
         self.assertEqual(refreshed["sessions"]["scout"]["id"], session_id)
 
-    def test_n6_unenforced_durable_output_is_byte_identical(self):
+    def test_unenforced_durable_output_is_byte_identical(self):
         """The real `role_saver(...)` closure, driven through the real
         `on_session` callback a role runner is handed, with `enforced` False --
         the `--no-session` shape of the seam. Its durable output must be
@@ -1038,7 +1038,7 @@ class PersistenceSeamTests(NegativeControlTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.root,
                                                      "provider-bindings")))
 
-    def test_n6_enforced_adds_only_the_provider_binding_record(self):
+    def test_enforced_adds_only_the_provider_binding_record(self):
         """With `enforced` True and no conflicting binding, the anchor's
         `state['sessions'][role]` is byte-identical to the unenforced case and
         the ONLY durable artifact the owner machinery adds is the
@@ -1091,13 +1091,13 @@ class PersistenceSeamTests(NegativeControlTestCase):
 
 
 class NestedRunTests(NegativeControlTestCase):
-    """N7. `test_m55_owner_gate.py::LifecycleTests::
+    """N7. `test_owner_gate.py::LifecycleTests::
     test_a_nested_run_restores_the_outer_context_verbatim` carries the clean
     nesting case. This suite adds the arm where the INNER run records AND
     drains a provider conflict of its own -- the case where the inner region
     genuinely mutates the shared box before restoring it."""
 
-    def test_n7_the_inner_run_restores_all_five_outer_context_fields_including_a_drained_conflict(self):
+    def test_the_inner_run_restores_all_five_outer_context_fields_including_a_drained_conflict(self):
         outer_uuid = str(uuid.uuid4())
         outer = self.seed_live_owner(outer_uuid)
         cowork._set_owner_context(outer_uuid, outer["owner_id"],
@@ -1167,7 +1167,7 @@ class EvaluatorExemptionTests(NegativeControlTestCase):
     all drain with zero owner exceptions -- alongside the AST count that keeps
     the exemption from widening."""
 
-    def test_n8_the_exemption_is_one_site_and_drains_without_owner_exceptions(self):
+    def test_the_exemption_is_one_site_and_drains_without_owner_exceptions(self):
         # (a) the exemption, at the gate itself.
         session_uuid = str(uuid.uuid4())
         record = self.seed_live_owner(session_uuid)
@@ -1252,7 +1252,7 @@ class EnqueueBoundTests(NegativeControlTestCase):
     was never observed at all, which is the failure mode rule E4 leaves open
     and this control refuses to leave unmeasured."""
 
-    def test_n9_every_post_loss_enqueue_is_preceded_by_a_raising_governed_call(self):
+    def test_every_post_loss_enqueue_is_preceded_by_a_raising_governed_call(self):
         log = []
 
         def governed(name, real):
@@ -1361,8 +1361,8 @@ class SendGatewayTests(NegativeControlTestCase):
 
     MAPPED SPAN, DISCLOSED: N10's accepted definition also spans F8's
     provider-exclusivity arms. Those are carried by
-    `scripts/test_m55_owner_exclusivity.py::TypedPropagationTests::
-    test_n10_nothing_anonymous_reaches_the_send_gateway` -- a CLOSED package's
+    `scripts/test_owner_exclusivity.py::TypedPropagationTests::
+    test_nothing_anonymous_reaches_the_send_gateway` -- a CLOSED package's
     frozen suite -- and are deliberately NOT re-executed here.
     """
 
@@ -1377,7 +1377,7 @@ class SendGatewayTests(NegativeControlTestCase):
         "pending_conflict_send_frame": 1,
     }
 
-    def test_n10_no_owner_refusal_and_nothing_anonymous_reaches_the_send_gateway(self):
+    def test_no_owner_refusal_and_nothing_anonymous_reaches_the_send_gateway(self):
         observed = 0
         for arm in ("no_session", "owned", "binding_failure", "drain_loss",
                     "pending_conflict_send_frame"):
@@ -1565,7 +1565,7 @@ class SendGatewayTests(NegativeControlTestCase):
 
 
 class BindingSurfaceTests(NegativeControlTestCase):
-    """N11. `test_m55_owner_store.py::BindingSurfaceBehaviourTests::
+    """N11. `test_owner_store.py::BindingSurfaceBehaviourTests::
     test_every_injected_failure_mode_translates_on_every_reader` carries this
     in depth. This suite adds the TOTALITY SWEEP as one control -- four failure
     modes on each of three functions, twelve cells -- plus the arm that a
@@ -1574,7 +1574,7 @@ class BindingSurfaceTests(NegativeControlTestCase):
     CONTROLLER = "claude"
     SID = "p5-n11-sid"
 
-    def test_n11_the_four_failure_modes_map_to_provider_binding_unavailable_on_all_three_functions(self):
+    def test_the_four_failure_modes_map_to_provider_binding_unavailable_on_all_three_functions(self):
         owner_ref = {"session_uuid": str(uuid.uuid4()),
                      "owner_id": str(uuid.uuid4())}
         surfaces = (
@@ -1604,7 +1604,7 @@ class BindingSurfaceTests(NegativeControlTestCase):
                 cells += 1
         self.assertEqual(cells, 12)
 
-    def test_n11_read_returns_none_only_for_an_absent_record(self):
+    def test_read_returns_none_only_for_an_absent_record(self):
         self.assertIsNone(
             owner.read_provider_binding(self.CONTROLLER, "p5-absent-sid"))
         for mode_name, injected in TRANSLATED_FAILURES:
@@ -1616,7 +1616,7 @@ class BindingSurfaceTests(NegativeControlTestCase):
                         owner.read_provider_binding(self.CONTROLLER,
                                                     "p5-absent-sid")
 
-    def test_n11_release_swallows_and_traces_its_translated_exception_during_teardown(self):
+    def test_release_swallows_and_traces_its_translated_exception_during_teardown(self):
         """The release `finally` is the one place a teardown error could
         displace a run's real exit code. It must be traced and swallowed."""
         boom = owner.ProviderBindingUnavailable(
@@ -1696,7 +1696,7 @@ class EvaluationDrainTests(NegativeControlTestCase):
         self.assertTrue(os.path.exists(queue_path))
         return session_uuid, queue_path
 
-    def test_f14_a_pre_drain_loss_ends_at_rc_three_with_zero_evaluator_constructions(self):
+    def test_a_pre_drain_loss_ends_at_rc_three_with_zero_evaluator_constructions(self):
         session_uuid, queue_path = self._established_session_with_a_queue(
             ["p5-f14-a"])
         before = _sha256_file(queue_path)
@@ -1715,7 +1715,7 @@ class EvaluationDrainTests(NegativeControlTestCase):
         self.assertEqual(ends[-1].get("rc"), 3)
         self.assertEqual(ends[-1].get("reason"), "session_owner_lost")
 
-    def test_f14_a_valid_lease_drains_normally(self):
+    def test_a_valid_lease_drains_normally(self):
         """The converse arm, identical in every respect but the lease: the same
         boundary drains, the queue advances, and the run ends at rc 0."""
         session_uuid, queue_path = self._established_session_with_a_queue(
@@ -1739,7 +1739,7 @@ class EvaluationDrainTests(NegativeControlTestCase):
         self.assertEqual(fold["state"], "held")
         self.assertEqual(fold["held_reason"], "policy_off")
 
-    def test_f14_a_mid_drain_loss_is_observed_at_the_next_governed_seam(self):
+    def test_a_mid_drain_loss_is_observed_at_the_next_governed_seam(self):
         """A lease lost MID-drain is first observed at the NEXT governed seam,
         not per queue entry -- and the residual (what the drain went on to
         mutate after the loss) is BOUNDED by the set of entries that were

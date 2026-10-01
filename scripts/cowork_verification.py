@@ -278,7 +278,7 @@ except ModuleNotFoundError as _seam_import_error:
     _latest_ledger_record = _seam_unavailable
     # Drift-protected fallback (M5A minor): this literal must stay equal to
     # cowork_verification_worker.MAX_STARTUP_LOG_BYTES's own definition --
-    # scripts/test_m5_package_a_contracts.py's
+    # scripts/test_checkpoint_contracts.py's
     # DriftProtectedFallbackConstantTests mechanically compares this exact
     # source line's value against that module's real constant on every run,
     # so a future edit to one without the other fails a gate immediately
@@ -4170,7 +4170,7 @@ def _authorize_live_candidate_mutations(cwd, declared_output_paths,
     THIS module (plus its known `cowork_state`/`cowork_ledger` siblings) into
     a standalone directory to prove this module's own seam-unavailable/
     import-error propagation semantics in isolation (see
-    `scripts/test_m5_package_a_contracts.py`'s `WorkerSubprocessMissingSeam
+    `scripts/test_checkpoint_contracts.py`'s `WorkerSubprocessMissingSeam
     SiblingsTests`/`NarrowedImportErrorHandlingTests`) -- a module-level
     import of a dependency those fixtures never copy would break that
     isolation for every caller, not just the one live_candidate mutation

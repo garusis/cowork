@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M2 Package F: end-to-end negative-control suite.
+"""Workflow orchestration: end-to-end negative-control suite.
 
 Independent, fresh proof — written without editing any existing test file —
 that every negative control the frozen brief names is refused by the REAL,
@@ -36,7 +36,7 @@ plus the two additional issue-#11/#30 controls Package E introduced):
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m2_negative_controls.py -v
+    python3 -m unittest scripts/test_workflow_negative_controls.py -v
 """
 
 import hashlib
@@ -130,7 +130,7 @@ def _uuid():
     return str(uuid.uuid4())
 
 
-class _M2E2EBase(unittest.TestCase):
+class _IsolatedE2EBase(unittest.TestCase):
     """Isolated COWORK_SESSIONS_ROOT + unconditional policy reset per test —
     mirrors the isolation discipline the E suite itself
     established, reproduced independently here."""
@@ -191,7 +191,7 @@ class _M2E2EBase(unittest.TestCase):
 # 1. Uncorrelated children
 # =============================================================================
 
-class UncorrelatedChildrenTest(_M2E2EBase):
+class UncorrelatedChildrenTest(_IsolatedE2EBase):
     """A correlation-unavailable child dispatch attempt, exercised through
     the REAL production dispatch/broker flow -- a live GuardBroker thread
     spun up by the real `cowork_bridge._guard_runtime`, reached over its real
@@ -299,7 +299,7 @@ class _SigtermSession:
         pass
 
 
-class NonCompletionMatrixTest(_M2E2EBase):
+class NonCompletionMatrixTest(_IsolatedE2EBase):
     """Named negative controls 2 (guard disappearance), 4 (controller
     abort), and 5 (EOF): each drives the real production `run_flow`/
     `run_scout`/`_advance_phase` seam to an explicit terminal PhaseState
@@ -357,7 +357,7 @@ class NonCompletionMatrixTest(_M2E2EBase):
 # 3. Invalid policy transition
 # =============================================================================
 
-class InvalidPolicyTransitionTest(_M2E2EBase):
+class InvalidPolicyTransitionTest(_IsolatedE2EBase):
     """A conflicting/invalid controller policy transition submitted through
     the REAL `--switch-controller` `run_flow` seam causes zero dispatch and
     leaves the persisted + active policy byte-identical to pre-attempt."""
@@ -397,7 +397,7 @@ class InvalidPolicyTransitionTest(_M2E2EBase):
 # 6. External kill -- positive durable-terminal-record assertion
 # =============================================================================
 
-class ExternalKillPositiveTerminalRecordTest(_M2E2EBase):
+class ExternalKillPositiveTerminalRecordTest(_IsolatedE2EBase):
     """A real SIGTERM, delivered at the review gate (the paired reviewer's
     pass) through the
     SAME production `run_flow` handler and the REAL (not bypassed)
@@ -474,7 +474,7 @@ class ExternalKillPositiveTerminalRecordTest(_M2E2EBase):
 # 7. Repeated identical repair
 # =============================================================================
 
-class RepeatedIdenticalRepairTest(_M2E2EBase):
+class RepeatedIdenticalRepairTest(_IsolatedE2EBase):
     """D's durable recovery breaker, integrated at the machine re-invocation
     boundary: once the identical cause has spent its budget, the next engagement
     is refused BEFORE another dispatch, with a stable, distinct reason code."""
@@ -577,7 +577,7 @@ def _node(work_id, predecessors=(), digest=None, index=None, gcp="inherit"):
     }
 
 
-class DependencyGraphNegativeControlsTest(_M2E2EBase):
+class DependencyGraphNegativeControlsTest(_IsolatedE2EBase):
 
     def _assert_revision_rejected(self, session_uuid, nodes, code):
         with self.assertRaises(workunit.GraphValidationError) as ctx:
@@ -698,7 +698,7 @@ class DependencyGraphNegativeControlsTest(_M2E2EBase):
 # 14. Context-acknowledgment failure before first accepted send (issue #11)
 # =============================================================================
 
-class ContextAckFailureTest(_M2E2EBase):
+class ContextAckFailureTest(_IsolatedE2EBase):
     """A failed FIRST send never acknowledges the context that rode it -- a
     resumed session redelivers BOTH the unseen context and the saved pending
     role request, through the real `run_flow`/`run_scout` seam."""
@@ -825,7 +825,7 @@ class ContextAckFailureTest(_M2E2EBase):
 # 15. Controller-switch mid-transition interruption (issue #30)
 # =============================================================================
 
-class ControllerSwitchInterruptionTest(_M2E2EBase):
+class ControllerSwitchInterruptionTest(_IsolatedE2EBase):
     """Interrupting exactly at the real controller-switch seam's single
     persisting write leaves only the prior byte-identical identity or the
     fully-committed new one -- zero dispatch either way -- and a subsequent

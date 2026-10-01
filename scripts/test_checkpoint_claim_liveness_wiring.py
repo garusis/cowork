@@ -36,7 +36,7 @@ live process handle, no in-memory state):
 
 Run standalone:
 
-    python3 scripts/test_m5_claim_liveness_wiring.py -v
+    python3 scripts/test_checkpoint_claim_liveness_wiring.py -v
 """
 
 import ast

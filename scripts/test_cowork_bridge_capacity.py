@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Fixture-driven tests for M3 Package C: pure controller raw-failure
-normalization in cowork_bridge.py.
+"""Fixture-driven tests for capacity failure classification: pure controller
+raw-failure normalization in cowork_bridge.py.
 
 Covers the frozen brief's required gates: fixture taxonomy coverage over
 Package A's closed ControllerOutcome set (rate-limit, HTTP 529 overload,

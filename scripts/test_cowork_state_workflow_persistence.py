@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Focused tests for M2 Package B: crash-safe WorkUnit / dependency-graph /
-PhaseState persistence, atomic controller-policy transitions, and the
-legacy read/migration shim added to cowork_state.py.
+"""Focused tests for workflow state persistence: crash-safe WorkUnit /
+dependency-graph / PhaseState persistence, atomic controller-policy
+transitions, and the legacy read/migration shim in cowork_state.py.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_cowork_state_m2.py -v
+    python3 -m unittest scripts/test_cowork_state_workflow_persistence.py -v
 """
 
 import fcntl
@@ -143,7 +143,7 @@ def _node(work_id, predecessors=(), candidate=None, index=None, policy="inherit"
     }
 
 
-class _M2EnvMixin:
+class _SessionsRootEnvMixin:
     """Isolated COWORK_SESSIONS_ROOT per test, so nothing ever touches the
     real home dir (mirrors test_cowork.py's _EvalEnvMixin)."""
 
@@ -175,7 +175,7 @@ class _M2EnvMixin:
 # --------------------------------------------------------------------------- #
 
 
-class WorkUnitStoreTest(_M2EnvMixin, unittest.TestCase):
+class WorkUnitStoreTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_mint_persists_first_record(self):
         w = _make_work_unit()
         stored = state_store.mint_work_unit(w)
@@ -372,7 +372,7 @@ class WorkUnitStoreTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class DependencyGraphStoreTest(_M2EnvMixin, unittest.TestCase):
+class DependencyGraphStoreTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_append_first_and_second_revision(self):
         session_id = _uuid()
         a, b = _uuid(), _uuid()
@@ -457,7 +457,7 @@ def _truncate_tail_bytes(path, n):
         fh.truncate(max(0, size - n))
 
 
-class AppendJsonlAtomicCrashSafetyTest(_M2EnvMixin, unittest.TestCase):
+class AppendJsonlAtomicCrashSafetyTest(_SessionsRootEnvMixin, unittest.TestCase):
     """Direct, primitive-level proofs against `append_jsonl_atomic` itself --
     the one shared write path every M2 Package B store (PhaseState, WorkUnit,
     graph revision) funnels through."""
@@ -652,7 +652,7 @@ class AppendJsonlAtomicCrashSafetyTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class AppendJsonlAtomicReentrantSignalTest(_M2EnvMixin, unittest.TestCase):
+class AppendJsonlAtomicReentrantSignalTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _some_record(self, session_id, work_id, marker):
         return {"session_id": session_id, "work_id": work_id,
                 "state": "running", "reason_code": None, "event": None,
@@ -853,7 +853,7 @@ class AppendJsonlAtomicReentrantSignalTest(_M2EnvMixin, unittest.TestCase):
         self.assertEqual(parsed[1]["source"], "reentrant")
 
 
-class PhaseStateMidWriteSignalTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateMidWriteSignalTest(_SessionsRootEnvMixin, unittest.TestCase):
     """The same B-CRASH-REENTRANT-2 hazard, proven through the PUBLIC
     PhaseState API rather than the raw primitive: a real SIGUSR1 fires
     strictly inside `append_jsonl_atomic`'s own write loop while the main
@@ -941,7 +941,7 @@ class PhaseStateMidWriteSignalTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class AppendJsonlAtomicRollbackAndRepairFreshnessTest(_M2EnvMixin, unittest.TestCase):
+class AppendJsonlAtomicRollbackAndRepairFreshnessTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _some_record(self, session_id, work_id, marker):
         return {"session_id": session_id, "work_id": work_id,
                 "state": "running", "reason_code": None, "event": None,
@@ -1130,7 +1130,7 @@ class AppendJsonlAtomicRollbackAndRepairFreshnessTest(_M2EnvMixin, unittest.Test
         self.assertEqual(parsed[2]["source"], "outer")
 
 
-class AppendJsonlAtomicCloseAndDirDurabilityTest(_M2EnvMixin, unittest.TestCase):
+class AppendJsonlAtomicCloseAndDirDurabilityTest(_SessionsRootEnvMixin, unittest.TestCase):
     """M2 (never-raise contract) and M3 (parent-directory durability)."""
 
     def _some_record(self, session_id, work_id, marker, transition_index=0):
@@ -1253,7 +1253,7 @@ class AppendJsonlAtomicCloseAndDirDurabilityTest(_M2EnvMixin, unittest.TestCase)
         self.assertEqual(state_store.read_jsonl_tolerant(path), [record])
 
 
-class PhaseStateCrashReconstructionTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateCrashReconstructionTest(_SessionsRootEnvMixin, unittest.TestCase):
     """Reopen/next-append reconstruction through the PUBLIC PhaseState API
     (not the raw primitive above): a torn tail left by a simulated crash
     must be transparently repaired by the next real
@@ -1302,7 +1302,7 @@ class PhaseStateCrashReconstructionTest(_M2EnvMixin, unittest.TestCase):
         self.assertNotEqual(entry["append_id"], history[0]["append_id"])
 
 
-class WorkUnitCrashReconstructionTest(_M2EnvMixin, unittest.TestCase):
+class WorkUnitCrashReconstructionTest(_SessionsRootEnvMixin, unittest.TestCase):
     """Reopen/next-append reconstruction through the PUBLIC WorkUnit API,
     for both `mint_work_unit` (the FIRST record) and
     `append_work_unit_transition` (a later record)."""
@@ -1366,7 +1366,7 @@ class WorkUnitCrashReconstructionTest(_M2EnvMixin, unittest.TestCase):
         self.assertEqual([h["transition_index"] for h in history], [0, 1])
 
 
-class GraphRevisionCrashReconstructionTest(_M2EnvMixin, unittest.TestCase):
+class GraphRevisionCrashReconstructionTest(_SessionsRootEnvMixin, unittest.TestCase):
     """Reopen/next-append reconstruction through the PUBLIC dependency-graph
     API: a torn tail left by a simulated crash must be repaired by the next
     `append_graph_revision` call, with revision numbering staying truthful
@@ -1404,7 +1404,7 @@ class GraphRevisionCrashReconstructionTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PhaseStateHistoryTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateHistoryTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_rejects_state_outside_closed_taxonomy(self):
         session_id, work_id = _uuid(), _uuid()
         with self.assertRaises(ValueError):
@@ -1697,7 +1697,7 @@ def _mint_candidate_work_unit(session_id, work_id, digest, index=None):
     return state_store.mint_work_unit(w)
 
 
-class PhaseStateCompletedGateTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateCompletedGateTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_completed_without_minted_work_unit_rejected(self):
         """B-10: there is no legitimate candidate to bind evidence to when
         this work_id was never minted at all -- fails closed even with
@@ -1828,7 +1828,7 @@ class PhaseStateCompletedGateTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PhaseStateReentrancyTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateReentrancyTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _hold_external_lock(self, session_id, work_id):
         path = state_store.phase_state_history_path_for(session_id, work_id)
         lock_path = path + ".lock"
@@ -1930,7 +1930,7 @@ class PhaseStateReentrancyTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PhaseStateInterleavingTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateInterleavingTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_signal_interruption_cannot_overtake_terminal_record(self):
         """Reproduces exactly what the module banner sanctions: the main
         flow is inside append_phase_state_entry_unlocked for
@@ -2096,7 +2096,7 @@ class PhaseStateInterleavingTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PhaseStateDuplicateRecordedAtIdentityTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateDuplicateRecordedAtIdentityTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _freeze_utc_now(self, value):
         real = state_store._utc_now
         state_store._utc_now = lambda: value
@@ -2317,7 +2317,7 @@ class PhaseStateDuplicateRecordedAtIdentityTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PhaseStateFinalWindowSignalTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateFinalWindowSignalTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_real_signal_in_final_window_overtakes_but_terminal_still_dominates(self):
         """Reproduces the exact B-14 residual with a real signal: the main
         flow's own `_jsonl_append_unlocked` call for 'running' has already
@@ -2514,7 +2514,7 @@ class PhaseStateFinalWindowSignalTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class PhaseStateForeignThreadSignalTest(_M2EnvMixin, unittest.TestCase):
+class PhaseStateForeignThreadSignalTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_foreign_unblocked_thread_can_run_handler_despite_this_threads_block(self):
         """The B-14-R1 premise, proven independently of cowork_state.py: a
         `signal.signal`-registered handler can still run WHILE this (main)
@@ -2618,7 +2618,7 @@ class PhaseStateForeignThreadSignalTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ControllerTransitionTest(_M2EnvMixin, unittest.TestCase):
+class ControllerTransitionTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_default_state_is_zero_revision(self):
         session_id = _uuid()
         default = state_store.read_controller_transition(session_id)
@@ -2724,7 +2724,7 @@ class ControllerTransitionTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class LegacyMigrationShimTest(_M2EnvMixin, unittest.TestCase):
+class LegacyMigrationShimTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _legacy_v1_fixture(self):
         """A version-1 session anchor captured from base, before M2 existed:
         no controller_policy, no context, no M2 fields whatsoever."""
@@ -2865,7 +2865,7 @@ class LegacyMigrationShimTest(_M2EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class CrashInjectionTest(_M2EnvMixin, unittest.TestCase):
+class CrashInjectionTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_locked_append_failure_leaves_no_partial_line(self):
         session_id, work_id = _uuid(), _uuid()
         state_store.append_phase_state_entry(session_id, work_id, "pending", None)
@@ -3174,7 +3174,7 @@ _ISOLATED_SNAPSHOT_SCRIPT = textwrap.dedent("""
 
 
 class IsolatedSnapshotCompatibilityTest(unittest.TestCase):
-    def test_import_and_run_without_package_a_siblings(self):
+    def test_import_and_run_without_control_plane_and_workunit_siblings(self):
         isolated_dir = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(isolated_dir, ignore_errors=True))
         for name in ("cowork_state.py", "cowork_policy.py"):

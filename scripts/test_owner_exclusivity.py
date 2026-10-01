@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Controller/provider session EXCLUSIVITY. The global binding store and the
-ownership gate/lifecycle are proven in `test_m55_owner_store.py` and
-`test_m55_owner_gate.py`; what has to be proven here is the wiring between
+ownership gate/lifecycle are proven in `test_owner_store.py` and
+`test_owner_gate.py`; what has to be proven here is the wiring between
 them -- REACHABILITY, ORDERING and COST:
 
   - **Three ordered enforcement seams, each refusing before anything is paid
@@ -1166,7 +1166,7 @@ class LivenessScopingTests(ExclusivityTestCase):
                                self.claimant(self.session_uuid),
                                "proved_dead", now=self._past_deadline())
 
-    def test_f8a_a_binding_blocks_only_a_live_foreign_session(self):
+    def test_a_binding_blocks_only_a_live_foreign_session(self):
         owner.bind_provider_session("claude", "sid-live", self.owner_ref,
                                     "builder")
         other = str(uuid.uuid4())
@@ -1184,7 +1184,7 @@ class LivenessScopingTests(ExclusivityTestCase):
                                         "sid-live")["owner_session_uuid"],
             self.session_uuid)
 
-    def test_f8a_the_same_session_rebinds_across_a_takeover(self):
+    def test_the_same_session_rebinds_across_a_takeover(self):
         """Exclusivity is per SESSION, not per owner: a successor keeps its
         predecessor's provider conversations without any hand-off step."""
         owner.bind_provider_session("claude", "sid-rebind", self.owner_ref,
@@ -1198,7 +1198,7 @@ class LivenessScopingTests(ExclusivityTestCase):
         self.assertEqual(rebound["bound_by_owner_id"], successor["owner_id"])
         self.assertEqual(rebound["owner_session_uuid"], self.session_uuid)
 
-    def test_f8d_a_predecessor_cannot_delete_a_successors_bindings(self):
+    def test_a_predecessor_cannot_delete_a_successors_bindings(self):
         owner.bind_provider_session("claude", "sid-inherited", self.owner_ref,
                                     "builder")
         path = state_store.provider_session_binding_path_for(
@@ -1212,7 +1212,7 @@ class LivenessScopingTests(ExclusivityTestCase):
         with open(path, "rb") as fh:
             self.assertEqual(_sha256(fh.read()), before)
 
-    def test_f8e_an_orphan_binding_self_heals_with_no_sweep_step(self):
+    def test_an_orphan_binding_self_heals_with_no_sweep_step(self):
         """The same key blocks a foreign session while the owning lease is
         live, and stops blocking once it is not -- with nothing anywhere in the
         path that sweeps, expires or repairs the record."""
@@ -1412,7 +1412,7 @@ class TypedPropagationTests(ExclusivityTestCase):
         self.assertEqual(events[0].get("cause_type"), "TimeoutError")
         self.assertEqual(events[0].get("session_id"), "prov-sid-traced")
 
-    def test_n10_nothing_anonymous_reaches_the_send_gateway(self):
+    def test_nothing_anonymous_reaches_the_send_gateway(self):
         """N10. The binding surface is the one place a typed refusal could be
         flattened into an anonymous turn failure. An instrumented `_send`
         records nothing at all on either binding path -- conflict or
@@ -1456,7 +1456,7 @@ class FrozenSeamTests(unittest.TestCase):
         self.assertEqual(len(nodes), 1, "expected exactly one `on_sess`")
         return nodes[0]
 
-    def test_g13b_the_handler_list_is_exactly_the_two_declared_types(self):
+    def test_the_handler_list_is_exactly_the_two_declared_types(self):
         """The whole obligation of enforcement point 3, as a structure: two
         handlers, in this order, the first returning (persist nothing) and the
         second NOT (fall through and persist)."""
@@ -1487,7 +1487,7 @@ class FrozenSeamTests(unittest.TestCase):
         self.assertLess(line_of("bind_provider_session"),
                         line_of("save_role_session"))
 
-    def test_g13f_no_broad_handler_anywhere_on_the_binding_path(self):
+    def test_no_broad_handler_anywhere_on_the_binding_path(self):
         node = self._on_sess()
         for handler in [h for n in ast.walk(node) if isinstance(n, ast.Try)
                         for h in n.handlers]:
@@ -1520,7 +1520,7 @@ class FrozenSeamTests(unittest.TestCase):
                                   "bind_provider_session": 1,
                                   "classify_owner_lease": 2})
 
-    def test_g13d_the_reason_mapping_is_total_over_the_hierarchy(self):
+    def test_the_reason_mapping_is_total_over_the_hierarchy(self):
         for klass in OWNER_SUBCLASSES:
             with self.subTest(klass.__name__):
                 self.assertIn(klass, owner.OWNER_REFUSAL_REASONS)
@@ -1531,7 +1531,7 @@ class FrozenSeamTests(unittest.TestCase):
             owner.OWNER_REFUSAL_REASONS[owner.ProviderBindingUnavailable],
             "provider_binding_unavailable")
 
-    def test_g14_save_role_session_keeps_its_exact_parameters(self):
+    def test_save_role_session_keeps_its_exact_parameters(self):
         self.assertEqual(
             list(inspect.signature(
                 state_store.save_role_session).parameters.keys()),

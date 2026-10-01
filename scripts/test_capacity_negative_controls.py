@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M3 Package G: end-to-end negative-control suite.
+"""Capacity pause and wake: end-to-end negative-control suite.
 
 Independent, fresh proof — written without editing any existing test file —
 that every M3 negative control the frozen brief and the corrected M3 plan's
@@ -22,7 +22,7 @@ importing any from `test_cowork.py`, so its proof stands independently.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m3_negative_controls.py -v
+    python3 -m unittest scripts/test_capacity_negative_controls.py -v
 """
 
 import ast
@@ -71,7 +71,7 @@ _DEFAULT_RETRY_EVIDENCE = {"source": "provider_header", "value": "0s"}
 # Shared fixtures (self-contained; independent of test_cowork.py's own).      #
 # --------------------------------------------------------------------------- #
 
-class _M3E2EBase(unittest.TestCase):
+class _IsolatedE2EBase(unittest.TestCase):
     """Isolated COWORK_SESSIONS_ROOT + isolated cwd per test."""
 
     def setUp(self):
@@ -238,7 +238,7 @@ def _now_plus(seconds):
 # 1. Malformed / untrusted / stale / absent retry evidence.
 # =============================================================================
 
-class RetryEvidenceNegativeControlsTest(_M3E2EBase):
+class RetryEvidenceNegativeControlsTest(_IsolatedE2EBase):
     """Package C's real `extract_retry_evidence`/`classify_trust_source`/
     `parse_retry_after_text` seams, driven end-to-end through the real
     capacity-entry path (`_enter_awaiting_capacity`)."""
@@ -325,7 +325,7 @@ class RetryEvidenceNegativeControlsTest(_M3E2EBase):
 # 2. Local guard and unknown-provider failures.
 # =============================================================================
 
-class LocalGuardAndUnknownProviderNegativeControlsTest(_M3E2EBase):
+class LocalGuardAndUnknownProviderNegativeControlsTest(_IsolatedE2EBase):
 
     def test_local_guard_unreachable_and_denied_never_capacity_eligible(self):
         for status, expected in (("unreachable", "guard_unavailable"),
@@ -409,7 +409,7 @@ class LocalGuardAndUnknownProviderNegativeControlsTest(_M3E2EBase):
 # 3. Candidate / session / policy / role mismatches.
 # =============================================================================
 
-class BindingMismatchNegativeControlsTest(_M3E2EBase):
+class BindingMismatchNegativeControlsTest(_IsolatedE2EBase):
 
     def test_role_mismatch_stops_for_supervision(self):
         """Issue #19 direction 5: a resume-trigger explicitly targeting a
@@ -495,7 +495,7 @@ class BindingMismatchNegativeControlsTest(_M3E2EBase):
 # 4. Duplicate / early / unauthorized wake.
 # =============================================================================
 
-class DuplicateEarlyUnauthorizedWakeNegativeControlsTest(_M3E2EBase):
+class DuplicateEarlyUnauthorizedWakeNegativeControlsTest(_IsolatedE2EBase):
 
     def test_duplicate_wake_after_success_refused_zero_double_dispatch(self):
         suid, work_id, payload, binding = self._enter_capacity(role="builder")
@@ -593,7 +593,7 @@ def _genuine_signed_signal(payload, role, key_id="authority-key-1", tamper=False
     return record, pinned
 
 
-class ManualSignalSignatureRefusalTest(_M3E2EBase):
+class ManualSignalSignatureRefusalTest(_IsolatedE2EBase):
 
     def test_unsigned_shape_refused(self):
         suid, work_id, payload, binding = self._enter_capacity(
@@ -720,7 +720,7 @@ class AdapterStructuralNoSelfSignTest(unittest.TestCase):
 # 7. Invalidation-gated replay (issue #34).
 # =============================================================================
 
-class InvalidationGatedReplayNegativeControlsTest(_M3E2EBase):
+class InvalidationGatedReplayNegativeControlsTest(_IsolatedE2EBase):
 
     def test_invalidation_record_blocks_replay_lease_cancelled_terminal(self):
         suid, work_id, payload, binding = self._enter_capacity(role="builder")
@@ -755,7 +755,7 @@ class InvalidationGatedReplayNegativeControlsTest(_M3E2EBase):
 #    (no --role given) success/failure boundary explicitly.
 # =============================================================================
 
-class DerivedRoleResumeTest(_M3E2EBase):
+class DerivedRoleResumeTest(_IsolatedE2EBase):
 
     def test_role_omitted_derives_from_lease_and_succeeds(self):
         suid, work_id, payload, binding = self._enter_capacity(role="builder")
@@ -770,7 +770,7 @@ class DerivedRoleResumeTest(_M3E2EBase):
 # 9. Headless resume — both forms (issue #57).
 # =============================================================================
 
-class HeadlessResumeBothFormsTest(_M3E2EBase):
+class HeadlessResumeBothFormsTest(_IsolatedE2EBase):
 
     def test_no_new_context_resume_replays_pending_turn_verbatim(self):
         suid, work_id, payload, binding = self._enter_capacity(role="builder")
@@ -803,7 +803,7 @@ class HeadlessResumeBothFormsTest(_M3E2EBase):
 # 10. Pending-turn exact equality + binding preservation across pause/resume.
 # =============================================================================
 
-class PendingTurnAndBindingPreservationTest(_M3E2EBase):
+class PendingTurnAndBindingPreservationTest(_IsolatedE2EBase):
 
     def test_pending_turn_digest_exact_equality_across_pause_and_resume(self):
         suid, work_id, payload, binding = self._enter_capacity(role="builder")
@@ -875,7 +875,7 @@ class PendingTurnAndBindingPreservationTest(_M3E2EBase):
 # 11. Zero same-provider immediate repair (quota/overload/authentication).
 # =============================================================================
 
-class ZeroSameProviderAutoRetryNegativeControlsTest(_M3E2EBase):
+class ZeroSameProviderAutoRetryNegativeControlsTest(_IsolatedE2EBase):
 
     def test_quota_and_overload_bypass_interactive_gate_entirely(self):
         for error_type in ("rate_limit_error", "overloaded_error"):
@@ -919,7 +919,7 @@ class ZeroSameProviderAutoRetryNegativeControlsTest(_M3E2EBase):
 # 12. ProviderHealth live-producer: malformed/stale classifier input.
 # =============================================================================
 
-class ProviderHealthMalformedInputNegativeControlsTest(_M3E2EBase):
+class ProviderHealthMalformedInputNegativeControlsTest(_IsolatedE2EBase):
 
     def test_non_dict_raw_evidence_degrades_to_unknown_never_raises(self):
         for bad_raw in (None, "a string", 42, [1, 2, 3]):
@@ -951,9 +951,9 @@ class ProviderHealthMalformedInputNegativeControlsTest(_M3E2EBase):
 # 13. Legacy-session-anchor compatibility smoke.
 # =============================================================================
 
-class LegacyCompatibilitySmokeTest(_M3E2EBase):
+class LegacyCompatibilitySmokeTest(_IsolatedE2EBase):
 
-    def test_plain_successful_turn_unaffected_by_m3_capacity_machinery(self):
+    def test_plain_successful_turn_unaffected_by_capacity_machinery(self):
         spath, suid = self._session()
         role = "builder"
         work_id, manifest, binding = self._bind_capacity_candidate(suid, role)
@@ -993,7 +993,7 @@ def _mint_lease(session_uuid, lease_id="lease-1", resume_mode="scheduled",
     return scheduler.start_new_episode(session_uuid, lease)["lease"]
 
 
-class FakeClockSchedulerNegativeControlsTest(_M3E2EBase):
+class FakeClockSchedulerNegativeControlsTest(_IsolatedE2EBase):
 
     def test_early_retry_refusal(self):
         suid = _uuid()
@@ -1126,7 +1126,7 @@ class FakeClockSchedulerNegativeControlsTest(_M3E2EBase):
 #     preflight returns to awaiting_capacity (never a terminal rejection).
 # =============================================================================
 
-class FailedWakePreflightReturnsToAwaitingCapacityTest(_M3E2EBase):
+class FailedWakePreflightReturnsToAwaitingCapacityTest(_IsolatedE2EBase):
 
     def test_failed_wake_preflight_genuinely_returns_to_awaiting_capacity(self):
         """M3R-B03: a genuine binding-preservation failure discovered
@@ -1186,7 +1186,7 @@ def _mp_resume_trigger(root, dirpath, session_uuid, lease_id, claimant_ref,
                   fh)
 
 
-class RealCrossProcessDuplicateClaimRaceTest(_M3E2EBase):
+class RealCrossProcessDuplicateClaimRaceTest(_IsolatedE2EBase):
 
     def test_two_real_separate_processes_race_exactly_one_success(self):
         suid, work_id, payload, binding = self._enter_capacity(role="builder")
@@ -1273,7 +1273,7 @@ class RealCrossProcessDuplicateClaimRaceTest(_M3E2EBase):
 #     `attempts_exhausted` without any adapter-owned storage or locking.
 # =============================================================================
 
-class GenuineChainReachesAttemptsExhaustedTest(_M3E2EBase):
+class GenuineChainReachesAttemptsExhaustedTest(_IsolatedE2EBase):
 
     class _Stdin:
         def write(self, s):
@@ -1313,7 +1313,7 @@ class GenuineChainReachesAttemptsExhaustedTest(_M3E2EBase):
                        "result": "", "session_id": "S1"}),
         ]
 
-    def test_genuine_retry_evidence_c_e_scheduled_pause_then_f_d_attempts_exhausted(self):
+    def test_genuine_retry_evidence_scheduled_pause_then_wake_attempts_exhausted(self):
         suid, work_id = None, None
         spath, suid = self._session()
         role = "builder"

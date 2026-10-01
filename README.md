@@ -426,7 +426,14 @@ cowork --session-file PATH --decline-handoff REQUEST_ID [--context-file ./why.md
   example `reviewer_unavailable`, `reviewer_absent`, `review_not_approved`
   without an approving verdict, `controller_failure`, `stale_noop`,
   `verification_not_current`). Recovery is a machine re-invocation: a plain
-  resume, or `--switch-controller`.
+  resume, or `--switch-controller`. When the failure is a Claude
+  authentication failure (`controller_outcome: authentication_failed`), the
+  stop carries `recovery_route` and `upstream_artifacts_reusable: true`:
+  re-authenticate Claude Code, then a plain `--session-file` resume. The
+  resume pays one uncached live probe; if the provider accepts it, the role
+  continues exactly once even when the recovery budget for that cause is
+  spent, reusing the approved upstream artifacts. A still-rejected probe ends
+  at the probe seam with the same route and no role turn.
 
 ### Controller updates
 
@@ -888,6 +895,14 @@ inventory as **one owned, hermetic, manifest-bound transaction**:
   every approved command green, evidence present, the final suite run exactly
   once, and the transaction's own captured manifest/index still matching what
   was actually reviewed.
+- **Each command has a fixed 300-second outer bound.** The worker terminates a
+  command that exceeds this bound even when that command supplies a larger
+  tool-level timeout such as `--timeout 3600`; the inner timeout does not
+  enlarge Cowork's process deadline. A schema-2 `final_suite` must therefore
+  be a genuinely complete regression command that can finish inside 300
+  seconds. Do not label one shard as the final suite merely to satisfy the
+  schema. If the complete suite cannot fit, Cowork cannot natively certify it
+  as a schema-2 final suite yet; stop and address that limitation explicitly.
 - **Bounded evidence, never a silent rerun.** If a command's terminal result is
   slow to land, Cowork polls the same pre-minted attempt for a bounded number
   of attempts; past that bound the attempt is recorded `unresolved`/`absent`
@@ -959,6 +974,29 @@ downstream is the receipt — never the builder's prose about verification:
   `verification.transaction` trace event's `reused_lock_result` flag as
   **avoided cost** attributed to the reused transaction — with no second
   incurred transaction.
+
+#### Evidence lifetime and repository hygiene
+
+Product tests committed to the repository protect behavior expected of every
+future revision. They use neutral inputs and may cover security, compatibility,
+architecture, integrity, negative controls and regressions.
+
+Evidence about one delivery does not become a permanent product test. Package
+receipts, audits, run results, candidate/base ancestry pins, one-delivery path
+allowlists, scope snapshots, gate transcripts or counts, and assertions about
+one historical implementation state belong in the session or package artifact
+directory outside product source and outside Git. A mixed check keeps its
+durable product assertion with neutral inputs and moves or drops the historical
+delivery portion. Legitimate Git behavior tests with throwaway repositories,
+controlled fixtures, security negatives, compatibility inputs, regression
+references and product receipt fields remain valid; no keyword alone decides
+the classification.
+
+The durable recurrence check is
+`python3 scripts/cowork_offline_tests.py test_evidence_lifetime_contract`.
+It scans representative forbidden shapes and verifies that the role and
+orchestration contracts carry this boundary; it is not a substitute for
+reviewing the semantics of a new test.
 
 #### Checkpoints: typed, candidate-bound, deterministically-executed
 
@@ -1707,8 +1745,10 @@ Its Cowork-owned
 writes. Neither path copies tokens, setup credentials, or an entire controller
 profile. Missing, permissively readable, mismatched, or unauthenticated
 references fail before a model process starts. The trace records only the
-controller, a bounded authentication-method category, success, duration, and
-error type.
+controller, a bounded authentication-method category, login-metadata presence
+(never live authentication proof), duration, and error type. A probe-cache hit
+reports `auth_revalidated: false`; only an uncached, provider-accepted probe
+turn is live proof.
 
 Claude transcripts remain in a stable per-role controller-state directory
 recorded in `identities.json`. On the first resume of a legacy session, Cowork
@@ -1741,7 +1781,7 @@ Run offline tests through the provider barrier, naming explicit unittest ids
 
 ```bash
 python3 scripts/cowork_offline_tests.py test_cowork
-python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x test_m2_negative_controls
+python3 scripts/cowork_offline_tests.py test_cowork.SomeTest.test_x test_workflow_negative_controls
 ```
 
 The suites use fakes, but a bug can still reach a real `claude`/`codex`/

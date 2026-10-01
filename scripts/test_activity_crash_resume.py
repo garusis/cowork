@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M4 Package F: end-to-end crash/resume suite.
+"""Activity journal: end-to-end crash/resume suite.
 
 Exercises every durable state-write boundary Package B introduced for M4 --
 the append-only activity journal (`append_activity_record`), the current
@@ -14,8 +14,8 @@ explicit "before and after controller exit" requirement.
 
 Every injected fault is a directly patched short write / fsync failure --
 never a hoped-for real crash timing -- matching this repository's own
-no-flake discipline already established by `test_m2_crash_resume.py` /
-`test_m3_crash_resume.py`.
+no-flake discipline already established by
+`test_workflow_state_crash_resume.py` / `test_capacity_crash_resume.py`.
 
 Boundaries covered (one class each):
 
@@ -40,7 +40,7 @@ Boundaries covered (one class each):
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m4_crash_resume.py -v
+    python3 -m unittest scripts/test_activity_crash_resume.py -v
 """
 
 import io
@@ -66,7 +66,7 @@ def _uuid():
     return str(uuid.uuid4())
 
 
-class _M4CrashEnvMixin:
+class _SessionsRootEnvMixin:
     """Isolated COWORK_SESSIONS_ROOT per test, reproduced independently
     (never imported from another test file)."""
 
@@ -132,7 +132,7 @@ def _schedule_record(work_id, next_at="2026-01-01T00:05:00Z",
 # 1/2. Activity journal append boundary.
 # =============================================================================
 
-class ActivityJournalAppendCrashResumeTest(_M4CrashEnvMixin, unittest.TestCase):
+class ActivityJournalAppendCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_fsync_failure_leaves_no_record_then_resumes(self):
         suid = _uuid()
@@ -234,7 +234,7 @@ class ActivityJournalAppendCrashResumeTest(_M4CrashEnvMixin, unittest.TestCase):
 # 3. Repair-before-append across a real pre-existing torn tail.
 # =============================================================================
 
-class ActivityJournalRepairBeforeAppendTest(_M4CrashEnvMixin, unittest.TestCase):
+class ActivityJournalRepairBeforeAppendTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_prior_crash_torn_tail_is_repaired_by_the_next_live_append(self):
         """Simulates a genuine PRIOR crash (an earlier process died mid-
@@ -275,7 +275,7 @@ class ActivityJournalRepairBeforeAppendTest(_M4CrashEnvMixin, unittest.TestCase)
 # 4/5. ScheduledReviewRecord write boundary.
 # =============================================================================
 
-class ScheduledReviewCrashResumeTest(_M4CrashEnvMixin, unittest.TestCase):
+class ScheduledReviewCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_fsync_failure_leaves_no_record_then_resumes(self):
         suid = _uuid()
@@ -359,7 +359,7 @@ class ScheduledReviewCrashResumeTest(_M4CrashEnvMixin, unittest.TestCase):
 # 6/7. Reconciliation record write boundary (reread_before_gate).
 # =============================================================================
 
-class ReconciliationCrashResumeTest(_M4CrashEnvMixin, unittest.TestCase):
+class ReconciliationCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_fsync_failure_leaves_prior_effective_classification_unchanged(self):
         suid = _uuid()
@@ -438,7 +438,7 @@ class ReconciliationCrashResumeTest(_M4CrashEnvMixin, unittest.TestCase):
 # 8. Concurrent same-process multi-threaded append (M4R-D04).
 # =============================================================================
 
-class ConcurrentAppendCrashSafetyTest(_M4CrashEnvMixin, unittest.TestCase):
+class ConcurrentAppendCrashSafetyTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_two_real_threads_append_same_work_id_zero_torn_records_bounded(self):
         suid = _uuid()
@@ -521,7 +521,7 @@ class ConcurrentAppendCrashSafetyTest(_M4CrashEnvMixin, unittest.TestCase):
         self.assertEqual(len(history), 2)
 
 
-class ConcurrentTickVersusTurnBoundaryAppendTest(_M4CrashEnvMixin,
+class ConcurrentTickVersusTurnBoundaryAppendTest(_SessionsRootEnvMixin,
                                                  unittest.TestCase):
     """Drives the REAL `cowork._run_activity_tick_loop` production function
     (Package D's in-turn tick mechanism, M4R-C03/M4R-D04) racing a
@@ -586,7 +586,7 @@ class ConcurrentTickVersusTurnBoundaryAppendTest(_M4CrashEnvMixin,
 #        exit (issue #5's explicit both-sides-of-controller-exit fixture).
 # =============================================================================
 
-class LateWriteBothSidesOfControllerExitTest(_M4CrashEnvMixin, unittest.TestCase):
+class LateWriteBothSidesOfControllerExitTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_reconciliation_before_controller_exit_session_still_open(self):
         """A late write reconciled while the controller session is STILL

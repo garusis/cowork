@@ -24,6 +24,7 @@ is baked in silently.
 Python 3.9+, stdlib only.
 """
 
+import datetime
 import json
 import os
 import re
@@ -688,7 +689,12 @@ def _stamp_guard_parent_work(runtime, work_id):
 
 
 def _require_controller_auth(runtime, controller, trace, role, run=None):
-    """Verify login inside the exact private profile before any model turn."""
+    """Check login METADATA inside the exact private profile before any model
+    turn. This is a presence check of the controller's own status command
+    (`claude auth status` / `codex login status`) run inside the private
+    profile -- it proves the profile can SEE a login, never that the login is
+    live: an expired or revoked credential still reports metadata. Live
+    authentication is proven only by a provider-accepted turn."""
     runner = run or subprocess.run
     command = controller_profiles.auth_command(controller)
     boundary = kernel_write_boundary(
@@ -709,16 +715,17 @@ def _require_controller_auth(runtime, controller, trace, role, run=None):
             controller, completed.returncode, status_output)
         error_type = None
     except Exception as exc:  # noqa: BLE001 - normalize to a safe preflight
-        status = {"authenticated": False, "method": None}
+        status = {"login_metadata_present": False, "method": None}
         error_type = type(exc).__name__
     duration_ms = int((time.monotonic() - started) * 1000)
     if trace:
         trace.event(
             "controller.auth.status", controller=controller, role=role,
-            authenticated=status["authenticated"], method=status.get("method"),
+            login_metadata_present=status["login_metadata_present"],
+            method=status.get("method"),
             private_profile=True, credential_copied=False,
             duration_ms=duration_ms, error_type=error_type)
-    if not status["authenticated"]:
+    if not status["login_metadata_present"]:
         raise RuntimeError(
             "controller_auth_unavailable: %s private profile cannot reuse "
             "the existing login" % controller)
@@ -1544,11 +1551,27 @@ def parse_claude_event(obj):
             # result. Falls back to the literal "api_error" bucket when
             # `error` carries no such token -- e.g. the repository's own
             # attested "401 OAuth token expired" fixture, which names no
-            # `type` field at all and is unaffected by this change.
+            # `type` field at all: that no-token shape now ALSO carries
+            # `http_status=401` additively (#101, below) so the status
+            # survives `send()`'s flattening and the role-loop classifier
+            # reaches `authentication_failed` exactly as the raw classifier
+            # would.
             token = error.get("type") if isinstance(error, dict) else None
             error_type = token if isinstance(token, str) and token else "api_error"
             parsed = {"kind": "error", "text": text,
                       "error_type": error_type}
+            # Byte-faithful to `classify_claude_failure`'s never-override
+            # rule: a status is attached ONLY when no `type` token is present
+            # (the classifier consults `status` only then), and only when it
+            # is a genuine int -- never fabricated, never beside a token.
+            http_status = None
+            if token is None:
+                http_status = (_as_int_status_or_none(error.get("status"))
+                               if isinstance(error, dict) else None)
+                if http_status is None:
+                    http_status = _extract_leading_http_status(text)
+            if http_status is not None:
+                parsed["http_status"] = http_status
             retry_evidence = _claude_provider_retry_evidence(error)
             if retry_evidence is not None:
                 parsed["retry_evidence"] = retry_evidence
@@ -1798,13 +1821,28 @@ def denial_message():
 # Probe: confirm the installed claude accepts our stdin schema.               #
 # --------------------------------------------------------------------------- #
 
+# The operator route after a Claude authentication failure. Identical wording
+# to `cowork._AUTH_RECOVERY_ROUTE` (the role-loop / launch-seam copy) so the
+# probe alert, the stop payload and the phase evidence all name ONE route.
+# `claude auth login` is offered as an example only: the exact login
+# subcommand of the installed CLI is not attested by this repository.
+_AUTH_RECOVERY_ROUTE_TEXT = (
+    "re-authenticate Claude Code (for example `claude auth login`), then "
+    "resume with a plain --session-file resume; approved upstream artifacts "
+    "(intel, plan, statuses) are reused")
+
+
+def _probe_proven_at():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+
 
 def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                              role_prompt_file=DEFAULT_ROLE_PROMPT, trace=None,
                              role="scout", extra_writable_dir=None,
                              cache_enabled=False, version_fn=None,
                              cache_path=None, model=None, effort=None,
-                             auth_run=None):
+                             auth_run=None, report=None):
     """Send one minimal user message to claude and confirm an assistant/result
     event comes back.
 
@@ -1823,8 +1861,31 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     (True, None) is returned. On a MISS the live probe runs and, on success, the
     key is stored. A version-resolution failure forces always-live (never
     cached). `version_fn`/`cache_path` are injectable for tests.
+
+    Metadata vs live proof (#101): a cache hit carries NO freshness (the cache
+    has no TTL) and therefore never claims revalidation -- every cache-hit
+    event reports `auth_revalidated` and `live_auth_proven` as False. The
+    guarded path additionally consults login METADATA (`_require_controller_
+    auth`, reported as `login_metadata_present`); metadata alone is never
+    live proof. Only an uncached, provider-accepted probe turn (no error event,
+    non-error result) is reported as `live_auth_proven=True`. A provider error
+    event or an error result FAILS the probe, is classified via
+    `classify_claude_failure` on the raw event, and is never cached.
+
+    `report` (optional, caller-owned dict) is filled additively on EVERY exit
+    path with: `cache_hit` (bool), `live_auth_proven` (bool),
+    `login_metadata_present` (True when the guarded path consulted metadata
+    and found it, False when it was consulted and absent, None when this path
+    never consulted it), `controller_outcome` (the classified outcome of a
+    provider-rejected probe, else None); a probe that actually ran also
+    reports `probe_work_id`, and an accepted one `proven_at` (RFC3339 UTC).
     """
     policy.guard("claude", role=role, kind="probe")
+
+    def _report(**kw):
+        if report is not None:
+            report.update(kw)
+
     probe_session_id = (
         str(uuid.uuid4()) if nested_guard_active() else None)
     command = build_claude_command(role_prompt_file, mode, yolo,
@@ -1846,6 +1907,9 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     probe_work_id = trace_store.new_work_id()
     probe_started = time.monotonic()
     runtime = None
+    # True only once the guarded path has actually consulted login metadata
+    # and found it; None on every path that never consulted it.
+    metadata_present = None
     if nested_guard_active():
         runtime = _guard_runtime(
             trace, role, extra_writable_dir, model, effort, False,
@@ -1856,18 +1920,28 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                 runtime, "claude", trace, role, run=auth_run)
         except RuntimeError:
             _close_guard_runtime(runtime)
+            _report(cache_hit=bool(cache_hit), live_auth_proven=False,
+                    login_metadata_present=False, controller_outcome=None)
             return False, (
-                "Claude Code is logged in globally, but the guarded private "
-                "profile could not reuse that login. No model turn was "
-                "launched."
+                "Claude Code login metadata is absent or unreadable inside "
+                "the guarded private profile (login metadata is never live "
+                "authentication proof). No model turn was launched. "
+                + _AUTH_RECOVERY_ROUTE_TEXT
             )
+        metadata_present = True
         if cache_hit:
+            # Metadata WAS consulted just above; the cached key carries no
+            # freshness, so this is honestly a metadata-only, zero-spawn
+            # launch -- never a live revalidation.
             if trace:
                 trace.event("controller.probe.cache_hit", controller="claude",
                             role=role, prompt_kind="probe", mode=mode, yolo=yolo,
                             role_prompt_file=role_prompt_file,
-                            auth_revalidated=True)
+                            auth_revalidated=False, live_auth_proven=False,
+                            login_metadata_present=True)
             _close_guard_runtime(runtime)
+            _report(cache_hit=True, live_auth_proven=False,
+                    login_metadata_present=True, controller_outcome=None)
             return True, None
         _stamp_guard_parent_work(runtime, probe_work_id)
         command = build_claude_command(
@@ -1886,11 +1960,17 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
             raise RuntimeError(boundary["reason"])
         command = boundary["argv"]
     elif cache_hit:
+        # Metadata was NOT consulted on this path: `login_metadata_present`
+        # is None (dropped by Trace.event) -- never a False observation that
+        # was never made.
         if trace:
             trace.event("controller.probe.cache_hit", controller="claude",
                         role=role, prompt_kind="probe", mode=mode, yolo=yolo,
                         role_prompt_file=role_prompt_file,
-                        auth_revalidated=False)
+                        auth_revalidated=False, live_auth_proven=False,
+                        login_metadata_present=None)
+        _report(cache_hit=True, live_auth_proven=False,
+                login_metadata_present=None, controller_outcome=None)
         return True, None
     stdin_text = encode_user_message("ping")
     # The probe is its own unit of work (P1): a probe's cost is real and is
@@ -1914,20 +1994,75 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         events = spawn(command, stdin_text)
         seen_ok = False
         probe_usage = None
+        # First provider error event (parsed, raw) and the error result that
+        # closes the stream, if any. An error anywhere in the stream fails the
+        # probe: a later assistant/result event never overrides it.
+        probe_error = None
+        error_result = None
         for obj in events:
             parsed = parse_claude_event(obj)
             kind = parsed.get("kind")
+            if kind == "error":
+                if probe_error is None:
+                    probe_error = (parsed, obj)
+                # Keep reading to the result for its subtype/usage.
+                continue
             if kind == "result":
                 # The result is terminal AND the only event carrying usage —
                 # capture it even when an assistant event preceded it (#1/D2),
                 # then stop.
                 probe_usage = parsed.get("usage")
+                if parsed.get("is_error") or probe_error is not None:
+                    error_result = parsed
+                    break
                 seen_ok = True
                 break
-            if kind == "assistant":
+            if kind == "assistant" and probe_error is None:
                 # A valid shape, but keep scanning so a following result's usage
                 # is not dropped.
                 seen_ok = True
+        if probe_error is not None or error_result is not None:
+            # The provider rejected the live probe turn. Never cached (a
+            # rejected turn is not a successful probe), classified from the
+            # raw event exactly as a role turn's failure would be.
+            outcome = "unknown_provider_failure"
+            if probe_error is not None:
+                try:
+                    outcome = classify_claude_failure(probe_error[1])
+                except ValueError:
+                    outcome = "unknown_provider_failure"
+            error_parsed = probe_error[0] if probe_error is not None else {}
+            error_text = (error_parsed.get("text")
+                          or (error_result or {}).get("text")
+                          or "controller API error")
+            error_type = (error_parsed.get("error_type")
+                          or (error_result or {}).get("subtype")
+                          or "controller_error")
+            if trace:
+                trace.event("controller.probe.end", controller="claude",
+                            role=role, prompt_kind="probe", result="error",
+                            error_type=error_type,
+                            subtype=(error_result or {}).get("subtype"),
+                            controller_outcome=outcome,
+                            live_auth_proven=False,
+                            usage=probe_usage, usage_native=probe_usage,
+                            **_probe_work(
+                                usage_scope="turn_native",
+                                duration_ms=_probe_elapsed_ms()))
+            _report(cache_hit=False, live_auth_proven=False,
+                    controller_outcome=outcome, probe_work_id=probe_work_id,
+                    login_metadata_present=metadata_present)
+            if outcome == "authentication_failed":
+                return False, (
+                    "Claude rejected the live probe turn: authentication "
+                    "failed (%s). Login metadata may still report a login; "
+                    "that is not live proof. No role turn was launched. "
+                    % error_text + _AUTH_RECOVERY_ROUTE_TEXT
+                )
+            return False, (
+                "Claude returned a provider error on the live probe (%s: %s). "
+                "No role turn was launched." % (outcome, error_text)
+            )
         if seen_ok:
             if cache_enabled and cache_key:
                 probe_cache.cache_store(cache_key, path=cache_path)
@@ -1938,10 +2073,15 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
             if trace:
                 trace.event("controller.probe.end", controller="claude",
                             role=role, prompt_kind="probe", result="ok",
+                            live_auth_proven=True,
                             usage=probe_usage, usage_native=probe_usage,
                             **_probe_work(
                                 usage_scope="turn_native",
                                 duration_ms=_probe_elapsed_ms()))
+            _report(cache_hit=False, live_auth_proven=True,
+                    controller_outcome=None, probe_work_id=probe_work_id,
+                    proven_at=_probe_proven_at(),
+                    login_metadata_present=metadata_present)
             return True, None
     except Exception as exc:  # noqa: BLE001 - surface any spawn failure as an alert
         if trace:
@@ -1949,6 +2089,9 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                         prompt_kind="probe", result="error",
                         error_type=type(exc).__name__,
                         **_probe_work(duration_ms=_probe_elapsed_ms()))
+        _report(cache_hit=False, live_auth_proven=False,
+                controller_outcome=None, probe_work_id=probe_work_id,
+                login_metadata_present=metadata_present)
         return False, (
             "Could not probe `claude` stream-json input (%s).\n"
             "    Confirm `claude` is installed and supports "
@@ -1961,6 +2104,9 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         trace.event("controller.probe.end", controller="claude", role=role,
                     prompt_kind="probe", result="unsupported",
                     **_probe_work(duration_ms=_probe_elapsed_ms()))
+    _report(cache_hit=False, live_auth_proven=False, controller_outcome=None,
+            probe_work_id=probe_work_id,
+            login_metadata_present=metadata_present)
     return False, (
         "`claude` did not accept the cowork stream-json stdin message shape.\n"
         "    The stdin schema is undocumented (anthropics/claude-code #24594); "
@@ -2517,6 +2663,10 @@ class ClaudeSession:
                         # every shape that carries no such field, never
                         # synthesized here.
                         "retry_evidence": parsed.get("retry_evidence"),
+                        # The token-less api_error's HTTP status (#101),
+                        # present only when `parse_claude_event` attached
+                        # it; None is dropped by `turn_result` below.
+                        "http_status": parsed.get("http_status"),
                     }
                     if region is not None:
                         region.__exit__(None, None, None)
@@ -2548,6 +2698,7 @@ class ClaudeSession:
                     return turn_result(
                         False, "error", subtype=parsed.get("subtype"),
                         error_type=error_type, retry_evidence=retry_evidence,
+                        http_status=(controller_error or {}).get("http_status"),
                         session_id=sid or self.session_id,
                         model=self.live_model or self.model, duration_ms=_elapsed_ms())
                 else:

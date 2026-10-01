@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the M4 activity snapshot in the run transcript
+"""Tests for the activity snapshot in the run transcript
 (`cowork_transcript.render_activity`).
 
 The renderer under test consumes ONLY an already-produced Package A

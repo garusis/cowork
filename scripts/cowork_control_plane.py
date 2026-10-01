@@ -132,21 +132,21 @@ EVENT_SET = frozenset(EVENTS)
 # silently discard a completed turn still waiting on gate validation by
 # forcing a second `turn_completed` (a second, budget-burning provider
 # execution) to reach `awaiting_gate` again. See
-# test_awaiting_gate_cannot_become_blocked_m2 in
+# test_awaiting_gate_cannot_become_blocked in
 # test_cowork_control_plane.py.
 #
 # `awaiting_capacity` was listed in PHASE_STATES/PHASE_STATE_SET (and
 # `capacity_reserved` in EVENTS/EVENT_SET) in M2 for future M3 activation,
 # with no (state, event) pair targeting it and no outbound entry of its
 # own — fully unreachable and inert in M2 (see the M2 baseline captured by
-# test_cowork_control_plane_m3.py's set-difference proof). M3 Package A
+# test_cowork_control_plane_capacity.py's set-difference proof). M3 Package A
 # narrowly activates it with exactly six new entries below: two inbound
 # (`capacity_reserved` from `running`/`preflighting`), one outbound resume
 # (`capacity_wake_claimed` back to `preflighting`), one outbound
 # binding-specific wake-failure return (`capacity_wake_preflight_failed`
 # from `preflighting`, back to `awaiting_capacity` — see that event's note
 # below), and the same `cancelled`/`aborted` pair every other paused state
-# already carries. See test_awaiting_capacity_m3_narrowly_reachable in
+# already carries. See test_awaiting_capacity_narrowly_reachable in
 # test_cowork_control_plane.py for the exhaustive reachability proof.
 #
 # `capacity_wake_preflight_failed` is legal ONLY from `preflighting` and
@@ -481,7 +481,7 @@ def _capacity_evidence_valid(evidence):
     `unknown_provider_failure` evidence is always refused here, never
     silently accepted (see test_local_guard_exhausted_never_enters_capacity
     / test_unknown_provider_failure_never_enters_capacity in
-    test_cowork_control_plane_m3.py)."""
+    test_cowork_control_plane_capacity.py)."""
     block = evidence.get("capacity_evidence")
     if not isinstance(block, dict):
         return False

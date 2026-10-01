@@ -13,7 +13,7 @@ reviewer-handoff import, and the `cowork_measure`/`cowork_control_plane`/
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m5_package_e_integration.py -v
+    python3 -m unittest scripts/test_checkpoint_gateway_integration.py -v
 """
 
 import hashlib
@@ -768,7 +768,7 @@ def _seed_worker_into_repo(repo):
     """Copy the REAL, candidate `cowork_verification.py` and every module it
     imports at load time into a throwaway repo's `scripts/` dir and commit
     them, so a real `--worker` subprocess `run_transaction` spawns below is
-    fully self-sufficient -- mirrors `test_m5_package_a_contracts.py`'s own
+    fully self-sufficient -- mirrors `test_checkpoint_contracts.py`'s own
     fixture of the same name (duplicated, not imported, since test additions
     are confined to this file)."""
     dest_dir = os.path.join(repo, "scripts")
@@ -788,7 +788,7 @@ class _RealTransactionFixture(unittest.TestCase):
     """Isolated COWORK_SESSIONS_ROOT and a throwaway committed git repo
     seeded with the real candidate worker modules, so `run_transaction`
     below spawns a genuine `--worker` subprocess -- exactly the shape
-    `test_m5_package_a_contracts.py`'s own `_RealWorkerFixture` uses for the
+    `test_checkpoint_contracts.py`'s own `_RealWorkerFixture` uses for the
     same reason (a real, unmocked identity-verified worker is the only way
     to prove cancellation ordering end-to-end, not merely unit-test it)."""
 
@@ -828,8 +828,8 @@ class CancellationOrderingCoverageTests(_RealTransactionFixture):
     correctly and (where applicable) boundedly, none of them synchronized
     via a raw sleep that could race a platform-dependent startup duration.
     Sibling coverage of the same dispositions lives in
-    `test_m5_package_a_contracts.CancellationOrderingEndToEndTests` and
-    `test_m5_package_c_evidence_reconciliation.
+    `test_checkpoint_contracts.CancellationOrderingEndToEndTests` and
+    `test_verification_evidence_reconciliation.
     CancellationDeadlineSemanticsPreservedTests`."""
 
     def test_pre_launch_cancellation_is_bounded_and_unverified(self):

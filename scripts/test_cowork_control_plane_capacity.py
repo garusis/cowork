@@ -6,7 +6,7 @@ control-plane evidence-validator layer.
 
 Run standalone:
 
-    python3 -m unittest scripts/test_cowork_control_plane_m3.py -v
+    python3 -m unittest scripts/test_cowork_control_plane_capacity.py -v
 """
 
 import itertools

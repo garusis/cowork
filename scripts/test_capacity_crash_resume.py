@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M3 Package G: end-to-end crash/resume suite.
+"""Capacity state: end-to-end crash/resume suite.
 
 Exercises every durable state-write boundary Package B introduced for M3 --
 CapacityPacket, PauseLease (create/claim/cancel/consume/replace/expire),
@@ -9,7 +9,7 @@ functions (`cowork_state.*`, `cowork_capacity_scheduler.*`) `scripts/cowork.py`
 itself calls, never a reimplemented or bypassed write path. Every injected
 fault is a directly patched short write / fsync failure -- never a
 hoped-for real crash timing -- matching this repository's own no-flake
-discipline (see `test_m2_crash_resume.py`).
+discipline (see `test_workflow_state_crash_resume.py`).
 
 Boundaries covered (one class each):
 
@@ -31,7 +31,7 @@ Boundaries covered (one class each):
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m3_crash_resume.py -v
+    python3 -m unittest scripts/test_capacity_crash_resume.py -v
 """
 
 import json
@@ -56,7 +56,7 @@ def _uuid():
     return str(uuid.uuid4())
 
 
-class _M3CrashEnvMixin:
+class _SessionsRootEnvMixin:
     """Isolated COWORK_SESSIONS_ROOT per test, matching every other M3/M2
     crash suite's own isolation discipline, reproduced independently here."""
 
@@ -152,7 +152,7 @@ def _invalidation_record(session_uuid, candidate_digest=None):
 # 1. CapacityPacket write boundary.
 # =============================================================================
 
-class CapacityPacketCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
+class CapacityPacketCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_fsync_failure_leaves_no_packet_then_resumes(self):
         suid = _uuid()
@@ -209,7 +209,7 @@ class CapacityPacketCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
 # 2. PauseLease create boundary, including binding-index write ordering.
 # =============================================================================
 
-class PauseLeaseCreateCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
+class PauseLeaseCreateCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_fsync_failure_on_lease_record_leaves_nothing_then_resumes(self):
         suid = _uuid()
@@ -277,7 +277,7 @@ class PauseLeaseCreateCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
 # 3. PauseLease transitions: claim / cancel / consume / replace / expire.
 # =============================================================================
 
-class PauseLeaseTransitionCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
+class PauseLeaseTransitionCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def _seeded(self, suid, **kw):
         lease = _pause_lease(**kw)
@@ -397,7 +397,7 @@ class PauseLeaseTransitionCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
 # 4. Failed-wake-attempt accounting.
 # =============================================================================
 
-class FailedWakeAttemptCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
+class FailedWakeAttemptCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_fsync_failure_leaves_counter_unchanged_then_resumes(self):
         suid = _uuid()
@@ -437,7 +437,7 @@ class FailedWakeAttemptCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
 # 5. Manual-signal journal write boundary.
 # =============================================================================
 
-class ManualSignalJournalCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
+class ManualSignalJournalCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def _signed_record(self):
         import hashlib
@@ -485,7 +485,7 @@ class ManualSignalJournalCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
 # 6. InvalidationRecord append boundary.
 # =============================================================================
 
-class InvalidationRecordCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
+class InvalidationRecordCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_short_write_crash_mid_append_persists_no_record_then_resumes(self):
         suid = _uuid()
@@ -531,7 +531,7 @@ class InvalidationRecordCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
 # 7. Pending-turn-before-pause boundary.
 # =============================================================================
 
-class PendingTurnCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
+class PendingTurnCrashResumeTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_write_fsync_failure_persists_nothing_then_resumes(self):
         suid = _uuid()
@@ -581,7 +581,7 @@ class PendingTurnCrashResumeTest(_M3CrashEnvMixin, unittest.TestCase):
 # 8. File-then-parent-directory fsync ordering.
 # =============================================================================
 
-class FileAndParentFsyncOrderingTest(_M3CrashEnvMixin, unittest.TestCase):
+class FileAndParentFsyncOrderingTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def test_file_fsync_happens_before_parent_directory_fsync(self):
         suid = _uuid()
@@ -653,7 +653,7 @@ class FileAndParentFsyncOrderingTest(_M3CrashEnvMixin, unittest.TestCase):
 # 9. Corrupt-state refusal.
 # =============================================================================
 
-class CorruptStateRefusalTest(_M3CrashEnvMixin, unittest.TestCase):
+class CorruptStateRefusalTest(_SessionsRootEnvMixin, unittest.TestCase):
 
     def _corrupt(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -756,8 +756,8 @@ def _mp_create_pause_lease(root, session_id, lease_id, role, barrier, result_pat
         json.dump(out, fh)
 
 
-class RealCrossProcessDuplicateClaimRaceAtBLevelTest(
-        _M3CrashEnvMixin, unittest.TestCase):
+class RealCrossProcessDuplicateClaimRaceAtStateStoreLevelTest(
+        _SessionsRootEnvMixin, unittest.TestCase):
 
     def test_two_real_separate_processes_race_same_binding_exactly_one_creates(self):
         suid = _uuid()

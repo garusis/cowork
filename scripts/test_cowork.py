@@ -4051,6 +4051,8 @@ class FramingTest(unittest.TestCase):
         })
         self.assertEqual(system["kind"], "error")
         self.assertEqual(system["error_type"], "api_error")
+        # The token-less 401 additionally carries its status (#101).
+        self.assertEqual(system["http_status"], 401)
 
     def test_parse_claude_partial_text_delta(self):
         ev = {"type": "stream_event",
@@ -5194,7 +5196,7 @@ class StaleNoOpTest(unittest.TestCase):
         return self._review_fn(
             [{"verdict": "revise", "findings": ["x"]}] + list(then or []))
 
-    def test_t1_detect_repair_fires(self):
+    def test_detect_repair_fires(self):
         path = self._path()
         # turn1 ready -> reviewer revise -> turn2 NO-OP -> repair -> turn3
         # progress (a new question, which then stops the phase).
@@ -5216,7 +5218,7 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertFalse(any(e["event"] == "stale_noop.unresolved"
                              for e in events))
 
-    def test_t2_repair_succeeds_reviewer_runs(self):
+    def test_repair_succeeds_reviewer_runs(self):
         path = self._path()
         sess = self._session(path, [dict(self._READY), None, dict(self._READY)])
         rfn = self._revise_once(then=[{"verdict": "approve"}])
@@ -5231,7 +5233,7 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertFalse(any(e["event"] == "stale_noop.unresolved"
                              for e in events))
 
-    def test_t3_repair_fails_ends_with_structured_failure(self):
+    def test_repair_fails_ends_with_structured_failure(self):
         path = self._path()
         # turn1 ready -> revise -> turn2 no-op -> repair -> turn3 no-op: the
         # phase ends (no inspect/retry choice exists) and names why.
@@ -5255,7 +5257,7 @@ class StaleNoOpTest(unittest.TestCase):
                              and e.get("decider") == "orchestrator"
                              for e in events))
 
-    def test_t4_legit_new_question_no_false_positive(self):
+    def test_legit_new_question_no_false_positive(self):
         path = self._path()
         sess = self._session(path, [dict(self._READY), dict(self._DIFF)])
         trace = self._trace(path)
@@ -5267,7 +5269,7 @@ class StaleNoOpTest(unittest.TestCase):
         self.assertEqual(len(sess.sent), 2)
         self.assertIn("[reviewer handoff]", sess.sent[1])
 
-    def test_t5_invalidation_trace_actual_status(self):
+    def test_invalidation_trace_actual_status(self):
         path = self._path()
         sess = self._session(path, [dict(self._READY), dict(self._DIFF)])
         trace = self._trace(path)
@@ -10412,7 +10414,7 @@ class PromptAccountingTest(unittest.TestCase):
         with open(path, "r") as fh:
             return [json.loads(line) for line in fh if line.strip()]
 
-    def test_t2_usage_extractor_best_effort(self):
+    def test_usage_extractor_best_effort(self):
         # result with usage -> populated; without -> None; never raises.
         self.assertEqual(
             bridge._usage_from_result(
@@ -10422,7 +10424,7 @@ class PromptAccountingTest(unittest.TestCase):
         self.assertIsNone(bridge._usage_from_result({}))
         self.assertIsNone(bridge._usage_from_result({"usage": "nope"}))
 
-    def test_t1_t13_turn_start_enriched_and_content_free(self):
+    def test_turn_start_enriched_and_content_free(self):
         import unittest.mock as mock
         path = self._tmp_trace()
         trace = trace_store.Trace(path, session_uuid="X", run_id="R")
@@ -10541,7 +10543,7 @@ class PromptAccountingTest(unittest.TestCase):
                if e["event"] == "controller.probe.end"][0]
         self.assertEqual(end["usage"], {"input_tokens": 8})
 
-    def test_t1_meta_never_collides_with_bridge_kwargs(self):
+    def test_meta_never_collides_with_bridge_kwargs(self):
         # meta carrying role/controller must not raise a duplicate-kwarg error.
         import unittest.mock as mock
         path = self._tmp_trace()
@@ -10579,7 +10581,7 @@ class ReportTest(unittest.TestCase):
             "{bad json",
         ]
 
-    def test_t3_aggregation(self):
+    def test_aggregation(self):
         s = cowork_measure.summarize_trace(self._synthetic())
         self.assertEqual(s["turn_count"], 2)
         self.assertEqual(s["bytes_by_role_controller"][("scout", "claude")], 100)
@@ -10594,7 +10596,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(len(s["review_skips"]), 1)
         self.assertEqual(s["usage_by_controller"]["codex"]["input_tokens"], 50)
 
-    def test_t3_render_has_sections(self):
+    def test_render_has_sections(self):
         text = _render_summary(
             cowork_measure.summarize_trace(self._synthetic()), "UUID")
         # Section headings changed with the D3 rewrite: the report now renders
@@ -10620,13 +10622,13 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(s["usage_by_controller"]["claude"]["input_tokens"], 15)
         self.assertEqual(s["usage_by_controller"]["claude"]["output_tokens"], 1)
 
-    def test_t3_malformed_lines_never_raise(self):
+    def test_malformed_lines_never_raise(self):
         # A trace of pure garbage yields an empty (no-turns) report.
         text = _render_summary(
             cowork_measure.summarize_trace(["x", "{", "[}"]))
         self.assertIn("No controller turns", text)
 
-    def test_t4_report_flag_end_to_end(self):
+    def test_report_flag_end_to_end(self):
         import tempfile
         root = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
@@ -10756,7 +10758,7 @@ class ProbeCacheTest(unittest.TestCase):
                 {"type": "text", "text": "pong"}]}}]
         return spawn
 
-    def test_t5_miss_stores_then_hit_skips_spawn(self):
+    def test_miss_stores_then_hit_skips_spawn(self):
         calls = []
         # Miss: live probe runs and stores on success.
         ok, _ = bridge.probe_claude_stream_json(
@@ -10774,7 +10776,7 @@ class ProbeCacheTest(unittest.TestCase):
         self.assertTrue(ok2)
         self.assertIsNone(alert2)
 
-    def test_t5_key_change_reprobes(self):
+    def test_key_change_reprobes(self):
         calls = []
         common = dict(role_prompt_file=self.role, cache_enabled=True,
                       cache_path=self.cache)
@@ -10791,7 +10793,7 @@ class ProbeCacheTest(unittest.TestCase):
             cache_path=self.cache)
         self.assertEqual(len(calls), 3)
 
-    def test_t5_corrupt_cache_is_a_miss(self):
+    def test_corrupt_cache_is_a_miss(self):
         with open(self.cache, "w") as fh:
             fh.write("{not json")
         calls = []
@@ -10802,7 +10804,7 @@ class ProbeCacheTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(len(calls), 1)  # treated as miss -> probed
 
-    def test_t5_probe_failure_not_stored(self):
+    def test_probe_failure_not_stored(self):
         def bad_spawn(cmd, stdin):
             return [{"type": "other"}]  # unsupported -> failure
         ok, _ = bridge.probe_claude_stream_json(
@@ -10844,7 +10846,7 @@ class ProbeCacheTest(unittest.TestCase):
             if old_cache is not None:
                 os.environ["COWORK_PROBE_CACHE"] = old_cache
 
-    def test_t5_unknown_version_never_cached(self):
+    def test_unknown_version_never_cached(self):
         calls = []
         common = dict(role_prompt_file=self.role, cache_enabled=True,
                       cache_path=self.cache, version_fn=lambda p: None)
@@ -22592,9 +22594,10 @@ class _QuickJoinThread(object):
 class _DeferredEvidenceMixin(object):
     """Shared fixture for issue #51: a REAL final-suite command that outlives
     the first bounded evidence poll (only that first poll is faked, exactly as
-    test_m5_package_c does), then a later continuation through the production
-    single-flight path. Every deferred transaction's command group and worker
-    are killed in cleanup so nothing leaks past the test."""
+    test_verification_evidence_reconciliation does), then a later
+    continuation through the production single-flight path. Every deferred
+    transaction's command group and worker are killed in cleanup so nothing
+    leaks past the test."""
 
     LABEL = "final"
 
@@ -26456,11 +26459,11 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
             "claude", 0,
             '{"loggedIn":true,"authMethod":"SECRET-SENTINEL"}')
         self.assertEqual(
-            claude, {"authenticated": True, "method": "other"})
+            claude, {"login_metadata_present": True, "method": "other"})
         codex = controller_profiles.parse_auth_status(
             "codex", 0, "Logged in using ChatGPT")
         self.assertEqual(
-            codex, {"authenticated": True, "method": "chatgpt"})
+            codex, {"login_metadata_present": True, "method": "chatgpt"})
 
     def test_exact_runtime_auth_trace_is_content_free(self):
         import unittest.mock as mock
@@ -26498,11 +26501,12 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
         self.assertNotIn("SECRET-OUTPUT", encoded)
         self.assertNotIn("SECRET-ENV", encoded)
         self.assertNotIn("/global/auth.json", encoded)
-        self.assertEqual(trace.events[0]["authenticated"], True)
+        self.assertIs(trace.events[0]["login_metadata_present"], True)
+        self.assertNotIn("authenticated", trace.events[0])
         self.assertEqual(trace.events[0]["private_profile"], True)
         self.assertEqual(trace.events[0]["credential_copied"], False)
 
-    def test_guarded_probe_cache_revalidates_auth_without_model_spawn(self):
+    def test_guarded_probe_cache_hit_reports_metadata_not_revalidation(self):
         import unittest.mock as mock
 
         class Trace:
@@ -26563,7 +26567,11 @@ class ControllerProfileBootstrapTests(unittest.TestCase):
         cache_event = next(
             event for event in trace.events
             if event["event"] == "controller.probe.cache_hit")
-        self.assertTrue(cache_event["auth_revalidated"])
+        # A cache hit carries no freshness: login metadata was consulted,
+        # but nothing was revalidated and no live proof exists.
+        self.assertIs(cache_event["auth_revalidated"], False)
+        self.assertIs(cache_event["live_auth_proven"], False)
+        self.assertIs(cache_event["login_metadata_present"], True)
 
     def test_codex_publishes_parent_work_before_guarded_turn(self):
         import unittest.mock as mock
@@ -26784,7 +26792,7 @@ class ControllerStateIsolationTests(unittest.TestCase):
                     mock.patch.object(
                         bridge, "_require_controller_auth",
                         return_value={
-                            "authenticated": True,
+                            "login_metadata_present": True,
                             "method": "claude.ai",
                         }), \
                     mock.patch.object(bridge.subprocess, "Popen",
@@ -26865,7 +26873,7 @@ class ControllerStateIsolationTests(unittest.TestCase):
                             mock.patch.object(
                                 bridge, "_require_controller_auth",
                                 return_value={
-                                    "authenticated": True,
+                                    "login_metadata_present": True,
                                     "method": "claude.ai",
                                 }), \
                             mock.patch.object(
@@ -30969,11 +30977,11 @@ class GateRepairLinkageTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Package D — reviewer, worktree, and evaluator adapters
+# Dispatch decisions — reviewer, worktree, and evaluator adapters
 # ---------------------------------------------------------------------------
 
-class PackageDAdaptersTest(ControllerPolicyTestBase):
-    """Package D: run_worktree, run_reviewer_once, and _isolated_evaluator_session
+class DispatchDecisionAdaptersTest(ControllerPolicyTestBase):
+    """run_worktree, run_reviewer_once, and _isolated_evaluator_session
     all route through dispatch.decide() before any provider spawn.
 
     Focused tests prove:
@@ -34931,8 +34939,9 @@ class RevalidationRuntimeRootTest(ControllerPolicyTestBase):
 
 
 # ---------------------------------------------------------------------------
-# M1 P5-v4: the mechanical exit audit. Discovery-based (it reads cowork.py's
-# real source, never a hand-maintained inventory), so a new dispatch site
+# Dispatch-surface manifest governance: a mechanical audit. Discovery-based
+# (it reads cowork.py's real source, never a hand-maintained inventory), so a
+# new dispatch site
 # added later is caught automatically instead of requiring this test to be
 # remembered. A discovered site is either manifest-fenced (its
 # `_decide_and_trace` call is wired to a `manifest=` variable that a real
@@ -34943,7 +34952,7 @@ class RevalidationRuntimeRootTest(ControllerPolicyTestBase):
 # audit is exactly the exit-audit omission this class exists to close.
 # ---------------------------------------------------------------------------
 
-class M1ExitAuditTest(unittest.TestCase):
+class DispatchSurfaceManifestGovernanceTest(unittest.TestCase):
     """Every real dispatch surface in cowork.py, audited by parsing the
     actual production source (not by re-describing it from memory)."""
 
@@ -37104,7 +37113,7 @@ class GraphDeclarationPreLaunchAndSwitchSeamTest(ControllerPolicyTestBase):
                          "absence of trace events")
 
 # =========================================================================== #
-# M3 Package E — orchestration-resume wiring: focused named tests.            #
+# Capacity orchestration-resume wiring: focused named tests.                  #
 #                                                                             #
 # Covers the frozen brief's non-vacuous live-fault list: trustworthy         #
 # scheduled resume exact binding; unknown reset manual signed-only;          #
@@ -37116,8 +37125,8 @@ class GraphDeclarationPreLaunchAndSwitchSeamTest(ControllerPolicyTestBase):
 # =========================================================================== #
 
 
-def _m3e_bind_capacity_candidate(session_uuid, role, controller="claude",
-                                 model=None, effort=None):
+def _bind_real_capacity_candidate(session_uuid, role, controller="claude",
+                                  model=None, effort=None):
     """Compile a REAL dispatch manifest for (session_uuid, role) and bind
     it as the role's WorkUnit candidate -- mirrors production's own
     preflighting -> running -> candidate-bound sequence
@@ -37141,7 +37150,7 @@ def _m3e_bind_capacity_candidate(session_uuid, role, controller="claude",
     return work_id, manifest, binding
 
 
-class M3PackageECapacityWiringTests(unittest.TestCase):
+class CapacityEntryWiringTests(unittest.TestCase):
     """Send-failure-seam wiring: C's classification, ProviderHealth, and the
     durable capacity-entry seam (`_role_loop`'s retain-on-send-failure
     block)."""
@@ -37159,7 +37168,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         suid = str(uuid.uuid4())
         spath = os.path.join(d, ".cowork", "session.json")
         state_store.ensure_session(spath, None, suid)
-        work_id, manifest, binding = _m3e_bind_capacity_candidate(
+        work_id, manifest, binding = _bind_real_capacity_candidate(
             suid, role, controller=controller)
         status_path = os.path.join(
             state_store.session_assets_dir(suid), "%s.status.json" % role)
@@ -37185,7 +37194,7 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         def close(self):
             pass
 
-    def test_provider_health_recorded_for_every_c_classification_including_unknown(self):
+    def test_provider_health_recorded_for_every_bridge_classification_including_unknown(self):
         cases = [
             ("rate_limit_error", "quota_limited"),
             ("overloaded_error", "overloaded"),
@@ -37350,11 +37359,12 @@ class M3PackageECapacityWiringTests(unittest.TestCase):
         self.assertNotIn("choose: retry", out.getvalue())
 
 
-def _m3e_signed_manual_signal(payload, role, key_id="authority-key-1",
-                              tamper=False):
+def _signed_capacity_manual_signal(payload, role, key_id="authority-key-1",
+                                   tamper=False):
     """A GENUINE Ed25519-signed manual-capacity-signal record bound to
     `payload`'s exact candidate/session/policy identity, mirroring
-    test_cowork_state_m3.py's own `_signed_manual_signal` convention.
+    test_cowork_state_capacity_persistence.py's own `_signed_manual_signal`
+    convention.
     Returns (record, pinned_public_keys)."""
     secret_key = hashlib.sha256(os.urandom(32)).digest()
     public_key = state_store._ed25519_selftest_publickey(secret_key)
@@ -37376,7 +37386,7 @@ def _m3e_signed_manual_signal(payload, role, key_id="authority-key-1",
     return record, {key_id: public_key.hex()}
 
 
-class M3PackageEResumeTriggerTests(unittest.TestCase):
+class ResumeTriggerCliTests(unittest.TestCase):
     """The resume-trigger CLI: both resume forms, binding-preserving
     wake preflight, InvalidationRecord no-replay, wrong-role supervision
     stop, and post-wake send-failure retention."""
@@ -37394,14 +37404,14 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
         """Drive a REAL quota-classified send failure all the way into a
         durable `awaiting_capacity` pause (persist-before-ack, exactly-once
         pending-turn contract already proven by
-        M3PackageECapacityWiringTests), then save the role's config/session
+        CapacityEntryWiringTests), then save the role's config/session
         id so a later resume-trigger call can reconstruct a session.
         Returns (d, suid, work_id, payload)."""
         d = self._session_dir()
         suid = str(uuid.uuid4())
         spath = os.path.join(d, ".cowork", "session.json")
         state_store.ensure_session(spath, None, suid)
-        work_id, manifest, binding = _m3e_bind_capacity_candidate(
+        work_id, manifest, binding = _bind_real_capacity_candidate(
             suid, role, controller=controller)
         status_path = os.path.join(
             state_store.session_assets_dir(suid), "%s.status.json" % role)
@@ -37409,7 +37419,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
         with open(status_path, "w") as fh:
             json.dump({"status": "needs_input"}, fh)
 
-        sess = M3PackageECapacityWiringTests._FailingSession(
+        sess = CapacityEntryWiringTests._FailingSession(
             controller, error_type)
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
@@ -37461,7 +37471,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
 
     def test_manual_signal_form_success_exactly_once_consumption(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         sent = []
@@ -37510,7 +37520,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
         suid = str(uuid.uuid4())
         spath = os.path.join(d, ".cowork", "session.json")
         state_store.ensure_session(spath, None, suid)
-        work_id, manifest, binding = _m3e_bind_capacity_candidate(suid, "builder")
+        work_id, manifest, binding = _bind_real_capacity_candidate(suid, "builder")
 
         issued_at = "2025-12-31T00:00:00Z"
         not_before = "2025-12-31T01:00:00Z"
@@ -37581,7 +37591,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
 
     def test_manual_signal_form_rejects_tampered_signature(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(
+        record, pinned = _signed_capacity_manual_signal(
             payload, "builder", tamper=True)
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
@@ -37601,7 +37611,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
 
     def test_manual_signal_form_requires_pinned_public_keys_argument(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         sent = []
         out = []
@@ -37635,7 +37645,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
 
     def test_wrong_first_role_after_resume_stops_durably_for_supervision(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         sent = []
@@ -37659,7 +37669,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
 
     def test_binding_mismatch_after_candidate_changes_returns_to_awaiting_capacity(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         # The dispatch identity changed AFTER the pause (a different model
@@ -37688,7 +37698,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
 
     def test_invalidation_record_blocks_replay_of_completed_paired_work(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         state_store.append_invalidation_record(suid, {
@@ -37717,7 +37727,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
 
     def test_post_wake_send_failure_retains_pending_turn(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         sent = []
@@ -37758,7 +37768,7 @@ class M3PackageEResumeTriggerTests(unittest.TestCase):
             cowork._resume_seed_delivery({"not": "a string"}, None)
 
 
-class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
+class BoundedResumeSeamTests(unittest.TestCase):
     """Non-vacuous, focused proofs for the bounded E/D/F resume-seam
     successor's own named blockers/majors: E-BLK-01/02, E-MAJ-01..05, and
     F-MJ-02 (the D/F seam) -- each test pins EXACTLY one closed gap, with a
@@ -37777,7 +37787,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
         suid = str(uuid.uuid4())
         spath = os.path.join(d, ".cowork", "session.json")
         state_store.ensure_session(spath, None, suid)
-        work_id, manifest, binding = _m3e_bind_capacity_candidate(
+        work_id, manifest, binding = _bind_real_capacity_candidate(
             suid, role, controller=controller)
         status_path = os.path.join(
             state_store.session_assets_dir(suid), "%s.status.json" % role)
@@ -37811,7 +37821,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
                         error_type="rate_limit_error"):
         d, suid, work_id, binding, status_path = self._fixture(
             role=role, controller=controller)
-        sess = M3PackageECapacityWiringTests._FailingSession(
+        sess = CapacityEntryWiringTests._FailingSession(
             controller, error_type)
         rc, outcome, payload = cowork._role_loop(
             sess, "do the thing", status_path, context="",
@@ -37878,7 +37888,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
         lease_before = state_store.read_pause_lease(suid, lease_id)
         self.assertEqual(lease_before["failed_wake_attempts"], 2)
 
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         sent = []
@@ -38355,7 +38365,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
     # -- never verifies/consumes the single-use manual signal.
     def test_wrong_role_preflight_never_claims_lease_or_consumes_manual_signal(self):
         d, suid, work_id, payload = self._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         rc = cowork.run_resume_trigger([
@@ -38388,7 +38398,7 @@ class M3BoundedResumeSeamSuccessorTests(unittest.TestCase):
         self.assertEqual(sent, ["do the thing"])
 
 
-class M3LiveFToEToDChainTests(unittest.TestCase):
+class MacosWakeSchedulerResumeChainTests(unittest.TestCase):
     """Non-vacuous LIVE proofs of the full Package F -> D -> E chain, using
     Package F's OWN public argv builders VERBATIM (never a hand-rolled
     approximation of what F would pass) -- pins the argv-compatibility and
@@ -38437,7 +38447,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
         suid = str(uuid.uuid4())
         spath = os.path.join(d, ".cowork", "session.json")
         state_store.ensure_session(spath, None, suid)
-        work_id, manifest, binding = _m3e_bind_capacity_candidate(suid, "builder")
+        work_id, manifest, binding = _bind_real_capacity_candidate(suid, "builder")
         lease_id = str(uuid.uuid4())
         automation_ref = "cowork.orchestration_resume/v%d" % (
             capacity_scheduler.SCHEDULER_DECISION_LAYER_VERSION)
@@ -38482,7 +38492,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
         state_store.save(spath, state)
         return d, suid, work_id, lease_id, automation_ref, turn_text, binding
 
-    def test_live_f_argv_claim_then_resume_succeeds_without_role_or_now(self):
+    def test_live_macos_wake_argv_claim_then_resume_succeeds_without_role_or_now(self):
         # REV-BLK: Package F's own fixed argv never supplies --role/--now.
         d, suid, work_id, lease_id, automation_ref, turn_text, binding = (
             self._build_scheduled_capacity_fixture(
@@ -38511,7 +38521,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
         lease_final = state_store.read_pause_lease(suid, lease_id)
         self.assertEqual(lease_final["consumption_state"], "consumed")
 
-    def test_live_f_argv_binding_mismatch_under_already_claimed_lease_accounts_failed_attempt(self):
+    def test_live_macos_wake_argv_binding_mismatch_under_already_claimed_lease_accounts_failed_attempt(self):
         # REV-BLK: failed-wake accounting must work truthfully even though
         # Package F/D already claimed the lease BEFORE Package E's own
         # preflight ever ran.
@@ -38567,7 +38577,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
         self.assertEqual(current["failed_wake_attempts"], 1)
         self.assertEqual(current["consumption_state"], "unclaimed")
 
-    def test_live_f_argv_repeated_failures_reach_attempts_exhausted_deterministically(self):
+    def test_live_macos_wake_argv_repeated_failures_reach_attempts_exhausted_deterministically(self):
         # F-MJ-02 closure, live: repeated genuine failures reached via the
         # EXACT Package F claim-then-invoke chain converge to D's own
         # `attempts_exhausted` -- Package F's NEXT fire never even reaches
@@ -38630,7 +38640,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
     # -- `bridge.ClaudeSession` send failure genuinely carrying a
     # -- provider-attested `retry_after` -- never a hand-built
     # -- PauseLease/CapacityPacket, never a monkeypatched evidence seam.
-    def test_live_chain_from_genuine_c_evidence_reaches_attempts_exhausted(self):
+    def test_live_chain_from_genuine_bridge_evidence_reaches_attempts_exhausted(self):
         import datetime
         import unittest.mock as mock
 
@@ -38665,7 +38675,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
         suid = str(uuid.uuid4())
         spath = os.path.join(d, ".cowork", "session.json")
         state_store.ensure_session(spath, None, suid)
-        work_id, manifest, binding = _m3e_bind_capacity_candidate(suid, "builder")
+        work_id, manifest, binding = _bind_real_capacity_candidate(suid, "builder")
         status_path = os.path.join(
             state_store.session_assets_dir(suid), "builder.status.json")
         os.makedirs(os.path.dirname(status_path), exist_ok=True)
@@ -38771,7 +38781,7 @@ class M3LiveFToEToDChainTests(unittest.TestCase):
         self.assertIn("attempts_exhausted", d_lines[0])
 
 
-class DecisionCapacityResumeTriggerTest(M3PackageEResumeTriggerTests):
+class DecisionCapacityResumeTriggerTest(ResumeTriggerCliTests):
     """MJ2: an orchestrator decision block that rode a capacity-paused first
     send is bound to that pending turn, never rebuilt by a plain run while
     the pause is live, and acknowledged by exactly the resume-trigger send
@@ -38797,7 +38807,7 @@ class DecisionCapacityResumeTriggerTest(M3PackageEResumeTriggerTests):
         suid = str(uuid.uuid4())
         spath = os.path.join(d, ".cowork", "session.json")
         state = state_store.ensure_session(spath, None, suid)
-        work_id, _manifest, _binding = _m3e_bind_capacity_candidate(
+        work_id, _manifest, _binding = _bind_real_capacity_candidate(
             suid, "builder")
         status_path = os.path.join(
             state_store.session_assets_dir(suid), "builder.status.json")
@@ -38823,7 +38833,7 @@ class DecisionCapacityResumeTriggerTest(M3PackageEResumeTriggerTests):
         cowork._bind_decision_launch(
             suid, "builder", [{"request_id": rid, "target": "builder"}])
         self.addCleanup(cowork._bind_decision_launch, suid, "builder", None)
-        sess = M3PackageECapacityWiringTests._FailingSession(
+        sess = CapacityEntryWiringTests._FailingSession(
             "claude", "rate_limit_error")
         _rc, outcome, payload = cowork._role_loop(
             sess, self.TURN, status_path, context="", io_out=io.StringIO(),
@@ -38839,7 +38849,7 @@ class DecisionCapacityResumeTriggerTest(M3PackageEResumeTriggerTests):
         return d, spath, suid, rid, payload
 
     def _trigger(self, d, suid, payload, factory, extra=(), lines=None):
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = self._write_json(d, "manual.json", record)
         pinned_path = self._write_json(d, "pinned.json", pinned)
         return cowork.run_resume_trigger([
@@ -39001,7 +39011,7 @@ class DecisionCapacityResumeTriggerTest(M3PackageEResumeTriggerTests):
 
 
 # The inherited resume-trigger tests run once, in their own class.
-for _name in [n for n in dir(M3PackageEResumeTriggerTests)
+for _name in [n for n in dir(ResumeTriggerCliTests)
               if n.startswith("test")]:
     if _name not in DecisionCapacityResumeTriggerTest.__dict__:
         setattr(DecisionCapacityResumeTriggerTest, _name, None)
@@ -39058,7 +39068,7 @@ class RoleLoopCleanupEvidenceTests(unittest.TestCase):
     carries cleanup evidence only as extra fields beside `result`."""
 
     def _fixture(self):
-        helper = M3PackageECapacityWiringTests(
+        helper = CapacityEntryWiringTests(
             "test_malformed_unrecognized_token_writes_unknown_provider_health")
         self.addCleanup(helper.doCleanups)
         return helper._fixture()
@@ -39140,7 +39150,7 @@ class ResumeTriggerSessionCloseTests(unittest.TestCase):
     before its owner lease is released."""
 
     def _helper(self):
-        helper = M3PackageEResumeTriggerTests(
+        helper = ResumeTriggerCliTests(
             "test_exit_codes_match_d_contract_naming")
         self.addCleanup(helper.doCleanups)
         return helper
@@ -39148,7 +39158,7 @@ class ResumeTriggerSessionCloseTests(unittest.TestCase):
     def _trigger(self, send_fn, close_error=None):
         helper = self._helper()
         d, suid, work_id, payload = helper._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = helper._write_json(d, "manual.json", record)
         pinned_path = helper._write_json(d, "pinned.json", pinned)
         sessions = []
@@ -39299,11 +39309,11 @@ class ResumeTriggerSigtermTests(unittest.TestCase):
 
     def test_sigterm_mid_send_governed(self):
         import cowork_owner
-        helper = M3PackageEResumeTriggerTests(
+        helper = ResumeTriggerCliTests(
             "test_exit_codes_match_d_contract_naming")
         self.addCleanup(helper.doCleanups)
         d, suid, work_id, payload = helper._enter_capacity()
-        record, pinned = _m3e_signed_manual_signal(payload, "builder")
+        record, pinned = _signed_capacity_manual_signal(payload, "builder")
         manual_path = helper._write_json(d, "manual.json", record)
         pinned_path = helper._write_json(d, "pinned.json", pinned)
         pidfile = os.path.join(d, "fake.pids")

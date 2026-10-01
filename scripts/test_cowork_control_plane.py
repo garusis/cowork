@@ -304,7 +304,7 @@ class ReducerExhaustiveMatrixTest(unittest.TestCase):
                 self.assertEqual(event, "capability_missing",
                                   "only capability_missing may target needs_authority")
 
-    def test_awaiting_capacity_m3_narrowly_reachable(self):
+    def test_awaiting_capacity_narrowly_reachable(self):
         """Named per the frozen brief (replacing test_awaiting_capacity_
         unreachable_m2): asserts the ONLY (state, event) pairs whose target
         is awaiting_capacity are exactly (running, capacity_reserved),
@@ -372,7 +372,7 @@ class ReducerExhaustiveMatrixTest(unittest.TestCase):
             evidence = _VALID_GATE_EVIDENCE if event == "gate_validated" else None
             cp.advance(state, event, evidence)  # must not raise
 
-    def test_awaiting_gate_cannot_become_blocked_m2(self):
+    def test_awaiting_gate_cannot_become_blocked(self):
         """Named per orchestrator finding MA-03: a unit that already reached
         awaiting_gate (finished its turn) can never become blocked, so
         blocked's single resume edge back to running can never be reached

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Focused tests for M4 Package B: the durable, crash-safe, append-only
-activity journal (`append_activity_record`/`read_activity_history`/
+"""Focused tests for activity journal persistence: the durable, crash-safe,
+append-only activity journal (`append_activity_record`/`read_activity_history`/
 `latest_activity`/`reread_before_gate`) and the durable scheduled-review
 store (`write_scheduled_review`/`read_next_inspection`), plus the pure
 `activity_status_age_seconds` helper -- all additive to `cowork_state.py`.
 
 Run standalone:
 
-    python3 -m unittest scripts.test_cowork_state_m4 -v
+    python3 -m unittest scripts.test_cowork_state_activity_journal -v
 """
 
 import os
@@ -30,10 +30,11 @@ def _uuid():
     return str(uuid.uuid4())
 
 
-class _M4EnvMixin:
+class _SessionsRootEnvMixin:
     """Isolated COWORK_SESSIONS_ROOT per test, so nothing ever touches the
-    real home dir (mirrors test_cowork_state_m2.py/test_cowork_state_m3.py's
-    identical `_M2EnvMixin`/`_M3EnvMixin`)."""
+    real home dir (mirrors test_cowork_state_workflow_persistence.py/
+    test_cowork_state_capacity_persistence.py's identical
+    `_SessionsRootEnvMixin`)."""
 
     def setUp(self):
         super().setUp()
@@ -124,7 +125,7 @@ def _provider_health(**overrides):
 # --------------------------------------------------------------------------- #
 
 
-class AppendAndReadTest(_M4EnvMixin, unittest.TestCase):
+class AppendAndReadTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_append_then_read_round_trips(self):
         session_uuid = _uuid()
         work_id = _uuid()
@@ -178,7 +179,7 @@ class AppendAndReadTest(_M4EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ValidationBeforeDiskTest(_M4EnvMixin, unittest.TestCase):
+class ValidationBeforeDiskTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_append_activity_record_rejects_invalid_before_any_write(self):
         session_uuid = _uuid()
         work_id = _uuid()
@@ -235,7 +236,7 @@ class ValidationBeforeDiskTest(_M4EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ReconciliationTest(_M4EnvMixin, unittest.TestCase):
+class ReconciliationTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_reread_before_gate_requires_existing_activity(self):
         session_uuid = _uuid()
         work_id = _uuid()
@@ -339,7 +340,7 @@ class ReconciliationTest(_M4EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class CorruptTailTest(_M4EnvMixin, unittest.TestCase):
+class CorruptTailTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _append_torn_fragment(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "ab") as fh:
@@ -409,7 +410,7 @@ class CorruptTailTest(_M4EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class CrashInjectionTest(_M4EnvMixin, unittest.TestCase):
+class CrashInjectionTest(_SessionsRootEnvMixin, unittest.TestCase):
     def _faulted_fsync(self):
         real_fsync = state_store.os.fsync
 
@@ -512,7 +513,7 @@ class CrashInjectionTest(_M4EnvMixin, unittest.TestCase):
             state_store.read_next_inspection(session_uuid, work_id), stored)
 
     def test_write_scheduled_review_parent_dir_fsync_fault_never_silently_succeeds(self):
-        """Mirrors test_m3_crash_resume.py's own `test_parent_fsync_failure_
+        """Mirrors test_capacity_crash_resume.py's own `test_parent_fsync_failure_
         after_replace_never_silently_reports_success`: `write_scheduled_
         review` reuses `write_json_atomic_durable` (M3, unmodified) verbatim,
         so a parent-directory fsync failing AFTER `os.replace` already
@@ -555,7 +556,7 @@ class CrashInjectionTest(_M4EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ScheduledReviewTest(_M4EnvMixin, unittest.TestCase):
+class ScheduledReviewTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_round_trip(self):
         session_uuid = _uuid()
         work_id = _uuid()
@@ -607,7 +608,7 @@ class ScheduledReviewTest(_M4EnvMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-class ConcurrencyTest(_M4EnvMixin, unittest.TestCase):
+class ConcurrencyTest(_SessionsRootEnvMixin, unittest.TestCase):
     def test_two_real_threads_append_same_work_id_serialize_under_timeout(self):
         session_uuid = _uuid()
         work_id = _uuid()
@@ -725,7 +726,7 @@ class StatusAgeHelperTest(unittest.TestCase):
 # Namespace hygiene + legacy/M2/M3 preservation.                             #
 # --------------------------------------------------------------------------- #
 
-_M4_NEW_NAMES = (
+_ACTIVITY_JOURNAL_EXPORTS = (
     "activity_dir_for", "activity_history_path_for", "scheduled_review_path_for",
     "append_activity_record", "read_activity_history", "latest_activity",
     "reread_before_gate", "write_scheduled_review", "read_next_inspection",
@@ -733,19 +734,19 @@ _M4_NEW_NAMES = (
 )
 
 
-class NamespaceAndPreservationTest(_M4EnvMixin, unittest.TestCase):
-    def test_m4_names_are_present_and_callable(self):
-        for name in _M4_NEW_NAMES:
+class NamespaceAndPreservationTest(_SessionsRootEnvMixin, unittest.TestCase):
+    def test_activity_journal_exports_are_present_and_callable(self):
+        for name in _ACTIVITY_JOURNAL_EXPORTS:
             self.assertTrue(
                 callable(getattr(state_store, name, None)), "missing M4 export: %s" % name)
 
-    def test_provider_health_still_works_after_m4(self):
+    def test_provider_health_still_works_alongside_activity_journal(self):
         session_uuid = _uuid()
         stored = state_store.write_provider_health(session_uuid, _provider_health())
         self.assertEqual(
             state_store.read_provider_health(session_uuid, "builder", "anthropic"), stored)
 
-    def test_pause_lease_still_works_after_m4(self):
+    def test_pause_lease_still_works_alongside_activity_journal(self):
         session_uuid = _uuid()
         lease = _pause_lease()
         stored = state_store.create_pause_lease(session_uuid, lease)
@@ -753,7 +754,7 @@ class NamespaceAndPreservationTest(_M4EnvMixin, unittest.TestCase):
         read_back = state_store.read_pause_lease(session_uuid, lease["lease_id"])
         self.assertEqual(read_back["lease_id"], lease["lease_id"])
 
-    def test_capacity_packet_still_works_after_m4(self):
+    def test_capacity_packet_still_works_alongside_activity_journal(self):
         session_uuid = _uuid()
         packet = _capacity_packet()
         stored = state_store.write_capacity_packet(session_uuid, packet)
@@ -768,7 +769,7 @@ class NamespaceAndPreservationTest(_M4EnvMixin, unittest.TestCase):
         loaded = state_store.load(path)
         self.assertEqual(loaded["version"], state_store.VERSION)
 
-    def test_phase_state_history_still_works_after_m4(self):
+    def test_phase_state_history_still_works_alongside_activity_journal(self):
         session_id = _uuid()
         work_id = _uuid()
         state_store.append_phase_state_entry(session_id, work_id, "pending", None)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M4 Package F: end-to-end negative-control suite.
+"""Activity observation: end-to-end negative-control suite.
 
 Independent, fresh proof -- written without editing or importing any
 existing test file's fixtures/doubles -- that every M4 negative control the
@@ -24,8 +24,8 @@ hand-rolled substitute for any of these.
 
 Self-contained: this file defines its own fixtures/test-doubles rather than
 importing any from `test_cowork_bridge_activity.py`, `test_cowork_
-activity_contracts.py`, `test_cowork_state_m4.py`, `test_cowork_watchdog.py`,
-or `test_cowork_activity_cross_surface.py`, so its proof stands
+activity_contracts.py`, `test_cowork_state_activity_journal.py`,
+`test_cowork_watchdog.py`, or `test_cowork_activity_cross_surface.py`, so its proof stands
 independently, matching M3 Package G's own self-containment discipline.
 
 Organized by the frozen brief's own eight named items (each also mapped to
@@ -44,7 +44,7 @@ the corrected M4 v3 plan's five `required_negative_controls` entries):
 
 Run standalone:
 
-    python3 -m unittest scripts/test_m4_negative_controls.py -v
+    python3 -m unittest scripts/test_activity_negative_controls.py -v
 """
 
 import io
@@ -1128,7 +1128,7 @@ class SevenRequiredDeterministicFixturesTest(unittest.TestCase):
 
     def test_5_late_writes_on_both_sides_of_controller_exit(self):
         """See `LateWriteBothSidesOfControllerExitTest` in
-        `test_m4_crash_resume.py` for the full crash/resume-flavored
+        `test_activity_crash_resume.py` for the full crash/resume-flavored
         derivation of this fixture; re-asserted here at the pure
         reconciliation-and-projection level for completeness in this
         file's own self-contained proof."""

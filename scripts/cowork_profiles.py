@@ -239,22 +239,29 @@ def auth_command(controller):
 
 
 def parse_auth_status(controller, returncode, stdout):
-    """Return content-free authentication status from a native CLI result."""
+    """Return content-free LOGIN METADATA from a native CLI status command.
+
+    Presence of metadata (`claude auth status` reporting `loggedIn: true`,
+    `codex login status` reporting "logged in") is never live authentication
+    proof: a stored credential can be expired or revoked while the status
+    command still reports a login. Only a provider-accepted model turn proves
+    live authentication (see `cowork_bridge.probe_claude_stream_json`)."""
     if controller == "claude":
         try:
             value = json.loads(stdout or "")
         except ValueError:
             value = {}
-        authenticated = returncode == 0 and value.get("loggedIn") is True
+        metadata_present = returncode == 0 and value.get("loggedIn") is True
         raw_method = value.get("authMethod")
-        method = (raw_method if authenticated
+        method = (raw_method if metadata_present
                   and raw_method in _SAFE_CLAUDE_AUTH_METHODS
-                  else ("other" if authenticated else None))
+                  else ("other" if metadata_present else None))
     elif controller == "codex":
         normalized = (stdout or "").strip().lower()
-        authenticated = returncode == 0 and normalized.startswith("logged in")
+        metadata_present = (returncode == 0
+                            and normalized.startswith("logged in"))
         method = "chatgpt" if "chatgpt" in normalized else (
             "api" if "api" in normalized else None)
     else:
         raise ProfileBootstrapError("unsupported_controller_profile")
-    return {"authenticated": authenticated, "method": method}
+    return {"login_metadata_present": metadata_present, "method": method}

@@ -70,7 +70,7 @@ no provider and no network client.
 
 Run standalone:
 
-    python3 -m unittest scripts.test_m55_owner_store -v
+    python3 -m unittest scripts.test_owner_store -v
 """
 
 import ast

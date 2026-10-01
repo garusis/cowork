@@ -723,7 +723,7 @@ class ImportAndIOBoundaryTest(unittest.TestCase):
     def test_module_has_no_os_import(self):
         self.assertNotIn("os", self._top_level_imports())
 
-    def test_control_plane_dependency_is_itself_a_pure_package_a_module(self):
+    def test_control_plane_dependency_is_itself_a_pure_module(self):
         # cowork_control_plane.py is one of this package's own two new
         # modules (also import/IO boundary tested), so depending on it does
         # not reach into runtime code.

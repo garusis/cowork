@@ -70,7 +70,7 @@ Public API:
     FIRE_EXIT_SUCCESS, FIRE_EXIT_RESUME_TRIGGER_FAILED (F-locally disjoint
         from every value in `scheduler.WAKE_TRIGGER_EXIT_CODES` except the
         shared "0 means success" convention -- see StructuralGatesTest's
-        `test_f_local_exit_codes_disjoint_from_d_exit_codes`)
+        `test_macos_wake_exit_codes_disjoint_from_scheduler_exit_codes`)
     fire(session_uuid, lease_id, automation_ref, resume_trigger_cmd,
         claimant_ref=None, now=None, reference_now=None,
         max_clock_skew_seconds=None, max_jitter_seconds=None,

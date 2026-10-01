@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-surface fact-equivalence tests (M4 Package D): the run transcript
+"""Cross-surface fact-equivalence tests: the run transcript
 (`cowork_transcript.render_activity`) and the report leg
 (`cowork_report._section_activity`, fed by `cowork_measure.build_record`'s
 `record["activity"]`) all consume the SAME compact facts for the same

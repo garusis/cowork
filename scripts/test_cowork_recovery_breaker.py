@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for M2 Package D: the durable recovery circuit breaker.
+"""Focused tests for the durable recovery circuit breaker.
 
 Implementer evidence only — non-authoritative. The controller runs its own
 focused breaker tests, repeated-identical/changed-cause fixtures, and
