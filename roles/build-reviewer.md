@@ -98,7 +98,11 @@ With those files and the live delta, check:
    final-suite binding / manifest binding / disposition; the receipt file it
    names carries the full detail. Check: did the transaction's inventory match
    the plan's approved `result.verification` exactly (no relabeled or
-   substituted commands)? Is the verdict actually `green` (not `red`/
+   substituted commands)? Was the last `final_suite` genuinely the complete
+   regression suite rather than a shard chosen to fit the 300-second command
+   deadline? Separately supplied supervisor evidence may inform the
+   orchestrator, but it does not change what the owned receipt certifies. Is
+   the verdict actually `green` (not `red`/
    `unverified` waved past in the summary)? Did the final suite run exactly
    once and is `final_suite_binding` `ran_once` (or `legacy_unknown` only for
    a genuinely legacy plan)? Is the transaction's captured manifest/index the

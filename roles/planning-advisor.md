@@ -51,7 +51,10 @@ Read them all from disk, then check:
    and non-historical assertions. Version control operations,
    controlled fixtures, security negatives, compatibility inputs,
    regression references and product fields are not flagged — a keyword alone
-   is never grounds for a finding.
+   is never grounds for a finding. Every owned-verification command has a
+   300-second outer deadline that a test runner's timeout cannot enlarge.
+   Flag a `final_suite` that is only a shard, is not the complete regression
+   suite, or cannot honestly finish inside that bound.
 6. **Altitude.** Is the plan over- or under-built? "Avoid overengineering"
    means removing unproven scaffolding, not accepting a vague or cheap plan.
 7. **Hygiene.** No placeholders (TBD/TODO/open question) in a ready plan; every

@@ -895,6 +895,14 @@ inventory as **one owned, hermetic, manifest-bound transaction**:
   every approved command green, evidence present, the final suite run exactly
   once, and the transaction's own captured manifest/index still matching what
   was actually reviewed.
+- **Each command has a fixed 300-second outer bound.** The worker terminates a
+  command that exceeds this bound even when that command supplies a larger
+  tool-level timeout such as `--timeout 3600`; the inner timeout does not
+  enlarge Cowork's process deadline. A schema-2 `final_suite` must therefore
+  be a genuinely complete regression command that can finish inside 300
+  seconds. Do not label one shard as the final suite merely to satisfy the
+  schema. If the complete suite cannot fit, Cowork cannot natively certify it
+  as a schema-2 final suite yet; stop and address that limitation explicitly.
 - **Bounded evidence, never a silent rerun.** If a command's terminal result is
   slow to land, Cowork polls the same pre-minted attempt for a bounded number
   of attempts; past that bound the attempt is recorded `unresolved`/`absent`
@@ -966,6 +974,29 @@ downstream is the receipt — never the builder's prose about verification:
   `verification.transaction` trace event's `reused_lock_result` flag as
   **avoided cost** attributed to the reused transaction — with no second
   incurred transaction.
+
+#### Evidence lifetime and repository hygiene
+
+Product tests committed to the repository protect behavior expected of every
+future revision. They use neutral inputs and may cover security, compatibility,
+architecture, integrity, negative controls and regressions.
+
+Evidence about one delivery does not become a permanent product test. Package
+receipts, audits, run results, candidate/base ancestry pins, one-delivery path
+allowlists, scope snapshots, gate transcripts or counts, and assertions about
+one historical implementation state belong in the session or package artifact
+directory outside product source and outside Git. A mixed check keeps its
+durable product assertion with neutral inputs and moves or drops the historical
+delivery portion. Legitimate Git behavior tests with throwaway repositories,
+controlled fixtures, security negatives, compatibility inputs, regression
+references and product receipt fields remain valid; no keyword alone decides
+the classification.
+
+The durable recurrence check is
+`python3 scripts/cowork_offline_tests.py test_evidence_lifetime_contract`.
+It scans representative forbidden shapes and verifies that the role and
+orchestration contracts carry this boundary; it is not a substitute for
+reviewing the semantics of a new test.
 
 #### Checkpoints: typed, candidate-bound, deterministically-executed
 

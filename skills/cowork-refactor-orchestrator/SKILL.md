@@ -162,6 +162,13 @@ Require a candidate-bound result, independent review, changed-path list,
 verification receipts, unresolved findings, and known limitations. Validate
 their schema and hashes before creating the final digest.
 
+Owned-verification commands have a fixed 300-second outer deadline; an inner
+test timeout cannot enlarge it. A schema-2 `final_suite` remains one complete
+regression command, not a shard relabeled to fit. When that cannot be expressed
+honestly, adjudicate the Cowork limitation explicitly. External supervisor
+evidence may support the supervisor's decision but does not change the scope
+of the Cowork receipt.
+
 Receipts, run results and review notes are ingested into the package
 directory, never into product source. A permanent test protects behavior
 expected of every future revision on neutral inputs; package receipts, audits,

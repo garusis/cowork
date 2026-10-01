@@ -94,6 +94,10 @@ Notes:
   `provider/model`. Switching a role's controller resets its model/effort.
 - `scripts/cowork_state.py` owns session discovery and persistence. Preserve
   compatibility with legacy `.cowork/session.json` files when changing state.
+- Owned-verification commands have a Cowork-controlled 300-second outer
+  deadline. A test runner's larger timeout does not extend it. Schema-2 plans
+  still require one last, genuinely complete `final_suite`; do not relabel a
+  shard to work around the deadline.
 - Role status/review artifacts are JSON contracts read by the orchestrator.
   Keep schema changes reflected in roles, README, and tests.
 - Measurable-goal contract: scout intel must carry `result.success_criteria`
