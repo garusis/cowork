@@ -95,9 +95,12 @@ Notes:
 - `scripts/cowork_state.py` owns session discovery and persistence. Preserve
   compatibility with legacy `.cowork/session.json` files when changing state.
 - Owned-verification commands have a Cowork-controlled 300-second outer
-  deadline. A test runner's larger timeout does not extend it. Schema-2 plans
-  still require one last, genuinely complete `final_suite`; do not relabel a
-  shard to work around the deadline.
+  deadline that applies to every owned command. A test runner's larger
+  timeout does not extend it. Schema-2 plans still require one last,
+  genuinely complete `final_suite`; a complete suite that cannot fit one
+  command uses schema-3 composed `final_suite_component` entries whose exact
+  partition of the declared universe Cowork proves (see `roles/planner.md`).
+  Never relabel a shard to work around the deadline.
 - Role status/review artifacts are JSON contracts read by the orchestrator.
   Keep schema changes reflected in roles, README, and tests.
 - Execution-profile policy (light/standard/assurance) lives only in

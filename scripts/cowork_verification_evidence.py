@@ -471,6 +471,8 @@ def _wait_for_attempt_and_revise_ledger(
     evidence_state = attempt.get("evidence_state")
     exit_code = attempt.get("exit_code")
     timed_out = bool(attempt.get("timed_out"))
+    is_component = (entry.get("kind")
+                    == _spine().KIND_FINAL_SUITE_COMPONENT)
     if evidence_state == EVIDENCE_PRESENT:
         if timed_out:
             exit_status, adjudication = "timeout", "fail"
@@ -484,21 +486,37 @@ def _wait_for_attempt_and_revise_ledger(
             "unresolved" if evidence_state == EVIDENCE_UNRESOLVED
             else "unknown")
         revise_state = "unresolved"
+    if (is_component and evidence_state == EVIDENCE_PRESENT
+            and not timed_out and exit_code == 0):
+        # Schema 3: exit 0 alone proves nothing about a composed-suite
+        # component -- a zero, unstated, mismatched or truncated
+        # executed-test count adjudicates it `fail` before the ledger is
+        # revised, so the parent stops and the verdict is red.
+        observed, check = _spine().component_test_count_check(entry, attempt)
+        attempt["observed_test_count"] = observed
+        attempt["test_count_check"] = check
+        if check != _spine().TEST_COUNT_OK:
+            exit_status, adjudication = "fail", "fail"
+    revision_fields = {
+        "exit_code": exit_code,
+        "evidence_state": evidence_state,
+        "timed_out": timed_out,
+        "wall_time_s": attempt.get("wall_time_s"),
+        "verification_kind": entry.get("kind"),
+        "exit_status": exit_status,
+        "adjudication": adjudication,
+        "command_fingerprint": " ".join(entry.get("command") or []),
+        "started_at": attempt.get("started_at"),
+        "ended_at": attempt.get("ended_at"),
+        "observed_source_digest": snapshot_manifest_digest,
+    }
+    if is_component:
+        revision_fields["observed_test_count"] = attempt.get(
+            "observed_test_count")
+        revision_fields["test_count_check"] = attempt.get("test_count_check")
     record, ledger_ok = _revise_attempt_ledger(
         ledger_path, transaction_id, label,
-        fields={
-            "exit_code": exit_code,
-            "evidence_state": evidence_state,
-            "timed_out": timed_out,
-            "wall_time_s": attempt.get("wall_time_s"),
-            "verification_kind": entry.get("kind"),
-            "exit_status": exit_status,
-            "adjudication": adjudication,
-            "command_fingerprint": " ".join(entry.get("command") or []),
-            "started_at": attempt.get("started_at"),
-            "ended_at": attempt.get("ended_at"),
-            "observed_source_digest": snapshot_manifest_digest,
-        },
+        fields=revision_fields,
         attempt_state=revise_state)
     if not ledger_ok:
         attempt["evidence_state"] = EVIDENCE_UNRESOLVED
@@ -1014,6 +1032,26 @@ def reconcile_pending_evidence(session_uuid, transaction_id, active_label):
                          "observed_source_digest"):
                 if carry in prior:
                     fields[carry] = prior[carry]
+        if (isinstance(prior, dict)
+                and prior.get("verification_kind")
+                == _spine().KIND_FINAL_SUITE_COMPONENT
+                and evidence_state == EVIDENCE_PRESENT
+                and not timed_out and exit_code == 0):
+            # Same executed-test count rule as the primary path; the
+            # request's inventory entry supplies expected_test_count.
+            request = state_store.read_json_tolerant(
+                state_store.verification_request_path_for(
+                    session_uuid, transaction_id))
+            entry = next(
+                (e for e in ((request or {}).get("inventory") or ())
+                 if isinstance(e, dict) and e.get("label") == label), {})
+            observed, check = _spine().component_test_count_check(
+                entry, attempt)
+            fields["observed_test_count"] = observed
+            fields["test_count_check"] = check
+            if check != _spine().TEST_COUNT_OK:
+                fields["exit_status"] = "fail"
+                fields["adjudication"] = "fail"
         _record, ledger_ok = _revise_attempt_ledger_with_retry(
             ledger_path, transaction_id, label, fields=fields,
             attempt_state="terminal")

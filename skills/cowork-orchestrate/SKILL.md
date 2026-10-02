@@ -63,10 +63,13 @@ needs its affected checks re-run.
 Cowork's owned transaction gives each verification command a fixed 300-second
 outer deadline; a test runner's own larger timeout does not extend it. Schema-2
 plans still require one last, genuinely complete `final_suite`. Do not relabel a
-shard as complete. If the full suite cannot fit, record the Cowork limitation
-explicitly. Separately authorized supervisor evidence may support the
-supervisor's acceptance decision, but it does not turn a focused Cowork receipt
-into a complete-suite receipt.
+shard as complete. If the full suite cannot fit one command, use a schema-3
+composed suite: check that the receipt's binding is `components_ran_once` with
+every component green, and judge from the receipt's declared universe whether
+it really is the complete regression suite (Cowork proves only the partition).
+Separately authorized supervisor evidence may support the supervisor's
+acceptance decision, but it does not turn a focused Cowork receipt into a
+complete-suite receipt.
 
 Tests that protect product behavior belong in the repository: a permanent test
 protects behavior expected of every future revision on neutral inputs.

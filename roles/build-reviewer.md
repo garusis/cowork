@@ -105,7 +105,14 @@ With those files and the live delta, check:
    the verdict actually `green` (not `red`/
    `unverified` waved past in the summary)? Did the final suite run exactly
    once and is `final_suite_binding` `ran_once` (or `legacy_unknown` only for
-   a genuinely legacy plan)? Is the transaction's captured manifest/index the
+   a genuinely legacy plan)? For a schema-3 composed suite the binding must be
+   `components_ran_once` with every `final_suite_component` green and its
+   executed-test count `ok`. Cowork proved only that the components partition
+   the declared universe and that each component ran exactly its proven test
+   ids by name; judge from the receipt's `suite` record and the overlay facts
+   (tests_dir, include/exclude selectors, exclusions, member count, universe
+   digest) whether that universe is the complete regression suite and whether
+   `tests_dir` is the runner's test-id root. Is the transaction's captured manifest/index the
    *same* candidate you are reviewing (a stale transaction from an earlier
    revision certifies nothing about the current delta)? Any mismatch,
    downgraded verdict, or mutation the builder didn't disclose is a `revise`.

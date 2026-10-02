@@ -974,19 +974,40 @@ inventory as **one owned, hermetic, manifest-bound transaction**:
   inventory (execution mode included) share one transaction; a bounded waiter
   reuses only a *terminal* result for that exact key, and a dead lock owner is
   reclaimed rather than blocking the next attempt forever.
-- **One final suite, bound to the reviewed candidate.** The plan's inventory
-  names at most one `kind: final_suite` entry, always last; readiness requires
+- **One final suite, bound to the reviewed candidate.** A schema-2 inventory
+  names exactly one `kind: final_suite` entry, always last; readiness requires
   every approved command green, evidence present, the final suite run exactly
-  once, and the transaction's own captured manifest/index still matching what
-  was actually reviewed.
+  once (`final_suite_binding: ran_once`), and the transaction's own captured
+  manifest/index still matching what was actually reviewed.
 - **Each command has a fixed 300-second outer bound.** The worker terminates a
   command that exceeds this bound even when that command supplies a larger
   tool-level timeout such as `--timeout 3600`; the inner timeout does not
   enlarge Cowork's process deadline. A schema-2 `final_suite` must therefore
   be a genuinely complete regression command that can finish inside 300
   seconds. Do not label one shard as the final suite merely to satisfy the
-  schema. If the complete suite cannot fit, Cowork cannot natively certify it
-  as a schema-2 final suite yet; stop and address that limitation explicitly.
+  schema.
+- **A complete suite longer than one command is composed (schema 3).** A plan
+  that declares `verification_schema: 3` and a `verification_suite` universe
+  (test-id root, include/exclude selectors with reasons, and optional modules
+  split by test class) expresses the complete suite as contiguous, last
+  `kind: final_suite_component` entries. Every component is still one
+  300-second command. Before anything runs, Cowork proves from the immutable
+  snapshot that the components **exactly partition** the declared universe —
+  a missing, duplicated, overlapping or foreign member, a selector matching
+  nothing, a split module whose classes cannot be enumerated statically, a
+  component bound above the per-command timeout, or a transaction whose
+  overall deadline exceeds Cowork's ceiling is rejected with no worker
+  spawned, no attempt minted and no snapshot left behind. Cowork appends each
+  component's proven test ids to its runner prefix itself, so a component
+  cannot run something narrower than it claims. A component that ran zero
+  tests, printed no `Ran N tests` summary, disagreed with its
+  `expected_test_count`, or overflowed the worker's output cap is red even on
+  exit 0. The suite certifies only as `final_suite_binding:
+  components_ran_once` with every component green, all inside the same
+  single transaction. Cowork does **not** prove that the declared universe is
+  the repo's complete regression suite, or that `tests_dir` is the runner's
+  test-id root: the planning-advisor and build-reviewer judge both from the
+  receipt. See `roles/planner.md` for both inventory schemas.
 - **Bounded evidence, never a silent rerun.** If a command's terminal result is
   slow to land, Cowork polls the same pre-minted attempt for a bounded number
   of attempts; past that bound the attempt is recorded `unresolved`/`absent`
@@ -1023,7 +1044,7 @@ Legacy (schema-1) plans — `{label, command}` only, no `execution_mode`/`kind`
 — are still accepted: they run isolated, keep their historical
 whole-inventory readiness comparison, and report their final-suite guarantee
 as `legacy_unknown` rather than inventing one. See `roles/planner.md` for the
-schema-2 inventory format plans should write going forward.
+schema-2 and schema-3 inventory formats plans should write going forward.
 
 #### The receipt downstream: overlays, dispositions, supersession, reuse
 
@@ -1042,6 +1063,11 @@ downstream is the receipt — never the builder's prose about verification:
   structured **contradiction signal** — computed once, from owned state —
   marks the overlay on both surfaces when the builder's verification prose is
   missing or disagrees with the receipt. It is visible, never blocking.
+  For a schema-3 composed suite the receipt also carries the partition proof
+  (`suite`: the declared universe, excluded paths with reasons, split
+  modules, per-component member ids and digests, member count and universe
+  digest); the pointer carries the universe selectors and counts, and the
+  overlay adds the universe digest plus member and component counts.
 - **Four-state review disposition.** Every owned transaction carries
   `pending_review` → `accepted` / `superseded_by_finding` / `rejected`, bound
   to (transaction id, candidate manifest) and recorded as a

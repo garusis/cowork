@@ -50,11 +50,15 @@ Python 3.9+, stdlib only.
 """
 
 import argparse
+import ast
 import datetime
 import errno
+import fnmatch
 import hashlib
 import json
 import os
+import posixpath
+import re
 import selectors
 import shutil
 import signal
@@ -95,6 +99,7 @@ import socket  # noqa: E402
 PROTOCOL_VERSION = 3
 
 # Inventory schema versions (see `normalize_inventory`).
+SCHEMA_3 = 3      # schema 2 + a composed final suite (final_suite_component)
 SCHEMA_2 = 2      # label, command, execution_mode, kind (+ optional metadata)
 SCHEMA_1 = 1      # normalized legacy label/command-only plans
 
@@ -116,6 +121,35 @@ MAX_DEPENDS_ON = 64
 # `final_suite_binding` of a transaction whose final suite was reused, bound to
 # its source transaction and an unchanged dependency digest, instead of run.
 FINAL_SUITE_BINDING_REUSED = "reused_dependency_bound"
+# Schema 3 (composed final suite). The complete suite is a declared set of
+# bounded components that run serially inside the one owned transaction. Each
+# component still runs under the unchanged per-command timeout; Cowork proves,
+# before anything spawns, that the components exactly partition a declared
+# universe of test modules (and classes of split modules) enumerated from the
+# immutable snapshot, and Cowork itself appends each component's runner ids.
+KIND_FINAL_SUITE_COMPONENT = "final_suite_component"
+SCHEMA3_KINDS = (KIND_BASELINE, KIND_FOCUSED, KIND_PREFLIGHT,
+                 KIND_FINAL_SUITE_COMPONENT)
+FINAL_SUITE_COMPONENTS_RAN_ONCE = "components_ran_once"
+SUITE_RUNNER_UNITTEST_IDS = "unittest_ids"
+SUITE_RUNNERS = (SUITE_RUNNER_UNITTEST_IDS,)
+SUITE_PROOF_VERSION = 1
+# Cowork-owned ceiling on one owned transaction's overall deadline. A schema-3
+# plan whose components could not all finish inside it is rejected before
+# execution; nothing is ever clamped.
+MAX_OWNED_TRANSACTION_DEADLINE_S = 7200
+
+# Executed-test count adjudication for a final_suite_component attempt.
+TEST_COUNT_OK = "ok"
+TEST_COUNT_ZERO = "zero"
+TEST_COUNT_UNSTATED = "unstated"
+TEST_COUNT_MISMATCH = "mismatch"
+TEST_COUNT_TRUNCATED = "truncated"
+
+_RUNNER_ID_RE = re.compile(r"^test_[A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_RAN_COUNT_RE = re.compile(r"\bRan (\d+) tests?\b")
+_SUITE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_SUITE_MODULE_FILE_RE = re.compile(r"^test_[A-Za-z0-9_]*\.py$")
 
 # Legacy two-field (label/command only) plans normalize to this kind, and
 # their final-suite binding is reported as "legacy_unknown" rather than
@@ -325,7 +359,7 @@ class InventoryError(ValueError):
         super().__init__(message)
 
 
-def normalize_inventory(raw_verification, declared_schema=None):
+def normalize_inventory(raw_verification, declared_schema=None, suite=None):
     """Validate and normalize an approved command inventory.
 
     Accepts either:
@@ -365,10 +399,49 @@ def normalize_inventory(raw_verification, declared_schema=None):
     weaker (whole-inventory, `legacy_unknown`-final-suite) readiness
     contract from being upgraded, or a schema-2 plan's stricter contract
     from being downgraded, by anything other than the plan itself.
+
+    SCHEMA 3 (composed final suite). An inventory is schema-3-shaped when any
+    entry has `kind=final_suite_component` or a `covers` key. Such an
+    inventory is accepted ONLY when `declared_schema == 3` exactly (`None`
+    does not qualify), and a declared-3 plan must be schema-3-shaped and pass
+    its `verification_suite` declaration as `suite`. A `suite` passed with
+    any other declared schema is itself a `declared_schema_mismatch` (this
+    guards direct library callers; `cowork.py` never passes one then).
+    Schema 3 returns `(SCHEMA_3, entries, suite_id)`; see
+    `_normalize_schema3_inventory`. Schema-2 and legacy behavior is unchanged
+    when `suite` is None.
     """
     if not isinstance(raw_verification, list) or not raw_verification:
         raise InventoryError("empty_inventory", "verification inventory is "
                              "missing or empty")
+    is_schema3 = any(
+        isinstance(e, dict) and (e.get("kind") == KIND_FINAL_SUITE_COMPONENT
+                                 or "covers" in e)
+        for e in raw_verification)
+    if is_schema3 and declared_schema != SCHEMA_3:
+        raise InventoryError(
+            "declared_schema_mismatch",
+            "inventory carries final_suite_component/covers entries but the "
+            "plan declares verification_schema=%r; a composed suite requires "
+            "verification_schema=3" % (declared_schema,))
+    if declared_schema == SCHEMA_3:
+        if not is_schema3:
+            raise InventoryError(
+                "declared_schema_mismatch",
+                "plan declares verification_schema=3 but its inventory has "
+                "no final_suite_component entries")
+        if suite is None:
+            raise InventoryError(
+                "missing_suite_declaration",
+                "plan declares verification_schema=3 but carries no "
+                "verification_suite declaration")
+        return _normalize_schema3_inventory(raw_verification, suite)
+    if suite is not None:
+        raise InventoryError(
+            "declared_schema_mismatch",
+            "a verification_suite declaration was given but the plan "
+            "declares verification_schema=%r (only schema 3 uses one)"
+            % (declared_schema,))
     is_schema2 = any(
         isinstance(e, dict) and ("execution_mode" in e or "kind" in e)
         for e in raw_verification)
@@ -503,6 +576,885 @@ def _normalize_schema2_inventory(raw_verification):
     return SCHEMA_2, entries, final_suite_label
 
 
+def _is_positive_int(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value > 0)
+
+
+def _is_positive_number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value > 0)
+
+
+def _is_str_list(value, allow_empty=True):
+    return (isinstance(value, list)
+            and (allow_empty or len(value) > 0)
+            and all(isinstance(v, str) and v.strip() for v in value))
+
+
+def normalize_suite_declaration(suite):
+    """Validate a plan's `result.verification_suite` declaration and return
+    its canonical form `{suite_id, runner, tests_dir, universe{include,
+    exclude}, exclusion_reasons, split_modules}`. Pure; raises
+    `InventoryError("bad_suite_declaration", ...)` on any malformed field.
+    Idempotent: the canonical form normalizes to itself."""
+    def bad(why):
+        raise InventoryError("bad_suite_declaration",
+                             "verification_suite %s" % why)
+
+    if not isinstance(suite, dict):
+        bad("must be an object")
+    suite_id = suite.get("suite_id")
+    if not isinstance(suite_id, str) or not _SUITE_ID_RE.match(suite_id):
+        bad("suite_id %r must match %s" % (suite_id, _SUITE_ID_RE.pattern))
+    runner = suite.get("runner")
+    if runner not in SUITE_RUNNERS:
+        bad("runner %r must be one of %s" % (runner, SUITE_RUNNERS))
+    tests_dir = suite.get("tests_dir")
+    if not isinstance(tests_dir, str):
+        bad("tests_dir must be a repo-relative directory string")
+    tests_dir = tests_dir.rstrip("/")
+    segments = tests_dir.split("/")
+    if (not tests_dir or tests_dir.startswith("/") or "\\" in tests_dir
+            or any(seg in ("", ".", "..") for seg in segments)):
+        bad("tests_dir %r must be a repo-relative posix directory with no "
+            "empty, '.' or '..' segment" % (suite.get("tests_dir"),))
+    universe = suite.get("universe")
+    if not isinstance(universe, dict):
+        bad("universe must be an object with an include list")
+    include = universe.get("include")
+    if not _is_str_list(include, allow_empty=False):
+        bad("universe.include must be a non-empty list of patterns")
+    exclude = universe.get("exclude", [])
+    if not _is_str_list(exclude):
+        bad("universe.exclude must be a list of patterns")
+    reasons = suite.get("exclusion_reasons", {})
+    if not isinstance(reasons, dict) or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in reasons.items()):
+        bad("exclusion_reasons must map pattern strings to reason strings")
+    split_modules = suite.get("split_modules", [])
+    if not _is_str_list(split_modules):
+        bad("split_modules must be a list of repo-relative module paths")
+    return {
+        "suite_id": suite_id,
+        "runner": runner,
+        "tests_dir": tests_dir,
+        "universe": {"include": list(include), "exclude": list(exclude)},
+        "exclusion_reasons": dict(sorted(reasons.items())),
+        "split_modules": sorted(set(split_modules)),
+    }
+
+
+def _normalize_schema3_inventory(raw_verification, suite):
+    """Schema 3 = the schema-2 entry shape plus `kind=final_suite_component`.
+    `final_suite` is forbidden; at least one component is required;
+    components are contiguous and last. Each component carries `suite_id`
+    equal to the declaration's, a non-empty `covers` selector list, an
+    optional positive-int `expected_test_count` and an optional positive
+    `max_duration_s`, and a runner-PREFIX `command` (Cowork appends the
+    proven ids later, so a prefix token shaped like a test id is rejected).
+    Returns `(SCHEMA_3, entries, suite_id)`."""
+    declaration = normalize_suite_declaration(suite)
+    suite_id = declaration["suite_id"]
+    if not any(isinstance(item, dict)
+               and item.get("kind") == KIND_FINAL_SUITE_COMPONENT
+               for item in raw_verification):
+        raise InventoryError("missing_suite_components",
+                             "no kind=final_suite_component entry present")
+    entries = []
+    seen_labels = set()
+    first_component_index = None
+    covers_seen = {}
+    for i, item in enumerate(raw_verification):
+        if not isinstance(item, dict):
+            raise InventoryError("bad_entry", "entry %d is not an object" % i)
+        label = str(item.get("label") or "").strip()
+        command = item.get("command")
+        mode = item.get("execution_mode")
+        kind = item.get("kind")
+        if not label:
+            raise InventoryError("missing_label", "entry %d has no label" % i)
+        if label in seen_labels:
+            raise InventoryError("duplicate_label",
+                                 "duplicate label %r" % label)
+        seen_labels.add(label)
+        if kind == KIND_FINAL_SUITE:
+            raise InventoryError(
+                "final_suite_in_schema3",
+                "entry %r is kind=final_suite; a schema-3 inventory expresses "
+                "its complete suite only as final_suite_component entries"
+                % label)
+        if mode not in EXECUTION_MODES:
+            raise InventoryError(
+                "bad_execution_mode",
+                "entry %r has unknown/missing execution_mode %r "
+                "(expected one of %s)" % (label, mode, EXECUTION_MODES))
+        if kind not in SCHEMA3_KINDS:
+            raise InventoryError(
+                "bad_kind",
+                "entry %r has unknown/missing kind %r (expected one of %s)"
+                % (label, kind, SCHEMA3_KINDS))
+        if kind != KIND_FINAL_SUITE_COMPONENT and "covers" in item:
+            raise InventoryError(
+                "bad_kind",
+                "entry %r carries covers but is kind=%s (only "
+                "final_suite_component entries declare covers)"
+                % (label, kind))
+        if kind == KIND_PREFLIGHT and mode != "candidate_read_only":
+            raise InventoryError(
+                "preflight_wrong_mode",
+                "entry %r is kind=preflight but execution_mode is %r "
+                "(preflight must be candidate_read_only)" % (label, mode))
+        if kind != KIND_PREFLIGHT and mode != "isolated_snapshot":
+            raise InventoryError(
+                "downgraded_mode",
+                "entry %r (kind=%s) must use execution_mode=isolated_snapshot"
+                % (label, kind))
+        if not _is_argv_list(command):
+            raise InventoryError(
+                "bad_command", "entry %r command must be a non-empty argv "
+                "list of strings" % label)
+        entry = {
+            "label": label,
+            "command": list(command),
+            "execution_mode": mode,
+            "kind": kind,
+        }
+        if kind == KIND_FINAL_SUITE_COMPONENT:
+            if first_component_index is None:
+                first_component_index = i
+            if item.get("suite_id") != suite_id:
+                raise InventoryError(
+                    "foreign_suite_component",
+                    "component %r names suite_id %r, not the declared %r"
+                    % (label, item.get("suite_id"), suite_id))
+            covers = item.get("covers")
+            if not _is_str_list(covers, allow_empty=False):
+                raise InventoryError(
+                    "empty_component",
+                    "component %r must declare a non-empty covers list of "
+                    "selector strings" % label)
+            if "expected_test_count" in item and not _is_positive_int(
+                    item["expected_test_count"]):
+                raise InventoryError(
+                    "bad_expected_test_count",
+                    "component %r expected_test_count %r must be a positive "
+                    "integer" % (label, item["expected_test_count"]))
+            if "max_duration_s" in item and not _is_positive_number(
+                    item["max_duration_s"]):
+                raise InventoryError(
+                    "component_timeout_exceeds_policy",
+                    "component %r max_duration_s %r must be a positive "
+                    "number" % (label, item["max_duration_s"]))
+            for token in command:
+                if _RUNNER_ID_RE.match(token):
+                    raise InventoryError(
+                        "unbound_component_argv",
+                        "component %r command token %r is shaped like a "
+                        "test id; a component command is a runner prefix "
+                        "only and Cowork appends the proven ids" % (
+                            label, token))
+            key = tuple(sorted(covers))
+            if key in covers_seen:
+                raise InventoryError(
+                    "duplicate_component",
+                    "components %r and %r declare identical covers"
+                    % (covers_seen[key], label))
+            covers_seen[key] = label
+            entry["suite_id"] = suite_id
+            entry["covers"] = list(covers)
+            for key_name in ("expected_test_count", "max_duration_s"):
+                if key_name in item:
+                    entry[key_name] = item[key_name]
+        elif first_component_index is not None:
+            raise InventoryError(
+                "components_not_last",
+                "entry %r (kind=%s) follows a final_suite_component; "
+                "components must be contiguous and last" % (label, kind))
+        for key_name in ("invalidation_reason", "reuse_decision",
+                         "triggering_finding", "marginal_cost", "measures"):
+            if key_name in item:
+                entry[key_name] = item[key_name]
+        entries.append(entry)
+    if suite_id in seen_labels:
+        raise InventoryError(
+            "bad_suite_declaration",
+            "verification_suite suite_id %r equals an inventory label"
+            % suite_id)
+    return SCHEMA_3, entries, suite_id
+
+
+def validate_timeout_policy(schema, entries, command_timeout_s=None):
+    """Reject, before any snapshot work, a schema-3 inventory that cannot
+    satisfy the effective timeout policy. The effective per-command timeout
+    is `command_timeout_s` or `DEFAULT_COMMAND_TIMEOUT_S`; no plan field can
+    raise it. A component `max_duration_s` above it raises
+    `component_timeout_exceeds_policy`; an overall transaction deadline
+    above `MAX_OWNED_TRANSACTION_DEADLINE_S` raises
+    `overall_deadline_exceeds_policy`. Nothing is clamped. A no-op for
+    schema 1 and 2."""
+    if schema != SCHEMA_3:
+        return
+    effective = command_timeout_s or DEFAULT_COMMAND_TIMEOUT_S
+    for entry in entries:
+        if entry.get("kind") != KIND_FINAL_SUITE_COMPONENT:
+            continue
+        declared = entry.get("max_duration_s")
+        if declared is not None and declared > effective:
+            raise InventoryError(
+                "component_timeout_exceeds_policy",
+                "component %r max_duration_s=%s exceeds the effective "
+                "per-command timeout of %ss" % (
+                    entry.get("label"), declared, effective))
+    overall = _overall_deadline_s(entries, {"command_timeout_s": effective})
+    if overall > MAX_OWNED_TRANSACTION_DEADLINE_S:
+        raise InventoryError(
+            "overall_deadline_exceeds_policy",
+            "the transaction's overall deadline of %ss (%d entries at %ss "
+            "each) exceeds the Cowork ceiling of %ss" % (
+                overall, len(entries), effective,
+                MAX_OWNED_TRANSACTION_DEADLINE_S))
+
+
+def _sha256_json(value):
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _suite_module_id(path):
+    return posixpath.basename(path)[:-len(".py")]
+
+
+def prove_suite_partition(declaration, components, manifest_files,
+                          read_bytes):
+    """Prove, from an immutable snapshot manifest, that `components` exactly
+    partition the declared suite universe. Pure apart from `read_bytes`
+    (sha256 -> bytes of a content-addressed snapshot object); never executes
+    candidate code.
+
+    The universe is every manifest path matching an include pattern and no
+    exclude pattern (`fnmatch.fnmatchcase` on the whole posix path). Every
+    member must be a regular file named `test_*.py` directly inside
+    `tests_dir`. A module listed in `split_modules` contributes its
+    TestCase classes (static `ast` enumeration, see
+    `_enumerate_split_module_classes`) instead of itself. A selector
+    `<module path>::<class glob>` resolves against a split module's
+    classes; any other selector is a module glob over non-split universe
+    modules. Raises `InventoryError` for an empty universe, a non-runnable
+    member, a foreign split module, an unclassifiable split module, a
+    selector matching nothing, an overlapping member or a missing member.
+
+    Returns `(record, resolved)`: the proof record persisted in the request
+    and receipt, and `{component label: sorted runner ids}`.
+    """
+    decl = normalize_suite_declaration(declaration)
+    tests_dir = decl["tests_dir"]
+    include = decl["universe"]["include"]
+    exclude = decl["universe"]["exclude"]
+    universe = []
+    excluded = []
+    for path in sorted(manifest_files):
+        if not any(fnmatch.fnmatchcase(path, pat) for pat in include):
+            continue
+        if any(fnmatch.fnmatchcase(path, pat) for pat in exclude):
+            excluded.append(path)
+            continue
+        universe.append(path)
+    if not universe:
+        raise InventoryError(
+            "empty_universe",
+            "verification_suite universe include=%r exclude=%r selects no "
+            "snapshot file" % (include, exclude))
+    for path in universe:
+        entry = manifest_files.get(path) or {}
+        if (entry.get("type") != "file"
+                or posixpath.dirname(path) != tests_dir
+                or not _SUITE_MODULE_FILE_RE.match(posixpath.basename(path))):
+            raise InventoryError(
+                "universe_member_not_runnable",
+                "universe member %r is not a regular test_*.py file directly "
+                "inside tests_dir %r" % (path, tests_dir))
+    universe_set = set(universe)
+    split_modules = decl["split_modules"]
+    for module in split_modules:
+        if module not in universe_set:
+            raise InventoryError(
+                "foreign_split_module",
+                "split module %r is not a universe member" % module)
+    split_set = set(split_modules)
+    classes_by_module = {}
+    for module in split_modules:
+        classes_by_module[module] = _enumerate_split_module_classes(
+            module, read_bytes(manifest_files[module]["sha256"]))
+    whole_modules = [p for p in universe if p not in split_set]
+
+    all_ids = [_suite_module_id(p) for p in whole_modules]
+    for module in split_modules:
+        all_ids.extend("%s.%s" % (_suite_module_id(module), cls)
+                       for cls in classes_by_module[module])
+    all_ids = sorted(all_ids)
+
+    resolved = {}
+    owners = {}
+    for component in components:
+        label = component["label"]
+        ids = set()
+        for selector in component.get("covers") or []:
+            if "::" in selector:
+                module, _sep, class_glob = selector.partition("::")
+                if module not in split_set:
+                    raise InventoryError(
+                        "foreign_selector",
+                        "component %r selector %r names a module that is "
+                        "not in split_modules" % (label, selector))
+                matched = ["%s.%s" % (_suite_module_id(module), cls)
+                           for cls in classes_by_module[module]
+                           if fnmatch.fnmatchcase(cls, class_glob)]
+            else:
+                matched = [_suite_module_id(p) for p in whole_modules
+                           if fnmatch.fnmatchcase(p, selector)]
+            if not matched:
+                raise InventoryError(
+                    "foreign_selector",
+                    "component %r selector %r matches no universe member"
+                    % (label, selector))
+            ids.update(matched)
+        resolved[label] = sorted(ids)
+        for member in ids:
+            owners.setdefault(member, []).append(label)
+    overlaps = sorted((m, labels) for m, labels in owners.items()
+                      if len(labels) > 1)
+    if overlaps:
+        raise InventoryError(
+            "overlapping_members",
+            "%d member(s) are covered by more than one component, e.g. %s"
+            % (len(overlaps), "; ".join(
+                "%s in %s" % (m, ", ".join(labels))
+                for m, labels in overlaps[:5])))
+    missing = [m for m in all_ids if m not in owners]
+    if missing:
+        raise InventoryError(
+            "missing_members",
+            "%d universe member(s) are covered by no component, e.g. %s"
+            % (len(missing), ", ".join(missing[:5])))
+
+    component_records = []
+    for component in components:
+        member_ids = resolved[component["label"]]
+        rec = {
+            "label": component["label"],
+            "covers": list(component.get("covers") or []),
+            "member_count": len(member_ids),
+            "member_ids": member_ids,
+            "members_digest": _sha256_json(member_ids),
+        }
+        if "expected_test_count" in component:
+            rec["expected_test_count"] = component["expected_test_count"]
+        component_records.append(rec)
+    record = {
+        "proof": "partition_valid",
+        "proof_version": SUITE_PROOF_VERSION,
+        "suite_id": decl["suite_id"],
+        "runner": decl["runner"],
+        "tests_dir": tests_dir,
+        "universe": {"include": list(include), "exclude": list(exclude)},
+        "excluded_paths": excluded,
+        "exclusion_reasons": dict(decl["exclusion_reasons"]),
+        "split_modules": list(split_modules),
+        "granularity": "module+class" if split_modules else "module",
+        "member_count": len(all_ids),
+        "universe_digest": _sha256_json(
+            {"proof_version": SUITE_PROOF_VERSION, "members": all_ids}),
+        "components": component_records,
+        "declaration": decl,
+    }
+    return record, resolved
+
+
+def resolve_component_entries(entries, resolved):
+    """New entry dicts in which each final_suite_component's command is its
+    runner prefix plus exactly the sorted runner ids the partition proof
+    resolved for it. Other entries are copied unchanged."""
+    out = []
+    for entry in entries:
+        entry = dict(entry)
+        if entry.get("kind") == KIND_FINAL_SUITE_COMPONENT:
+            entry["command"] = (list(entry["command"])
+                                + list(resolved[entry["label"]]))
+        out.append(entry)
+    return out
+
+
+def component_test_count_check(entry, terminal):
+    """`(observed_count_or_None, check)` for one final_suite_component
+    attempt's terminal evidence. The count is the last `Ran N test(s)`
+    summary in stdout (the offline harness's JSON brief), else the last one
+    in stderr (plain unittest). `check` is `truncated` when either stream
+    was truncated (the worker keeps the head of a stream, so the summary may
+    be lost), `unstated` with no summary, `zero` for 0, `mismatch` against a
+    declared `expected_test_count`, otherwise `ok`. Pure."""
+    terminal = terminal if isinstance(terminal, dict) else {}
+    count = None
+    for stream in ("stdout", "stderr"):
+        text = terminal.get(stream)
+        if not isinstance(text, str):
+            continue
+        matches = _RAN_COUNT_RE.findall(text)
+        if matches:
+            count = int(matches[-1])
+            break
+    if terminal.get("stdout_truncated") or terminal.get("stderr_truncated"):
+        return count, TEST_COUNT_TRUNCATED
+    if count is None:
+        return None, TEST_COUNT_UNSTATED
+    if count == 0:
+        return 0, TEST_COUNT_ZERO
+    expected = (entry or {}).get("expected_test_count")
+    if expected is not None and count != expected:
+        return count, TEST_COUNT_MISMATCH
+    return count, TEST_COUNT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Static classification of a split module (no candidate code is executed).    #
+# --------------------------------------------------------------------------- #
+
+# Calls that can create classes or rewrite a namespace at import time (R7).
+_DYNAMIC_CALL_NAMES = frozenset((
+    "type", "exec", "eval", "compile", "globals", "vars", "locals",
+    "__import__", "setattr", "delattr", "getattr"))
+_ATTR_TARGET_CALL_NAMES = frozenset(("setattr", "delattr", "getattr"))
+_MODULE_HOOK_NAMES = frozenset(("load_tests", "__getattr__", "__dir__"))
+_CLASS_HOOK_NAMES = frozenset((
+    "__init_subclass__", "__class_getitem__", "__set_name__"))
+_TESTCASE_BASE_NAMES = frozenset(("TestCase", "IsolatedAsyncioTestCase"))
+_BUILTIN_METHOD_DECORATORS = frozenset((
+    "staticmethod", "classmethod", "property"))
+_PROPERTY_ACCESSORS = frozenset(("setter", "getter", "deleter"))
+_METHOD_DECORATOR_MODULES = frozenset((
+    "contextlib", "functools", "unittest", "unittest.mock"))
+_COMPOUND_STMTS = tuple(t for t in (
+    getattr(ast, name, None) for name in (
+        "If", "For", "AsyncFor", "While", "With", "AsyncWith", "Try",
+        "TryStar", "Match")) if t is not None)
+
+
+def _is_main_guard(stmt):
+    if not isinstance(stmt, ast.If):
+        return False
+    test = stmt.test
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1):
+        return False
+    sides = (test.left, test.comparators[0])
+
+    def is_name(node):
+        return isinstance(node, ast.Name) and node.id == "__name__"
+
+    def is_main(node):
+        return isinstance(node, ast.Constant) and node.value == "__main__"
+
+    return ((is_name(sides[0]) and is_main(sides[1]))
+            or (is_main(sides[0]) and is_name(sides[1])))
+
+
+def _expr_chain(node):
+    """`(root, parts)` for an Attribute/Subscript/Call chain: the innermost
+    node and the outer-to-inner accessor parts, root first."""
+    parts = []
+    while True:
+        if isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        elif isinstance(node, ast.Subscript):
+            parts.append("[]")
+            node = node.value
+        elif isinstance(node, ast.Call):
+            parts.append("()")
+            node = node.func
+        else:
+            parts.reverse()
+            return node, parts
+
+
+class _SplitModuleClassifier(object):
+    """Applies the fail-closed classification rule R1-R10 to one split
+    module's source over its import-executed code (IEC): every module-level
+    statement except the `if __name__ == "__main__":` block, every class
+    body (recursively through nested classes, never into def/lambda
+    bodies), and every decorator, base, keyword, argument default and
+    annotation evaluated at definition time."""
+
+    def __init__(self, path, tree):
+        self.path = path
+        self.tree = tree
+        self.module_stmts = [s for s in tree.body if not _is_main_guard(s)]
+        # name -> list of (binding kind, detail) at module scope.
+        self.bindings = {}
+        self.top_classes = {}
+        self.class_names = set()
+        self.local_code_names = set()
+        # Local classes mutated by an allowed `setattr(LocalClass, ...)`:
+        # they may gain test attributes at import, so a TestCase-derived
+        # target is always a member (over-inclusion is the safe direction).
+        self.setattr_targets = set()
+
+    def fail(self, rule, construct, node):
+        raise InventoryError(
+            "unclassifiable_split_module",
+            "%s: %s %s at line %s" % (
+                self.path, rule, construct, getattr(node, "lineno", "?")))
+
+    # -- module-scope bindings ------------------------------------------- #
+
+    def _bind(self, name, kind, detail=None):
+        self.bindings.setdefault(name, []).append((kind, detail))
+
+    def _bind_target(self, target, kind):
+        for node in ast.walk(target):
+            if isinstance(node, ast.Name):
+                self._bind(node.id, kind)
+
+    def _collect_module_scope(self, stmts, direct):
+        for stmt in stmts:
+            if isinstance(stmt, ast.ClassDef):
+                if not direct:
+                    self.fail("R4", "class %r defined inside a module-level "
+                              "compound statement" % stmt.name, stmt)
+                self._bind(stmt.name, "class", stmt)
+                self.top_classes[stmt.name] = stmt
+                continue
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._bind(stmt.name, "def", stmt)
+                continue
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if alias.asname:
+                        self._bind(alias.asname, "import", alias.name)
+                    else:
+                        root = alias.name.split(".")[0]
+                        self._bind(root, "import", root)
+                continue
+            if isinstance(stmt, ast.ImportFrom):
+                module = ("." * (stmt.level or 0)) + (stmt.module or "")
+                for alias in stmt.names:
+                    if alias.name == "*":
+                        self.fail("R9", "star import from %r can rebind "
+                                  "any name" % module, stmt)
+                    self._bind(alias.asname or alias.name, "from", module)
+                continue
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    self._bind_target(target, "assign")
+                    if (isinstance(target, ast.Name)
+                            and isinstance(stmt.value, ast.Lambda)):
+                        self.local_code_names.add(target.id)
+            elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
+                self._bind_target(stmt.target, "assign")
+            elif isinstance(stmt, (ast.For, getattr(ast, "AsyncFor", ast.For))):
+                self._bind_target(stmt.target, "for")
+            elif isinstance(stmt, (ast.With,
+                                   getattr(ast, "AsyncWith", ast.With))):
+                for item in stmt.items:
+                    if item.optional_vars is not None:
+                        self._bind_target(item.optional_vars, "with")
+            elif isinstance(stmt, ast.Delete):
+                for target in stmt.targets:
+                    self._bind_target(target, "del")
+            if isinstance(stmt, _COMPOUND_STMTS):
+                for field in ("body", "orelse", "finalbody"):
+                    self._collect_module_scope(
+                        getattr(stmt, field, None) or [], False)
+                for handler in getattr(stmt, "handlers", None) or []:
+                    if handler.name:
+                        self._bind(handler.name, "except")
+                    self._collect_module_scope(handler.body, False)
+                for case in getattr(stmt, "cases", None) or []:
+                    self._collect_module_scope(case.body, False)
+
+    def _only_bound_by_import_of(self, name, modules):
+        """True when every module-scope binding of `name` is an import of a
+        module in `modules` (`import X`/`import X as name`/`from X import
+        name`)."""
+        bound = self.bindings.get(name)
+        if not bound:
+            return False
+        return all(kind in ("import", "from") and detail in modules
+                   for kind, detail in bound)
+
+    # -- class membership ------------------------------------------------ #
+
+    def _base_kind(self, base):
+        """'local', 'testcase', 'object', or None (unresolvable, R2)."""
+        if isinstance(base, ast.Name):
+            if base.id in self.top_classes:
+                return "local"
+            if base.id == "object" and base.id not in self.bindings:
+                return "object"
+            if (base.id in _TESTCASE_BASE_NAMES
+                    and self._only_bound_by_import_of(
+                        base.id, ("unittest",))
+                    and all(kind == "from"
+                            for kind, _d in self.bindings[base.id])):
+                return "testcase"
+            return None
+        if (isinstance(base, ast.Attribute)
+                and isinstance(base.value, ast.Name)
+                and base.value.id == "unittest"
+                and base.attr in _TESTCASE_BASE_NAMES
+                and self._only_bound_by_import_of("unittest", ("unittest",))):
+            return "testcase"
+        return None
+
+    @staticmethod
+    def _own_test_attrs(cls):
+        for stmt in cls.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if stmt.name.startswith("test"):
+                    return True
+            elif isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if (isinstance(target, ast.Name)
+                            and target.id.startswith("test")):
+                        return True
+            elif isinstance(stmt, ast.AnnAssign):
+                if (isinstance(stmt.target, ast.Name)
+                        and stmt.target.id.startswith("test")):
+                    return True
+        return False
+
+    def _members(self):
+        derived = {}
+        has_tests = {}
+
+        def walk(name, seen):
+            if name in derived:
+                return derived[name], has_tests[name]
+            if name in seen:
+                return False, False
+            seen = seen | {name}
+            cls = self.top_classes[name]
+            is_tc = False
+            tests = (self._own_test_attrs(cls)
+                     or name in self.setattr_targets)
+            for base in cls.bases:
+                kind = self._base_kind(base)
+                if kind == "testcase":
+                    is_tc = True
+                elif kind == "local":
+                    b_tc, b_tests = walk(base.id, seen)
+                    is_tc = is_tc or b_tc
+                    tests = tests or b_tests
+            derived[name], has_tests[name] = is_tc, tests
+            return is_tc, tests
+
+        members = []
+        for name in sorted(self.top_classes):
+            is_tc, tests = walk(name, frozenset())
+            if is_tc and tests:
+                members.append(name)
+        return members
+
+    # -- IEC walk -------------------------------------------------------- #
+
+    def _check_call(self, node):
+        func = node.func
+        if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) \
+                and func.func.id in _ATTR_TARGET_CALL_NAMES:
+            self.fail("R8", "call of a %s() result" % func.func.id, node)
+        if isinstance(func, ast.Name):
+            name = func.id
+            if name in _DYNAMIC_CALL_NAMES and name not in self.bindings:
+                first = node.args[0] if node.args else None
+                if not (name in _ATTR_TARGET_CALL_NAMES
+                        and isinstance(first, ast.Name)
+                        and first.id in self.top_classes):
+                    self.fail("R7", "%s() call" % name, node)
+                if name == "setattr":
+                    self.setattr_targets.add(first.id)
+            elif name in _DYNAMIC_CALL_NAMES:
+                # A module-level rebinding of a builtin such as `setattr`
+                # would make the exemption above meaningless.
+                self.fail("R7", "call of rebound %s" % name, node)
+        root, parts = _expr_chain(func)
+        if (isinstance(func, ast.Attribute)
+                and func.attr in _DYNAMIC_CALL_NAMES
+                and isinstance(root, ast.Name)
+                and root.id in ("builtins", "__builtins__")):
+            self.fail("R7", "%s.%s() call" % (root.id, func.attr), node)
+        if isinstance(root, ast.Name):
+            if root.id in self.local_code_names:
+                self.fail("R8", "call into locally defined %r" % root.id,
+                          node)
+            if root.id == "sys" and parts[:1] == ["modules"]:
+                self.fail("R10", "sys.modules mutation call", node)
+
+    def _check_store_target(self, node):
+        root, parts = _expr_chain(node)
+        if not isinstance(root, ast.Name):
+            return
+        if (root.id == "sys" and parts[:1] == ["modules"]) \
+                or root.id == "__builtins__":
+            self.fail("R10", "write through %s" % root.id, node)
+
+    def _check_function_decorator(self, deco, class_ctx):
+        if isinstance(deco, ast.Name):
+            if (deco.id in _BUILTIN_METHOD_DECORATORS
+                    and deco.id not in self.bindings):
+                return
+        if (isinstance(deco, ast.Attribute)
+                and isinstance(deco.value, ast.Name)
+                and deco.attr in _PROPERTY_ACCESSORS
+                and class_ctx is not None
+                and deco.value.id in class_ctx["properties"]):
+            return
+        root, _parts = _expr_chain(deco)
+        if (isinstance(root, ast.Name)
+                and self._only_bound_by_import_of(
+                    root.id, _METHOD_DECORATOR_MODULES)):
+            return
+        self.fail("R8", "function decorator outside the allow-list", deco)
+
+    def _check_class_decorator(self, deco):
+        root, _parts = _expr_chain(deco)
+        if (isinstance(root, ast.Name) and root.id == "unittest"
+                and self._only_bound_by_import_of("unittest", ("unittest",))
+                and all(kind == "import"
+                        for kind, _d in self.bindings["unittest"])):
+            return
+        self.fail("R8", "class decorator not rooted at unittest", deco)
+
+    def _visit_def(self, node, class_ctx):
+        if node.name in self.class_names:
+            self.fail("R9", "def rebinding class name %r" % node.name, node)
+        for deco in node.decorator_list:
+            self._check_function_decorator(deco, class_ctx)
+            self._visit(deco, False, class_ctx)
+            if (class_ctx is not None and isinstance(deco, ast.Name)
+                    and deco.id == "property"):
+                class_ctx["properties"].add(node.name)
+        self._visit(node.args, False, class_ctx)
+        if node.returns is not None:
+            self._visit(node.returns, False, class_ctx)
+
+    def _visit_class(self, node, module_direct):
+        if node.keywords:
+            self.fail("R5", "class %r keyword %r" % (
+                node.name, node.keywords[0].arg or "**"), node)
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and stmt.name in _CLASS_HOOK_NAMES:
+                self.fail("R6", "class %r defines %s" % (
+                    node.name, stmt.name), stmt)
+            targets = []
+            if isinstance(stmt, ast.Assign):
+                targets = stmt.targets
+            elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                targets = [stmt.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and (
+                        target.id in _CLASS_HOOK_NAMES
+                        or target.id == "__class__"):
+                    self.fail("R6", "class %r assigns %s" % (
+                        node.name, target.id), stmt)
+        for deco in node.decorator_list:
+            self._check_class_decorator(deco)
+            self._visit(deco, False, None)
+        for base in node.bases:
+            if isinstance(base, ast.Starred):
+                self.fail("R2", "starred base of class %r" % node.name,
+                          base)
+            if module_direct and self._base_kind(base) is None:
+                self.fail("R2", "unresolvable base of class %r" % node.name,
+                          base)
+            self._visit(base, False, None)
+        class_ctx = {"properties": set()}
+        for stmt in node.body:
+            self._visit(stmt, False, class_ctx)
+
+    def _visit(self, node, module_direct, class_ctx):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self._visit_def(node, class_ctx)
+            return
+        if isinstance(node, ast.ClassDef):
+            self._visit_class(node, module_direct)
+            return
+        if isinstance(node, ast.Lambda):
+            self._visit(node.args, False, class_ctx)
+            return
+        if isinstance(node, ast.Call):
+            self._check_call(node)
+        elif isinstance(node, ast.Name):
+            if (isinstance(node.ctx, (ast.Store, ast.Del))
+                    and node.id in self.class_names):
+                self.fail("R9", "rebinding of class name %r" % node.id, node)
+        elif isinstance(node, (ast.Attribute, ast.Subscript)):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self._check_store_target(node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                if bound in self.class_names:
+                    self.fail("R9", "import rebinding class name %r"
+                              % bound, node)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name and node.name in self.class_names:
+                self.fail("R9", "except target rebinding class name %r"
+                          % node.name, node)
+        else:
+            for attr in ("name",):
+                value = getattr(node, attr, None)
+                if (type(node).__name__ in ("MatchAs", "MatchStar")
+                        and value in self.class_names):
+                    self.fail("R9", "match target rebinding class name %r"
+                              % value, node)
+        for child in ast.iter_child_nodes(node):
+            self._visit(child, False, class_ctx)
+
+    def run(self):
+        self._collect_module_scope(self.module_stmts, True)
+        self.class_names = set(self.top_classes)
+        for name in _MODULE_HOOK_NAMES:
+            if name in self.bindings:
+                self.fail("R3", "module-level %s" % name,
+                          next((d for _k, d in self.bindings[name]
+                                if hasattr(d, "lineno")), None))
+        for name, bound in self.bindings.items():
+            if name in self.class_names and any(
+                    kind != "class" for kind, _d in bound):
+                self.fail("R9", "module-level rebinding of class name %r"
+                          % name, self.top_classes[name])
+        self.local_code_names |= {
+            name for name, bound in self.bindings.items()
+            if any(kind in ("def", "class") for kind, _d in bound)}
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                for name in node.names:
+                    if name in self.class_names:
+                        self.fail("R9", "global/nonlocal naming class %r"
+                                  % name, node)
+        for stmt in self.module_stmts:
+            self._visit(stmt, True, None)
+        return self._members()
+
+
+def _enumerate_split_module_classes(path, source_bytes):
+    """The sorted TestCase member class names of one split module, by static
+    `ast` analysis of its snapshot bytes under the fail-closed rule R1-R10
+    (see `_SplitModuleClassifier`). Raises
+    `InventoryError("unclassifiable_split_module", "<path>: R<n> ...")`."""
+    try:
+        tree = ast.parse(source_bytes, filename=path)
+    except (SyntaxError, ValueError) as exc:
+        raise InventoryError(
+            "unclassifiable_split_module",
+            "%s: R1 unparseable source at line %s" % (
+                path, getattr(exc, "lineno", "?")))
+    return _SplitModuleClassifier(path, tree).run()
+
+
 def _is_argv_list(command):
     return (isinstance(command, list) and len(command) > 0
             and all(isinstance(tok, str) for tok in command))
@@ -566,12 +1518,17 @@ def deduplicate_inventory(entries):
     final-suite-execution guarantee unreachable — "final" is a role, not
     just a command string, so it is exempt from the command-identity
     dedup that plain focused/baseline checks are subject to.
+
+    A schema-3 `kind=final_suite_component` entry is exempt for the same
+    reason: each component is a proven share of the composed suite, so dedup
+    can never mask coverage (their resolved argv differ by construction).
     """
     kept = []
     index_by_identity = {}
     reused = {}
     for entry in entries:
-        if entry.get("kind") == KIND_FINAL_SUITE:
+        if entry.get("kind") in (KIND_FINAL_SUITE,
+                                 KIND_FINAL_SUITE_COMPONENT):
             kept.append(entry)
             continue
         identity = (tuple(entry["command"]), entry["execution_mode"])
@@ -590,7 +1547,7 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
                   command_timeout_s=None, term_grace_s=None,
                   overall_deadline_s=None, evidence_poll_attempts=None,
                   evidence_poll_delay_s=None, output_cap_bytes=None,
-                  work_id=None, key_suffix=""):
+                  work_id=None, key_suffix="", suite_record=None):
     """Build the versioned JSON request document persisted before the worker
     is spawned (see `cowork_state.verification_request_path_for`).
 
@@ -611,16 +1568,23 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
     correlation field on the persisted request document — never consulted
     by `request_key`, dedup, or any decision this module makes — so an
     absent `work_id` (every pre-M2 caller) changes nothing about existing
-    behavior."""
+    behavior.
+
+    `suite_record` (schema 3 only): the partition proof record. When given
+    it is persisted as `request["suite"]` and its canonical JSON is appended
+    to the request-key material, so a different partition never reuses
+    another transaction's terminal result. When None, the key material and
+    the request document are exactly as before (no `suite` key)."""
     entries, reused = deduplicate_inventory(entries)
     inventory_key = normalized_inventory_key(schema, entries)
     config_blob = json.dumps(configuration or {}, sort_keys=True)
-    request_key = hashlib.sha256(
-        ("%s|%s|%s|%s%s" % (snapshot_manifest_digest, index_digest,
-                            config_blob, inventory_key,
-                            key_suffix)).encode("utf-8")
-    ).hexdigest()
-    return {
+    key_material = "%s|%s|%s|%s" % (snapshot_manifest_digest, index_digest,
+                                    config_blob, inventory_key)
+    key_material += key_suffix
+    if suite_record is not None:
+        key_material += "|" + json.dumps(suite_record, sort_keys=True)
+    request_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+    request = {
         "protocol_version": PROTOCOL_VERSION,
         "transaction_id": transaction_id,
         "session_uuid": session_uuid,
@@ -654,6 +1618,9 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
         "output_cap_bytes": output_cap_bytes or DEFAULT_OUTPUT_CAP_BYTES,
         "created_at": _utc_now(),
     }
+    if suite_record is not None:
+        request["suite"] = suite_record
+    return request
 
 
 # =========================================================================== #
@@ -1671,6 +2638,35 @@ def reconcile_deferred_transaction(repo, session_uuid, stored_result):
             final_suite_binding = "ran_once"
         rebuilt.append(attempt)
 
+    # Schema 3: re-prove the partition against this transaction's own
+    # snapshot, and recompute each present component's executed-test count
+    # from its durable terminal event (ledger records carry no stdout).
+    schema3 = (isinstance(request, dict)
+               and request.get("inventory_schema") == SCHEMA_3
+               and isinstance(inventory, list))
+    suite_note = None
+    if schema3:
+        suite_note = _reprove_suite(session_uuid, transaction_id, request)
+        entry_by_label = {e.get("label"): e for e in inventory
+                          if isinstance(e, dict)}
+        recounted = []
+        for attempt in rebuilt:
+            entry = (entry_by_label.get(attempt.get("label"))
+                     if isinstance(attempt, dict) else None)
+            if (isinstance(entry, dict)
+                    and entry.get("kind") == KIND_FINAL_SUITE_COMPONENT
+                    and attempt.get("evidence_state") == EVIDENCE_PRESENT
+                    and attempt.get("exit_code") == 0
+                    and not attempt.get("timed_out")):
+                count, check = component_test_count_check(
+                    entry, _terminal_event_for(
+                        session_uuid, transaction_id, attempt.get("label")))
+                attempt = dict(attempt, observed_test_count=count,
+                               test_count_check=check)
+            recounted.append(attempt)
+        rebuilt = recounted
+        final_suite_binding = _components_binding(inventory, rebuilt)
+
     # Same verdict rules as `_run_owned_transaction`, including a fresh
     # mutation check against the ORIGINAL snapshot.
     mutation = base.get("mutation")
@@ -1678,6 +2674,8 @@ def reconcile_deferred_transaction(repo, session_uuid, stored_result):
     if not base.get("worker_identity_verified"):
         verdict = VERDICT_UNVERIFIED
     elif base.get("ledger_failure") is not None:
+        verdict = VERDICT_UNVERIFIED
+    elif suite_note is not None:
         verdict = VERDICT_UNVERIFIED
     elif stamp.get("deadline_hit"):
         verdict = VERDICT_UNVERIFIED
@@ -1700,28 +2698,69 @@ def reconcile_deferred_transaction(repo, session_uuid, stored_result):
                 isinstance(a, dict)
                 and a.get("evidence_state") == EVIDENCE_PRESENT
                 and a.get("exit_code") == 0 and not a.get("timed_out")
-                for a in rebuilt):
+                for a in rebuilt) and (
+                    not schema3 or _components_green(inventory, rebuilt)):
             verdict = VERDICT_GREEN
-            final_suite_binding = _green_final_suite_binding(
-                final_suite_label, final_suite_binding,
-                bool(isinstance(request, dict)
-                     and request.get("final_suite_reused")
-                     or base.get("final_suite_reused")))
+            if schema3:
+                final_suite_binding = FINAL_SUITE_COMPONENTS_RAN_ONCE
+            else:
+                final_suite_binding = _green_final_suite_binding(
+                    final_suite_label, final_suite_binding,
+                    bool(isinstance(request, dict)
+                         and request.get("final_suite_reused")
+                         or base.get("final_suite_reused")))
         else:
             verdict = VERDICT_RED
 
     reconciled_at = _utc_now()
+    stamp_out = {
+        "state": "reconciled", "transaction_id": transaction_id,
+        "reconciled": sorted(resolved),
+        "reconciled_at": reconciled_at}
+    if suite_note is not None:
+        stamp_out["note"] = suite_note
     result = TransactionResult(dict(
         base, attempts=rebuilt, verdict=verdict,
         final_suite_binding=final_suite_binding, mutation=mutation,
         reused_lock_result=False,
-        deferred_reconciliation={
-            "state": "reconciled", "transaction_id": transaction_id,
-            "reconciled": sorted(resolved),
-            "reconciled_at": reconciled_at}))
+        deferred_reconciliation=stamp_out))
     return (_persist_terminal_result(
         session_uuid, transaction_id, base["request_key"], result),
         "reconciled")
+
+
+def _reprove_suite(session_uuid, transaction_id, request):
+    """Deferred-path re-proof for a schema-3 request: re-run
+    `prove_suite_partition` with the stored declaration and components
+    against the transaction's own snapshot manifest and objects. Returns
+    None when the fresh record equals `request["suite"]`, else the note
+    `suite_proof_mismatch` (any InventoryError or unreadable snapshot
+    included)."""
+    stored = request.get("suite")
+    if not isinstance(stored, dict) or not isinstance(
+            stored.get("declaration"), dict):
+        return "suite_proof_mismatch"
+    manifest_doc = state_store.read_json_tolerant(
+        state_store.verification_snapshot_manifest_path_for(
+            session_uuid, transaction_id))
+    if not isinstance(manifest_doc, dict):
+        return "suite_proof_mismatch"
+    components = [e for e in request.get("inventory") or ()
+                  if isinstance(e, dict)
+                  and e.get("kind") == KIND_FINAL_SUITE_COMPONENT]
+
+    def _read_snapshot_object(sha256):
+        with open(state_store.verification_snapshot_object_path(
+                session_uuid, sha256), "rb") as fh:
+            return fh.read()
+
+    try:
+        record, _resolved = prove_suite_partition(
+            stored["declaration"], components,
+            manifest_doc.get("files") or {}, _read_snapshot_object)
+    except (InventoryError, OSError, KeyError, TypeError):
+        return "suite_proof_mismatch"
+    return None if record == stored else "suite_proof_mismatch"
 
 
 def _recover_abandoned_transaction(session_uuid, owner):
@@ -2372,14 +3411,22 @@ class TransactionResult(dict):
         {
           "transaction_id", "request_key", "verdict": green|red|unverified,
           "final_suite_label", "final_suite_binding": ran_once|legacy_unknown|
-              not_reached,
+              not_reached|components_ran_once,
           "attempts": [{"label", "attempt_id", "exit_code", "timed_out",
                         "evidence_state", ...per-command fields}],
           "mutation": None | {mutation report},
           "worker_identity_verified": bool,
           "reused_lock_result": bool,
           "created_at", "finished_at",
+          "suite": {partition proof record}   # schema 3 only
         }
+
+    Schema 3 (composed final suite): `final_suite_label` is the declared
+    `suite_id`; `final_suite_binding` is `components_ran_once` when every
+    `final_suite_component` attempt has evidence present exactly once, and
+    each component attempt also carries `observed_test_count` and
+    `test_count_check` (`ok`/`zero`/`unstated`/`mismatch`/`truncated`). Green
+    additionally requires every component's count check to be `ok`.
     """
 
 
@@ -2470,7 +3517,8 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
                     python_executable=None, command_timeout_s=None,
                     term_grace_s=None, waiter_deadline_s=None,
                     evidence_poll_attempts=None, evidence_poll_delay_s=None,
-                    cancel_event=None, work_id=None, reuse_policy=None):
+                    cancel_event=None, work_id=None, declared_schema=None,
+                    suite=None, reuse_policy=None):
     """Build the snapshot, acquire single-flight, spawn+verify the worker,
     drive it through the approved inventory, tear everything down on
     completion/cancel/timeout, and return a `TransactionResult`.
@@ -2500,10 +3548,21 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
     `result["evidence_reuse"]` with its source transaction and dependency
     digest. A reused final suite is bound `reused_dependency_bound`, never
     `ran_once`.
+    `declared_schema`/`suite` (schema 3): the plan's own
+    `verification_schema` and `verification_suite`, forwarded to
+    `normalize_inventory`. For schema 3 the timeout policy is checked before
+    any snapshot work, and the partition proof runs against the immutable
+    snapshot BEFORE the request is built, the single-flight lock is taken,
+    any ledger id is minted or any worker is spawned; each component's
+    command then gets exactly its proven runner ids appended. Any
+    `InventoryError` raised after the snapshot exists deletes the partial
+    snapshot before propagating.
     """
     python_executable = python_executable or sys.executable or "python3"
     transaction_id = new_transaction_id()
-    schema, entries, final_suite_label = normalize_inventory(raw_verification)
+    schema, entries, final_suite_label = normalize_inventory(
+        raw_verification, declared_schema=declared_schema, suite=suite)
+    validate_timeout_policy(schema, entries, command_timeout_s)
 
     snapshot = build_snapshot(repo, session_uuid, transaction_id)
     entries, evidence_reuse, dependency_digests = _plan_evidence_reuse(
@@ -2517,7 +3576,28 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
     # (`os.path.realpath` normalizes a not-yet-existing path just fine).
     checks_root = state_store.verification_command_checks_root_for(
         session_uuid, transaction_id)
-    validate_argv_safety(entries, checks_root)
+    suite_record = None
+    try:
+        validate_argv_safety(entries, checks_root)
+        if schema == SCHEMA_3:
+            manifest_doc = state_store.read_json_tolerant(
+                snapshot["manifest_path"]) or {}
+
+            def _read_snapshot_object(sha256):
+                with open(state_store.verification_snapshot_object_path(
+                        session_uuid, sha256), "rb") as fh:
+                    return fh.read()
+
+            suite_record, resolved = prove_suite_partition(
+                suite,
+                [e for e in entries
+                 if e.get("kind") == KIND_FINAL_SUITE_COMPONENT],
+                manifest_doc.get("files") or {}, _read_snapshot_object)
+            entries = resolve_component_entries(entries, resolved)
+            validate_argv_safety(entries, checks_root)
+    except InventoryError:
+        _delete_partial_snapshot(session_uuid, transaction_id)
+        raise
 
     request = build_request(
         session_uuid, transaction_id, repo, snapshot["manifest_digest"],
@@ -2526,7 +3606,7 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
         term_grace_s=term_grace_s,
         evidence_poll_attempts=evidence_poll_attempts,
         evidence_poll_delay_s=evidence_poll_delay_s, work_id=work_id,
-        key_suffix=_reuse_key_suffix(evidence_reuse))
+        key_suffix=_reuse_key_suffix(evidence_reuse), suite_record=suite_record)
     if reuse_policy is not None:
         request["evidence_reuse"] = evidence_reuse
     if dependency_digests:
@@ -2805,6 +3885,7 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
     manifest_doc = state_store.read_json_tolerant(snapshot["manifest_path"])
     manifest_files = (manifest_doc or {}).get("files", {})
     ledger_path = state_store.ledger_path_for(session_uuid)
+    schema3 = request.get("inventory_schema") == SCHEMA_3
 
     # `timeout_policy`/`overall_deadline` are computed BEFORE `spawn_worker`
     # is called (M5A-R-M1) -- restoring the base commit's own ordering, not
@@ -3101,7 +4182,8 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
                     # in flight for it anymore.
                     active_label = None
                 if attempt.get("exit_code") not in (0, None) or attempt.get(
-                        "timed_out"):
+                        "timed_out") or attempt.get("test_count_check") not in (
+                            None, TEST_COUNT_OK):
                     break
 
         # BACKSTOP: complete the lifecycle for every entry not already
@@ -3166,6 +4248,9 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
                                if ledger_failure else None,
             }
 
+        if schema3:
+            final_suite_binding = _components_binding(entries, attempts)
+
         if not worker_verified:
             verdict = VERDICT_UNVERIFIED
         elif ledger_failure is not None:
@@ -3184,11 +4269,16 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
             elif len(attempts) == len(entries) and all(
                     a.get("evidence_state") == EVIDENCE_PRESENT
                     and a.get("exit_code") == 0 and not a.get("timed_out")
-                    for a in attempts):
+                    for a in attempts) and (
+                        not schema3
+                        or _components_green(entries, attempts)):
                 verdict = VERDICT_GREEN
-                final_suite_binding = _green_final_suite_binding(
-                    final_suite_label, final_suite_binding,
-                    bool(request.get("final_suite_reused")))
+                if schema3:
+                    final_suite_binding = FINAL_SUITE_COMPONENTS_RAN_ONCE
+                else:
+                    final_suite_binding = _green_final_suite_binding(
+                        final_suite_label, final_suite_binding,
+                        bool(request.get("final_suite_reused")))
             else:
                 verdict = VERDICT_RED
     finally:
@@ -3268,6 +4358,8 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         "finished_at": _utc_now(),
     })
     _stamp_reuse(result, request)
+    if schema3:
+        result["suite"] = request.get("suite")
     if _defer_teardown:
         # Issue #51: teardown was deferred because a command is still
         # possibly alive. The verdict above is unchanged (evidence is not
@@ -3278,6 +4370,56 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         result["deferred_reconciliation"] = _deferred_reconciliation_stamp(
             session_uuid, transaction_id, deadline_hit)
     return result
+
+
+def _component_labels(entries):
+    return [e.get("label") for e in entries or ()
+            if isinstance(e, dict)
+            and e.get("kind") == KIND_FINAL_SUITE_COMPONENT]
+
+
+def _components_binding(entries, attempts):
+    """Schema-3 final-suite binding: `components_ran_once` when every
+    component label has exactly one attempt with evidence present,
+    `not_reached` otherwise."""
+    present = {}
+    for attempt in attempts or ():
+        if (isinstance(attempt, dict)
+                and attempt.get("evidence_state") == EVIDENCE_PRESENT):
+            label = attempt.get("label")
+            present[label] = present.get(label, 0) + 1
+    labels = _component_labels(entries)
+    if labels and all(present.get(label) == 1 for label in labels):
+        return FINAL_SUITE_COMPONENTS_RAN_ONCE
+    return "not_reached"
+
+
+def _components_green(entries, attempts):
+    """The schema-3 additions to the green rule: exactly one attempt per
+    component label, and each with an `ok` executed-test count."""
+    by_label = {}
+    for attempt in attempts or ():
+        if isinstance(attempt, dict):
+            by_label.setdefault(attempt.get("label"), []).append(attempt)
+    for label in _component_labels(entries):
+        mine = by_label.get(label) or []
+        if len(mine) != 1 or mine[0].get("test_count_check") != TEST_COUNT_OK:
+            return False
+    return True
+
+
+def _terminal_event_for(session_uuid, transaction_id, label):
+    """The last worker `terminal` event recorded for `label` in this
+    transaction's durable attempt-events file, or None."""
+    events = state_store.read_jsonl_tolerant(
+        state_store.verification_attempt_events_path_for(
+            session_uuid, transaction_id))
+    found = None
+    for event in events or ():
+        if (isinstance(event, dict) and event.get("event") == "terminal"
+                and event.get("label") == label):
+            found = event
+    return found
 
 
 def _deferred_reconciliation_stamp(session_uuid, transaction_id,

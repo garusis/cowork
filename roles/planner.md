@@ -149,11 +149,11 @@ measurement metadata (`invalidation_reason`, `reuse_decision`,
   the one accepted full-suite result for the reviewed candidate.
 - Every inventory command has a Cowork-owned outer deadline of 300 seconds.
   A larger timeout passed to the test program does not extend that deadline.
-  Size focused entries accordingly, but do not call a shard `final_suite`: the
-  single final entry must still be the complete regression suite and must fit
-  inside the outer deadline. If no honest complete-suite command can do so,
-  report the plan as blocked by that execution constraint instead of weakening
-  the meaning of `final_suite`.
+  Size focused entries accordingly, but do not call a shard `final_suite`: in
+  schema 2 the single final entry must still be the complete regression suite
+  and must fit inside the outer deadline. If no honest complete-suite command
+  can do so, use a schema-3 composed suite (below) instead of weakening the
+  meaning of `final_suite`.
 
 ```json
 "verification_schema": 2,
@@ -166,6 +166,95 @@ measurement metadata (`invalidation_reason`, `reuse_decision`,
    "execution_mode": "isolated_snapshot", "kind": "final_suite"}
 ]
 ```
+
+#### Composed complete suite (schema 3)
+
+When the repo's complete regression suite cannot honestly finish inside one
+300-second command, declare `result.verification_schema: 3`, a plan-level
+`result.verification_suite`, and express the complete suite as
+`kind: final_suite_component` entries instead of one `final_suite`. The
+300-second bound still applies to **every** component; schema 3 composes
+bounded commands, it never enlarges one.
+
+- `verification_suite` declares the universe: `suite_id` (a short token, not
+  equal to any label), `runner` (exactly `unittest_ids`), `tests_dir`,
+  `universe.include` / optional `universe.exclude` (repo-relative
+  `fnmatch` patterns; `*` crosses `/`), optional `exclusion_reasons`
+  (pattern → reason), and optional `split_modules`.
+- The universe **must be the repo's complete regression suite.** Name every
+  exclusion in `universe.exclude` and give it a reason in
+  `exclusion_reasons`; a test that must run differently (e.g. outside the
+  harness) belongs in its own `baseline` entry.
+- `tests_dir` **must be the directory the runner resolves test ids in**
+  (e.g. the offline harness resolves ids in `scripts/`). Every universe module
+  is a `test_*.py` file directly inside it.
+- Each component has `label`, `command`, `execution_mode:
+  isolated_snapshot`, `kind: final_suite_component`, `suite_id` (equal to the
+  declaration's), and non-empty `covers` selectors, plus optional
+  `expected_test_count` (exact) and `max_duration_s` (at most the per-command
+  timeout). Components are contiguous and last; `final_suite` is not allowed
+  in schema 3. `baseline`, `focused` and `preflight` entries keep their
+  schema-2 rules.
+- `command` is the runner **prefix only**. Cowork appends the sorted ids of
+  exactly the members it proved for that component (`test_mod` for a module,
+  `test_mod.Class` for a class); a prefix token shaped like a test id is
+  rejected.
+- A `covers` selector is a module glob over universe modules that are not
+  split (`scripts/test_owner_*.py`), or `<split module path>::<class glob>`
+  (`scripts/test_big.py::[A-M]*`) for a module listed in `split_modules`.
+- Before anything runs, Cowork proves from the immutable snapshot that the
+  components **exactly partition** the declared universe: a member covered by
+  no component, by two components, a selector matching nothing, or a split
+  module that cannot be classified is rejected, as is any component or
+  transaction that cannot satisfy the timeout policy. A test file added later
+  is either picked up by a selector or rejected as missing.
+- A split module is enumerated statically, never executed. It must not create
+  or rebind classes at import: no metaclasses or class keywords, no
+  `__init_subclass__`, no module-level `__getattr__`/`__dir__`/`load_tests`,
+  no `type()`/`exec()`/`globals()`-style calls or calls into local helpers at
+  import time, class decorators only from `unittest`, method decorators only
+  `staticmethod`/`classmethod`/`property` or from
+  `contextlib`/`functools`/`unittest`/`unittest.mock`, and no rebinding of a
+  test class name. If a module cannot meet this, do not split it.
+- The runner must print unittest's `Ran N tests` summary. A component that
+  ran zero tests, printed no summary, disagreed with `expected_test_count`, or
+  produced output beyond the worker's per-stream output cap (the cap keeps the
+  head of the stream, where the summary is not) is red. Use a runner whose
+  summary output fits the cap; the offline harness prints a short JSON brief.
+- Cowork proves only that the components partition the **declared** universe.
+  Whether that universe is the complete regression suite, and whether
+  `tests_dir` is the runner's id root, is judged by the planning-advisor and
+  the build-reviewer from the receipt-visible declaration.
+
+```json
+"verification_schema": 3,
+"verification_suite": {
+  "suite_id": "complete-regression", "runner": "unittest_ids",
+  "tests_dir": "scripts",
+  "universe": {"include": ["scripts/test_*.py"],
+               "exclude": ["scripts/test_plain_only.py"]},
+  "exclusion_reasons": {"scripts/test_plain_only.py": "must run outside the harness; listed as its own baseline"},
+  "split_modules": ["scripts/test_big.py"]
+},
+"verification": [
+  {"label": "plain-only self-test", "command": ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_plain_only.py"],
+   "execution_mode": "isolated_snapshot", "kind": "baseline"},
+  {"label": "suite-modules", "command": ["python3", "scripts/cowork_offline_tests.py"],
+   "execution_mode": "isolated_snapshot", "kind": "final_suite_component",
+   "suite_id": "complete-regression", "covers": ["scripts/test_*.py"]},
+  {"label": "suite-big-a-m", "command": ["python3", "scripts/cowork_offline_tests.py"],
+   "execution_mode": "isolated_snapshot", "kind": "final_suite_component",
+   "suite_id": "complete-regression", "covers": ["scripts/test_big.py::[A-M]*"],
+   "max_duration_s": 280},
+  {"label": "suite-big-rest", "command": ["python3", "scripts/cowork_offline_tests.py"],
+   "execution_mode": "isolated_snapshot", "kind": "final_suite_component",
+   "suite_id": "complete-regression", "covers": ["scripts/test_big.py::[!A-M]*"]}
+]
+```
+
+A plan whose change touches the verification mechanism itself is gated by the
+**stable** runner's contract, not the candidate's: plan its inventory in a
+schema the stable runner already understands.
 
 **Legacy compatibility.** A plan that omits `verification_schema` and writes
 plain `{label, command}` entries (a `command` string or argv, no

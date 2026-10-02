@@ -53,8 +53,18 @@ Read them all from disk, then check:
    regression references and product fields are not flagged — a keyword alone
    is never grounds for a finding. Every owned-verification command has a
    300-second outer deadline that a test runner's timeout cannot enlarge.
-   Flag a `final_suite` that is only a shard, is not the complete regression
-   suite, or cannot honestly finish inside that bound.
+   In a schema-2 plan, flag a `final_suite` that is only a shard, is not the
+   complete regression suite, or cannot honestly finish inside that bound. In
+   a schema-3 plan (a composed suite of `final_suite_component` entries),
+   Cowork proves only that the components partition the **declared**
+   universe, so judge the declaration itself: flag a universe whose
+   `include`/`exclude` selectors do not cover the repo's complete regression
+   suite, an exclusion without a sound reason, a `tests_dir` that is not the
+   runner's test-id root, a `split_modules` entry the static classification
+   rule would reject (dynamic or rebound classes, metaclasses, class
+   keywords, non-`unittest` class decorators), a runner that does not print a
+   `Ran N tests` summary within the worker's output cap, and any component
+   that cannot plausibly finish inside 300 seconds.
 6. **Altitude.** Is the plan over- or under-built? "Avoid overengineering"
    means removing unproven scaffolding, not accepting a vague or cheap plan.
 7. **Hygiene.** No placeholders (TBD/TODO/open question) in a ready plan; every

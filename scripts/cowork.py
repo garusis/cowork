@@ -3027,6 +3027,20 @@ def _declared_plan_schema(session_uuid, plan_json_path=None):
         return None
 
 
+def _plan_verification_suite(session_uuid, plan_json_path=None):
+    """The plan's OWN `result.verification_suite` declaration (any type), or
+    None when absent/unreadable. Consulted ONLY when the plan declares
+    `verification_schema: 3`; a stray declaration on a schema-2/1 plan is
+    never read, so those plans behave exactly as before."""
+    try:
+        directory = state_store.session_assets_dir(session_uuid)
+        plan = measure._read_json(plan_json_path or os.path.join(
+            directory, "planner.plan.json"))
+        return ((plan or {}).get("result") or {}).get("verification_suite")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _plan_inventory(session_uuid):
     """Normalize the approved plan's verification array via
     `cowork_verification.normalize_inventory`, preserving label/command/
@@ -3040,9 +3054,14 @@ def _plan_inventory(session_uuid):
     raw = _raw_plan_verification(session_uuid)
     if not raw:
         return None, None, None
+    declared_schema = _declared_plan_schema(session_uuid)
     try:
+        if declared_schema == verification.SCHEMA_3:
+            return verification.normalize_inventory(
+                raw, declared_schema=declared_schema,
+                suite=_plan_verification_suite(session_uuid))
         return verification.normalize_inventory(
-            raw, declared_schema=_declared_plan_schema(session_uuid))
+            raw, declared_schema=declared_schema)
     except verification.InventoryError:
         return None, None, None
 
@@ -3357,6 +3376,11 @@ def _owned_transaction_reason(result):
         if attempt.get("exit_code") not in (0, None):
             return ("%s exited %s" % (attempt.get("label"),
                                        attempt.get("exit_code")))
+        if attempt.get("test_count_check") not in (
+                None, verification.TEST_COUNT_OK):
+            return ("%s: executed-test count %s"
+                    % (attempt.get("label"),
+                       attempt.get("test_count_check")))
     return "the transaction did not reach a green verdict"
 
 
@@ -3394,8 +3418,20 @@ def _run_owned_verification_transaction(session_uuid, role, round_index,
     if not raw:
         return None, "the approved plan carries no verification inventory"
     declared_schema = _declared_plan_schema(session_uuid, plan_json_path)
+    # Schema 3 (composed final suite) alone reads and forwards the plan's
+    # `verification_suite`; for any other declared schema the suite is
+    # neither read nor passed, so schema-2/1 gates are exactly as before.
+    suite = None
+    composed = declared_schema == verification.SCHEMA_3
     try:
-        verification.normalize_inventory(raw, declared_schema=declared_schema)
+        if composed:
+            suite = _plan_verification_suite(session_uuid, plan_json_path)
+            schema, entries, _label = verification.normalize_inventory(
+                raw, declared_schema=declared_schema, suite=suite)
+            verification.validate_timeout_policy(schema, entries)
+        else:
+            verification.normalize_inventory(
+                raw, declared_schema=declared_schema)
     except verification.InventoryError as exc:
         return None, "the approved plan's verification inventory is " \
             "invalid (%s): %s" % (exc.code, exc)
@@ -3404,6 +3440,8 @@ def _run_owned_verification_transaction(session_uuid, role, round_index,
     if reuse_policy is not None:
         transaction_kwargs["reuse_policy"] = reuse_policy
     try:
+        if composed:
+            transaction_kwargs.update(declared_schema=declared_schema, suite=suite)
         result = run_transaction_fn(repo, session_uuid, raw,
                                     **transaction_kwargs)
     except verification.InventoryError as exc:
@@ -3427,9 +3465,11 @@ def _profile_inventory(session_uuid, plan_json_path):
     if not raw:
         return []
     try:
+        declared_schema = _declared_plan_schema(session_uuid, plan_json_path)
+        suite = (_plan_verification_suite(session_uuid, plan_json_path)
+                 if declared_schema == verification.SCHEMA_3 else None)
         _schema, entries, _final = verification.normalize_inventory(
-            raw, declared_schema=_declared_plan_schema(
-                session_uuid, plan_json_path))
+            raw, declared_schema=declared_schema, suite=suite)
     except verification.InventoryError:
         return []
     return entries
@@ -4088,6 +4128,23 @@ def _update_receipt_pointer_for_readiness(session_uuid, role, round_index,
             session_uuid, txn_result, readiness, status_path,
             summary_path=summary_path)),
     }
+    suite = txn_result.get("suite")
+    if isinstance(suite, dict):
+        # Schema 3 (composed final suite): the declared universe reviewers
+        # must judge, plus the proven member/component counts and digest.
+        # Absent for every other schema, so those pointers are unchanged.
+        universe = suite.get("universe") or {}
+        pointer["final_suite_universe"] = {
+            "tests_dir": suite.get("tests_dir"),
+            "include": list(universe.get("include") or []),
+            "exclude": list(universe.get("exclude") or []),
+            "split_modules": list(suite.get("split_modules") or []),
+            "exclusion_reasons": dict(suite.get("exclusion_reasons") or {}),
+        }
+        pointer["final_suite_universe_digest"] = suite.get("universe_digest")
+        pointer["final_suite_member_count"] = suite.get("member_count")
+        pointer["final_suite_component_count"] = len(
+            suite.get("components") or [])
     state_store.write_current_receipt_pointer(session_uuid, pointer)
     stale = _latest_verification_disposition(session_uuid, transaction_id)
     if stale and stale != verification.DISPOSITION_PENDING_REVIEW:
@@ -4167,7 +4224,7 @@ def verification_overlay(pointer, disposition=None):
         return checkpoint_overlay(pointer, disposition=disposition)
     if not isinstance(pointer, dict) or not pointer.get("transaction_id"):
         return None
-    return {
+    overlay = {
         "txn_id": pointer.get("transaction_id"),
         "manifest_digest": pointer.get("manifest_digest"),
         "index_digest": pointer.get("index_digest"),
@@ -4180,6 +4237,17 @@ def verification_overlay(pointer, disposition=None):
                         or verification.DISPOSITION_PENDING_REVIEW),
         "contradiction": bool(pointer.get("contradiction")),
     }
+    if pointer.get("final_suite_universe_digest"):
+        # Schema 3 only: content-free composed-suite facts (a 64-hex digest
+        # and two non-negative counts). The universe selectors themselves
+        # reach the reviewer by path, in the receipt and the pointer.
+        overlay["suite_universe_digest"] = pointer.get(
+            "final_suite_universe_digest")
+        overlay["suite_member_count"] = pointer.get(
+            "final_suite_member_count")
+        overlay["suite_component_count"] = pointer.get(
+            "final_suite_component_count")
+    return overlay
 
 
 def _current_verification_overlay(session_uuid, work_id=None):
@@ -4221,6 +4289,11 @@ def render_verification_overlay_block(overlay, receipt_path=None,
                  % (str(overlay.get("manifest_digest"))[:12],
                     str(overlay.get("index_digest"))[:12],
                     overlay.get("command_count"), overlay.get("disposition")))
+    if overlay.get("suite_universe_digest"):
+        lines.append("  composed suite: components=%s members=%s universe=%s"
+                     % (overlay.get("suite_component_count"),
+                        overlay.get("suite_member_count"),
+                        str(overlay.get("suite_universe_digest"))[:12]))
     if receipt_path:
         lines.append("  receipt → %s" % receipt_path)
     if agent_status_path:
