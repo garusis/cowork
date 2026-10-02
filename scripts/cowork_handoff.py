@@ -549,8 +549,17 @@ _FACT_SCHEMAS = {
     "verdict": _in({"green", "red", "unverified"}),
     "final_suite_label": is_content_free_token,
     "final_suite_binding": _in({"ran_once", "not_reached", "legacy_unknown",
-                                "reused_dependency_bound"}),
+                                "reused_dependency_bound", "components_ran_once"}),
     "command_count": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    # Schema-3 composed-suite facts (present only when the bound receipt is a
+    # composed suite): the proven universe digest and two counts.
+    "suite_universe_digest": lambda v: (
+        isinstance(v, str) and len(v) == 64
+        and all(c in "0123456789abcdef" for c in v)),
+    "suite_member_count": lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0),
+    "suite_component_count": lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0),
     "disposition": _in({"pending_review", "accepted", "superseded_by_finding",
                         "rejected"}),
     "contradiction": lambda v: isinstance(v, bool),
@@ -800,10 +809,18 @@ def _render_owned_verification_block(facts):
             % (str(facts.get("manifest_digest"))[:12],
                str(facts.get("index_digest"))[:12], facts.get("command_count")),
             "  disposition=%s" % facts.get("disposition"),
+        ]
+        if facts.get("suite_universe_digest"):
+            lines.append(
+                "  composed suite: components=%s members=%s universe=%s"
+                % (facts.get("suite_component_count"),
+                   facts.get("suite_member_count"),
+                   str(facts.get("suite_universe_digest"))[:12]))
+        lines.extend([
             "  The receipt file itself (result.json) reaches you by absolute "
             "path",
             "  among the artifacts above (the verification_receipt slot).",
-        ]
+        ])
         if facts.get("contradiction"):
             lines.append(
                 "  CONTRADICTION: the builder's own verification prose is "
@@ -1103,6 +1120,8 @@ EDGES = {
         "facts": ("team", "txn_id", "manifest_digest", "index_digest",
                   "verdict", "final_suite_label", "final_suite_binding",
                   "command_count", "disposition", "contradiction",
+                  "suite_universe_digest", "suite_member_count",
+                  "suite_component_count",
                   "checkpoint_id", "checkpoint_phase", "checkpoint_verdict",
                   "checkpoint_disposition", "checkpoint_superseded_count"),
         "ctx_keys": ("repos",),
@@ -1117,6 +1136,8 @@ EDGES = {
         "facts": ("team", "txn_id", "manifest_digest", "index_digest",
                   "verdict", "final_suite_label", "final_suite_binding",
                   "command_count", "disposition", "contradiction",
+                  "suite_universe_digest", "suite_member_count",
+                  "suite_component_count",
                   "checkpoint_id", "checkpoint_phase", "checkpoint_verdict",
                   "checkpoint_disposition", "checkpoint_superseded_count"),
         "ctx_keys": ("repos", "context_update_prefix"),

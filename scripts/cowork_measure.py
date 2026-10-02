@@ -1332,7 +1332,8 @@ def latest_owned_transaction(session_uuid):
 # (invalidation_reason/reuse_decision/triggering_finding/marginal_cost).
 _INITIAL_INVENTORY_KINDS = (
     verification.KIND_BASELINE, verification.KIND_PREFLIGHT,
-    verification.KIND_FINAL_SUITE, verification.KIND_LEGACY_REQUIRED)
+    verification.KIND_FINAL_SUITE, verification.KIND_LEGACY_REQUIRED,
+    verification.KIND_FINAL_SUITE_COMPONENT)
 
 
 def owned_transaction_cost_summary(result):
@@ -1403,6 +1404,13 @@ def owned_transaction_cost_summary(result):
         # transaction, present only when a reuse policy was in force.
         summary["executed_entry_count"] = len(attempts)
         summary["reused_entry_count"] = len(result.get("evidence_reuse") or [])
+    suite = result.get("suite")
+    if isinstance(suite, dict):
+        # Schema 3 only: the composed suite's proven shape.
+        summary["final_suite_component_count"] = len(
+            suite.get("components") or [])
+        summary["final_suite_member_count"] = suite.get("member_count")
+        summary["final_suite_universe_digest"] = suite.get("universe_digest")
     return summary
 
 

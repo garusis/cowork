@@ -13469,6 +13469,10 @@ class TransportChokePointTests(unittest.TestCase):
                 "final_suite_label": "full", "final_suite_binding": "ran_once",
                 "command_count": 1, "disposition": "pending_review",
                 "contradiction": False,
+                # Schema-3 composed-suite overlay facts (both
+                # builder->build-reviewer edges declare them).
+                "suite_universe_digest": "ef" * 32, "suite_member_count": 1,
+                "suite_component_count": 1,
                 # M5 checkpoint facts, each already inside its own closed
                 # _FACT_SCHEMAS shape: Package D's reviewer-facing overlay
                 # (both builder->build-reviewer edges) plus route 14's

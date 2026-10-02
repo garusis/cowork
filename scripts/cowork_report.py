@@ -553,6 +553,22 @@ def _section_owned_verification(record):
                     _fmt(latest.get("verdict")),
                     _fmt(latest.get("final_suite_label")),
                     _fmt(latest.get("final_suite_binding"))))
+    suite = latest.get("suite")
+    if isinstance(suite, dict):
+        universe = suite.get("universe") or {}
+        lines.append("  composed suite %s: components=%s members=%s "
+                     "universe=%s granularity=%s"
+                     % (_fmt(suite.get("suite_id")),
+                        _fmt(cost.get("final_suite_component_count")),
+                        _fmt(suite.get("member_count")),
+                        _fmt(str(suite.get("universe_digest"))[:12]),
+                        _fmt(suite.get("granularity"))))
+        lines.append("    universe tests_dir=%s include=%s exclude=%s "
+                     "split=%s"
+                     % (_fmt(suite.get("tests_dir")),
+                        ",".join(universe.get("include") or []) or "-",
+                        ",".join(universe.get("exclude") or []) or "-",
+                        ",".join(suite.get("split_modules") or []) or "-"))
     lines.append("  work_items=%s  attempts=%s (initial=%s focused=%s)  "
                  "subprocess_wall_time=%s"
                  % (_fmt(cost.get("work_items")),
