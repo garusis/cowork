@@ -22633,14 +22633,31 @@ class _DeferredEvidenceMixin(object):
                  "execution_mode": "isolated_snapshot",
                  "kind": verification.KIND_FINAL_SUITE}]
 
+    READY_DEADLINE_S = 60
+    READY_POLL_S = 0.05
+
     @contextlib.contextmanager
     def _defer_first_run(self):
+        missed = []
+
         def fake_wait(session_uuid, transaction_id, labels, poll_attempts,
                       poll_delay_s):
-            # A short REAL delay so the worker has started the command and
-            # published its pgid before should_defer_teardown's own (real)
-            # liveness check runs.
-            time.sleep(0.3)
+            # Wait until the worker has published a live process group for
+            # one of the labels: the exact evidence should_defer_teardown
+            # consults, so deferral is guaranteed before this returns. The
+            # wait is bounded and returns at once when already published.
+            deadline = time.time() + self.READY_DEADLINE_S
+            while not any(evidence_module._label_possibly_alive_pgid(
+                    session_uuid, transaction_id, label) is not None
+                    for label in labels):
+                if time.time() >= deadline:
+                    self._track(transaction_id)
+                    missed.append(
+                        "transaction %s published no live process group for "
+                        "%s within %ss" % (transaction_id, list(labels),
+                                           self.READY_DEADLINE_S))
+                    break
+                time.sleep(self.READY_POLL_S)
             return {label: {"evidence_state":
                             evidence_module.EVIDENCE_UNRESOLVED}
                     for label in labels}
@@ -22661,6 +22678,8 @@ class _DeferredEvidenceMixin(object):
                 mock.patch.object(verification, "spawn_worker",
                                   side_effect=spawn_quick_join):
             yield
+        if missed:
+            self.fail(missed[0])
 
     @contextlib.contextmanager
     def _short_reconcile_poll(self):
@@ -22735,6 +22754,16 @@ class _DeferredEvidenceMixin(object):
             return 0
         with open(marker) as fh:
             return fh.read().split().count("launch")
+
+    def _wait_launched(self, marker, timeout=60):
+        """Wait until the gated command has recorded its launch; the count
+        assertions that follow still require exactly one."""
+        deadline = time.time() + timeout
+        while self._launches(marker) < 1:
+            if time.time() >= deadline:
+                self.fail("gated command never recorded a launch within "
+                          "%ss" % timeout)
+            time.sleep(self.READY_POLL_S)
 
     def _marker_file(self, transaction_id):
         return state_store.verification_deferred_reconciliation_path_for(
@@ -22824,6 +22853,7 @@ class DeferredEvidenceContinuationTests(_DeferredEvidenceMixin,
         self._track(txn_id)
         self.assertEqual(txn1["verdict"], verification.VERDICT_RED)
         # The command outlived the first poll and only now finishes (0).
+        self._wait_launched(launch)
         self.assertEqual(self._launches(launch), 1)
         self._release(release)
         self._wait_for_terminal_event(txn_id, self.LABEL)
@@ -22911,6 +22941,7 @@ class DeferredEvidenceFailClosedTests(_DeferredEvidenceMixin,
         launch, release = self._marker_path(), self._marker_path()
         cmd = self._gated_cmd(launch, release)
         _entries, r1 = self._defer(cmd)
+        self._wait_launched(launch)
         txn_id = r1["transaction_id"]
         watched = [self._marker_file(txn_id),
                    state_store.verification_result_path_for(
@@ -22941,6 +22972,7 @@ class DeferredEvidenceFailClosedTests(_DeferredEvidenceMixin,
         launch, release = self._marker_path(), self._marker_path()
         cmd = self._gated_cmd(launch, release)
         _entries, r1 = self._defer(cmd)
+        self._wait_launched(launch)
         txn_id = r1["transaction_id"]
         active = state_store.read_json_tolerant(
             state_store.verification_active_pgid_path_for(
@@ -23090,7 +23122,19 @@ repo, session_uuid, entries_json, mode = sys.argv[2:6]
 
 def fake_wait(session_uuid, transaction_id, labels, poll_attempts,
               poll_delay_s):
-    time.sleep(0.3)
+    # Wait (bounded) for the worker's published live process group, the
+    # evidence should_defer_teardown consults; return at once if present.
+    deadline = time.time() + 60
+    while not any(e._label_possibly_alive_pgid(
+            session_uuid, transaction_id, label) is not None
+            for label in labels):
+        if time.time() >= deadline:
+            sys.stderr.write("transaction %s published no live process "
+                             "group for %s within 60s\n"
+                             % (transaction_id, list(labels)))
+            sys.stderr.flush()
+            os._exit(3)
+        time.sleep(0.05)
     return {label: {"evidence_state": e.EVIDENCE_UNRESOLVED}
             for label in labels}
 
@@ -23223,6 +23267,7 @@ class DeferredEvidenceCrashRecoveryTests(_DeferredEvidenceMixin,
         launch, release = self._marker_path(), self._marker_path()
         cmd = self._gated_cmd(launch, release)
         _entries, r1 = self._defer(cmd)
+        self._wait_launched(launch)
         old_id = r1["transaction_id"]
         request_key = r1["request_key"]
         exited = subprocess.Popen(["true"])
@@ -23419,6 +23464,7 @@ class DeferredEvidenceReadOnlyReportTests(_DeferredEvidenceMixin,
         launch, release = self._marker_path(), self._marker_path()
         cmd = self._gated_cmd(launch, release)
         _entries, r1 = self._defer(cmd)
+        self._wait_launched(launch)
         txn_id = r1["transaction_id"]
         trace = trace_store.Trace(
             trace_store.trace_path_for(self.session_uuid),
