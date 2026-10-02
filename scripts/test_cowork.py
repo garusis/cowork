@@ -39648,6 +39648,66 @@ class JevObserverIntegrationTests(unittest.TestCase):
         self.assertEqual(result, base)
         self.assertEqual(self.transport.calls, [])
 
+    def test_auto_mode_builder_boundary_captures_then_observes(self):
+        import cowork_jev_activation as activation
+        import test_cowork_jev_capture as capt
+        from test_cowork_jev_activation import FakeJevTransport
+
+        sid = "S-disabled"
+        pilot = os.path.join(self.root, "automatic-pilot")
+        config_path = os.path.join(self.root, "automatic-config.json")
+        config = {"schema": activation.SCHEMA, "enabled": True,
+                  "mode": "observation_only",
+                  "effective_at": "2020-01-01T00:00:00Z",
+                  "repository_identity": activation.repository_identity(
+                      self.repo),
+                  "pilot_dir": pilot, "shared_budget_usd": 5,
+                  "credential_env": "JEV_TEST_AUTO_KEY"}
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+        config["_config_path"] = os.path.realpath(config_path)
+        capt.write(self.repo, "app.py", capt.BASE_APP)
+        binding = activation.session_binding(
+            config, sid, self.repo,
+            "The observer must preserve the real build objective.")
+        capt.write(self.repo, "app.py", capt.NEW_APP)
+        session_file = state_store.new_session_path(self.repo, sid)
+        os.makedirs(os.path.dirname(session_file), exist_ok=True)
+        with open(session_file, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "session_uuid": sid,
+                       "jev_observation": binding}, handle)
+        transport = FakeJevTransport()
+        activation.reset_overrides()
+        activation.configure(transport=transport)
+        self.addCleanup(activation.reset_overrides)
+        with mock.patch.dict(os.environ, {
+                activation.CONFIG_ENV: config_path,
+                "JEV_TEST_AUTO_KEY": "synthetic-test-credential"}):
+            os.environ.pop(self.obs.PILOT_ENV, None)
+            result = self._drive("disabled", ["ready_for_review"],
+                                 [dict(self.UNCITED)])
+            worker = activation._WORKERS.get(sid)
+            self.assertIsNotNone(worker)
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result["kind"], "review_not_approved")
+        self.assertGreaterEqual(len(transport.calls), 1)
+        review_input = json.dumps([result["sent"], result["review_args"]]).lower()
+        for forbidden in ("jev", "candidate_id", "observation_status"):
+            self.assertNotIn(forbidden, review_input)
+        receipt_path = os.path.join(pilot, "automatic", "sessions",
+                                    sid + ".json")
+        with open(receipt_path, "r", encoding="utf-8") as handle:
+            receipt = json.load(handle)
+        self.assertEqual(receipt["observation_status"], "observed")
+        self.assertEqual(receipt["objective_text"],
+                         "The observer must preserve the real build objective.")
+        self.assertEqual(receipt["accuracy_metrics"],
+                         "pending_independent_ground_truth")
+        self.assertEqual(receipt["independent_adjudication"],
+                         "unavailable_not_authorized")
+        self.assertTrue(any(unit["queried"] for unit in receipt["signals"]))
+
     def test_env_constant_matches_observer(self):
         self.assertEqual(cowork._JEV_PILOT_ENV, self.obs.PILOT_ENV)
 

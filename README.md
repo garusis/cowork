@@ -1359,6 +1359,50 @@ Everything else (captures, acceptance registry, Jev records, observer registry,
 reports) is written by the observer under the same directory. No real call is
 made without an authorized activation, a credential and a budget.
 
+**Automatic observation mode (opt-in, observation-only).** A separate JSON
+configuration may be placed at `~/.cowork/jev-auto-config.json`, or its path
+may be supplied through `COWORK_JEV_AUTO_CONFIG`. Cowork reads JSON directly;
+it never sources shell configuration. Example schema:
+
+```json
+{
+  "schema": "jev_auto_observation.v1",
+  "enabled": true,
+  "mode": "observation_only",
+  "effective_at": "2026-10-02T00:00:00Z",
+  "repository_identity": "/absolute/path/to/repository/.git",
+  "pilot_dir": "/absolute/path/outside/git/jev-pilot",
+  "shared_budget_usd": 5,
+  "credential_env": "JEV_API_KEY"
+}
+```
+
+`repository_identity` must be the canonical Git common-dir identity; linked
+worktrees share it. Each newly created matching session stores its binding and
+gets a per-session status receipt under `<pilot_dir>/automatic/sessions/`.
+Resumes do not enroll old sessions. At the existing pre-review candidate
+boundary, the observer captures only against the clean Git `HEAD` recorded at
+session enrollment; an unborn or dirty enrollment tree has no trusted baseline
+and is explicitly not queried. Requirement sentences are derived from the
+persisted objective; candidates without requirements are explicitly not
+queried. The candidate snapshot and a durable queued-work record are written
+before detached observation starts, and ordinary resume recovers queued work.
+Started attempts are recovered as unknown charges and never resent. A disabled,
+missing, invalid or changed config uniformly blocks paid attempts for both
+launch-root and linked-worktree sessions while preserving the binding for a
+later re-enable. Config and pilot paths are checked against both the active
+worktree and primary repository root after resolving symlinks. The observer
+then uses a single append-only Jev reservation ledger shared by every session
+and linked worktree. A cross-process lock serializes reservations against the USD5 cap;
+unknown charges stay reserved, exhausted/suspended pilots stop paid requests,
+and ordinary review and approval are unaffected. `JEV_API_KEY` (or the
+configured environment-variable name) is read only when a query is eligible;
+its value is never saved. The session anchor stores the enrollment and initial
+no-candidate status; the external per-session receipt carries updated
+missing-key, suspension, cap, usage, latency, error and signal states.
+Accuracy/precision/recall remain pending because independent adjudication is
+not authorized. The frozen-cohort mode above is unchanged.
+
 **Suspension and recovery.** Create `SUSPENDED` in the pilot directory (or call
 `cowork_jev_observer.suspend(pilot)`) to suspend: no new capture or query starts,
 ordinary review is unaffected and the cohort clock keeps running. Remove it (or

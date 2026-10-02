@@ -2805,18 +2805,31 @@ def _corrective_finding_count(verdict):
     return len(findings) if isinstance(findings, list) else 0
 
 
-# Jev observational pilot (off by default). Duplicates cowork_jev_observer.
+# Jev observational pilot (off by default).
 # PILOT_ENV so a disabled run never imports the observer; a test pins equality.
 _JEV_PILOT_ENV = "COWORK_JEV_PILOT_DIR"
 
 
 def _jev_hook(name, *args, **kwargs):
-    """Call a Jev observer hook. Inert unless the pilot env var is set; never
+    """Call a Jev observer hook. Inert without an explicit opt-in; never
     raises and never writes to stdout/stderr or the run result. Return values
     only feed the next hook, never review, approval or any prompt."""
-    if not os.environ.get(_JEV_PILOT_ENV):
-        return None
     try:
+        auto_role = kwargs.pop("_auto_role", None)
+        # The frozen-cohort path remains authoritative when explicitly set.
+        # Automatic enrollment is a separate, versioned opt-in binding stored
+        # only on newly-created sessions; resumed sessions never enroll here.
+        if not os.environ.get(_JEV_PILOT_ENV):
+            if name == "hook_promoted" and auto_role != "builder":
+                return None
+            if name == "hook_promoted" and len(args) >= 2:
+                import cowork_jev_activation as jev_activation
+                binding = jev_activation.session_binding_from_file(
+                    args[0], args[1])
+                if binding is not None:
+                    return jev_activation.start_candidate_observation(
+                        binding, args[1])
+            return None
         import cowork_jev_observer
         return getattr(cowork_jev_observer, name)(*args, **kwargs)
     except Exception:  # noqa: BLE001 - observation must never alter delivery
@@ -8123,7 +8136,8 @@ def _role_loop(session, first, status_path, context, io_out,
                             and readiness.get("state") == "verified"):
                         jev_attempted = True
                         jev_token = _jev_hook(
-                            "hook_promoted", session_uuid, os.getcwd())
+                            "hook_promoted", session_uuid, os.getcwd(),
+                            _auto_role=role)
                 reviewer_approved = False
                 # Hash-gate (scout + planner): when the lead's reviewed artifact
                 # set is byte-identical to what the paired reviewer LAST APPROVED
@@ -14112,6 +14126,26 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 if session_uuid:
                     for _inv_role in list(config):
                         state_store.invalidate_manifest_for(session_uuid, _inv_role)
+            if choice.new_uuid:
+                try:
+                    import cowork_jev_activation as jev_activation
+                    auto_config, _config_reason = jev_activation.load_config()
+                    binding = jev_activation.session_binding(
+                        auto_config, session_uuid, os.getcwd(), current_text)
+                    if binding.get("status") == "enrolled":
+                        holder["state"]["jev_observation"] = binding
+                        holder["state"]["jev_observation_status"] = {
+                            "status": "not_applicable",
+                            "reason": "no_eligible_builder_candidate_yet",
+                            "mode": "observation_only",
+                            "accuracy_metrics":
+                                "pending_independent_ground_truth"}
+                        state_store.save(spath, holder["state"])
+                        jev_activation.persist_session_binding(binding)
+                        trace.event("jev.auto_enrollment", status="enrolled",
+                                    reason=None)
+                except Exception:  # observational config never blocks a run
+                    pass
             state = holder["state"]
             current_text = state_store.get_context(state) or ""
             current_rev = state_store.get_context_revision(state)
@@ -14122,6 +14156,20 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         if isinstance(state.get("context"), dict) else None)
 
         shared_context = (current_text or context) if session_enabled else context
+
+        # Automatic Jev work is durable and may outlive this CLI process. A
+        # resumed session replays a queued observation independently of a new
+        # builder promotion; config revocation is checked before paid work.
+        if (session_enabled and session_uuid
+                and not os.environ.get(_JEV_PILOT_ENV)):
+            try:
+                binding = (holder.get("state") or {}).get("jev_observation")
+                if isinstance(binding, dict):
+                    import cowork_jev_activation as jev_activation
+                    jev_activation.recover_session_observation(
+                        binding, os.getcwd())
+            except Exception:  # observational recovery never blocks a run
+                pass
 
         # What consumed orchestrator decisions still owe each target role,
         # filled from the durable pending deliveries below:
