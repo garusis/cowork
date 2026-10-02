@@ -1376,7 +1376,7 @@ def owned_transaction_cost_summary(result):
         else:
             initial.append(attempt)
     mutation = result.get("mutation")
-    return {
+    summary = {
         "transaction_id": result.get("transaction_id"),
         "request_key": result.get("request_key"),
         "verdict": result.get("verdict"),
@@ -1398,6 +1398,12 @@ def owned_transaction_cost_summary(result):
         "created_at": result.get("created_at"),
         "finished_at": result.get("finished_at"),
     }
+    if "evidence_reuse" in result:
+        # Execution profiles (#63): executed versus reused entries of this
+        # transaction, present only when a reuse policy was in force.
+        summary["executed_entry_count"] = len(attempts)
+        summary["reused_entry_count"] = len(result.get("evidence_reuse") or [])
+    return summary
 
 
 def owned_focused_check_attribution(result):
@@ -1765,6 +1771,35 @@ def _activity_view(session_uuid):
     latest = dict(snapshots[-1])
     del latest["_sort_time"]
     return latest
+
+
+def execution_profile_view(doc):
+    """The cohort-comparison view of one execution profile record, or None
+    when the document is not a readable record. Derived only from the record;
+    the effective profile is read, never recomputed."""
+    if not isinstance(doc, dict):
+        return None
+    counters = doc.get("counters")
+    history = doc.get("promotion_history")
+    notes = doc.get("deferred_minor_notes")
+    batch = doc.get("batch")
+    if not (isinstance(counters, dict) and isinstance(history, list)
+            and isinstance(notes, list)
+            and doc.get("selected") and doc.get("effective")):
+        return None
+    return {
+        "selected": doc.get("selected"),
+        "effective": doc.get("effective"),
+        "policy_version": doc.get("policy_version"),
+        "promotion_history": list(history),
+        "promotion_count": len(history),
+        "deferred_minor_note_count": len(notes),
+        "batch_artifact_count": (len(batch.get("artifacts") or [])
+                                 if isinstance(batch, dict) else 0),
+        "verification": {
+            "executed": counters.get("verification_executed", 0),
+            "reused": counters.get("verification_reused", 0)},
+    }
 
 
 def build_record(session_uuid, cwd=None, ingest_results=None):
@@ -2148,6 +2183,23 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
                           "readable JSON array; scores cannot be rendered and "
                           "the file is preserved for manual inspection",
                 "path": paths["orchestrator_evaluations"]})
+
+    # Execution profile (#63; additive, SCHEMA_VERSION stays 1). The key and
+    # its `built_from` fingerprint exist ONLY for a session that has a profile
+    # record, so a legacy record is byte-identical to a pre-feature one. An
+    # unreadable record is reported as incomplete rather than guessed at.
+    profile_path = state_store.execution_profile_path_for(session_uuid)
+    if os.path.exists(profile_path):
+        built_from["execution_profile"] = _fingerprint(profile_path)
+        view = execution_profile_view(_read_json(profile_path))
+        if view is None:
+            incomplete.append({
+                "field": "record.execution_profile",
+                "reason": "execution_profile.json exists but is not a "
+                          "readable profile record",
+                "path": profile_path})
+        else:
+            record["execution_profile"] = view
 
     record["replay"] = replay_rounds(record)
     record["completion"] = completion_account(
@@ -3058,6 +3110,14 @@ def check_provenance(session_uuid, record):
             current = _fingerprint(path)
             if current.get("sha256") != recorded.get("sha256"):
                 diverged.append(name)
+        # The execution profile record is stamped only for a profiled
+        # session; it is checked only when the record carries its stamp.
+        recorded = built_from.get("execution_profile")
+        if isinstance(recorded, dict):
+            current = _fingerprint(
+                state_store.execution_profile_path_for(session_uuid))
+            if current.get("sha256") != recorded.get("sha256"):
+                diverged.append("execution_profile")
     except Exception:  # noqa: BLE001
         return {"state": UNKNOWN, "diverged": [],
                 "built_at": record.get("built_at"),

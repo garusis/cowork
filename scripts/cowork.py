@@ -66,6 +66,7 @@ import cowork_recovery_breaker as recovery_breaker  # noqa: E402
 import cowork_owner  # noqa: E402
 import cowork_profiles as controller_profiles  # noqa: E402
 import cowork_action_policy as action_policy  # noqa: E402
+import cowork_execution_profiles as exec_profiles  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -327,6 +328,21 @@ def build_parser():
                    help="comma-separated roles, e.g. "
                         "scout,scout-reviewer (default: every role, or the "
                         "saved team on resume)")
+    p.add_argument("--profile", metavar="NAME",
+                   help="run this NEW session under an explicit execution "
+                        "profile (light, standard or assurance). The profile "
+                        "derives the team, so it cannot be combined with "
+                        "--team or --no-session. On resume it can only "
+                        "promote the session to a stricter profile. Preview "
+                        "one first with --preview-profile")
+    p.add_argument("--profile-rationale", dest="profile_rationale",
+                   metavar="TEXT",
+                   help="with --profile on a new session: why this profile "
+                        "was chosen, stored on the profile record")
+    p.add_argument("--preview-profile", dest="preview_profile", metavar="NAME",
+                   help="print one execution profile's complete effective "
+                        "policy as a single JSON object and exit; read-only, "
+                        "dispatches nothing and creates no session")
     p.add_argument("--config", action="append", default=[],
                    metavar="ROLE=opt,opt",
                    help="per-role override, e.g. scout=codex,no-yolo,implement "
@@ -564,6 +580,28 @@ def validate_output_roots(raw_roots, launch_toplevel, registered_worktrees,
                         "--output-root %s duplicates or nests another "
                         "declared root" % raw_roots[index])
     return tuple(sorted(dict.fromkeys(reals))), None, None
+
+
+def run_profile_preview(args, io_out=None):
+    """Handle `cowork --preview-profile NAME`: print the profile's complete
+    effective policy as ONE JSON object and exit. Read-only by construction:
+    it reads no session, takes no lease and constructs no controller. An
+    unknown name is refused (rc 2) with a stderr notice and a JSON error
+    object on stdout."""
+    out = io_out or sys.stdout
+    name = args.preview_profile
+    try:
+        payload = exec_profiles.preview(name)
+    except exec_profiles.UnknownProfile:
+        sys.stderr.write("cowork: unknown execution profile %r (known: %s).\n"
+                         % (name, ", ".join(exec_profiles.known_profiles())))
+        out.write(json.dumps({
+            "error": "unknown_profile", "requested": name,
+            "known_profiles": exec_profiles.known_profiles()},
+            sort_keys=True) + "\n")
+        return 2
+    out.write(json.dumps(payload, sort_keys=True) + "\n")
+    return 0
 
 
 def run_report(args, io_out=None):
@@ -1215,14 +1253,16 @@ def scout_intel_path(intel_dir, session_uuid):
     return os.path.join(intel_dir, "scout.intel.json")
 
 
-def assemble_scout_brief(selected, intel_path, intel_md_path=None):
+def assemble_scout_brief(selected, intel_path, intel_md_path=None,
+                         profile_note=None):
     """Dynamic first-message brief for the scout: where to write, the JSON +
     domain guardrail, and the plan-only fallthrough for this team.
 
     When `intel_md_path` is given, the scout writes TWO files: the JSON (machine
     source of truth + status channel) and a readable markdown rendering (the
     review surface, also reviewed by the scout-reviewer). Both are the
-    scout's write targets and nothing else."""
+    scout's write targets and nothing else. `profile_note` (execution-profile
+    sessions only) is appended verbatim."""
     if "planner" in selected:
         plan_note = (
             "A dedicated `planner` role is on the team: stop at the intel file "
@@ -1253,7 +1293,10 @@ def assemble_scout_brief(selected, intel_path, intel_md_path=None):
             "delete any other file (reading/searching the repo is fine)."
             % intel_path
         )
-    return "%s\n%s" % (target, plan_note)
+    brief = "%s\n%s" % (target, plan_note)
+    if profile_note:
+        brief = "%s\n%s" % (brief, profile_note)
+    return brief
 
 
 def read_scout_prompt(path=SCOUT_PROMPT_PATH):
@@ -1851,6 +1894,16 @@ def _success_criteria_flag(intel_path):
         "can be approved.")
 
 
+def _profile_artifacts(profile_path):
+    """The optional execution-profile record artifact (profiled sessions
+    only; nothing for every other session)."""
+    if not profile_path:
+        return []
+    return [{"label": "execution profile record",
+             "path": profile_path, "kind": "json",
+             "source": "execution_profile"}]
+
+
 def _intel_artifacts(intel_path, intel_md_path=None):
     arts = [{"label": "intel JSON (machine source of truth)",
              "path": intel_path, "kind": "json", "source": "intel_json"}]
@@ -1919,7 +1972,8 @@ def _handback_payload_artifact(payload, assets_dir=None, filename=None,
 
 
 def assemble_reviewer_context(context, selected, intel_path, intel_md_path=None,
-                              assets_dir=None, context_revision=None):
+                              assets_dir=None, context_revision=None,
+                              profile_path=None):
     """The reviewer's situational context, delivered FILE-ONLY via the shared
     transport: the SAME shared session context the scout received (materialized
     to a revision-keyed file, referenced by path — never embedded), the team
@@ -1931,6 +1985,7 @@ def assemble_reviewer_context(context, selected, intel_path, intel_md_path=None,
     that carries the scout's own guardrail and would mis-instruct the reviewer."""
     artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
     artifacts.extend(_intel_artifacts(intel_path, intel_md_path))
+    artifacts.extend(_profile_artifacts(profile_path))
     return handoff.render_handoff(
         "scout->scout-reviewer:review_ctx",
         artifacts=artifacts, facts={"team": list(selected or [])})
@@ -2939,23 +2994,25 @@ def _required_verification_labels(session_uuid):
         return None
 
 
-def _raw_plan_verification(session_uuid):
+def _raw_plan_verification(session_uuid, plan_json_path=None):
     """The approved plan's raw `result.verification` array, or None when the
     plan artifact is absent/unreadable. The sole read of that array for the
     owned-transaction path below — everything downstream goes through
     `cowork_verification.normalize_inventory`, never a hand-rolled label-only
-    reading of the plan."""
+    reading of the plan. `plan_json_path` (an execution profile whose approved
+    plan is the scout intel) names the document explicitly; without it the
+    session's `planner.plan.json` is read exactly as before."""
     try:
         directory = state_store.session_assets_dir(session_uuid)
-        plan = measure._read_json(os.path.join(directory,
-                                               "planner.plan.json"))
+        plan = measure._read_json(plan_json_path or os.path.join(
+            directory, "planner.plan.json"))
         entries = ((plan or {}).get("result") or {}).get("verification")
         return entries if isinstance(entries, list) else None
     except Exception:  # noqa: BLE001
         return None
 
 
-def _declared_plan_schema(session_uuid):
+def _declared_plan_schema(session_uuid, plan_json_path=None):
     """The plan's OWN `result.verification_schema` field, or None when the
     plan never set one. Read separately from `_raw_plan_verification` (the
     entries array) so `normalize_inventory` can compare what the PLAN
@@ -2963,8 +3020,8 @@ def _declared_plan_schema(session_uuid):
     never upgrade or downgrade what the plan itself declared."""
     try:
         directory = state_store.session_assets_dir(session_uuid)
-        plan = measure._read_json(os.path.join(directory,
-                                               "planner.plan.json"))
+        plan = measure._read_json(plan_json_path or os.path.join(
+            directory, "planner.plan.json"))
         return ((plan or {}).get("result") or {}).get("verification_schema")
     except Exception:  # noqa: BLE001
         return None
@@ -3306,7 +3363,8 @@ def _owned_transaction_reason(result):
 def _run_owned_verification_transaction(session_uuid, role, round_index,
                                         trace, repo=None,
                                         run_transaction_fn=None,
-                                        work_id=None):
+                                        work_id=None, plan_json_path=None,
+                                        reuse_policy=None):
     """Synchronously submit ONE owned verification transaction for the
     approved plan's inventory, at the builder's ready-for-review transition.
 
@@ -3332,18 +3390,22 @@ def _run_owned_verification_transaction(session_uuid, role, round_index,
         # session_uuid): return`) for scout/planner, so a caller that has not
         # wired session tracking is not blocked at every builder promotion.
         return None, None
-    raw = _raw_plan_verification(session_uuid)
+    raw = _raw_plan_verification(session_uuid, plan_json_path)
     if not raw:
         return None, "the approved plan carries no verification inventory"
-    declared_schema = _declared_plan_schema(session_uuid)
+    declared_schema = _declared_plan_schema(session_uuid, plan_json_path)
     try:
         verification.normalize_inventory(raw, declared_schema=declared_schema)
     except verification.InventoryError as exc:
         return None, "the approved plan's verification inventory is " \
             "invalid (%s): %s" % (exc.code, exc)
     repo = repo or os.getcwd()
+    transaction_kwargs = {"work_id": work_id}
+    if reuse_policy is not None:
+        transaction_kwargs["reuse_policy"] = reuse_policy
     try:
-        result = run_transaction_fn(repo, session_uuid, raw, work_id=work_id)
+        result = run_transaction_fn(repo, session_uuid, raw,
+                                    **transaction_kwargs)
     except verification.InventoryError as exc:
         return None, "the approved plan's verification inventory is " \
             "invalid (%s): %s" % (exc.code, exc)
@@ -3356,6 +3418,68 @@ def _run_owned_verification_transaction(session_uuid, role, round_index,
             final_suite_binding=result.get("final_suite_binding"),
             reused_lock_result=bool(result.get("reused_lock_result")))
     return result, None
+
+
+def _profile_inventory(session_uuid, plan_json_path):
+    """The approved plan's normalized verification entries (execution
+    profiles), or [] when it carries none or fails validation."""
+    raw = _raw_plan_verification(session_uuid, plan_json_path)
+    if not raw:
+        return []
+    try:
+        _schema, entries, _final = verification.normalize_inventory(
+            raw, declared_schema=_declared_plan_schema(
+                session_uuid, plan_json_path))
+    except verification.InventoryError:
+        return []
+    return entries
+
+
+def _profile_changed_paths(session_uuid, record, txn_result):
+    """`(changed_paths, executable_paths)` of the candidate a transaction
+    verified, measured against the profile-owned building-entry baseline with
+    verification's own manifest enumeration on both sides. `(None, None)`
+    when the baseline or the transaction manifest is missing, unreadable or
+    does not match its recorded fingerprint: an unmeasurable change set is a
+    `signal_malformed` promotion, never a silent pass."""
+    reference = record.get("building_baseline")
+    if not isinstance(reference, dict):
+        return None, None
+    base_doc = state_store.read_json_tolerant(
+        state_store.execution_profile_baseline_path_for(session_uuid))
+    base_files = base_doc.get("files") if isinstance(base_doc, dict) else None
+    if not (isinstance(base_files, dict)
+            and base_doc.get("building_epoch") == reference.get(
+                "building_epoch")
+            and base_doc.get("manifest_fingerprint") == reference.get(
+                "manifest_fingerprint")
+            and verification.manifest_fingerprint(base_files)
+            == reference.get("manifest_fingerprint")):
+        return None, None
+    manifest_doc = state_store.read_json_tolerant(
+        state_store.verification_snapshot_manifest_path_for(
+            session_uuid, txn_result.get("transaction_id")))
+    new_files = (manifest_doc.get("files")
+                 if isinstance(manifest_doc, dict) else None)
+    if not isinstance(new_files, dict):
+        return None, None
+    return exec_profiles.diff_manifests(base_files, new_files)
+
+
+def _profile_on_builder_transaction(profile_session, session_uuid,
+                                    plan_json_path, status_path, txn_result):
+    """Feed one owned transaction into the profile record (accepted
+    evidence, dependency graph, executed/reused counters) and evaluate the
+    builder-ready promotion signals against the building baseline."""
+    inventory = _profile_inventory(session_uuid, plan_json_path)
+    profile_session.on_transaction(txn_result, inventory)
+    changed, executable = _profile_changed_paths(
+        session_uuid, profile_session.record, txn_result)
+    status_doc = measure._read_json(status_path)
+    status_result = (status_doc.get("result")
+                     if isinstance(status_doc, dict) else None)
+    profile_session.on_builder_ready(
+        changed, executable, txn_result, inventory, status_result)
 
 
 def _record_readiness_from_transaction(session_uuid, role, round_index,
@@ -4800,7 +4924,7 @@ def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
 
 
 def make_scout_reviewer_runner(intel_md_path, trace=None,
-                               extra_writable_dir=None):
+                               extra_writable_dir=None, profile_path=None):
     """Build the real (non-test) reviewer runner for the scouting phase: a
     `run_reviewer_once` closure carrying the scout-reviewer role, prompt, and
     the dual-artifact (intel JSON + markdown) context assemblers, so the
@@ -4828,7 +4952,8 @@ def make_scout_reviewer_runner(intel_md_path, trace=None,
                 context_revision=None:
                 assemble_reviewer_context(
                     ctx, sel, p, intel_md_path, assets_dir=assets_dir,
-                    context_revision=context_revision),
+                    context_revision=context_revision,
+                    profile_path=profile_path),
             resume_context_fn=lambda p, context_update=None, assets_dir=None,
                 context_revision=None:
                 assemble_reviewer_resume_context(
@@ -4861,7 +4986,7 @@ def assemble_planner_brief(plan_json_path, plan_md_path):
 
 
 def assemble_planner_seed(intel_path, context, assets_dir=None,
-                          context_revision=None):
+                          context_revision=None, profile_path=None):
     """The fresh planner's situational context (route 3), FILE-ONLY: the approved
     scout intel AND the shared session context, both carried by PATH via the
     shared transport. scout->planner is a cross-role handoff, so the context is
@@ -4869,6 +4994,7 @@ def assemble_planner_seed(intel_path, context, assets_dir=None,
     orchestrator->scout prompt inlines context text)."""
     artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
     artifacts.extend(_intel_artifacts(intel_path))
+    artifacts.extend(_profile_artifacts(profile_path))
     return handoff.render_handoff("scout->planner:seed", artifacts=artifacts)
 
 
@@ -4938,14 +5064,29 @@ def assemble_builder_brief(build_status_path, build_summary_path=None):
 
 
 def assemble_builder_seed(plan_json_path, plan_md_path, context,
-                          assets_dir=None, context_revision=None):
+                          assets_dir=None, context_revision=None,
+                          profile_path=None):
     """The fresh builder's situational context (route 6), FILE-ONLY: the approved
     plan (JSON + markdown) AND the shared session context, both carried by PATH
     via the shared transport. planner->builder is a cross-role handoff, so the
     context is persisted and referenced by path — never inlined."""
     artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
     artifacts.extend(_plan_artifacts(plan_json_path, plan_md_path))
+    artifacts.extend(_profile_artifacts(profile_path))
     return handoff.render_handoff("planner->builder:seed", artifacts=artifacts)
+
+
+def assemble_light_builder_seed(plan_json_path, plan_md_path, context,
+                                assets_dir=None, context_revision=None,
+                                profile_path=None):
+    """The fresh builder's situational context under the light execution
+    profile (scout->builder): there is no planning phase, so the approved scout
+    intel rides in the plan slots and is the approved plan. FILE-ONLY, like
+    every cross-role seed."""
+    artifacts = [_shared_context_artifact(context, assets_dir, context_revision)]
+    artifacts.extend(_plan_artifacts(plan_json_path, plan_md_path))
+    artifacts.extend(_profile_artifacts(profile_path))
+    return handoff.render_handoff("scout->builder:seed", artifacts=artifacts)
 
 
 def plan_updated_block(plan_json_path, plan_md_path):
@@ -4980,7 +5121,8 @@ def _plan_artifacts(plan_json_path, plan_md_path):
 
 def assemble_advisor_context(context, selected, plan_json_path, plan_md_path,
                              intel_path=None, intel_md_path=None,
-                             assets_dir=None, context_revision=None):
+                             assets_dir=None, context_revision=None,
+                             profile_path=None):
     """The planning-advisor's situational context (route 4), delivered FILE-ONLY
     via the shared transport: the shared session context (by path), the team
     framing, BOTH planner artifacts to review, AND the approved scout intel
@@ -4993,6 +5135,7 @@ def assemble_advisor_context(context, selected, plan_json_path, plan_md_path,
     # approved intel.
     if intel_path:
         artifacts.extend(_intel_artifacts(intel_path, intel_md_path))
+    artifacts.extend(_profile_artifacts(profile_path))
     return handoff.render_handoff(
         "planner->planning-advisor:review_ctx",
         artifacts=artifacts, facts={"team": list(selected or [])})
@@ -5017,7 +5160,7 @@ def assemble_advisor_resume_context(plan_json_path, plan_md_path,
 
 def make_planning_advisor_runner(plan_md_path, trace=None,
                                  extra_writable_dir=None, intel_path=None,
-                                 intel_md_path=None):
+                                 intel_md_path=None, profile_path=None):
     """Build the real (non-test) reviewer runner for the planning phase: a
     `run_reviewer_once` closure carrying the advisor role, prompt, and the
     context assemblers. Route 4 is multi-source: `intel_path`/`intel_md_path`
@@ -5045,7 +5188,8 @@ def make_planning_advisor_runner(plan_md_path, trace=None,
                 assemble_advisor_context(
                     ctx, sel, p, plan_md_path, intel_path=intel_path,
                     intel_md_path=intel_md_path, assets_dir=assets_dir,
-                    context_revision=context_revision),
+                    context_revision=context_revision,
+                    profile_path=profile_path),
             resume_context_fn=lambda p, context_update=None, assets_dir=None,
                 context_revision=None:
                 assemble_advisor_resume_context(
@@ -5684,7 +5828,8 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
                                     verification_receipt_path=None,
                                     verification_overlay=None,
                                     checkpoint_receipt_path=None,
-                                    checkpoint_facts=None):
+                                    checkpoint_facts=None,
+                                    profile_path=None):
     """The build-reviewer's situational context (route 7), delivered FILE-ONLY
     via the shared transport: the shared session context, BOTH plan artifacts,
     the builder's status JSON, the builder's markdown summary (when wired), and
@@ -5706,6 +5851,7 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
         verification_receipt_path=verification_receipt_path,
         checkpoint_receipt_path=checkpoint_receipt_path))
     artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
+    artifacts.extend(_profile_artifacts(profile_path))
     facts = {"team": list(selected or [])}
     if verification_overlay:
         facts.update(verification_overlay)
@@ -5742,7 +5888,8 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
                                            verification_receipt_path=None,
                                            verification_overlay=None,
                                            checkpoint_receipt_path=None,
-                                           checkpoint_facts=None):
+                                           checkpoint_facts=None,
+                                           profile_path=None):
     """Lighter context for a RESUMED build-reviewer session, delivered FILE-ONLY
     via the shared transport: only the updated artifacts are sent by PATH (plan,
     status, summary, build-baseline) — plus a context-update wake block
@@ -5757,6 +5904,7 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
         verification_receipt_path=verification_receipt_path,
         checkpoint_receipt_path=checkpoint_receipt_path))
     artifacts.append(_build_baseline_artifact(baseline_note, assets_dir))
+    artifacts.extend(_profile_artifacts(profile_path))
     ctx = {"repos": list(baseline_repos or [])}
     if context_update:
         ctx["context_update_prefix"] = _context_update_prefix(
@@ -5774,7 +5922,8 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
 def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                                baseline_repos=None, trace=None,
                                extra_writable_dir=None, build_summary_path=None,
-                               session_uuid=None, role_work_id=None):
+                               session_uuid=None, role_work_id=None,
+                               profile_path=None):
     """Build the real (non-test) reviewer runner for the building phase: a
     `run_reviewer_once` closure carrying the build-reviewer role, prompt, and
     the full-delta context assemblers. The reviewed artifact passed to the
@@ -5830,7 +5979,7 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                     baseline_note=baseline_note, baseline_repos=baseline_repos,
                     build_summary_path=build_summary_path,
                     assets_dir=assets_dir, context_revision=context_revision,
-                    **receipt_kwargs()),
+                    profile_path=profile_path, **receipt_kwargs()),
             resume_context_fn=lambda p, context_update=None, assets_dir=None,
                 context_revision=None:
                 assemble_build_reviewer_resume_context(
@@ -5839,7 +5988,7 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                     baseline_repos=baseline_repos,
                     build_summary_path=build_summary_path,
                     assets_dir=assets_dir, context_revision=context_revision,
-                    **receipt_kwargs()))
+                    profile_path=profile_path, **receipt_kwargs()))
     # See make_planning_advisor_runner: marks a real surface-capable closure.
     runner._coplan_surface_capable = True
     return runner
@@ -7167,7 +7316,8 @@ def _role_loop(session, first, status_path, context, io_out,
                   require_pending_question=False, review_path=None,
                   save_pending_turn_fn=None, clear_pending_turn_fn=None,
                   spath=None, session_uuid=None, build_summary_path=None,
-                  role_work_id=None, checkpoint_id=None, artifact_kind=None):
+                  role_work_id=None, checkpoint_id=None, artifact_kind=None,
+                  profile_session=None, plan_json_path=None):
     """Drive a lead role's per-turn loop: send → read status → review, stop,
     or finish. Role-generic: the scout, planner and builder all run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -7216,7 +7366,16 @@ def _role_loop(session, first, status_path, context, io_out,
     traces the binding so a resume/audit trail can correlate this loop
     invocation with the checkpoint that gates it -- never changes this
     function's own control flow or return value; a caller that never
-    supplies them sees no change at all."""
+    supplies them sees no change at all.
+
+    `profile_session` (execution profiles, additive, default `None`): the
+    session's `cowork_execution_profiles.ProfileSession`. When given, every
+    verdict is screened and may promote the profile, the builder gate reuses
+    dependency-compatible evidence and promotes on scope/evidence signals, and
+    a build-reviewer approve may carry deferred minor notes. `plan_json_path`
+    names the approved plan document the owned verification inventory is read
+    from (the scout intel under the light profile). With `profile_session`
+    None every path below is exactly the legacy one."""
     if checkpoint_id and trace:
         trace.event("checkpoint.role_loop_bound", role=role,
                     checkpoint_id=checkpoint_id, artifact_kind=artifact_kind)
@@ -7892,10 +8051,19 @@ def _role_loop(session, first, status_path, context, io_out,
                     # other unverified promotion; a green one records verified
                     # readiness against the transaction's OWN captured
                     # manifest/index, never a controller-log rejoin.
+                    txn_profile_kwargs = {}
+                    if profile_session is not None:
+                        txn_profile_kwargs["plan_json_path"] = plan_json_path
+                        txn_profile_kwargs["reuse_policy"] = (
+                            profile_session.reuse_policy())
                     txn_result, txn_missing_reason = (
                         _run_owned_verification_transaction(
                             session_uuid, role, review_rounds, trace,
-                            work_id=role_work_id))
+                            work_id=role_work_id, **txn_profile_kwargs))
+                    if profile_session is not None and txn_result is not None:
+                        _profile_on_builder_transaction(
+                            profile_session, session_uuid, plan_json_path,
+                            status_path, txn_result)
                     readiness = _record_readiness_from_transaction(
                         session_uuid, role, review_rounds, trace, txn_result,
                         missing_reason=txn_missing_reason)
@@ -8078,6 +8246,32 @@ def _role_loop(session, first, status_path, context, io_out,
                                 if trace:
                                     trace.event("eval.error", evaluator=role,
                                                 round=review_rounds)
+                        if profile_session is not None:
+                            # Execution profile: typed finding signals may
+                            # promote the profile, and a build-reviewer
+                            # approve that breaks the profile's review
+                            # contract stops the phase unapproved with a
+                            # closed reason. A deterministic contract
+                            # misuse is never retried and never reported as
+                            # an unavailable reviewer.
+                            profile_session.on_verdict(reviewer_role, verdict)
+                            rejected_code = profile_session.screen_verdict(
+                                role, verdict)
+                            if rejected_code:
+                                if trace:
+                                    trace.event(
+                                        "review.failure", role=reviewer_role,
+                                        round=review_rounds,
+                                        profile_rejected=rejected_code)
+                                review_action = "stop"
+                                stop_payload = _agent_stop_payload(
+                                    "review_profile_rejected", role,
+                                    requires="reviewer",
+                                    reviewer_role=reviewer_role,
+                                    profile_rejected=rejected_code,
+                                    status_path=status_path,
+                                    review_path=review_path)
+                                break
                         v = verdict.get("verdict")
                         has_question = bool(str(
                             verdict.get("user_question") or "").strip())
@@ -8140,6 +8334,11 @@ def _role_loop(session, first, status_path, context, io_out,
                             break
                         if v == "approve":
                             reviewer_approved = True
+                            if profile_session is not None and role == "builder":
+                                profile_session.on_build_approved(
+                                    verdict, disposition_round,
+                                    (receipt_pointer or {}).get(
+                                        "manifest_digest"))
                             if receipt_pointer:
                                 # accepted ONLY when the candidate being
                                 # approved is still exactly the candidate the
@@ -8279,6 +8478,8 @@ def _role_loop(session, first, status_path, context, io_out,
                                 trace.event("review.round_cap",
                                             role=reviewer_role,
                                             round_cap=REVIEW_ROUND_CAP)
+                            if profile_session is not None:
+                                profile_session.on_round_cap(role)
                             # Unresolved dissent is never accepted: the phase
                             # stops with the reviewer's findings attached.
                             review_action = "stop"
@@ -8459,7 +8660,7 @@ def _scout_loop(session, first, intel_path, context, io_out,
                 on_first_send_accepted=None, on_first_send_rejected=None,
                 review_path=None,
                 save_pending_turn_fn=None, clear_pending_turn_fn=None,
-                session_uuid=None, role_work_id=None):
+                session_uuid=None, role_work_id=None, profile_session=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
     `run_flow` can chain into the planning phase on approval.
@@ -8476,6 +8677,8 @@ def _scout_loop(session, first, intel_path, context, io_out,
         require_pending_question=True,
         review_path=review_path, save_pending_turn_fn=save_pending_turn_fn,
         clear_pending_turn_fn=clear_pending_turn_fn)
+    if profile_session is not None:
+        loop_kwargs["profile_session"] = profile_session
     if intel_md_path:
         loop_kwargs["review_text"] = (
             lambda _p: scout_review_text(intel_md_path))
@@ -10850,7 +11053,8 @@ def run_scout(config, context, selected, io_out=None,
               on_first_send_accepted=None, on_first_send_rejected=None,
               reviewer_controller_check_fn=None,
               save_pending_turn_fn=None,
-              clear_pending_turn_fn=None, worktree=None, worktree_base=None):
+              clear_pending_turn_fn=None, worktree=None, worktree_base=None,
+              profile_session=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -10930,14 +11134,29 @@ def run_scout(config, context, selected, io_out=None,
                          "refusal_message": _mdec.get("refusal_message")},
                 source="manifest_preflight")
             return 1
-    brief = assemble_scout_brief(selected, intel_path or "", intel_md_path)
+    # Execution profile (additive): only a profiled session carries the profile
+    # record to the scout and its reviewer; every other session builds the
+    # exact same brief, runner and loop call as before.
+    profile_kw = ({"profile_session": profile_session}
+                  if profile_session is not None else {})
+    profile_path = (state_store.execution_profile_path_for(session_uuid)
+                    if profile_session is not None and session_uuid else None)
+    if profile_session is not None:
+        brief = assemble_scout_brief(
+            selected, intel_path or "", intel_md_path,
+            profile_note=exec_profiles.role_brief_note(
+                profile_session.record, profile_path or "the execution "
+                "profile record"))
+    else:
+        brief = assemble_scout_brief(selected, intel_path or "", intel_md_path)
     # The real scout-reviewer runner embeds BOTH intel files (JSON + markdown) so
     # the reviewer actually receives the markdown (D8); a test-injected
     # reviewer_runner overrides it byte-identically to the other phases.
     runner = reviewer_runner
     if runner is None and intel_md_path:
         runner = make_scout_reviewer_runner(
-            intel_md_path, trace=trace, extra_writable_dir=sessions_dir)
+            intel_md_path, trace=trace, extra_writable_dir=sessions_dir,
+            **({"profile_path": profile_path} if profile_path else {}))
     review_fn = make_review_fn(
         config,
         reviewer_context if reviewer_context is not None else context,
@@ -11095,6 +11314,7 @@ def run_scout(config, context, selected, io_out=None,
                        source="run_scout")
         first = _role_seed_delivery(brief, context)
         return _scout_loop(session, first, intel_path, context, io_out,
+                           **profile_kw,
                            review_fn=review_fn, trace=trace,
                            on_outcome=on_outcome, evaluate_fn=evaluate_fn,
                            intel_md_path=intel_md_path,
@@ -11166,6 +11386,7 @@ def run_scout(config, context, selected, io_out=None,
                        source="run_scout")
         first = _role_seed_delivery(brief, context)
         return _scout_loop(session, first, intel_path, context, io_out,
+                           **profile_kw,
                            review_fn=review_fn, trace=trace,
                            on_outcome=on_outcome, evaluate_fn=evaluate_fn,
                            intel_md_path=intel_md_path,
@@ -11229,6 +11450,7 @@ def run_scout(config, context, selected, io_out=None,
     _advance_phase(session_uuid, role_work_id, "preflight_passed",
                    source="run_scout")
     return _scout_loop(session, prompt, intel_path, context, io_out,
+                       **profile_kw,
                        review_fn=review_fn, trace=trace, on_outcome=on_outcome,
                        evaluate_fn=evaluate_fn, intel_md_path=intel_md_path,
                        skip_baseline=skip_baseline,
@@ -11263,7 +11485,8 @@ def run_planner(config, context, selected, io_out=None,
                 on_first_send_accepted=None, on_first_send_rejected=None,
                 reviewer_controller_check_fn=None,
                 save_pending_turn_fn=None,
-                clear_pending_turn_fn=None, worktree=None, worktree_base=None):
+                clear_pending_turn_fn=None, worktree=None, worktree_base=None,
+                profile_session=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -11345,9 +11568,12 @@ def run_planner(config, context, selected, io_out=None,
                 on_outcome(_OUTCOME_ENDED, None)
             return 1
     brief = assemble_planner_brief(plan_json_path or "", plan_md_path or "")
+    profile_path = (state_store.execution_profile_path_for(session_uuid)
+                    if profile_session is not None and session_uuid else None)
     runner = reviewer_runner or make_planning_advisor_runner(
         plan_md_path, trace=trace, extra_writable_dir=sessions_dir,
-        intel_path=intel_path, intel_md_path=intel_md_path)
+        intel_path=intel_path, intel_md_path=intel_md_path,
+        **({"profile_path": profile_path} if profile_path else {}))
     review_fn = make_review_fn(
         config,
         reviewer_context if reviewer_context is not None else context,
@@ -11421,6 +11647,8 @@ def run_planner(config, context, selected, io_out=None,
         require_pending_question=True,
         review_path=review_path, save_pending_turn_fn=save_pending_turn_fn,
         clear_pending_turn_fn=clear_pending_turn_fn)
+    if profile_session is not None:
+        loop_kwargs["profile_session"] = profile_session
 
     if cfg["controller"] == "claude":
         _pf = _guard_to_policy_fact(cfg["controller"], "planner", trace=trace)
@@ -11659,7 +11887,7 @@ def run_builder(config, context, selected, io_out=None,
                 save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None,
                 checkpoint_id=None, artifact_kind=None,
-                external_output_roots=()):
+                external_output_roots=(), profile_session=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -11753,11 +11981,14 @@ def run_builder(config, context, selected, io_out=None,
                 on_outcome(_OUTCOME_ENDED, None)
             return 1
     brief = assemble_builder_brief(build_status_path or "", build_summary_path)
+    profile_path = (state_store.execution_profile_path_for(session_uuid)
+                    if profile_session is not None and session_uuid else None)
     runner = reviewer_runner or make_build_reviewer_runner(
         plan_json_path, plan_md_path, baseline_note=baseline_note,
         baseline_repos=baseline_repos, trace=trace,
         extra_writable_dir=sessions_dir, build_summary_path=build_summary_path,
-        session_uuid=session_uuid, role_work_id=role_work_id)
+        session_uuid=session_uuid, role_work_id=role_work_id,
+        **({"profile_path": profile_path} if profile_path else {}))
     consumed = plan_consumed_upstream(plan_json_path, plan_md_path,
                                       building_epoch)
     review_fn = make_review_fn(
@@ -11849,6 +12080,9 @@ def run_builder(config, context, selected, io_out=None,
         review_path=build_review_path, save_pending_turn_fn=save_pending_turn_fn,
         clear_pending_turn_fn=clear_pending_turn_fn,
         build_summary_path=build_summary_path)
+    if profile_session is not None:
+        loop_kwargs["profile_session"] = profile_session
+        loop_kwargs["plan_json_path"] = plan_json_path
 
     if cfg["controller"] == "claude":
         _bf = _guard_to_policy_fact(cfg["controller"], "builder", trace=trace)
@@ -12529,6 +12763,10 @@ def build_run_result(rc, result_box):
     }
     if result_box.get("decision_ack_failed"):
         result["decision_ack_failed"] = list(result_box["decision_ack_failed"])
+    if result_box.get("execution_profile"):
+        # Additive and present ONLY for a profiled session: selected and
+        # effective profile, promotion count, deferred minor note count.
+        result["execution_profile"] = dict(result_box["execution_profile"])
     if session_file:
         resume = ["--session-file", session_file]
         result["resume_argv"] = resume
@@ -12735,6 +12973,63 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                           "start a new session")
         declared_roots = roots
         persist_output_roots = not (resuming_saved and saved_roots)
+    # Execution profile (#63). Resolved and refused HERE, before anything is
+    # written, so a refused invocation leaves session.json and
+    # execution_profile.json byte-identical. A profile DERIVES the team: it
+    # cannot be combined with --team, it cannot ride --no-session (the record
+    # must persist), it only ever promotes on resume, and a damaged record
+    # stops the run (there is no reader that treats damage as "no profile").
+    profile_arg = getattr(args, "profile", None)
+    profile_resume_record = None
+    if profile_arg is not None:
+        if profile_arg not in exec_profiles.PROFILES:
+            return refuse("unknown_profile",
+                          "unknown execution profile %r (known: %s)"
+                          % (profile_arg,
+                             ", ".join(exec_profiles.known_profiles())))
+        if not session_enabled:
+            return refuse("profile_requires_session",
+                          "--profile binds a persisted execution profile to a "
+                          "session; it cannot be combined with --no-session")
+        if args.team:
+            return refuse("profile_team_conflict",
+                          "--profile derives the team; it cannot be combined "
+                          "with --team")
+    if resuming_saved:
+        profile_kind, profile_value, profile_reason = (
+            state_store.read_execution_profile(saved))
+        if profile_kind == "invalid":
+            return refuse("execution_profile_unreadable",
+                          "the saved execution profile cannot be read (%s); "
+                          "nothing was run" % profile_reason)
+        if profile_kind == "valid":
+            profile_resume_record = profile_value
+            if args.team:
+                return refuse("profile_team_conflict",
+                              "this session runs under an execution profile; "
+                              "--team cannot change its team")
+            if (profile_arg is not None
+                    and exec_profiles.rank(profile_arg)
+                    < exec_profiles.rank(profile_value["effective"])):
+                return refuse("profile_demotion_refused",
+                              "--profile %s is below the session's effective "
+                              "profile %s; a profile only moves up"
+                              % (profile_arg, profile_value["effective"]))
+        elif profile_arg is not None:
+            return refuse("profile_not_bound",
+                          "this session was started without an execution "
+                          "profile; a profile cannot be attached to it")
+    # The profile whose team this run needs: a new profiled session's own, or
+    # a resumed one's current-or-requested stricter profile.
+    profile_target = None
+    if profile_resume_record is not None:
+        profile_target = profile_resume_record["effective"]
+        if (profile_arg is not None
+                and exec_profiles.rank(profile_arg)
+                > exec_profiles.rank(profile_target)):
+            profile_target = profile_arg
+    elif profile_arg is not None:
+        profile_target = profile_arg
     # Team, config and reviewer pairing are validated BEFORE any session is
     # created or lease acquired: an invalid invocation leaves nothing behind
     # for a later --resume to pick up.
@@ -12746,6 +13041,15 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
         preview_selected = [r for r in ROLES if r in saved["team"]]
     else:
         preview_selected = list(ROLES)
+    if profile_target is not None:
+        needed_roles = exec_profiles.team_for(profile_target)
+        preview_selected = [
+            r for r in ROLES
+            if r in needed_roles
+            or (profile_resume_record is not None and r in preview_selected)]
+    profile_team_grown = bool(
+        profile_resume_record is not None
+        and set(preview_selected) != set(saved["team"]))
     if not preview_selected:
         return refuse("no_roles_selected", "no roles selected; nothing to do.")
     if args.config:
@@ -13013,6 +13317,10 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
             selected = [r for r in ROLES if r in saved["team"]]
         else:
             selected = list(ROLES)
+        if profile_target is not None:
+            # The profile derived this team (and, on a resumed session, grew
+            # it to the stricter profile) before the lease was acquired.
+            selected = list(preview_selected)
 
         # Step 2: config.
         config = default_config(selected)
@@ -13023,6 +13331,13 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
             config = {r: normalize_role_config(saved["config"][r])
                       for r in selected if r in saved["config"]}
             io_out.write("cowork: using saved session config (%s)\n" % spath)
+        if profile_target is not None:
+            # Roles a promotion added to the team get the default config;
+            # every existing role entry is left exactly as it was.
+            for _grown_role in selected:
+                if _grown_role not in config:
+                    config[_grown_role] = default_config(
+                        [_grown_role])[_grown_role]
         trace.event("run.config", selected=selected, reuse_config=reuse_config,
                     config={r: dict(config[r]) for r in selected if r in config})
 
@@ -13724,7 +14039,35 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     spath, evaluation_policy, prior=holder["state"])
             except ValueError:
                 pass
-        if session_enabled and not reuse_config:
+        # Execution profile (#63): a new profiled session's record is written
+        # and its immutable binding is set on the holder BEFORE save_config, so
+        # binding, team and config land in ONE save and no crash window leaves
+        # a resumable session half-bound. A resumed session loads its record;
+        # a stricter --profile promotes it explicitly (recorded, one-way).
+        profile_session = None
+        profile_record = profile_resume_record
+        if profile_target is not None:
+            def _save_profile_record(record):
+                if not state_store.write_execution_profile_record(
+                        session_uuid, record):
+                    raise OSError(
+                        "the execution profile record could not be written")
+            if profile_record is None:
+                profile_record = exec_profiles.new_record(
+                    profile_arg, getattr(args, "profile_rationale", None),
+                    exec_profiles.utc_now())
+                _save_profile_record(profile_record)
+                holder["state"] = state_store.bind_execution_profile(
+                    holder["state"] or {}, profile_record)
+            profile_session = exec_profiles.ProfileSession(
+                profile_record, _save_profile_record, trace_fn=trace.event)
+            if (profile_arg is not None and exec_profiles.rank(profile_arg)
+                    > exec_profiles.rank(profile_session.effective)):
+                profile_session.promote_explicit(profile_arg)
+            trace.event("profile.active", selected=profile_session.selected,
+                        effective=profile_session.effective,
+                        resumed=profile_resume_record is not None)
+        if session_enabled and (not reuse_config or profile_team_grown):
             holder["state"] = saved = state_store.save_config(
                 spath, selected, config, prior=holder["state"] or {})
         if session_enabled and persist_output_roots:
@@ -14128,6 +14471,38 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
         review_path = state_store.review_path_for(intel_dir, session_uuid)
         plan_json_path = state_store.planner_plan_json_path_for(intel_dir, session_uuid)
         plan_md_path = state_store.planner_plan_md_path_for(intel_dir, session_uuid)
+        # The approved plan documents the builder, its reviewer and the owned
+        # verification inventory read from. They are the planner's own files,
+        # except under the light profile, where the approved scout intel IS the
+        # plan: the planner's paths stay the planner's (a promoted session's
+        # planner must never overwrite the intel).
+        build_plan_json_path, build_plan_md_path = plan_json_path, plan_md_path
+        profile_record_path = None
+        if profile_session is not None:
+            profile_record_path = state_store.execution_profile_path_for(
+                session_uuid)
+            if profile_session.plan_source == exec_profiles.PLAN_SOURCE_INTEL:
+                build_plan_json_path, build_plan_md_path = (
+                    intel_path, intel_md_path)
+
+        def refresh_profile_result():
+            """Mirror the profile record into the run result (additive; only
+            profiled sessions carry the field)."""
+            if profile_session is None:
+                return
+            record = profile_session.record
+            result_box["execution_profile"] = {
+                "selected": record["selected"],
+                "effective": record["effective"],
+                "promotion_count": len(record["promotion_history"]),
+                "deferred_minor_note_count": len(
+                    record["deferred_minor_notes"])}
+
+        refresh_profile_result()
+        # Handed to a lead runner only for a profiled session, so every legacy
+        # (and test-injected) runner is called exactly as before.
+        profile_run_kw = ({"profile_session": profile_session}
+                          if profile_session is not None else {})
         planner_review_path = state_store.planner_review_path_for(
             intel_dir, session_uuid)
         build_status_path = state_store.build_status_path_for(
@@ -14262,11 +14637,13 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 return [intel_path, intel_md_path, plan_json_path, plan_md_path,
                         planner_review_path]
             if role == "builder":
-                return [plan_json_path, plan_md_path, build_status_path,
-                        build_summary_path, build_review_path]
+                return [build_plan_json_path, build_plan_md_path,
+                        build_status_path, build_summary_path,
+                        build_review_path]
             if role == BUILD_REVIEWER:
-                return [plan_json_path, plan_md_path, build_status_path,
-                        build_summary_path, build_review_path]
+                return [build_plan_json_path, build_plan_md_path,
+                        build_status_path, build_summary_path,
+                        build_review_path]
             return []
 
         def switch_note_for(role):
@@ -14483,7 +14860,7 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
             # snapshot; the explicit root list (with a has_head flag) is threaded to
             # the reviewer so a no-commit/fallback root is still named and captured.
             if not baseline_box["computed"]:
-                repo_paths = _plan_repo_set(plan_json_path, run_cwd)
+                repo_paths = _plan_repo_set(build_plan_json_path, run_cwd)
                 entries = []
                 repos = []
                 dirty_repos = []
@@ -14520,6 +14897,59 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 baseline_box["repos"] = repos
                 baseline_box["computed"] = True
             return baseline_box
+
+        def capture_building_baseline():
+            """Execution profile (#63): snapshot the candidate ONCE per
+            building epoch, before the first builder launch, with the SAME
+            enumeration the owned transaction snapshot uses, so a later change
+            set is a like-for-like difference (pre-existing untracked files are
+            part of the baseline, never a spurious scope signal). A capture
+            failure leaves no baseline: the builder-ready gate then measures
+            no change set and promotes on `signal_malformed`."""
+            epoch = building_epoch_box["epoch"]
+            try:
+                manifest = verification.candidate_manifest(
+                    active_worktree or run_cwd)
+                fingerprint = verification.manifest_fingerprint(manifest)
+                if not state_store.write_json_atomic_durable(
+                        state_store.execution_profile_baseline_path_for(
+                            session_uuid),
+                        {"building_epoch": epoch,
+                         "manifest_fingerprint": fingerprint,
+                         "files": manifest}):
+                    raise OSError("baseline could not be written")
+            except (verification.SnapshotRaceError, OSError) as exc:
+                trace.event("profile.baseline_failed", epoch=epoch,
+                            error_type=type(exc).__name__)
+                return
+            profile_session.set_building_baseline(epoch, fingerprint)
+            trace.event("profile.baseline", epoch=epoch,
+                        manifest_fingerprint=fingerprint,
+                        file_count=len(manifest))
+
+        def reconcile_profile_team():
+            """After a lead run: surface the profile in the run result and, if
+            the run promoted it, grow the team to the stricter profile's roles
+            (default config for the added roles only; existing entries are left
+            untouched). No planning phase is ever inserted mid-build."""
+            nonlocal planner_on_team, builder_on_team
+            if profile_session is None:
+                return
+            refresh_profile_result()
+            needed = [r for r in exec_profiles.team_for(
+                profile_session.effective) if r not in selected]
+            if not needed:
+                return
+            selected[:] = [r for r in ROLES if r in selected or r in needed]
+            for added in needed:
+                config.setdefault(added, default_config([added])[added])
+            planner_on_team = "planner" in selected
+            builder_on_team = "builder" in selected
+            if session_enabled:
+                holder["state"] = state_store.save_config(
+                    spath, selected, config, prior=holder["state"] or {})
+            trace.event("profile.team_grown", roles=needed,
+                        effective=profile_session.effective)
 
         # Phase loop: scouting -> (on intel approval, planner on team) planning ->
         # (on an authorized hand-back) scouting -> ... Plan approval, EOF, or an
@@ -14565,7 +14995,9 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
             if role_resume_id("planner"):
                 planner_seed = context
             else:
-                planner_seed = assemble_planner_seed(intel_path, shared_context, intel_dir, current_rev)
+                planner_seed = assemble_planner_seed(
+                    intel_path, shared_context, intel_dir, current_rev,
+                    profile_path=profile_record_path)
         elif phase == "building":
             # Resuming into the building phase. A saved builder session continues
             # with the (possibly new) context; a building phase persisted WITHOUT a
@@ -14573,10 +15005,19 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
             # start a fresh builder from the approved plan, not from a bare context.
             if role_resume_id("builder"):
                 builder_seed = context
+            elif (profile_session is not None
+                    and profile_session.plan_source
+                    == exec_profiles.PLAN_SOURCE_INTEL):
+                # Light profile: the approved scout intel IS the plan, so the
+                # fresh builder is seeded from it (scout->builder), never from
+                # a planner plan that does not exist.
+                builder_seed = assemble_light_builder_seed(
+                    build_plan_json_path, build_plan_md_path, shared_context,
+                    intel_dir, current_rev, profile_path=profile_record_path)
             else:
                 builder_seed = assemble_builder_seed(
-                    plan_json_path, plan_md_path, shared_context,
-                    intel_dir, current_rev)
+                    build_plan_json_path, build_plan_md_path, shared_context,
+                    intel_dir, current_rev, profile_path=profile_record_path)
 
         # The orchestrator's decision, validated and prechecked before anything
         # ran, is consumed HERE exactly once, under the store lock (a
@@ -14680,6 +15121,16 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     planner_seed = None
                 else:
                     planner_seed = plan_handback_wake_block(note, intel_dir)
+                    if (profile_session is not None
+                            and not role_resume_id("planner")):
+                        # A planner a promotion just added has no session
+                        # yet: it starts from the approved intel AND the
+                        # hand-back note, never from the note alone.
+                        planner_seed = handoff.compose_handoff_blocks(
+                            assemble_planner_seed(
+                                intel_path, shared_context, intel_dir,
+                                current_rev, profile_path=profile_record_path),
+                            handoff.STATIC_SEPARATOR, planner_seed)
                     builder_seed = None
             elif (response_kind == "decline_handoff"
                     and lead_target in targets):
@@ -14892,9 +15343,11 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         clear_pending_turn_fn=clear_pending_switch_for,
                         worktree=active_worktree, worktree_base=active_worktree_root,
                         on_outcome=lambda o, p=None: outcome_box.update(
-                            outcome=o, payload=p))
+                            outcome=o, payload=p),
+                        **profile_run_kw)
                     _bind_decision_launch(session_uuid, "scout", None)
                     record_outcome("scout", outcome_box)
+                    reconcile_profile_team()
                     if rc != 0:
                         recover_controller_failure("scout", "startup_or_probe")
                         break
@@ -14909,6 +15362,37 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         ack_lead("scout")
                         decision_delivered("scout")
                     if (rc == 0 and outcome_box["outcome"] == "approved"
+                            and profile_session is not None):
+                        # Execution profile: the approved intel declares the
+                        # batch and its derivative edges (recorded now), and
+                        # its signals decide the route. A clean light batch
+                        # goes straight to building with the intel as the
+                        # approved plan; anything else promotes the session
+                        # and goes through planning.
+                        intel_doc = measure._read_json(intel_path)
+                        intel_route = profile_session.on_intel_approved(
+                            intel_doc.get("result")
+                            if isinstance(intel_doc, dict) else None)
+                        reconcile_profile_team()
+                        if intel_route == "building" and builder_on_team:
+                            profile_session.set_plan_source(
+                                exec_profiles.PLAN_SOURCE_INTEL)
+                            build_plan_json_path, build_plan_md_path = (
+                                intel_path, intel_md_path)
+                            phase = set_phase("building")
+                            bump_building_epoch()
+                            if role_resume_id("builder"):
+                                builder_seed = plan_updated_block(
+                                    build_plan_json_path, build_plan_md_path)
+                            else:
+                                builder_seed = with_decision_record(
+                                    assemble_light_builder_seed(
+                                        build_plan_json_path,
+                                        build_plan_md_path, shared_context,
+                                        intel_dir, current_rev,
+                                        profile_path=profile_record_path))
+                            continue
+                    if (rc == 0 and outcome_box["outcome"] == "approved"
                             and planner_on_team):
                         phase = set_phase("planning")
                         bump_planning_epoch()
@@ -14921,7 +15405,8 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                             planner_seed = with_decision_record(
                                 assemble_planner_seed(
                                     intel_path, shared_context, intel_dir,
-                                    current_rev))
+                                    current_rev,
+                                    profile_path=profile_record_path))
                         continue
                     break
 
@@ -14977,9 +15462,11 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         save_pending_turn_fn=save_pending_turn_for,
                         clear_pending_turn_fn=clear_pending_switch_for,
                         worktree=active_worktree, worktree_base=active_worktree_root,
-                        on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+                        on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p),
+                        **profile_run_kw)
                     _bind_decision_launch(session_uuid, "planner", None)
                     record_outcome("planner", planner_box)
+                    reconcile_profile_team()
                     if rc != 0:
                         recover_controller_failure("planner", "startup_or_probe")
                         break
@@ -14990,6 +15477,22 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     if rc == 0 and planner_first_send_box["delivered"]:
                         ack_lead("planner")
                         decision_delivered("planner")
+                    if (rc == 0 and planner_box["outcome"] == "approved"
+                            and profile_session is not None):
+                        # Execution profile: the approved plan's batch (its
+                        # declared boundary, else the per-file list; an
+                        # unresolvable one is a malformed signal) replaces the
+                        # intel's provisional one, and the planner's plan is
+                        # the approved plan from here on.
+                        plan_doc = measure._read_json(plan_json_path)
+                        profile_session.on_plan_approved(
+                            plan_doc.get("result")
+                            if isinstance(plan_doc, dict) else None, run_cwd)
+                        profile_session.set_plan_source(
+                            exec_profiles.PLAN_SOURCE_PLAN)
+                        build_plan_json_path, build_plan_md_path = (
+                            plan_json_path, plan_md_path)
+                        reconcile_profile_team()
                     if (rc == 0 and planner_box["outcome"] == "approved"
                             and builder_on_team):
                         # Plan approved with a builder on the team: chain into the
@@ -15003,12 +15506,13 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         bump_building_epoch()
                         if role_resume_id("builder"):
                             builder_seed = plan_updated_block(
-                                plan_json_path, plan_md_path)
+                                build_plan_json_path, build_plan_md_path)
                         else:
                             builder_seed = with_decision_record(
                                 assemble_builder_seed(
-                                    plan_json_path, plan_md_path,
-                                    shared_context, intel_dir, current_rev))
+                                    build_plan_json_path, build_plan_md_path,
+                                    shared_context, intel_dir, current_rev,
+                                    profile_path=profile_record_path))
                         continue
                     if (rc == 0 and planner_box["outcome"] == "approved"
                             and not builder_on_team):
@@ -15037,6 +15541,10 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         session_uuid, trace, clear_pending_switch_for)
                     if pending_switch_for("builder") else None)
                 builder_first_send_cb = decision_first_send("builder", builder_first_send_cb)
+                if (profile_session is not None
+                        and profile_session.needs_building_baseline(
+                            building_epoch_box["epoch"])):
+                    capture_building_baseline()
                 rc = run_builder_fn(
                     config,
                     with_agent_lead_note(with_decision_note("builder", seed_with_switch_note(
@@ -15059,7 +15567,8 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     eval_scratch_path=eval_scratch["builder"],
                     reviewer_eval_scratch_path=eval_scratch[BUILD_REVIEWER],
                     scores_path=scores_path, session_uuid=session_uuid,
-                    plan_json_path=plan_json_path, plan_md_path=plan_md_path,
+                    plan_json_path=build_plan_json_path,
+                    plan_md_path=build_plan_md_path,
                     building_epoch=building_epoch_box["epoch"],
                     baseline_note=build_baseline()["note"],
                     baseline_repos=build_baseline()["repos"],
@@ -15076,9 +15585,11 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     clear_pending_turn_fn=clear_pending_switch_for,
                     worktree=active_worktree, worktree_base=active_worktree_root,
                     external_output_roots=declared_roots,
-                    on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
+                    on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p),
+                    **profile_run_kw)
                 _bind_decision_launch(session_uuid, "builder", None)
                 record_outcome("builder", builder_box)
+                reconcile_profile_team()
                 if rc != 0:
                     recover_controller_failure("builder", "startup_or_probe")
                     break
@@ -16214,14 +16725,17 @@ def main(argv=None):
                     ("--allow-controllers",
                      args.allow_controllers is not None),
                     ("--take-over", bool(getattr(args, "take_over", False))),
-                    ("--output-root", bool(args.output_root))]
+                    ("--output-root", bool(args.output_root)),
+                    ("--profile", args.profile is not None)]
         mutating += [("--" + kind.replace("_", "-"), True)
                      for kind, _rid in _decision_flags(args)]
         for flag, supplied in mutating:
             for read_only, active in (("--check", args.check),
                                       ("--report", args.report),
                                       ("--session-owner",
-                                       args.session_owner)):
+                                       args.session_owner),
+                                      ("--preview-profile",
+                                       args.preview_profile is not None)):
                 if supplied and active:
                     sys.stderr.write("cowork: %s cannot be combined with "
                                      "%s.\n" % (flag, read_only))
@@ -16236,6 +16750,10 @@ def main(argv=None):
             emit_run_result(sys.stdout, 2,
                             {"reason": "conflicting_arguments"})
             return 2
+        # Read-only policy preview: prints one JSON object, reads no session
+        # and constructs nothing that could dispatch.
+        if args.preview_profile is not None:
+            return run_profile_preview(args)
         if args.check:
             return preflight.main()
         if args.report:

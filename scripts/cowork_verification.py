@@ -107,6 +107,16 @@ KIND_PREFLIGHT = "preflight"
 KIND_FINAL_SUITE = "final_suite"
 KINDS = (KIND_BASELINE, KIND_FOCUSED, KIND_PREFLIGHT, KIND_FINAL_SUITE)
 
+# Optional schema-2 entry fields (execution profiles, #63). `depends_on` lists
+# the repo-relative paths, globs or trailing-slash prefixes an entry's result
+# depends on; an entry without it always reruns. `check_class` marks a
+# deterministic lint/format check whose failure alone never promotes a profile.
+CHECK_CLASSES = ("lint", "format")
+MAX_DEPENDS_ON = 64
+# `final_suite_binding` of a transaction whose final suite was reused, bound to
+# its source transaction and an unchanged dependency digest, instead of run.
+FINAL_SUITE_BINDING_REUSED = "reused_dependency_bound"
+
 # Legacy two-field (label/command only) plans normalize to this kind, and
 # their final-suite binding is reported as "legacy_unknown" rather than
 # invented (a legacy plan never expressed which entry, if any, was the final
@@ -467,6 +477,21 @@ def _normalize_schema2_inventory(raw_verification):
                     "triggering_finding", "marginal_cost", "measures"):
             if key in item:
                 entry[key] = item[key]
+        if "depends_on" in item:
+            if not _valid_depends_on(item["depends_on"]):
+                raise InventoryError(
+                    "bad_depends_on",
+                    "entry %r depends_on must be a 1..%d element list of "
+                    "repo-relative paths, globs or trailing-slash prefixes"
+                    % (label, MAX_DEPENDS_ON))
+            entry["depends_on"] = list(item["depends_on"])
+        if "check_class" in item:
+            if item["check_class"] not in CHECK_CLASSES:
+                raise InventoryError(
+                    "bad_check_class",
+                    "entry %r check_class %r is not one of %s"
+                    % (label, item["check_class"], CHECK_CLASSES))
+            entry["check_class"] = item["check_class"]
         entries.append(entry)
     if final_suite_label is None:
         raise InventoryError("missing_final_suite",
@@ -481,6 +506,23 @@ def _normalize_schema2_inventory(raw_verification):
 def _is_argv_list(command):
     return (isinstance(command, list) and len(command) > 0
             and all(isinstance(tok, str) for tok in command))
+
+
+def _valid_depends_on(value):
+    """A 1..MAX_DEPENDS_ON list of repo-relative paths, each optionally a glob
+    or a trailing-slash prefix: never absolute, never containing `..` or a
+    backslash."""
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_DEPENDS_ON:
+        return False
+    for item in value:
+        if not isinstance(item, str):
+            return False
+        probe = item[:-1] if item.endswith("/") else item
+        if (not probe or "\x00" in probe or "\\" in probe
+                or probe.startswith("/") or ".." in probe.split("/")
+                or probe.strip() != probe):
+            return False
+    return True
 
 
 def normalized_inventory_key(schema, entries):
@@ -548,9 +590,14 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
                   command_timeout_s=None, term_grace_s=None,
                   overall_deadline_s=None, evidence_poll_attempts=None,
                   evidence_poll_delay_s=None, output_cap_bytes=None,
-                  work_id=None):
+                  work_id=None, key_suffix=""):
     """Build the versioned JSON request document persisted before the worker
     is spawned (see `cowork_state.verification_request_path_for`).
+
+    `key_suffix` (execution profiles, additive): appended to the request-key
+    material only when evidence was reused for this request, so a composite
+    (partly reused) result can never be single-flight-reused by an identical
+    candidate that reused nothing. Empty for every legacy caller.
 
     `configuration` is a caller-supplied, already-normalized dict (e.g. team/
     role config relevant to verification); it is included verbatim in the
@@ -569,8 +616,9 @@ def build_request(session_uuid, transaction_id, repo, snapshot_manifest_digest,
     inventory_key = normalized_inventory_key(schema, entries)
     config_blob = json.dumps(configuration or {}, sort_keys=True)
     request_key = hashlib.sha256(
-        ("%s|%s|%s|%s" % (snapshot_manifest_digest, index_digest,
-                          config_blob, inventory_key)).encode("utf-8")
+        ("%s|%s|%s|%s%s" % (snapshot_manifest_digest, index_digest,
+                            config_blob, inventory_key,
+                            key_suffix)).encode("utf-8")
     ).hexdigest()
     return {
         "protocol_version": PROTOCOL_VERSION,
@@ -959,6 +1007,183 @@ def build_snapshot(repo, session_uuid, transaction_id):
         "manifest_path": manifest_path,
         "index_path": index_path,
     }
+
+
+def candidate_manifest(repo):
+    """`{rel: {type, sha256, size, mode, symlink_target}}` for the live
+    candidate, enumerated EXACTLY like `build_snapshot` (tracked +
+    untracked-non-ignored via `git_repo_paths`, unstaged deletions via
+    `git_deleted_paths`, the same hashing) but without copying any bytes into
+    the object store. An execution profile uses it to take a building-entry
+    baseline that is directly comparable with a transaction snapshot
+    manifest. Raises `SnapshotRaceError` on any enumeration failure."""
+    paths = git_repo_paths(repo)
+    if paths is None:
+        raise SnapshotRaceError({"reason": "git_ls_files_failed"})
+    manifest, _raw = _enumerate_and_hash(
+        repo, paths, git_deleted_paths(repo) or frozenset())
+    return manifest
+
+
+def manifest_fingerprint(manifest):
+    """Public name of the order-independent manifest digest."""
+    return _manifest_fingerprint(manifest)
+
+
+def _profiles():
+    # Lazy: a `--worker` process execs this file alone from a snapshot of a
+    # target repo that need not track `cowork_execution_profiles.py`, and the
+    # worker never reaches any caller of this accessor.
+    import cowork_execution_profiles
+    return cowork_execution_profiles
+
+
+def dependency_digest(manifest_files, patterns):
+    """Digest of the content, type, mode and symlink identity of every
+    manifest path matched by `patterns`, prefixed by the sorted pattern list.
+    None when any pattern matches no path at all (an unverifiable dependency
+    is never reusable)."""
+    profiles = _profiles()
+    matched = set()
+    for pattern in patterns:
+        hits = [p for p in manifest_files
+                if profiles.dependency_matches(p, [pattern])]
+        if not hits:
+            return None
+        matched.update(hits)
+    lines = []
+    for path in sorted(matched):
+        entry = manifest_files[path]
+        lines.append("%s:%s:%s:%s:%s" % (
+            path, entry.get("type"), entry.get("sha256"), entry.get("mode"),
+            entry.get("symlink_target")))
+    blob = json.dumps(sorted(patterns)) + "\n" + "\n".join(lines)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _green_final_suite_binding(final_suite_label, current, reused=False):
+    """The `final_suite_binding` of a GREEN transaction. A schema-2 final
+    suite that ran is `ran_once`; one that was reused is
+    `reused_dependency_bound` and is never labelled `ran_once`; a legacy plan
+    keeps whatever it already had. Every green-binding site uses this."""
+    if final_suite_label == FINAL_SUITE_LEGACY_UNKNOWN:
+        return current
+    return FINAL_SUITE_BINDING_REUSED if reused else "ran_once"
+
+
+def _plan_evidence_reuse(session_uuid, snapshot, entries, reuse_policy):
+    """Decide, per entry, whether accepted evidence stands for the new
+    snapshot. Returns `(executed_entries, evidence_reuse, dependency_digests)`.
+
+    `dependency_digests` covers every entry that declares `depends_on`
+    (None when a pattern matches nothing). With `reuse_policy` None nothing is
+    reused: the digests are still produced so accepted evidence can be
+    recorded."""
+    if not any(e.get("depends_on") for e in entries):
+        return list(entries), [], {}
+    manifest_doc = state_store.read_json_tolerant(snapshot["manifest_path"])
+    files = (manifest_doc or {}).get("files") or {}
+    digests = {e["label"]: dependency_digest(files, e["depends_on"])
+               for e in entries if e.get("depends_on")}
+    if reuse_policy is None:
+        return list(entries), [], digests
+    profiles = _profiles()
+    diffs = {}
+    executed = []
+    reused = []
+    for entry in entries:
+        prior = reuse_policy.prior_for(entry)
+        source = prior.get("source_transaction_id") if prior else None
+        if prior is None or not source:
+            executed.append(entry)
+            continue
+        if source not in diffs:
+            prior_doc = state_store.read_json_tolerant(
+                state_store.verification_snapshot_manifest_path_for(
+                    session_uuid, source))
+            prior_files = (prior_doc or {}).get("files")
+            diffs[source] = (profiles.diff_manifests(prior_files, files)
+                             if isinstance(prior_files, dict) else None)
+        diff = diffs[source]
+        if diff is None:
+            executed.append(entry)
+            continue
+        changed, executable = diff
+        if reuse_policy.may_reuse(entry, prior, changed, bool(executable),
+                                  digests.get(entry["label"])):
+            reused.append({
+                "label": entry["label"], "kind": entry["kind"],
+                "source_transaction_id": source,
+                "dependency_digest": digests[entry["label"]]})
+        else:
+            executed.append(entry)
+    return executed, reused, digests
+
+
+def _reuse_key_suffix(evidence_reuse):
+    if not evidence_reuse:
+        return ""
+    rows = sorted((r["label"], r["source_transaction_id"],
+                   r["dependency_digest"]) for r in evidence_reuse)
+    return "|reuse:%s" % hashlib.sha256(
+        json.dumps(rows).encode("utf-8")).hexdigest()
+
+
+def _stamp_reuse(result, request):
+    """Carry the reuse facts of `request` onto a terminal `result`; absent for
+    every request that reused nothing and declared no dependencies."""
+    for key in ("evidence_reuse", "dependency_digests"):
+        if key in request:
+            result[key] = request[key]
+    if request.get("final_suite_reused"):
+        result["final_suite_reused"] = True
+    return result
+
+
+def _finish_all_reused(repo, session_uuid, transaction_id, request,
+                       final_suite_label, snapshot):
+    """Terminal result for a transaction whose every entry's evidence was
+    reused: no worker, no minted attempt, no command. It is green only if the
+    live candidate still equals the snapshot the reuse was decided against."""
+    manifest_doc = state_store.read_json_tolerant(snapshot["manifest_path"])
+    mutation = detect_mutation(
+        repo, snapshot["manifest_digest"], snapshot["index_digest"],
+        expected_manifest=(manifest_doc or {}).get("files"))
+    green = mutation is None
+    shutil.rmtree(state_store.verification_snapshot_checkout_dir(
+        session_uuid, transaction_id), ignore_errors=True)
+    state_store.write_json_atomic(
+        state_store.verification_request_path_for(
+            session_uuid, transaction_id), request)
+    result = TransactionResult({
+        "transaction_id": transaction_id,
+        "request_key": request["request_key"],
+        "verdict": VERDICT_GREEN if green else VERDICT_RED,
+        "final_suite_label": final_suite_label,
+        "final_suite_binding": (_green_final_suite_binding(
+            final_suite_label, "not_reached",
+            bool(request.get("final_suite_reused")))
+            if green else "not_reached"),
+        "attempts": [],
+        "mutation": mutation,
+        "worker_identity_verified": False,
+        "worker_identity": None,
+        "startup_failure": None,
+        "ledger_failure": None,
+        "reused_lock_result": False,
+        "snapshot": {"manifest_digest": snapshot["manifest_digest"],
+                     "index_digest": snapshot["index_digest"]},
+        "created_at": request.get("created_at"),
+        "finished_at": _utc_now(),
+    })
+    _stamp_reuse(result, request)
+    result_path = state_store.verification_result_path_for(
+        session_uuid, transaction_id)
+    if not state_store.write_json_atomic(result_path, result):
+        result = TransactionResult(dict(
+            result, verdict=VERDICT_UNVERIFIED,
+            result_persistence_failed=True))
+    return result
 
 
 def _write_object_atomic(path, raw_bytes):
@@ -1477,8 +1702,11 @@ def reconcile_deferred_transaction(repo, session_uuid, stored_result):
                 and a.get("exit_code") == 0 and not a.get("timed_out")
                 for a in rebuilt):
             verdict = VERDICT_GREEN
-            if final_suite_label != FINAL_SUITE_LEGACY_UNKNOWN:
-                final_suite_binding = "ran_once"
+            final_suite_binding = _green_final_suite_binding(
+                final_suite_label, final_suite_binding,
+                bool(isinstance(request, dict)
+                     and request.get("final_suite_reused")
+                     or base.get("final_suite_reused")))
         else:
             verdict = VERDICT_RED
 
@@ -2242,7 +2470,7 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
                     python_executable=None, command_timeout_s=None,
                     term_grace_s=None, waiter_deadline_s=None,
                     evidence_poll_attempts=None, evidence_poll_delay_s=None,
-                    cancel_event=None, work_id=None):
+                    cancel_event=None, work_id=None, reuse_policy=None):
     """Build the snapshot, acquire single-flight, spawn+verify the worker,
     drive it through the approved inventory, tear everything down on
     completion/cancel/timeout, and return a `TransactionResult`.
@@ -2261,12 +2489,25 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
 
     `work_id` (M2 Package E, additive): threaded straight through to
     `build_request`'s own `work_id` — see that function's docstring.
+
+    `reuse_policy` (execution profiles, additive): an object with
+    `prior_for(entry)` and `may_reuse(...)` (see
+    `cowork_execution_profiles.ReusePolicy`). With None — every legacy
+    caller, and every assurance session — nothing is ever reused and the
+    request and result are byte-identical to a call without the argument. With
+    a policy, an entry whose declared dependencies are unchanged since the
+    prior accepted run is not sent to the worker; it is listed in
+    `result["evidence_reuse"]` with its source transaction and dependency
+    digest. A reused final suite is bound `reused_dependency_bound`, never
+    `ran_once`.
     """
     python_executable = python_executable or sys.executable or "python3"
     transaction_id = new_transaction_id()
     schema, entries, final_suite_label = normalize_inventory(raw_verification)
 
     snapshot = build_snapshot(repo, session_uuid, transaction_id)
+    entries, evidence_reuse, dependency_digests = _plan_evidence_reuse(
+        session_uuid, snapshot, entries, reuse_policy)
     checkout_root = materialize_checkout(session_uuid, transaction_id)
     # Validate against the CHECKS ROOT (the parent of every per-command
     # checkout: `<txn>/checks/0000`, `<txn>/checks/0001`, ...), not the
@@ -2284,8 +2525,21 @@ def run_transaction(repo, session_uuid, raw_verification, configuration=None,
         final_suite_label, command_timeout_s=command_timeout_s,
         term_grace_s=term_grace_s,
         evidence_poll_attempts=evidence_poll_attempts,
-        evidence_poll_delay_s=evidence_poll_delay_s, work_id=work_id)
+        evidence_poll_delay_s=evidence_poll_delay_s, work_id=work_id,
+        key_suffix=_reuse_key_suffix(evidence_reuse))
+    if reuse_policy is not None:
+        request["evidence_reuse"] = evidence_reuse
+    if dependency_digests:
+        request["dependency_digests"] = dependency_digests
+    if any(r["label"] == final_suite_label for r in evidence_reuse):
+        request["final_suite_reused"] = True
     request_key = request["request_key"]
+
+    if not entries:
+        # Every entry's evidence stands: nothing to execute, so no worker is
+        # spawned and nothing is minted.
+        return _finish_all_reused(repo, session_uuid, transaction_id,
+                                  request, final_suite_label, snapshot)
 
     # Issue #51: the owner-path reuse of a DEFERRED transaction reconciles
     # it from its own evidence (under the held flock) instead of
@@ -2414,6 +2668,7 @@ def _run_transaction_body(repo, session_uuid, transaction_id, request,
             "created_at": request.get("created_at"),
             "finished_at": _utc_now(),
         })
+        _stamp_reuse(result, request)
         return _persist_terminal_result(
             session_uuid, transaction_id, request_key, result)
 
@@ -2485,6 +2740,7 @@ def _run_transaction_body(repo, session_uuid, transaction_id, request,
             "created_at": request.get("created_at"),
             "finished_at": _utc_now(),
         })
+        _stamp_reuse(result, request)
     # Persist the terminal result to its OWN advertised, session-relative
     # path — `verification/transactions/<transaction_id>/result.json` —
     # BEFORE publishing the single-flight lock's terminal metadata or
@@ -2930,8 +3186,9 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
                     and a.get("exit_code") == 0 and not a.get("timed_out")
                     for a in attempts):
                 verdict = VERDICT_GREEN
-                if final_suite_label != FINAL_SUITE_LEGACY_UNKNOWN:
-                    final_suite_binding = "ran_once"
+                final_suite_binding = _green_final_suite_binding(
+                    final_suite_label, final_suite_binding,
+                    bool(request.get("final_suite_reused")))
             else:
                 verdict = VERDICT_RED
     finally:
@@ -3010,6 +3267,7 @@ def _run_owned_transaction(repo, session_uuid, transaction_id, request,
         "created_at": request.get("created_at"),
         "finished_at": _utc_now(),
     })
+    _stamp_reuse(result, request)
     if _defer_teardown:
         # Issue #51: teardown was deferred because a command is still
         # possibly alive. The verdict above is unchanged (evidence is not

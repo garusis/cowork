@@ -243,6 +243,38 @@ credited to that child, overlapping evidenced edits are contested, and missing
 actor evidence remains unattributed. Reference those artifacts by path and do
 not reproduce their contents in the review file.
 
+## Execution profiles (a profile-scoped contract change)
+
+When the context names an **execution profile** record, the build is judged under
+that profile. This section changes the approve contract **deliberately and only
+for profiled sessions**; a session without a profile record keeps the contract
+above unchanged.
+
+- **Thresholds.** Under `light` and `standard` only `blocking` and `major`
+  findings justify a `revise`. A `minor` remark does not restart the cycle: put
+  it in `deferred_minor_notes` on an **`approve`**, as `[{"summary": "...",
+  "evidence_path": "<absolute path>", "evidence_sha256": "<64-hex digest>"}]`,
+  outside `corrective_findings`, which stays **empty** on an approve. Under
+  `assurance` every finding, including `minor`, is a corrective finding in a
+  `revise`.
+- **What stops the phase.** An `approve` that carries any corrective finding, in
+  every profile, or deferred notes under `assurance`, or malformed notes, is not
+  an approval: the phase stops unapproved (`review_profile_rejected`, with
+  `profile_rejected` = `corrective_findings_on_approve`,
+  `deferred_notes_refused` or `deferred_notes_malformed`). Nothing is retried, so
+  write the verdict correctly the first time.
+- **`revise` always reopens the builder**, whatever its severities.
+- **Reused evidence.** A receipt whose `final_suite_binding` is
+  `reused_dependency_bound` means the final suite was reused from an earlier
+  transaction because every declared dependency is unchanged; judge the reuse
+  from the receipt's `evidence_reuse` entries (source transaction and
+  dependency digest), not from the builder's prose. An entry that depends on a
+  path it does not declare is a `revise` finding.
+- **Risk tag.** You may tag a corrective finding with `"risk_class":
+  "architectural"`; the runtime promotes the session deterministically from the
+  typed tag, and any other value is malformed and also promotes. A `blocking` or
+  `major` finding also promotes a `light` session.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,

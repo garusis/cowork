@@ -123,6 +123,8 @@ SLOT_LABELS = {
     "reviewed": "the artifact you reviewed",
     "upstream": "consumed upstream artifact",
     "answer": "orchestrator answer to a decision request",
+    "execution_profile": "execution profile record (policy, effective "
+                         "profile, batch, evidence)",
 }
 
 
@@ -546,7 +548,8 @@ _FACT_SCHEMAS = {
     "index_digest": is_content_free_token,
     "verdict": _in({"green", "red", "unverified"}),
     "final_suite_label": is_content_free_token,
-    "final_suite_binding": _in({"ran_once", "not_reached", "legacy_unknown"}),
+    "final_suite_binding": _in({"ran_once", "not_reached", "legacy_unknown",
+                                "reused_dependency_bound"}),
     "command_count": lambda v: isinstance(v, int) and not isinstance(v, bool),
     "disposition": _in({"pending_review", "accepted", "superseded_by_finding",
                         "rejected"}),
@@ -713,6 +716,19 @@ def _render_builder_seed(descriptor_lines, facts, ctx):
         "The planning phase is complete and the planning-advisor APPROVED the "
         "plan. Execute it: make the code changes and verify them. The approved plan AND the current shared context are the "
         "files on disk below.\n\n%s"
+        % _read_from_disk_block(descriptor_lines))
+
+
+def _render_light_builder_seed(descriptor_lines, facts, ctx):
+    # scout->builder is the light-profile cross-role handoff: there is no
+    # planning phase, so the approved scout intel (carried in the plan slots)
+    # is this session's approved plan.
+    return (
+        "The scouting phase is complete and the scout-reviewer APPROVED the "
+        "intel. This session runs under the light execution profile, so that "
+        "intel is your approved plan: execute it, make the changes and verify "
+        "them. The approved intel (plan) AND the current shared context are "
+        "the files on disk below.\n\n%s"
         % _read_from_disk_block(descriptor_lines))
 
 
@@ -1001,7 +1017,8 @@ EDGES = {
     # JSON-only intel call is still path-first and legal)
     "scout->scout-reviewer:review_ctx": {
         "from_role": "scout", "to_role": "scout-reviewer", "kind": "review_ctx",
-        "sources": ["context", "intel_json", "intel_md"],
+        "sources": ["context", "intel_json", "intel_md",
+                    "execution_profile"],
         "required": ["context", "intel_json"],
         "facts": ("team",), "render": _render_review_ctx,
     },
@@ -1020,7 +1037,8 @@ EDGES = {
     # route 3 (cross-role seed: context rides by PATH, not inline)
     "scout->planner:seed": {
         "from_role": "scout", "to_role": "planner", "kind": "seed",
-        "sources": ["context", "intel_json", "intel_md"],
+        "sources": ["context", "intel_json", "intel_md",
+                    "execution_profile"],
         "required": ["context", "intel_json"],
         "facts": (), "render": _render_planner_seed,
     },
@@ -1036,7 +1054,7 @@ EDGES = {
         "from_role": "planner", "to_role": "planning-advisor",
         "kind": "review_ctx",
         "sources": ["context", "plan_json", "plan_md", "intel_json",
-                    "intel_md"],
+                    "intel_md", "execution_profile"],
         "required": ["context", "plan_json", "plan_md", "intel_json",
                      "intel_md"],
         "facts": ("team",), "render": _render_advisor_ctx,
@@ -1050,9 +1068,17 @@ EDGES = {
     # route 6 (cross-role seed: context rides by PATH, not inline)
     "planner->builder:seed": {
         "from_role": "planner", "to_role": "builder", "kind": "seed",
-        "sources": ["context", "plan_json", "plan_md"],
+        "sources": ["context", "plan_json", "plan_md", "execution_profile"],
         "required": ["context", "plan_json", "plan_md"],
         "facts": (), "render": _render_builder_seed,
+    },
+    # light profile: no planning phase, the approved scout intel rides in the
+    # plan slots and is the approved plan
+    "scout->builder:seed": {
+        "from_role": "scout", "to_role": "builder", "kind": "seed",
+        "sources": ["context", "plan_json", "plan_md", "execution_profile"],
+        "required": ["context", "plan_json", "plan_md"],
+        "facts": (), "render": _render_light_builder_seed,
     },
     "planner->builder:plan_updated": {
         "from_role": "planner", "to_role": "builder", "kind": "resume",
@@ -1070,7 +1096,8 @@ EDGES = {
         "kind": "review_ctx",
         "sources": ["context", "plan_json", "plan_md", "build_status",
                     "build_summary", "build_baseline",
-                    "verification_receipt", "checkpoint_receipt"],
+                    "verification_receipt", "checkpoint_receipt",
+                    "execution_profile"],
         "required": ["context", "plan_json", "plan_md", "build_status",
                      "build_baseline"],
         "facts": ("team", "txn_id", "manifest_digest", "index_digest",
@@ -1085,7 +1112,7 @@ EDGES = {
         "from_role": "builder", "to_role": "build-reviewer", "kind": "resume",
         "sources": ["plan_json", "plan_md", "build_status", "build_summary",
                     "build_baseline", "verification_receipt",
-                    "checkpoint_receipt"],
+                    "checkpoint_receipt", "execution_profile"],
         "required": ["plan_json", "plan_md", "build_status", "build_baseline"],
         "facts": ("team", "txn_id", "manifest_digest", "index_digest",
                   "verdict", "final_suite_label", "final_suite_binding",

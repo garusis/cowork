@@ -240,6 +240,7 @@ def render_report(record):
     lines.extend(_section_input(record))
     lines.extend(_section_verification(record))
     lines.extend(_section_owned_verification(record))
+    lines.extend(_section_execution_profile(record))
     lines.extend(_section_claims(record))
     lines.extend(_section_findings(record))
     lines.extend(_section_marginal(record))
@@ -657,6 +658,50 @@ def _section_owned_verification(record):
         lines.append("")
         lines.append("  %s owned transaction(s) recorded this session "
                      "(the latest is detailed above)." % _fmt(transaction_count))
+    lines.append("")
+    return lines
+
+
+def _section_execution_profile(record):
+    """Execution profile (`execution_profile.*`): the selected and effective
+    profile, every promotion with its reason codes, the deferred minor note
+    count, and executed versus reused verification entries, for cohort
+    comparison. A PURE lookup section: it returns `[]` when the record carries
+    no such key, so a report for an unprofiled session is byte-identical to a
+    pre-feature one, and every figure is read straight from the record."""
+    profile = _at(record, "execution_profile", None)
+    if not isinstance(profile, dict):
+        return []
+    lines = ["Execution profile", "-" * 56]
+    lines.append("  selected=%s  effective=%s  policy_version=%s"
+                 % (_fmt(_at(record, "execution_profile.selected")),
+                    _fmt(_at(record, "execution_profile.effective")),
+                    _fmt(_at(record, "execution_profile.policy_version"))))
+    lines.append("  promotions: %s"
+                 % _fmt(_at(record, "execution_profile.promotion_count")))
+    history = profile.get("promotion_history")
+    if isinstance(history, list):
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            codes = entry.get("reason_codes")
+            lines.append("    #%s %s -> %s  reasons=%s  seam=%s"
+                         % (_fmt(entry.get("seq")), _fmt(entry.get("from")),
+                            _fmt(entry.get("to")),
+                            ",".join(str(c) for c in codes)
+                            if isinstance(codes, list) else _fmt(codes),
+                            _fmt(entry.get("seam"))))
+    lines.append("  deferred minor notes: %s"
+                 % _fmt(_at(record,
+                            "execution_profile.deferred_minor_note_count")))
+    lines.append("  batch artifacts: %s"
+                 % _fmt(_at(record,
+                            "execution_profile.batch_artifact_count")))
+    lines.append("  verification entries: executed=%s  reused=%s"
+                 % (_fmt(_at(record,
+                             "execution_profile.verification.executed")),
+                    _fmt(_at(record,
+                             "execution_profile.verification.reused"))))
     lines.append("")
     return lines
 

@@ -142,6 +142,20 @@ three it is:
 - **refinement** — the decision stands; you need a detail inside it.
 - **reopen** — you believe the decision itself should change, and why.
 
+## Execution profiles
+
+When the context names an **execution profile** record, additionally check that
+the plan declares `result.batch` consistently with its per-file changes (every
+planned file is a batch artifact or a declared derivative, derivative keys are
+listed artifacts, no absolute or `..` paths), and that any `depends_on` on an
+inventory entry is honest and any `check_class` marks a genuinely deterministic
+lint/format check. An entry with no `depends_on` simply always reruns.
+
+You may tag a corrective finding with `"risk_class": "architectural"`; the
+runtime promotes the session deterministically from that typed tag, and any
+other value is malformed and also promotes. Approval keeps its meaning in every
+profile. Sessions without a profile record ignore this section.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,

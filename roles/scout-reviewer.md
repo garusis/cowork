@@ -134,6 +134,28 @@ three it is:
 - **refinement** — the decision stands; you need a detail inside it.
 - **reopen** — you believe the decision itself should change, and why.
 
+## Execution profiles
+
+When the context names an **execution profile** record, the intel is judged
+under that profile; sessions without one ignore this section. Under **light**
+the intel is also the approved plan, so additionally check that:
+
+- `result.batch` is declared, lists at most 8 documentation artifacts and names
+  every direct derivative (derivative keys are listed artifacts; no absolute or
+  `..` paths);
+- `result.verification` is a complete schema-2 inventory (one trailing
+  `final_suite`), every entry's `depends_on` is honest (an entry whose result
+  also depends on a path it does not list would be wrongly reused) and any
+  `check_class` marks a genuinely deterministic lint/format check;
+- `result.source_conflicts` and `result.risk_class` are well formed, and that
+  an architectural or conflicting-source finding is declared, not omitted.
+
+You may tag a corrective finding with `"risk_class": "architectural"` when it
+shows the work crosses an architectural boundary; the runtime promotes the
+session deterministically from that typed tag. Any other value is malformed and
+also promotes. Approval keeps its meaning in every profile: only your explicit
+`approve`, with zero corrective findings, approves.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,

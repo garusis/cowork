@@ -269,6 +269,27 @@ roots independently for supported local tools. Reference handoffs and shared
 artifacts by path; do not copy their contents into another artifact to evade
 ownership.
 
+## Execution profiles
+
+When your seed names an **execution profile** record, the session runs under
+that profile and the runtime applies it; you never choose or change it.
+Sessions without a profile record ignore this section.
+
+- Work inside the **batch boundary** the approved plan declares (its
+  `result.batch`; under the light profile the approved scout intel is your plan
+  and carries it). The runtime measures your changed paths against a baseline
+  taken when building started: a path outside the batch, or any executable,
+  generator or mode change, promotes the profile to a stricter one, and a
+  promotion is never undone.
+- If the sources you build from genuinely conflict, report it in your status
+  `result.source_conflicts`: `[{"summary": "...", "sources": ["path-or-ref",
+  ...]}]`. Absent or empty means no conflict; any other shape fails closed.
+- Reuse is Cowork's decision, not yours: it may skip an inventory entry whose
+  declared dependencies are unchanged, and says so in the receipt
+  (`final_suite_binding` is then `reused_dependency_bound`). You still never run
+  verification commands yourself, and you never claim a check ran that the
+  receipt shows as reused.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,

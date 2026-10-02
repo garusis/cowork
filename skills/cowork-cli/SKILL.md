@@ -78,6 +78,16 @@ cowork --worktree my-feature --team scout,scout-reviewer,planner,planning-adviso
   deliverable), or all six roles. A builder pair without the planner pair is
   accepted but never reaches building. Pick the smallest team that supplies
   the discovery, planning, implementation, and assurance the risk needs.
+- Prefer an **execution profile** to an ad hoc smallest `--team`:
+  `cowork --preview-profile light|standard|assurance` prints the complete policy
+  as one JSON object (read-only, nothing dispatched), then start the session
+  with `--profile NAME` (it derives the team, so it cannot be combined with
+  `--team` or `--no-session`; `--profile-rationale TEXT` records why). `light`
+  suits a bounded documentation batch, `standard` is the default for a behavior
+  change, `assurance` suits invariant or architectural work. Promotion to a
+  stricter profile is automatic and one-way; resume with a higher `--profile`
+  to promote explicitly (a lower one is refused). See the README's "Execution
+  profiles" for the refusal codes and the `review_profile_rejected` stop.
 - `--worktree [NAME]` / `--wt` requires launching inside a git work tree
   (`worktree_requires_git`); `--wt-controller` picks the worktree role's
   controller. The session anchor stays in the **launch** directory.

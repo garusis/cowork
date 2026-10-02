@@ -32,7 +32,12 @@ Schema (version 1):
       # shape to a pre-feature session.
       "controller_policy": {"allowed": ["claude", "codex"],
                             "updated": 1750000000.0,
-                            "source": "cli"}
+                            "source": "cli"},
+      # OPTIONAL execution-profile BINDING (immutable; written in the same save
+      # as team/config). ABSENT = an unprofiled session. The mutable record
+      # lives in the session assets (`execution_profile.json`), never here.
+      "execution_profile": {"selected": "light", "policy_version": 1,
+                            "policy_digest": "<sha256>"}
     }
 
 A PRESENT-BUT-INVALID `controller_policy` is a HARD ERROR, never an implicit
@@ -2797,6 +2802,78 @@ def get_allowed_controllers(state):
     if kind == "invalid":
         raise InvalidControllerPolicy(value)
     return value if kind == "allowed" else None
+
+
+# --------------------------------------------------------------------------- #
+# Execution profile (garusis/cowork-internal#63).                              #
+#                                                                              #
+# The session binding lives in `session.json`; the full mutable record lives   #
+# in the session assets so mid-build hooks and measurement, which know the     #
+# session uuid but not the session-file path, can reach it. The reader is      #
+# TAGGED and there is deliberately no reader that collapses `invalid` into     #
+# `absent`: a damaged profile record stops the run.                            #
+# --------------------------------------------------------------------------- #
+
+EXECUTION_PROFILE_KEY = "execution_profile"
+
+
+def execution_profile_path_for(session_uuid):
+    return os.path.join(session_assets_dir(session_uuid),
+                        "execution_profile.json")
+
+
+def execution_profile_baseline_path_for(session_uuid):
+    return os.path.join(session_assets_dir(session_uuid),
+                        "execution_profile.baseline.json")
+
+
+def read_execution_profile(state):
+    """Return a TAGGED read of the session's execution profile:
+
+        ("absent", None, None)          — no binding and no record (unprofiled)
+        ("valid", record, None)         — binding and record agree and are intact
+        ("invalid", raw, reason_code)   — anything else, with a closed reason
+
+    `reason_code` is one of `cowork_execution_profiles.RECORD_REASONS`."""
+    import cowork_execution_profiles as profiles
+    state = state if isinstance(state, dict) else {}
+    session_uuid = get_session_uuid(state)
+    path = execution_profile_path_for(session_uuid) if session_uuid else None
+    has_binding = EXECUTION_PROFILE_KEY in state
+    if not has_binding:
+        if path and os.path.exists(path):
+            return ("invalid", None, "binding_mismatch")
+        return ("absent", None, None)
+    binding = state.get(EXECUTION_PROFILE_KEY)
+    if not path:
+        return ("invalid", binding, "record_missing")
+    try:
+        with open(path, "r") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return ("invalid", binding, "record_missing")
+    except (OSError, ValueError):
+        return ("invalid", None, "record_unparseable")
+    record, reason = profiles.validate_record(raw, binding)
+    if record is None:
+        return ("invalid", raw, reason)
+    return ("valid", record, None)
+
+
+def write_execution_profile_record(session_uuid, record):
+    """Durably write the profile record to the session assets. Returns True
+    only once the bytes and the directory entry are durable."""
+    return write_json_atomic_durable(
+        execution_profile_path_for(session_uuid), record)
+
+
+def bind_execution_profile(state, record):
+    """A new state dict carrying the immutable binding for `record`. The
+    caller persists it in the SAME save as team/config."""
+    import cowork_execution_profiles as profiles
+    bound = dict(state)
+    bound[EXECUTION_PROFILE_KEY] = profiles.binding_for(record)
+    return bound
 
 
 def apply_controller_transition(path, mappings, allowed=None, set_policy=False,

@@ -277,6 +277,31 @@ three it is:
 - **refinement** — the decision stands; you need a detail inside it.
 - **reopen** — you believe the decision itself should change, and why.
 
+## Execution profiles
+
+When your seed names an **execution profile** record, read it: the runtime
+applies the profile (`standard` or `assurance` once planning runs) and you do
+not choose or change it. Sessions without a profile record ignore this section.
+
+In a profiled session `result.batch` is **required**:
+`{"artifacts": [repo-relative paths], "derivatives": {"<artifact>": [paths that
+derive directly from it]}}` — the boundary the build may touch. If it is absent,
+the runtime derives the boundary from `result.implementation[*].file`
+(comma-separated values are split), and when neither yields a valid boundary the
+session is promoted to the strictest profile — so declare it. Paths are
+repo-relative, never absolute and never contain `..`.
+
+Inventory entries in `result.verification` may carry optional `depends_on`
+(repo-relative paths, globs or trailing-slash prefixes the entry's result
+depends on) and `check_class` (`lint` or `format`). **An entry without
+`depends_on` always reruns.** A declared dependency lets the runtime reuse an
+earlier green result only while every dependency is byte-identical, no
+executable file changed and no direct derivative of a changed artifact is
+involved; under `assurance` nothing is reused.
+
+The final-suite rule is unchanged: the `final_suite` entry is the genuinely
+complete regression suite in every profile.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,

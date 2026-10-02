@@ -390,6 +390,67 @@ cowork --session-file .cowork/session.<uuid>.json
   `saved_session_selector_required`, `conflicting_session_selectors` and every
   decision refusal — because such a directory can never have hosted a session.
 
+### Execution profiles
+
+An **execution profile** is an explicit, versioned policy that jointly decides
+the role topology, the batch boundary, the validation and review cadence, how
+evidence is invalidated and reused, and when the session is promoted to a
+stricter profile. Sessions started without `--profile` run exactly as before.
+
+```bash
+# read the complete effective policy first; prints one JSON object, dispatches
+# nothing and creates no session
+cowork --preview-profile light
+
+# start a NEW session under it (the profile derives the team)
+cowork --profile light --profile-rationale "two docs, no code" \
+       --context-file ./brief.md
+```
+
+| Profile | Roles | Reuse | Review notes | Invalidation |
+| --- | --- | --- | --- | --- |
+| `light` | scout, scout-reviewer, builder, build-reviewer (the approved scout intel is the plan) | per entry, by dependency digest | minor notes deferred on an approve | changed artifact plus its direct derivatives |
+| `standard` | all six | per entry, by dependency digest | minor notes deferred on an approve | changed artifact plus its direct derivatives |
+| `assurance` | all six | none across candidates | every finding must be fixed; deferred notes are refused | everything reruns on any change |
+
+Every profile requires the owned verification transaction with its final
+suite, paired reviewer approval of each phase that runs, and any
+user-declared check: a profile never weakens a required check. Every phase that
+runs keeps its paired reviewer; `light` omits the planning pair, not review.
+
+- `--profile NAME` — `light`, `standard` or `assurance`; an unknown name is
+  refused (`unknown_profile`). `--profile-rationale TEXT` stores why.
+- `--preview-profile NAME` — read-only; prints the policy as one JSON object
+  (rc 0), or `{"error": "unknown_profile", ...}` with rc 2. It cannot be
+  combined with a session-mutating flag (`conflicting_arguments`).
+- Refusals (rc 2, nothing written, session files byte-identical):
+  `profile_requires_session` (`--no-session`), `profile_team_conflict`
+  (`--team` with `--profile`, or `--team` on a profiled session),
+  `profile_not_bound` (attaching a profile to an existing unprofiled session),
+  `profile_demotion_refused` (a lower `--profile` on resume) and
+  `execution_profile_unreadable` (a damaged or mismatched profile record; there
+  is no reader that treats damage as "no profile").
+- **Promotion is deterministic and one-way.** Scope expansion past the declared
+  batch, an executable or generator change, conflicting sources, failed
+  evidence (a lint/format-only failure excepted), a blocking or major finding, an
+  architectural risk tag, a repeated review-round cap, an explicit higher
+  `--profile` on resume and any malformed signal each promote to the target
+  fixed in the preview's `promotion.triggers` table, with that table's reason
+  code. Nothing ever demotes; the history is part of the record.
+- **Deferred minor notes.** Under `light`/`standard` a build-reviewer `approve`
+  may carry `deferred_minor_notes` outside `corrective_findings`. An approve
+  that carries a corrective finding (any profile), deferred notes under
+  `assurance`, or malformed notes stops the phase unapproved with kind
+  `review_profile_rejected` and `profile_rejected` set to
+  `corrective_findings_on_approve`, `deferred_notes_refused` or
+  `deferred_notes_malformed`. A `revise` always reopens the builder.
+- The run result gains an additive `execution_profile` object (`selected`,
+  `effective`, `promotion_count`, `deferred_minor_note_count`) for profiled
+  sessions only. `--report` shows an Execution profile section for them.
+- A profile exposes a frozen serial concurrency contract
+  (`mode: serial`, `max_parallel_vertices: 1`) and a per-vertex policy accessor
+  for a later scheduler; nothing here schedules parallel work.
+
 ### Stops and orchestrator decisions
 
 A phase that needs an answer or an authorization stops unapproved with rc 4
@@ -534,6 +595,9 @@ live — see the bullet below.
 - `cowork --session-owner [SESSION_UUID] [--json]` — read-only owner-lease
   view (who owns it, heartbeat freshness, recovery command); acquires nothing
   and always exits 0.
+- `cowork --preview-profile NAME` — read-only; one JSON object with the
+  profile's complete effective policy (see [Execution profiles](#execution-profiles)).
+  Reads no session and dispatches nothing.
 - `cowork --evaluate-role ROLE --eval-session SESSION_UUID ...` — record one
   orchestrator-owned evaluation to `orchestrator-evaluations.json`, separate
   from peer `scores.json` and never read by a phase gate (`--help` lists the
@@ -607,7 +671,17 @@ discovered). It stores:
 - each paired reviewer's **last-approved hash-gate baseline** (the artifact
   composite it last approved, scoped by phase epoch + acknowledged context
   revision) — so the [reviewer skip on unchanged artifacts](#reviewer-skip-on-unchanged-artifacts-hash-gate)
-  survives a resume.
+  survives a resume; and
+- for a session started with `--profile`, an immutable **`execution_profile`
+  binding** (`selected`, `policy_version`, `policy_digest`) written in the same
+  save as the team and config. The mutable record — effective profile, rationale,
+  batch, accepted evidence, invalidation graph, deferred notes and promotion
+  history — lives beside the other session assets as
+  `execution_profile.json`, with the building-entry baseline in
+  `execution_profile.baseline.json`. A resume re-reads and validates the record
+  and stops with `execution_profile_unreadable` on any damage. A policy-version
+  change makes an in-flight profiled session unreadable on purpose (fail
+  closed); a future version adds an explicit migration.
 
 A saved session is resumed only when it is selected explicitly
 (`--session-file PATH` or `--resume`); a run with no selector starts a new
@@ -805,6 +879,16 @@ with a warning is honest; silently recomputing them is not.
 `cowork --report --rebuild` refreshes the record on demand. A report never
 rebuilds implicitly.
 
+For a session started with `--profile`, the record also carries an additive
+`execution_profile` key (and its source fingerprint in `built_from`): the
+selected and effective profile, the policy version, the promotion history with
+reason codes, the deferred minor note count, the batch artifact count and the
+executed versus reused verification entries; each owned transaction summary
+adds `executed_entry_count`/`reused_entry_count` when a reuse policy was in
+force. The key is absent for every other session, so legacy records and reports
+are unchanged, and `--report` renders an Execution profile section from it for
+equivalent-cohort comparison.
+
 ### Where the money went
 
 Cost splits into **exclusive classes** — productive, review, evaluation,
@@ -917,6 +1001,23 @@ inventory as **one owned, hermetic, manifest-bound transaction**:
   gone with no evidence is `absent` — never a pass. A dead supervisor's
   abandoned deferred transaction is reconciled fail-closed before anything
   new launches. `--report` and `--check` never reconcile.
+
+Under an [execution profile](#execution-profiles) a schema-2 entry may also
+declare two optional fields: `depends_on` (repo-relative paths, globs or
+trailing-slash prefixes its result depends on) and `check_class` (`lint` or
+`format`, for a deterministic check whose failure alone never promotes). Under
+`light`/`standard` the transaction reuses an entry per entry instead of
+rerunning it, but only when every dependency pattern still matches a path, the
+dependency digest equals the one it ran against, no executable file changed
+since its source transaction and no direct derivative of a changed artifact is
+involved; an entry without `depends_on` always reruns, and `assurance` never
+reuses. A reused entry is not sent to the worker: it is listed in the receipt's
+`evidence_reuse` with its source transaction id and dependency digest, and
+`executed ∪ reused` always equals the inventory. A reused final suite is bound
+`reused_dependency_bound`, never `ran_once`, and the request key carries a reuse
+suffix so a partly reused result is never single-flight-reused by a candidate
+that reused nothing. A transaction whose every entry is reused runs no worker
+and is green only if the live candidate still equals its snapshot.
 
 Legacy (schema-1) plans — `{label, command}` only, no `execution_mode`/`kind`
 — are still accepted: they run isolated, keep their historical
@@ -1517,6 +1618,23 @@ resumes (woken with the updated artifact to digest) and continues. With
 `handoff_back` without a note degrades to a `needs_input` stop — never an
 implicit hand-back.
 
+Under the **light** [execution profile](#execution-profiles) the loop is shorter:
+on intel approval a clean documentation batch chains straight from `scouting`
+to `building` with the approved intel as the plan (the builder is seeded through
+the `scout->builder:seed` edge), and a missing batch or inventory, an executable
+path, a source conflict or an architectural risk tag promotes the session and
+goes through `planning` instead. Right before the first builder launch of a
+building epoch Cowork snapshots a profile-owned baseline of the candidate with
+the same enumeration the owned transaction uses; at each ready-for-review the
+changed paths are measured against it (untracked files that were already
+present, and Python bytecode, never promote). A promotion takes effect
+immediately for the next transaction and verdict and adds the stricter profile's
+roles to the team for any later authorized hand-back, but never inserts a
+planning phase mid-build. A builder hand-back on a light session targets the
+planner, which is not on its team until it is promoted: pass `--profile
+standard` on the same invocation as `--authorize-handoff` to promote first (the
+fresh planner is seeded from the intel and the hand-back note).
+
 The signal contract is role-generic (any role → its pre-processor); planner →
 scout and builder → planner are wired. A resumed session re-enters the persisted
 phase: a session mid-building re-enters the builder conversation directly,
@@ -1605,6 +1723,7 @@ from before this store existed reads as `milestone: null`.
     |-- cowork.py               # argument parser + run-result contract + phase loop + role orchestration + resume-trigger
     |-- cowork_bridge.py        # flag assembly, stream-json framing, codex resume, probe
     |-- cowork_profiles.py      # private controller state + reference-only authentication reuse
+    |-- cowork_execution_profiles.py # execution-profile policy (light/standard/assurance); distinct from cowork_profiles.py, which owns controller authentication
     |-- cowork_action_policy.py # controller capability matrix + content-free action decisions
     |-- cowork_transcript.py    # plain-text transcript writer (stderr during a run; never reads input)
     |-- cowork_preflight.py     # Python-version + controller PATH checks

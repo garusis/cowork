@@ -25,6 +25,12 @@ Cowork is the agent transport. Run the package through the `cowork` CLI per the
   discovery, planning, implementation, and assurance the risk needs. Teams are
   paired and every new session begins with `scout` and `scout-reviewer`; there
   is no standalone planner, builder, or reviewer session.
+- Prefer an explicit execution profile over an ad hoc team: preview it with
+  `cowork --preview-profile NAME`, then pass `--profile NAME` (`light` for a
+  bounded documentation batch, `standard` for a behavior change, `assurance` for
+  invariant or architectural work). Promotion is automatic and one-way; a
+  profile never weakens the final suite, paired approval or any user-required
+  check.
 
 ## Run and supervise
 

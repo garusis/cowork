@@ -100,6 +100,12 @@ Notes:
   shard to work around the deadline.
 - Role status/review artifacts are JSON contracts read by the orchestrator.
   Keep schema changes reflected in roles, README, and tests.
+- Execution-profile policy (light/standard/assurance) lives only in
+  `scripts/cowork_execution_profiles.py` — never in `cowork_profiles.py`, which
+  owns controller authentication. Runtime modules consult it through thin hooks
+  guarded by `profile_session is not None`, and an unprofiled session must take
+  its unchanged paths. Later packages that schedule work consume
+  `resolved_vertex_policy`; they do not re-derive policy.
 - Measurable-goal contract: scout intel must carry `result.success_criteria`
   (1–5 of `{statement, measurement, expected, tier: must|should}`); the plan
   must map each criterion in `result.criteria_coverage` to steps + a

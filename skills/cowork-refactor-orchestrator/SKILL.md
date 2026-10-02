@@ -104,6 +104,14 @@ on the team brings its reviewer. Select one of:
   deliverable;
 - all six roles (the default team) when the package authorizes implementation.
 
+Prefer an explicit execution profile to a hand-picked team: preview one with
+`cowork --preview-profile light|standard|assurance`, then launch with
+`--profile NAME`, which derives the paired team. `light` fits a bounded
+documentation batch, `standard` a behavior change, `assurance` invariant or
+architectural work. The profile promotes itself, one way, on typed risk signals
+(or explicitly with a higher `--profile` on resume); record the effective
+profile and its promotion history in the package evidence.
+
 A later phase continues the same session through its saved session file; a
 fresh session starts scouting again. Give the session the brief, relevant
 authority, targeted artifacts, and a result schema—not previous chat

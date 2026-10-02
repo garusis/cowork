@@ -195,6 +195,41 @@ three it is:
 - **refinement** — the decision stands; you need a detail inside it.
 - **reopen** — you believe the decision itself should change, and why.
 
+## Execution profiles
+
+When your first message names an **execution profile** record, read that file:
+it states the profile policy this session runs under (`light`, `standard` or
+`assurance`), and the runtime applies it — you do not choose or change it.
+Sessions without a profile record ignore this section.
+
+Under **light** there is no planning phase: the approved intel IS the plan the
+builder executes. In `result` write, in addition to the usual fields:
+
+- `batch`: `{"artifacts": [repo-relative paths, 1..8], "derivatives":
+  {"<artifact>": [repo-relative paths that derive directly from it]}}` — the
+  documentation family this batch touches. Derivative keys must be listed
+  artifacts; paths are never absolute and never contain `..`.
+- `verification` plus `verification_schema: 2`: the full owned verification
+  inventory (`label`, `command`, `execution_mode`, `kind`, with exactly one
+  `final_suite` entry, last). Each entry may declare `depends_on` (repo-relative
+  paths, globs or trailing-slash prefixes the result depends on; **absent means
+  the entry always reruns**) and `check_class` (`lint` or `format`, for a
+  deterministic lint/format check whose failure alone never promotes the
+  profile).
+
+Optional promotion signals, each with absent/malformed semantics:
+
+- `source_conflicts`: `[{"summary": "...", "sources": ["path-or-ref", ...]}]`
+  when the sources you read genuinely disagree. Absent or empty means no
+  conflict; any other shape fails closed to the strictest profile.
+- `risk_class`: `"architectural"` when the work reaches an invariant or an
+  architectural boundary. Absent means no signal; any other value fails closed.
+
+A missing `batch` or inventory, an executable path in the batch, a source
+conflict or an architectural risk promotes the session to planning. A profile
+never lowers a requirement: the final suite, paired reviewer approval and any
+user-declared check still apply in every profile.
+
 ## Tooling
 
 - If `rtk` is available, prefer `rtk`-wrapped shell commands (e.g. `rtk grep`,
