@@ -281,13 +281,12 @@ class RedactionAndBaseTests(TmpCase):
             "home": "/Users/" + "jdoe/projects/app",
         }
 
-    def test_redact_rules_and_counts(self):
+    def test_credential_redaction_and_ordinary_text_passthrough(self):
         p = self.planted()
         for rule, value in (("aws_access_key", p["aws"]),
                             ("github_token", p["gh"]),
                             ("sk_key", p["sk"]), ("bearer_token", p["bearer"]),
-                            ("entropy", p["entropy"]), ("email", p["email"]),
-                            ("home_path", p["home"])):
+                            ):
             red, counts = cap.redact_text("x = '%s'" % value)
             self.assertEqual(counts, {rule: 1}, (rule, red))
             self.assertIn("<redacted:%s>" % rule, red)
@@ -295,18 +294,18 @@ class RedactionAndBaseTests(TmpCase):
         key = ("-----BEGIN RSA PRIVATE KEY-----\nabc\n"
                "-----END RSA PRIVATE KEY-----")
         self.assertEqual(cap.redact_text(key)[1], {"private_key": 1})
-        for other in ("/home/jdoe/x", "C:\\Users\\jdoe\\x", "gho_" + "A" * 20):
-            self.assertTrue(cap.redact_text(other)[1], other)
-        low = "a" * 40
-        self.assertEqual(cap.redact_text(low)[0], low)
-        self.assertEqual(cap.redact_text("f" * 64 + " plain words")[1], {})
+        for ordinary in (p["email"], p["home"], p["entropy"],
+                         "ghx_" + "A" * 20, "a" * 40):
+            self.assertEqual(cap.redact_text(ordinary), (ordinary, {}))
 
     def test_forbidden_path(self):
-        for rel in (".env", ".env.local", "a/b.pem", "keys/x.py",
-                    "my_secret.txt", "credentials.json", ".cowork/s.json",
+        for rel in (".env", ".env.local", "a/b.pem", "a/b.key",
+                    "identity.p12", "credentials.json", ".cowork/s.json",
                     "x/.cowork/y"):
             self.assertTrue(cap.forbidden_path(rel), rel)
-        for rel in ("app.py", "src/util.py", "docs/readme.md"):
+        for rel in ("app.py", "src/util.py", "docs/readme.md",
+                    "keys/x.py", "monkey.py", "my_secret.txt",
+                    "secrets.md"):
             self.assertFalse(cap.forbidden_path(rel), rel)
 
     def test_out_of_scope_material_never_in_provider_facing_data(self):
@@ -319,16 +318,18 @@ class RedactionAndBaseTests(TmpCase):
         write(self.repo, "ignored.txt", "ignored %s\n" % p["bearer"])
         write(self.repo, ".cowork/state.json", "{\"t\": \"%s\"}" %
               p["entropy"])
-        write(self.repo, "notes.py", "# %s %s\nVALUE = 1\n" % (
-            p["email"], p["home"]))
+        write(self.repo, "notes.py", "# %s %s %s\nVALUE = 1\n" % (
+            p["email"], p["home"], p["entropy"]))
         res = self.capture()
         self.assertTrue(res["ok"], res)
         rec = res["record"]
         view = cap.capture_content_view(rec)
         provider = json.dumps(view) + "".join(
             u["state_text"] for u in rec["units"]) + rec["diff"]
-        for value in p.values():
+        for value in (p["aws"], p["gh"], p["sk"], p["bearer"]):
             self.assertNotIn(value, provider)
+        for value in (p["email"], p["home"], p["entropy"]):
+            self.assertIn(value, provider)
         self.assertIn("<redacted:github_token>", rec["diff"])
         by_path = {f["rel_path"]: f for f in rec["files"]}
         for rel in (".env", "server.pem"):
@@ -337,10 +338,10 @@ class RedactionAndBaseTests(TmpCase):
         self.assertNotIn("ignored.txt", by_path)
         self.assertFalse([f for f in rec["files"] if ".cowork" in
                           f["rel_path"]])
-        self.assertTrue(by_path["notes.py"]["redacted"])
+        self.assertFalse(by_path["notes.py"]["redacted"])
         rules = {(r["rel_path"], r["rule_id"]) for r in rec["redactions"]}
-        self.assertIn(("notes.py", "email"), rules)
-        self.assertIn(("notes.py", "home_path"), rules)
+        self.assertNotIn(("notes.py", "email"), rules)
+        self.assertNotIn(("notes.py", "home_path"), rules)
         # No blob or diff for forbidden files; local metadata keeps sha256.
         self.assertIsNone(cap.read_capture_file(self.store, res["capture_id"],
                                                 ".env"))
@@ -378,33 +379,52 @@ class RedactionAndBaseTests(TmpCase):
         self.assertIn("redacted:github_token", units[0]["state_text"])
         self.assertNotIn(p["gh"], units[0]["state_text"])
 
-    def test_redacted_symbol_withholds_only_that_unit(self):
-        name = "aZ3kQ9xT2mW7vB5nR8cL1dF6gH4jY0pEqW"
-        self.assertTrue(cap.redact_text(name)[1])
+    def test_symbol_names_and_random_identifiers_do_not_withhold_units(self):
+        name = "secret_export_key_aZ3kQ9xT2mW7vB5nR8cL1dF6gH4jY0pEqW"
+        self.assertFalse(cap.redact_text(name)[1])
         self.base_repo()
         write(self.repo, "app.py", NEW_APP + (
-            "\ndef %s():\n    raise ValueError('x')\n" % name))
+            "\ndef %s():\n    raise ValueError('x')\n"
+            "\ndef ghp_abcdefghijklmnopqrst():\n"
+            "    raise ValueError('y')\n" % name))
         rec = self.capture()["record"]
         errors = [u for u in rec["units"] if u["kind"] == "error_behavior"]
-        omissions = sorted(u["omission"] or "none" for u in errors)
-        self.assertEqual(omissions, ["data_withheld", "none"])
-        withheld = [u for u in errors if u["omission"]][0]
-        self.assertEqual(withheld["state_text"], "")
-        self.assertNotIn(name, json.dumps(withheld))
-        self.assertNotIn(name, rec["diff"])
+        self.assertTrue(any(name in u["state_text"] for u in errors))
+        self.assertIn(name, rec["diff"])
+        serialized = json.dumps(rec)
+        self.assertNotIn("ghp_abcdefghijklmnopqrst", serialized)
+        self.assertNotIn("data_withheld", serialized)
 
-    def test_secret_in_requirement_excludes_candidate(self):
+    def test_credential_in_requirement_is_scrubbed_without_exclusion(self):
         self.base_repo()
         write(self.repo, "app.py", NEW_APP)
         res = self.capture(requirement_text=REQUIREMENT + " Mail " +
-                           self.planted()["email"] + " when done.")
-        self.assertFalse(res["ok"])
-        self.assertEqual(res["exclusion_reason"], "data_withheld")
-        self.assertEqual(res["record"]["units"], [])
-        self.assertNotIn(self.planted()["email"], json.dumps(res["record"]))
+                           self.planted()["aws"] + " when done.")
+        self.assertTrue(res["ok"], res)
+        self.assertIsNone(res["exclusion_reason"])
+        self.assertTrue(res["record"]["units"])
+        self.assertNotIn(self.planted()["aws"], json.dumps(res["record"]))
         rules = {(r["rel_path"], r["rule_id"])
                  for r in res["record"]["redactions"]}
-        self.assertIn(("<requirement>", "email"), rules)
+        self.assertIn(("<requirement>", "aws_access_key"), rules)
+
+    def test_ordinary_objective_content_is_preserved_and_eligible(self):
+        self.base_repo()
+        write(self.repo, "monkey.py", NEW_APP)
+        objective = ("Implement export handling in /Users/example/work/src, "
+                     "coordinate with owner@example.invalid, and preserve "
+                     "build " + self.planted()["entropy"] + ".")
+        requirement = ("The exporter must write to /Users/example/work/src "
+                       "for owner@example.invalid using "
+                       + self.planted()["entropy"] + ".")
+        res = self.capture(objective_text=objective,
+                           requirement_text=requirement)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["record"]["objective_text"], objective)
+        self.assertEqual(res["record"]["requirement_text"], requirement)
+        self.assertTrue(res["record"]["units"])
+        self.assertTrue(any(u["state_text"] for u in res["record"]["units"]
+                            if u["applicable"]))
 
     def test_missing_objective_and_requirement(self):
         self.base_repo()
@@ -504,16 +524,16 @@ class RedactionAndBaseTests(TmpCase):
         self.assertEqual(cap.base_digest_for(rec["base_files"]),
                          rec["base_digest"])
 
-    def test_base_view_withholds_forbidden_and_secrets(self):
+    def test_base_view_withholds_credential_containers_not_ordinary_text(self):
         res = self._base_dir_capture()
         rec, cid = res["record"], res["capture_id"]
         planted = self.planted()
         view = cap.capture_content_view(rec)
         text = json.dumps(view)
-        for value in (planted["aws"], planted["email"],
-                      rec["base_raw_fingerprint"],
+        for value in (planted["aws"], rec["base_raw_fingerprint"],
                       rec["raw_content_fingerprint"]):
             self.assertNotIn(value, text)
+        self.assertIn(planted["email"], text)
         self.assertNotIn(".env", text)
         self.assertIsNone(cap.read_capture_base_file(self.store, cid, ".env"))
         self.assertIsNone(cap.read_capture_base_file(self.store, cid,
@@ -522,7 +542,7 @@ class RedactionAndBaseTests(TmpCase):
                    for e in rec["base_files"]}
         self.assertEqual(reasons[".env"], "forbidden_path")
         self.assertEqual(reasons["blob.bin"], "non_text")
-        self.assertIn("redacted:email", cap.read_capture_base_file(
+        self.assertIn(planted["email"], cap.read_capture_base_file(
             self.store, cid, "notes.py"))
         # Withheld entries stay listed in the adjudicator view with a reason.
         withheld = [e for e in view["base_files"] if e.get("withheld_reason")]

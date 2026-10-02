@@ -39671,16 +39671,26 @@ class JevObserverIntegrationTests(unittest.TestCase):
             json.dump(config, handle)
         config["_config_path"] = os.path.realpath(config_path)
         capt.write(self.repo, "app.py", capt.BASE_APP)
+        objective = ("The observer must preserve the real build objective in "
+                     "/Users/example/workspace for owner@example.invalid.")
         binding = activation.session_binding(
-            config, sid, self.repo,
-            "The observer must preserve the real build objective.")
+            config, sid, self.repo, objective)
         capt.write(self.repo, "app.py", capt.NEW_APP)
         session_file = state_store.new_session_path(self.repo, sid)
         os.makedirs(os.path.dirname(session_file), exist_ok=True)
         with open(session_file, "w", encoding="utf-8") as handle:
             json.dump({"version": 1, "session_uuid": sid,
                        "jev_observation": binding}, handle)
-        transport = FakeJevTransport()
+        class RecordingTransport(FakeJevTransport):
+            def __init__(self):
+                super().__init__()
+                self.bodies = []
+
+            def __call__(self, url, headers, body, timeout):
+                self.bodies.append(body)
+                return super().__call__(url, headers, body, timeout)
+
+        transport = RecordingTransport()
         activation.reset_overrides()
         activation.configure(transport=transport)
         self.addCleanup(activation.reset_overrides)
@@ -39696,6 +39706,10 @@ class JevObserverIntegrationTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result["kind"], "review_not_approved")
         self.assertGreaterEqual(len(transport.calls), 1)
+        jev_payloads = json.dumps([json.loads(body.decode("utf-8"))
+                                   for body in transport.bodies])
+        self.assertIn("/Users/example/workspace", jev_payloads)
+        self.assertIn("owner@example.invalid", jev_payloads)
         review_input = json.dumps([result["sent"], result["review_args"]]).lower()
         for forbidden in ("jev", "candidate_id", "observation_status"):
             self.assertNotIn(forbidden, review_input)
@@ -39704,8 +39718,7 @@ class JevObserverIntegrationTests(unittest.TestCase):
         with open(receipt_path, "r", encoding="utf-8") as handle:
             receipt = json.load(handle)
         self.assertEqual(receipt["observation_status"], "observed")
-        self.assertEqual(receipt["objective_text"],
-                         "The observer must preserve the real build objective.")
+        self.assertEqual(receipt["objective_text"], objective)
         self.assertEqual(receipt["accuracy_metrics"],
                          "pending_independent_ground_truth")
         self.assertEqual(receipt["independent_adjudication"],

@@ -1411,7 +1411,12 @@ boundary, the observer captures only against the clean Git `HEAD` recorded at
 session enrollment; an unborn or dirty enrollment tree has no trusted baseline
 and is explicitly not queried. Requirement sentences are derived from the
 persisted objective; candidates without requirements are explicitly not
-queried. The candidate snapshot and a durable queued-work record are written
+queried. Ordinary candidate content is not rejected or rewritten based on
+home-directory paths, email addresses, identifier entropy or symbol names;
+these inputs reach Jev unchanged. Explicit credential patterns in text are
+still scrubbed, and dedicated credential containers (such as `.env*`, private
+key formats and `credentials*` files) remain excluded. The candidate snapshot
+and a durable queued-work record are written
 before detached observation starts, and ordinary resume recovers queued work.
 Started attempts are recovered as unknown charges and never resent. A disabled,
 missing, invalid or changed config uniformly blocks paid attempts for both
