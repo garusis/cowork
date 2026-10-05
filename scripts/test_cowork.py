@@ -13481,7 +13481,13 @@ class TransportChokePointTests(unittest.TestCase):
                 "checkpoint_verdict": "accepted",
                 "checkpoint_state": "terminal",
                 "checkpoint_disposition": "pending_review",
-                "checkpoint_superseded_count": 0}
+                "checkpoint_superseded_count": 0,
+                # Bounded-correction facts, full scope: this helper supplies
+                # only the REQUIRED artifact slots, and a targeted scope also
+                # requires the correction packet slot.
+                "correction_kind": "correction", "correction_scope": "full",
+                "correction_finding_count": 1,
+                "correction_max_severity": "major"}
         return {k: vals[k] for k in spec["facts"]}
 
     def _edge_ctx(self, spec):

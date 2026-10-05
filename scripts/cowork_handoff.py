@@ -125,6 +125,7 @@ SLOT_LABELS = {
     "answer": "orchestrator answer to a decision request",
     "execution_profile": "execution profile record (policy, effective "
                          "profile, batch, evidence)",
+    "correction_packet": "correction packet (typed bounded-correction record)",
 }
 
 
@@ -371,12 +372,23 @@ def _embedded_map(entries):
 # checks — every cross-role prompt must go through the registry choke point.
 
 
-def build_diff_recipe(repos):
+def build_diff_recipe(repos, changed_paths=None):
     """The build-reviewer's live-delta capture recipe — CONTENT-FREE static
     instructions parameterized only by the selected repo roots (paths +
     has_head booleans). It is built HERE (owned by the transport) from validated
     repo metadata, so no caller can inject arbitrary text through it. `repos` is
-    a list of ``{"path": <abs>, "has_head": bool}`` (empty -> single-cwd form)."""
+    a list of ``{"path": <abs>, "has_head": bool}`` (empty -> single-cwd form).
+
+    `changed_paths` (additive): None/empty returns the recipe above unchanged.
+    A validated list of repo-relative paths (see `_valid_changed_paths`) returns
+    the SCOPED recipe, which limits the diff and the direct reads to those paths
+    and keeps `git status` so a change outside the list stays visible."""
+    if changed_paths:
+        if not _valid_changed_paths(changed_paths):
+            raise ContextError(
+                "changed_paths is outside its closed schema — only a bounded "
+                "list of repo-relative paths may drive the scoped recipe")
+        return _scoped_diff_recipe(repos, list(changed_paths))
     if not repos:
         return (
             "The unit of review is the builder's FULL working-tree delta against "
@@ -428,6 +440,89 @@ def build_diff_recipe(repos):
         "ignore repos the plan does not list." % "\n".join(blocks))
 
 
+_MAX_CHANGED_PATHS = 200
+_MAX_CHANGED_PATH_LEN = 256
+_CHANGED_PATH_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "._/@+=,-")
+
+
+def _valid_changed_paths(value):
+    """A `changed_paths` ctx value: a non-empty list of at most 200 repo-
+    relative paths drawn from a conservative character set (no whitespace, no
+    leading '/' or '-', no '.' or '..' segment), so no free-form text and no
+    shell/argument syntax rides through the scoped recipe."""
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    if len(value) > _MAX_CHANGED_PATHS:
+        return False
+    for path in value:
+        if (not isinstance(path, str) or not path
+                or len(path) > _MAX_CHANGED_PATH_LEN):
+            return False
+        if path[0] in "/-" or any(c not in _CHANGED_PATH_CHARS for c in path):
+            return False
+        if any(seg in (".", "..") for seg in path.split("/")):
+            return False
+    return True
+
+
+def _scoped_diff_recipe(repos, changed_paths):
+    """The targeted-review form of the live-delta recipe (content-free; the
+    paths were validated by the caller)."""
+    listing = "\n".join("    - %s" % p for p in changed_paths)
+    escape = (
+        "Compare it with the list below: a path changed since your last review "
+        "that the list does not name is a scope escape — report it as a "
+        "finding and review at full scope.")
+    if not repos:
+        return (
+            "The unit of review is the correction's CHANGED PATHS only, listed "
+            "below. The delta is NOT embedded here — capture it yourself. Run:"
+            "\n  - `git status --porcelain` — every staged, unstaged, and "
+            "untracked path at a glance. %s"
+            "\n  - `git diff HEAD -- <the listed paths>` — tracked staged+"
+            "unstaged changes to those paths since the last commit;"
+            "\n  - read each listed untracked/new file directly — it will NOT "
+            "appear in `git diff`."
+            "\nChanged paths:\n%s"
+            "\nReview the listed changes critically against the plan and "
+            "context above." % (escape, listing))
+    blocks = []
+    for r in repos:
+        path = r.get("path", ".")
+        if r.get("has_head"):
+            blocks.append(
+                "  Repo %s (has a baseline commit):"
+                "\n    - `git -C %s status --porcelain` — staged, unstaged, and "
+                "untracked paths;"
+                "\n    - `git -C %s diff HEAD -- <the listed paths>` — tracked "
+                "staged+unstaged changes to those paths since the last commit;"
+                "\n    - read each listed untracked/new file under %s directly "
+                "— it will NOT appear in `git diff`."
+                % (path, path, path, path))
+        else:
+            blocks.append(
+                "  Repo %s (NO baseline commit — unborn repo or non-git "
+                "fallback; do NOT run `git diff HEAD`, it fails):"
+                "\n    - `git -C %s status --porcelain` — every path at a glance;"
+                "\n    - `git -C %s diff --cached -- <the listed paths>` and "
+                "`git -C %s diff -- <the listed paths>` — staged and unstaged "
+                "changes to those paths;"
+                "\n    - read each listed untracked/new file under %s directly."
+                % (path, path, path, path, path))
+    return (
+        "The unit of review is the correction's CHANGED PATHS only, listed "
+        "below (repo-relative; each applies to every selected repo root). The "
+        "delta is NOT embedded here — capture it yourself, per root. Capture "
+        "the delta of EACH of these repos, limited to the listed paths:"
+        "\n%s"
+        "\nIn every repo `git status --porcelain` stays unscoped. %s"
+        "\nChanged paths:\n%s"
+        "\nReview the listed changes critically against the plan and context "
+        "above." % ("\n".join(blocks), escape, listing))
+
+
 def _valid_repos(value):
     """A `repos` ctx value: a list of ``{"path": <abs str>, "has_head": bool}``.
     Bounds the diff-recipe input so no free-form text rides through it."""
@@ -447,10 +542,13 @@ def _valid_repos(value):
 # Per-ctx-key closed schema (blocks body-smuggling through unvalidated ctx):
 #  - context_update_prefix: must itself be a HandoffBlock (built via
 #    render_handoff, so path-only);
-#  - repos: a validated list of {abs path, bool has_head} (drives the recipe).
+#  - repos: a validated list of {abs path, bool has_head} (drives the recipe);
+#  - changed_paths: a bounded list of repo-relative paths (drives the scoped
+#    recipe of a targeted review).
 _CTX_SCHEMAS = {
     "context_update_prefix": lambda v: isinstance(v, HandoffBlock),
     "repos": _valid_repos,
+    "changed_paths": _valid_changed_paths,
 }
 
 
@@ -589,7 +687,17 @@ _FACT_SCHEMAS = {
     # checkpoints`'s `state` vocabulary minus `"unknown"` (this edge is never
     # rendered for a checkpoint with no request at all).
     "checkpoint_state": _in({"pending", "claimed", "terminal"}),
+    # Bounded-correction facts (closed enums and a count; never agent prose).
+    # The packet itself rides by path in the `correction_packet` slot.
+    "correction_kind": _in({"correction", "finding_import"}),
+    "correction_scope": _in({"targeted", "full"}),
+    "correction_finding_count": lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0),
+    "correction_max_severity": _in({"blocking", "major", "minor", "none"}),
 }
+
+CORRECTION_FACT_KEYS = ("correction_kind", "correction_scope",
+                        "correction_finding_count", "correction_max_severity")
 
 
 def _assert_content_free(edge_id, facts, allowed):
@@ -670,6 +778,41 @@ def _read_from_disk_block(descriptor_lines):
     return "%s\n\n%s" % (descriptor_lines, FULL_REREAD_INSTRUCTION)
 
 
+# ---- bounded correction wording (additive: only when correction facts bind) - #
+
+TARGETED_REREAD_NOTICE = (
+    "Review scope is TARGETED: read the correction packet and the artifacts "
+    "listed above instead of re-reading the whole session. Targeting narrows "
+    "what you re-read, never whether you give a verdict: your verdict is "
+    "still required, and only your verdict approves or closes anything. If "
+    "the correction reaches beyond what the packet names, review at full "
+    "scope and report the escape as a finding.")
+
+LEAD_TARGETED_NOTICE = (
+    "The next review of your correction is TARGETED: it re-reads the "
+    "correction packet and the artifacts you update, not the whole session. "
+    "The reviewer's verdict is still required and only that verdict approves "
+    "or closes a finding. Keep the correction within what the packet names; a "
+    "change beyond it is reviewed at full scope.")
+
+
+def _has_correction(facts):
+    return facts.get("correction_kind") is not None
+
+
+def _is_targeted(facts):
+    return _has_correction(facts) and facts.get("correction_scope") == "targeted"
+
+
+def _correction_summary(facts):
+    """One content-free line built only from the closed correction facts."""
+    return ("Correction (orchestrator-derived): kind=%s scope=%s findings=%s "
+            "max_severity=%s."
+            % (facts.get("correction_kind"), facts.get("correction_scope"),
+               facts.get("correction_finding_count"),
+               facts.get("correction_max_severity")))
+
+
 # ---- route 1: scout <-> scout-reviewer situational context ---------------- #
 
 def _render_review_ctx(descriptor_lines, facts, ctx):
@@ -685,11 +828,27 @@ def _render_review_ctx(descriptor_lines, facts, ctx):
 
 
 def _render_review_resume(descriptor_lines, facts, ctx):
-    body = (
-        "The reviewed role has updated its artifact(s) since your last review. "
-        "Re-review the current authoritative files below against the current "
-        "task context, and write your verdict to the review file again.\n%s\n\n"
-        "%s" % (descriptor_lines, FULL_REREAD_INSTRUCTION))
+    if _is_targeted(facts):
+        body = (
+            "The reviewed role has made a bounded correction since your last "
+            "review. Re-review the correction packet and the artifacts listed "
+            "below, and write your verdict to the review file again.\n%s\n\n"
+            "%s\n\n%s" % (descriptor_lines, _correction_summary(facts),
+                          TARGETED_REREAD_NOTICE))
+    elif _has_correction(facts):
+        body = (
+            "The reviewed role has updated its artifact(s) since your last "
+            "review. Re-review the current authoritative files below against "
+            "the current task context, and write your verdict to the review "
+            "file again.\n%s\n\n%s\n\n%s"
+            % (descriptor_lines, _correction_summary(facts),
+               FULL_REREAD_INSTRUCTION))
+    else:
+        body = (
+            "The reviewed role has updated its artifact(s) since your last "
+            "review. Re-review the current authoritative files below against "
+            "the current task context, and write your verdict to the review "
+            "file again.\n%s\n\n%s" % (descriptor_lines, FULL_REREAD_INSTRUCTION))
     prefix = ctx.get("context_update_prefix")
     return (prefix + "\n\n" + body) if prefix else body
 
@@ -698,13 +857,18 @@ def _render_review_resume(descriptor_lines, facts, ctx):
 
 def _render_handback_revise(descriptor_lines, facts, ctx):
     noun = facts.get("artifact_noun") or "artifact"
-    return (
+    text = (
         "[reviewer handoff] A reviewer checked your %s and it is not ready to "
         "hand off yet. Read the reviewer's findings from the review file on "
         "disk:\n%s\n"
         "Address them, update your %s, and set status back to "
         "ready_for_review when done."
         % (noun, descriptor_lines, noun))
+    if _has_correction(facts):
+        text += "\n\n" + _correction_summary(facts)
+        if _is_targeted(facts):
+            text += "\n" + LEAD_TARGETED_NOTICE
+    return text
 
 
 # ---- routes 3/6: active-lead seed (context MAY be inline — decision 2) ----- #
@@ -872,16 +1036,32 @@ def _render_build_reviewer_ctx(descriptor_lines, facts, ctx):
 
 
 def _render_build_reviewer_resume(descriptor_lines, facts, ctx):
-    parts = [
-        "The builder has updated its work since your last review. Re-review "
-        "the current full working-tree delta against the plan and the "
-        "builder's current status. The current authoritative files are on "
-        "disk:\n%s" % descriptor_lines,
-    ]
+    targeted = _is_targeted(facts)
+    if targeted:
+        intro = (
+            "The builder has made a bounded correction since your last "
+            "review. Re-review the correction against the plan and the "
+            "builder's current status. The authoritative files for this "
+            "review are on disk:\n%s" % descriptor_lines)
+    else:
+        intro = (
+            "The builder has updated its work since your last review. "
+            "Re-review the current full working-tree delta against the plan "
+            "and the builder's current status. The current authoritative "
+            "files are on disk:\n%s" % descriptor_lines)
+    parts = [intro]
     owned = _render_owned_verification_block(facts)
     if owned:
         parts.append(owned)
-    parts.extend([FULL_REREAD_INSTRUCTION, build_diff_recipe(ctx.get("repos"))])
+    if _has_correction(facts):
+        parts.append(_correction_summary(facts))
+    if targeted:
+        parts.extend([TARGETED_REREAD_NOTICE,
+                      build_diff_recipe(ctx.get("repos"),
+                                        ctx.get("changed_paths"))])
+    else:
+        parts.extend([FULL_REREAD_INSTRUCTION,
+                      build_diff_recipe(ctx.get("repos"))])
     body = "\n\n".join(parts)
     prefix = ctx.get("context_update_prefix")
     return (prefix + "\n\n" + body) if prefix else body
@@ -1041,15 +1221,20 @@ EDGES = {
     },
     "scout->scout-reviewer:review_resume": {
         "from_role": "scout", "to_role": "scout-reviewer", "kind": "resume",
-        "sources": ["intel_json", "intel_md"], "required": ["intel_json"],
-        "facts": ("team",), "ctx_keys": ("context_update_prefix",),
+        "sources": ["intel_json", "intel_md", "correction_packet"],
+        "required": ["intel_json"],
+        "facts": ("team",) + CORRECTION_FACT_KEYS,
+        "ctx_keys": ("context_update_prefix",),
         "render": _render_review_resume,
     },
-    # routes 2/5/8 (reviewer -> lead, generic over the three pairs)
+    # routes 2/5/8 (reviewer -> lead, generic over the three pairs). This is
+    # also the lead-facing correction edge: it may carry the correction packet
+    # path and the closed correction facts.
     "reviewer->lead:handback_revise": {
         "from_role": "reviewer", "to_role": "lead", "kind": "handback",
-        "sources": ["review"], "required": ["review"],
-        "facts": ("artifact_noun",), "render": _render_handback_revise,
+        "sources": ["review", "correction_packet"], "required": ["review"],
+        "facts": ("artifact_noun",) + CORRECTION_FACT_KEYS,
+        "render": _render_handback_revise,
     },
     # route 3 (cross-role seed: context rides by PATH, not inline)
     "scout->planner:seed": {
@@ -1078,8 +1263,10 @@ EDGES = {
     },
     "planner->planning-advisor:review_resume": {
         "from_role": "planner", "to_role": "planning-advisor", "kind": "resume",
-        "sources": ["plan_json", "plan_md"], "required": ["plan_json", "plan_md"],
-        "facts": ("team",), "ctx_keys": ("context_update_prefix",),
+        "sources": ["plan_json", "plan_md", "correction_packet"],
+        "required": ["plan_json", "plan_md"],
+        "facts": ("team",) + CORRECTION_FACT_KEYS,
+        "ctx_keys": ("context_update_prefix",),
         "render": _render_review_resume,
     },
     # route 6 (cross-role seed: context rides by PATH, not inline)
@@ -1131,7 +1318,8 @@ EDGES = {
         "from_role": "builder", "to_role": "build-reviewer", "kind": "resume",
         "sources": ["plan_json", "plan_md", "build_status", "build_summary",
                     "build_baseline", "verification_receipt",
-                    "checkpoint_receipt", "execution_profile"],
+                    "checkpoint_receipt", "execution_profile",
+                    "correction_packet"],
         "required": ["plan_json", "plan_md", "build_status", "build_baseline"],
         "facts": ("team", "txn_id", "manifest_digest", "index_digest",
                   "verdict", "final_suite_label", "final_suite_binding",
@@ -1139,8 +1327,9 @@ EDGES = {
                   "suite_universe_digest", "suite_member_count",
                   "suite_component_count",
                   "checkpoint_id", "checkpoint_phase", "checkpoint_verdict",
-                  "checkpoint_disposition", "checkpoint_superseded_count"),
-        "ctx_keys": ("repos", "context_update_prefix"),
+                  "checkpoint_disposition", "checkpoint_superseded_count"
+                  ) + CORRECTION_FACT_KEYS,
+        "ctx_keys": ("repos", "context_update_prefix", "changed_paths"),
         "render": _render_build_reviewer_resume,
     },
     # route 9
@@ -1287,6 +1476,26 @@ def validate_role_topology(registry=None, edges=None):
     return True
 
 
+def _assert_correction_structure(edge_id, facts, present_sources):
+    """The correction facts travel together, and a targeted scope must point
+    at its packet: a targeted prompt that cannot name the packet would drop the
+    only instruction to read the correction."""
+    supplied = [k for k in CORRECTION_FACT_KEYS if k in facts]
+    if not supplied:
+        return
+    missing = [k for k in CORRECTION_FACT_KEYS if k not in facts]
+    if missing:
+        raise ContentFreeError(
+            "edge %r: correction facts must be supplied together (missing: %s)"
+            % (edge_id, ", ".join(missing)))
+    if (facts["correction_scope"] == "targeted"
+            and "correction_packet" not in present_sources):
+        raise MissingSourceError(
+            "edge %r: a targeted correction scope requires the "
+            "'correction_packet' artifact so the prompt can name it"
+            % (edge_id,))
+
+
 def render_handoff(edge_id, *, artifacts=None, facts=None, ctx=None):
     """THE CHOKE POINT. Render one cross-role prompt block for `edge_id`.
 
@@ -1357,6 +1566,7 @@ def render_handoff(edge_id, *, artifacts=None, facts=None, ctx=None):
             raise MissingSourceError(
                 "edge %r: required artifact slot %r has no artifact "
                 "(supplied: %s)" % (edge_id, req, sorted(present_sources)))
+    _assert_correction_structure(edge_id, facts, present_sources)
     entries = _descriptor_entries(normalized)
     descriptor_lines = _descriptor_lines(entries)
     prompt = edge["render"](descriptor_lines, facts, ctx or {})

@@ -171,9 +171,13 @@ Use this shape:
      "verification_challenge": {"transaction_id": "<owned receipt id>",
                                 "reason_code": "<why the receipt is wrong>"}}
   ],
+  "closed_source_findings": ["<source_finding_id verified closed>"],
   "user_question": "<required only when verdict is needs_user>"
 }
 ```
+
+`closed_source_findings` is optional and additive; see "Targeted re-review and
+source-finding closure". Omit it when it would be empty.
 
 **`corrective_findings` and `summary` are separate on purpose.** They used to be
 one `findings` array, so an approving reviewer's overall remarks were counted as
@@ -231,6 +235,26 @@ artifacts. A vague or context-light question is a failed review.
 
 Everything else — wrong content, gaps, guesses a lead made where the context
 did settle the answer — is a `revise` finding for the builder.
+
+## Targeted re-review and source-finding closure
+
+When the handoff says the correction scope is **targeted**, read the
+correction packet and the artifacts the handoff lists, plus the changed paths
+the diff recipe names, instead of re-reading the whole session. Targeted scope
+narrows what you re-read, never whether you give a verdict: your verdict is
+always required, and only your verdict approves or closes anything. The
+correction packet links existing ids; it cannot close a finding or approve, and
+the outcome the builder records in it is a claim, not evidence.
+
+When the packet or the handoff says the scope is **full**, or when a path
+outside the listed changed paths changed since your last review, review at full
+scope and report the escape as a finding.
+
+`closed_source_findings` is an optional list of `source_finding_id` values from
+an imported `finding_import` packet that you verified are closed in the current
+work. List only ids you verified yourself, omit the field when it would be
+empty, and never use it in place of `corrective_findings`: an approving round
+still has zero corrective findings.
 
 ## Domain guardrail (strict)
 

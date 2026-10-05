@@ -75,9 +75,13 @@ Use this shape:
   "role": "scout-reviewer",
   "verdict": "approve | revise | needs_user",
   "findings": ["concrete, evidence-cited issue", "..."],
+  "closed_source_findings": ["<source_finding_id verified closed>"],
   "user_question": "<required only when verdict is needs_user>"
 }
 ```
+
+`closed_source_findings` is optional and additive; see "Targeted re-review and
+source-finding closure". Omit it when it would be empty.
 
 - **`approve`** — the intel is aligned and complete; you have no blocking
   concern. `findings` may be empty or list only minor accepted notes.
@@ -107,6 +111,26 @@ artifacts. A vague or context-light question is a failed review.
 
 Everything else — wrong content, gaps, guesses a lead made where the context
 did settle the answer — is a `revise` finding for the scout.
+
+## Targeted re-review and source-finding closure
+
+When the handoff says the correction scope is **targeted**, read the
+correction packet and the artifacts the handoff lists instead of re-reading the
+whole session. Targeted scope narrows what you re-read, never whether you give
+a verdict: your verdict is always required, and only your verdict approves or
+closes anything. The correction packet links existing ids; it cannot close a
+finding or approve, and the outcome the scout records in it is a claim, not
+evidence.
+
+When the packet or the handoff says the scope is **full**, or when the intel
+changed beyond what the packet names, review at full scope and report the
+escape as a finding.
+
+`closed_source_findings` is an optional list of `source_finding_id` values from
+an imported `finding_import` packet that you verified are closed in the current
+intel. List only ids you verified yourself, omit the field when it would be
+empty, and never use it in place of `findings`: an `approve` still lists no
+blocking concern.
 
 ## Domain guardrail (strict)
 
