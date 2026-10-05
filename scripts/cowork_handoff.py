@@ -126,6 +126,11 @@ SLOT_LABELS = {
     "execution_profile": "execution profile record (policy, effective "
                          "profile, batch, evidence)",
     "correction_packet": "correction packet (typed bounded-correction record)",
+    # Session rotation successor edge: distinct slots from the correction
+    # packet so the correction-edge slot pins stay exact.
+    "rotation_record": "rotation record (predecessor session handoff key)",
+    "rotation_packet": "correction packet to resume from (typed "
+                       "bounded-correction record)",
 }
 
 
@@ -627,6 +632,13 @@ def _list_in(enum_set):
         isinstance(x, str) and x in enum_set for x in v)
 
 
+_ROTATION_CHAIN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+_ROTATION_BOUNDARIES = frozenset({"lead_after_phase_approved",
+                                  "reviewer_between_rounds",
+                                  "lead_before_correction_round"})
+
+
 # Per-fact CLOSED schema: a validator that accepts only the fact's legal values.
 # A key without an entry falls back to the normalized-token check (reason codes).
 _FACT_SCHEMAS = {
@@ -694,6 +706,16 @@ _FACT_SCHEMAS = {
     "correction_finding_count": lambda v: (
         isinstance(v, int) and not isinstance(v, bool) and v >= 0),
     "correction_max_severity": _in({"blocking", "major", "minor", "none"}),
+    # Session rotation successor facts: the rotation record's key, as closed
+    # tokens (never prose). `rotation_boundary` mirrors
+    # `cowork_context.BOUNDARIES` (this module imports no sibling).
+    "rotation_chain": lambda v: (
+        isinstance(v, str) and 0 < len(v) <= 128
+        and v[0] in _ROTATION_CHAIN_CHARS and v[0] not in "_-"
+        and all(c in _ROTATION_CHAIN_CHARS for c in v)),
+    "rotation_boundary": _in(_ROTATION_BOUNDARIES),
+    "rotation_boundary_seq": lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0),
 }
 
 CORRECTION_FACT_KEYS = ("correction_kind", "correction_scope",
@@ -1130,6 +1152,31 @@ def _render_pending_resume(descriptor_lines, facts, ctx):
         "%s" % descriptor_lines)
 
 
+def _render_rotation_successor(descriptor_lines, facts, ctx):
+    missing = [k for k in ("role", "rotation_chain", "rotation_boundary",
+                           "rotation_boundary_seq") if k not in facts]
+    if missing:
+        raise ContentFreeError(
+            "edge 'rotation->successor:handoff': the rotation key must "
+            "travel together (missing: %s)" % ", ".join(missing))
+    return "\n".join([
+        "[session rotation handoff]",
+        "You are continuing an existing cowork session as %s." % facts["role"],
+        "Your previous provider conversation for this role was rotated at "
+        "the %s boundary (chain %s, boundary sequence %s). This is a fresh "
+        "provider conversation: hidden chat history is not available; "
+        "cowork-visible session state, artifacts, shared context, and the "
+        "working tree continue."
+        % (facts["rotation_boundary"], facts["rotation_chain"],
+           facts["rotation_boundary_seq"]),
+        "",
+        "The rotation record and any shared context, current artifacts and "
+        "correction packet below are the authoritative files on disk — "
+        "read them from disk to orient yourself, then continue your work:",
+        descriptor_lines,
+    ]).strip()
+
+
 # ---- route 13: context revision wake (context by path) --------------------- #
 
 def _render_context_update(descriptor_lines, facts, ctx):
@@ -1401,6 +1448,18 @@ EDGES = {
         "facts": ("role", "checkpoint_id", "checkpoint_phase",
                   "checkpoint_verdict", "checkpoint_state"),
         "render": _render_checkpoint_wake,
+    },
+    # Session rotation (M7-D): a role continues in a fresh provider
+    # conversation. Path-first and content-free; only the rotation record is
+    # required so the edge can deliver at any of the three boundaries.
+    "rotation->successor:handoff": {
+        "from_role": "role", "to_role": "role", "kind": "resume",
+        "sources": ["rotation_record", "context", "artifacts",
+                    "rotation_packet"],
+        "required": ["rotation_record"],
+        "facts": ("role", "rotation_chain", "rotation_boundary",
+                  "rotation_boundary_seq"),
+        "render": _render_rotation_successor,
     },
 }
 

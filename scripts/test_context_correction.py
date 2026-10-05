@@ -69,6 +69,9 @@ _NEUTRAL_FACT_VALUES = {
     "checkpoint_verdict": "accepted", "checkpoint_state": "terminal",
     "checkpoint_disposition": "pending_review",
     "checkpoint_superseded_count": 0,
+    "rotation_chain": "chain-1",
+    "rotation_boundary": "lead_after_phase_approved",
+    "rotation_boundary_seq": 1,
 }
 _CORRECTION_SOURCE = "correction_packet"
 _TWO_REPOS = [{"path": "/neutral/repo-a", "has_head": True},
@@ -406,6 +409,19 @@ GOLDEN = {
         + _lines("checkpoint_status") + "\n\n"
         "This is an orchestrator-run, deterministic checkpoint result — "
         "never agent prose. Continue once you have read it."),
+    "rotation->successor:handoff": (
+        "[session rotation handoff]\n"
+        "You are continuing an existing cowork session as scout.\n"
+        "Your previous provider conversation for this role was rotated at "
+        "the lead_after_phase_approved boundary (chain chain-1, boundary "
+        "sequence 1). This is a fresh provider conversation: hidden chat "
+        "history is not available; cowork-visible session state, artifacts, "
+        "shared context, and the working tree continue.\n\n"
+        "The rotation record and any shared context, current artifacts and "
+        "correction packet below are the authoritative files on disk — read "
+        "them from disk to orient yourself, then continue your work:\n"
+        + _line("rotation record (predecessor session handoff key)",
+                "rotation_record")),
     # Variants whose output depends on composition.
     "scout->scout-reviewer:review_resume#prefix": (
         _CONTEXT_UPDATE + "\n\n" + _review_resume("intel_json")),

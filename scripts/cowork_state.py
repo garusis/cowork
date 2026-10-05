@@ -6726,6 +6726,293 @@ def clear_pending_turn_before_pause(session_uuid, role):
         pass
 
 
+# --------------------------------------------------------------------------- #
+# Session rotation: a compare-and-pop of one role's provider session id, and  #
+# the write-ahead record that makes the pop restart-safe. Additions only:     #
+# nothing below is called by the runtime yet, and `clear_role_session` /      #
+# `save_role_session` are untouched. A rotation record lives at               #
+# `<assets>/rotation/<role>.<chain>.<boundary>.<seq>.json`, moves one way     #
+# (intended -> popped -> delivered | abandoned) and is only ever written      #
+# through `_locked_json_transaction`. A torn record reads `unreadable`; it is #
+# never treated as absent.                                                    #
+# --------------------------------------------------------------------------- #
+
+ROTATION_RECORD_SCHEMA = 1
+ROTATION_STATES = ("intended", "popped", "delivered", "abandoned")
+_ROTATION_TRANSITIONS = {
+    "intended": ("popped", "abandoned"),
+    "popped": ("delivered", "abandoned"),
+    "delivered": (),
+    "abandoned": (),
+}
+ROTATION_READ_STATUSES = ("absent", "readable", "unreadable")
+ROTATION_OUTCOMES = ("popped", "already_complete", "abandoned_mismatch")
+# No dots: the dot-joined record file name stays injective.
+_ROTATION_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{0,127}")
+
+
+def _rotation_context():
+    """Lazily import `cowork_context` (stdlib-only leaf) so this module's
+    import lines stay unchanged."""
+    import cowork_context
+    return cowork_context
+
+
+def _validate_rotation_key(role, chain, boundary, boundary_seq):
+    """Raise ValueError unless the four key parts are safe, closed values."""
+    for label, value in (("role", role), ("chain", chain)):
+        if not isinstance(value, str) or not _ROTATION_TOKEN_RE.fullmatch(value):
+            raise ValueError(
+                "rotation %s %r must match [A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+                % (label, value))
+    if boundary not in _rotation_context().BOUNDARIES:
+        raise ValueError("unknown rotation boundary: %r" % (boundary,))
+    if (not isinstance(boundary_seq, int) or isinstance(boundary_seq, bool)
+            or boundary_seq < 0):
+        raise ValueError(
+            "rotation boundary_seq must be a non-negative integer, got %r"
+            % (boundary_seq,))
+
+
+def rotation_dir_for(session_uuid):
+    """Directory holding a session's rotation records."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid), "rotation")
+
+
+def rotation_record_path_for(session_uuid, role, chain, boundary,
+                             boundary_seq):
+    """Path of one rotation record. Rejects an unsafe or unknown key part."""
+    _validate_rotation_key(role, chain, boundary, boundary_seq)
+    return os.path.join(
+        rotation_dir_for(session_uuid),
+        "%s.%s.%s.%d.json" % (role, chain, boundary, boundary_seq))
+
+
+def rotate_role_session(path, role, controller, session_id, prior=None):
+    """Compare-and-pop a role's provider session id: remove ONLY
+    `sessions[role]['id']`, and only when the entry still names exactly
+    (`controller`, `session_id`). Controller, model, effort, context-ack and
+    baseline fields and every other state key survive (unlike
+    `clear_role_session`, which drops the whole entry). Any other entry (absent,
+    a different id, a different controller) is left alone and nothing is
+    written. Returns the resulting state."""
+    state = dict(prior or load(path) or {})
+    sessions = dict(state.get("sessions") or {})
+    entry = sessions.get(role)
+    if not (isinstance(entry, dict) and entry.get("controller") == controller
+            and entry.get("id") == session_id):
+        return state
+    entry = dict(entry)
+    del entry["id"]
+    sessions[role] = entry
+    state["sessions"] = sessions
+    save(path, state)
+    return state
+
+
+def _rotation_record_matches(record, role, chain, boundary, boundary_seq):
+    return (isinstance(record, dict)
+            and record.get("schema") == ROTATION_RECORD_SCHEMA
+            and record.get("state") in ROTATION_STATES
+            and record.get("role") == role
+            and record.get("chain") == chain
+            and record.get("boundary") == boundary
+            and record.get("boundary_seq") == boundary_seq
+            and isinstance(record.get("controller"), str)
+            and isinstance(record.get("session_id"), str))
+
+
+def _checked_rotation_record(path, existing, role, chain, boundary,
+                             boundary_seq):
+    if existing is not None and not _rotation_record_matches(
+            existing, role, chain, boundary, boundary_seq):
+        raise CorruptRecordError(
+            "%s: exists but is not a valid rotation record for its key" % path)
+    return existing
+
+
+def write_rotation_intent(session_uuid, role, chain, boundary, boundary_seq,
+                          controller, session_id, metric=None,
+                          reason_code=None):
+    """Durably write the `intended` rotation record for one key BEFORE the
+    session id is popped. Idempotent for the same (`controller`,
+    `session_id`): a repeat leaves the file untouched. A different pair on an
+    existing key raises ValueError (a key describes one provider session
+    only); a torn or malformed existing record raises `CorruptRecordError`.
+    Returns the record."""
+    path = rotation_record_path_for(
+        session_uuid, role, chain, boundary, boundary_seq)
+    for label, value in (("controller", controller),
+                         ("session_id", session_id)):
+        if not isinstance(value, str) or not value:
+            raise ValueError("rotation %s must be a nonempty string" % label)
+    ctx = _rotation_context()
+    if metric is not None and metric not in ctx.METRICS:
+        raise ValueError("unknown rotation metric: %r" % (metric,))
+    if reason_code is not None and reason_code not in ctx.REASON_CODES:
+        raise ValueError("unknown rotation reason_code: %r" % (reason_code,))
+
+    def mutate(existing):
+        existing = _checked_rotation_record(
+            path, existing, role, chain, boundary, boundary_seq)
+        if existing is not None:
+            if (existing["controller"] == controller
+                    and existing["session_id"] == session_id):
+                return None
+            raise ValueError(
+                "rotation record %s/%s/%s/%d already names a different "
+                "provider session" % (role, chain, boundary, boundary_seq))
+        return {
+            "schema": ROTATION_RECORD_SCHEMA,
+            "role": role,
+            "chain": chain,
+            "boundary": boundary,
+            "boundary_seq": boundary_seq,
+            "metric": metric,
+            "reason_code": reason_code,
+            "state": "intended",
+            "controller": controller,
+            "session_id": session_id,
+            "intended_at": _utc_now(),
+        }
+
+    return _locked_json_transaction(path, mutate)
+
+
+def read_rotation_record(session_uuid, role, chain, boundary, boundary_seq):
+    """`{'status': absent|readable|unreadable, 'record': dict|None}`. A torn
+    file, non-object JSON or a record that disagrees with its own key is
+    `unreadable`, never `absent`."""
+    path = rotation_record_path_for(
+        session_uuid, role, chain, boundary, boundary_seq)
+    try:
+        record = _read_json_or_raise_if_corrupt(path)
+    except CorruptRecordError:
+        return {"status": "unreadable", "record": None}
+    if record is None:
+        return {"status": "absent", "record": None}
+    if not _rotation_record_matches(record, role, chain, boundary,
+                                    boundary_seq):
+        return {"status": "unreadable", "record": None}
+    return {"status": "readable", "record": record}
+
+
+def list_rotation_records(session_uuid, role=None):
+    """Sorted `{'file', 'status', 'record'}` for every `*.json` in the session's
+    rotation directory (lock and temp files are ignored). With `role`, only that
+    role's records plus any file whose name cannot be attributed to a role."""
+    directory = rotation_dir_for(session_uuid)
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".json"))
+    except OSError:
+        return []
+    entries = []
+    for name in names:
+        parts = name[:-len(".json")].split(".")
+        key = None
+        if len(parts) == 4 and parts[3].isascii() and parts[3].isdigit():
+            key = (parts[0], parts[1], parts[2], int(parts[3]))
+        if role is not None and key is not None and key[0] != role:
+            continue
+        status, record = "unreadable", None
+        if key is not None:
+            try:
+                found = read_rotation_record(session_uuid, *key)
+            except ValueError:
+                found = None
+            if found is not None:
+                status, record = found["status"], found["record"]
+        entries.append({"file": name, "status": status, "record": record})
+    return entries
+
+
+def advance_rotation_record(session_uuid, role, chain, boundary,
+                            boundary_seq, new_state):
+    """Move a rotation record forward one step (intended -> popped ->
+    delivered, or abandoned from either non-final state). Re-applying the
+    current state is a no-op. Any other transition, or a missing record, raises
+    ValueError and leaves the file byte-identical; a torn record raises
+    `CorruptRecordError`. Returns the record."""
+    path = rotation_record_path_for(
+        session_uuid, role, chain, boundary, boundary_seq)
+    if new_state not in ROTATION_STATES:
+        raise ValueError("unknown rotation state: %r" % (new_state,))
+
+    def mutate(existing):
+        existing = _checked_rotation_record(
+            path, existing, role, chain, boundary, boundary_seq)
+        if existing is None:
+            raise ValueError(
+                "no rotation record for %s/%s/%s/%d"
+                % (role, chain, boundary, boundary_seq))
+        current = existing["state"]
+        if new_state == current:
+            return None
+        if new_state not in _ROTATION_TRANSITIONS[current]:
+            raise ValueError(
+                "rotation record cannot move %s -> %s" % (current, new_state))
+        advanced = dict(existing)
+        advanced["state"] = new_state
+        advanced["%s_at" % new_state] = _utc_now()
+        return advanced
+
+    return _locked_json_transaction(path, mutate)
+
+
+def rotate_session_with_record(path, session_uuid, role, chain, boundary,
+                               boundary_seq, controller, session_id,
+                               metric=None, reason_code=None):
+    """Pop a role's provider session id behind a write-ahead record, safe to
+    re-run after a crash at any point. Order: the `intended` record is durable
+    first; state.json is then loaded fresh and exactly one of three things
+    happens --
+
+      - the entry names exactly (`controller`, `session_id`): the id is popped
+        and the record moves to `popped`;
+      - the role has no entry, or its entry carries no id (an earlier pop
+        already landed before a crash): the record moves to `popped` and
+        state.json is not written;
+      - any other id-bearing entry (a different id, the same id under another
+        controller, a non-string id): the record moves to `abandoned`,
+        nothing is popped.
+
+    A record that is already past `intended` is `already_complete` and pops
+    nothing, even if the same id is present again. A torn record, or a
+    state.json that cannot be loaded, raises with nothing popped. Moving the
+    record on to `delivered` once the successor has been sent is the caller's
+    step (`advance_rotation_record`).
+
+    Returns `{'outcome', 'record', 'state'}`; `outcome` is one of
+    ROTATION_OUTCOMES."""
+    record = write_rotation_intent(
+        session_uuid, role, chain, boundary, boundary_seq, controller,
+        session_id, metric, reason_code)
+    state = load(path)
+    if state is None:
+        raise ValueError(
+            "state.json is absent or unreadable; nothing was popped")
+    if record["state"] != "intended":
+        return {"outcome": "already_complete", "record": record,
+                "state": state}
+    entry = (state.get("sessions") or {}).get(role)
+    if isinstance(entry, dict) and not entry.get("id"):
+        entry = None
+    if entry is None:
+        outcome = "popped"
+    elif (isinstance(entry, dict) and entry.get("controller") == controller
+            and entry.get("id") == session_id):
+        state = rotate_role_session(
+            path, role, controller, session_id, prior=state)
+        outcome = "popped"
+    else:
+        outcome = "abandoned_mismatch"
+    record = advance_rotation_record(
+        session_uuid, role, chain, boundary, boundary_seq,
+        "abandoned" if outcome == "abandoned_mismatch" else "popped")
+    return {"outcome": outcome, "record": record, "state": state}
+
+
 # =========================================================================== #
 # M4 Package B: durable, crash-safe activity journal + scheduled-review      #
 # store for the truthful-liveness surface Package A (`cowork_activity.py`,   #

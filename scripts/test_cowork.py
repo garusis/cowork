@@ -13449,6 +13449,10 @@ class TransportChokePointTests(unittest.TestCase):
     """SC1: every registry edge resolves through render_handoff, and no cross-
     role prompt is emitted outside the single choke point."""
 
+    # Registered but not yet rendered by cowork.py: the wiring stage removes
+    # this exemption when it renders the edge.
+    _EDGES_NOT_YET_WIRED = frozenset({"rotation->successor:handoff"})
+
     def _edge_artifacts(self, spec):
         # Supply exactly the REQUIRED sources for an edge (plus one declared
         # source when nothing is strictly required, e.g. the switch edge) so the
@@ -13482,6 +13486,10 @@ class TransportChokePointTests(unittest.TestCase):
                 "checkpoint_state": "terminal",
                 "checkpoint_disposition": "pending_review",
                 "checkpoint_superseded_count": 0,
+                # Session rotation successor edge's key facts.
+                "rotation_chain": "chain-1",
+                "rotation_boundary": "lead_after_phase_approved",
+                "rotation_boundary_seq": 1,
                 # Bounded-correction facts, full scope: this helper supplies
                 # only the REQUIRED artifact slots, and a targeted scope also
                 # requires the correction packet slot.
@@ -13651,10 +13659,11 @@ class TransportChokePointTests(unittest.TestCase):
         self.assertEqual(
             used - registered, set(),
             "cowork.py renders unregistered edge(s): %s" % sorted(used - registered))
+        unwired = registered - used - self._EDGES_NOT_YET_WIRED
         self.assertEqual(
-            registered - used, set(),
+            unwired, set(),
             "registered edge(s) never rendered live in cowork.py: %s"
-            % sorted(registered - used))
+            % sorted(unwired))
 
     def test_a_new_unregistered_edge_cannot_be_rendered(self):
         # Regression: a newly named function/role that tries to render an edge
