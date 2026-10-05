@@ -240,6 +240,71 @@ def _digest(value):
     return hashlib.sha256(raw).hexdigest()
 
 
+_COMMAND_IDENTITY_DOMAIN = b"cowork.guard.command-identity.v1\0"
+_COMMAND_IDENTITY = re.compile(r"cmd1:[0-9a-f]{64}")
+
+
+def _normalize_command(text):
+    """Neutral normal form of one shell command text, or None without one.
+
+    Only two things are normalized: leading/trailing whitespace is stripped,
+    and OUTSIDE quotes each run of spaces and tabs becomes one space.  Every
+    other byte is kept exactly (case, argument order, flags, operators,
+    newlines, quote characters and all text inside quotes), so this is a
+    fingerprint of what was typed, not a claim that two commands are
+    equivalent (`-n 5` and `-n5` stay different).  A backslash escapes the next
+    character outside quotes and inside double quotes; single quotes have no
+    escapes.  An unterminated quote just scans to the end of the text."""
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    out = []
+    quote = None
+    collapsed = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        index += 1
+        if char == "\\" and quote != "'":
+            out.append(char)
+            if index < len(text):
+                out.append(text[index])
+                index += 1
+            collapsed = False
+        elif quote is None and char in " \t":
+            if not collapsed:
+                out.append(" ")
+            collapsed = True
+        else:
+            if quote is None and char in "'\"":
+                quote = char
+            elif char == quote:
+                quote = None
+            out.append(char)
+            collapsed = False
+    return "".join(out)
+
+
+def command_identity(text):
+    """Versioned, content-free identity of one shell command, or None.
+
+    The value is `cmd1:` plus the SHA-256 of a domain separator and the
+    normalized command text (see `_normalize_command`).  It identifies WHICH
+    command was attempted and nothing else: the working directory, resolved
+    targets, proof, action class, environment, path resolution and shell
+    expansion are deliberately not part of it (targets are carried by
+    path_digests/target_count and the class by action_class).  Only the digest
+    is ever persisted.  Blank or non-string input has no identity."""
+    normalized = _normalize_command(text)
+    if normalized is None:
+        return None
+    raw = _COMMAND_IDENTITY_DOMAIN + normalized.encode(
+        "utf-8", "surrogatepass")
+    return "cmd1:" + hashlib.sha256(raw).hexdigest()
+
+
 def child_request_metadata(requested):
     """Content-free durable metadata for a delegated child request."""
     requested = requested if isinstance(requested, dict) else {}
@@ -910,8 +975,10 @@ def classify_action(tool_name, tool_input, cwd=None, installed_schema=None,
         return {"class": "read", "targets": [target] if target else [],
                 "resolution_complete": True, "proof": "builtin_read"}
     if tool_name in ("Bash", "Shell", "exec_command"):
-        return _bash_action(tool_input.get("command") or tool_input.get("cmd"),
-                            cwd)
+        command = tool_input.get("command") or tool_input.get("cmd")
+        action = _bash_action(command, cwd)
+        action["command_identity"] = command_identity(command)
+        return action
     if tool_name in MUTATION_TOOLS:
         raw = (tool_input.get("file_path") or tool_input.get("path")
                or tool_input.get("notebook_path"))
@@ -1043,6 +1110,10 @@ def sanitize(decision, action=None, work_id=None, parent_work_id=None,
     """Return the content-free durable representation of a decision."""
     action = action or {}
     targets = action.get("targets") or ()
+    identity = action.get("command_identity")
+    if not (isinstance(identity, str)
+            and _COMMAND_IDENTITY.fullmatch(identity)):
+        identity = None
     record = {
         "guard_attempt_id": guard_attempt_id,
         "work_id": work_id,
@@ -1052,10 +1123,10 @@ def sanitize(decision, action=None, work_id=None, parent_work_id=None,
         "action_class": action.get("class") or "unknown",
         "target_count": len(targets),
         "path_digests": [_digest(_real(p)) for p in targets if p],
-        "command_fingerprint": _digest({
-            "proof": action.get("proof"), "class": action.get("class"),
-            "target_count": len(targets),
-        }),
+        # Command identity only.  Target and proof identity is carried by
+        # path_digests/target_count/action_class/authorities and is
+        # intentionally not part of this value.
+        "command_fingerprint": identity,
     }
     if action.get("stage_count") is not None:
         record["stage_count"] = action["stage_count"]
