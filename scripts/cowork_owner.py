@@ -160,7 +160,7 @@ OWNER_VERDICTS = frozenset({
 })
 
 _LEASE_STATES = frozenset({"live", "released", "terminal"})
-_ENTRY_POINTS = frozenset({"run_flow", "resume_trigger"})
+_ENTRY_POINTS = frozenset({"run_flow", "resume_trigger", "graph_publish"})
 _TAKEOVER_MODES = frozenset({"proved_dead", "terminate_prior"})
 
 # `ps -o lstart=` prints this host's LOCAL wall clock with no offset field.

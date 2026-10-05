@@ -339,6 +339,14 @@ def build_parser():
                    metavar="TEXT",
                    help="with --profile on a new session: why this profile "
                         "was chosen, stored on the profile record")
+    p.add_argument("--graph-vertex", dest="graph_vertex",
+                   metavar="GRAPH_ID:WORK_ID:EPOCH", default=None,
+                   help="agent-only: bind this NEW profiled session to the "
+                        "graph vertex claimed by `cowork graph claim` (pass "
+                        "its launch_argv). Requires --profile equal to the "
+                        "vertex profile and launching from the vertex root; "
+                        "refused with --no-session, --worktree, --team, "
+                        "--output-root and on any resumed session")
     p.add_argument("--preview-profile", dest="preview_profile", metavar="NAME",
                    help="print one execution profile's complete effective "
                         "policy as a single JSON object and exit; read-only, "
@@ -12854,6 +12862,10 @@ def build_run_result(rc, result_box):
         # Additive and present ONLY for a profiled session: selected and
         # effective profile, promotion count, deferred minor note count.
         result["execution_profile"] = dict(result_box["execution_profile"])
+    if result_box.get("graph_vertex"):
+        # Additive and present ONLY for a graph-bound session: the vertex
+        # (graph_id, work_id, lease_epoch) this session holds.
+        result["graph_vertex"] = dict(result_box["graph_vertex"])
     if session_file:
         resume = ["--session-file", session_file]
         result["resume_argv"] = resume
@@ -13117,6 +13129,43 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
             profile_target = profile_arg
     elif profile_arg is not None:
         profile_target = profile_arg
+    # Graph vertex binding (#75): validated HERE, read-only and before
+    # anything is written. Only a NEW profiled session launched from the
+    # claimed vertex root may bind; the bind itself happens after the owner
+    # lease is held (first statement of the owned region below).
+    graph_vertex = None
+    if getattr(args, "graph_vertex", None) is not None:
+        import cowork_graph_cli
+        import cowork_graph_store
+        graph_vertex = cowork_graph_cli.parse_graph_vertex(args.graph_vertex)
+        if graph_vertex is None:
+            return refuse("graph_vertex_malformed",
+                          "--graph-vertex %r is not GRAPH_ID:WORK_ID:EPOCH"
+                          % (args.graph_vertex,))
+        if profile_arg is None:
+            return refuse("graph_vertex_requires_profile",
+                          "--graph-vertex requires --profile equal to the "
+                          "vertex profile")
+        if choice.resume:
+            return refuse("graph_vertex_requires_new_session",
+                          "--graph-vertex binds a NEW session; %s names an "
+                          "existing one" % spath)
+        conflicting = [flag for flag, on in (
+            ("--no-session", not session_enabled),
+            ("--worktree", worktree_requested),
+            ("--team", bool(args.team)),
+            ("--output-root", bool(raw_roots))) if on]
+        if conflicting:
+            return refuse("graph_vertex_flag_conflict",
+                          "--graph-vertex cannot be combined with %s"
+                          % ", ".join(conflicting))
+        try:
+            cowork_graph_store.check_bind_preconditions(
+                graph_vertex[0], graph_vertex[1], graph_vertex[2], run_cwd,
+                profile_arg)
+        except cowork_graph_store.GraphRefusal as exc:
+            return refuse(exc.code, "--graph-vertex refused: %s" % exc,
+                          rc=exc.rc)
     # Team, config and reviewer pairing are validated BEFORE any session is
     # created or lease acquired: an invalid invocation leaves nothing behind
     # for a later --resume to pick up.
@@ -13270,6 +13319,28 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
             daemon=True)
         heartbeat_thread.start()
     try:
+        # Graph vertex bind/fence (#75): the FIRST statement of the owned
+        # region, before any decision check or dispatch. A refusal returns
+        # from inside this try, so the finally below stops the heartbeat and
+        # releases the owner lease. An unbound session reads one absent
+        # session-index path and continues unchanged.
+        if session_enabled:
+            import cowork_graph_store
+            try:
+                graph_binding = (
+                    cowork_graph_store.bind_session(
+                        graph_vertex[0], graph_vertex[1], graph_vertex[2],
+                        session_uuid, run_cwd, profile_arg)
+                    if graph_vertex is not None
+                    else cowork_graph_store.fence(session_uuid))
+            except cowork_graph_store.GraphRefusal as exc:
+                return refuse(exc.code,
+                              "graph vertex fence refused: %s" % exc,
+                              rc=exc.rc, trace_obj=trace)
+            if graph_binding is not None:
+                result_box["graph_vertex"] = {
+                    k: graph_binding[k]
+                    for k in ("graph_id", "work_id", "lease_epoch")}
         # Orchestrator decisions bind to the ONE open decision request this
         # session recorded when a phase stopped, and are checked here, before
         # anything is written or dispatched. An open answer/authorization
@@ -16442,6 +16513,18 @@ def run_resume_trigger(argv, output=None, session_factory=None):
     rt_prior_owner_context = _set_owner_context(
         session_uuid, rt_owner_id, rt_owner_epoch)
     try:
+        # Graph vertex fence (#75): FIRST statement of the owned region,
+        # before step 2's PauseLease claim. A reclaimed, superseded or
+        # cancel-requested vertex child is refused having claimed nothing;
+        # the finally below releases rt_lease.
+        import cowork_graph_store
+        try:
+            cowork_graph_store.fence(session_uuid)
+        except cowork_graph_store.GraphRefusal as exc:
+            write(json.dumps({"outcome": "owner_conflict",
+                              "session_uuid": session_uuid,
+                              "reason": exc.code}) + "\n")
+            return RESUME_TRIGGER_EXIT_OWNER_CONFLICT
         # Step 2: every read-only preflight check above passed -- only NOW
         # attempt this CLI's OWN state-mutating claim (idempotent under
         # Package F's own claim-then-invoke ordering -- see the docstring).
@@ -16819,6 +16902,12 @@ def _run_resume_trigger_governed(argv, output=None, session_factory=None):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["graph"]:
+        # Issue #75: the agent-only `cowork graph <op>` CLI has its own
+        # one-result-line contract (cowork_graph_cli), dispatched here before
+        # the flat argparse like resume-trigger below.
+        import cowork_graph_cli
+        return cowork_graph_cli.main(argv[1:])
     if argv[:1] == ["resume-trigger"]:
         # M3 Package E: the resume-trigger CLI is a wholly separate,
         # independently-versioned contract (RESUME_TRIGGER_CONTRACT_VERSION)
