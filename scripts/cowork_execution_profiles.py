@@ -322,6 +322,174 @@ def non_weakening_violations(profile):
     return problems
 
 
+# --------------------------------------------------------------------------- #
+# Context envelopes.                                                          #
+# --------------------------------------------------------------------------- #
+#
+# A context envelope is the per-(profile, role) LIMITS a later stage compares
+# an observation against. It is a separate frozen table, not part of
+# PROFILE_DEFINITIONS: folding it into the definitions would change
+# `policy_digest`, which `validate_record` checks, and invalidate every saved
+# profiled session. The table holds limits only. It carries no required check,
+# review cadence or threshold, so no entry can weaken a profile's policy; an
+# unknown or missing limit is advisory and never stops anything.
+
+CONTEXT_ENVELOPE_VERSION = 1
+
+# Literal copies of the metric classification owned by `cowork_context`; the
+# two modules do not import each other and a test keeps the copies equal.
+_ENVELOPE_METRICS = ("prompt_bytes", "artifact_bytes", "repository_reads",
+                     "elapsed_ms", "reported_input_tokens",
+                     "cache_read_tokens")
+_ENVELOPE_SESSION_WINDOW_METRICS = ("repository_reads", "elapsed_ms",
+                                    "reported_input_tokens",
+                                    "cache_read_tokens")
+
+# Substrings that mark a policy key. Matched against lowercased key names
+# inside a role entry, where no legitimate envelope key contains any of them.
+_ENVELOPE_POLICY_KEY_PARTS = ("required_checks", "review", "cadence",
+                              "threshold")
+
+_MISSING = object()
+
+
+def _envelope(limits, step_pct, max_per_chain, rotation_trigger_metrics):
+    return {
+        "limits": {metric: {"warn": warn, "hard": hard}
+                   for metric, (warn, hard) in limits.items()},
+        "expansion": {"step_pct": step_pct, "max_per_chain": max_per_chain},
+        "rotation_trigger_metrics": list(rotation_trigger_metrics),
+    }
+
+
+def _default_envelope():
+    # Conservative defaults, not provider limits. cache_read_tokens has no
+    # defensible number (providers expose it unevenly), so it stays None.
+    return _envelope(
+        {"prompt_bytes": (60000, 120000),
+         "artifact_bytes": (200000, 400000),
+         "repository_reads": (150, 300),
+         "elapsed_ms": (1800000, 3600000),
+         "reported_input_tokens": (120000, 180000),
+         "cache_read_tokens": (None, None)},
+        25, 2, ("reported_input_tokens", "repository_reads", "elapsed_ms"))
+
+
+CONTEXT_ENVELOPES = _freeze({
+    PROFILE_LIGHT: {role: _default_envelope() for role in _LIGHT_ROLES},
+    PROFILE_STANDARD: {role: _default_envelope() for role in _ALL_ROLES},
+    PROFILE_ASSURANCE: {role: _default_envelope() for role in _ALL_ROLES},
+})
+
+
+def resolved_context_envelope(profile, role):
+    """The context envelope of one (profile, role) as an independent copy, or
+    None when the role is not on the profile's team (an unprofiled caller then
+    gets no limits, which a later stage reads as advisory). Raises
+    UnknownProfile for a profile that does not exist."""
+    if profile not in RANK:
+        raise UnknownProfile(profile)
+    if role not in team_for(profile):
+        return None
+    entry = CONTEXT_ENVELOPES[profile].get(role)
+    if entry is None:
+        return None
+    out = {"envelope_version": CONTEXT_ENVELOPE_VERSION,
+           "profile": profile, "role": role}
+    out.update(_thaw(entry))
+    return out
+
+
+def context_envelope_digest():
+    """Digest of the whole envelope table. Independent of `policy_digest`: the
+    table is read at call time and never feeds the policy digest."""
+    return hashlib.sha256(_canonical({
+        "envelope_version": CONTEXT_ENVELOPE_VERSION,
+        "envelopes": _thaw(CONTEXT_ENVELOPES)}).encode("utf-8")).hexdigest()
+
+
+def _is_plain_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _policy_key_paths(value, prefix=""):
+    """Dotted paths of every key, at any depth, naming a policy concept."""
+    found = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            path = prefix + str(key)
+            lowered = str(key).lower()
+            if any(part in lowered for part in _ENVELOPE_POLICY_KEY_PARTS):
+                found.append(path)
+            found.extend(_policy_key_paths(child, path + "."))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            found.extend(_policy_key_paths(child, prefix))
+    return found
+
+
+def envelope_non_weakening_violations(profile):
+    """Reasons a profile's context envelopes would stop being limits-only.
+    Empty for every shipped profile. Role-level keys are checked by team
+    membership alone (the legitimate role names scout-reviewer and
+    build-reviewer contain 'review'); the policy-key walk starts inside each
+    role entry. An entry that is not a mapping with a mapping of limits is
+    reported as missing, since it offers no usable envelope."""
+    if profile not in RANK:
+        raise UnknownProfile(profile)
+    table = CONTEXT_ENVELOPES[profile]
+    team = team_for(profile)
+    problems = []
+    for role in table:
+        if role not in team:
+            problems.append("envelope_role_not_in_team:%s" % (role,))
+    for role in team:
+        entry = table.get(role)
+        if not isinstance(entry, dict) or not isinstance(
+                entry.get("limits"), dict):
+            problems.append("envelope_missing_for_role:%s" % (role,))
+            continue
+        for path in _policy_key_paths(entry):
+            problems.append("policy_key_in_envelope:%s:%s" % (role, path))
+        for metric, limit in entry["limits"].items():
+            if metric not in _ENVELOPE_METRICS:
+                problems.append("unknown_metric:%s:%s" % (role, metric))
+                continue
+            # A limit that is not a mapping, or lacks a bound, is invalid: an
+            # absent bound must be spelled None.
+            limit = limit if isinstance(limit, dict) else {}
+            bounds = {}
+            for name in ("warn", "hard"):
+                value = limit.get(name, _MISSING)
+                if value is not None and not (
+                        _is_plain_int(value) and value >= 0):
+                    problems.append("limit_invalid:%s:%s:%s" % (
+                        role, metric, name))
+                else:
+                    bounds[name] = value
+            if (_is_plain_int(bounds.get("warn"))
+                    and _is_plain_int(bounds.get("hard"))
+                    and bounds["hard"] < bounds["warn"]):
+                problems.append("hard_below_warn:%s:%s" % (role, metric))
+        rotation = entry.get("rotation_trigger_metrics")
+        if not isinstance(rotation, (list, tuple)):
+            problems.append("rotation_metric_not_session_window:%s:%s" % (
+                role, "rotation_trigger_metrics"))
+        else:
+            for metric in rotation:
+                if metric not in _ENVELOPE_SESSION_WINDOW_METRICS:
+                    problems.append(
+                        "rotation_metric_not_session_window:%s:%s" % (
+                            role, metric))
+        expansion = entry.get("expansion")
+        if not (isinstance(expansion, dict)
+                and all(_is_plain_int(expansion.get(k))
+                        and expansion[k] > 0
+                        for k in ("step_pct", "max_per_chain"))):
+            problems.append("expansion_invalid:%s" % (role,))
+    return problems
+
+
 def role_brief_note(record, record_path="<execution profile record>"):
     """Plain text appended to the scout's first-message brief for a profiled
     session."""

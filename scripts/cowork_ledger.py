@@ -46,6 +46,8 @@ KINDS = {
     "amendment": "A",
     "escape": "E",
     "attempt": "V",
+    "expansion": "X",
+    "closure": "C",
 }
 
 # Record states. `superseded` and `withdrawn` are terminal for the record but
@@ -1031,6 +1033,55 @@ def append_escape(path, summary=None, severity=None, discovered_in=None,
     fields.update(extra)
     return append_record(path, "escape",
                          {k: v for k, v in fields.items() if v is not None})
+
+
+def append_expansion(path, role=None, work_id=None, chain=None, metric=None,
+                     prior_limit=None, new_limit=None, reason_code=None,
+                     envelope_digest=None, authorized_by=None, **extra):
+    """Record one context-limit EXPANSION: a role's limit on one metric grew
+    from `prior_limit` to `new_limit` within a chain of work. Growth is only
+    acceptable when it is attributable, so the record names the role, the work
+    unit, the chain it counts against, the reason and the envelope it departed
+    from; `authorized_by` is present only when an authority granted it."""
+    fields = {"role": role, "work_id": work_id, "chain": chain,
+              "metric": metric, "prior_limit": prior_limit,
+              "new_limit": new_limit, "reason_code": reason_code,
+              "envelope_digest": envelope_digest,
+              "authorized_by": authorized_by}
+    fields.update(extra)
+    return append_record(path, "expansion",
+                         {k: v for k, v in fields.items() if v is not None})
+
+
+def append_closure(path, closes=None, source_finding_id=None,
+                   source_session=None, verdict_ref=None, round_index=None,
+                   phase=None, **extra):
+    """Record that a finding was CLOSED by a later verdict. A closure is its own
+    kind and never sets state 'closed' on anything: `finding_lifecycle` counts a
+    record in state 'closed' as an open, confirmed finding, so reusing that
+    state to mean "resolved" would silently inflate the count it is meant to
+    reduce. The finding's own record stays exactly as it was."""
+    fields = {"closes": closes, "source_finding_id": source_finding_id,
+              "source_session": source_session, "verdict_ref": verdict_ref,
+              "round": round_index, "phase": phase}
+    fields.update(extra)
+    return append_record(path, "closure",
+                         {k: v for k, v in fields.items() if v is not None})
+
+
+def expansions_for_chain(records, role, chain):
+    """The live expansion records of one (role, chain), in ledger order. A
+    withdrawn or superseded expansion no longer counts against the chain's
+    bound."""
+    out = []
+    for rec in collapse(records).values():
+        if rec.get("kind") != "expansion" or rec.get("marker"):
+            continue
+        if rec.get("state") in ("withdrawn", "superseded"):
+            continue
+        if rec.get("role") == role and rec.get("chain") == chain:
+            out.append(dict(rec))
+    return out
 
 
 def validate_citations(records, cited_ids, allow_withdrawn=False):
