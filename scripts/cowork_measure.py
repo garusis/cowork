@@ -36,6 +36,14 @@ figure with no source is `unknown` and its absence is listed in `incomplete[]`
 with the reason — which is what lets the two legacy sessions on disk report
 cleanly while saying plainly which records they predate.
 
+UNIVERSAL VIEWS. Every record also carries the derived keys `context`,
+`profile_attribution`, `repeated_context`, `cost_split`, `recovery` and
+`lineage`, plus `owned_verification.bound_reuse`, whether or not the session
+has a profile. They are built from data already recorded, carry a fixed
+none/`unknown` shape when their source is absent or torn, and keep their own
+`incomplete` list: a view never appends to the top-level `incomplete[]`, so a
+record minus these keys is exactly the legacy record.
+
 Python 3.9+, stdlib only.
 """
 
@@ -44,15 +52,20 @@ import glob
 import hashlib
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import cowork_context as context_vocab  # noqa: E402
 import cowork_ingest as ingest  # noqa: E402
 import cowork_ledger as ledger  # noqa: E402
 import cowork_delta as delta_store  # noqa: E402
+import cowork_execution_profiles as exec_profiles  # noqa: E402
 import cowork_guard_broker as guard_broker  # noqa: E402
+import cowork_lineage as lineage_store  # noqa: E402
 import cowork_pricing as pricing  # noqa: E402
+import cowork_recovery_evidence as recovery_evidence  # noqa: E402
 import cowork_state as state_store  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_verification as verification  # noqa: E402
@@ -1810,6 +1823,914 @@ def execution_profile_view(doc):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Universal context views: derived, additive, present for every session.      #
+# --------------------------------------------------------------------------- #
+
+_CHILD_WORK_KINDS = ("child", "child_attempt")
+_SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
+UNPROFILED = "unprofiled"
+_BOUND_REUSE_UNKNOWN_ID = UNKNOWN
+
+
+def _is_count(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0)
+
+
+def _parse_ts(value):
+    """A timezone-aware datetime from ISO text ('Z' accepted, naive read as
+    UTC), or None for anything else."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+    return stamp
+
+
+def _attributable_work(work):
+    """`[(work_id, entry)]` of every non-child work entry, sorted. Nested child
+    usage is reported by the nested tree and is never added to its parent."""
+    return sorted(
+        ((work_id, entry) for work_id, entry in (work or {}).items()
+         if isinstance(entry, dict)
+         and entry.get("work_kind") not in _CHILD_WORK_KINDS),
+        key=lambda pair: str(pair[0]))
+
+
+def _comparable_usage(entry):
+    """`{field: int}` of one entry's usage, or None when it cannot be compared
+    (incomparable scope, no usage, or no integer field)."""
+    if entry.get("usage_scope") == "incomparable":
+        return None
+    usage = entry.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    ints = {key: value for key, value in usage.items()
+            if isinstance(value, int) and not isinstance(value, bool)}
+    return ints or None
+
+
+def _usage_rollup(entries):
+    """Usage and duration of `entries`. A figure nobody measured is 'unknown',
+    never 0; `turns` always carries the real count."""
+    turns = 0
+    usage = {}
+    usage_known = 0
+    unknown_usage = 0
+    duration = 0
+    unknown_duration = 0
+    for entry in entries:
+        turns += 1
+        ints = _comparable_usage(entry)
+        if ints is None:
+            unknown_usage += 1
+        else:
+            usage_known += 1
+            for field, value in ints.items():
+                usage[field] = usage.get(field, 0) + value
+        if _is_count(entry.get("duration_ms")):
+            duration += entry["duration_ms"]
+        else:
+            unknown_duration += 1
+    return {
+        "turns": turns,
+        "usage": usage if usage_known else UNKNOWN,
+        "unknown_usage_turns": unknown_usage,
+        "duration_ms": duration if turns and not unknown_duration else UNKNOWN,
+        "unknown_duration_turns": unknown_duration,
+    }
+
+
+def _view_note(field, reason):
+    return {"field": field, "reason": reason}
+
+
+def profile_timeline(profile_path):
+    """The profile in force over time, from `execution_profile.json`.
+
+    `{state, initial, steps}`: `unprofiled` when the file is absent, `unknown`
+    when it is unreadable or its promotion boundaries cannot be ordered, else
+    `ok` with the initial profile and each promotion as `(at, to)`."""
+    if not os.path.exists(profile_path):
+        return {"state": UNPROFILED, "initial": None, "steps": []}
+    unknown = {"state": UNKNOWN, "initial": None, "steps": []}
+    doc = _read_json(profile_path)
+    if execution_profile_view(doc) is None:
+        return unknown
+    history = doc["promotion_history"]
+    steps = []
+    previous = None
+    for entry in history:
+        at = _parse_ts(entry.get("at")) if isinstance(entry, dict) else None
+        to = entry.get("to") if isinstance(entry, dict) else None
+        if at is None or not isinstance(to, str) or not to:
+            return unknown
+        if previous is not None and at <= previous:
+            return unknown
+        previous = at
+        steps.append((at, to))
+    initial = history[0].get("from") if history else doc.get("effective")
+    if not isinstance(initial, str) or not initial:
+        return unknown
+    return {"state": "ok", "initial": initial, "steps": steps}
+
+
+def profile_at(timeline, started_at):
+    """The profile label in force at `started_at`: a profile name,
+    'unprofiled', or 'unknown' (an unparsable time, or a time exactly on a
+    promotion boundary, is never guessed)."""
+    state = timeline.get("state")
+    if state == UNPROFILED:
+        return UNPROFILED
+    if state != "ok":
+        return UNKNOWN
+    stamp = _parse_ts(started_at)
+    if stamp is None:
+        return UNKNOWN
+    label = timeline["initial"]
+    for at, to in timeline["steps"]:
+        if stamp == at:
+            return UNKNOWN
+        if stamp < at:
+            break
+        label = to
+    return label
+
+
+def _row_limits(profile, role):
+    if profile == UNPROFILED:
+        return None
+    if profile == UNKNOWN:
+        return UNKNOWN
+    try:
+        envelope = exec_profiles.resolved_context_envelope(profile, role)
+    except Exception:  # noqa: BLE001 - an unreadable policy is unknown
+        return UNKNOWN
+    if envelope is None:
+        return None
+    limits = envelope.get("limits")
+    return limits if isinstance(limits, dict) else UNKNOWN
+
+
+def _start_events(events):
+    """The first start event per work id."""
+    out = {}
+    for event in events or ():
+        if event.get("event") not in ("controller.turn.start",
+                                      "controller.probe.start",
+                                      "eval.turn.start"):
+            continue
+        work_id = event.get("work_id")
+        if work_id and work_id not in out:
+            out[work_id] = event
+    return out
+
+
+def _artifact_bytes(start_event):
+    if start_event is None:
+        return UNKNOWN
+    artifacts = start_event.get("artifacts")
+    if not isinstance(artifacts, list):
+        return UNKNOWN
+    total = 0
+    for item in artifacts:
+        if not isinstance(item, dict) or not _is_count(item.get("bytes")):
+            return UNKNOWN
+        total += item["bytes"]
+    return total
+
+
+def _repository_reads(tool_view, role, work_id):
+    bucket = tool_view.get(role) if isinstance(tool_view, dict) else None
+    if not isinstance(bucket, dict) or bucket.get("state") != "ok":
+        return UNKNOWN
+    by_turn = bucket.get("by_turn")
+    if not isinstance(by_turn, dict):
+        return UNKNOWN
+    turn = by_turn.get(str(work_id))
+    if not isinstance(turn, dict):
+        return 0
+    intents = turn.get("by_intent")
+    if not isinstance(intents, dict):
+        return UNKNOWN
+    return sum(count for intent, count in intents.items()
+               if intent in ("read", "search") and _is_count(count))
+
+
+def _dispatch_row(work_id, entry, start_event, tool_view, timeline):
+    role = entry.get("role")
+    prompt = (start_event.get("prompt_bytes") if start_event is not None
+              else entry.get("prompt_bytes"))
+    if not _is_count(prompt):
+        prompt = entry.get("prompt_bytes")
+    delivery = {"prompt_bytes": prompt,
+                "artifact_bytes": _artifact_bytes(start_event),
+                "repository_reads": _repository_reads(tool_view, role,
+                                                      work_id)}
+    metrics = context_vocab.observe([entry], delivery)
+    profile = profile_at(timeline, entry.get("started_at"))
+    return {
+        "work_id": work_id, "role": role, "phase": entry.get("phase"),
+        "round": entry.get("round"), "started_at": entry.get("started_at"),
+        "work_class": entry.get("work_class"), "profile": profile,
+        "limits": _row_limits(profile, role), "metrics": metrics,
+        "usage_scope": entry.get("usage_scope", UNKNOWN),
+    }
+
+
+def context_envelope_view(work, events, tool_view, timeline):
+    """Per-dispatch context envelope and consumption, for every session.
+
+    One row per non-child work id (a shared evaluation turn is one work id and
+    so one row). Limits are None for an unprofiled session; a metric with no
+    data is 'unknown' and is noted only in this view's own `incomplete`."""
+    starts = _start_events(events)
+    rows = [_dispatch_row(work_id, entry, starts.get(work_id), tool_view,
+                          timeline)
+            for work_id, entry in _attributable_work(work)]
+    rows.sort(key=lambda row: (row["started_at"]
+                               if isinstance(row["started_at"], str) else "",
+                               str(row["work_id"])))
+    by_role = {}
+    unknown_metric_count = 0
+    for row in rows:
+        bucket = by_role.setdefault(str(row["role"]), {
+            "dispatches": 0,
+            "max": {metric: UNKNOWN for metric in context_vocab.METRICS},
+            "unknown_count": {metric: 0 for metric in context_vocab.METRICS}})
+        bucket["dispatches"] += 1
+        for metric in context_vocab.METRICS:
+            value = row["metrics"][metric]["value"]
+            if _is_count(value):
+                current = bucket["max"][metric]
+                bucket["max"][metric] = (value if current == UNKNOWN
+                                         else max(current, value))
+            else:
+                bucket["unknown_count"][metric] += 1
+                unknown_metric_count += 1
+    incomplete = []
+    for role in sorted(by_role):
+        for metric in context_vocab.METRICS:
+            count = by_role[role]["unknown_count"][metric]
+            if count:
+                incomplete.append(_view_note(
+                    "record.context.by_role[%s].%s" % (role, metric),
+                    "metric unavailable for %d dispatch(es)" % count))
+    state = timeline.get("state")
+    if not rows:
+        incomplete.append(_view_note("record.context.dispatches",
+                                     "no dispatch rows were recorded"))
+    return {
+        "version": 1,
+        "state": "ok" if rows else UNKNOWN,
+        "limits_basis": ("unprofiled" if state == UNPROFILED
+                         else "profiled" if state == "ok" else UNKNOWN),
+        "dispatches": rows,
+        "dispatch_count": len(rows),
+        "unknown_metric_count": unknown_metric_count,
+        "by_role": by_role,
+        "incomplete": incomplete,
+    }
+
+
+def profile_attribution_view(work, timeline):
+    """Usage and duration per profile in force at each turn's start."""
+    groups = {}
+    for _work_id, entry in _attributable_work(work):
+        label = profile_at(timeline, entry.get("started_at"))
+        groups.setdefault(label, []).append(entry)
+    state = timeline.get("state")
+    incomplete = []
+    if state == UNKNOWN:
+        incomplete.append(_view_note(
+            "record.profile_attribution",
+            "execution_profile.json is unreadable or its promotion "
+            "boundaries are ambiguous"))
+    unknown_turns = len(groups.get(UNKNOWN, ()))
+    if unknown_turns and state != UNKNOWN:
+        incomplete.append(_view_note(
+            "record.profile_attribution.by_profile.unknown",
+            "%d turn(s) have no unambiguous profile in force"
+            % unknown_turns))
+    return {
+        "version": 1,
+        "state": ("unprofiled" if state == UNPROFILED
+                  else "profiled" if state == "ok" else UNKNOWN),
+        "initial": timeline.get("initial"),
+        "by_profile": {label: _usage_rollup(entries)
+                       for label, entries in sorted(groups.items())},
+        "unknown_turns": unknown_turns,
+        "incomplete": incomplete,
+    }
+
+
+def _evidence_times(events, ledger_records):
+    """`(times, unparsable)`: when a verification transaction ran or a finding
+    was recorded, and how many such items carry no readable time."""
+    times = []
+    unparsable = 0
+    stamps = [event.get("ts") for event in events or ()
+              if event.get("event") == "verification.transaction"]
+    stamps.extend(record.get("recorded_at") for record in ledger_records or ()
+                  if record.get("kind") == "finding"
+                  and not record.get("marker"))
+    for stamp in stamps:
+        parsed = _parse_ts(stamp)
+        if parsed is None:
+            unparsable += 1
+        else:
+            times.append(parsed)
+    return times, unparsable
+
+
+def repeated_context_view(events, ledger_records, tool_view):
+    """Artifact bytes re-delivered unchanged, and repeated command identities.
+
+    A delivery is classified in trace order per (role, path): `first`,
+    `changed` (sha256 differs), `renewed` (same sha256 but a verification
+    transaction or a finding came in between), `repeated` (same sha256, nothing
+    in between) or `unknown` (a digest or a time cannot be read). Only
+    `repeated` counts as repeated."""
+    evidence, unparsable_evidence = _evidence_times(events, ledger_records)
+    last = {}
+    seen_work = set()
+    deliveries = {"total": 0, "first": 0, "changed": 0, "renewed": 0,
+                  "repeated": 0, "unknown": 0}
+    repeated = []
+    incomplete = []
+    start_count = 0
+    without_descriptors = 0
+    for event in events or ():
+        if event.get("event") != "controller.turn.start":
+            continue
+        work_id = event.get("work_id")
+        if work_id:
+            if work_id in seen_work:
+                continue
+            seen_work.add(work_id)
+        start_count += 1
+        artifacts = event.get("artifacts")
+        if artifacts is None:
+            without_descriptors += 1
+            continue
+        role = event.get("role")
+        stamp = _parse_ts(event.get("ts"))
+        for item in (artifacts if isinstance(artifacts, list) else [None]):
+            deliveries["total"] += 1
+            path = item.get("path") if isinstance(item, dict) else None
+            if not isinstance(path, str) or not path:
+                deliveries["unknown"] += 1
+                continue
+            sha = item.get("sha256")
+            sha = (sha.lower() if isinstance(sha, str)
+                   and _SHA256_HEX.match(sha) else None)
+            key = (role, path)
+            prior = last.get(key)
+            last[key] = {"sha256": sha, "ts": stamp, "work_id": work_id}
+            if prior is None:
+                deliveries["first"] += 1
+            elif sha is None or prior["sha256"] is None:
+                deliveries["unknown"] += 1
+            elif sha != prior["sha256"]:
+                deliveries["changed"] += 1
+            elif stamp is None or prior["ts"] is None or unparsable_evidence:
+                deliveries["unknown"] += 1
+            elif any(prior["ts"] < moment <= stamp for moment in evidence):
+                deliveries["renewed"] += 1
+            else:
+                deliveries["repeated"] += 1
+                repeated.append({
+                    "role": role, "path": path, "sha256": sha,
+                    "work_id": work_id,
+                    "previous_work_id": prior["work_id"],
+                    "bytes": (item.get("bytes")
+                              if _is_count(item.get("bytes")) else UNKNOWN)})
+    if without_descriptors:
+        incomplete.append(_view_note(
+            "record.repeated_context.deliveries",
+            "%d dispatch(es) carried no artifact descriptors"
+            % without_descriptors))
+    if deliveries["unknown"]:
+        incomplete.append(_view_note(
+            "record.repeated_context.deliveries.unknown",
+            "%d delivery(ies) could not be classified"
+            % deliveries["unknown"]))
+    state = "ok" if start_count else UNKNOWN
+    if not start_count:
+        incomplete.append(_view_note(
+            "record.repeated_context",
+            "no controller turn start events were recorded"))
+    if any(item["bytes"] == UNKNOWN for item in repeated):
+        repeated_bytes = UNKNOWN
+    else:
+        repeated_bytes = sum(item["bytes"] for item in repeated)
+    commands = {}
+    for role in sorted(tool_view if isinstance(tool_view, dict) else ()):
+        bucket = tool_view[role]
+        ok = isinstance(bucket, dict) and bucket.get("state") == "ok"
+        commands[role] = {
+            "state": "detected" if ok else UNKNOWN,
+            "repeated_targets": (bucket.get("repeated_targets")
+                                 if ok else UNKNOWN)}
+    ingested = [entry for entry in commands.values()
+                if entry["state"] == "detected"]
+    reread_state = ("detected" if commands and len(ingested) == len(commands)
+                    else UNKNOWN)
+    if reread_state == UNKNOWN:
+        incomplete.append(_view_note(
+            "record.repeated_context.reread_state",
+            "controller log ingestion was not ok for every role"))
+    return {
+        "version": 1,
+        "state": state,
+        "deliveries": deliveries,
+        "repeated": repeated,
+        "repeated_bytes": repeated_bytes if state == "ok" else UNKNOWN,
+        "repeated_work_ids": sorted({item["work_id"] for item in repeated}),
+        "commands": {"by_role": commands},
+        "reread_state": reread_state,
+        "incomplete": incomplete,
+    }
+
+
+COST_SPLIT_BUCKETS = ("implementation", "correction", "review", "recovery",
+                      "unknown")
+
+
+def cost_split_view(work, repeated_work_ids, owned_incurred_cost):
+    """Model cost split by what the turn was for.
+
+    implementation, correction, review, recovery and unknown are exclusive per
+    turn. Verification is a separate unit (wall seconds, not model usage).
+    `rework` is an overlay of correction, recovery and repeated-delivery turns
+    and is never added into a total. `cost.by_class` is not read or changed."""
+    leads = set(lineage_store.PHASE_LEAD.values())
+    reviewers = set(lineage_store.PHASE_REVIEWER.values())
+
+    def lead_phase(entry):
+        phase = entry.get("phase")
+        return (entry.get("role") in leads
+                and entry.get("work_class") == "productive"
+                and isinstance(entry.get("round"), int)
+                and not isinstance(entry.get("round"), bool)
+                and isinstance(phase, str) and bool(phase))
+
+    first_round = {}
+    for _work_id, entry in _attributable_work(work):
+        if lead_phase(entry):
+            phase = entry["phase"]
+            first_round[phase] = min(first_round.get(phase, entry["round"]),
+                                     entry["round"])
+    buckets = {name: [] for name in COST_SPLIT_BUCKETS}
+    unmapped = {}
+    rework = []
+    repeated_ids = {str(item) for item in repeated_work_ids or ()}
+    for work_id, entry in _attributable_work(work):
+        work_class = entry.get("work_class")
+        name = "unknown"
+        if work_class == "recovery":
+            name = "recovery"
+        elif (entry.get("role") in reviewers
+              and work_class in ("review", "productive")):
+            name = "review"
+        elif lead_phase(entry):
+            name = ("implementation"
+                    if entry["round"] == first_round[entry["phase"]]
+                    else "correction")
+        if name == "unknown":
+            label = str(work_class) if work_class else UNKNOWN
+            unmapped[label] = unmapped.get(label, 0) + 1
+        buckets[name].append(entry)
+        if name in ("correction", "recovery") or str(work_id) in repeated_ids:
+            rework.append((work_id, entry))
+    incomplete = []
+    if buckets["unknown"]:
+        incomplete.append(_view_note(
+            "record.cost_split.buckets.unknown",
+            "%d turn(s) could not be mapped to a cost bucket"
+            % len(buckets["unknown"])))
+    if isinstance(owned_incurred_cost, dict):
+        verification_cost = {
+            "work_items": owned_incurred_cost.get("work_items", UNKNOWN),
+            "subprocess_wall_time_s": owned_incurred_cost.get(
+                "subprocess_wall_time_s", UNKNOWN),
+            "unit": "wall_seconds"}
+    else:
+        verification_cost = {"work_items": UNKNOWN,
+                             "subprocess_wall_time_s": UNKNOWN,
+                             "unit": "wall_seconds"}
+        incomplete.append(_view_note(
+            "record.cost_split.verification",
+            "owned verification cost is unavailable"))
+    overlay = _usage_rollup([entry for _work_id, entry in rework])
+    return {
+        "version": 1,
+        "buckets": {name: _usage_rollup(entries)
+                    for name, entries in buckets.items()},
+        "verification": verification_cost,
+        "rework": {"overlay": True, "turns": overlay["turns"],
+                   "work_ids": [work_id for work_id, _entry in rework],
+                   "usage": overlay["usage"],
+                   "duration_ms": overlay["duration_ms"]},
+        "unmapped_classes": unmapped,
+        "incomplete": incomplete,
+    }
+
+
+def _delta_count(delta, field):
+    if not isinstance(delta, dict) or delta.get("state") not in (
+            recovery_evidence.FINDING_DELTA_STATES) \
+            or delta.get("state") == UNKNOWN:
+        return UNKNOWN
+    items = delta.get(field)
+    return len(items) if isinstance(items, list) else UNKNOWN
+
+
+def _state_in(value, allowed):
+    return value if value in allowed else UNKNOWN
+
+
+def _episode_row(episode):
+    value = episode.get("value")
+    value = value if isinstance(value, dict) else {}
+    a_delta = episode.get("artifact_delta")
+    f_delta = episode.get("finding_delta")
+    credited = value.get("credited_finding_keys")
+    return {
+        "episode_id": episode.get("episode_id"),
+        "failed_role": episode.get("failed_role"),
+        "failed_work_id": episode.get("failed_work_id"),
+        "recovery_work_id": episode.get("recovery_work_id"),
+        "reason_class": episode.get("reason_class"),
+        "reason_ref": episode.get("reason_ref"),
+        "artifact_delta_state": _state_in(
+            a_delta.get("state") if isinstance(a_delta, dict) else None,
+            recovery_evidence.DELTA_STATES),
+        "finding_delta_state": _state_in(
+            f_delta.get("state") if isinstance(f_delta, dict) else None,
+            recovery_evidence.FINDING_DELTA_STATES),
+        "new_finding_count": _delta_count(f_delta, "new"),
+        "closed_finding_count": _delta_count(f_delta, "closed"),
+        "retired_finding_count": _delta_count(f_delta, "retired"),
+        "value_state": _state_in(value.get("state"),
+                                 recovery_evidence.VALUE_STATES),
+        "recovery_overhead": _state_in(value.get("recovery_overhead"),
+                                       recovery_evidence.OVERHEAD_STATES),
+        "credited_finding_keys": ([key for key in credited
+                                   if isinstance(key, str)]
+                                  if isinstance(credited, list) else []),
+        "reread_state": _state_in(episode.get("reread_state"),
+                                  recovery_evidence.REREAD_STATES),
+    }
+
+
+def recovery_view(assets_dir, work):
+    """Recovery episodes with their artifact delta, finding delta and value.
+
+    A missing episode file, or one with no valid episode, is 'unknown' and
+    never zero. An invalid episode is skipped and counted."""
+    directory = os.path.join(assets_dir, "recovery")
+    present = os.path.exists(os.path.join(
+        directory, recovery_evidence.EPISODES_FILENAME))
+    rows = []
+    invalid = 0
+    for episode in recovery_evidence.read_episodes(directory):
+        if recovery_evidence.validate_episode(episode):
+            invalid += 1
+            continue
+        rows.append(_episode_row(episode))
+    recovery_ids = [work_id for work_id, entry in _attributable_work(work)
+                    if entry.get("work_class") == "recovery"]
+    attributed = {row["recovery_work_id"] for row in rows}
+    incomplete = []
+    if not rows:
+        incomplete.append(_view_note(
+            "record.recovery.episodes",
+            "no recovery episode file was found" if not present
+            else "the episode file holds no valid episode"))
+    if invalid:
+        incomplete.append(_view_note(
+            "record.recovery.invalid_episode_count",
+            "%d episode(s) were invalid and skipped" % invalid))
+    return {
+        "version": 1,
+        "state": "ok" if rows else UNKNOWN,
+        "episode_count": len(rows) if rows else UNKNOWN,
+        "invalid_episode_count": invalid,
+        "episodes": rows,
+        "value_by_state": {
+            state: sum(1 for row in rows if row["value_state"] == state)
+            for state in recovery_evidence.VALUE_STATES},
+        "recovery_turn_count": len(recovery_ids),
+        "unattributed_recovery_work_ids": [
+            work_id for work_id in recovery_ids if work_id not in attributed],
+        "incomplete": incomplete,
+    }
+
+
+_COHORT_KEYS = ("recovery", "recovery_reason", "evaluation_policy")
+
+
+def cohort_view(a, b):
+    """`{comparable, code}`: a comparison is refused with `descriptor_missing`
+    unless BOTH descriptors carry every cohort key; otherwise the closed codes
+    of `cowork_lineage.cohort_comparable` decide."""
+    for descriptor in (a, b):
+        if not isinstance(descriptor, dict) or any(
+                key not in descriptor for key in _COHORT_KEYS):
+            return {"comparable": False, "code": "descriptor_missing"}
+    return lineage_store.cohort_comparable(a, b)
+
+
+def _plain_token(value):
+    return (isinstance(value, str) and bool(value) and value not in (".", "..")
+            and "/" not in value and "\\" not in value
+            and os.sep not in value and "\x00" not in value)
+
+
+def _lineage_shape(state, **fields):
+    out = {"version": 1, "state": state, "source_session": None,
+           "replacement_session": None, "reason": None, "start_role": None,
+           "imported_artifact_count": None, "unresolved_finding_count": None,
+           "unresolved_basis_reason": None, "reconciliation": None,
+           "closure": None, "cohort": None, "incomplete": []}
+    out.update(fields)
+    return out
+
+
+def _closure_inputs(records):
+    """`(cited, replacement_findings)` from the replacement ledger: distinct
+    live closure source ids, and the live findings that are not imports."""
+    collapsed = ledger.collapse(records)
+    cited = []
+    findings = []
+    for record in collapsed.values():
+        if record.get("marker") or record.get("state") in (
+                "withdrawn", "superseded"):
+            continue
+        if record.get("kind") == "closure":
+            source_id = record.get("source_finding_id")
+            if isinstance(source_id, str) and source_id \
+                    and source_id not in cited:
+                cited.append(source_id)
+        elif record.get("kind") == "finding" \
+                and not record.get("source_finding_id"):
+            findings.append(record)
+    return cited, findings
+
+
+def lineage_view(session_uuid, work, repeated_work_ids, ledger_records):
+    """Preserved, repeated and new work of an imported session, closure value
+    and cohort comparability. Reads the source session's measurement and ledger
+    read-only. A session with no `lineage.json` is state 'none'; an unreadable
+    or foreign one is 'unknown'."""
+    path = os.path.join(state_store.session_assets_dir(session_uuid),
+                        "lineage.json")
+    if not os.path.exists(path):
+        return _lineage_shape("none")
+    doc = _read_json(path)
+    source = doc.get("source_session") if isinstance(doc, dict) else None
+    if (not isinstance(doc, dict)
+            or doc.get("schema") != lineage_store.LINEAGE_VERSION
+            or not _plain_token(source)):
+        return _lineage_shape(UNKNOWN, incomplete=[_view_note(
+            "record.lineage", "lineage.json is unreadable or foreign")])
+    incomplete = []
+    artifacts = doc.get("imported_artifacts")
+    ids = doc.get("unresolved_finding_ids")
+    ids = ids if isinstance(ids, list) else []
+    basis = doc.get("unresolved_basis")
+    out = _lineage_shape(
+        "ok", source_session=source,
+        replacement_session=doc.get("replacement_session"),
+        reason=doc.get("reason"), start_role=doc.get("start_role"),
+        imported_artifact_count=(len(artifacts)
+                                 if isinstance(artifacts, list) else UNKNOWN),
+        unresolved_finding_count=len(ids),
+        unresolved_basis_reason=(basis.get("reason")
+                                 if isinstance(basis, dict) else UNKNOWN),
+        incomplete=incomplete)
+
+    source_measurement = _read_json(state_store.measurement_path_for(source))
+    source_work = (source_measurement.get("work")
+                   if isinstance(source_measurement, dict) else None)
+    repeated_ids = {str(item) for item in repeated_work_ids or ()}
+    if isinstance(source_work, dict):
+        replacement = {}
+        for work_id, entry in _attributable_work(work):
+            copy = dict(entry)
+            if str(work_id) in repeated_ids:
+                copy["repeated_context"] = True
+            replacement[work_id] = copy
+        reconciled = lineage_store.reconcile_lineage(
+            {"session_uuid": source,
+             "work": {work_id: entry for work_id, entry
+                      in _attributable_work(source_work)}},
+            {"session_uuid": session_uuid, "work": replacement})
+        out["reconciliation"] = {
+            "state": "ok",
+            "preserved_count": len(reconciled["preserved"]),
+            "repeated_count": len(reconciled["repeated"]),
+            "new_count": len(reconciled["new"]),
+            "totals": reconciled["totals"],
+            "unknown_count": len(reconciled["unknown"]),
+            "duplicates_skipped_count": len(reconciled["duplicates_skipped"]),
+        }
+    else:
+        out["reconciliation"] = {
+            "state": UNKNOWN, "preserved_count": UNKNOWN,
+            "repeated_count": UNKNOWN, "new_count": UNKNOWN,
+            "totals": UNKNOWN, "unknown_count": UNKNOWN,
+            "duplicates_skipped_count": UNKNOWN}
+        incomplete.append(_view_note(
+            "record.lineage.reconciliation",
+            "the source session's measurement is unreadable"))
+
+    collapsed_source = ledger.collapse(ledger.read_ledger(
+        state_store.ledger_path_for(source)))
+    imported = []
+    rebuilt = True
+    for finding_id in ids:
+        row = collapsed_source.get(finding_id)
+        if not isinstance(row, dict):
+            rebuilt = False
+            break
+        imported.append({"source_finding_id": finding_id,
+                         "summary": row.get("summary"),
+                         "severity": row.get("severity"),
+                         "criterion": row.get("criterion")})
+    if rebuilt:
+        cited, findings = _closure_inputs(ledger_records)
+        linked = lineage_store.closure_link(imported, cited, findings)
+        out["closure"] = {
+            "closures": linked["value"]["closures"],
+            "new_findings": linked["value"]["new_findings"],
+            "replay_findings": sum(1 for item in linked["replacement"]
+                                   if item["class"] == "replay"),
+            "replay_earned": 0,
+            "rejected_count": len(linked["rejected"]),
+        }
+    else:
+        out["closure"] = {"closures": UNKNOWN, "new_findings": UNKNOWN,
+                          "replay_findings": UNKNOWN, "replay_earned": 0,
+                          "rejected_count": UNKNOWN}
+        incomplete.append(_view_note(
+            "record.lineage.closure",
+            "the imported findings cannot be rebuilt from the source ledger"))
+
+    own = {"recovery": True, "recovery_reason": doc.get("reason")}
+    source_lineage = (source_measurement.get("lineage")
+                      if isinstance(source_measurement, dict) else None)
+    source_cohort = (source_lineage.get("cohort")
+                     if isinstance(source_lineage, dict) else None)
+    source_descriptor = (source_cohort.get("own_descriptor")
+                         if isinstance(source_cohort, dict) else None)
+    if not isinstance(source_descriptor, dict):
+        source_descriptor = UNKNOWN
+    compared = cohort_view(own, source_descriptor)
+    out["cohort"] = {"own_descriptor": own,
+                     "source_descriptor": source_descriptor,
+                     "comparable": compared["comparable"],
+                     "code": compared["code"]}
+    return out
+
+
+def bound_reuse_rollup(owned_transactions, events):
+    """Bound verification reuse, counted apart from execution.
+
+    Derived only from `verification.transaction` events flagged `bound_reuse`.
+    A bound reuse is never counted as an executed transaction. The wall time a
+    reuse avoided is the prior transaction's own subprocess time, and is
+    'unknown' when that transaction is not among the owned ones."""
+    wall_by_id = {}
+    for transaction in owned_transactions or ():
+        if isinstance(transaction, dict):
+            summary = owned_transaction_cost_summary(transaction) or {}
+            wall_by_id[transaction.get("transaction_id")] = summary.get(
+                "subprocess_wall_time_s") or 0.0
+    counts = {}
+    for event in events or ():
+        if (event.get("event") != "verification.transaction"
+                or event.get("bound_reuse") is not True):
+            continue
+        prior = event.get("bound_prior_transaction_id")
+        key = prior if isinstance(prior, str) and prior \
+            else _BOUND_REUSE_UNKNOWN_ID
+        counts[key] = counts.get(key, 0) + 1
+    rows = []
+    avoided = 0.0
+    for key in sorted(counts):
+        wall = wall_by_id.get(key, UNKNOWN)
+        rows.append({"transaction_id": key, "bound_count": counts[key],
+                     "subprocess_wall_time_s": wall})
+        if wall == UNKNOWN or avoided == UNKNOWN:
+            avoided = UNKNOWN
+        else:
+            avoided += wall * counts[key]
+    return {"count": sum(counts.values()), "by_transaction": rows,
+            "avoided_subprocess_wall_time_s": avoided}
+
+
+def _unknown_views():
+    """The fixed shape of each view when it could not be built."""
+    return {
+        "context": {"version": 1, "state": UNKNOWN, "limits_basis": UNKNOWN,
+                    "dispatches": [], "dispatch_count": UNKNOWN,
+                    "unknown_metric_count": UNKNOWN, "by_role": {},
+                    "incomplete": []},
+        "profile_attribution": {"version": 1, "state": UNKNOWN,
+                                "initial": None, "by_profile": {},
+                                "unknown_turns": UNKNOWN, "incomplete": []},
+        "repeated_context": {
+            "version": 1, "state": UNKNOWN,
+            "deliveries": {name: UNKNOWN for name in (
+                "total", "first", "changed", "renewed", "repeated",
+                "unknown")},
+            "repeated": [], "repeated_bytes": UNKNOWN,
+            "repeated_work_ids": [], "commands": {"by_role": {}},
+            "reread_state": UNKNOWN, "incomplete": []},
+        "cost_split": {
+            "version": 1, "buckets": {},
+            "verification": {"work_items": UNKNOWN,
+                             "subprocess_wall_time_s": UNKNOWN,
+                             "unit": "wall_seconds"},
+            "rework": {"overlay": True, "turns": UNKNOWN, "work_ids": [],
+                       "usage": UNKNOWN, "duration_ms": UNKNOWN},
+            "unmapped_classes": {}, "incomplete": []},
+        "recovery": {"version": 1, "state": UNKNOWN,
+                     "episode_count": UNKNOWN, "invalid_episode_count": 0,
+                     "episodes": [],
+                     "value_by_state": {state: UNKNOWN for state in
+                                        recovery_evidence.VALUE_STATES},
+                     "recovery_turn_count": UNKNOWN,
+                     "unattributed_recovery_work_ids": [], "incomplete": []},
+        "lineage": _lineage_shape(UNKNOWN),
+    }
+
+
+def _attach_universal_views(record, session_uuid, events, work,
+                            ledger_records):
+    """Attach the universal views to `record`, in dependency order. Every view
+    is guarded: one that cannot be built carries its fixed unknown shape and a
+    note in its OWN `incomplete`. Nothing is appended to `record['incomplete']`.
+    """
+    fallback = _unknown_views()
+    assets = state_store.session_assets_dir(session_uuid)
+
+    def guarded(key, build):
+        try:
+            return build()
+        except Exception:  # noqa: BLE001 - a view never breaks a build
+            view = fallback[key]
+            view["incomplete"] = [_view_note(
+                "record.%s" % key, "view could not be built")]
+            return view
+
+    tool_view = record.get("tool_activity")
+    try:
+        timeline = profile_timeline(
+            state_store.execution_profile_path_for(session_uuid))
+    except Exception:  # noqa: BLE001
+        timeline = {"state": UNKNOWN, "initial": None, "steps": []}
+    repeated = guarded("repeated_context", lambda: repeated_context_view(
+        events, ledger_records, tool_view))
+    repeated_ids = repeated.get("repeated_work_ids") or []
+    record["context"] = guarded("context", lambda: context_envelope_view(
+        work, events, tool_view, timeline))
+    record["profile_attribution"] = guarded(
+        "profile_attribution", lambda: profile_attribution_view(
+            work, timeline))
+    record["repeated_context"] = repeated
+    record["cost_split"] = guarded("cost_split", lambda: cost_split_view(
+        work, repeated_ids,
+        record["owned_verification"].get("incurred_cost")))
+    record["recovery"] = guarded("recovery", lambda: recovery_view(
+        assets, work))
+    record["lineage"] = guarded("lineage", lambda: lineage_view(
+        session_uuid, work, repeated_ids, ledger_records))
+    try:
+        record["owned_verification"]["bound_reuse"] = bound_reuse_rollup(
+            record["owned_verification"].get("transactions"), events)
+    except Exception:  # noqa: BLE001
+        record["owned_verification"]["bound_reuse"] = {
+            "count": UNKNOWN, "by_transaction": [],
+            "avoided_subprocess_wall_time_s": UNKNOWN}
+    for name, path in (
+            ("recovery_episodes", os.path.join(
+                assets, "recovery", recovery_evidence.EPISODES_FILENAME)),
+            ("lineage", os.path.join(assets, "lineage.json"))):
+        if os.path.exists(path):
+            record["built_from"][name] = _fingerprint(path)
+
+
 def build_record(session_uuid, cwd=None, ingest_results=None):
     """Build the authoritative record from every raw source. Never raises.
 
@@ -2217,6 +3138,10 @@ def build_record(session_uuid, cwd=None, ingest_results=None):
     # missing, and D's report section (`cowork_report._section_activity`)
     # and every cross-surface consumer always resolves it.
     record["activity"] = _activity_view(session_uuid)
+    # M7 Package B: the universal context views. Always attached, additive,
+    # and never appended to the legacy `incomplete` list above.
+    _attach_universal_views(record, session_uuid, events, work,
+                            ledger_records)
     return record
 
 
@@ -3126,6 +4051,18 @@ def check_provenance(session_uuid, record):
                 state_store.execution_profile_path_for(session_uuid))
             if current.get("sha256") != recorded.get("sha256"):
                 diverged.append("execution_profile")
+        # The recovery episodes and lineage files are stamped only when they
+        # existed at build time, and checked only when stamped.
+        assets = state_store.session_assets_dir(session_uuid)
+        for name, path in (
+                ("recovery_episodes", os.path.join(
+                    assets, "recovery",
+                    recovery_evidence.EPISODES_FILENAME)),
+                ("lineage", os.path.join(assets, "lineage.json"))):
+            recorded = built_from.get(name)
+            if isinstance(recorded, dict) and _fingerprint(path).get(
+                    "sha256") != recorded.get("sha256"):
+                diverged.append(name)
     except Exception:  # noqa: BLE001
         return {"state": UNKNOWN, "diverged": [],
                 "built_at": record.get("built_at"),

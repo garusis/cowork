@@ -190,6 +190,53 @@ LINEAGE = (
     ("activity.process_probe_ref", "activity.process_probe_ref"),
     ("activity.next_inspection_at", "activity.next_inspection_at"),
     ("activity.interval_seconds", "activity.interval_seconds"),
+    # M7 Package B: universal context views, rendered by the trailing
+    # `_section_*` functions after the activity section.
+    ("context.limits_basis", "context.limits_basis"),
+    ("context.dispatch_count", "context.dispatch_count"),
+    ("context.unknown_metric_count", "context.unknown_metric_count"),
+    ("context.by_role", "context.by_role"),
+    ("context.incomplete", "context.incomplete"),
+    ("profile_attribution.state", "profile_attribution.state"),
+    ("profile_attribution.initial", "profile_attribution.initial"),
+    ("profile_attribution.by_profile", "profile_attribution.by_profile"),
+    ("profile_attribution.unknown_turns",
+     "profile_attribution.unknown_turns"),
+    ("profile_attribution.incomplete", "profile_attribution.incomplete"),
+    ("repeated_context.deliveries", "repeated_context.deliveries"),
+    ("repeated_context.repeated", "repeated_context.repeated"),
+    ("repeated_context.repeated_bytes", "repeated_context.repeated_bytes"),
+    ("repeated_context.commands", "repeated_context.commands"),
+    ("repeated_context.reread_state", "repeated_context.reread_state"),
+    ("repeated_context.incomplete", "repeated_context.incomplete"),
+    ("cost_split.buckets", "cost_split.buckets"),
+    ("cost_split.verification", "cost_split.verification"),
+    ("cost_split.rework", "cost_split.rework"),
+    ("cost_split.unmapped_classes", "cost_split.unmapped_classes"),
+    ("cost_split.incomplete", "cost_split.incomplete"),
+    ("recovery.state", "recovery.state"),
+    ("recovery.episode_count", "recovery.episode_count"),
+    ("recovery.invalid_episode_count", "recovery.invalid_episode_count"),
+    ("recovery.recovery_turn_count", "recovery.recovery_turn_count"),
+    ("recovery.episodes", "recovery.episodes"),
+    ("recovery.value_by_state", "recovery.value_by_state"),
+    ("recovery.unattributed_recovery_work_ids",
+     "recovery.unattributed_recovery_work_ids"),
+    ("recovery.incomplete", "recovery.incomplete"),
+    ("lineage.state", "lineage.state"),
+    ("lineage.source_session", "lineage.source_session"),
+    ("lineage.replacement_session", "lineage.replacement_session"),
+    ("lineage.reason", "lineage.reason"),
+    ("lineage.start_role", "lineage.start_role"),
+    ("lineage.imported_artifact_count", "lineage.imported_artifact_count"),
+    ("lineage.unresolved_finding_count",
+     "lineage.unresolved_finding_count"),
+    ("lineage.unresolved_basis_reason", "lineage.unresolved_basis_reason"),
+    ("lineage.reconciliation", "lineage.reconciliation"),
+    ("lineage.closure", "lineage.closure"),
+    ("lineage.cohort", "lineage.cohort"),
+    ("lineage.incomplete", "lineage.incomplete"),
+    ("owned.bound_reuse", "owned_verification.bound_reuse"),
 )
 
 
@@ -256,6 +303,13 @@ def render_report(record):
     lines.extend(_section_completion(record))
     lines.extend(_section_incomplete(record))
     lines.extend(_section_activity(record))
+    lines.extend(_section_context(record))
+    lines.extend(_section_profile_attribution(record))
+    lines.extend(_section_repeated_context(record))
+    lines.extend(_section_cost_split(record))
+    lines.extend(_section_recovery(record))
+    lines.extend(_section_lineage(record))
+    lines.extend(_section_bound_reuse(record))
     return "\n".join(lines) + "\n"
 
 
@@ -1323,6 +1377,309 @@ def _section_activity(record):
         _at(record, "activity.next_inspection_at")))
     lines.append("  interval_seconds   %s" % _fmt(
         _at(record, "activity.interval_seconds")))
+    lines.append("")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# M7 Package B: the universal context views. Each section is a pure lookup    #
+# that returns `[]` when the record lacks its key, so a record built before    #
+# these views existed renders exactly as it always did. Every count and total  #
+# was computed in `cowork_measure`; nothing here adds anything up.             #
+# --------------------------------------------------------------------------- #
+
+_LIMITS_BASIS_TEXT = {"unprofiled": "none (unprofiled)",
+                      "profiled": "profile envelope",
+                      UNKNOWN: UNKNOWN}
+
+
+def _fmt_metric(metric, value):
+    if metric in ("prompt_bytes", "artifact_bytes"):
+        return _fmt_bytes(value)
+    if metric == "elapsed_ms":
+        return _fmt_ms(value)
+    return _fmt(value)
+
+
+def _fmt_usage(value):
+    if isinstance(value, dict):
+        return ", ".join("%s=%s" % (key, _fmt(amount))
+                         for key, amount in sorted(value.items()))
+    return _fmt(value)
+
+
+def _rollup_text(rollup):
+    if not isinstance(rollup, dict):
+        return UNKNOWN
+    return ("turns=%s  usage=%s  duration=%s"
+            % (_fmt(rollup.get("turns")), _fmt_usage(rollup.get("usage")),
+               _fmt_ms(rollup.get("duration_ms"))))
+
+
+def _note_lines(view):
+    """One `unknown:` line per note a view recorded in its own `incomplete`."""
+    notes = view.get("incomplete")
+    out = []
+    if isinstance(notes, list):
+        for note in notes:
+            if isinstance(note, dict):
+                out.append("  unknown: %s - %s"
+                           % (_fmt(note.get("field")),
+                              _fmt(note.get("reason"))))
+    return out
+
+
+def _section_context(record):
+    """Context envelope and consumption (`context.*`): per-dispatch size and
+    consumption by role. Limits print as `none (unprofiled)` for a session with
+    no profile; a metric with no data prints `unknown`, never 0."""
+    view = _at(record, "context", None)
+    if not isinstance(view, dict):
+        return []
+    lines = ["Context envelope and consumption", "-" * 56]
+    basis = _at(record, "context.limits_basis")
+    lines.append("  limits: %s" % (_LIMITS_BASIS_TEXT.get(basis, _fmt(basis))
+                                   if isinstance(basis, str) else _fmt(basis)))
+    lines.append("  dispatches: %s  metrics with no data: %s"
+                 % (_fmt(_at(record, "context.dispatch_count")),
+                    _fmt(_at(record, "context.unknown_metric_count"))))
+    roles = _at(record, "context.by_role")
+    if isinstance(roles, dict):
+        for role, bucket in sorted(roles.items()):
+            if not isinstance(bucket, dict):
+                continue
+            lines.append("  %s  dispatches=%s"
+                         % (_fmt(role), _fmt(bucket.get("dispatches"))))
+            maxima = bucket.get("max")
+            unknowns = bucket.get("unknown_count")
+            unknowns = unknowns if isinstance(unknowns, dict) else {}
+            if isinstance(maxima, dict):
+                for metric, value in maxima.items():
+                    lines.append("    %-22s max=%s  no data=%s"
+                                 % (metric, _fmt_metric(metric, value),
+                                    _fmt(unknowns.get(metric))))
+    lines.extend(_note_lines(view))
+    lines.append("")
+    return lines
+
+
+def _section_profile_attribution(record):
+    """Usage and duration per execution profile in force at each turn."""
+    view = _at(record, "profile_attribution", None)
+    if not isinstance(view, dict):
+        return []
+    lines = ["Profile attribution", "-" * 56]
+    lines.append("  state=%s  initial profile=%s  turns with no clear profile=%s"
+                 % (_fmt(_at(record, "profile_attribution.state")),
+                    _fmt(_at(record, "profile_attribution.initial")),
+                    _fmt(_at(record, "profile_attribution.unknown_turns"))))
+    by_profile = _at(record, "profile_attribution.by_profile")
+    if isinstance(by_profile, dict):
+        for label, rollup in sorted(by_profile.items()):
+            lines.append("  %-12s %s" % (_fmt(label), _rollup_text(rollup)))
+    lines.extend(_note_lines(view))
+    lines.append("")
+    return lines
+
+
+def _section_repeated_context(record):
+    """Artifact bytes delivered again unchanged, and repeated command
+    identities. Reread state is `detected` (read from controller logs after the
+    fact) or `unknown`; nothing here claims a repeat was prevented."""
+    view = _at(record, "repeated_context", None)
+    if not isinstance(view, dict):
+        return []
+    lines = ["Repeated context", "-" * 56]
+    deliveries = _at(record, "repeated_context.deliveries")
+    if isinstance(deliveries, dict):
+        lines.append("  deliveries: total=%s  first=%s  changed=%s  renewed=%s"
+                     "  repeated=%s  unknown=%s"
+                     % (_fmt(deliveries.get("total")),
+                        _fmt(deliveries.get("first")),
+                        _fmt(deliveries.get("changed")),
+                        _fmt(deliveries.get("renewed")),
+                        _fmt(deliveries.get("repeated")),
+                        _fmt(deliveries.get("unknown"))))
+    lines.append("  repeated bytes: %s"
+                 % _fmt_bytes(_at(record, "repeated_context.repeated_bytes")))
+    repeated = _at(record, "repeated_context.repeated")
+    if isinstance(repeated, list):
+        for item in repeated:
+            if isinstance(item, dict):
+                lines.append("    %s  %s  %s (was %s)"
+                             % (_fmt(item.get("role")), _fmt(item.get("path")),
+                                _fmt_bytes(item.get("bytes")),
+                                _fmt(item.get("previous_work_id"))))
+    lines.append("  reread state: %s"
+                 % _fmt(_at(record, "repeated_context.reread_state")))
+    commands = _at(record, "repeated_context.commands.by_role")
+    if isinstance(commands, dict):
+        for role, entry in sorted(commands.items()):
+            if isinstance(entry, dict):
+                lines.append("    %s  repeated commands=%s  (%s)"
+                             % (_fmt(role), _fmt(entry.get("repeated_targets")),
+                                _fmt(entry.get("state"))))
+    lines.extend(_note_lines(view))
+    lines.append("")
+    return lines
+
+
+def _section_cost_split(record):
+    """Model cost split by purpose. The buckets are exclusive; verification is
+    a separate unit (wall time, not model usage) and rework is an overlay that
+    is not added into any total."""
+    view = _at(record, "cost_split", None)
+    if not isinstance(view, dict):
+        return []
+    lines = ["Cost split", "-" * 56]
+    buckets = _at(record, "cost_split.buckets")
+    if isinstance(buckets, dict):
+        for name, rollup in buckets.items():
+            lines.append("  %-15s %s" % (_fmt(name), _rollup_text(rollup)))
+    lines.append("  verification (wall time, not model usage): items=%s  "
+                 "wall=%s"
+                 % (_fmt(_at(record, "cost_split.verification.work_items")),
+                    _fmt_ms(_secs_to_ms(_at(
+                        record,
+                        "cost_split.verification.subprocess_wall_time_s")))))
+    lines.append("  rework (overlay, not added to the buckets above): "
+                 "turns=%s  usage=%s  duration=%s"
+                 % (_fmt(_at(record, "cost_split.rework.turns")),
+                    _fmt_usage(_at(record, "cost_split.rework.usage")),
+                    _fmt_ms(_at(record, "cost_split.rework.duration_ms"))))
+    unmapped = _at(record, "cost_split.unmapped_classes")
+    if isinstance(unmapped, dict):
+        for work_class, count in sorted(unmapped.items()):
+            lines.append("  unmapped class %s: %s turn(s)"
+                         % (_fmt(work_class), _fmt(count)))
+    lines.extend(_note_lines(view))
+    lines.append("")
+    return lines
+
+
+def _section_recovery(record):
+    """Recovery episodes: what each recovery turn changed and earned. A missing
+    record of episodes is `unknown`, never zero."""
+    view = _at(record, "recovery", None)
+    if not isinstance(view, dict):
+        return []
+    lines = ["Recovery episodes", "-" * 56]
+    lines.append("  state=%s  episodes=%s  invalid=%s  recovery turns=%s"
+                 % (_fmt(_at(record, "recovery.state")),
+                    _fmt(_at(record, "recovery.episode_count")),
+                    _fmt(_at(record, "recovery.invalid_episode_count")),
+                    _fmt(_at(record, "recovery.recovery_turn_count"))))
+    episodes = _at(record, "recovery.episodes")
+    if isinstance(episodes, list):
+        for episode in episodes:
+            if not isinstance(episode, dict):
+                continue
+            lines.append("    %s -> %s  reason=%s  artifacts=%s  findings=%s"
+                         "  value=%s  overhead=%s"
+                         % (_fmt(episode.get("failed_work_id")),
+                            _fmt(episode.get("recovery_work_id")),
+                            _fmt(episode.get("reason_class")),
+                            _fmt(episode.get("artifact_delta_state")),
+                            _fmt(episode.get("finding_delta_state")),
+                            _fmt(episode.get("value_state")),
+                            _fmt(episode.get("recovery_overhead"))))
+            lines.append("      findings: new=%s  closed=%s  retired=%s"
+                         "  reread=%s"
+                         % (_fmt(episode.get("new_finding_count")),
+                            _fmt(episode.get("closed_finding_count")),
+                            _fmt(episode.get("retired_finding_count")),
+                            _fmt(episode.get("reread_state"))))
+    by_value = _at(record, "recovery.value_by_state")
+    if isinstance(by_value, dict):
+        lines.append("  value: zero=%s  positive=%s  unknown=%s"
+                     % (_fmt(by_value.get("zero")),
+                        _fmt(by_value.get("positive")),
+                        _fmt(by_value.get("unknown"))))
+    unattributed = _at(record, "recovery.unattributed_recovery_work_ids")
+    if isinstance(unattributed, list):
+        for work_id in unattributed:
+            lines.append("  recovery turn with no episode: %s" % _fmt(work_id))
+    lines.extend(_note_lines(view))
+    lines.append("")
+    return lines
+
+
+def _section_lineage(record):
+    """Lineage of an imported session: preserved, repeated and new work, the
+    closure value of imported findings, and cohort comparability."""
+    view = _at(record, "lineage", None)
+    if not isinstance(view, dict):
+        return []
+    lines = ["Lineage", "-" * 56]
+    state = _at(record, "lineage.state")
+    lines.append("  state: %s" % _fmt(state))
+    if state == "none":
+        lines.append("  (not an imported session)")
+        lines.append("")
+        return lines
+    lines.append("  source=%s  replacement=%s  start role=%s"
+                 % (_fmt(_at(record, "lineage.source_session")),
+                    _fmt(_at(record, "lineage.replacement_session")),
+                    _fmt(_at(record, "lineage.start_role"))))
+    lines.append("  reason=%s  imported artifacts=%s  unresolved findings=%s"
+                 "  basis=%s"
+                 % (_fmt(_at(record, "lineage.reason")),
+                    _fmt(_at(record, "lineage.imported_artifact_count")),
+                    _fmt(_at(record, "lineage.unresolved_finding_count")),
+                    _fmt(_at(record, "lineage.unresolved_basis_reason"))))
+    reconciliation = _at(record, "lineage.reconciliation")
+    if isinstance(reconciliation, dict):
+        lines.append("  work: preserved=%s  repeated=%s  new=%s  unknown=%s"
+                     "  duplicates skipped=%s"
+                     % (_fmt(reconciliation.get("preserved_count")),
+                        _fmt(reconciliation.get("repeated_count")),
+                        _fmt(reconciliation.get("new_count")),
+                        _fmt(reconciliation.get("unknown_count")),
+                        _fmt(reconciliation.get("duplicates_skipped_count"))))
+        totals = reconciliation.get("totals")
+        if isinstance(totals, dict):
+            for name in ("preserved", "repeated", "new"):
+                lines.append("    %-10s %s"
+                             % (name, _rollup_text(totals.get(name))))
+    closure = _at(record, "lineage.closure")
+    if isinstance(closure, dict):
+        lines.append("  closure: closed=%s  new findings=%s  replayed=%s"
+                     "  replay earned=%s  rejected=%s"
+                     % (_fmt(closure.get("closures")),
+                        _fmt(closure.get("new_findings")),
+                        _fmt(closure.get("replay_findings")),
+                        _fmt(closure.get("replay_earned")),
+                        _fmt(closure.get("rejected_count"))))
+    cohort = _at(record, "lineage.cohort")
+    if isinstance(cohort, dict):
+        lines.append("  cohort comparable: %s  code=%s"
+                     % (_fmt(cohort.get("comparable")),
+                        _fmt(cohort.get("code"))))
+    lines.extend(_note_lines(view))
+    lines.append("")
+    return lines
+
+
+def _section_bound_reuse(record):
+    """Bound verification reuse, kept apart from executed transactions."""
+    reuse = _at(record, "owned_verification.bound_reuse", None)
+    if not isinstance(reuse, dict):
+        return []
+    lines = ["Bound verification reuse", "-" * 56]
+    lines.append("  bound reuses: %s  avoided wall time: %s"
+                 % (_fmt(_at(record, "owned_verification.bound_reuse.count")),
+                    _fmt_ms(_secs_to_ms(_at(
+                        record, "owned_verification.bound_reuse."
+                                "avoided_subprocess_wall_time_s")))))
+    rows = _at(record, "owned_verification.bound_reuse.by_transaction")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                lines.append("    %s  reused=%s  wall=%s"
+                             % (_fmt(row.get("transaction_id")),
+                                _fmt(row.get("bound_count")),
+                                _fmt_ms(_secs_to_ms(
+                                    row.get("subprocess_wall_time_s")))))
     lines.append("")
     return lines
 
