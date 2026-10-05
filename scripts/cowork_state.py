@@ -7272,3 +7272,64 @@ def reconstruct_session_checkpoints(session_uuid):
                               "result": result, "receipt": receipt,
                               "state": state}
     return out
+
+
+# --------------------------------------------------------------------------- #
+# M5.5 #75 P2: graph store paths and live PauseLease listing.                 #
+# --------------------------------------------------------------------------- #
+
+
+def graphs_root():
+    """Root of the governed work-graph store: `<sessions_root>/graphs`.
+    A pure path helper; creates nothing."""
+    return os.path.join(sessions_root(), "graphs")
+
+
+def graph_dir_for(graph_id):
+    """Directory of one graph's durable record. Rejects unsafe ids."""
+    _assert_safe_identifier(graph_id, "graph_id")
+    return os.path.join(graphs_root(), graph_id)
+
+
+def graph_state_path_for(graph_id):
+    """Path of one graph's single current `GraphState` record."""
+    return os.path.join(graph_dir_for(graph_id), "graph.json")
+
+
+def graph_registry_path():
+    """Path of the graph registry `{schema_version, graph_ids}`."""
+    return os.path.join(graphs_root(), "registry.json")
+
+
+def graph_session_index_path_for(session_uuid):
+    """Path of one session's exclusive vertex-binding index record. Rejects
+    unsafe session ids; creates nothing."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(graphs_root(), "session-index",
+                        session_uuid + ".json")
+
+
+def live_pause_lease_ids(session_uuid):
+    """Sorted ids of the session's PauseLeases whose stored
+    `consumption_state` is live (`unclaimed` or `claimed`). Read-only: lists
+    `<capacity>/pause_leases/*.json` through `read_pause_lease` and never
+    creates a directory. A listed record that cannot be read as a valid
+    PauseLease raises `CorruptRecordError`, so a caller fails closed."""
+    directory = os.path.join(capacity_dir_for(session_uuid), "pause_leases")
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    live = []
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        lease_id = name[:-len(".json")]
+        record = read_pause_lease(session_uuid, lease_id)
+        if record is None:
+            raise CorruptRecordError(
+                "%s: listed PauseLease is unreadable or invalid"
+                % os.path.join(directory, name))
+        if record.get("consumption_state") in ("unclaimed", "claimed"):
+            live.append(lease_id)
+    return sorted(live)
