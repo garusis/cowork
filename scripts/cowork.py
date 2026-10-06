@@ -6666,6 +6666,121 @@ def _handoff_request_digest(note):
         str(note).encode("utf-8", "replace")).hexdigest()
 
 
+# Exact-role recovery: a paired reviewer that could not return a usable verdict
+# is the role that resumes first, against the exact candidate it was judging.
+# The stop kind below is the one non-approving end a recovery binding that no
+# longer holds reports (always `requires: operator`, always before any send).
+RECOVERY_STOP_KIND = "recovery_binding_mismatch"
+RECOVERY_REASON_CODES = (
+    "wrong_first_role", "phase_mismatch", "reviewer_not_on_team",
+    "malformed_record", "lead_session_mismatch", "lead_not_ready",
+    "candidate_changed")
+
+
+def _file_sha256(path):
+    """sha256 of the raw bytes of `path`, or None when it is missing."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def build_failed_turn_request(phase, status_path, candidate_sha, review_path,
+                              round_index):
+    """The deterministic request text of one failed reviewer turn. It is stored
+    as the reviewer's `pending_turn` so the existing path-based recovery
+    packets deliver it; its sha256 is part of the exact record."""
+    return ("Review the completed %s candidate at %s (sha256 %s), write the "
+            "verdict to %s, review round %d."
+            % (phase, status_path, candidate_sha, review_path, round_index))
+
+
+def _open_finding_ids(session_uuid, phase, reviewer_role):
+    """Ids of the open typed findings of the latest round the reviewer
+    recorded for `phase`, read through the ledger's existing read API."""
+    if not session_uuid:
+        return []
+    path = state_store.ledger_path_for(session_uuid)
+    open_findings = [
+        rec for rec in ledger.collapse(ledger.read_ledger(path)).values()
+        if rec.get("kind") == "finding" and rec.get("state") == "open"
+        and rec.get("discoverer") == reviewer_role
+        and rec.get("phase") == phase
+        and isinstance(rec.get("round"), int)]
+    if not open_findings:
+        return []
+    latest = max(rec["round"] for rec in open_findings)
+    return sorted(rec["id"] for rec in open_findings if rec["round"] == latest)
+
+
+def build_failed_turn_record(ident, session_uuid, lead_provider_session_id,
+                             candidate_manifest_digest,
+                             invalidation_seq_at_failure, epoch,
+                             ledger_ids=(), created=None):
+    """The schema-1 `failed_turn` record for one reviewer_unavailable stop.
+    `ident` carries what `_role_loop` held at the stop; the rest is
+    session-level identity only `run_flow` can resolve."""
+    request_text = build_failed_turn_request(
+        ident["phase"], ident["status_path"], ident["candidate_sha256"],
+        ident["review_path"], ident["round"])
+    candidate = {"path": ident["status_path"],
+                 "sha256": ident["candidate_sha256"]}
+    if ident.get("summary_path"):
+        candidate["summary_path"] = ident["summary_path"]
+        candidate["summary_sha256"] = ident.get("summary_sha256")
+    return {
+        "schema": state_store.FAILED_TURN_SCHEMA,
+        "role": ident["reviewer_role"],
+        "lead_role": ident["lead_role"],
+        "phase": ident["phase"],
+        "request": {"sha256": hashlib.sha256(
+            request_text.encode("utf-8")).hexdigest(), "text": request_text},
+        "candidate": candidate,
+        "finding": {"path": ident["review_path"],
+                    "sha256": ident.get("finding_sha256"),
+                    "ledger_ids": list(ledger_ids)},
+        "lead": {"controller": ident["lead_controller"],
+                 "provider_session_id": lead_provider_session_id,
+                 "work_id": ident["work_id"],
+                 "candidate_manifest_digest": candidate_manifest_digest,
+                 "status": "ready_for_review"},
+        "session_uuid": session_uuid,
+        "invalidation_seq_at_failure": invalidation_seq_at_failure,
+        "round": ident["round"],
+        "failures": ident.get("failures"),
+        "context_revision": ident.get("context_revision"),
+        "epoch": epoch,
+        "created": time.time() if created is None else created,
+    }
+
+
+def _recovery_stop_payload(lead_role, reason_code, reviewer_role=None,
+                           record=None):
+    """The structured stop for a recovery binding that no longer holds. It
+    carries only identities (no content): what a supervisor needs to build the
+    InvalidationRecord that reopens the lead."""
+    if reason_code not in RECOVERY_REASON_CODES:
+        raise ValueError("unknown recovery reason %r" % (reason_code,))
+    facts = {"mismatch": reason_code, "reviewer_role": reviewer_role}
+    if isinstance(record, dict):
+        lead = record.get("lead") or {}
+        candidate = record.get("candidate") or {}
+        facts.update(
+            session_uuid=record.get("session_uuid"),
+            lead_role=record.get("lead_role"),
+            work_id=lead.get("work_id"),
+            candidate_manifest_digest=lead.get("candidate_manifest_digest"),
+            invalidation_seq_at_failure=record.get(
+                "invalidation_seq_at_failure"),
+            request_sha256=(record.get("request") or {}).get("sha256"),
+            candidate_sha256=candidate.get("sha256"))
+    return _agent_stop_payload(RECOVERY_STOP_KIND, lead_role,
+                               requires="operator", **facts)
+
+
 _DECISION_VIEW_KEYS = ("request_id", "kind", "role", "phase", "requires",
                        "question", "handoff", "findings", "state")
 
@@ -7411,7 +7526,9 @@ def _role_loop(session, first, status_path, context, io_out,
                   save_pending_turn_fn=None, clear_pending_turn_fn=None,
                   spath=None, session_uuid=None, build_summary_path=None,
                   role_work_id=None, checkpoint_id=None, artifact_kind=None,
-                  profile_session=None, plan_json_path=None):
+                  profile_session=None, plan_json_path=None,
+                  failed_turn_fn=None, reviewer_first=None,
+                  lead_context_block_fn=None):
     """Drive a lead role's per-turn loop: send → read status → review, stop,
     or finish. Role-generic: the scout, planner and builder all run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -7469,7 +7586,19 @@ def _role_loop(session, first, status_path, context, io_out,
     a build-reviewer approve may carry deferred minor notes. `plan_json_path`
     names the approved plan document the owned verification inventory is read
     from (the scout intel under the light profile). With `profile_session`
-    None every path below is exactly the legacy one."""
+    None every path below is exactly the legacy one.
+
+    Exact-role recovery (additive, all default `None`): `failed_turn_fn(ident)`
+    is called at the `reviewer_unavailable` stop with the identities this loop
+    holds so `run_flow` can persist the hash-bound failed-turn record.
+    `reviewer_first` is the binding `run_flow` validated for a resume whose
+    paired reviewer failed: the loop re-verifies it, skips the completed
+    lead's send exactly once, and the unchanged reviewer gate runs first; a
+    genuine `revise` then reopens the lead through the ordinary path, and
+    `lead_context_block_fn()` supplies the context-update block that rides the
+    lead's first real send. A binding that no longer holds stops with
+    `recovery_binding_mismatch` before any send. With all three `None` every
+    path below is exactly the legacy one."""
     if checkpoint_id and trace:
         trace.event("checkpoint.role_loop_bound", role=role,
                     checkpoint_id=checkpoint_id, artifact_kind=artifact_kind)
@@ -7603,6 +7732,30 @@ def _role_loop(session, first, status_path, context, io_out,
             return None
 
     breaker_checked = False
+    # Exact-role recovery state: validated once, on the first iteration only.
+    reviewer_first_checked = reviewer_first is None
+    skip_lead_send = False
+    lead_block_pending = False
+
+    def _reviewer_first_mismatch():
+        """Re-verify the binding `run_flow` validated (defence in depth for a
+        direct caller): the loop's own role pairing, the lead's status and,
+        for an exact binding, the candidate bytes. Returns a reason code or
+        None."""
+        if (reviewer_first.get("lead_role") != role
+                or reviewer_first.get("reviewer_role") != reviewer_role):
+            return "wrong_first_role"
+        if state_store.read_status(status_path) != "ready_for_review":
+            return "lead_not_ready"
+        if reviewer_first.get("tier") == "exact":
+            if (state_store.fingerprint_status(status_path)["sha256"]
+                    != reviewer_first.get("candidate_sha256")):
+                return "candidate_changed"
+            if role == "builder" and (
+                    _file_sha256(build_summary_path)
+                    != reviewer_first.get("summary_sha256")):
+                return "candidate_changed"
+        return None
 
     def _end_unapproved(stop):
         """Record a non-approving end. A request for an answer or an
@@ -7680,416 +7833,457 @@ def _role_loop(session, first, status_path, context, io_out,
                                     **_auth_recovery_facts()}
                                    if _auth_trigger else {})))
                         break
-            # Capture the reopen signal BEFORE the invalidate/reset block runs.
-            reopened_this_turn = pending_reopen_reason is not None
-            reopen_reason_this_turn = pending_reopen_reason
-            if pending_reopens_work:
-                before_status = state_store.read_status(status_path)
-                changed = state_store.invalidate_ready_status(status_path)
-                after_status = state_store.read_status(status_path)
-                if trace and before_status != after_status:
-                    # Emitted ONLY when the observed state actually moved
-                    # (CV-016). The event used to fire whenever invalidation was
-                    # ATTEMPTED, so a no-op invalidation of an already-correct
-                    # status read as a real transition. `requested_status` is the
-                    # transition asked for; `before`/`after`/`changed` are what
-                    # was observed, and they are deliberately distinct.
-                    trace.event("status.invalidated", role=role,
-                                path=status_path, changed=changed,
-                                requested_status="needs_input",
-                                before=before_status, after=after_status,
-                                reason="work_reopened",
-                                triggering_event_id=pending_reopen_event_id)
-                pending_reopens_work = False
-            pending_reopen_reason = None
-            pending_reopen_event_id = None
-            if role == "builder" and not reopened_this_turn:
-                # A fresh builder turn that is not a reopen is editing work.
-                record_milestone(trace, role, "editing", review_rounds)
-            fp_before = state_store.fingerprint_status(status_path)
-            # Per-turn accounting (#1/D11): classify this lead send and attach the
-            # status-artifact descriptor + context revision. The reopen reason
-            # (set at every work-reopening site) keys the kind; the very first
-            # send is the role seed.
-            if in_repair:
-                lead_kind = "repair"
-            elif reopen_reason_this_turn in (
-                    "reviewer_needs_user", "reviewer_revise"):
-                lead_kind = "reviewer_handoff"
-            elif reopen_reason_this_turn == "handoff_declined":
-                lead_kind = "handoff_wake"
-            elif reopen_reason_this_turn:
-                lead_kind = "user_answer"
-            elif pending is first:
-                lead_kind = "role_seed"
-            else:
-                lead_kind = "role_turn"
-            # The seed prompt references the upstream artifact(s) (planner:
-            # approved intel; builder: approved plan) path-first on the first
-            # send only (#1 — the bodies are read from disk, not embedded);
-            # every send also touches the role's own status file (its write
-            # target, never embedded). So no artifact body rides a lead send:
-            # tag all lead artifacts path-first. fresh-vs-resume: the first send
-            # of a non-resumed launch is fresh; a resumed launch and every
-            # continuation turn are resume turns.
-            first_send = pending is first
-            delivery = _lead_turn_delivery(pending)
-            lead_artifacts = (
-                [dict(rec) for rec in delivery.descriptors]
-                if delivery.descriptors
-                else _artifact_descriptors(
-                    (list(seed_artifact_paths or []) if first_send else []) + [status_path],
-                    delivery="path")
-            )
-            lead_meta = {
-                "prompt_kind": lead_kind,
-                "phase": phase,
-                "fresh": first_send and not is_resume,
-                "resume": is_resume or not first_send,
-                "context_revision": context_revision,
-                "artifacts": lead_artifacts,
-                # MJ-1: the genuine WorkUnit identity for this engagement --
-                # threaded through so the bridge session can stamp the REAL
-                # parent WorkUnit (not its own per-turn trace work_id) into
-                # the guard context a child-dispatch/ungoverned-terminal
-                # hook payload carries as `parent_work_id` (see
-                # `cowork_bridge.py`'s `_send_turn`/`send` methods).
-                "role_work_id": role_work_id,
-            }
-            if trace:
-                trace.event("role.fingerprint.before", role=role,
-                            status=fp_before["status"],
-                            sha256=fp_before["sha256"],
-                            size=fp_before["size"], exists=fp_before["exists"])
-                send_start_event_id = trace.event(
-                    "role.send.start", role=role,
-                    prompt_kind=lead_kind, phase=phase,
-                    fresh=lead_meta["fresh"], resume=lead_meta["resume"],
-                    context_revision=context_revision,
-                    artifacts=lead_meta["artifacts"],
-                    **trace_store.prompt_meta(pending))
-            else:
-                send_start_event_id = None
-            last_send_source_ref = _build_pending_source_ref(
-                session, send_start_event_id, str(pending))
-            # M4 Package D: the activity-emission seam's bounded in-turn
-            # daemon tick, ticking ONLY while this real turn-boundary send
-            # is in flight -- created/closed in try/finally, bounded join.
-            milestones.begin_round()
-            if milestones.enabled:
-                try:
-                    session.tool_boundary_hook = milestones.on_tool_end
-                except (AttributeError, TypeError):
-                    pass
-            turn_started_monotonic = time.monotonic()
-            tick_stop_event = threading.Event()
-            tick_thread = None
-            if session_uuid and role_work_id and getattr(
-                    session, "controller", None) in _ACTIVITY_CLASSIFIERS:
-                def _fire_tick(_session=session, _work_id=role_work_id,
-                              _started=turn_started_monotonic):
-                    if (_ACTIVITY_SHUTDOWN_EVENT.is_set()
-                            or tick_stop_event.is_set()):
-                        return
-                    _emit_activity_record(
-                        session_uuid, _work_id, _session, {"kind": "tick"},
-                        _started, trace=trace, role=role)
-                tick_thread = threading.Thread(
-                    target=_run_activity_tick_loop,
-                    args=(tick_stop_event, _fire_tick), daemon=True)
-                tick_thread.start()
-            try:
-                send_result = _send(
-                    session, delivery, meta=lead_meta)
-            finally:
-                tick_stop_event.set()
-                if tick_thread is not None:
-                    tick_thread.join(timeout=2.0)
+            if not reviewer_first_checked:
+                reviewer_first_checked = True
+                mismatch = _reviewer_first_mismatch()
+                if trace:
+                    trace.event("recovery.route", role=role,
+                                reviewer_role=reviewer_role,
+                                route=("stop" if mismatch else
+                                       "reviewer_first"),
+                                reason=mismatch or "held",
+                                tier=reviewer_first.get("tier"),
+                                stage="role_loop")
+                if mismatch:
+                    if on_first_send_rejected:
+                        on_first_send_rejected()
+                    outcome_kind, payload = _end_unapproved(
+                        _recovery_stop_payload(
+                            role, mismatch, reviewer_role=reviewer_role,
+                            record=reviewer_first.get("record")))
+                    break
+                # The completed lead is not sent; the reviewer gate below
+                # runs first. A skipped send never acknowledges the lead's
+                # context or decisions, and the retry is the SAME review
+                # round the failed turn was in.
+                skip_lead_send = True
+                lead_block_pending = lead_context_block_fn is not None
+                review_rounds = max(0, int(reviewer_first.get("round") or 1) - 1)
+                if on_first_send_rejected:
+                    on_first_send_rejected()
+            if not skip_lead_send:
+                if lead_block_pending and isinstance(
+                        pending, handoff.HandoffBlock):
+                    # First real lead send after a reviewer-first revise: the
+                    # context update rides in front of the revise handoff so
+                    # the lead never acts on findings from a context revision
+                    # it has not received.
+                    lead_block_pending = False
+                    _lead_block = lead_context_block_fn()
+                    if _lead_block is not None:
+                        pending = handoff.compose_handoff_blocks(
+                            _lead_block, handoff.STATIC_SEPARATOR, pending)
+                # Capture the reopen signal BEFORE the invalidate/reset block runs.
+                reopened_this_turn = pending_reopen_reason is not None
+                reopen_reason_this_turn = pending_reopen_reason
+                if pending_reopens_work:
+                    before_status = state_store.read_status(status_path)
+                    changed = state_store.invalidate_ready_status(status_path)
+                    after_status = state_store.read_status(status_path)
+                    if trace and before_status != after_status:
+                        # Emitted ONLY when the observed state actually moved
+                        # (CV-016). The event used to fire whenever invalidation was
+                        # ATTEMPTED, so a no-op invalidation of an already-correct
+                        # status read as a real transition. `requested_status` is the
+                        # transition asked for; `before`/`after`/`changed` are what
+                        # was observed, and they are deliberately distinct.
+                        trace.event("status.invalidated", role=role,
+                                    path=status_path, changed=changed,
+                                    requested_status="needs_input",
+                                    before=before_status, after=after_status,
+                                    reason="work_reopened",
+                                    triggering_event_id=pending_reopen_event_id)
+                    pending_reopens_work = False
+                pending_reopen_reason = None
+                pending_reopen_event_id = None
+                if role == "builder" and not reopened_this_turn:
+                    # A fresh builder turn that is not a reopen is editing work.
+                    record_milestone(trace, role, "editing", review_rounds)
+                fp_before = state_store.fingerprint_status(status_path)
+                # Per-turn accounting (#1/D11): classify this lead send and attach the
+                # status-artifact descriptor + context revision. The reopen reason
+                # (set at every work-reopening site) keys the kind; the very first
+                # send is the role seed.
+                if in_repair:
+                    lead_kind = "repair"
+                elif reopen_reason_this_turn in (
+                        "reviewer_needs_user", "reviewer_revise"):
+                    lead_kind = "reviewer_handoff"
+                elif reopen_reason_this_turn == "handoff_declined":
+                    lead_kind = "handoff_wake"
+                elif reopen_reason_this_turn:
+                    lead_kind = "user_answer"
+                elif pending is first:
+                    lead_kind = "role_seed"
+                else:
+                    lead_kind = "role_turn"
+                # The seed prompt references the upstream artifact(s) (planner:
+                # approved intel; builder: approved plan) path-first on the first
+                # send only (#1 — the bodies are read from disk, not embedded);
+                # every send also touches the role's own status file (its write
+                # target, never embedded). So no artifact body rides a lead send:
+                # tag all lead artifacts path-first. fresh-vs-resume: the first send
+                # of a non-resumed launch is fresh; a resumed launch and every
+                # continuation turn are resume turns.
+                first_send = pending is first
+                delivery = _lead_turn_delivery(pending)
+                lead_artifacts = (
+                    [dict(rec) for rec in delivery.descriptors]
+                    if delivery.descriptors
+                    else _artifact_descriptors(
+                        (list(seed_artifact_paths or []) if first_send else []) + [status_path],
+                        delivery="path")
+                )
+                lead_meta = {
+                    "prompt_kind": lead_kind,
+                    "phase": phase,
+                    "fresh": first_send and not is_resume,
+                    "resume": is_resume or not first_send,
+                    "context_revision": context_revision,
+                    "artifacts": lead_artifacts,
+                    # MJ-1: the genuine WorkUnit identity for this engagement --
+                    # threaded through so the bridge session can stamp the REAL
+                    # parent WorkUnit (not its own per-turn trace work_id) into
+                    # the guard context a child-dispatch/ungoverned-terminal
+                    # hook payload carries as `parent_work_id` (see
+                    # `cowork_bridge.py`'s `_send_turn`/`send` methods).
+                    "role_work_id": role_work_id,
+                }
+                if trace:
+                    trace.event("role.fingerprint.before", role=role,
+                                status=fp_before["status"],
+                                sha256=fp_before["sha256"],
+                                size=fp_before["size"], exists=fp_before["exists"])
+                    send_start_event_id = trace.event(
+                        "role.send.start", role=role,
+                        prompt_kind=lead_kind, phase=phase,
+                        fresh=lead_meta["fresh"], resume=lead_meta["resume"],
+                        context_revision=context_revision,
+                        artifacts=lead_meta["artifacts"],
+                        **trace_store.prompt_meta(pending))
+                else:
+                    send_start_event_id = None
+                last_send_source_ref = _build_pending_source_ref(
+                    session, send_start_event_id, str(pending))
+                # M4 Package D: the activity-emission seam's bounded in-turn
+                # daemon tick, ticking ONLY while this real turn-boundary send
+                # is in flight -- created/closed in try/finally, bounded join.
+                milestones.begin_round()
                 if milestones.enabled:
                     try:
-                        session.tool_boundary_hook = None
+                        session.tool_boundary_hook = milestones.on_tool_end
                     except (AttributeError, TypeError):
                         pass
-            if trace:
-                trace.event("role.send.end", role=role,
-                            ok=bool(send_result.get("ok", True)),
-                            result=send_result.get("result"),
-                            error_type=send_result.get("error_type"),
-                            subtype=send_result.get("subtype"))
-            # M4 Package D: the activity-emission seam's real turn-boundary
-            # append (Package C's classify_<controller>_activity on this
-            # turn's real, flattened evidence, durably appended via Package
-            # B) and D's sole output-arbitration call site: the activity
-            # snapshot is written ONLY here, after the send has returned.
-            turn_activity_record = _emit_activity_record(
-                session_uuid, role_work_id, session,
-                _turn_boundary_activity_evidence(
-                    getattr(session, "controller", None), send_result),
-                turn_started_monotonic, trace=trace, role=role)
-            if turn_activity_record is not None:
-                turn_schedule_record = _ensure_scheduled_review(
-                    session_uuid, role_work_id, turn_activity_record["time"],
-                    activity_class=turn_activity_record["activity_class"])
-                turn_watchdog_decision = _watchdog_decision_for_presentation(
-                    session_uuid, role_work_id, session, trace=trace,
-                    role=role)
-                _render_activity_snapshot(
-                    io_out, turn_activity_record, turn_watchdog_decision,
-                    turn_schedule_record)
-            fp_after = state_store.fingerprint_status(status_path)
-            milestones.on_turn_end(send_ok=bool(send_result.get("ok", True)))
-            if trace:
-                trace.event("role.fingerprint.after", role=role,
-                            status=fp_after["status"], sha256=fp_after["sha256"],
-                            size=fp_after["size"], exists=fp_after["exists"])
-            if (not send_result.get("ok", True)
-                    and fp_after["sha256"] == fp_before["sha256"]):
-                if save_pending_turn_fn and pending:
-                    save_pending_turn_fn(role, pending,
-                                        source=last_send_source_ref)
-                elif spath and pending:
-                    state_store.save_pending_turn(spath, role, pending,
-                                                  source=last_send_source_ref)
+                turn_started_monotonic = time.monotonic()
+                tick_stop_event = threading.Event()
+                tick_thread = None
+                if session_uuid and role_work_id and getattr(
+                        session, "controller", None) in _ACTIVITY_CLASSIFIERS:
+                    def _fire_tick(_session=session, _work_id=role_work_id,
+                                  _started=turn_started_monotonic):
+                        if (_ACTIVITY_SHUTDOWN_EVENT.is_set()
+                                or tick_stop_event.is_set()):
+                            return
+                        _emit_activity_record(
+                            session_uuid, _work_id, _session, {"kind": "tick"},
+                            _started, trace=trace, role=role)
+                    tick_thread = threading.Thread(
+                        target=_run_activity_tick_loop,
+                        args=(tick_stop_event, _fire_tick), daemon=True)
+                    tick_thread.start()
+                try:
+                    send_result = _send(
+                        session, delivery, meta=lead_meta)
+                finally:
+                    tick_stop_event.set()
+                    if tick_thread is not None:
+                        tick_thread.join(timeout=2.0)
+                    if milestones.enabled:
+                        try:
+                            session.tool_boundary_hook = None
+                        except (AttributeError, TypeError):
+                            pass
                 if trace:
-                    trace.event("controller.failure", role=role, phase=phase,
-                                reason="send_failed",
+                    trace.event("role.send.end", role=role,
+                                ok=bool(send_result.get("ok", True)),
                                 result=send_result.get("result"),
                                 error_type=send_result.get("error_type"),
-                                subtype=send_result.get("subtype"),
-                                artifact_progress=False)
-                # M3 Package E: classify this send failure via C's pure
-                # taxonomy and durably record ProviderHealth for EVERY
-                # classification, including the explicit
-                # `unknown_provider_failure` member -- never skipped just
-                # because it is unclassifiable.
-                controller_name = getattr(session, "controller", None)
-                raw_evidence = _synthesize_raw_failure_evidence(
-                    controller_name, send_result)
-                controller_outcome = _classify_raw_failure(
-                    controller_name, raw_evidence)
-                _record_provider_health(
-                    session_uuid, role, controller_name, controller_outcome,
-                    _capacity_now())
-                # M4 Package D: reconcile + decide immediately before the
-                # actual stall/retry/invalidation presentation below (the
-                # capacity-entry write or the structured end/termination)
-                # -- retains
-                # original plus reconciled classification durably, and
-                # combines durable evidence with a live process probe
-                # before any terminal-leaning watchdog verdict.
-                _classify_for_reconcile = _ACTIVITY_CLASSIFIERS.get(
-                    controller_name)
-                if _classify_for_reconcile is not None:
-                    _reconcile_before_presentation(
-                        session_uuid, role_work_id,
-                        _classify_for_reconcile(
-                            _turn_boundary_activity_evidence(
-                                controller_name, send_result)),
-                        trace=trace)
-                _watchdog_decision_for_presentation(
-                    session_uuid, role_work_id, session, trace=trace,
-                    role=role)
-                if controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES:
-                    # quota_limited/overloaded: a genuine provider-capacity
-                    # signal must never auto-retry the SAME provider (the
-                    # frozen brief's invariant) -- attempt a durable
-                    # awaiting-capacity entry BEFORE falling through to the
-                    # ordinary controller-failure end below.
-                    # `provider_session_id`
-                    # is sourced from THIS session's own durable resume
-                    # state (`_durable_provider_session_id`), never an
-                    # in-process session object attribute -- works
-                    # identically for a fresh dispatch and a resumed one.
-                    capacity_payload = _enter_awaiting_capacity(
-                        session_uuid, role_work_id, role, controller_name,
-                        (_durable_provider_session_id(
-                            session_uuid, role, controller_name)
-                         or getattr(session, "session_id", None)
-                         or getattr(session, "thread_id", None)),
-                        controller_outcome, str(pending),
-                        getattr(session, "model", None),
-                        getattr(session, "effort", None),
-                        raw_evidence=raw_evidence,
-                        # Only the FIRST send carries the launch's decision
-                        # blocks (a later send follows an accepted, already
-                        # acknowledged one).
-                        decision_bindings=(
-                            _decision_launch_bindings(session_uuid, role)
-                            if first_send else None))
-                    if capacity_payload is not None:
+                                subtype=send_result.get("subtype"))
+                # M4 Package D: the activity-emission seam's real turn-boundary
+                # append (Package C's classify_<controller>_activity on this
+                # turn's real, flattened evidence, durably appended via Package
+                # B) and D's sole output-arbitration call site: the activity
+                # snapshot is written ONLY here, after the send has returned.
+                turn_activity_record = _emit_activity_record(
+                    session_uuid, role_work_id, session,
+                    _turn_boundary_activity_evidence(
+                        getattr(session, "controller", None), send_result),
+                    turn_started_monotonic, trace=trace, role=role)
+                if turn_activity_record is not None:
+                    turn_schedule_record = _ensure_scheduled_review(
+                        session_uuid, role_work_id, turn_activity_record["time"],
+                        activity_class=turn_activity_record["activity_class"])
+                    turn_watchdog_decision = _watchdog_decision_for_presentation(
+                        session_uuid, role_work_id, session, trace=trace,
+                        role=role)
+                    _render_activity_snapshot(
+                        io_out, turn_activity_record, turn_watchdog_decision,
+                        turn_schedule_record)
+                fp_after = state_store.fingerprint_status(status_path)
+                milestones.on_turn_end(send_ok=bool(send_result.get("ok", True)))
+                if trace:
+                    trace.event("role.fingerprint.after", role=role,
+                                status=fp_after["status"], sha256=fp_after["sha256"],
+                                size=fp_after["size"], exists=fp_after["exists"])
+                if (not send_result.get("ok", True)
+                        and fp_after["sha256"] == fp_before["sha256"]):
+                    if save_pending_turn_fn and pending:
+                        save_pending_turn_fn(role, pending,
+                                            source=last_send_source_ref)
+                    elif spath and pending:
+                        state_store.save_pending_turn(spath, role, pending,
+                                                      source=last_send_source_ref)
+                    if trace:
+                        trace.event("controller.failure", role=role, phase=phase,
+                                    reason="send_failed",
+                                    result=send_result.get("result"),
+                                    error_type=send_result.get("error_type"),
+                                    subtype=send_result.get("subtype"),
+                                    artifact_progress=False)
+                    # M3 Package E: classify this send failure via C's pure
+                    # taxonomy and durably record ProviderHealth for EVERY
+                    # classification, including the explicit
+                    # `unknown_provider_failure` member -- never skipped just
+                    # because it is unclassifiable.
+                    controller_name = getattr(session, "controller", None)
+                    raw_evidence = _synthesize_raw_failure_evidence(
+                        controller_name, send_result)
+                    controller_outcome = _classify_raw_failure(
+                        controller_name, raw_evidence)
+                    _record_provider_health(
+                        session_uuid, role, controller_name, controller_outcome,
+                        _capacity_now())
+                    # M4 Package D: reconcile + decide immediately before the
+                    # actual stall/retry/invalidation presentation below (the
+                    # capacity-entry write or the structured end/termination)
+                    # -- retains
+                    # original plus reconciled classification durably, and
+                    # combines durable evidence with a live process probe
+                    # before any terminal-leaning watchdog verdict.
+                    _classify_for_reconcile = _ACTIVITY_CLASSIFIERS.get(
+                        controller_name)
+                    if _classify_for_reconcile is not None:
+                        _reconcile_before_presentation(
+                            session_uuid, role_work_id,
+                            _classify_for_reconcile(
+                                _turn_boundary_activity_evidence(
+                                    controller_name, send_result)),
+                            trace=trace)
+                    _watchdog_decision_for_presentation(
+                        session_uuid, role_work_id, session, trace=trace,
+                        role=role)
+                    if controller_outcome in capacity_contracts.CAPACITY_ELIGIBLE_OUTCOMES:
+                        # quota_limited/overloaded: a genuine provider-capacity
+                        # signal must never auto-retry the SAME provider (the
+                        # frozen brief's invariant) -- attempt a durable
+                        # awaiting-capacity entry BEFORE falling through to the
+                        # ordinary controller-failure end below.
+                        # `provider_session_id`
+                        # is sourced from THIS session's own durable resume
+                        # state (`_durable_provider_session_id`), never an
+                        # in-process session object attribute -- works
+                        # identically for a fresh dispatch and a resumed one.
+                        capacity_payload = _enter_awaiting_capacity(
+                            session_uuid, role_work_id, role, controller_name,
+                            (_durable_provider_session_id(
+                                session_uuid, role, controller_name)
+                             or getattr(session, "session_id", None)
+                             or getattr(session, "thread_id", None)),
+                            controller_outcome, str(pending),
+                            getattr(session, "model", None),
+                            getattr(session, "effort", None),
+                            raw_evidence=raw_evidence,
+                            # Only the FIRST send carries the launch's decision
+                            # blocks (a later send follows an accepted, already
+                            # acknowledged one).
+                            decision_bindings=(
+                                _decision_launch_bindings(session_uuid, role)
+                                if first_send else None))
+                        if capacity_payload is not None:
+                            if trace:
+                                trace.event(
+                                    "capacity.awaiting", role=role, phase=phase,
+                                    controller_outcome=controller_outcome,
+                                    package_id=capacity_payload.get("package_id"),
+                                    lease_id=capacity_payload.get("lease_id"))
+                            io_out.write(
+                                "cowork: %s is awaiting provider capacity (%s) "
+                                "-- durably paused; resume via the capacity "
+                                "resume-trigger once eligible.\n"
+                                % (role, controller_outcome))
+                            io_out.flush()
+                            if first_send and on_first_send_rejected:
+                                on_first_send_rejected()
+                            outcome_kind = "awaiting_capacity"
+                            payload = capacity_payload
+                            break
+                    # Agent-only: there is no in-process recovery choice. A controller
+                    # failure ends the phase with a structured, non-approving
+                    # outcome; recovery is a machine re-invocation (resume, or
+                    # --switch-controller) by the orchestrator.
+                    #
+                    # M4 Package D: a run has no fallback at all -- so a TYPED
+                    # provider refusal or a
+                    # first-token-deadline expiry (never mere elapsed time or
+                    # an event tail: `no_first_token` is real, positive
+                    # evidence the deadline mechanism itself observed and
+                    # reaped) terminates the WHOLE PROCESS nonzero, naming
+                    # the provider reason, rather than quietly ending only
+                    # this phase. Every other send failure ends the phase with
+                    # the structured controller-failure outcome below.
+                    _turn_outcome = send_result.get("controller_turn_outcome")
+                    _no_fallback_terminal = (
+                        send_result.get("result") == "no_first_token"
+                        or (isinstance(_turn_outcome, dict)
+                            and _turn_outcome.get("outcome") == "refused"))
+                    if _no_fallback_terminal:
+                        _termination_reason = (
+                            (_turn_outcome or {}).get("failure_class")
+                            or send_result.get("result") or "no_first_token")
+                        io_out.write(
+                            "cowork: run terminating -- %s (%s), "
+                            "no fallback available.\n"
+                            % (controller_name or "controller",
+                               _termination_reason))
+                        io_out.flush()
                         if trace:
                             trace.event(
-                                "capacity.awaiting", role=role, phase=phase,
-                                controller_outcome=controller_outcome,
-                                package_id=capacity_payload.get("package_id"),
-                                lease_id=capacity_payload.get("lease_id"))
-                        io_out.write(
-                            "cowork: %s is awaiting provider capacity (%s) "
-                            "-- durably paused; resume via the capacity "
-                            "resume-trigger once eligible.\n"
-                            % (role, controller_outcome))
-                        io_out.flush()
+                                "gate.decision", decider="runtime", role=role,
+                                gate="controller_failure",
+                                action="terminate_process",
+                                reason=_termination_reason)
+                        _advance_phase(
+                            session_uuid, role_work_id, "execution_failed",
+                            evidence={
+                                "reason": "send_failed",
+                                "terminates_process": True,
+                                "termination_reason": _termination_reason},
+                            source="gate.runtime")
                         if first_send and on_first_send_rejected:
                             on_first_send_rejected()
-                        outcome_kind = "awaiting_capacity"
-                        payload = capacity_payload
+                        outcome_kind = _OUTCOME_PROCESS_TERMINATED
+                        payload = {
+                            "exit_code": PROVIDER_REFUSAL_EXIT_CODE,
+                            "role": role, "controller": controller_name,
+                            "reason": _termination_reason}
                         break
-                # Agent-only: there is no in-process recovery choice. A controller
-                # failure ends the phase with a structured, non-approving
-                # outcome; recovery is a machine re-invocation (resume, or
-                # --switch-controller) by the orchestrator.
-                #
-                # M4 Package D: a run has no fallback at all -- so a TYPED
-                # provider refusal or a
-                # first-token-deadline expiry (never mere elapsed time or
-                # an event tail: `no_first_token` is real, positive
-                # evidence the deadline mechanism itself observed and
-                # reaped) terminates the WHOLE PROCESS nonzero, naming
-                # the provider reason, rather than quietly ending only
-                # this phase. Every other send failure ends the phase with
-                # the structured controller-failure outcome below.
-                _turn_outcome = send_result.get("controller_turn_outcome")
-                _no_fallback_terminal = (
-                    send_result.get("result") == "no_first_token"
-                    or (isinstance(_turn_outcome, dict)
-                        and _turn_outcome.get("outcome") == "refused"))
-                if _no_fallback_terminal:
-                    _termination_reason = (
-                        (_turn_outcome or {}).get("failure_class")
-                        or send_result.get("result") or "no_first_token")
-                    io_out.write(
-                        "cowork: run terminating -- %s (%s), "
-                        "no fallback available.\n"
-                        % (controller_name or "controller",
-                           _termination_reason))
-                    io_out.flush()
                     if trace:
-                        trace.event(
-                            "gate.decision", decider="runtime", role=role,
-                            gate="controller_failure",
-                            action="terminate_process",
-                            reason=_termination_reason)
+                        trace.event("gate.decision", decider="runtime", role=role,
+                                    gate="controller_failure", action="end")
+                    _breaker_record("controller_failure")
                     _advance_phase(
                         session_uuid, role_work_id, "execution_failed",
-                        evidence={
-                            "reason": "send_failed",
-                            "terminates_process": True,
-                            "termination_reason": _termination_reason},
+                        evidence={"reason": "send_failed"},
                         source="gate.runtime")
                     if first_send and on_first_send_rejected:
                         on_first_send_rejected()
-                    outcome_kind = _OUTCOME_PROCESS_TERMINATED
-                    payload = {
-                        "exit_code": PROVIDER_REFUSAL_EXIT_CODE,
-                        "role": role, "controller": controller_name,
-                        "reason": _termination_reason}
+                    # #101: an authentication failure names the safe route and
+                    # that approved upstream artifacts are reused; every other
+                    # controller failure keeps its exact payload shape.
+                    _auth_end = controller_outcome == "authentication_failed"
+                    if _auth_end:
+                        io_out.write(
+                            "cowork: %s rejected the turn: authentication "
+                            "failed. %s.\n"
+                            % (controller_name or "controller",
+                               _AUTH_RECOVERY_ROUTE))
+                        io_out.flush()
+                    outcome_kind = _OUTCOME_ENDED
+                    payload = _agent_stop_payload(
+                        "controller_failure", role, requires="operator",
+                        controller=controller_name,
+                        controller_outcome=controller_outcome,
+                        status_path=status_path,
+                        **(_auth_recovery_facts() if _auth_end else {}))
                     break
-                if trace:
-                    trace.event("gate.decision", decider="runtime", role=role,
-                                gate="controller_failure", action="end")
-                _breaker_record("controller_failure")
-                _advance_phase(
-                    session_uuid, role_work_id, "execution_failed",
-                    evidence={"reason": "send_failed"},
-                    source="gate.runtime")
-                if first_send and on_first_send_rejected:
-                    on_first_send_rejected()
-                # #101: an authentication failure names the safe route and
-                # that approved upstream artifacts are reused; every other
-                # controller failure keeps its exact payload shape.
-                _auth_end = controller_outcome == "authentication_failed"
-                if _auth_end:
-                    io_out.write(
-                        "cowork: %s rejected the turn: authentication "
-                        "failed. %s.\n"
-                        % (controller_name or "controller",
-                           _AUTH_RECOVERY_ROUTE))
-                    io_out.flush()
-                outcome_kind = _OUTCOME_ENDED
-                payload = _agent_stop_payload(
-                    "controller_failure", role, requires="operator",
-                    controller=controller_name,
-                    controller_outcome=controller_outcome,
-                    status_path=status_path,
-                    **(_auth_recovery_facts() if _auth_end else {}))
-                break
-            if send_result.get("ok", True):
-                if first_send:
-                    # #101: the first accepted send after an authentication
-                    # failure clears the forced-probe trigger (best-effort).
-                    _clear_live_auth_trigger(
-                        session_uuid, role,
-                        getattr(session, "controller", None),
-                        _capacity_now(), trace=trace)
-                if first_send and on_first_send_accepted:
-                    on_first_send_accepted()
-                    on_first_send_accepted = None
-                if clear_pending_turn_fn:
-                    clear_pending_turn_fn(role)
-                elif spath:
-                    state_store.clear_pending_switch(spath, role)
-            # Stale-no-op detection: a reopened (or in-repair) turn that left the
-            # status file byte-identical made no progress. Both-missing
-            # (None == None) also counts as a no-op — the role never wrote.
-            if (reopened_this_turn or in_repair) and (
-                    fp_after["sha256"] == fp_before["sha256"]):
-                if not in_repair:
-                    # First no-op of the episode: one automatic, invisible
-                    # repair turn (bounded — never a repair loop).
-                    in_repair = True
-                    repair_reason = reopen_reason_this_turn
+                if send_result.get("ok", True):
+                    if first_send:
+                        # #101: the first accepted send after an authentication
+                        # failure clears the forced-probe trigger (best-effort).
+                        _clear_live_auth_trigger(
+                            session_uuid, role,
+                            getattr(session, "controller", None),
+                            _capacity_now(), trace=trace)
+                    if first_send and on_first_send_accepted:
+                        on_first_send_accepted()
+                        on_first_send_accepted = None
+                    if clear_pending_turn_fn:
+                        clear_pending_turn_fn(role)
+                    elif spath:
+                        state_store.clear_pending_switch(spath, role)
+                # Stale-no-op detection: a reopened (or in-repair) turn that left the
+                # status file byte-identical made no progress. Both-missing
+                # (None == None) also counts as a no-op — the role never wrote.
+                if (reopened_this_turn or in_repair) and (
+                        fp_after["sha256"] == fp_before["sha256"]):
+                    if not in_repair:
+                        # First no-op of the episode: one automatic, invisible
+                        # repair turn (bounded — never a repair loop).
+                        in_repair = True
+                        repair_reason = reopen_reason_this_turn
+                        if trace:
+                            trace.event(
+                                "stale_noop", role=role,
+                                reopen_reason=reopen_reason_this_turn,
+                                before_status=fp_before["status"],
+                                after_status=fp_after["status"],
+                                before_sha256=fp_before["sha256"],
+                                after_sha256=fp_after["sha256"],
+                                repair_attempted=True)
+                        repair_ordinal += 1
+                        _repair_link = _build_gate_repair_attempt_link(
+                            role, phase, last_send_source_ref,
+                            _repair_prompt(artifact_noun), repair_ordinal)
+                        if session_uuid:
+                            guard_broker.append_once(
+                                state_store.dispatch_links_path_for(session_uuid),
+                                _repair_link, key="idempotency_key")
+                        if trace:
+                            trace.event("dispatch.attempt_link", role=role,
+                                        kind="gate_repair", ordinal=repair_ordinal,
+                                        attempt_id=_repair_link["attempt_id"],
+                                        idempotency_key=_repair_link["idempotency_key"])
+                        pending = _repair_delivery(artifact_noun,
+                                                  attempt_link=_repair_link)
+                        continue
+                    # Second consecutive no-op: the automatic repair failed. End
+                    # with a structured failure instead of looping forever.
                     if trace:
                         trace.event(
-                            "stale_noop", role=role,
-                            reopen_reason=reopen_reason_this_turn,
+                            "stale_noop.unresolved", role=role,
+                            reopen_reason=repair_reason,
                             before_status=fp_before["status"],
                             after_status=fp_after["status"],
                             before_sha256=fp_before["sha256"],
                             after_sha256=fp_after["sha256"],
                             repair_attempted=True)
-                    repair_ordinal += 1
-                    _repair_link = _build_gate_repair_attempt_link(
-                        role, phase, last_send_source_ref,
-                        _repair_prompt(artifact_noun), repair_ordinal)
-                    if session_uuid:
-                        guard_broker.append_once(
-                            state_store.dispatch_links_path_for(session_uuid),
-                            _repair_link, key="idempotency_key")
+                    in_repair = False
+                    # Agent-only: the bounded automatic repair already failed, so
+                    # the phase ends with a structured, non-approving outcome
+                    # rather than waiting on an inspect/retry choice.
                     if trace:
-                        trace.event("dispatch.attempt_link", role=role,
-                                    kind="gate_repair", ordinal=repair_ordinal,
-                                    attempt_id=_repair_link["attempt_id"],
-                                    idempotency_key=_repair_link["idempotency_key"])
-                    pending = _repair_delivery(artifact_noun,
-                                              attempt_link=_repair_link)
-                    continue
-                # Second consecutive no-op: the automatic repair failed. End
-                # with a structured failure instead of looping forever.
-                if trace:
-                    trace.event(
-                        "stale_noop.unresolved", role=role,
-                        reopen_reason=repair_reason,
-                        before_status=fp_before["status"],
-                        after_status=fp_after["status"],
-                        before_sha256=fp_before["sha256"],
-                        after_sha256=fp_after["sha256"],
-                        repair_attempted=True)
-                in_repair = False
-                # Agent-only: the bounded automatic repair already failed, so
-                # the phase ends with a structured, non-approving outcome
-                # rather than waiting on an inspect/retry choice.
-                if trace:
-                    trace.event("gate.decision", decider="runtime", role=role, gate="stuck",
-                                action="end")
-                _advance_phase(
-                    session_uuid, role_work_id, "execution_failed",
-                    evidence={"reason": "stale_noop"},
-                    source="gate.runtime")
-                outcome_kind = _OUTCOME_ENDED
-                payload = _agent_stop_payload(
-                    "stale_noop", role, requires="operator",
-                    status_path=status_path, reopen_reason=repair_reason)
-                break
+                        trace.event("gate.decision", decider="runtime", role=role, gate="stuck",
+                                    action="end")
+                    _advance_phase(
+                        session_uuid, role_work_id, "execution_failed",
+                        evidence={"reason": "stale_noop"},
+                        source="gate.runtime")
+                    outcome_kind = _OUTCOME_ENDED
+                    payload = _agent_stop_payload(
+                        "stale_noop", role, requires="operator",
+                        status_path=status_path, reopen_reason=repair_reason)
+                    break
+            skip_lead_send = False
             # Progress (the file changed) — clear any repair state and proceed.
             in_repair = False
             repair_reason = None
@@ -8309,6 +8503,38 @@ def _role_loop(session, first, status_path, context, io_out,
                                     reviewer_role=reviewer_role,
                                     gate="reviewer_failure", action="stop")
                             review_action = "stop"
+                            if failed_turn_fn is not None:
+                                # Retain the exact request, candidate and
+                                # finding identities so the next run resumes
+                                # THIS reviewer, not the completed lead.
+                                try:
+                                    failed_turn_fn({
+                                        "lead_role": role,
+                                        "reviewer_role": reviewer_role,
+                                        "phase": phase,
+                                        "status_path": status_path,
+                                        "candidate_sha256": reviewed_sha256,
+                                        "summary_path": (
+                                            build_summary_path
+                                            if role == "builder" else None),
+                                        "summary_sha256": (
+                                            _file_sha256(build_summary_path)
+                                            if role == "builder" else None),
+                                        "review_path": review_path,
+                                        "finding_sha256":
+                                            _file_sha256(review_path),
+                                        "round": review_rounds,
+                                        "failures": review_failures,
+                                        "context_revision": context_revision,
+                                        "work_id": role_work_id,
+                                        "lead_controller": getattr(
+                                            session, "controller", None)})
+                                except (OSError, ValueError) as exc:
+                                    if trace:
+                                        trace.event(
+                                            "recovery.failed_turn.error",
+                                            role=reviewer_role,
+                                            error_type=type(exc).__name__)
                             stop_payload = _agent_stop_payload(
                                 "reviewer_unavailable", role,
                                 requires="reviewer",
@@ -11581,9 +11807,14 @@ def run_planner(config, context, selected, io_out=None,
                 reviewer_controller_check_fn=None,
                 save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None,
-                profile_session=None):
+                profile_session=None, failed_turn_fn=None,
+                reviewer_first=None, lead_context_block_fn=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
+
+    `failed_turn_fn` / `reviewer_first` / `lead_context_block_fn` (exact-role
+    recovery, additive, default `None`) are handed to `_role_loop` unchanged;
+    with all three `None` the launch is exactly the legacy one.
 
     `context` is the seed message for this cycle: the approved-intel seed on a
     fresh chain, a digest wake block after a hand-back round trip, or "" on a
@@ -11744,6 +11975,11 @@ def run_planner(config, context, selected, io_out=None,
         clear_pending_turn_fn=clear_pending_turn_fn)
     if profile_session is not None:
         loop_kwargs["profile_session"] = profile_session
+    for _name, _value in (("failed_turn_fn", failed_turn_fn),
+                          ("reviewer_first", reviewer_first),
+                          ("lead_context_block_fn", lead_context_block_fn)):
+        if _value is not None:
+            loop_kwargs[_name] = _value
 
     if cfg["controller"] == "claude":
         _pf = _guard_to_policy_fact(cfg["controller"], "planner", trace=trace)
@@ -11982,9 +12218,15 @@ def run_builder(config, context, selected, io_out=None,
                 save_pending_turn_fn=None,
                 clear_pending_turn_fn=None, worktree=None, worktree_base=None,
                 checkpoint_id=None, artifact_kind=None,
-                external_output_roots=(), profile_session=None):
+                external_output_roots=(), profile_session=None,
+                failed_turn_fn=None, reviewer_first=None,
+                lead_context_block_fn=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
+
+    `failed_turn_fn` / `reviewer_first` / `lead_context_block_fn` (exact-role
+    recovery, additive, default `None`) are handed to `_role_loop` unchanged;
+    with all three `None` the launch is exactly the legacy one.
 
     `external_output_roots` (#99) are the session's declared external output
     roots; the builder is the only role that receives them, on every spawn.
@@ -12178,6 +12420,11 @@ def run_builder(config, context, selected, io_out=None,
     if profile_session is not None:
         loop_kwargs["profile_session"] = profile_session
         loop_kwargs["plan_json_path"] = plan_json_path
+    for _name, _value in (("failed_turn_fn", failed_turn_fn),
+                          ("reviewer_first", reviewer_first),
+                          ("lead_context_block_fn", lead_context_block_fn)):
+        if _value is not None:
+            loop_kwargs[_name] = _value
 
     if cfg["controller"] == "claude":
         _bf = _guard_to_policy_fact(cfg["controller"], "builder", trace=trace)
@@ -14887,6 +15134,190 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 return note
             raise TypeError("controller-switch note lacks handoff provenance")
 
+        # ------------------------------------------------------------------ #
+        # Exact-role recovery. A paired reviewer that could not return a      #
+        # usable verdict is the role that resumes FIRST, against the exact    #
+        # candidate it was judging; its completed lead receives no send. The  #
+        # reviewer's own pending entry is the only anchor: the packets above  #
+        # already deliver it by path, and no second dispatcher exists -- the  #
+        # decision below only tells the ONE lead runner to skip its send.     #
+        # ------------------------------------------------------------------ #
+
+        def _recovery_lead_paths(lead):
+            """(status_path, review_path, summary_path) of one lead's
+            candidate and its reviewer's verdict file."""
+            if lead == "planner":
+                return plan_json_path, planner_review_path, None
+            return build_status_path, build_review_path, build_summary_path
+
+        def failed_turn_writer_for(lead):
+            """The `failed_turn_fn` handed to a lead launch: at the
+            `reviewer_unavailable` stop it persists the hash-bound record
+            (and its request text as the reviewer's pending turn) in ONE
+            write. Identities that cannot be resolved leave the legacy
+            behavior untouched."""
+            def write(ident):
+                if not (session_enabled and session_uuid):
+                    return
+                reviewer = ident["reviewer_role"]
+                provider_id = role_resume_id(lead)
+                # The lead's controller is the session's own configuration,
+                # the same source `role_resume_id` resolves its id against.
+                ident = dict(ident, lead_controller=(
+                    config.get(lead) or {}).get("controller"))
+                if not (provider_id and ident.get("candidate_sha256")
+                        and ident.get("review_path") and ident.get("work_id")
+                        and ident.get("lead_controller")):
+                    trace.event("recovery.failed_turn.skipped", role=reviewer,
+                                reason="identity_unresolved")
+                    return
+                manifest = dispatch_manifest.load_manifest(
+                    state_store.manifest_path_for(session_uuid, lead))
+                record = build_failed_turn_record(
+                    ident, session_uuid, provider_id,
+                    (manifest or {}).get("digest"),
+                    len(state_store.read_invalidation_history(session_uuid)),
+                    (epoch_box if lead == "planner"
+                     else building_epoch_box)["epoch"],
+                    ledger_ids=_open_finding_ids(
+                        session_uuid, ident["phase"], reviewer))
+                holder["state"] = state_store.save_failed_turn(
+                    spath, reviewer, record, prior=holder["state"])
+                trace.event("recovery.failed_turn.saved", role=reviewer,
+                            lead_role=lead,
+                            request_sha256=record["request"]["sha256"],
+                            candidate_sha256=record["candidate"]["sha256"])
+            return write
+
+        def lead_context_block_for(lead):
+            """The context-update block a lead still owes, composed in front
+            of its first real send after a reviewer-first revise (None when it
+            owes none). The honest delivery trace is emitted only here."""
+            def block():
+                if not session_enabled or not role_resume_id(lead):
+                    return None
+                gap = state_store.role_context_gap(holder["state"], lead)
+                if not gap:
+                    return None
+                trace.event("context.gap", role=lead, revision=current_rev,
+                            context_revision=current_rev, delivered=True,
+                            reason="reviewer_first_revise")
+                return context_update_block(gap, intel_dir, current_rev)
+            return block
+
+        def recovery_route_for(lead):
+            """Decide, BEFORE any dispatch, whether this lead launch resumes
+            its failed paired reviewer first. Returns `(route, detail)`:
+            ("fresh", None) -> the unchanged lead-first launch;
+            ("reviewer_first", binding) -> skip the lead's send once;
+            ("stop", payload) -> `recovery_binding_mismatch`, no send.
+            Order: structure, linked reopen reasons, then the holds."""
+            reviewer = handoff.ROLE_REGISTRY[lead]["reviewer"]
+            if not (session_enabled and session_uuid):
+                return "fresh", None
+            state = holder["state"]
+            status_path, review_path, summary_path = _recovery_lead_paths(lead)
+
+            def decided(route, reason, tier=None, detail=None):
+                trace.event("recovery.route", role=lead,
+                            reviewer_role=reviewer, route=route,
+                            reason=reason, tier=tier, stage="run_flow")
+                return route, detail
+
+            def stop(code, record=None):
+                return decided("stop", code, tier="exact",
+                               detail=_recovery_stop_payload(
+                                   lead, code, reviewer_role=reviewer,
+                                   record=record))
+
+            for stray in (PLANNING_ADVISOR, BUILD_REVIEWER):
+                if stray != reviewer and state_store.failed_turn_present(
+                        state, stray):
+                    return stop("wrong_first_role")
+            entry = state_store.read_pending_switch(state, reviewer)
+            if not entry:
+                return "fresh", None
+            lead_session_id = role_resume_id(lead)
+            if not state_store.failed_turn_present(state, reviewer):
+                # An older-shaped reviewer entry (a switch marker, or a bare
+                # pending turn): reviewer-first only while the lead's complete
+                # candidate has no usable verdict on disk and nothing else
+                # owes the lead a send. The binding is in memory only.
+                derived = (
+                    state_store.read_status(status_path) == "ready_for_review"
+                    and _is_review_failure(state_store.read_review(review_path))
+                    and bool(lead_session_id)
+                    and not pending_switch_for(lead)
+                    and state_store.read_pending_turn_before_pause(
+                        session_uuid, lead) is None
+                    and not decision_pending_for.get(lead))
+                if not derived:
+                    return decided("fresh", "derived_conditions_unmet",
+                                   tier="derived")
+                return decided(
+                    "reviewer_first", "held", tier="derived", detail={
+                        "tier": "derived", "record": None, "lead_role": lead,
+                        "reviewer_role": reviewer, "round": 1})
+            record = state_store.read_failed_turn(state, reviewer)
+            if record is None:
+                return stop("malformed_record")
+            if record["role"] != reviewer or record["lead_role"] != lead:
+                return stop("wrong_first_role", record)
+            if record["phase"] != phase:
+                return stop("phase_mismatch", record)
+            if reviewer not in selected:
+                return stop("reviewer_not_on_team", record)
+            # Linked reopen reasons (never a context-revision bump or a lead
+            # controller switch on its own): a durable InvalidationRecord that
+            # names this exact candidate, or a trusted lead decision that is
+            # still owed. Either retires the record and the lead runs first.
+            reopen = None
+            lead_facts = record["lead"]
+            digest = lead_facts.get("candidate_manifest_digest")
+            if digest:
+                for rec in state_store.read_invalidation_history(session_uuid):
+                    seq = rec.get("sequence") if isinstance(rec, dict) else None
+                    if (isinstance(seq, int) and not isinstance(seq, bool)
+                            and seq >= record["invalidation_seq_at_failure"]
+                            and rec.get("invalidated_session_id")
+                            == session_uuid
+                            and rec.get("invalidated_work_id")
+                            == lead_facts["work_id"]
+                            and rec.get("invalidated_candidate_digest")
+                            == digest):
+                        reopen = ("invalidation_record",
+                                  "invalidation:%d" % seq)
+                        break
+            if reopen is None and decision_pending_for.get(lead):
+                reopen = ("pending_lead_decision",
+                          ",".join(decision_pending_for[lead]))
+            if reopen is not None:
+                holder["state"] = state_store.retire_failed_turn(
+                    spath, reviewer, reopen[0], reopen[1],
+                    prior=holder["state"])
+                pending_switch_turns.pop(reviewer, None)
+                return decided("fresh", reopen[0], tier="exact")
+            if (lead_session_id != lead_facts["provider_session_id"]
+                    or lead_facts["controller"]
+                    != (config.get(lead) or {}).get("controller")):
+                return stop("lead_session_mismatch", record)
+            if state_store.read_status(status_path) != "ready_for_review":
+                return stop("lead_not_ready", record)
+            candidate = record["candidate"]
+            if (state_store.fingerprint_status(status_path)["sha256"]
+                    != candidate["sha256"]
+                    or (summary_path is not None
+                        and _file_sha256(summary_path)
+                        != candidate.get("summary_sha256"))):
+                return stop("candidate_changed", record)
+            return decided(
+                "reviewer_first", "held", tier="exact", detail={
+                    "tier": "exact", "record": record, "lead_role": lead,
+                    "reviewer_role": reviewer,
+                    "candidate_sha256": candidate["sha256"],
+                    "summary_sha256": candidate.get("summary_sha256"),
+                    "round": record["round"]})
+
         # Peer-evaluation assets: a per-role scratch file (each evaluator's only
         # eval write target) and the orchestrator-only aggregate scores file.
         eval_scratch = {
@@ -15609,6 +16040,22 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     if not ensure_controller_available("planner", reason="lead_launch"):
                         rc = 1
                         break
+                    recovery_route, recovery_detail = recovery_route_for(
+                        "planner")
+                    if recovery_route == "stop":
+                        record_outcome("planner", {
+                            "outcome": _OUTCOME_ENDED,
+                            "payload": recovery_detail})
+                        result_box.setdefault("reason", RECOVERY_STOP_KIND)
+                        rc = 1
+                        break
+                    recovery_run_kw = {
+                        "failed_turn_fn": failed_turn_writer_for("planner")}
+                    if recovery_route == "reviewer_first":
+                        recovery_run_kw.update(
+                            reviewer_first=recovery_detail,
+                            lead_context_block_fn=lead_context_block_for(
+                                "planner"))
                     planner_box = {"outcome": None, "payload": None}
                     (planner_first_send_cb, planner_first_send_rejected_cb,
                      planner_first_send_box) = _first_send_delivery_tracker(
@@ -15619,6 +16066,10 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     planner_first_send_cb = decision_first_send("planner", planner_first_send_cb)
                     rc = run_planner_fn(
                         config,
+                        # Reviewer-first: no lead seed is composed (nothing is
+                        # sent to the completed lead, so no context or
+                        # decision delivery may be recorded for it).
+                        "" if recovery_route == "reviewer_first" else
                         with_agent_lead_note(with_decision_note("planner", seed_with_switch_note(
                             "planner",
                             deliver_context(
@@ -15655,7 +16106,7 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         clear_pending_turn_fn=clear_pending_switch_for,
                         worktree=active_worktree, worktree_base=active_worktree_root,
                         on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p),
-                        **profile_run_kw)
+                        **recovery_run_kw, **profile_run_kw)
                     _bind_decision_launch(session_uuid, "planner", None)
                     record_outcome("planner", planner_box)
                     reconcile_profile_team()
@@ -15725,6 +16176,21 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 if not ensure_controller_available("builder", reason="lead_launch"):
                     rc = 1
                     break
+                recovery_route, recovery_detail = recovery_route_for("builder")
+                if recovery_route == "stop":
+                    record_outcome("builder", {
+                        "outcome": _OUTCOME_ENDED,
+                        "payload": recovery_detail})
+                    result_box.setdefault("reason", RECOVERY_STOP_KIND)
+                    rc = 1
+                    break
+                recovery_run_kw = {
+                    "failed_turn_fn": failed_turn_writer_for("builder")}
+                if recovery_route == "reviewer_first":
+                    recovery_run_kw.update(
+                        reviewer_first=recovery_detail,
+                        lead_context_block_fn=lead_context_block_for(
+                            "builder"))
                 builder_box = {"outcome": None, "payload": None}
                 (builder_first_send_cb, builder_first_send_rejected_cb,
                  builder_first_send_box) = _first_send_delivery_tracker(
@@ -15739,6 +16205,8 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     capture_building_baseline()
                 rc = run_builder_fn(
                     config,
+                    # Reviewer-first: no lead seed is composed (see planning).
+                    "" if recovery_route == "reviewer_first" else
                     with_agent_lead_note(with_decision_note("builder", seed_with_switch_note(
                         "builder",
                         deliver_context("builder",
@@ -15778,7 +16246,7 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     worktree=active_worktree, worktree_base=active_worktree_root,
                     external_output_roots=declared_roots,
                     on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p),
-                    **profile_run_kw)
+                    **recovery_run_kw, **profile_run_kw)
                 _bind_decision_launch(session_uuid, "builder", None)
                 record_outcome("builder", builder_box)
                 reconcile_profile_team()

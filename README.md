@@ -495,6 +495,12 @@ cowork --session-file PATH --decline-handoff REQUEST_ID [--context-file ./why.md
   continues exactly once even when the recovery budget for that cause is
   spent, reusing the approved upstream artifacts. A still-rejected probe ends
   at the probe seam with the same route and no role turn.
+- After `reviewer_unavailable` (the planning-advisor or build-reviewer could not
+  return a usable verdict), the next plain resume or `--switch-controller` of
+  that reviewer dispatches the reviewer first, against the exact candidate it
+  was judging, and never re-sends the completed lead. A recovery binding that
+  no longer holds ends rc 1 with `stop.kind` `recovery_binding_mismatch` before
+  any send. See [Controller switching](#controller-switching).
 
 ### Controller updates
 
@@ -722,6 +728,40 @@ orchestrator then re-invokes with the switch:
 ```bash
 cowork --session-file .cowork/session.<uuid>.json --switch-controller planner=codex
 ```
+
+A failed paired reviewer recovers first. When the planning-advisor or
+build-reviewer stops the phase with `reviewer_unavailable`, cowork records the
+failed request, the candidate's sha256 (and, for the builder, its summary's),
+the verdict-file identity and the lead's session and work identities in the
+reviewer's own pending entry. A plain resume, or a `--switch-controller` of the
+reviewer, then dispatches that reviewer first through the same path-based
+handoff packet and sends nothing to the completed lead; the lead's artifacts,
+session id, review rounds, limits, capacity leases, context revisions and
+controller policy are held. The builder's owned verification transaction still
+runs before the build-reviewer gate (it is not a lead send). If the reviewer
+approves, the phase completes as usual; if it genuinely asks for changes, the
+lead is reopened through the ordinary revise handoff, with any unseen context
+update delivered ahead of it. A reviewer entry written by an older run (a switch
+marker or bare pending turn, no recorded failure) takes the same route only
+while the lead's candidate is `ready_for_review` and has no usable verdict on
+disk.
+
+The lead is reopened first only for a linked reason: a durable
+`InvalidationRecord` naming the cowork session, the failed lead attempt's work
+id and the lead's dispatch-manifest digest (appended after the failure), or a
+trusted orchestrator decision still owed to the lead. A context-revision bump or
+a lead controller switch is not one. Without such a reason, a candidate whose
+bytes changed (`candidate_changed`), a lead that is no longer `ready_for_review`
+(`lead_not_ready`) or whose saved session no longer matches
+(`lead_session_mismatch`) stops with `recovery_binding_mismatch` (rc 1,
+`requires: operator`, no send); the stop carries the session uuid, the failed
+lead work id and the manifest digest. The supervisor's exit is to append that
+`InvalidationRecord` with `state_store.append_invalidation_record`, after which
+the next run reopens the lead. A record naming the wrong role or phase, a
+reviewer that is not on the team, or a malformed record (`wrong_first_role`,
+`phase_mismatch`, `reviewer_not_on_team`, `malformed_record`) has no such exit
+and needs the session anchor repaired out of band. The capacity resume-trigger
+is unchanged.
 
 Before committing the switch, cowork checks the target controller executable and
 uses the existing install guidance if it is missing. When the target is Claude,

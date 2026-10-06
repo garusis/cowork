@@ -2673,6 +2673,125 @@ def clear_pending_switch(path, role, prior=None):
     return state
 
 
+# --------------------------------------------------------------------------- #
+# Failed reviewer turn (exact-role recovery).                                 #
+#                                                                             #
+# When a paired reviewer cannot return a usable verdict the phase stops, and  #
+# the next run must resume THAT reviewer against the exact candidate it was   #
+# judging, not re-send the lead that already finished. The record lives       #
+# inside the reviewer's own `pending_switches` entry, beside `pending_turn`,  #
+# so the existing consume path (`clear_pending_switch`) retires it together   #
+# with the entry. Everything here is additive: an old session file has no     #
+# `failed_turn` key and reads exactly as before.                              #
+# --------------------------------------------------------------------------- #
+
+FAILED_TURN_SCHEMA = 1
+FAILED_TURN_RETIREMENTS_KEY = "failed_turn_retirements"
+FAILED_TURN_RETIREMENTS_KEEP = 8
+
+
+def _is_plain_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _nonempty_str(value):
+    return isinstance(value, str) and bool(value)
+
+
+def save_failed_turn(path, role, record, prior=None):
+    """Persist `record` as `role`'s `failed_turn` in ONE write, together with
+    its request text as the entry's `pending_turn` (so the existing path-based
+    handoff packets deliver the request by path). Any controller-switch fields
+    already on the entry are kept; a stale `pending_source` is dropped because
+    it described the text this write replaces."""
+    state = dict(prior or load(path) or {})
+    pending = dict(state.get("pending_switches") or {})
+    entry = dict(pending.get(role) or {})
+    entry["failed_turn"] = dict(record)
+    entry["pending_turn"] = record["request"]["text"]
+    entry.pop("pending_source", None)
+    pending[role] = entry
+    state["pending_switches"] = pending
+    save(path, state)
+    return state
+
+
+def failed_turn_present(state, role):
+    """True when `role`'s pending entry carries a `failed_turn` key at all,
+    even a malformed one, so a caller can fail closed instead of silently
+    treating an unreadable record as absent."""
+    entry = ((state or {}).get("pending_switches") or {}).get(role)
+    return isinstance(entry, dict) and entry.get("failed_turn") is not None
+
+
+def read_failed_turn(state, role):
+    """The validated schema-1 `failed_turn` of `role`, or None when absent,
+    retired or malformed."""
+    entry = ((state or {}).get("pending_switches") or {}).get(role)
+    rec = entry.get("failed_turn") if isinstance(entry, dict) else None
+    if not isinstance(rec, dict) or rec.get("schema") != FAILED_TURN_SCHEMA:
+        return None
+    for key in ("role", "lead_role", "phase"):
+        if not _nonempty_str(rec.get(key)):
+            return None
+    request = rec.get("request")
+    if not (isinstance(request, dict) and _nonempty_str(request.get("sha256"))
+            and isinstance(request.get("text"), str)):
+        return None
+    candidate = rec.get("candidate")
+    if not (isinstance(candidate, dict) and _nonempty_str(candidate.get("path"))
+            and _nonempty_str(candidate.get("sha256"))):
+        return None
+    finding = rec.get("finding")
+    if not (isinstance(finding, dict) and _nonempty_str(finding.get("path"))):
+        return None
+    lead = rec.get("lead")
+    if not (isinstance(lead, dict) and _nonempty_str(lead.get("controller"))
+            and _nonempty_str(lead.get("provider_session_id"))
+            and _nonempty_str(lead.get("work_id"))):
+        return None
+    if not (_is_plain_int(rec.get("invalidation_seq_at_failure"))
+            and _is_plain_int(rec.get("round"))):
+        return None
+    return dict(rec)
+
+
+def retire_failed_turn(path, role, reason, reason_ref=None, prior=None):
+    """Retire `role`'s `failed_turn` because the lead was legitimately
+    reopened. Drops the entry's `pending_turn` only when it is the record's own
+    request text, and the entry itself when no switch fields or pending turn
+    remain. The retirement is appended to a bounded top-level log."""
+    state = dict(prior or load(path) or {})
+    pending = dict(state.get("pending_switches") or {})
+    entry = dict(pending.get(role) or {})
+    rec = entry.pop("failed_turn", None)
+    if rec is None:
+        return state
+    request = rec.get("request") if isinstance(rec, dict) else None
+    request = request if isinstance(request, dict) else {}
+    if entry.get("pending_turn") == request.get("text"):
+        entry.pop("pending_turn", None)
+        entry.pop("pending_source", None)
+    if entry.get("from_controller") or entry.get("to_controller") \
+            or entry.get("pending_turn"):
+        pending[role] = entry
+    else:
+        pending.pop(role, None)
+    if pending:
+        state["pending_switches"] = pending
+    else:
+        state.pop("pending_switches", None)
+    log = dict(state.get(FAILED_TURN_RETIREMENTS_KEY) or {})
+    history = list(log.get(role) or [])
+    history.append({"reason": reason, "reason_ref": reason_ref,
+                    "request_sha256": request.get("sha256"),
+                    "retired_at": time.time()})
+    log[role] = history[-FAILED_TURN_RETIREMENTS_KEEP:]
+    state[FAILED_TURN_RETIREMENTS_KEY] = log
+    save(path, state)
+    return state
+
+
 def switch_role_controller(path, role, target_controller, prior=None,
                            reason=None, source=None, created=None,
                            pending_turn=None):
@@ -2740,6 +2859,11 @@ def _apply_role_switch(state, role, target_controller, reason=None,
     ps = prev_entry.get("pending_source")
     if ps is not None:
         switch_entry["pending_source"] = ps
+    # A failed reviewer turn's hash-bound record survives the switch with its
+    # request text, so the switched reviewer resumes against the same candidate.
+    ft = prev_entry.get("failed_turn")
+    if ft is not None:
+        switch_entry["failed_turn"] = ft
     pending[role] = switch_entry
     state["pending_switches"] = pending
     return state
