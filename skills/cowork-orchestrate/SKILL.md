@@ -25,12 +25,22 @@ Cowork is the agent transport. Run the package through the `cowork` CLI per the
   discovery, planning, implementation, and assurance the risk needs. Teams are
   paired and every new session begins with `scout` and `scout-reviewer`; there
   is no standalone planner, builder, or reviewer session.
-- Prefer an explicit execution profile over an ad hoc team: preview it with
-  `cowork --preview-profile NAME`, then pass `--profile NAME` (`light` for a
-  bounded documentation batch, `standard` for a behavior change, `assurance` for
-  invariant or architectural work). Promotion is automatic and one-way; a
-  profile never weakens the final suite, paired approval or any user-required
-  check.
+- Select an explicit execution profile for implementation from the actual
+  scope, risk and deliverable; use `cowork-cli` for preview and launch mechanics.
+  Use `light` for bounded non-executable documentation batches, `standard` for
+  behavior changes or executable tests, and `assurance` for architectural,
+  security or authority invariants. Do not select by milestone or default to
+  `standard` without judgment. Preserve explicit product/user checks and record
+  the rationale and preview policy version/digest in package authority.
+- Investigation-only and planning-only deliverables may use a manual paired
+  team: every shipped profile includes building. Record the required stopping
+  phase and why a profile exceeds scope; label the session manual/unprofiled.
+  Do not invent profile-plus-team or stop-phase flags. An external supervisor
+  validation is not a Cowork profile session.
+- Existing unprofiled implementation sessions remain an explicit resume
+  exception: Cowork cannot bind a profile to them after launch. Preserve their
+  team, authority and manual/unprofiled attribution; use profiles for new work,
+  not a restart or invented historical rationale for old work.
 
 ## Run and supervise
 
@@ -51,6 +61,20 @@ Cowork is the agent transport. Run the package through the `cowork` CLI per the
   polling loop or normal-path log tail.
 - Use `cowork-debug` only when the run result, artifacts, trace, session
   identity, or status conflict.
+- Verify the saved anchor and official execution-profile record against the
+  intended selection after launch and at collection. Preserve the effective
+  profile, promotions and their reasons on resume; never demote or relabel old
+  sessions to reduce apparent cost. Missing historical rationale stays unknown,
+  and retrospective explanations are marked as such. Compare equivalent task,
+  risk, checks, model and evaluation cohorts using independent quality, usage,
+  elapsed/recovery/repeated-verification time and external supervisor/review
+  overhead; do not pool manual sessions with profiled ones.
+- When observed work exposes an inadequately served task shape, use
+  `cowork-internal` to find or file a `dogfooding` issue: include session/task
+  evidence, why existing profiles or exceptions are insufficient, expected
+  benefit as a hypothesis, retained safeguards and a measurable comparison.
+  Consider adapting an existing profile before adding one. Recording an idea
+  neither authorizes implementation nor blocks unrelated work.
 
 ## Accept
 

@@ -43,8 +43,8 @@ Use a `schema_version` and `package_id` in every JSON artifact.
 | Artifact | Required content |
 | --- | --- |
 | `brief.md` | objective; in/out scope; allowed paths; invariants; deterministic gates; delegated judgment/publish policy; `subscription_only` capacity policy; discovery/build/correction package limits |
-| `authority.json` | base and current candidate digest; issue/decision references; immutable finding IDs; amendments; delegated capabilities/policy principal; authority status |
-| `state.json` | backend (`cowork`; a package Cowork cannot run is `blocked` before dispatch); actor-neutral phase; role; controller/model identity when available; worktree; process/session ID; timestamps; last artifact hash; pause/recovery count; package-limit counters; verified provider-capacity policy and active capacity packet reference when applicable |
+| `authority.json` | base and current candidate digest; issue/decision references; immutable finding IDs; amendments; delegated capabilities/policy principal; authority status; execution-profile choice/rationale and preview policy version/digest, or documented unprofiled exception (phase-only team or existing unprofiled resume) |
+| `state.json` | backend (`cowork`; a package Cowork cannot run is `blocked` before dispatch); actor-neutral phase; role; controller/model identity when available; worktree; process/session ID; timestamps; last artifact hash; pause/recovery count; package-limit counters; verified provider-capacity policy and active capacity packet reference when applicable; observed selected/effective execution profile and promotion evidence from the official session record, or manual/unprofiled classification |
 | `plan.md` | proposed steps, affected paths, checks, assumptions, risks, and finding mapping |
 | `result.json` | candidate digest; changed paths; commands/checkpoints and exit facts; receipt references; remaining limitations; worker self-assessment |
 | `review.json` | reviewed candidate digest; independent verdict; findings with severity and evidence; required corrections |

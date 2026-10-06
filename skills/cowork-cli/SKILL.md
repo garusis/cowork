@@ -56,13 +56,13 @@ session-mutating flag passed with it is silently ignored. Invoke it on its own.
 ## Start a session
 
 ```bash
-# full team (every role, all on claude by default)
-cowork --context-file ./brief.md
+# profiled implementation (models are configured separately)
+cowork --profile standard --profile-rationale "bounded behavior change" --context-file ./brief.md
 
-# smallest useful team: scouting only
+# investigation-only exception: profiles include building
 cowork --team scout,scout-reviewer --context-file ./brief.md
 
-# isolated in a git worktree created by a small worktree role
+# planning-only exception in an isolated worktree
 cowork --worktree my-feature --team scout,scout-reviewer,planner,planning-advisor \
        --context-file ./brief.md
 ```
@@ -75,19 +75,27 @@ cowork --worktree my-feature --team scout,scout-reviewer,planner,planning-adviso
   (`scout_not_selected`). Every new session starts in scouting, so there is no
   standalone planner, builder, or reviewer session. The useful teams are
   `scout,scout-reviewer`, that plus `planner,planning-advisor` (the plan is the
-  deliverable), or all six roles. A builder pair without the planner pair is
-  accepted but never reaches building. Pick the smallest team that supplies
+  deliverable), or all six roles. An unprofiled manual team with a builder pair
+  but no planner pair is accepted but never reaches building. Pick the smallest team that supplies
   the discovery, planning, implementation, and assurance the risk needs.
-- Prefer an **execution profile** to an ad hoc smallest `--team`:
+- For implementation, launch with an explicit **execution profile**:
   `cowork --preview-profile light|standard|assurance` prints the complete policy
   as one JSON object (read-only, nothing dispatched), then start the session
-  with `--profile NAME` (it derives the team, so it cannot be combined with
-  `--team` or `--no-session`; `--profile-rationale TEXT` records why). `light`
+  with `--profile NAME --profile-rationale TEXT` (it derives the team, so it
+  cannot be combined with `--team` or `--no-session`). `light`
   suits a bounded documentation batch, `standard` is the default for a behavior
   change, `assurance` suits invariant or architectural work. Promotion to a
   stricter profile is automatic and one-way; resume with a higher `--profile`
   to promote explicitly (a lower one is refused). See the README's "Execution
   profiles" for the refusal codes and the `review_profile_rejected` stop.
+  Investigation-only/planning-only teams are explicit unprofiled exceptions;
+  no shipped profile stops before building. Follow `cowork-orchestrate` for
+  selection, exception evidence, cohort comparison and profile-opportunity
+  tracking. Read selected/effective profile and promotions from the official
+  session `execution_profile.json`, not from role count or model names.
+  Existing unprofiled sessions cannot acquire a profile on resume
+  (`profile_not_bound`); preserve that classification rather than restarting
+  work or inventing a selected profile.
 - `--worktree [NAME]` / `--wt` requires launching inside a git work tree
   (`worktree_requires_git`); `--wt-controller` picks the worktree role's
   controller. The session anchor stays in the **launch** directory.

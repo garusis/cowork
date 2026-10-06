@@ -94,23 +94,25 @@ make a worker responsible for controller state.
 
 ### Launch
 
+Apply `cowork-orchestrate`'s explicit profile selection, provenance and
+profile-opportunity tracking rules; use `cowork-cli` for command mechanics.
+Record the preview policy and rationale before implementation dispatch, then
+verify selected/effective profile and promotions in the official session record.
+Preserve existing sessions and mandatory checks; do not make an assurance-shaped
+brief universal or label manual review work as a measured assurance profile.
+
 Cowork dispatches paired teams, not standalone roles. Every new session begins
-in scouting, so its team includes `scout` and `scout-reviewer`, and each lead
-on the team brings its reviewer. Select one of:
+in scouting and each lead brings its reviewer. Profiles derive the implementation
+team. For a documented phase-only exception, select:
 
 - `scout,scout-reviewer` for investigation (the scout adds a lightweight plan
   when no planner is on the team);
 - `scout,scout-reviewer,planner,planning-advisor` when the plan is the
   deliverable;
-- all six roles (the default team) when the package authorizes implementation.
 
-Prefer an explicit execution profile to a hand-picked team: preview one with
-`cowork --preview-profile light|standard|assurance`, then launch with
-`--profile NAME`, which derives the paired team. `light` fits a bounded
-documentation batch, `standard` a behavior change, `assurance` invariant or
-architectural work. The profile promotes itself, one way, on typed risk signals
-(or explicitly with a higher `--profile` on resume); record the effective
-profile and its promotion history in the package evidence.
+Record why the investigation-only/planning-only deliverable cannot use a shipped
+profile (all include building); retain paired review and label its cohort
+manual/unprofiled. A deterministic supervisor runner has no Cowork profile.
 
 A later phase continues the same session through its saved session file; a
 fresh session starts scouting again. Give the session the brief, relevant
