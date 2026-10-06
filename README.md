@@ -299,6 +299,11 @@ an accepted decision delivery could not be acknowledged (it is re-sent later).
 Only rc 0 with `approved: true` is success. A stop, a capacity pause, or a
 missing result line is never an approval.
 
+`cowork graph OP` is a separate command: it emits its own single result line
+(`cowork_graph_result`) with its own exit codes 0, 1, 2 and 3, never 5, where
+rc 3 means an ownership or lease conflict. See
+[Governed parallel graph](#governed-parallel-graph).
+
 A run launched outside a git work tree is refused with rc 2 and
 `reason: requires_git_work_tree` before any session, lease, trace or dispatch
 exists; from such a directory that refusal pre-empts the session-selection and
@@ -592,6 +597,188 @@ live — see the bullet below.
 - With `--worktree`, the session store stays in the **launch** directory, not
   the worktree. Resume from the launch directory or with its `--session-file`,
   and pass `--cwd LAUNCH_DIR` to `resume-trigger`.
+
+### Governed parallel graph
+
+`cowork graph OP` is an agent-only command for running several independent work
+packages as the vertices of one governed graph. OP is one of `admit`, `status`,
+`claim`, `publish`, `cancel`, `fail`, `reclaim` or `join`. It is dispatched
+before the flat argument parser and has its own result line (below). Cowork
+records and fences the graph; it never spawns children, creates worktrees or
+merges anything. The orchestrator pre-creates one git worktree per vertex,
+launches each child itself and integrates the results itself. Execution
+profiles expose the serial concurrency contract this command consumes (see
+[Execution profiles](#execution-profiles)); the production cap of 1 still
+applies, so nothing here runs vertices in parallel.
+
+**Revision document.** `admit` reads one JSON file:
+
+```json
+{"schema_version": 1, "max_parallel": 1, "claim_ttl_s": 900,
+ "vertices": [{"work_id": "<uuid>", "root": "/abs/worktree",
+               "base_commit": "<40-hex>", "authority_path": "/abs/authority",
+               "authority_digest": "<sha256 of the authority file>",
+               "profile": "standard", "predecessors": ["<work_id>"]}],
+ "joins": [{"join_id": "<uuid>", "rule": "all_succeeded",
+            "requires": ["<work_id>"]}]}
+```
+
+`max_parallel` is at least 1; `claim_ttl_s` is 60 to 86400 and defaults to 900;
+`joins` is optional. No other keys are accepted (`revision_malformed`,
+`join_malformed`). Ids are lowercase UUIDs.
+
+**`cowork graph admit --revision-file PATH (--new | --graph-id ID)`** admits a
+revision into a new or an existing graph and returns `graph_id`,
+`graph_revision` and `effective_cap`. Admission fails closed and writes nothing
+on any refusal. It checks the predecessor structure (`cycle`, `self_edge`,
+`dangling_predecessor`, `duplicate_work_id`), then for every non-terminal
+vertex its root (an existing, symlink-free git worktree top level whose HEAD
+equals `base_commit`, with `.cowork/` ignored, and not the main checkout, the
+sessions root, another vertex's root, or a root in use by another active
+graph), and its authority file (present, bytes matching `authority_digest`, a
+distinct digest per vertex). The effective cap is `max_parallel`; it may not
+exceed the policy cap, which is read only through
+`resolved_vertex_policy(profile, 'builder')` (`ceiling_above_policy`). A later
+revision may add vertices, but every vertex that is no longer pending must be
+repeated with an identical normalized declaration, no `work_id` may change its
+declaration, and a join that already has a decision may not change
+(`revision_conflict`).
+
+**`cowork graph status --graph-id ID`** is read-only and takes no lock. Fields:
+`graph_id`, `revision`, `cancelled`, `effective_cap`, `held_slots`,
+`ready_order` and `statuses`, which maps every current vertex to `waiting`,
+`ready`, `blocked`, `claimed`, `running`, `succeeded`, `failed` or `cancelled`;
+`joins` holds the stored decisions.
+
+**`cowork graph claim --graph-id ID [--work-id ID]`** atomically takes one slot
+for a ready vertex (without `--work-id`, the first of `ready_order`) and bumps
+its lease epoch. The claim result line carries these fields flat, with no nested
+object: `graph_id`, `work_id`, `lease_epoch`, `root`, `profile`,
+`authority_digest`, `claim_deadline`, `cwd` (the vertex root) and `launch_argv`.
+Refusals include `cap_reached`,
+`none_ready`, `vertex_not_ready`, `vertex_blocked`, `vertex_held`,
+`vertex_terminal` and `graph_cancelled`.
+
+**Launch.** The orchestrator runs `cowork` with `launch_argv` (`--new --profile
+PROFILE --graph-vertex GRAPH_ID:WORK_ID:EPOCH`) plus its own `--context-file`,
+from the vertex root, and supervises it like any other run. `--graph-vertex` is
+set only from `launch_argv`: it needs a matching `--profile` and a new session,
+and cannot be combined with `--no-session`, `--worktree`, `--team` or
+`--output-root`. The bind is the first statement after the child owns its
+session lease; it records the session in a write-once index and moves the
+vertex to `running`. A graph-bound run result carries the additive
+`graph_vertex` object (`graph_id`, `work_id`, `lease_epoch`). Every later entry
+of that session re-checks the fence and is refused with `vertex_lease_superseded`
+or `vertex_cancel_requested` once it no longer holds the vertex.
+
+Launch refusals are reported on the ordinary run-result line (`cowork_result`),
+not on a `cowork_graph_result` line, with the closed graph code in `reason`.
+The `--graph-vertex` argument refusals (`graph_vertex_malformed`,
+`graph_vertex_requires_profile`, `graph_vertex_requires_new_session`,
+`graph_vertex_flag_conflict`) are rc 2. A store bind refusal keeps its own rc: rc
+3, read there as `outcome: owner_conflict`, for `vertex_lease_superseded`,
+`session_already_bound` and `vertex_held`, rc 1 for a store lock, corrupt or
+inconsistent state, or I/O failure (`lock_timeout`, `graph_state_corrupt`,
+`graph_state_inconsistent`, `io_error`), rc 2 otherwise. The graph argument
+conflicts are checked after the earlier `profile_requires_session` and
+`profile_team_conflict` refusals, so those codes win for `--no-session` and
+`--team`. The argument refusals and the read-only bind pre-check write
+nothing. A bind refused later, in the owned region (a race after the pre-check,
+or `session_already_bound`), comes after the new session record and owner
+lease exist; it still dispatches nothing.
+
+**`cowork graph publish --graph-id ID --work-id ID [--take-over]`** accepts the
+vertex's result. It takes no session argument: the child is the session bound
+to the vertex. It acquires that session's owner lease under the entry point
+`graph_publish`; a live, unproven or corrupt owner is refused as
+`owner_conflict`, and `--take-over` replaces only an owner proved dead. The
+evidence is the child's own accepted, green owned-verification transaction
+whose result manifest equals its request manifest and the candidate manifest
+now on disk in the vertex root, with the transaction's requesting session and
+repository matching the vertex, and every required check of the vertex profile
+satisfied. The child's process exit is never evidence. Success returns
+`receipt_identity`, `session_uuid`, `slot_released` and `publish_outcome`
+(`published`). Publishing the same receipt again is idempotent: rc 0, `outcome:
+ok`, `publish_outcome: already_published`, state unchanged.
+
+**`cowork graph cancel --graph-id ID [--work-id ID]`** returns `outcomes`, a
+list of `{work_id, outcome, pause_cleanup}` where `outcome` is `cancelled`,
+`cancel_requested` or `already_cancelled`. A pending or claimed vertex is
+cancelled at once. A running vertex is cancelled only when its holder is
+provably not live (`stale_dead_owner` or `unowned`); otherwise a durable cancel
+request is recorded, its slot stays held and the child's next fence entry is
+refused, so repeat the cancel until `cancelled`. Without `--work-id` the whole
+graph is cancelled (no further claims) and every vertex that has not succeeded
+or failed is handled the same way. For a cancelled vertex with a session, live
+capacity PauseLeases are cancelled and listed in `pause_cleanup`.
+
+**`cowork graph fail --graph-id ID --work-id ID --reason-code TOKEN`** records a
+claimed or running vertex as failed (`TOKEN` matches `[a-z][a-z0-9_]{0,63}`)
+and returns `state: failed` and `slot_released`. A failure is always explicit,
+never inferred from an exit status. A running vertex needs a holder proved not
+live and not paused (`vertex_live`, `holder_unproven`, `vertex_paused`).
+
+**`cowork graph reclaim --graph-id ID --work-id ID`** releases an abandoned
+vertex: a claimed one only after its `claim_deadline` (`claim_not_expired`), a
+running one only when the holder is proved dead or unowned and has no live
+PauseLease. It returns `new_lease_epoch`, `holder_verdict` (`null` for a claimed
+vertex) and `slot_released`. The vertex returns to pending (or cancelled, when a
+cancel was requested) under a bumped epoch, so the old session can never
+rebind.
+
+**Slots.** A slot is held from claim until exactly one of: accepted
+publication, `fail`, a confirmed cancel, or an audited reclaim. A process exit
+or a capacity pause never releases it.
+
+**`cowork graph join --graph-id ID --join-id ID`** returns `decision`, the
+deterministic `JoinDecision`: `outcome` (`joined` or `blocked`), the ordered
+`members` and a `decision_digest`. It refuses `early_join` while any member is
+waiting, ready, claimed, running or holding a slot, and is `blocked` when a
+member failed, was cancelled or is blocked. `joined` requires each member's
+receipt to still bind its vertex and the live candidate manifest to equal the
+receipt's (`receipt_candidate_changed`). A decision is stored once per join and
+revision, and repeating the join returns it unchanged. A join is a decision
+record, not a merge: it reads and writes no vertex root, and merging candidates
+is the orchestrator's own, separate act.
+
+**Result line.** Every `cowork graph` invocation ends stdout with exactly one
+JSON object, and the process exit status equals its `rc`:
+
+```json
+{"cowork_graph_result": 1, "rc": 0, "op": "claim", "outcome": "ok",
+ "reason": null, "graph_id": "<uuid>", "work_id": "<uuid>"}
+```
+
+`outcome` is `ok`, `refused` (a closed `reason` code from the table below, plus
+a string `detail` when it has one) or `error` (an unexpected failure, rc 1,
+`reason: io_error`). The op's own fields are added to the object, and the keys
+above always win over them. An argument error is rc 2 `argument_error`; `--help`
+emits no line. Diagnostics go to stderr; branch on the result line only. Exit
+codes are 0, 1, 2 and 3, never 5: rc 5 is provider capacity and is not used
+here.
+
+| rc | meaning | reason codes |
+| --- | --- | --- |
+| 1 | corrupt state, lock timeout or I/O failure | `graph_state_corrupt`, `graph_state_inconsistent`, `lock_timeout`, `io_error` |
+| 2 | contract refusal; nothing changed | `argument_error`, `revision_malformed`, `cycle`, `self_edge`, `dangling_predecessor`, `duplicate_work_id`, `root_missing`, `root_symlink`, `root_not_worktree_toplevel`, `base_commit_mismatch`, `anchor_dir_not_ignored`, `candidate_collision`, `root_alias`, `root_nested`, `root_overlaps_main_checkout`, `root_overlaps_sessions_root`, `root_in_use`, `authority_missing`, `authority_malformed`, `authority_digest_mismatch`, `authority_shared`, `unknown_profile`, `ceiling_invalid`, `ceiling_above_policy`, `unsupported_concurrency_contract`, `join_malformed`, `join_unknown_member`, `revision_conflict`, `graph_cancelled`, `graph_unknown`, `vertex_unknown`, `vertex_not_ready`, `vertex_blocked`, `none_ready`, `cap_reached`, `vertex_terminal`, `vertex_not_claimed`, `vertex_not_running`, `bind_root_mismatch`, `bind_profile_mismatch`, `graph_vertex_malformed`, `graph_vertex_requires_profile`, `graph_vertex_requires_new_session`, `graph_vertex_flag_conflict`, `receipt_malformed`, `receipt_cross_vertex`, `receipt_stale_epoch`, `receipt_stale_revision`, `receipt_no_accepted_transaction`, `receipt_wrong_candidate`, `receipt_candidate_collision`, `receipt_missing_required_check`, `receipt_candidate_changed`, `join_unknown`, `early_join` |
+| 3 | ownership or lease conflict | `vertex_held`, `session_already_bound`, `vertex_lease_superseded`, `vertex_cancel_requested`, `vertex_live`, `vertex_paused`, `holder_unproven`, `claim_not_expired`, `receipt_non_owner`, `owner_conflict` |
+
+**Concurrency.** The production cap of 1 holds for every shipped profile, and
+an admitted `max_parallel` may not exceed it. Raising it needs a separately
+authorized policy revision; nothing in this command claims parallel
+production.
+
+**Interplay.** Policy is read only through `resolved_vertex_policy` and never
+re-derived. Vertex ownership and liveness come only from the single-writer
+owner lease. A vertex paused on provider capacity keeps its slot, `reclaim` and
+`fail` refuse it while its PauseLease is live, `cancel` cancels the lease, and
+rc 5 is never used by the graph. Each vertex's receipt references the child's
+own owned-verification transaction and changes none of it. Static plan-step
+dependency validation is separate from this runtime graph admission.
+
+State lives under `<sessions_root>/graphs/` (`COWORK_SESSIONS_ROOT` overrides
+the sessions root): a registry, one `graph.json` per graph and a write-once
+session index.
 
 ### Read-only and side-channel commands
 

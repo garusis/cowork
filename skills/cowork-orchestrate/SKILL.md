@@ -76,6 +76,36 @@ Cowork is the agent transport. Run the package through the `cowork` CLI per the
   Consider adapting an existing profile before adding one. Recording an idea
   neither authorizes implementation nor blocks unrelated work.
 
+## Governed parallel graph
+
+When a package splits into independent vertices, run them through `cowork graph`
+(field shapes and the reason table are in the README's "Governed parallel
+graph" and the `cowork-cli` skill). Cowork records and fences; you create the
+worktrees, launch the children and merge. Branch on the `cowork_graph_result`
+line, never on stderr, and never treat a child's process exit as evidence.
+
+- Pre-create one worktree per vertex at its base commit with `.cowork/` ignored
+  and write one authority file per vertex. Write the revision document and run
+  `cowork graph admit`; read `cowork graph status`.
+- `cowork graph claim` the next ready vertex and read `cwd` and `launch_argv`
+  from the claim result line. Launch the child as
+  `cowork <launch_argv> --context-file BRIEF` from `cwd` and supervise it like
+  any other run. Launch refusals arrive on the ordinary
+  run-result line (`reason` holds the graph code), not on the graph line.
+- When the child's paired reviewer approves with a green owned verification,
+  run `cowork graph publish`. rc 0 `ok` also covers `publish_outcome:
+  already_published`. rc 3 `owner_conflict` means retry later; use `--take-over`
+  only when the owner is proved dead.
+- Record an explicit failure with `cowork graph fail --reason-code`. Run
+  `cowork graph cancel` to stop work; `cancel_requested` is not final, so
+  repeat it until `cancelled`. Run `cowork graph reclaim` only after
+  `claim_deadline` or for a proven-dead child.
+- Run `cowork graph join` once the members are terminal, then act on its
+  `decision`. A join is a decision record and not a merge: merging the
+  candidates stays a separate act you do, within your authority.
+- The production cap of 1 means claim one vertex at a time; do not assume
+  parallel production.
+
 ## Accept
 
 Cowork commits nothing. After an approved build, review the working-tree diff

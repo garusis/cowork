@@ -109,6 +109,9 @@ Notes:
   guarded by `profile_session is not None`, and an unprofiled session must take
   its unchanged paths. Later packages that schedule work consume
   `resolved_vertex_policy`; they do not re-derive policy.
+- The graph code consumes graph policy only through `resolved_vertex_policy`
+  and decides vertex ownership and liveness only through `cowork_owner`
+  (additive entry point `graph_publish`); there is no second pid prober.
 - Measurable-goal contract: scout intel must carry `result.success_criteria`
   (1–5 of `{statement, measurement, expected, tier: must|should}`); the plan
   must map each criterion in `result.criteria_coverage` to steps + a
@@ -161,6 +164,13 @@ Contract source: `build_parser`, `select_session`, `build_run_result` and
   identities and `--cwd LAUNCH_DIR`; that retrigger can replace the claimed
   lease, so re-read the current lease from a plain resume before triggering
   again.
+- `cowork graph OP` (admit, status, claim, publish, cancel, fail, reclaim,
+  join) is dispatched before the flat parser and writes exactly one
+  `cowork_graph_result` JSON line as the last line of stdout, with `rc` equal
+  to the exit status: 0 ok, 1 corrupt state/lock/io, 2 contract refusal,
+  3 ownership/lease conflict, never 5. A join is a decision record, not a
+  merge, and the production cap is 1. Full description: README "Governed
+  parallel graph".
 
 ## Git worktrees
 

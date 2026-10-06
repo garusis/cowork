@@ -202,6 +202,26 @@ cowork --session-owner [SESSION_UUID] [--json]
 UUID, `--report` and `--session-owner` read the directory's most recent
 session.
 
+## Governed parallel graph (`cowork graph`)
+
+Agent-only; each call ends stdout with one `cowork_graph_result` line whose `rc`
+is the exit status: 0 `ok`, 1 corrupt state/lock/io, 2 contract refusal, 3
+ownership/lease conflict, never 5. `outcome` is `ok`, `refused` (closed `reason`
+code, optional `detail`) or `error`. The README "Governed parallel graph" has
+the revision document and the full reason table.
+
+| Command | Required flags | Key result fields |
+| --- | --- | --- |
+| `cowork graph admit` | `--revision-file PATH` and `--new` or `--graph-id ID` | `graph_id`, `graph_revision`, `effective_cap` |
+| `cowork graph status` | `--graph-id ID` (read-only) | `revision`, `cancelled`, `effective_cap`, `held_slots`, `ready_order`, `statuses`, `joins` |
+| `cowork graph claim` | `--graph-id ID` [`--work-id ID`] | `lease_epoch`, `root`, `profile`, `claim_deadline`, `cwd`, `launch_argv` |
+| `cowork graph publish` | `--graph-id ID --work-id ID` [`--take-over`] | `publish_outcome` (`published`; rc 0 `ok` + `already_published` when repeated), `receipt_identity`, `slot_released` |
+| `cowork graph cancel` | `--graph-id ID` [`--work-id ID`] | `outcomes[]` (`cancelled`, `cancel_requested`, `already_cancelled`; `pause_cleanup`) |
+| `cowork graph fail` | `--graph-id ID --work-id ID --reason-code TOKEN` | `state`, `slot_released` |
+| `cowork graph reclaim` | `--graph-id ID --work-id ID` | `new_lease_epoch`, `holder_verdict`, `slot_released` |
+| `cowork graph join` | `--graph-id ID --join-id ID` | `decision` (`outcome` `joined` or `blocked`, `members`, `decision_digest`); not a merge |
+| launch flag `--graph-vertex GRAPH_ID:WORK_ID:EPOCH` | set only from `launch_argv`; needs matching `--profile` and a new session | run-result `graph_vertex`; refusals ride the ordinary `cowork_result` line with the graph code in `reason` (rc 2 for argument refusals, the store refusal's own rc otherwise), after the earlier `profile_requires_session` / `profile_team_conflict` refusals; argument refusals and the bind pre-check write nothing, a bind refused later (race, `session_already_bound`) follows the new session record and owner lease but dispatches nothing |
+
 ## Targeted role evaluations (`--evaluate-role`)
 
 An external orchestrator can record per-contribution scores in
