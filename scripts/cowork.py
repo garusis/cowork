@@ -23,6 +23,7 @@ Python 3.9+.
 import argparse
 import collections
 import contextlib
+import contextvars
 import datetime
 import errno
 import hashlib
@@ -67,6 +68,8 @@ import cowork_owner  # noqa: E402
 import cowork_profiles as controller_profiles  # noqa: E402
 import cowork_action_policy as action_policy  # noqa: E402
 import cowork_execution_profiles as exec_profiles  # noqa: E402
+import cowork_verified_binding as verified_binding  # noqa: E402
+import cowork_correction as correction_packets  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -3496,6 +3499,120 @@ def _profile_inventory(session_uuid, plan_json_path):
     return entries
 
 
+def _gate_inventory_identity(session_uuid, plan_json_path=None):
+    """The identity of the approved plan's verification inventory, prepared
+    exactly as `_run_owned_verification_transaction` prepares it (the same
+    normalization, before any reuse), or None when the inventory is missing or
+    invalid. The pointer writer and the prior-green binder both use it, so the
+    two can only ever disagree toward a refusal."""
+    try:
+        raw = _raw_plan_verification(session_uuid, plan_json_path)
+        if not raw:
+            return None
+        declared_schema = _declared_plan_schema(session_uuid, plan_json_path)
+        suite = (_plan_verification_suite(session_uuid, plan_json_path)
+                 if declared_schema == verification.SCHEMA_3 else None)
+        schema, entries, _label = verification.normalize_inventory(
+            raw, declared_schema=declared_schema, suite=suite)
+    except Exception:  # noqa: BLE001 - no identity never binds
+        return None
+    return verified_binding.compute_inventory_identity(
+        schema, entries, suite, {})
+
+
+def _open_finding_classes_for_gate(review_path, pointer):
+    """The closed open-finding tokens of the previous review round, read from
+    the verdict the reviewer left at `review_path`, or None when that verdict
+    cannot be trusted (missing, unreadable, malformed, not a `revise`, or with a
+    finding that is not a well-formed entry). None never binds."""
+    verdict = state_store.read_review(review_path)
+    if (not isinstance(verdict, dict) or verdict.get("malformed")
+            or verdict.get("verdict") != "revise"):
+        return None
+    typed = verdict.get("corrective_findings")
+    if typed is None:
+        return []
+    if not isinstance(typed, list) or not all(
+            isinstance(f, dict) for f in typed):
+        return None
+    _blocking, defeated = _classify_blocking_verification_challenges(
+        verdict, pointer)
+    defeated_ids = {id(f) for f in defeated}
+    cited = (pointer or {}).get("transaction_id")
+    classes = []
+    for finding in typed:
+        challenge = finding.get("verification_challenge")
+        if isinstance(challenge, dict):
+            if finding.get("severity") == "blocking":
+                still_open = id(finding) not in defeated_ids
+            else:
+                still_open = bool(cited) and challenge.get(
+                    "transaction_id") == cited
+            if still_open:
+                classes.append("verification_challenge")
+        risk = finding.get("risk_class")
+        if risk == correction_packets.RISK_ARCHITECTURAL:
+            classes.append("architectural")
+        elif risk is not None:
+            classes.append("signal_malformed")
+        if finding.get("severity") not in correction_packets.SEVERITIES:
+            classes.append("signal_malformed")
+    return classes
+
+
+def _bind_prior_green_at_gate(session_uuid, plan_json_path, profile_session,
+                              review_path, inventory_identity, repo=None):
+    """`(bound_result, None)` when the prior green owned transaction named by
+    the current-receipt pointer may be reused for the live candidate, else
+    `(None, refusal_code)`. Every doubt is a refusal and the caller then runs
+    the ordinary transaction; this never raises."""
+    try:
+        if not session_uuid or profile_session is None:
+            return None, "no_session"
+        if profile_session.reuse_policy() is None:
+            return None, "reuse_mode_not_allowed"
+        pointer = state_store.read_current_receipt_pointer(session_uuid)
+        transaction_id = (pointer or {}).get("transaction_id")
+        if not transaction_id:
+            return None, "no_pointer"
+        stored_result = state_store.read_json_tolerant(
+            state_store.verification_result_path_for(
+                session_uuid, transaction_id))
+        stored_request = state_store.read_json_tolerant(
+            state_store.verification_request_path_for(
+                session_uuid, transaction_id))
+        classes = _open_finding_classes_for_gate(review_path, pointer)
+        if classes is None:
+            return None, "verdict_unusable"
+        live_identity = verification.current_candidate_identity(
+            repo or os.getcwd())
+        reuse_mode = exec_profiles.resolved_vertex_policy(
+            profile_session.effective, "builder")["reuse_mode"]
+        return verified_binding.bind_prior_green(
+            pointer, stored_result, stored_request, live_identity,
+            inventory_identity, reuse_mode, session_uuid=session_uuid,
+            disposition=_latest_verification_disposition(
+                session_uuid, transaction_id),
+            open_finding_classes=classes)
+    except Exception:  # noqa: BLE001 - corrupt state is a refusal
+        return None, "bind_error"
+
+
+def _emit_bound_transaction_event(trace, role, round_index, bound):
+    """The one `verification.transaction` event of a bound result: the stored
+    transaction's own identity, flagged so the measurement counts it as a
+    reuse and never as an executed transaction."""
+    if not trace:
+        return
+    trace.event(
+        "verification.transaction", role=role, round=round_index,
+        transaction_id=bound.get("transaction_id"),
+        request_key=bound.get("request_key"), verdict=bound.get("verdict"),
+        final_suite_binding=bound.get("final_suite_binding"),
+        reused_lock_result=False, bound_reuse=True,
+        bound_prior_transaction_id=bound.get("bound_prior_transaction_id"))
+
+
 def _profile_changed_paths(session_uuid, record, txn_result):
     """`(changed_paths, executable_paths)` of the candidate a transaction
     verified, measured against the profile-owned building-entry baseline with
@@ -3533,7 +3650,11 @@ def _profile_on_builder_transaction(profile_session, session_uuid,
     evidence, dependency graph, executed/reused counters) and evaluate the
     builder-ready promotion signals against the building baseline."""
     inventory = _profile_inventory(session_uuid, plan_json_path)
-    profile_session.on_transaction(txn_result, inventory)
+    if txn_result.get("bound_reuse") is not True:
+        # A bound result ran no verification work: the executed/reused
+        # counters and the accepted evidence stay exactly as they were, while
+        # the promotion signals below still read the live changed paths.
+        profile_session.on_transaction(txn_result, inventory)
     changed, executable = _profile_changed_paths(
         session_uuid, profile_session.record, txn_result)
     status_doc = measure._read_json(status_path)
@@ -4080,7 +4201,8 @@ def _emit_verification_disposition(session_uuid, trace, transaction_id,
 
 def _update_receipt_pointer_for_readiness(session_uuid, role, round_index,
                                           trace, txn_result, readiness,
-                                          status_path, summary_path=None):
+                                          status_path, summary_path=None,
+                                          inventory_identity=None):
     """Bind the promotion to its owned receipt (D-0002) at the builder
     ready_for_review transition.
 
@@ -4149,6 +4271,11 @@ def _update_receipt_pointer_for_readiness(session_uuid, role, round_index,
             session_uuid, txn_result, readiness, status_path,
             summary_path=summary_path)),
     }
+    if isinstance(inventory_identity, str) and inventory_identity:
+        # Additive: only a profiled caller supplies it, so every other
+        # pointer is byte-identical to before. The prior-green binder
+        # requires it to match the identity of the current inventory.
+        pointer["inventory_identity"] = inventory_identity
     suite = txn_result.get("suite")
     if isinstance(suite, dict):
         # Schema 3 (composed final suite): the declared universe reviewers
@@ -5000,21 +5127,72 @@ def _context_update_prefix(context_update, assets_dir=None, revision=None):
     return context_update_block(context_update, assets_dir, revision)
 
 
+# The correction packet of the review pass in flight. `review_fn` sets it
+# around the single runner call of a profiled correction round, so the resume
+# assemblers (called from inside the runner closures, outside any seam this
+# package owns) can name the packet and carry its closed facts. The value is
+# {role, packet_path, facts, changed_paths}; unset means the ordinary prompt.
+_CORRECTION_CTX = contextvars.ContextVar("cowork_review_correction",
+                                         default=None)
+# The four closed facts a correction carries (the transport validates values).
+_CORRECTION_FACT_KEYS = ("correction_kind", "correction_scope",
+                         "correction_finding_count", "correction_max_severity")
+
+
+def _resolve_correction(own_role, correction=None):
+    """The usable correction of one resume assembler, or None. An explicit
+    `correction` wins; otherwise the in-flight value applies only to the role
+    it was prepared for. A value without an absolute packet path and exactly the
+    four closed facts is ignored, so a doubtful value yields the full prompt."""
+    value = correction
+    if value is None:
+        value = _CORRECTION_CTX.get()
+        if isinstance(value, dict) and value.get("role") != own_role:
+            return None
+    if not isinstance(value, dict):
+        return None
+    packet_path = value.get("packet_path")
+    facts = value.get("facts")
+    if not (isinstance(packet_path, str) and os.path.isabs(packet_path)
+            and isinstance(facts, dict)
+            and set(facts) == set(_CORRECTION_FACT_KEYS)):
+        return None
+    return value
+
+
+def _correction_artifact(packet_path):
+    return {"label": "correction packet (typed bounded-correction record)",
+            "path": os.path.abspath(packet_path), "kind": "json",
+            "source": "correction_packet"}
+
+
 def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
                                      context_update=None, assets_dir=None,
-                                     context_revision=None):
+                                     context_revision=None, correction=None):
     """Lighter context for a RESUMED reviewer session, delivered FILE-ONLY via
     the shared transport: its thread already holds the role + the prior context,
     so only the updated intel is sent (by path — JSON, and markdown when given).
     When the session context changed since the reviewer last acknowledged it
     (`context_update` is the un-acked context text), a context-update wake block
-    referencing the persisted context FILE is prepended. No body is inlined."""
+    referencing the persisted context FILE is prepended. No body is inlined.
+    `correction` (additive): a profiled correction round's packet path and its
+    four closed facts; without one the prompt is exactly the ordinary one."""
     prefix = _context_update_prefix(context_update, assets_dir,
                                     context_revision)
+    ctx = {"context_update_prefix": prefix} if prefix else None
+    artifacts = _intel_artifacts(intel_path, intel_md_path)
+    resolved = _resolve_correction(SCOUT_REVIEWER, correction)
+    if resolved is not None:
+        try:
+            return handoff.render_handoff(
+                "scout->scout-reviewer:review_resume",
+                artifacts=artifacts + [
+                    _correction_artifact(resolved["packet_path"])],
+                facts=dict(resolved["facts"]), ctx=ctx)
+        except ValueError:
+            pass  # any doubt resolves to the ordinary full prompt
     return handoff.render_handoff(
-        "scout->scout-reviewer:review_resume",
-        artifacts=_intel_artifacts(intel_path, intel_md_path),
-        ctx={"context_update_prefix": prefix} if prefix else None)
+        "scout->scout-reviewer:review_resume", artifacts=artifacts, ctx=ctx)
 
 
 def make_scout_reviewer_runner(intel_md_path, trace=None,
@@ -5237,19 +5415,30 @@ def assemble_advisor_context(context, selected, plan_json_path, plan_md_path,
 
 def assemble_advisor_resume_context(plan_json_path, plan_md_path,
                                     context_update=None, assets_dir=None,
-                                    context_revision=None):
+                                    context_revision=None, correction=None):
     """Lighter context for a RESUMED planning-advisor session, delivered
     FILE-ONLY via the shared transport: only the updated plan artifacts (by
     path) — plus a context-update wake block referencing the persisted context
     FILE when the session context changed since the advisor last acknowledged
-    it. No body is inlined."""
+    it. No body is inlined. `correction` is the same additive packet path and
+    closed facts as on the scout-reviewer edge."""
     prefix = _context_update_prefix(context_update, assets_dir,
                                     context_revision)
+    ctx = {"context_update_prefix": prefix} if prefix else None
+    artifacts = _plan_artifacts(plan_json_path, plan_md_path)
+    resolved = _resolve_correction(PLANNING_ADVISOR, correction)
+    if resolved is not None:
+        try:
+            return handoff.render_handoff(
+                "planner->planning-advisor:review_resume",
+                artifacts=artifacts + [
+                    _correction_artifact(resolved["packet_path"])],
+                facts=dict(resolved["facts"], team=[]), ctx=ctx)
+        except ValueError:
+            pass  # any doubt resolves to the ordinary full prompt
     return handoff.render_handoff(
         "planner->planning-advisor:review_resume",
-        artifacts=_plan_artifacts(plan_json_path, plan_md_path),
-        facts={"team": []},
-        ctx={"context_update_prefix": prefix} if prefix else None)
+        artifacts=artifacts, facts={"team": []}, ctx=ctx)
 
 
 def make_planning_advisor_runner(plan_md_path, trace=None,
@@ -5983,7 +6172,8 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
                                            verification_overlay=None,
                                            checkpoint_receipt_path=None,
                                            checkpoint_facts=None,
-                                           profile_path=None):
+                                           profile_path=None,
+                                           correction=None):
     """Lighter context for a RESUMED build-reviewer session, delivered FILE-ONLY
     via the shared transport: only the updated artifacts are sent by PATH (plan,
     status, summary, build-baseline) — plus a context-update wake block
@@ -5992,7 +6182,10 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
     owned verification receipt + overlay ride exactly as on the fresh edge
     (ORCH-050), so a resumed reviewer never loses the receipt mid-loop. The
     bound checkpoint's receipt + facts (M5 Package E) ride the same way via
-    `checkpoint_receipt_path`/`checkpoint_facts`."""
+    `checkpoint_receipt_path`/`checkpoint_facts`. `correction` (additive) adds
+    a profiled correction round's packet path and four closed facts, and, when
+    its scope is targeted and the changed paths are known, scopes the diff
+    recipe to them."""
     artifacts = list(_build_reviewer_artifacts(
         plan_json_path, plan_md_path, build_status_path, build_summary_path,
         verification_receipt_path=verification_receipt_path,
@@ -6008,6 +6201,22 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
         facts.update(verification_overlay)
     if checkpoint_facts:
         facts.update(checkpoint_facts)
+    resolved = _resolve_correction(BUILD_REVIEWER, correction)
+    if resolved is not None:
+        correction_ctx = dict(ctx)
+        changed_paths = resolved.get("changed_paths")
+        if (resolved["facts"].get("correction_scope") == "targeted"
+                and isinstance(changed_paths, list) and changed_paths
+                and len(changed_paths) <= 200):
+            correction_ctx["changed_paths"] = list(changed_paths)
+        try:
+            return handoff.render_handoff(
+                "builder->build-reviewer:review_resume",
+                artifacts=artifacts + [
+                    _correction_artifact(resolved["packet_path"])],
+                facts=dict(facts, **resolved["facts"]), ctx=correction_ctx)
+        except ValueError:
+            pass  # any doubt resolves to the ordinary full prompt
     return handoff.render_handoff(
         "builder->build-reviewer:review_resume",
         artifacts=artifacts, facts=facts, ctx=ctx)
@@ -8344,10 +8553,30 @@ def _role_loop(session, first, status_path, context, io_out,
                         txn_profile_kwargs["plan_json_path"] = plan_json_path
                         txn_profile_kwargs["reuse_policy"] = (
                             profile_session.reuse_policy())
-                    txn_result, txn_missing_reason = (
-                        _run_owned_verification_transaction(
-                            session_uuid, role, review_rounds, trace,
-                            work_id=role_work_id, **txn_profile_kwargs))
+                    # A profiled light/standard session whose correction moved
+                    # only session artifacts binds the exact prior green
+                    # transaction instead of running a new one; every refusal
+                    # (and every other session) runs the ordinary transaction.
+                    gate_identity = None
+                    bound_result = None
+                    if (profile_session is not None
+                            and txn_profile_kwargs["reuse_policy"] is not None
+                            and session_uuid and trace):
+                        gate_identity = _gate_inventory_identity(
+                            session_uuid, plan_json_path)
+                        if gate_identity is not None:
+                            bound_result, _refusal = _bind_prior_green_at_gate(
+                                session_uuid, plan_json_path, profile_session,
+                                review_path, gate_identity)
+                    if bound_result is not None:
+                        txn_result, txn_missing_reason = bound_result, None
+                        _emit_bound_transaction_event(
+                            trace, role, review_rounds, bound_result)
+                    else:
+                        txn_result, txn_missing_reason = (
+                            _run_owned_verification_transaction(
+                                session_uuid, role, review_rounds, trace,
+                                work_id=role_work_id, **txn_profile_kwargs))
                     if profile_session is not None and txn_result is not None:
                         _profile_on_builder_transaction(
                             profile_session, session_uuid, plan_json_path,
@@ -8364,7 +8593,9 @@ def _role_loop(session, first, status_path, context, io_out,
                     _update_receipt_pointer_for_readiness(
                         session_uuid, role, review_rounds, trace, txn_result,
                         readiness, status_path,
-                        summary_path=build_summary_path)
+                        summary_path=build_summary_path,
+                        **({"inventory_identity": gate_identity}
+                           if gate_identity is not None else {}))
                     if readiness and readiness.get("state") == "unverified":
                         state_store.invalidate_ready_status(status_path)
                         # SAME wrap-and-hand-back mechanism as any other
@@ -9024,6 +9255,287 @@ def _scout_loop(session, first, intel_path, context, io_out,
     return rc
 
 
+_REVIEWED_REFERENCE_SCHEMA = 1
+
+
+def _is_sha256_hex(value):
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value))
+
+
+def _correction_dir(session_uuid):
+    return os.path.join(state_store.session_assets_dir(session_uuid),
+                        "correction")
+
+
+def _reviewed_reference_path(session_uuid, phase, reviewer_role):
+    return os.path.join(_correction_dir(session_uuid),
+                        "reviewed.%s.%s.json" % (phase, reviewer_role))
+
+
+def _hash_artifacts(paths):
+    """`{absolute_path: sha256}` of the reviewed artifact files, or None when
+    there are none or any of them cannot be read (an unmeasured artifact is
+    never reported as unchanged)."""
+    if not paths:
+        return None
+    out = {}
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            return None
+        absolute = os.path.abspath(path)
+        try:
+            with open(absolute, "rb") as fh:
+                out[absolute] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            return None
+    return out
+
+
+def _artifacts_digest(artifacts):
+    """The canonical digest of a `{path: sha256}` map, or None."""
+    try:
+        blob = json.dumps(artifacts, sort_keys=True, separators=(",", ":"),
+                          allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _capture_reviewed_reference(session_uuid, phase, reviewer_role,
+                                round_index, artifact_paths):
+    """What a review pass is ABOUT TO judge, captured before the reviewer runs:
+    the current owned transaction (build) or the hash of each reviewed artifact
+    (scout, planner). It is written only once that pass produced a usable
+    verdict, and is what a later correction round measures its delta against."""
+    record = {"schema_version": _REVIEWED_REFERENCE_SCHEMA,
+              "session_uuid": session_uuid, "phase": phase,
+              "role": reviewer_role, "round": round_index,
+              "transaction": None, "artifacts": None,
+              "artifacts_digest": None}
+    if phase == "building":
+        pointer = state_store.read_current_receipt_pointer(session_uuid)
+        if (isinstance(pointer, dict)
+                and isinstance(pointer.get("transaction_id"), str)
+                and pointer["transaction_id"]
+                and _is_sha256_hex(pointer.get("manifest_digest"))
+                and _is_sha256_hex(pointer.get("index_digest"))):
+            record["transaction"] = {
+                "transaction_id": pointer["transaction_id"],
+                "manifest_digest": pointer["manifest_digest"],
+                "index_digest": pointer["index_digest"]}
+    else:
+        artifacts = _hash_artifacts(artifact_paths)
+        if artifacts is not None:
+            record["artifacts"] = artifacts
+            record["artifacts_digest"] = _artifacts_digest(artifacts)
+    return record
+
+
+def _write_reviewed_reference(session_uuid, record):
+    state_store.write_json_atomic(
+        _reviewed_reference_path(session_uuid, record["phase"],
+                                 record["role"]), record)
+
+
+def _read_reviewed_reference(session_uuid, phase, reviewer_role):
+    doc = state_store.read_json_tolerant(
+        _reviewed_reference_path(session_uuid, phase, reviewer_role))
+    if (isinstance(doc, dict)
+            and doc.get("schema_version") == _REVIEWED_REFERENCE_SCHEMA
+            and doc.get("session_uuid") == session_uuid
+            and doc.get("phase") == phase
+            and doc.get("role") == reviewer_role):
+        return doc
+    return None
+
+
+def _manifest_files_of(session_uuid, transaction_id):
+    doc = state_store.read_json_tolerant(
+        state_store.verification_snapshot_manifest_path_for(
+            session_uuid, transaction_id))
+    files = doc.get("files") if isinstance(doc, dict) else None
+    return files if isinstance(files, dict) else None
+
+
+def _build_correction_basis(session_uuid, reference, pointer):
+    """`(delta, prior_reviewed)` of a build correction round: the delta between
+    the candidate the previous review judged and the candidate the current
+    receipt pointer certifies, both from persisted manifests. The delta is None
+    (unmeasurable, so full scope) whenever any piece is missing, unreadable or
+    inconsistent. `dependency_hit` is never measured here, so it stays None."""
+    prior = reference.get("transaction")
+    if not isinstance(prior, dict):
+        return None, {}
+    prior_id = prior.get("transaction_id")
+    prior_files = _manifest_files_of(session_uuid, prior_id)
+    prior_reviewed = {
+        "recorded_manifest_digest": prior.get("manifest_digest"),
+        "verified_manifest_digest": (
+            verification.manifest_fingerprint(prior_files)
+            if prior_files is not None else None)}
+    if (not isinstance(pointer, dict) or not pointer.get("transaction_id")
+            or not _is_sha256_hex(pointer.get("manifest_digest"))):
+        return None, prior_reviewed
+    if pointer["transaction_id"] == prior_id:
+        return ({"changed_paths": [], "executable_paths": [],
+                 "candidate_unchanged": True, "dependency_hit": None},
+                prior_reviewed)
+    current_files = _manifest_files_of(session_uuid, pointer["transaction_id"])
+    if (prior_files is None or current_files is None
+            or verification.manifest_fingerprint(current_files)
+            != pointer["manifest_digest"]):
+        return None, prior_reviewed
+    changed, executable = exec_profiles.diff_manifests(
+        prior_files, current_files)
+    return ({"changed_paths": list(changed),
+             "executable_paths": list(executable),
+             "candidate_unchanged": not changed, "dependency_hit": None},
+            prior_reviewed)
+
+
+def _artifact_correction_basis(reference, artifact_paths):
+    """`(delta, prior_reviewed)` of a scout or planner correction round. The
+    reviewed subject is the artifact set, so the delta is the per-artifact
+    hash comparison against the recorded reference. The recorded digest is
+    stored AND recomputed from the record's own map, so an edited map no
+    longer verifies."""
+    recorded = reference.get("artifacts")
+    prior_reviewed = {
+        "recorded_manifest_digest": reference.get("artifacts_digest"),
+        "verified_manifest_digest": (
+            _artifacts_digest(recorded) if isinstance(recorded, dict)
+            else None)}
+    live = _hash_artifacts(artifact_paths)
+    if live is None or not isinstance(recorded, dict) \
+            or set(live) != set(recorded):
+        return None, prior_reviewed
+    changed = sorted(path for path in live if live[path] != recorded[path])
+    return ({"changed_paths": changed, "executable_paths": [],
+             "candidate_unchanged": not changed, "dependency_hit": None},
+            prior_reviewed)
+
+
+def _correction_findings(session_uuid, reviewer_role, phase, typed):
+    """The packet findings of the previous round: the verdict's typed
+    corrective findings joined, in order, to the ledger records minted for them
+    (the finding records of this reviewer and phase from the highest recorded
+    round). Ids and lineage are carried verbatim and none is minted; any
+    mismatch of count, summary or severity returns None (no packet)."""
+    records = [
+        r for r in ledger.read_ledger(state_store.ledger_path_for(session_uuid))
+        if r.get("kind") == "finding" and not r.get("marker")
+        and r.get("discoverer") == reviewer_role and r.get("phase") == phase
+        and isinstance(r.get("round"), int)]
+    if not records:
+        return None
+    latest = max(r["round"] for r in records)
+    records = [r for r in records if r["round"] == latest]
+    if len(records) != len(typed):
+        return None
+    findings = []
+    for record, finding in zip(records, typed):
+        if (record.get("summary") != finding.get("summary")
+                or record.get("severity") != finding.get("severity")
+                or finding.get("severity") not in
+                correction_packets.SEVERITIES):
+            return None
+        findings.append({
+            "finding_id": record.get("id"),
+            "source_finding_id": record.get("source_finding_id"),
+            "source_session": record.get("source_session"),
+            "severity": finding["severity"],
+            "criterion": finding.get("criterion"),
+            "evidence_path": finding.get("evidence_path"),
+            "evidence_sha256": finding.get("evidence_sha256"),
+            "risk_class": finding.get("risk_class")})
+    return findings
+
+
+def _prepare_review_correction(profile_session, session_uuid, phase,
+                               reviewer_role, round_index, review_path,
+                               artifact_paths):
+    """The in-flight correction (`_CORRECTION_CTX` value) for one resumed
+    review pass of a profiled light/standard session, or None for the ordinary
+    full prompt. The packet is computed by `cowork_correction` from the
+    previous verdict's typed findings and the measured delta; nothing here
+    asserts a class or a scope. Any failure at any point yields None."""
+    try:
+        if phase not in correction_packets.PHASES or not session_uuid:
+            return None
+        previous = state_store.read_review(review_path)
+        if (not isinstance(previous, dict) or previous.get("malformed")
+                or previous.get("verdict") != "revise"):
+            return None
+        typed = previous.get("corrective_findings")
+        if (not isinstance(typed, list) or not typed
+                or not all(isinstance(f, dict) for f in typed)):
+            return None
+        findings = _correction_findings(
+            session_uuid, reviewer_role, phase, typed)
+        reference = _read_reviewed_reference(
+            session_uuid, phase, reviewer_role)
+        if findings is None:
+            return None
+        pointer = None
+        if phase == "building":
+            pointer = state_store.read_current_receipt_pointer(session_uuid)
+            delta, prior_reviewed = (
+                _build_correction_basis(session_uuid, reference, pointer)
+                if reference is not None else (None, {}))
+        else:
+            delta, prior_reviewed = (
+                _artifact_correction_basis(reference, artifact_paths)
+                if reference is not None else (None, {}))
+        links = {}
+        if isinstance(pointer, dict):
+            disposition = (_latest_verification_disposition(
+                session_uuid, pointer.get("transaction_id"))
+                or pointer.get("disposition"))
+            links = {
+                "verification_transaction_id": pointer.get("transaction_id"),
+                "candidate_manifest_digest": (
+                    pointer.get("manifest_digest")
+                    if _is_sha256_hex(pointer.get("manifest_digest"))
+                    else None),
+                "candidate_index_digest": (
+                    pointer.get("index_digest")
+                    if _is_sha256_hex(pointer.get("index_digest")) else None),
+                "disposition": (disposition if disposition
+                                in correction_packets.DISPOSITIONS else None)}
+        if _is_sha256_hex(prior_reviewed.get("recorded_manifest_digest")):
+            links["prior_reviewed_manifest_digest"] = prior_reviewed[
+                "recorded_manifest_digest"]
+        policy = exec_profiles.resolved_vertex_policy(
+            profile_session.effective, reviewer_role)
+        packet = correction_packets.build_correction_packet(
+            session_uuid, phase, reviewer_role, round_index, delta, findings,
+            {}, links, "pending", policy, prior_reviewed)
+        path = os.path.join(
+            _correction_dir(session_uuid),
+            "correction.%s.%s.r%d.json" % (phase, reviewer_role, round_index))
+        if not state_store.write_json_atomic(path, packet):
+            return None
+        if correction_packets.validate_packet(
+                state_store.read_json_tolerant(path)) != (True, None):
+            return None
+        severities = [f["severity"] for f in packet["findings"]]
+        facts = {
+            "correction_kind": packet["kind"],
+            "correction_scope": packet["review_scope"]["scope"],
+            "correction_finding_count": len(packet["findings"]),
+            "correction_max_severity": next(
+                (s for s in correction_packets.SEVERITIES
+                 if s in severities), "none")}
+        changed = (delta or {}).get("changed_paths")
+        return {"role": reviewer_role, "packet_path": os.path.abspath(path),
+                "facts": facts,
+                "changed_paths": (list(changed) if phase == "building"
+                                  and changed else None)}
+    except Exception:  # noqa: BLE001 - any doubt resolves to the full prompt
+        return None
+
+
 def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    reviewer_resume_id=None, on_reviewer_session=None,
                    context_update=None, on_context_ack=None, trace=None,
@@ -9035,7 +9547,8 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    review_packet_ctx=None,
                    switch_note_fn=None, on_switch_consumed=None,
                    reviewer_controller_check_fn=None,
-                   evaluation_policy=None):
+                   evaluation_policy=None, profile_session=None,
+                   correction_artifact_paths=None):
     """Build the `review_fn` passed to `_role_loop` when the paired reviewer
     (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
     not. The closure runs one reviewer pass and returns its verdict dict.
@@ -9059,7 +9572,16 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     and appended to the aggregate — the evaluator is never given the
     aggregate path (the scratch itself stays under the session-assets home,
     ~/.cowork/sessions/<uuid>/, overwritten per round; it is cleared before
-    each eval send, not after)."""
+    each eval send, not after).
+
+    Correction rounds (additive): only for a `profile_session` whose reuse
+    policy exists (light/standard). From the second round of a revise loop the
+    closure computes a correction packet from the previous verdict's typed
+    findings and the measured delta, and hands its path and four closed facts
+    to the resume assembler for the one runner call. Every doubt resolves to
+    the ordinary full prompt. `correction_artifact_paths` names the reviewed
+    artifact files whose hashes are the scout/planner delta. With no
+    `profile_session` none of this runs."""
     if reviewer_role not in selected or not review_path:
         return None
     runner = reviewer_runner or run_reviewer_once
@@ -9200,8 +9722,32 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
             # queued below instead, and an isolated evaluator runs them at
             # phase end.
             kwargs["eval_scratch_path"] = eval_scratch_path
-        verdict = runner(config, runner_context, selected, artifact_path,
-                         review_path, **kwargs)
+        reviewed_reference = None
+        correction_value = None
+        if (profile_session is not None and session_uuid
+                and phase in correction_packets.PHASES
+                and profile_session.reuse_policy() is not None):
+            try:
+                reviewed_reference = _capture_reviewed_reference(
+                    session_uuid, phase, reviewer_role, round_index,
+                    correction_artifact_paths)
+            except Exception:  # noqa: BLE001 - no reference means full scope
+                reviewed_reference = None
+            if round_index >= 2 and not force_full_reread:
+                correction_value = _prepare_review_correction(
+                    profile_session, session_uuid, phase, reviewer_role,
+                    round_index, review_path, correction_artifact_paths)
+        correction_token = (_CORRECTION_CTX.set(correction_value)
+                            if correction_value is not None else None)
+        try:
+            verdict = runner(config, runner_context, selected, artifact_path,
+                             review_path, **kwargs)
+        finally:
+            if correction_token is not None:
+                _CORRECTION_CTX.reset(correction_token)
+        if reviewed_reference is not None and not _is_review_failure(verdict):
+            # The reviewer judged exactly what was captured before it ran.
+            _write_reviewed_reference(session_uuid, reviewed_reference)
         if specs:
             if len(specs) > 1:
                 holder["consumed_done"] = True
@@ -11494,7 +12040,11 @@ def run_scout(config, context, selected, io_out=None,
         review_packet_ctx=review_packet_ctx,
         switch_note_fn=reviewer_switch_note_fn,
         on_switch_consumed=on_reviewer_switch_consumed,
-        reviewer_controller_check_fn=reviewer_controller_check_fn)
+        reviewer_controller_check_fn=reviewer_controller_check_fn,
+        **({"profile_session": profile_session,
+            "correction_artifact_paths": [
+                p for p in (intel_path, intel_md_path) if p]}
+           if profile_session is not None else {}))
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_enqueue_eval_fn(
@@ -11918,7 +12468,11 @@ def run_planner(config, context, selected, io_out=None,
         review_packet_ctx=review_packet_ctx,
         switch_note_fn=reviewer_switch_note_fn,
         on_switch_consumed=on_reviewer_switch_consumed,
-        reviewer_controller_check_fn=reviewer_controller_check_fn)
+        reviewer_controller_check_fn=reviewer_controller_check_fn,
+        **({"profile_session": profile_session,
+            "correction_artifact_paths": [
+                p for p in (plan_json_path, plan_md_path) if p]}
+           if profile_session is not None else {}))
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_enqueue_eval_fn(
@@ -12344,7 +12898,9 @@ def run_builder(config, context, selected, io_out=None,
         surface_io_out=io_out, review_packet_ctx=review_packet_ctx,
         switch_note_fn=reviewer_switch_note_fn,
         on_switch_consumed=on_reviewer_switch_consumed,
-        reviewer_controller_check_fn=reviewer_controller_check_fn)
+        reviewer_controller_check_fn=reviewer_controller_check_fn,
+        **({"profile_session": profile_session}
+           if profile_session is not None else {}))
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_enqueue_eval_fn(
