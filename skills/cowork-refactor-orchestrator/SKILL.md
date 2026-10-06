@@ -81,13 +81,13 @@ combine a roadmap milestone with unrelated cleanup.
    and separate discovery/build/correction package limits, plus the verified
    provider capacity policy. Limits bound a package; they never grant credit,
    spending, overage, or permission to amend a limit.
-4. Create an authority record that freezes the base/candidate identity and
+4. Create an authority record that binds the base/candidate identity and
    records findings or amendments.
 5. Run `cowork --check` on the runner that will execute the package; a failed
-   preflight blocks the package. Use the
-   [Cowork self-hosting runner](references/bootstrap-backend.md) — a frozen
-   stable runner driving an isolated target worktree — when the package changes
-   the dispatch, phase-truth, guard, or recovery mechanism being relied on.
+   preflight blocks the package. Follow the repository's
+   [dogfooding policy](../../AGENTS.md#cowork-dogfooding) for execution.
+   Read [Cowork self-hosting](references/bootstrap-backend.md) when the package
+   changes the dispatch, phase-truth, guard, or recovery mechanism being relied on.
 
 Perform these filesystem steps explicitly and record the artifacts. Never
 make a worker responsible for controller state.
@@ -215,8 +215,8 @@ Cowork is the transport for every package. A package that Cowork cannot run
 used only when the user explicitly asks for it for that work.
 
 A self-hosting package — one whose changes would circularly rely on Cowork's
-own dispatch, phase-truth, guard, or recovery contract — still runs on Cowork,
-launched from the frozen stable runner against an isolated target worktree.
+own dispatch, phase-truth, guard, or recovery contract — still runs on Cowork
+against an isolated target worktree under the repository's execution policy.
 Use one paired-team session for the package and treat its approvals as
 advisory until the supervisor validates them and completes its own independent
 review.

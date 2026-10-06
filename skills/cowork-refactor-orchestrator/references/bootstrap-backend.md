@@ -1,4 +1,4 @@
-# Cowork self-hosting runner
+# Cowork self-hosting
 
 Use this treatment when the package changes the Cowork mechanism that would
 otherwise authorize, dispatch, observe, recover, or accept that same package.
@@ -6,34 +6,15 @@ Examples include capability preflight, governed identity, terminal phase truth,
 guards, provider health, or exact-role resume. Milestone labels alone never
 select this treatment.
 
-Self-hosting work still runs on Cowork. Launch it from a frozen stable runner —
-an installed main checkout that the package never edits — driving an
-isolated target worktree that holds the candidate. Freezing the runner resolves
-the circularity: the mechanism executing the package is a fixed artifact, and
-the mechanism under repair is a separate one.
+Self-hosting work still runs on Cowork against an isolated target worktree.
+Follow the repository's [dogfooding policy](../../../AGENTS.md#cowork-dogfooding)
+for execution and integration; use `cowork-cli` for invocation mechanics.
 
-## Selecting and freezing the runner
-
-Resolve the runner explicitly, once per package. Do not inherit it from this
-document, from a previous package, or from any commit written down in advance;
-a literal pinned in prose goes stale silently and then names a runner nobody
-validated. At package start, select the checkout to run on, verify it passes its
-own environmental preflight, and record in the package's authority record the
-runner's repository path together with the exact HEAD commit and tree it
-resolved to.
-
-That recorded HEAD/tree is frozen for the whole run. Every role in the package
-uses the same recorded runner, and re-pointing it is a new package rather than
-an amendment to this one.
-
-Validated means validated for this package: the recorded runner passed its own
-preflight. Evidence from an earlier package or runner does not transfer.
-
-Runner and target are distinct artifacts even when they sit on the same commit.
-A diff in the target does not mean the runner changed. Derive no runner-identity
-claim from the target diff, and never edit the runner while it is running the
-package. If the runner's environmental preflight fails, the package is blocked
-and does not re-route.
+Record the invoked runner's path and observed revision as provenance, not a
+promise that its checkout remains unchanged. Runner and target are distinct
+artifacts even when they start on the same commit; do not infer runner identity
+from the target diff. A failed environmental preflight remains a named package
+failure, not permission to change transport.
 
 Do not require Cowork to authoritatively run the mechanisms whose correctness
 is under repair. A Cowork scout may provide advisory research, but do not make
@@ -46,8 +27,9 @@ Cowork runs paired teams: a new session always begins in scouting with
 reviewer. There is no standalone planner, builder, or reviewer session.
 
 1. Create the worktree and package state before starting a worker.
-2. Start one bounded Cowork session from the frozen runner against the target
-   worktree. When the supervisor must gate the plan before building, start it
+2. Start one bounded Cowork session against the target worktree following the
+   repository's execution policy. When the supervisor must gate the plan before
+   building, start it
    with the planning team (`scout,scout-reviewer,planner,planning-advisor`);
    the run ends with the approved plan as its deliverable. With the full team,
    the planning-advisor's approval chains directly into building.

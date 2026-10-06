@@ -16,6 +16,19 @@ operating in this repo. Keep entries factual and tool-agnostic.
   usually need matching updates in the relevant role spec, orchestration code,
   tests, and README.
 
+## Cowork dogfooding
+
+When developing this repository, invoke `cowork` from PATH pointing to the
+Cowork checkout on `main`. This identifies the executable, not the working
+directory: agents may work in isolated target worktrees.
+
+Do not freeze `main` or the executor for active sessions, create pinned executor
+copies, or require preventive compatibility gates before integrating because
+other sessions are running. Integrate reviewed and validated work on current
+`main`, reconciling conflicts in the integration candidate as needed. If an
+execution error occurs, preserve its evidence and audit that specific case;
+do not turn a hypothetical failure into a development-wide block.
+
 ## Development commands
 
 ```bash
