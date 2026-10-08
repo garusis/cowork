@@ -289,7 +289,8 @@ class CharacterizationTests(FlowEnv):
     trace order of the fix handoff."""
 
     def test_eval_on_numbering_continues_across_a_resume(self):
-        first = self.drive(SCOUTING, [_revise(_finding("one")), NEEDS_USER])
+        first = self.drive(
+            SCOUTING, [_revise(_finding("one", "major")), NEEDS_USER])
         self.assertEqual(first[0], "stopped")
         second = self.drive(SCOUTING, [APPROVE])
         self.assertEqual(second[0], "approved")
@@ -300,9 +301,9 @@ class CharacterizationTests(FlowEnv):
             [q["loop_round"] for q in self.queue("scout-reviewer")], [1, 2, 1])
 
     def test_sampled_selection_follows_the_durable_round(self):
-        for script in ([_revise(_finding("one")), _revise(_finding("two")),
-                        NEEDS_USER],
-                       [_revise(_finding("three")), APPROVE]):
+        for script in ([_revise(_finding("one", "major")),
+                        _revise(_finding("two", "major")), NEEDS_USER],
+                       [_revise(_finding("three", "major")), APPROVE]):
             self.drive(PLANNING, script, eval_policy="sampled")
         for seat in ("planner", "planning-advisor"):
             self.assertEqual([q["round"] for q in self.queue(seat)], [1, 3, 5])
@@ -313,15 +314,16 @@ class CharacterizationTests(FlowEnv):
                                    ("planning-advisor", 4)])
 
     def test_eval_off_session_numbers_rounds_from_one(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), _revise(_finding("two")),
-                              APPROVE], eval_on=False)
+        self.drive(SCOUTING, [_revise(_finding("one", "major")),
+                              _revise(_finding("two", "major")), APPROVE],
+                   eval_on=False)
         self.assertEqual([r["round"] for r in self.ledger_findings()], [1, 2])
         self.assertEqual(
             [e["round"] for e in self.events("review.handoff.recorded")],
             [1, 2])
 
     def test_eval_enqueue_precedes_the_fix_handoff(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), APPROVE])
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), APPROVE])
         names = [e["event"] for e in self.events()]
         self.assertIn("eval.enqueued", names)
         self.assertIn("review.handoff.recorded", names)
@@ -583,7 +585,7 @@ class VerdictRecordingFlowTests(FlowEnv):
              "status_sha256": self.status_sha(SCOUTING)})
 
     def test_the_round_names_the_review_file_and_a_verdict_copy(self):
-        verdict = _revise(_finding("one"))
+        verdict = _revise(_finding("one", "major"))
         self.drive(SCOUTING, [verdict, APPROVE], eval_on=False)
         record = self.chain_records("round")[0]
         copy_path = record["verdict_copy_path"]
@@ -601,7 +603,8 @@ class VerdictRecordingFlowTests(FlowEnv):
     def test_each_verdict_kind_mints_exactly_one_round(self):
         cases = (
             ("approve", [APPROVE], 1, "approved", None),
-            ("revise", [_revise(_finding("x")), APPROVE], 2, "approved", None),
+            ("revise", [_revise(_finding("x", "major")), APPROVE], 2,
+             "approved", None),
             ("needs_user", [NEEDS_USER], 1, "stopped", "reviewer_question"),
             ("round_cap",
              [_revise(_finding("again"))] * cowork.REVIEW_ROUND_CAP,
@@ -641,14 +644,15 @@ class VerdictRecordingFlowTests(FlowEnv):
         self.assertEqual(len(self.chain_records("round")), 1)
 
     def test_a_failed_turn_queues_no_reviewer_entry_and_burns_no_number(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), UNUSABLE, APPROVE])
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), UNUSABLE,
+                              APPROVE])
         self.assertEqual(
             [q["round"] for q in self.queue("scout-reviewer")], [1, 2])
         self.assertEqual([q["round"] for q in self.queue("scout")], [1, 2])
         self.assertEqual(len(self.chain_records("round")), 2)
 
     def test_a_resume_continues_the_numbering(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), NEEDS_USER],
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), NEEDS_USER],
                    eval_on=False)
         self.drive(SCOUTING, [APPROVE], eval_on=False)
         self.assertEqual(
@@ -684,7 +688,7 @@ class VerdictRecordingFlowTests(FlowEnv):
 
     def test_typed_findings_carry_the_round_id_and_candidate(self):
         self.drive(SCOUTING, [_revise(_finding("one"), _finding("two", "minor")),
-                              APPROVE], eval_on=False)
+                              NEEDS_USER], eval_on=False)
         round_record = self.chain_records("round")[0]
         findings = self.chain_records("finding")
         self.assertEqual([f["summary"] for f in findings], ["one", "two"])
@@ -852,7 +856,7 @@ class BlockingFlagTests(FlowEnv):
 
     def test_a_non_builder_role_never_supersedes(self):
         findings = self.record(SCOUTING, [self.challenge()],
-                               script_tail=[APPROVE])
+                               script_tail=[NEEDS_USER])
         self.assertEqual(
             [(f["blocking"], f["superseded_by_transaction"])
              for f in findings], [(True, None)])
@@ -884,7 +888,8 @@ class FindingRefTests(FlowEnv):
         their ids; then `tail`."""
         def second(path):
             return _revise(*(mark(self.af_ids()) for mark in marks))
-        self.drive(SCOUTING, [_revise(_finding("first"), _finding("second")),
+        self.drive(SCOUTING, [_revise(_finding("first", "major"),
+                                      _finding("second", "major")),
                               second] + list(tail), eval_on=False)
 
     def state(self, finding_id):
@@ -968,7 +973,7 @@ class FindingRefTests(FlowEnv):
         self.assertEqual(events[0]["finding_id"], findings[0]["id"])
 
     def test_a_ref_into_another_phase_does_not_resolve(self):
-        self.drive(SCOUTING, [_revise(_finding("scouted")), APPROVE],
+        self.drive(SCOUTING, [_revise(_finding("scouted", "major")), APPROVE],
                    eval_on=False)
         scouted = self.af_ids()[0]
         self.drive(PLANNING, [
@@ -981,8 +986,9 @@ class FindingRefTests(FlowEnv):
 
     def test_a_ref_to_a_finding_of_the_same_verdict_cannot_resolve(self):
         self.drive(SCOUTING, [
-            _revise(_finding("one"), {"finding_ref": "AF-0002",
-                                      "summary": "two", "severity": "minor"}),
+            _revise(_finding("one", "major"), {"finding_ref": "AF-0002",
+                                               "summary": "two",
+                                               "severity": "minor"}),
             APPROVE], eval_on=False)
         self.assertEqual(len(self.af_ids()), 2)
         self.assertEqual(len(self.events("authority.finding_ref_unresolved")), 1)
@@ -1025,7 +1031,7 @@ class FindingRefTests(FlowEnv):
         self.assertEqual(self.state("AF-0002"), "closed")
         self.drive(SCOUTING, [
             _revise({"finding_ref": "AF-0002", "closure": "still_open"}),
-            APPROVE], eval_on=False)
+            NEEDS_USER], eval_on=False)
         self.assertEqual(self.state("AF-0002"), "open")
         self.assertEqual(self.chain_records("reopen")[0]["finding_id"],
                          "AF-0002")
@@ -1037,7 +1043,7 @@ class ClosedSourceTests(FlowEnv):
     """`closed_source_findings` and closure markings are measurement."""
 
     def test_closed_source_findings_create_no_chain_record(self):
-        verdict = _revise(_finding("one"))
+        verdict = _revise(_finding("one", "major"))
         verdict["closed_source_findings"] = ["SRC-1", "SRC-2"]
         self.drive(SCOUTING, [verdict, APPROVE], eval_on=False)
         self.assertEqual(
@@ -1050,7 +1056,7 @@ class ClosedSourceTests(FlowEnv):
         def second(path):
             ids = self.af_ids()
             verdict = _revise({"finding_ref": ids[0], "closure": "fixed"},
-                              _finding("new", closure="fixed"))
+                              _finding("new", "major", closure="fixed"))
             verdict["closed_source_findings"] = ids
             # the ledger closure exists before this verdict's own boundary and
             # before the later approving one
@@ -1059,8 +1065,8 @@ class ClosedSourceTests(FlowEnv):
                 closes=self.ledger_findings()[0]["id"],
                 phase=SCOUTING, round_index=2)
             return verdict
-        self.drive(SCOUTING, [_revise(_finding("one")), second, APPROVE],
-                   eval_on=False)
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), second,
+                              APPROVE], eval_on=False)
         closure = appended["closure"]
         self.assertIsNotNone(closure)
         for row in self.folded()["findings"].values():
@@ -1076,7 +1082,7 @@ class RoundSurfaceTests(FlowEnv):
     """Every surface of a usable verdict carries the chain round."""
 
     def test_the_trace_carries_the_chain_round(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), APPROVE])
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), APPROVE])
         rounds = {r["round"]: r["id"] for r in self.chain_records("round")}
         recorded = self.events("review.round.recorded")
         self.assertEqual([e["authority_round"] for e in recorded], [1, 2])
@@ -1087,7 +1093,8 @@ class RoundSurfaceTests(FlowEnv):
                           for e in handoff], [(1, 1)])
 
     def test_the_recorded_event_reports_the_new_finding_ids(self):
-        self.drive(SCOUTING, [_revise(_finding("one"), _finding("two")),
+        self.drive(SCOUTING, [_revise(_finding("one", "major"),
+                                      _finding("two", "major")),
                               APPROVE], eval_on=False)
         event = self.events("review.round.recorded")[0]
         self.assertEqual(event["finding_ids"], self.af_ids())
@@ -1096,7 +1103,7 @@ class RoundSurfaceTests(FlowEnv):
             self.assertEqual(event[key], [])
 
     def test_the_eval_queue_and_events_carry_the_chain_round(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), APPROVE])
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), APPROVE])
         chain_rounds = [r["round"] for r in self.chain_records("round")]
         for seat in ("scout", "scout-reviewer"):
             self.assertEqual([q["round"] for q in self.queue(seat)],
@@ -1106,7 +1113,8 @@ class RoundSurfaceTests(FlowEnv):
         self.assertEqual([e["authority_round"] for e in lead], chain_rounds)
 
     def test_the_ledger_mirror_carries_the_chain_identity(self):
-        self.drive(SCOUTING, [_revise(_finding("one"), _finding("two")),
+        self.drive(SCOUTING, [_revise(_finding("one", "major"),
+                                      _finding("two", "major")),
                               APPROVE], eval_on=False)
         mirrored = self.ledger_findings()
         self.assertEqual([m["authority_id"] for m in mirrored], self.af_ids())
@@ -1118,8 +1126,8 @@ class RoundSurfaceTests(FlowEnv):
             return _revise({"finding_ref": self.af_ids()[0],
                             "summary": "again", "severity": "major",
                             "closure": "still_open"})
-        self.drive(SCOUTING, [_revise(_finding("one")), second, APPROVE],
-                   eval_on=False)
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), second,
+                              APPROVE], eval_on=False)
         first, again = self.ledger_findings()
         self.assertEqual(again["authority_ref"], first["authority_id"])
         self.assertNotIn("authority_id", again)
@@ -1146,17 +1154,17 @@ class RoundSurfaceTests(FlowEnv):
                 epochs = os.path.join(self.assets, "round_epochs.json")
                 if os.path.exists(epochs):
                     os.unlink(epochs)
-                self.drive(SCOUTING, [_revise(_finding("one")), APPROVE],
-                           eval_on=eval_on)
+                self.drive(SCOUTING, [_revise(_finding("one", "major")),
+                                      APPROVE], eval_on=eval_on)
                 top = len(self.chain_records("round"))
                 self.assertEqual(
                     self.epochs(), {"scouting|scout": top,
                                     "scouting|scout-reviewer": top})
 
     def test_eval_off_rounds_are_the_chain_rounds_across_a_resume(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), NEEDS_USER],
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), NEEDS_USER],
                    eval_on=False)
-        self.drive(SCOUTING, [_revise(_finding("two")), APPROVE],
+        self.drive(SCOUTING, [_revise(_finding("two", "major")), APPROVE],
                    eval_on=False)
         self.assertEqual([m["round"] for m in self.ledger_findings()], [1, 3])
         self.assertEqual(
@@ -1189,7 +1197,8 @@ class DivergenceFaultTests(FlowEnv):
         with mock.patch.object(state_store, "sync_phase_round",
                                side_effect=flaky):
             outcome, _payload, _sess = self.drive(
-                SCOUTING, [_revise(_finding("one")), second], eval_on=False)
+                SCOUTING, [_revise(_finding("one", "major")), second],
+                eval_on=False)
         self.assertEqual(outcome, "approved")
         self.assertEqual(seen, {"epochs": {}, "rounds": 1})
         self.assertEqual(self.epochs(), {"scouting|scout": 2,
@@ -1209,7 +1218,8 @@ class DivergenceFaultTests(FlowEnv):
     def test_a_ledger_mirror_failure_does_not_stop_the_gate(self):
         with mock.patch.object(ledger, "append_record", return_value=None):
             outcome, _payload, _sess = self.drive(
-                SCOUTING, [_revise(_finding("one")), APPROVE], eval_on=False)
+                SCOUTING, [_revise(_finding("one", "major")), APPROVE],
+                eval_on=False)
         self.assertEqual(outcome, "approved")
         self.assertEqual(self.ledger_findings(), [])
         self.assertEqual(len(self.af_ids()), 1)
@@ -1315,7 +1325,8 @@ class FailClosedTests(FlowEnv):
         with mock.patch.object(cowork, "_chain_append",
                                side_effect=commit_then_doubt):
             outcome, _payload, _sess = self.drive(
-                SCOUTING, [_revise(_finding("one")), APPROVE], eval_on=False)
+                SCOUTING, [_revise(_finding("one", "major")), APPROVE],
+                eval_on=False)
         self.assertEqual(outcome, "approved")
         self.assertEqual(len(calls), 3)
         self.assertEqual(
@@ -1413,17 +1424,17 @@ class LifecycleFixtureTests(FlowEnv):
         def second(path):
             ids = self.af_ids()
             return _revise({"finding_ref": ids[0], "disposition": "withdrawn"},
-                           _finding("e"), _finding("f"))
+                           _finding("e", "major"), _finding("f", "major"))
 
         def third(path):
             ids = self.af_ids()
-            return _revise(_finding("g"), _finding("h"),
+            return _revise(_finding("g", "major"), _finding("h", "major"),
                            {"finding_ref": ids[4], "disposition": "duplicate",
                             "duplicate_of": ids[1]})
 
         outcome, _payload, _sess = self.drive(SCOUTING, [
-            _revise(*[_finding(name) for name in "abcd"]), second, third,
-            APPROVE], eval_on=False)
+            _revise(*[_finding(name, "major") for name in "abcd"]), second,
+            third, APPROVE], eval_on=False)
         self.assertEqual(outcome, "approved")
         folded = self.folded()
         rounds = [1, 2, 3, 4]
@@ -1475,7 +1486,7 @@ class ChainGateNumberingTests(FlowEnv):
     def test_seeded_epochs_without_a_chain_number_every_surface_alike(self):
         self.seed_epochs(3)
         outcome, _payload, _sess = self.drive(
-            SCOUTING, [_revise(_finding("one")), APPROVE])
+            SCOUTING, [_revise(_finding("one", "major")), APPROVE])
         self.assertEqual(outcome, "approved")
         chain_rounds = [r["round"] for r in self.chain_records("round")]
         self.assertEqual(chain_rounds, [1, 2])
@@ -1676,7 +1687,7 @@ class LostChainTests(StopAssertions, FlowEnv):
         self.assertTrue(cowork._prior_authority_round_evidence(self.sid))
 
     def test_a_non_empty_chain_is_never_treated_as_lost(self):
-        self.drive(SCOUTING, [_revise(_finding("one")), NEEDS_USER],
+        self.drive(SCOUTING, [_revise(_finding("one", "major")), NEEDS_USER],
                    eval_on=False)
         outcome, _payload, _sess = self.drive(
             SCOUTING, [APPROVE], eval_on=False)
@@ -1888,7 +1899,7 @@ class CandidateMutationTests(FlowEnv):
     def test_a_revise_records_the_pre_review_candidate(self):
         seen = {}
         self.drive(SCOUTING, [
-            self.mutating(_revise(_finding("one")), seen), APPROVE],
+            self.mutating(_revise(_finding("one", "major")), seen), APPROVE],
             eval_on=False)
         self.assertNotEqual(seen["before"], seen["after"])
         first = self.chain_records("round")[0]

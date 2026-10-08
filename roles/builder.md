@@ -234,6 +234,23 @@ only its explicit `approve` approves the build.
   stops and the orchestrator answers. The answer reaches you as a context
   update: apply it and set `ready_for_review` again.
 
+### Resolution proposals
+
+A revise handoff can end with a note that lists the open authority finding ids
+(`AF-…`) that still have no basis for closure. When you have fixed one, say so
+in your `ready_for_review` status: add `result.resolution_proposals`, a list of
+entries `{"authority_ids": ["AF-…"], "changed_evidence_paths": ["<a file you
+changed>"], "requires": []}`. `authority_ids` are ids the handoff lists;
+`changed_evidence_paths` names the files you changed for them; `requires` is
+only a capability the fix needs beyond your authority (omit it when none), and
+may only hold the tokens `scope_expansion` and `policy_exception`. Any other
+token voids the whole entry: it is not recorded. You
+never write a candidate, a sha256, an author or a closure: the runtime binds
+the evidence candidate and the digests of those files when it records the
+proposal, and ignores anything else in the entry. A proposal alone closes
+nothing: a finding closes only when the control plane sees a valid proposal and
+the reviewer's current-round closed recommendation.
+
 ## Iron rule: build the plan, nothing more
 
 - You edit the repository freely to execute the approved plan. Stay within the

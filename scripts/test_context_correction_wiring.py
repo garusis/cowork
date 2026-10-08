@@ -38,6 +38,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import cowork  # noqa: E402
+import cowork_authority_chain as authority_chain  # noqa: E402
 import cowork_correction as correction_packets  # noqa: E402
 import cowork_execution_profiles as profiles  # noqa: E402
 import cowork_handoff as handoff  # noqa: E402
@@ -136,10 +137,11 @@ class _GateCase(flow._RoleLoopCase):
         self.trace = trace_store.Trace(
             self.trace_path, session_uuid=self.suid, run_id="R")
 
-    def drive_review(self, session, edits, verdicts):
+    def drive_review(self, session, edits, verdicts, result_fn=None):
         """Like the flow tests' driver, with a review path. A verdict item is
         a dict (returned and written to the review file), a
-        `(returned, file_content)` pair, or a callable producing either."""
+        `(returned, file_content)` pair, or a callable producing either.
+        `result_fn(send_number)`, when given, supplies the status `result`."""
         status_path = self.status_path
         sent = []
         case = self
@@ -150,10 +152,11 @@ class _GateCase(flow._RoleLoopCase):
                 edit = edits.pop(0) if edits else None
                 if edit is not None:
                     edit()
+                result = result_fn(len(sent)) if result_fn else {}
                 with open(status_path, "w") as fh:
                     json.dump({"session": "X", "role": "builder",
-                               "status": "ready_for_review", "result": {}},
-                              fh)
+                               "status": "ready_for_review",
+                               "result": result}, fh)
 
             def close(self_inner):
                 pass
@@ -181,13 +184,37 @@ class _GateCase(flow._RoleLoopCase):
         self.sent, self.reviewed = sent, reviewed
         return rc, outcome, payload
 
-    def drive_spied(self, session, edits, verdicts):
+    def drive_spied(self, session, edits, verdicts, result_fn=None):
         with mock.patch.object(
                 verification, "run_transaction",
                 wraps=verification.run_transaction) as spy:
-            result = self.drive_review(session, edits, verdicts)
+            result = self.drive_review(session, edits, verdicts, result_fn)
         self.transaction_calls = spy.call_count
         return result
+
+    def chain_finding_ids(self):
+        read = authority_chain.read_chain(
+            state_store.authority_chain_path_for(self.suid))
+        return [r["id"] for r in read["records"] if r["kind"] == "finding"]
+
+    def closing_recommendation(self):
+        """A revise whose one entry recommends closing the first chain
+        finding. It carries a valid severity because the prior-green binder
+        refuses an entry without one."""
+        return revise_with(finding(
+            "fixed", "minor", finding_ref=self.chain_finding_ids()[0],
+            closure="fixed"))
+
+    def proposing_on_send(self, number):
+        """A `result_fn`: the lead's status after send `number` proposes the
+        closure of the first chain finding."""
+        def result_fn(sent):
+            if sent != number:
+                return {}
+            return {"resolution_proposals": [{
+                "authority_ids": self.chain_finding_ids()[:1],
+                "changed_evidence_paths": []}]}
+        return result_fn
 
     def disposition_values(self, transaction_id):
         return [e.get("disposition")
@@ -217,33 +244,50 @@ class ArtifactOnlyBindingFlowTests(_GateCase):
                 mock.patch.object(
                     session, "on_builder_ready",
                     wraps=session.on_builder_ready) as on_ready:
+            # The blocking finding stays blocking, so the approval is only
+            # possible once the control plane closes it: the lead proposes
+            # the closure on its second send, a second review round
+            # recommends it closed, and only then does the reviewer approve.
             rc, outcome, _payload = self.drive_spied(
-                session, [None, self.touch_session_artifact],
+                session,
+                [None, self.touch_session_artifact,
+                 self.touch_session_artifact],
                 [revise_with(finding("section is unclear", "blocking")),
-                 APPROVE])
+                 self.closing_recommendation, APPROVE],
+                result_fn=self.proposing_on_send(2))
         self.assertEqual((rc, outcome), (0, "approved"))
-        self.assertEqual(self.reviewed, [1, 2])
-        # One owned transaction ran: the second gate bound it.
+        self.assertEqual(self.reviewed, [1, 2, 3])
+        # The finding was closed by the control plane, through a resolution
+        # that cites the lead's proposal and the round-2 recommendation.
+        resolutions = [
+            r for r in authority_chain.read_chain(
+                state_store.authority_chain_path_for(self.suid))["records"]
+            if r["kind"] == "resolution"]
+        self.assertEqual([r["finding_id"] for r in resolutions],
+                         self.chain_finding_ids())
+        # One owned transaction ran: the second and third gates bound it.
         self.assertEqual(self.transaction_calls, 1)
         self.assertEqual(self.runs(),
                          ["doc a", "doc b", "index", "unit"])
-        first, second = self.events("verification.transaction")
+        first, second, third = self.events("verification.transaction")
         self.assertNotIn("bound_reuse", first)
-        self.assertIs(second["bound_reuse"], True)
-        self.assertEqual(second["transaction_id"], first["transaction_id"])
-        self.assertEqual(second["bound_prior_transaction_id"],
-                         first["transaction_id"])
-        self.assertIs(second["reused_lock_result"], False)
-        self.assertEqual(len(self.bound_events()), 1)
+        for bound in (second, third):
+            self.assertIs(bound["bound_reuse"], True)
+            self.assertEqual(bound["transaction_id"],
+                             first["transaction_id"])
+            self.assertEqual(bound["bound_prior_transaction_id"],
+                             first["transaction_id"])
+            self.assertIs(bound["reused_lock_result"], False)
+        self.assertEqual(len(self.bound_events()), 2)
         # The disposition is truthful: the blocking finding superseded the
         # transaction, and the rebind made it a real pending review again.
         self.assertEqual(
             self.disposition_values(first["transaction_id"]),
             ["superseded_by_finding", "pending_review", "accepted"])
         # No work ran, so the accounting did not move; promotion signals did
-        # still get evaluated at both gates.
+        # still get evaluated at every gate.
         self.assertEqual(on_transaction.call_count, 1)
-        self.assertEqual(on_ready.call_count, 2)
+        self.assertEqual(on_ready.call_count, 3)
         self.assertEqual(session.record["counters"],
                          {"verification_executed": 4,
                           "verification_reused": 0})
@@ -252,7 +296,7 @@ class ArtifactOnlyBindingFlowTests(_GateCase):
                      if e.get("state") == "verified"]
         self.assertEqual(
             [e["transaction_id"] for e in readiness],
-            [first["transaction_id"]] * 2)
+            [first["transaction_id"]] * 3)
         pointer = self.pointer()
         self.assertEqual(
             pointer["inventory_identity"],
@@ -303,7 +347,7 @@ class FailClosedBindingWiringTests(_GateCase):
         rc, outcome, _payload = self.drive_spied(
             session, [None, edit],
             [first_verdict
-             or revise_with(finding("section is unclear", "blocking")),
+             or revise_with(finding("section is unclear", "major")),
              APPROVE])
         self.assertEqual((rc, outcome), (0, "approved"))
         self.assert_ordinary_second_transaction()
@@ -328,7 +372,7 @@ class FailClosedBindingWiringTests(_GateCase):
         def challenge():
             transaction_id = self.pointer()["transaction_id"]
             return revise_with(finding(
-                "the receipt is wrong", "blocking",
+                "the receipt is wrong", "major",
                 verification_challenge={"transaction_id": transaction_id}))
         self.run_refusal(self.touch_session_artifact,
                          first_verdict=challenge)
@@ -336,24 +380,24 @@ class FailClosedBindingWiringTests(_GateCase):
     def test_an_absent_verdict_file_runs_a_real_transaction(self):
         self.run_refusal(
             self.touch_session_artifact,
-            first_verdict=(revise_with(finding("x", "blocking")), None))
+            first_verdict=(revise_with(finding("x", "major")), None))
 
     def test_a_malformed_verdict_file_runs_a_real_transaction(self):
         self.run_refusal(
             self.touch_session_artifact,
-            first_verdict=(revise_with(finding("x", "blocking")),
+            first_verdict=(revise_with(finding("x", "major")),
                            {"verdict": "maybe"}))
 
     def test_a_question_less_needs_user_file_runs_a_real_transaction(self):
         self.run_refusal(
             self.touch_session_artifact,
-            first_verdict=(revise_with(finding("x", "blocking")),
+            first_verdict=(revise_with(finding("x", "major")),
                            {"verdict": "needs_user"}))
 
     def test_a_non_revise_verdict_file_runs_a_real_transaction(self):
         self.run_refusal(
             self.touch_session_artifact,
-            first_verdict=(revise_with(finding("x", "blocking")), APPROVE))
+            first_verdict=(revise_with(finding("x", "major")), APPROVE))
 
     def test_a_pointer_without_an_identity_runs_a_real_transaction(self):
         def edit():
@@ -377,7 +421,7 @@ class UnprofiledAssuranceUnchangedTests(_GateCase):
         self.unprofiled_session()
         rc, outcome, _payload = self.drive_spied(
             None, [None, self.touch_session_artifact],
-            [revise_with(finding("section is unclear", "blocking")),
+            [revise_with(finding("section is unclear", "major")),
              APPROVE])
         self.assertEqual((rc, outcome), (0, "approved"))
         self.assert_untouched()
@@ -387,7 +431,7 @@ class UnprofiledAssuranceUnchangedTests(_GateCase):
         self.assertIsNone(session.reuse_policy())
         rc, outcome, _payload = self.drive_spied(
             session, [None, self.touch_session_artifact],
-            [revise_with(finding("section is unclear", "blocking")),
+            [revise_with(finding("section is unclear", "major")),
              APPROVE])
         self.assertEqual((rc, outcome), (0, "approved"))
         self.assert_untouched()

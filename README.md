@@ -1462,6 +1462,35 @@ reviewer entry that cites an earlier finding with `finding_ref` is a
 recommendation or retraction about that finding, not a new one, and
 `closure=fixed` or `closed_source_findings` never close anything.
 
+The same chain decides whether a phase may advance. A lead's `ready_for_review`
+status may carry `result.resolution_proposals`, a list of `{authority_ids,
+changed_evidence_paths, requires}` entries; the runtime records each valid
+entry as a proposal bound to the candidate the reviewer judged, and ignores any
+lead-written candidate, digest, author or closure. A finding closes only
+through the pure `closure_decision`: a valid proposal plus the reviewer's closed
+recommendation on the current round, recorded as one resolution that cites both.
+The verdict boundary then asks `blocking_decision` whether the phase is still
+blocked, and an approve it blocks is handed back to the lead as a revise (at the
+round cap the existing `review_round_cap` stop applies) before any approval
+effect. The same decision runs again in a read-only final gate before the gate
+events, the acceptance grant and phase completion, also after a carried
+hash-gate approval; a block ends the phase as `review_not_approved` with
+`requires: answer`, and an unreadable chain, `chain_lost` or a missing candidate
+ends it as `authority_unavailable`. A reviewer's brief lists the phase's open
+blocking ids; the reviewer recommends on every listed id and approves only when
+none is listed, so closing a finding costs a revise round, and under an
+execution profile a build `approve` that carries any corrective entry is
+rejected. A proposal whose `requires` names a capability the lead's policy does
+not cover keeps its finding open and is traced as `authority.escalation_needed`;
+escalation itself arrives with the escalation work. Limits: a legacy `F-`
+reference resolves to its chain finding through the ledger mirror or an earlier
+unresolved-reference trace event, and one that matches neither opens a new
+blocking finding each time it is cited; `chain_lost` detection stays
+best-effort; ledger entries and the evidence digests a proposal records are
+attestations of the bytes read, not verified evidence; and a session whose chain
+predates this gate and holds an open blocking finding of an earlier phase
+reports it as foreign and revises until the round cap.
+
 Legacy verification attempts arrive by **reconciliation**: ingestion emits
 id-free observations keyed on `(controller_session_id, tool_call_id)`, and
 reconciliation mints an id for each key it has not seen. Replaying the same

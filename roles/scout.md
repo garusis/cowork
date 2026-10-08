@@ -158,6 +158,21 @@ reviewer finding or an orchestrator context update reopens the work, set
 `status` back to `needs_input` (with a question) only if you actually need a
 decision; otherwise fix the intel and set `ready_for_review` again.
 
+A revise handoff can end with a note that lists the open authority finding ids
+(`AF-…`) that still have no basis for closure. When you have fixed one, say so
+in the intel JSON `result`: add `resolution_proposals`, a list of entries
+`{"authority_ids": ["AF-…"], "changed_evidence_paths": ["<a file you
+changed>"], "requires": []}`. `authority_ids` are ids the handoff lists;
+`changed_evidence_paths` names the files you changed for them; `requires` is
+only a capability the fix needs beyond your authority (omit it when none), and
+may only hold the tokens `scope_expansion` and `policy_exception`. Any other
+token voids the whole entry: it is not recorded. You
+never write a candidate, a sha256, an author or a closure: the runtime binds
+the evidence candidate and the digests of those files when it records the
+proposal, and ignores anything else in the entry. A proposal alone closes
+nothing: a finding closes only when the control plane sees a valid proposal and
+the scout-reviewer's current-round closed recommendation.
+
 > **Status check:** before your turn ends, re-read the **literal** `status`
 > field on disk in the intel file and confirm it says what you intend. cowork
 > gates only on that on-disk field, never on your reply text.

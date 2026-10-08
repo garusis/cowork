@@ -72,6 +72,8 @@ import cowork_verified_binding as verified_binding  # noqa: E402
 import cowork_correction as correction_packets  # noqa: E402
 import cowork_authority_candidate as authority_candidate  # noqa: E402
 import cowork_authority_chain as authority_chain  # noqa: E402
+import cowork_authority_gate as authority_gate  # noqa: E402
+import cowork_escalation as escalation_policy  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -1753,13 +1755,28 @@ def _role_seed_delivery(brief, context):
     return _initial_user_delivery(text)
 
 
-def _lead_turn_delivery(value):
-    """Classify one lead continuation through closed transport constructors."""
+def _lead_turn_delivery(value, authority_ids=()):
+    """Classify one lead continuation through closed transport constructors.
+
+    `authority_ids` are chain-assigned finding ids. When a hand-back block
+    carries any, the fixed `_lead_open_ids_note` sentence naming them rides
+    after the block through the same cross-role gateway; nothing else can be
+    appended."""
     if isinstance(value, handoff.DeliveryEnvelope):
         return value
     if isinstance(value, handoff.HandoffBlock):
+        ids = [i for i in authority_ids if _is_authority_finding_id(i)]
+        if ids:
+            suffix = "\n\n" + _lead_open_ids_note(ids)
+            return _cross_delivery(str(value) + suffix, [value],
+                                   static_fragments=[suffix])
         return _cross_delivery(str(value), [value])
     raise TypeError("lead turn lacks typed user/static/handoff provenance")
+
+
+def _is_authority_finding_id(value):
+    return (isinstance(value, str) and value.startswith("AF-")
+            and value[3:].isdigit())
 
 
 def _eval_delivery(prompt, specs):
@@ -3034,15 +3051,17 @@ def _finding_evidence(entry, review_path, copy_path, copy_sha):
 def _plan_verdict_records(session_uuid, phase, reviewer_role, verdict, folded,
                           head, next_seq, candidate, review_path, copy_path,
                           copy_sha, verdict_sha, supersede_ids=(),
-                          supersede_tx=None):
+                          supersede_tx=None, ref_alias=None):
     """The ordered batch for one usable verdict, planned against the chain as
     read (`folded`, `head`, `next_seq`). Pure: nothing is written.
 
     The round record comes first. Each typed finding then becomes a new
     finding, or -- when it carries a `finding_ref` that resolves to an earlier
     finding of the same phase -- a recommendation, a retraction or a reopen of
-    that finding; it never closes anything. A ref that does not resolve is a
-    new finding and is reported in `unresolved`. `blocking` follows the store's
+    that finding; it never closes anything. A `finding_ref` that is not a chain
+    finding resolves through `ref_alias` (a legacy ref -> chain finding map)
+    when its target is a finding of the same phase. A ref that does not resolve
+    is a new finding and is reported in `unresolved`. `blocking` follows the store's
     rule: severity `blocking` and not superseded, where only a defeated
     verification challenge cited against a real transaction is superseded.
     Every record carries an `op_key`, so an identical retry replays."""
@@ -3086,6 +3105,12 @@ def _plan_verdict_records(session_uuid, phase, reviewer_role, verdict, folded,
         ref = ref.strip() if isinstance(ref, str) and ref.strip() else None
         if ref is None and not (entry.get("summary") or entry.get("severity")):
             continue
+        if (ref is not None and ref not in folded["findings"]
+                and ref_alias):
+            aliased = ref_alias.get(ref)
+            alias_row = folded["findings"].get(aliased) if aliased else None
+            if alias_row is not None and alias_row["phase"] == phase:
+                ref = aliased
         target = folded["findings"].get(ref) if ref is not None else None
         if target is not None and target["phase"] != phase:
             target = None
@@ -3172,6 +3197,7 @@ def _record_verdict_round(session_uuid, phase, role, reviewer_role, verdict,
     copy_path = _persist_verdict_copy(session_uuid, raw, copy_sha)
     review_ref, verdict_sha = _stand_in_evidence(
         review_path, copy_path, copy_sha)
+    ref_alias = _legacy_ref_aliases(session_uuid, phase, verdict)
     path = state_store.authority_chain_path_for(session_uuid)
     for attempt in (1, 2):
         read = authority_chain.read_chain(path)
@@ -3187,7 +3213,8 @@ def _record_verdict_round(session_uuid, phase, role, reviewer_role, verdict,
         plan = _plan_verdict_records(
             session_uuid, phase, reviewer_role, verdict, read["folded"],
             read["head"], next_seq, candidate, review_ref,
-            copy_path, copy_sha, verdict_sha, supersede_ids, supersede_tx)
+            copy_path, copy_sha, verdict_sha, supersede_ids, supersede_tx,
+            ref_alias=ref_alias)
         try:
             try:
                 committed = _chain_append(
@@ -3235,6 +3262,465 @@ def _authority_mirror_kwargs(minted, verdict):
     return {"authority_ids": [minted["new_ids"].get(i) for i in range(size)],
             "authority_refs": [minted["ref_ids"].get(i) for i in range(size)],
             "authority_round": minted["round"]}
+
+
+def _legacy_ref_aliases(session_uuid, phase, verdict):
+    """`{legacy finding_ref: chain finding id}` for the refs of `verdict` that
+    an earlier surface already joined to a chain finding.
+
+    Two tolerant translation sources, in order: the measurement-ledger mirror
+    (a ledger finding of this session and phase carries the `authority_id` or
+    `authority_ref` it was joined to) and an earlier
+    `authority.finding_ref_unresolved` trace event of the same session, phase
+    and ref (written only after the round commit, so its `finding_id` denotes a
+    committed finding). They translate an id only: closure, blocking and every
+    recommendation still come from the chain, and the caller honours an alias
+    only for a finding of the same phase. An unreadable source, or no match,
+    yields no alias."""
+    typed = verdict.get("corrective_findings") if isinstance(
+        verdict, dict) else None
+    refs = set()
+    for entry in typed if isinstance(typed, list) else []:
+        ref = entry.get("finding_ref") if isinstance(entry, dict) else None
+        if isinstance(ref, str) and ref.strip():
+            refs.add(ref.strip())
+    aliases = {}
+    if not (session_uuid and refs):
+        return aliases
+    try:
+        for record in ledger.read_ledger(state_store.ledger_path_for(
+                session_uuid)):
+            ref = record.get("id")
+            joined = record.get("authority_id") or record.get("authority_ref")
+            if (record.get("kind") == "finding" and ref in refs
+                    and record.get("phase") == phase
+                    and isinstance(joined, str) and joined):
+                aliases.setdefault(ref, joined)
+    except Exception:  # noqa: BLE001 - the ledger is a tolerant mirror
+        pass
+    try:
+        for event in state_store.read_jsonl_tolerant(
+                trace_store.trace_path_for(session_uuid)):
+            ref = event.get("finding_ref")
+            joined = event.get("finding_id")
+            if (event.get("event") == "authority.finding_ref_unresolved"
+                    and event.get("session_uuid", session_uuid)
+                    == session_uuid
+                    and event.get("phase") == phase and ref in refs
+                    and isinstance(joined, str) and joined):
+                aliases.setdefault(ref, joined)
+    except Exception:  # noqa: BLE001 - the trace is best-effort evidence
+        pass
+    return aliases
+
+
+# --------------------------------------------------------------------------- #
+# The blocking gate and closure over the authority chain.                      #
+#                                                                             #
+# A finding closes ONLY through `authority_gate.closure_decision`, called in   #
+# `_close_resolved_findings`, and a phase advances ONLY while                  #
+# `authority_gate.blocking_decision`, called in `_authority_decide`, reports   #
+# nothing blocking -- at the verdict boundary (an approve it blocks becomes a  #
+# revise) and again in the read-only final gate before any approval effect.    #
+# A reviewer's word, a ledger record or a lead-written value closes nothing.   #
+# Every strict fault raises `_AuthorityUnavailable` and stops the gate; an     #
+# `OwnerLeaseError` propagates. A lead only PROPOSES (`result.resolution_      #
+# proposals`); the runtime binds the proposal to the reviewed candidate.       #
+# --------------------------------------------------------------------------- #
+
+_LEAD_PROPOSAL_KEYS = ("authority_ids", "changed_evidence_paths", "requires")
+_BASIS_CODES = ("unresolved", "stale_candidate", "proposal_invalid")
+
+
+def _commit_batch(session_uuid, records, expected_head):
+    """Append one batch through the single writer with W1's fault mapping. A
+    head conflict is re-raised for the caller's single replan."""
+    try:
+        try:
+            return _chain_append(session_uuid, records, expected_head)
+        except authority_chain.AuthorityCommitUncertain:
+            # The same op_keys resolve either outcome without a duplicate.
+            return _chain_append(session_uuid, records, expected_head)
+    except authority_chain.AuthorityHeadConflict:
+        raise
+    except authority_chain.AuthorityRecordRefused as exc:
+        raise _AuthorityUnavailable(
+            "chain_refused", type(exc).__name__) from None
+    except authority_chain.AuthorityReadError as exc:
+        raise _AuthorityUnavailable(
+            "chain_unreadable", type(exc).__name__) from None
+    except (authority_chain.AuthorityError, OSError) as exc:
+        raise _AuthorityUnavailable(
+            "chain_write_failed", type(exc).__name__) from None
+
+
+def _authority_read(session_uuid):
+    """The strict fresh read of the session's chain, owner-fenced.
+
+    An unreadable chain and an empty chain whose session shows an earlier
+    committed round (`chain_lost`) raise `_AuthorityUnavailable`; a provably
+    empty chain (`not read["records"]`) is a session with no authority
+    findings."""
+    _require_owner(session_uuid)
+    read = authority_chain.read_chain(
+        state_store.authority_chain_path_for(session_uuid))
+    if not read["ok"]:
+        raise _AuthorityUnavailable("chain_unreadable", "AuthorityReadError")
+    if not read["records"] and _prior_authority_round_evidence(session_uuid):
+        raise _AuthorityUnavailable("chain_lost")
+    return read
+
+
+def _append_planned(session_uuid, plan):
+    """Plan against a strict read and append the batch, replanning once on a
+    head conflict. `plan(read)` returns `(records, notes)`; returns
+    `(notes, committed records)` (no records: nothing is written)."""
+    for attempt in (1, 2):
+        read = _authority_read(session_uuid)
+        records, notes = plan(read)
+        if not records:
+            return notes, []
+        try:
+            return notes, _commit_batch(
+                session_uuid, records,
+                read["head"] or authority_chain.EMPTY_HEAD)
+        except authority_chain.AuthorityHeadConflict:
+            if attempt == 2:
+                raise _AuthorityUnavailable(
+                    "head_conflict", "AuthorityHeadConflict") from None
+
+
+def _fresh_gate_candidate(session_uuid, chain_phase, role, status_path):
+    """The candidate of the gate as it stands now. No candidate raises
+    `_AuthorityUnavailable`, carrying the selection reason."""
+    candidate, reason = _gate_candidate(
+        session_uuid, chain_phase, role, status_path)
+    if candidate is None:
+        unavailable = _AuthorityUnavailable("candidate_unavailable")
+        unavailable.candidate_reason = reason
+        raise unavailable
+    return candidate
+
+
+def _gating_open_ids(folded, session_uuid, phase):
+    """Ids of the open findings of `phase` that gate it."""
+    return [fid for fid, row in folded["findings"].items()
+            if isinstance(row, dict) and row.get("state") == "open"
+            and row.get("blocking") is not False
+            and row.get("session_uuid") == session_uuid
+            and row.get("phase") == phase]
+
+
+def _latest_phase_round(folded, phase):
+    rows = [row for row in folded["rounds"] if row["phase"] == phase]
+    return rows[-1] if rows else None
+
+
+def _lead_proposal_coverage(folded):
+    """`{proposal id: covered}` for the lead's effective policy. Folded grants
+    are not consumed here: they carry no phase or candidate scope."""
+    grants = escalation_policy.EFFECTIVE_RESOLUTION_POLICY["lead"]
+    return {pid: escalation_policy.policy_covers(row.get("requires"), grants)
+            for pid, row in folded["proposals"].items()}
+
+
+def _proposal_body(entry, folded, session_uuid, chain_phase, role,
+                   reviewed_candidate, reviewed_sha256, round_row):
+    """`(proposal record body | None, reject reason | None, ignored keys,
+    dropped path count)` of one lead proposal entry. The lead supplies only
+    `authority_ids`, `changed_evidence_paths` and `requires`; the candidate,
+    the digests of the named files and the author are the runtime's.
+
+    `round_row` is the latest phase round (or None). The op_key is a function
+    of the whole body, so it carries that round's immutable id: a replay in
+    the same round is the same record, a re-assertion in a later round is a
+    new one."""
+    if not isinstance(entry, dict):
+        return None, "malformed_entry", [], 0
+    ignored = sorted(str(key) for key in entry if key not in
+                     _LEAD_PROPOSAL_KEYS)
+    ids = entry.get("authority_ids")
+    if not (isinstance(ids, list) and ids
+            and all(isinstance(i, str) and i for i in ids)):
+        return None, "malformed_ids", ignored, 0
+    paths = entry.get("changed_evidence_paths")
+    paths = [] if paths is None else paths
+    if not (isinstance(paths, list)
+            and all(isinstance(p, str) and p for p in paths)):
+        return None, "malformed_paths", ignored, 0
+    requires = entry.get("requires")
+    requires = [] if requires is None else requires
+    if not (isinstance(requires, list) and all(
+            isinstance(t, str) and t in authority_chain.CAPABILITIES
+            for t in requires)):
+        return None, "malformed_requires", ignored, 0
+    kept, digests = [], []
+    for path in dict.fromkeys(os.path.abspath(p) for p in paths):
+        digest = _readable_digest(path) if os.path.isfile(path) else None
+        if digest is not None:
+            kept.append(path)
+            digests.append(digest)
+    dropped = len(set(paths)) - len(kept)
+    ids = list(dict.fromkeys(ids))
+    requires = list(dict.fromkeys(requires))
+    body = {"kind": "proposal", "session_uuid": session_uuid,
+            "phase": chain_phase,
+            "round": round_row["round"] if round_row else None,
+            "candidate": dict(reviewed_candidate), "finding_ids": ids,
+            "changed_evidence": {"paths": kept, "sha256s": digests,
+                                 "candidate": dict(reviewed_candidate)},
+            "author_role": role, "requires": requires}
+    if authority_gate.validate_proposal(
+            body, folded, session_uuid=session_uuid, phase=chain_phase):
+        return None, "unknown_or_foreign_id", ignored, dropped
+    identity = json.dumps(
+        {"ids": ids, "paths": kept, "sha256s": digests, "requires": requires,
+         "candidate": reviewed_candidate,
+         "round_id": round_row["round_id"] if round_row else None},
+        sort_keys=True, separators=(",", ":"))
+    body["op_key"] = hashlib.sha256("|".join(
+        [session_uuid, chain_phase, role, reviewed_sha256, identity]
+    ).encode("utf-8")).hexdigest()
+    return body, None, ignored, dropped
+
+
+def _record_lead_proposals(session_uuid, chain_phase, role, status_path,
+                           reviewed_sha256, reviewed_candidate, trace):
+    """Record the lead's `result.resolution_proposals` as proposals bound to
+    the reviewed candidate, in one atomic batch. Returns whether anything was
+    written.
+
+    The status bytes are read once and must hash to what the reviewer judged;
+    otherwise the intake is skipped. An entry is all-or-nothing: an unknown,
+    foreign or malformed one is skipped with a reason code, never partly
+    recorded. Lead-written keys other than the three above are ignored and
+    only their names are traced. An already-recorded proposal may stay in an
+    unchanged status: a repeat within a round replays, a later round records
+    anew, and an entry repeated within one status is recorded once. A
+    recorded digest attests the bytes read now; it is not verified
+    evidence."""
+    try:
+        with open(status_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        raw = None
+    if raw is None or hashlib.sha256(raw).hexdigest() != reviewed_sha256:
+        if trace:
+            trace.event("authority.proposal.skipped", role=role,
+                        phase=chain_phase, reason="status_changed")
+        return False
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return False
+    result = data.get("result") if isinstance(data, dict) else None
+    entries = (result.get("resolution_proposals")
+               if isinstance(result, dict) else None)
+    if entries is None:
+        return False
+    if not isinstance(entries, list):
+        if trace:
+            trace.event("authority.proposal.rejected", role=role,
+                        phase=chain_phase, reason="malformed_list")
+        return False
+
+    def plan(read):
+        folded = read["folded"]
+        latest = _latest_phase_round(folded, chain_phase)
+        records, notes, seen = [], [], set()
+        for index, entry in enumerate(entries):
+            body, reason, ignored, dropped = _proposal_body(
+                entry, folded, session_uuid, chain_phase, role,
+                reviewed_candidate, reviewed_sha256, latest)
+            if ignored:
+                notes.append(("authority.proposal.field_ignored",
+                              {"index": index, "keys": ignored}))
+            if dropped:
+                notes.append(("authority.proposal.path_dropped",
+                              {"index": index, "count": dropped}))
+            if body is None:
+                notes.append(("authority.proposal.rejected",
+                              {"index": index, "reason": reason}))
+            elif body["op_key"] in seen:
+                notes.append(("authority.proposal.skipped",
+                              {"index": index, "reason": "duplicate_entry"}))
+            else:
+                seen.add(body["op_key"])
+                records.append(body)
+        return records, notes
+
+    notes, committed = _append_planned(session_uuid, plan)
+    if trace:
+        for name, facts in notes:
+            trace.event(name, role=role, phase=chain_phase, **facts)
+        for record in committed:
+            trace.event("authority.proposal.recorded", role=role,
+                        phase=chain_phase, proposal_id=record["id"],
+                        finding_ids=list(record["finding_ids"]),
+                        requires=list(record["requires"]))
+    return bool(committed)
+
+
+def _closing_basis(folded, finding_id, gate_candidate):
+    """`(proposal id, recommendation id)` that `closure_decision` closed
+    `finding_id` on, or None: the first valid proposal citing it and the
+    latest closed recommendation of the finding on the latest phase round."""
+    phase = folded["findings"][finding_id]["phase"]
+    proposal_id = None
+    for pid, proposal in folded["proposals"].items():
+        cited = proposal.get("finding_ids")
+        if (isinstance(cited, list) and finding_id in cited
+                and not authority_gate.validate_proposal(
+                    proposal, folded, gate_candidate=gate_candidate,
+                    session_uuid=folded["session_uuid"], phase=phase,
+                    proposal_id=pid)):
+            proposal_id = pid
+            break
+    latest = _latest_phase_round(folded, phase)
+    recommendation_id = None
+    for entry in (folded["recommendations"].get(finding_id) or []):
+        if (latest is not None and entry["round_id"] == latest["round_id"]
+                and entry["recommend"] == "closed"):
+            recommendation_id = entry["id"]
+    if proposal_id is None or recommendation_id is None:
+        return None
+    return proposal_id, recommendation_id
+
+
+def _close_resolved_findings(session_uuid, chain_phase, gate_candidate,
+                             trace):
+    """The one closure call site: run `closure_decision` for every gating open
+    finding of the phase and append one resolution per `close` result, citing
+    the proposal and the current-round recommendation that closed it. Only
+    that decision ever produces a resolution. A capability the lead's policy
+    does not cover is traced and leaves the finding open."""
+
+    def plan(read):
+        folded = read["folded"]
+        coverage = _lead_proposal_coverage(folded)
+        latest = _latest_phase_round(folded, chain_phase)
+        records, notes = [], []
+        for fid in _gating_open_ids(folded, session_uuid, chain_phase):
+            decision = authority_gate.closure_decision(
+                folded, fid, gate_candidate, {}, coverage, {})
+            if decision["escalation_needed"] is not None:
+                notes.append(("authority.escalation_needed",
+                              {"finding_id": fid,
+                               "capability": decision["escalation_needed"]}))
+            if not decision["close"]:
+                continue
+            basis = _closing_basis(folded, fid, gate_candidate)
+            if basis is None or latest is None:
+                raise _AuthorityUnavailable("basis_missing")
+            records.append({
+                "kind": "resolution", "session_uuid": session_uuid,
+                "phase": chain_phase, "round": latest["round"],
+                "candidate": dict(gate_candidate), "finding_id": fid,
+                "outcome": "closed", "decided_by": "control_plane",
+                "basis": {"proposal_id": basis[0],
+                          "recommendation_id": basis[1],
+                          "decision_id": None, "witness_ids": []},
+                "op_key": hashlib.sha256("|".join(
+                    [session_uuid, chain_phase, "close", fid, basis[0],
+                     basis[1]]).encode("utf-8")).hexdigest()})
+        return records, notes
+
+    notes, committed = _append_planned(session_uuid, plan)
+    if trace:
+        for name, facts in notes:
+            trace.event(name, phase=chain_phase, **facts)
+        for record in committed:
+            trace.event("authority.closure.recorded", phase=chain_phase,
+                        finding_id=record["finding_id"],
+                        resolution_id=record["id"],
+                        proposal_id=record["basis"]["proposal_id"],
+                        recommendation_id=record["basis"]["recommendation_id"])
+    return bool(committed)
+
+
+def _authority_decide(read, session_uuid, chain_phase, gate_candidate):
+    """The one `blocking_decision` call site: `{blocked, reasons, head,
+    blocking_ids, basis_ids}` for a gate over an already-read chain.
+
+    A provably empty chain holds no authority findings, so nothing blocks and
+    the pure decision (which reads an empty chain as a foreign binding) is not
+    consulted. `basis_ids` are the findings still lacking a valid proposal or a
+    current-round closed recommendation: what a lead can act on."""
+    if not read["records"]:
+        return {"blocked": False, "reasons": [], "head": None,
+                "blocking_ids": [], "basis_ids": []}
+    decision = authority_gate.blocking_decision(
+        read, read["folded"], session_uuid, chain_phase, gate_candidate)
+    ids = list(dict.fromkeys(
+        r["id"] for r in decision["reasons"] if r["id"] is not None))
+    basis = list(dict.fromkeys(
+        r["id"] for r in decision["reasons"]
+        if r["id"] is not None and r["code"] in _BASIS_CODES))
+    return {"blocked": decision["blocked"], "reasons": decision["reasons"],
+            "head": decision["head"], "blocking_ids": ids, "basis_ids": basis}
+
+
+def _authority_boundary(session_uuid, chain_phase, role, status_path,
+                        reviewed_sha256, reviewed_candidate, trace):
+    """The verdict-boundary evaluation of one recorded verdict: record the
+    lead's proposals, close what `closure_decision` closes, then decide
+    whether the phase is blocked on a fresh read. Raises `_AuthorityUnavailable`
+    on any strict fault."""
+    gate_candidate = _fresh_gate_candidate(
+        session_uuid, chain_phase, role, status_path)
+    _record_lead_proposals(session_uuid, chain_phase, role, status_path,
+                           reviewed_sha256, reviewed_candidate, trace)
+    _close_resolved_findings(session_uuid, chain_phase, gate_candidate, trace)
+    return _authority_decide(
+        _authority_read(session_uuid), session_uuid, chain_phase,
+        gate_candidate)
+
+
+def _authority_final_gate(session_uuid, chain_phase, role, status_path):
+    """The read-only final defensive gate: a fresh owner-fenced chain read and
+    a fresh candidate, then the blocking decision. It never appends."""
+    read = _authority_read(session_uuid)
+    gate_candidate = _fresh_gate_candidate(
+        session_uuid, chain_phase, role, status_path)
+    return _authority_decide(read, session_uuid, chain_phase, gate_candidate)
+
+
+def _reviewer_open_ids(session_uuid, reviewer_role):
+    """The open blocking authority ids of the active chain gate's phase, or []
+    (no active gate for this seat, an unreadable chain, or nothing open).
+    Tolerant: exposure is advisory, the strict gate is elsewhere."""
+    gate = _in_chain_gate(session_uuid, reviewer_role)
+    if gate is None:
+        return []
+    try:
+        read = authority_chain.read_chain(
+            state_store.authority_chain_path_for(session_uuid))
+        if not read["ok"]:
+            return []
+        return _gating_open_ids(read["folded"], session_uuid, gate["phase"])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _reviewer_open_ids_fragment(ids):
+    """The static brief fragment that lists the open blocking authority ids
+    of the reviewer's gate. Ids only."""
+    return (
+        "Open blocking authority findings of this phase, by id: %s. Give a "
+        "recommendation for every listed id on this verdict (an entry with "
+        "its id as `finding_ref` and `closure` fixed or still_open, or a "
+        "`disposition` of withdrawn or duplicate); approve only when no id "
+        "is listed." % ", ".join(ids))
+
+
+def _lead_open_ids_note(ids):
+    """The static revise-handoff note that names the authority findings still
+    lacking a valid basis. Ids only."""
+    return (
+        "Authority findings still open without a basis for closure: %s. "
+        "When you have fixed one, name its id in `authority_ids` of an entry "
+        "in `result.resolution_proposals` of your next ready_for_review "
+        "status." % ", ".join(ids))
 
 
 def _record_findings(session_uuid, verdict, discoverer, phase, round_index,
@@ -6949,6 +7435,14 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 trace.event("review.structural_flag", role=reviewer_role,
                             check="success_criteria_missing",
                             intel_path=intel_path)
+    # The open blocking authority findings of the gate this pass belongs to
+    # (fresh AND resume passes): the reviewer recommends on exactly these ids.
+    open_ids = _reviewer_open_ids(session_uuid, reviewer_role)
+    if open_ids:
+        brief = brief + "\n\n" + _reviewer_open_ids_fragment(open_ids)
+        if trace:
+            trace.event("authority.reviewer_ids_exposed", role=reviewer_role,
+                        phase=phase, count=len(open_ids))
     # Build the reviewer context FIRST (before the trace + accounting) via the
     # shared FILE-ONLY transport. The shared session context is materialized to a
     # revision-keyed file under the session-assets dir and referenced by PATH; a
@@ -8290,6 +8784,18 @@ def _role_loop(session, first, status_path, context, io_out,
     earlier committed round stops the same way with reason `chain_lost`.
     Without a session there is no chain activity.
 
+    The same chain decides whether a phase may advance. Right after the
+    verdict is recorded the loop records the lead's
+    `result.resolution_proposals` as proposals bound to the reviewed
+    candidate, closes every finding `closure_decision` closes (a resolution
+    citing the proposal and the reviewer's current-round closed
+    recommendation), and asks `blocking_decision` whether the phase is still
+    blocked. An approve it blocks is handed back as a revise (or stops at
+    `review_round_cap`); no other verdict becomes an approve. Before any
+    approval effect or gate event, a read-only final defensive gate repeats the
+    decision on a fresh chain read and a fresh candidate -- also for a carried
+    hash-gate approval -- and a block ends the phase as `review_not_approved`.
+
     When `handoff_enabled`, a `handoff_back` status with a payload is an
     authority request: the phase stops with a `handoff_requested` request and
     the status is left untouched (`run_flow` executes or declines it only on
@@ -8349,6 +8855,9 @@ def _role_loop(session, first, status_path, context, io_out,
     # status.invalidated can name its cause (P16).
     pending_reopen_event_id = None
     pending_reopens_work = False
+    # The authority findings still lacking a basis, named to the lead by a
+    # fixed sentence on the next revise hand-back only.
+    pending_authority_ids = ()
     # A source-tagged reason set at every work-reopening site (one of
     # 'user_revise'/'user_iterate'/'user_answer'/'reviewer_needs_user'/
     # 'reviewer_revise'/'handoff_declined'). Detection keys off this being set —
@@ -8498,6 +9007,55 @@ def _role_loop(session, first, status_path, context, io_out,
             "capability_missing" if authority else "execution_failed",
             evidence={"reason": stop["kind"]}, source="gate.runtime")
         return (_OUTCOME_STOPPED if authority else _OUTCOME_ENDED), stop
+
+    def _authority_stop(unavailable, stage):
+        """The stop request of a strict authority fault at `stage`; traces
+        the gate decision."""
+        if trace:
+            trace.event("gate.decision", decider="runtime", role=role,
+                        reviewer_role=reviewer_role,
+                        gate="authority_unavailable", action="stop",
+                        reason=unavailable.reason, stage=stage,
+                        candidate_reason=getattr(
+                            unavailable, "candidate_reason", None))
+        return _agent_stop_payload(
+            "authority_unavailable", role, requires="operator",
+            reviewer_role=reviewer_role, reason=unavailable.reason,
+            error_type=unavailable.error_type, stage=stage,
+            status_path=status_path, review_path=review_path)
+
+    def _apply_approval_effects(deferred):
+        """The effects of a reviewer approve, run only once the approval can
+        no longer be withheld: they never precede the final defensive gate
+        (or the verification-currency stop that follows an approve)."""
+        nonlocal review_rounds
+        if profile_session is not None and role == "builder":
+            profile_session.on_build_approved(
+                deferred["verdict"], deferred["disposition_round"],
+                (deferred["receipt_pointer"] or {}).get("manifest_digest"))
+        receipt_pointer = deferred["receipt_pointer"]
+        if receipt_pointer:
+            # accepted ONLY when the candidate being approved is still
+            # exactly the candidate the receipt verified (A5/D-0005);
+            # otherwise the receipt's candidate was abandoned (rejected).
+            _emit_verification_disposition(
+                session_uuid, trace,
+                receipt_pointer["transaction_id"],
+                (verification.DISPOSITION_ACCEPTED
+                 if _accepted_manifest_matches(receipt_pointer)
+                 else verification.DISPOSITION_REJECTED),
+                review_round=deferred["disposition_round"],
+                reviewed_manifest_digest=(
+                    receipt_pointer.get("manifest_digest")))
+        # Only an explicit approve approves the phase.
+        review_rounds = 0
+        # Seed the hash-gate baseline so the NEXT unchanged ready_for_review
+        # skips the reviewer (D4: only a real approve seeds it). The composite
+        # is recomputed over the artifact the reviewer just approved; the
+        # record() closure updates the in-memory session state in place so a
+        # later lead-ack / phase-save cannot clobber it.
+        if skip_baseline is not None:
+            skip_baseline.record(skip_baseline.compute_composite())
 
     try:
         # Controller-switch packets are controller-only recovery context.  The
@@ -8656,7 +9214,8 @@ def _role_loop(session, first, status_path, context, io_out,
                 # of a non-resumed launch is fresh; a resumed launch and every
                 # continuation turn are resume turns.
                 first_send = pending is first
-                delivery = _lead_turn_delivery(pending)
+                delivery = _lead_turn_delivery(pending, pending_authority_ids)
+                pending_authority_ids = ()
                 lead_artifacts = (
                     [dict(rec) for rec in delivery.descriptors]
                     if delivery.descriptors
@@ -9166,6 +9725,11 @@ def _role_loop(session, first, status_path, context, io_out,
                             "hook_promoted", session_uuid, os.getcwd(),
                             _auto_role=role)
                 reviewer_approved = False
+                # The approve effects a real reviewer approve defers to the
+                # final defensive gate, and the chain head the verdict
+                # boundary last evaluated (trace only, never authority).
+                deferred_approval = None
+                last_boundary_head = None
                 # Hash-gate (scout + planner): when the lead's reviewed artifact
                 # set is byte-identical to what the paired reviewer LAST APPROVED
                 # in this phase epoch + acked context revision, skip the reviewer
@@ -9200,6 +9764,10 @@ def _role_loop(session, first, status_path, context, io_out,
                     # "continue"/"stop": act on the OUTER loop after the inner one.
                     review_action = None
                     stop_payload = None
+                    # The authority findings the boundary left blocking, and
+                    # those still lacking a valid basis (named to the lead).
+                    blocked_ids = ()
+                    blocked_basis_ids = ()
                     # A reviewer-failure RETRY (D8) re-runs the reviewer with the
                     # path-first full-reread packet instead of a diff: a
                     # malformed/weak verdict means the diff was insufficient to
@@ -9510,41 +10078,47 @@ def _role_loop(session, first, status_path, context, io_out,
                                 status_path=status_path,
                                 review_path=review_path)
                             break
+                        # THE BLOCKING GATE: record the lead's proposals, close
+                        # what `closure_decision` closes, then ask
+                        # `blocking_decision` whether the phase is still
+                        # blocked. An approve it blocks is screened to a
+                        # revise before any approval effect; no other verdict
+                        # is ever promoted to approve. A strict fault stops
+                        # the gate and never approves.
+                        if chain_phase is not None:
+                            try:
+                                boundary = _authority_boundary(
+                                    session_uuid, chain_phase, role,
+                                    status_path, reviewed_sha256,
+                                    reviewed_candidate, trace)
+                            except _AuthorityUnavailable as unavailable:
+                                review_action = "stop"
+                                stop_payload = _authority_stop(
+                                    unavailable, "boundary")
+                                break
+                            last_boundary_head = boundary["head"]
+                            blocked_basis_ids = tuple(boundary["basis_ids"])
+                            blocked_ids = tuple(boundary["blocking_ids"])
+                            if v == "approve" and boundary["blocked"]:
+                                if trace:
+                                    trace.event(
+                                        "authority.approve_screened",
+                                        role=reviewer_role,
+                                        phase=chain_phase,
+                                        round=review_rounds,
+                                        finding_ids=list(blocked_ids),
+                                        reason_codes=sorted({
+                                            r["code"]
+                                            for r in boundary["reasons"]}))
+                                v = "revise"
                         if v == "approve":
+                            # The effects of this approve wait for the final
+                            # defensive gate (`_apply_approval_effects`).
                             reviewer_approved = True
-                            if profile_session is not None and role == "builder":
-                                profile_session.on_build_approved(
-                                    verdict, disposition_round,
-                                    (receipt_pointer or {}).get(
-                                        "manifest_digest"))
-                            if receipt_pointer:
-                                # accepted ONLY when the candidate being
-                                # approved is still exactly the candidate the
-                                # receipt verified (A5/D-0005); otherwise the
-                                # receipt's candidate was abandoned (rejected).
-                                _emit_verification_disposition(
-                                    session_uuid, trace,
-                                    receipt_pointer["transaction_id"],
-                                    (verification.DISPOSITION_ACCEPTED
-                                     if _accepted_manifest_matches(
-                                         receipt_pointer)
-                                     else verification.DISPOSITION_REJECTED),
-                                    review_round=disposition_round,
-                                    reviewed_manifest_digest=(
-                                        receipt_pointer.get(
-                                            "manifest_digest")))
-                            # Only an explicit approve approves the phase.
-                            review_rounds = 0
-                            # Seed the hash-gate baseline so the NEXT unchanged
-                            # ready_for_review skips the reviewer (D4: only a
-                            # real approve seeds it). The composite is recomputed
-                            # over the artifact the reviewer just approved; the
-                            # record() closure updates the in-memory session
-                            # state in place so a later lead-ack / phase-save
-                            # cannot clobber it.
-                            if skip_baseline is not None:
-                                skip_baseline.record(
-                                    skip_baseline.compute_composite())
+                            deferred_approval = {
+                                "verdict": verdict,
+                                "disposition_round": disposition_round,
+                                "receipt_pointer": receipt_pointer}
                         elif suppress_reopen_for_challenges:
                             # D-0004 mechanical supersession: EVERY blocking
                             # finding is an uncited-or-contradicted verification
@@ -9603,6 +10177,7 @@ def _role_loop(session, first, status_path, context, io_out,
                             pending = assemble_reviewer_handoff(
                                 "revise", verdict, artifact=artifact_noun,
                                 review_path=review_path)
+                            pending_authority_ids = blocked_basis_ids
                             pending_reopens_work = True
                             pending_reopen_reason = "reviewer_revise"
                             # Sent back for changes: whatever the role does
@@ -9671,6 +10246,8 @@ def _role_loop(session, first, status_path, context, io_out,
                                 requires="answer",
                                 reviewer_role=reviewer_role,
                                 round_cap=REVIEW_ROUND_CAP,
+                                authority_blocking_ids=(
+                                    list(blocked_ids) or None),
                                 findings=list(verdict.get("findings") or []),
                                 status_path=status_path,
                                 review_path=review_path)
@@ -9704,6 +10281,8 @@ def _role_loop(session, first, status_path, context, io_out,
                     # Verification no longer holds for the candidate the
                     # reviewer approved: never an approval. The receipt's
                     # candidate was abandoned, which the grant records.
+                    if deferred_approval is not None:
+                        _apply_approval_effects(deferred_approval)
                     _grant_gate_acceptance(session_uuid, trace)
                     outcome_kind, payload = _end_unapproved(
                         _agent_stop_payload(
@@ -9712,6 +10291,51 @@ def _role_loop(session, first, status_path, context, io_out,
                             transaction_id=bound_receipt.get("transaction_id"),
                             status_path=status_path))
                     break
+                # THE FINAL DEFENSIVE GATE: whatever approved -- a reviewer
+                # approve or its carried hash-gate approval -- a fresh chain
+                # read and a fresh candidate must still show nothing
+                # blocking before any approval effect or gate event. It only
+                # reads: a late authoritative append is seen here, never
+                # missed.
+                if chain_phase is not None:
+                    try:
+                        final = _authority_final_gate(
+                            session_uuid, chain_phase, role, status_path)
+                    except _AuthorityUnavailable as unavailable:
+                        outcome_kind, payload = _end_unapproved(
+                            _authority_stop(unavailable, "final_gate"))
+                        break
+                    if final["blocked"]:
+                        if trace:
+                            trace.event(
+                                "authority.final_gate_blocked", role=role,
+                                phase=chain_phase,
+                                finding_ids=list(final["blocking_ids"]),
+                                reason_codes=sorted({
+                                    r["code"] for r in final["reasons"]}))
+                            if (last_boundary_head is not None
+                                    and final["head"] != last_boundary_head):
+                                trace.event(
+                                    "authority.head_moved", role=role,
+                                    phase=chain_phase)
+                            trace.event(
+                                "gate.decision", decider="runtime", role=role,
+                                reviewer_role=reviewer_role,
+                                gate="authority_final_gate", action="stop",
+                                reason="blocked")
+                        outcome_kind, payload = _end_unapproved(
+                            _agent_stop_payload(
+                                "review_not_approved", role,
+                                requires="answer",
+                                reviewer_role=reviewer_role,
+                                verdict="approve", stage="final_gate",
+                                authority_blocking_ids=(
+                                    list(final["blocking_ids"]) or None),
+                                status_path=status_path,
+                                review_path=review_path))
+                        break
+                if deferred_approval is not None:
+                    _apply_approval_effects(deferred_approval)
                 transcript.notice(io_out, review_text(status_path))
                 if trace:
                     trace.event("gate.show", role=role,

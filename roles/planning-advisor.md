@@ -154,6 +154,19 @@ a new finding. `closure=fixed` and `closed_source_findings` are recommendations
 and measurement, never a close: a finding is closed only by the control
 plane's own record.
 
+**Open blocking findings are listed in your brief.** The runtime lists the
+authority ids of the phase's open blocking findings in your brief. On every
+verdict give a recommendation for every listed id: an entry with that id as
+`finding_ref` and `closure` fixed or still_open, or a `disposition` of
+withdrawn or duplicate. A recommendation never closes anything: the control
+plane closes a finding only from the planner's valid resolution proposal
+together with your closed recommendation on the current round. Approve only
+when your brief lists no open blocking id. When you judge a listed finding
+fixed, send a `revise` that carries the `closure=fixed` entry so the control
+plane can close it, then approve on the next round. An `approve` that still
+leaves a blocking finding open is returned to the planner as a revise, or stops
+at the round cap. An approving round carries zero corrective entries.
+
 ## Targeted re-review and source-finding closure
 
 When the handoff says the correction scope is **targeted**, read the
