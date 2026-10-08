@@ -1434,6 +1434,34 @@ rewrite or delete. A withdrawn finding survives as withdrawn, because retracting
 a false finding is good work and erasing it would make it indistinguishable from
 never having looked.
 
+The ledger is **best-effort measurement**; the session's **authority chain**
+(`authority_chain.jsonl`) is the strict record beside it. At the reviewer
+verdict boundary every usable verdict mints exactly one chain round and records
+its typed findings against the candidate the reviewer judged, in one atomic,
+owner-fenced batch. The reviewer-seat evaluation entry is queued earlier, inside
+the reviewer turn, with the round that commit is about to mint (the chain is
+authoritative from round 1, with or without a chain file), so it can remain
+queued after an authority stop. The lead-side evaluation closure, the
+`review.round.recorded` trace event, `round_epochs.json` and the ledger mirror
+follow the commit and carry that same round. The chain fails closed: if it
+cannot be read, written or read back, or no candidate can be identified, the
+gate stops with kind `authority_unavailable` (`requires: operator`) and never
+approves, and a corrupt or unreadable chain is never read as an empty one. An
+absent or empty chain file is the chain of a session that has not recorded a
+verdict yet, unless the session's `review.round.recorded` trace events or
+ledger findings carrying an `authority_round` show a committed round; the gate
+then stops with reason `chain_lost` and mints nothing. That detection is
+best-effort: it cannot see a chain cut back to a shorter valid prefix, and it
+needs the trace or the ledger to have been written after the commit. A failing
+ledger write, by contrast, never stops the gate. The mirrored ledger findings
+carry the chain's `authority_id` and `authority_round`. A finding's evidence
+pair is the reviewer's own when its path is readable; a missing, unreadable or
+malformed path, or a digest without a path, is replaced by the review file with
+the digest of its bytes, or by the immutable verdict copy and its digest. A
+reviewer entry that cites an earlier finding with `finding_ref` is a
+recommendation or retraction about that finding, not a new one, and
+`closure=fixed` or `closed_source_findings` never close anything.
+
 Legacy verification attempts arrive by **reconciliation**: ingestion emits
 id-free observations keyed on `(controller_session_id, tool_call_id)`, and
 reconciliation mints an id for each key it has not seen. Replaying the same

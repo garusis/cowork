@@ -1122,6 +1122,43 @@ def current_phase_round(session_uuid, phase, seat, default=None):
         return default
 
 
+def sync_phase_round(session_uuid, phase, seats, round_number):
+    """Set the durable round identity of every `seat` in `phase` to
+    `round_number`; True on success, False when it could not be persisted.
+
+    `round_epochs.json` is a compatibility mirror of the authority chain: the
+    chain is authoritative and this writer only brings the mirror in line with
+    it, so a crash between a chain commit and this write is repaired by the next
+    verdict's sync. Tolerant like `next_phase_round`: a failure costs the mirror,
+    never the run.
+    """
+    if not session_uuid or not isinstance(round_number, int) or isinstance(
+            round_number, bool):
+        return False
+    path = os.path.join(session_assets_dir(session_uuid), "round_epochs.json")
+    try:
+        try:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            data = {}
+        for seat in seats:
+            data["%s|%s" % (phase or "phase", seat or "role")] = round_number
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def evidence_chain_path_for(session_uuid):
     """Where the prior round's frozen evidence pointers are persisted.
 
@@ -1178,6 +1215,24 @@ def ledger_path_for(session_uuid):
     findings, decisions, human amendments, escaped defects and verification
     attempts. Written only by cowork_ledger (P3)."""
     return os.path.join(session_assets_dir(session_uuid), "ledger.jsonl")
+
+
+def authority_chain_path_for(session_uuid):
+    """Path of the session's strict authority chain. Written only through
+    `cowork_authority_chain`; unlike the best-effort ledger above, a corrupt or
+    unreadable chain is never read as an empty one. An absent or empty file is
+    the chain of a session that has not recorded a verdict yet, unless the
+    session's trace or ledger shows a committed authority round: the gate then
+    stops with reason `chain_lost`."""
+    return os.path.join(session_assets_dir(session_uuid),
+                        "authority_chain.jsonl")
+
+
+def authority_verdict_copy_dir_for(session_uuid):
+    """Directory of the content-addressed copies of the reviewer verdicts the
+    authority chain's round records name. Session assets, outside Git."""
+    return os.path.join(session_assets_dir(session_uuid),
+                        "authority_verdicts")
 
 
 def measurement_path_for(session_uuid):

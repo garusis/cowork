@@ -70,6 +70,8 @@ import cowork_action_policy as action_policy  # noqa: E402
 import cowork_execution_profiles as exec_profiles  # noqa: E402
 import cowork_verified_binding as verified_binding  # noqa: E402
 import cowork_correction as correction_packets  # noqa: E402
+import cowork_authority_candidate as authority_candidate  # noqa: E402
+import cowork_authority_chain as authority_chain  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
@@ -2591,9 +2593,19 @@ def _make_enqueue_eval_fn(role, reviewer_role, phase, scratch_path,
         # every resume instead of continuing the monotonic sequence, and it made
         # the queue, ledger, chain and cost joins merge pre- and post-resume
         # rounds. One durable number now drives all of them.
-        durable_round = state_store.next_phase_round(session_uuid, phase, role)
-        if durable_round is None:
-            durable_round = round_index
+        boundary = _BOUNDARY_ROUND_CTX.get()
+        authority_round = None
+        if (boundary and boundary.get("session_uuid") == session_uuid
+                and boundary.get("phase") == phase):
+            # A strict sessioned verdict: the verdict boundary already minted
+            # this round in the authority chain, and that round is the identity.
+            authority_round = boundary.get("round")
+            durable_round = authority_round
+        else:
+            durable_round = state_store.next_phase_round(
+                session_uuid, phase, role)
+            if durable_round is None:
+                durable_round = round_index
         decision = evaluation.decide(
             evaluation_policy or state_store.DEFAULT_EVALUATION_POLICY,
             durable_round)
@@ -2668,7 +2680,8 @@ def _make_enqueue_eval_fn(role, reviewer_role, phase, scratch_path,
             # handoff is assembled — the ordering invariant C4 asserts.
             trace.event("eval.enqueued", evaluator=role,
                         evaluatee=reviewer_role, phase=phase,
-                        round=round_index, entry_id=entry["entry_id"],
+                        round=round_index, authority_round=authority_round,
+                        entry_id=entry["entry_id"],
                         envelope_id=envelope.envelope_id,
                         sealed_complete=envelope.complete,
                         result="ok" if ok else "write_failed")
@@ -2685,14 +2698,31 @@ def _enqueue_reviewer_eval(specs, scratch_path, scores_path, session_uuid,
     The mirror of `_make_enqueue_eval_fn` for the other side of the pairing. It
     seals after the reviewer's verdict file exists and is validated, and it
     sends nothing — the reviewer's own session never scores again.
+
+    The entry is queued BEFORE the verdict boundary commits the chain round,
+    carrying the round that commit is about to mint, so it can remain queued
+    when the boundary then stops the gate. The lead-side closure runs after the
+    commit instead.
     """
     if not (scratch_path and scores_path and session_uuid and specs):
         return False
-    # Durable identity first, then decide from it (see the role seat).
-    durable_round = state_store.next_phase_round(session_uuid, phase,
-                                                 reviewer_role)
-    if durable_round is None:
-        durable_round = round_index
+    # Durable identity first, then decide from it (see the role seat). With an
+    # authority chain in force the next minted round IS that identity: it is
+    # peeked, never allocated here, so a turn without a usable verdict (which
+    # mints nothing) cannot burn a number.
+    authority_round = _chain_round_peek(session_uuid, phase, reviewer_role)
+    if authority_round is None and _in_chain_gate(session_uuid, reviewer_role):
+        # Inside a chain-active gate the boundary mints nothing it cannot
+        # number from the chain (unreadable or lost chain), so an entry
+        # numbered from the legacy counter would diverge from it.
+        return False
+    if authority_round is not None:
+        durable_round = authority_round
+    else:
+        durable_round = state_store.next_phase_round(session_uuid, phase,
+                                                     reviewer_role)
+        if durable_round is None:
+            durable_round = round_index
     decision = evaluation.decide(
         evaluation_policy or state_store.DEFAULT_EVALUATION_POLICY,
         durable_round)
@@ -2751,21 +2781,477 @@ def _enqueue_reviewer_eval(specs, scratch_path, scores_path, session_uuid,
     if trace:
         trace.event("eval.enqueued", evaluator=reviewer_role,
                     evaluatee=entry["evaluatee"], phase=phase,
-                    round=round_index, entry_id=entry["entry_id"],
+                    round=round_index, authority_round=authority_round,
+                    entry_id=entry["entry_id"],
                     envelope_id=envelope.envelope_id,
                     sealed_complete=envelope.complete,
                     result="ok" if ok else "write_failed")
     return ok
 
 
+# --------------------------------------------------------------------------- #
+# Strict recording of reviewer verdicts in the session's authority chain.      #
+#                                                                             #
+# Every usable verdict of a sessioned review gate mints exactly one chain      #
+# round and records its typed findings against the candidate the reviewer      #
+# judged, in ONE atomic batch, BEFORE the lead-side evaluation closure, the    #
+# trace round event, `round_epochs.json` or the best-effort ledger write. The  #
+# reviewer-seat evaluation entry is queued EARLIER, by `make_review_fn`, with  #
+# the round that commit is about to mint, and can stay queued after an         #
+# authority stop. The chain is strict: a fault in it stops the gate            #
+# (`authority_unavailable`) and never approves. The measurement ledger        #
+# (`_record_findings`) stays tolerant and now only mirrors what the chain      #
+# already holds.                                                               #
+# --------------------------------------------------------------------------- #
+
+
+# The round the verdict boundary minted for the verdict whose lead-side
+# evaluation closure is about to run: {session_uuid, phase, round}. The
+# closure's signature is fixed (`evaluate_fn(session, verdict, round_index)`),
+# so the minted round reaches it through this context instead.
+_BOUNDARY_ROUND_CTX = contextvars.ContextVar("cowork_boundary_round",
+                                             default=None)
+
+# The chain-active review gate whose reviewer turn is running:
+# {session_uuid, phase, seat}. `make_review_fn` queues the reviewer-seat
+# evaluation entry inside that turn, so the gate reaches it through this
+# context. A direct `make_review_fn` caller sets none and keeps the legacy
+# round counter.
+_CHAIN_GATE_CTX = contextvars.ContextVar("cowork_chain_gate", default=None)
+
+
+def _in_chain_gate(session_uuid, seat):
+    """The active chain gate when it is `session_uuid`'s gate of reviewer
+    `seat`, else None."""
+    gate = _CHAIN_GATE_CTX.get()
+    if (gate is not None and gate["session_uuid"] == session_uuid
+            and gate["seat"] == seat):
+        return gate
+    return None
+
+
+def _prior_authority_round_evidence(session_uuid):
+    """True when the session's trace or ledger shows a chain round that was
+    committed: a `review.round.recorded` trace event or a ledger finding
+    carrying an `authority_round`. Both are written only after a successful
+    commit and read-back, so a first-write failure, a verdict-copy directory,
+    a queued evaluation entry or `round_epochs.json` never count. Tolerant:
+    an unreadable source counts as no evidence."""
+    def committed(value):
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and value >= 1)
+
+    try:
+        for event in state_store.read_jsonl_tolerant(
+                trace_store.trace_path_for(session_uuid)):
+            if (event.get("event") == "review.round.recorded"
+                    and committed(event.get("authority_round"))
+                    and event.get("session_uuid", session_uuid)
+                    == session_uuid):
+                return True
+        for record in ledger.read_ledger(
+                state_store.ledger_path_for(session_uuid)):
+            if (record.get("kind") == "finding"
+                    and committed(record.get("authority_round"))):
+                return True
+    except Exception:  # noqa: BLE001 - best-effort evidence
+        return False
+    return False
+
+
+class _AuthorityUnavailable(Exception):
+    """A strict authority step failed: the gate must stop, never approve.
+
+    `reason` is a closed code and `error_type` the class name of the underlying
+    fault, so a stop payload carries facts and never exception text."""
+
+    def __init__(self, reason, error_type=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.error_type = error_type
+
+
+def _authority_phase(phase, role, reviewer_role):
+    """The chain phase of a loop's `(phase, role, reviewer_role)` triple, or
+    None when it is not exactly one of the three registered pairs (a direct
+    call with other roles has no chain activity). A loop without a phase takes
+    it from its lead role."""
+    pairs = authority_candidate.PHASE_ROLES
+    if phase is None:
+        for name, pair in pairs.items():
+            if pair == (role, reviewer_role):
+                return name
+        return None
+    if pairs.get(phase) == (role, reviewer_role):
+        return phase
+    return None
+
+
+def _gate_candidate(session_uuid, phase, role, status_path):
+    """The reviewed candidate of one gate: `(candidate | None, reason)`.
+
+    The single runtime filler of the candidate. It reads only the current
+    receipt pointer (and whether its file exists, which the tolerant reader
+    cannot say), and the status artifact's fingerprint; selection itself is the
+    pure `authority_candidate.select_candidate`."""
+    pointer_read = {
+        "exists": os.path.exists(
+            state_store.current_receipt_pointer_path_for(session_uuid)),
+        "data": state_store.read_current_receipt_pointer(session_uuid),
+    }
+    status = state_store.fingerprint_status(status_path)
+    return authority_candidate.select_candidate(
+        phase, role, pointer_read, status)
+
+
+def _chain_append(session_uuid, records, expected_head=None):
+    """The single owner-fenced writer of the session's authority chain."""
+    _require_owner(session_uuid)
+    path = state_store.authority_chain_path_for(session_uuid)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as exc:
+        raise authority_chain.AuthorityWriteError(
+            "cannot create the chain directory") from exc
+    return authority_chain.append_batch(path, records, expected_head)
+
+
+def _chain_round_peek(session_uuid, phase, seat):
+    """The round the next usable verdict of `(phase, seat)` will mint, or None
+    when no chain is in force.
+
+    Outside a chain gate that is: no session, an unrecognised seat, no chain
+    file yet, or an unreadable chain. Inside a chain gate (`_CHAIN_GATE_CTX`,
+    whose phase replaces `phase`) the chain is authoritative even before its
+    file exists -- the next round is then 1 -- and None means the boundary
+    will stop on its own: an unreadable chain, or an empty one whose session
+    shows an earlier committed round (`chain_lost`).
+
+    Peeks only: nothing is allocated, so a reviewer turn that yields no usable
+    verdict leaves the number for the retry."""
+    gate = _in_chain_gate(session_uuid, seat)
+    if gate is not None:
+        phase = gate["phase"]
+    pair = authority_candidate.PHASE_ROLES.get(phase)
+    if not session_uuid or pair is None or pair[1] != seat:
+        return None
+    path = state_store.authority_chain_path_for(session_uuid)
+    if gate is None and not os.path.exists(path):
+        return None
+    read = authority_chain.read_chain(path)
+    if not read["ok"]:
+        return None
+    if (gate is not None and not read["records"]
+            and _prior_authority_round_evidence(session_uuid)):
+        return None
+    return 1 + sum(1 for row in read["folded"]["rounds"]
+                   if row["phase"] == phase and row["seat"] == seat)
+
+
+def _canonical_verdict_bytes(verdict):
+    try:
+        return json.dumps(verdict, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False
+                          ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise _AuthorityUnavailable(
+            "verdict_copy_failed", type(exc).__name__) from None
+
+
+def _fsync_directory(path):
+    """Flush the directory entries of `path` to stable storage."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _persist_verdict_copy(session_uuid, raw, digest):
+    """Write the content-addressed copy of a verdict and return its path.
+
+    The reviewer overwrites its review file every round, so the chain's round
+    record names this immutable copy instead. The directory entry is fsynced
+    before this returns, so a committed round never names a copy a crash can
+    lose."""
+    directory = state_store.authority_verdict_copy_dir_for(session_uuid)
+    path = os.path.join(directory, digest + ".json")
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        os.makedirs(directory, exist_ok=True)
+        if os.path.exists(path) and _file_sha256(path) == digest:
+            _fsync_directory(directory)
+            return path
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(directory)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise _AuthorityUnavailable(
+            "verdict_copy_failed", type(exc).__name__) from None
+    return path
+
+
+def _readable_digest(path):
+    """sha256 of the bytes of `path`, or None when it is not a non-empty
+    string naming a readable file. A non-string is never opened."""
+    if not (isinstance(path, str) and path):
+        return None
+    try:
+        return _file_sha256(path)
+    except ValueError:  # e.g. an embedded NUL
+        return None
+
+
+def _stand_in_evidence(review_path, copy_path, copy_sha):
+    """`(path, sha256)` that stands in for evidence the reviewer did not give
+    in a usable form: the review file with the digest of the bytes read now,
+    else the immutable verdict copy with its own digest. Never a digest next to
+    a path that does not denote it."""
+    digest = _readable_digest(review_path)
+    if digest is not None:
+        return review_path, digest
+    return copy_path, copy_sha
+
+
+def _finding_evidence(entry, review_path, copy_path, copy_sha):
+    """`(evidence_path, evidence_sha256)` of one typed finding. The reviewer's
+    own pair wins when its path is readable (its digest is kept when well
+    formed, else taken from the bytes); a missing, unreadable, malformed or
+    absent path -- including an orphan digest -- falls back to the stand-in."""
+    path = entry.get("evidence_path")
+    digest = _readable_digest(path)
+    if digest is None:
+        return _stand_in_evidence(review_path, copy_path, copy_sha)
+    sha = entry.get("evidence_sha256")
+    return path, sha if _is_sha256_hex(sha) else digest
+
+
+def _plan_verdict_records(session_uuid, phase, reviewer_role, verdict, folded,
+                          head, next_seq, candidate, review_path, copy_path,
+                          copy_sha, verdict_sha, supersede_ids=(),
+                          supersede_tx=None):
+    """The ordered batch for one usable verdict, planned against the chain as
+    read (`folded`, `head`, `next_seq`). Pure: nothing is written.
+
+    The round record comes first. Each typed finding then becomes a new
+    finding, or -- when it carries a `finding_ref` that resolves to an earlier
+    finding of the same phase -- a recommendation, a retraction or a reopen of
+    that finding; it never closes anything. A ref that does not resolve is a
+    new finding and is reported in `unresolved`. `blocking` follows the store's
+    rule: severity `blocking` and not superseded, where only a defeated
+    verification challenge cited against a real transaction is superseded.
+    Every record carries an `op_key`, so an identical retry replays."""
+    expected_head = head or authority_chain.EMPTY_HEAD
+    op_base = hashlib.sha256("|".join(
+        [session_uuid, phase, reviewer_role, expected_head, copy_sha]
+    ).encode("utf-8")).hexdigest()
+    round_number = 1 + sum(1 for row in folded["rounds"]
+                           if row["phase"] == phase
+                           and row["seat"] == reviewer_role)
+    state = {fid: row["state"] for fid, row in folded["findings"].items()}
+    seq = [next_seq - 1]
+    records = []
+
+    def add(kind, number, **fields):
+        body = {"kind": kind, "session_uuid": session_uuid, "phase": phase,
+                "round": number, "candidate": dict(candidate)}
+        body.update(fields)
+        body["op_key"] = "%s:%d" % (op_base, len(records))
+        records.append(body)
+        seq[0] += 1
+        return authority_chain.record_id(kind, seq[0])
+
+    round_id = add("round", None, seat=reviewer_role, verdict_sha256=verdict_sha,
+                   review_path=review_path or copy_path,
+                   verdict_copy_path=copy_path, verdict_copy_sha256=copy_sha)
+
+    def recommend(ref, what):
+        add("recommendation", round_number, finding_id=ref, recommend=what,
+            reviewer_seat=reviewer_role, round_id=round_id)
+
+    new_ids, ref_ids, unresolved = {}, {}, []
+    reported = {"finding_ids": [], "withdrawn_ids": [], "duplicate_ids": [],
+                "reopened_ids": []}
+    typed = verdict.get("corrective_findings") if isinstance(
+        verdict, dict) else None
+    for index, entry in enumerate(typed if isinstance(typed, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        ref = entry.get("finding_ref")
+        ref = ref.strip() if isinstance(ref, str) and ref.strip() else None
+        if ref is None and not (entry.get("summary") or entry.get("severity")):
+            continue
+        target = folded["findings"].get(ref) if ref is not None else None
+        if target is not None and target["phase"] != phase:
+            target = None
+        if target is None:
+            if ref is not None:
+                unresolved.append((index, ref))
+            severity = entry.get("severity")
+            if not (isinstance(severity, str) and severity):
+                severity = "unspecified"
+            summary = entry.get("summary")
+            criterion = entry.get("criterion")
+            superseded = (supersede_tx if supersede_tx
+                          and id(entry) in supersede_ids else None)
+            evidence_path, evidence_sha = _finding_evidence(
+                entry, review_path, copy_path, copy_sha)
+            fid = add(
+                "finding", round_number, round_id=round_id,
+                summary=summary if isinstance(summary, str) else "",
+                severity=severity,
+                blocking=(severity == "blocking" and superseded is None),
+                criterion=criterion if isinstance(criterion, str) else "",
+                evidence_path=evidence_path, evidence_sha256=evidence_sha,
+                claim_class=None, discoverer=reviewer_role,
+                superseded_by_transaction=superseded)
+            new_ids[index] = fid
+            state[fid] = "open"
+            reported["finding_ids"].append(fid)
+            continue
+        ref_ids[index] = ref
+        disposition = entry.get("disposition")
+        closure = entry.get("closure")
+        if disposition == "withdrawn":
+            if state.get(ref) == "open":
+                add("retraction", round_number, finding_id=ref,
+                    reason="withdrawn", duplicate_of=None, by="reviewer")
+                state[ref] = "withdrawn"
+                reported["withdrawn_ids"].append(ref)
+            else:
+                recommend(ref, "withdrawn")
+        elif disposition == "duplicate":
+            twin = entry.get("duplicate_of")
+            twin = twin.strip() if isinstance(twin, str) and twin.strip() \
+                else None
+            twin_row = folded["findings"].get(twin) if twin else None
+            if (state.get(ref) == "open" and twin_row is not None
+                    and twin != ref and twin_row["phase"] == phase):
+                add("retraction", round_number, finding_id=ref,
+                    reason="duplicate", duplicate_of=twin, by="reviewer")
+                state[ref] = "duplicate"
+                reported["duplicate_ids"].append(ref)
+            else:
+                recommend(ref, "duplicate")
+        elif closure == "fixed":
+            recommend(ref, "closed")
+        else:
+            recommend(ref, "still_open")
+            if (closure == "still_open" or disposition == "confirmed") \
+                    and state.get(ref) == "closed":
+                add("reopen", round_number, finding_id=ref, round_id=round_id,
+                    by="reviewer")
+                state[ref] = "open"
+                reported["reopened_ids"].append(ref)
+    return {"records": records, "expected_head": expected_head,
+            "round_number": round_number, "round_id": round_id,
+            "new_ids": new_ids, "ref_ids": ref_ids, "unresolved": unresolved,
+            "reported": reported}
+
+
+def _record_verdict_round(session_uuid, phase, role, reviewer_role, verdict,
+                          candidate, review_path, supersede_ids=(),
+                          supersede_tx=None):
+    """Mint the chain round of one usable verdict and record its typed
+    findings in one atomic batch; return the facts the surfaces carry.
+
+    The owner fence is checked before anything is written, the verdict copy is
+    written before the batch, and `round_epochs.json` is synced to the minted
+    round only after the chain commit. Any strict fault raises
+    `_AuthorityUnavailable`; an `OwnerLeaseError` is never swallowed."""
+    _require_owner(session_uuid)
+    if candidate is None:
+        raise _AuthorityUnavailable("candidate_unavailable")
+    raw = _canonical_verdict_bytes(verdict)
+    copy_sha = hashlib.sha256(raw).hexdigest()
+    copy_path = _persist_verdict_copy(session_uuid, raw, copy_sha)
+    review_ref, verdict_sha = _stand_in_evidence(
+        review_path, copy_path, copy_sha)
+    path = state_store.authority_chain_path_for(session_uuid)
+    for attempt in (1, 2):
+        read = authority_chain.read_chain(path)
+        if not read["ok"]:
+            raise _AuthorityUnavailable("chain_unreadable", "AuthorityReadError")
+        if not read["records"] and _prior_authority_round_evidence(
+                session_uuid):
+            # An absent or empty chain is a session with no recorded verdict
+            # only when nothing shows an earlier committed round; otherwise
+            # minting round 1 again would reuse identities.
+            raise _AuthorityUnavailable("chain_lost")
+        next_seq = len(read["records"]) + 1
+        plan = _plan_verdict_records(
+            session_uuid, phase, reviewer_role, verdict, read["folded"],
+            read["head"], next_seq, candidate, review_ref,
+            copy_path, copy_sha, verdict_sha, supersede_ids, supersede_tx)
+        try:
+            try:
+                committed = _chain_append(
+                    session_uuid, plan["records"], plan["expected_head"])
+            except authority_chain.AuthorityCommitUncertain:
+                # The same op_keys resolve either outcome without a duplicate.
+                committed = _chain_append(
+                    session_uuid, plan["records"], plan["expected_head"])
+        except authority_chain.AuthorityHeadConflict:
+            if attempt == 2:
+                raise _AuthorityUnavailable(
+                    "head_conflict", "AuthorityHeadConflict") from None
+            continue
+        except authority_chain.AuthorityRecordRefused as exc:
+            raise _AuthorityUnavailable(
+                "chain_refused", type(exc).__name__) from None
+        except authority_chain.AuthorityReadError as exc:
+            raise _AuthorityUnavailable(
+                "chain_unreadable", type(exc).__name__) from None
+        except (authority_chain.AuthorityError, OSError) as exc:
+            raise _AuthorityUnavailable(
+                "chain_write_failed", type(exc).__name__) from None
+        break
+    minted = committed[0]["round"]
+    try:
+        state_store.sync_phase_round(
+            session_uuid, phase, (role, reviewer_role), minted)
+    except Exception:  # noqa: BLE001 - the epoch file is a mirror of the chain
+        pass
+    return {"round": minted, "round_id": committed[0]["id"],
+            "new_ids": plan["new_ids"], "ref_ids": plan["ref_ids"],
+            "unresolved": plan["unresolved"], "reported": plan["reported"],
+            "verdict_copy_path": copy_path, "verdict_copy_sha256": copy_sha}
+
+
+def _authority_mirror_kwargs(minted, verdict):
+    """The `_record_findings` keywords that join the tolerant ledger mirror to
+    the chain records `minted` holds for `verdict` (none when nothing was
+    recorded), aligned with the verdict's `corrective_findings`."""
+    if not minted:
+        return {}
+    typed = (verdict.get("corrective_findings")
+             if isinstance(verdict, dict) else None)
+    size = len(typed) if isinstance(typed, list) else 0
+    return {"authority_ids": [minted["new_ids"].get(i) for i in range(size)],
+            "authority_refs": [minted["ref_ids"].get(i) for i in range(size)],
+            "authority_round": minted["round"]}
+
+
 def _record_findings(session_uuid, verdict, discoverer, phase, round_index,
-                     review_path=None):
+                     review_path=None, authority_ids=None, authority_refs=None,
+                     authority_round=None):
     """Append a reviewer's typed corrective findings to the ledger.
 
     Best-effort in every direction: no session, no ledger, no typed findings, or
     a write failure all leave the run untouched. A finding the reviewer wrote as
     prose rather than as a typed entry is NOT invented into a typed one — it is
     simply not a corrective finding, which is the CV-030 distinction.
+
+    This is the tolerant MEASUREMENT mirror, never the authority record. When
+    the strict chain already holds the verdict, `authority_ids` and
+    `authority_refs` (aligned with the verdict's `corrective_findings`: the new
+    chain finding an entry opened, or the chain finding it referenced) and
+    `authority_round` ride on each mirrored record so the two ledgers join.
     """
     if not (session_uuid and isinstance(verdict, dict)):
         return []
@@ -2774,20 +3260,36 @@ def _record_findings(session_uuid, verdict, discoverer, phase, round_index,
         return []
     path = state_store.ledger_path_for(session_uuid)
     out = []
-    for finding in typed:
+    for position, finding in enumerate(typed):
         if not isinstance(finding, dict):
             continue
+        extra = {}
+        if authority_ids and position < len(authority_ids):
+            extra["authority_id"] = authority_ids[position]
+        if authority_refs and position < len(authority_refs):
+            extra["authority_ref"] = authority_refs[position]
+        if authority_round is not None:
+            extra["authority_round"] = authority_round
+        evidence_path = finding.get("evidence_path")
+        evidence_sha = finding.get("evidence_sha256")
+        if _readable_digest(evidence_path) is None and _is_sha256_hex(
+                evidence_sha):
+            # A digest with no readable path (an orphan, or a path that
+            # denotes no bytes) is never paired with the review file.
+            evidence_path = None
+        else:
+            evidence_path = evidence_path or review_path
         record = ledger.append_finding(
             path, summary=finding.get("summary"),
             severity=finding.get("severity"),
             criterion=finding.get("criterion"),
-            evidence_path=finding.get("evidence_path") or review_path,
-            evidence_sha256=finding.get("evidence_sha256"),
+            evidence_path=evidence_path,
+            evidence_sha256=evidence_sha,
             discoverer=discoverer, round_index=round_index, phase=phase,
             disposition=finding.get("disposition"),
             closure=finding.get("closure"),
             superseded_by_transaction=finding.get(
-                "superseded_by_transaction"))
+                "superseded_by_transaction"), **extra)
         if record:
             out.append(record["id"])
     return out
@@ -7774,6 +8276,20 @@ def _role_loop(session, first, status_path, context, io_out,
     — one seam that covers approve, revise, needs_user, and round-cap rounds
     identically. It is purely observational: failures are traced and skipped.
 
+    A sessioned loop whose (phase, role, reviewer) is one of the three
+    registered pairs records every usable verdict in the session's authority
+    chain BEFORE `evaluate_fn` runs: one round per verdict and its typed
+    findings, bound to the candidate captured when the reviewer round started.
+    That chain round is the identity the trace, the lead-side evaluation
+    closure, `round_epochs.json` and the ledger mirror then carry, and the
+    reviewer-seat evaluation entry queued earlier inside the reviewer turn
+    carries the same number (the chain is authoritative from round 1, with or
+    without a chain file). A chain fault or a missing candidate stops the
+    phase as `authority_unavailable` (`requires: operator`) and never
+    approves; an absent or empty chain whose session trace or ledger shows an
+    earlier committed round stops the same way with reason `chain_lost`.
+    Without a session there is no chain activity.
+
     When `handoff_enabled`, a `handoff_back` status with a payload is an
     authority request: the phase stops with a `handoff_requested` request and
     the status is left untouched (`run_flow` executes or declines it only on
@@ -7849,6 +8365,11 @@ def _role_loop(session, first, status_path, context, io_out,
     send_start_event_id = None  # trace event ID from the most recent role.send.start
     last_send_source_ref = None  # source_ref built for the most recent send
     review_rounds = 0
+    # The authority-chain phase of this gate: set only for a sessioned loop
+    # whose (phase, role, reviewer) is one of the three registered pairs. None
+    # means no chain activity at all.
+    chain_phase = (_authority_phase(phase, role, reviewer_role)
+                   if session_uuid else None)
     # Jev observer state (inert unless the pilot env var is set): one capture
     # attempt per loop, the candidate token it returned, and one seal per token.
     jev_attempted = False
@@ -8692,13 +9213,30 @@ def _role_loop(session, first, status_path, context, io_out,
                         # to exactly this artifact state.
                         reviewed_sha256 = state_store.fingerprint_status(
                             status_path)["sha256"]
+                        # The candidate the reviewer is judging, captured with
+                        # the bytes above and re-captured on every retry. A
+                        # missing candidate is enforced at the verdict
+                        # boundary, never before a paid reviewer turn.
+                        reviewed_candidate, reviewed_candidate_reason = (
+                            _gate_candidate(session_uuid, chain_phase, role,
+                                            status_path)
+                            if chain_phase is not None else (None, None))
                         if role == "builder" and jev_token is not None \
                                 and not jev_sealed:
                             _jev_hook("hook_review_start", jev_token,
                                       os.getcwd())
-                        verdict = _call_review_fn(
-                            review_fn, status_path, review_rounds,
-                            force_full_reread) or {}
+                        gate_token = (
+                            _CHAIN_GATE_CTX.set({
+                                "session_uuid": session_uuid,
+                                "phase": chain_phase, "seat": reviewer_role})
+                            if chain_phase is not None else None)
+                        try:
+                            verdict = _call_review_fn(
+                                review_fn, status_path, review_rounds,
+                                force_full_reread) or {}
+                        finally:
+                            if gate_token is not None:
+                                _CHAIN_GATE_CTX.reset(gate_token)
                         if trace:
                             trace.event(
                                 "review.verdict", role=reviewer_role,
@@ -8785,6 +9323,103 @@ def _role_loop(session, first, status_path, context, io_out,
                                       os.getcwd(), verdict)
                         transcript.notice(io_out, scout_reviewed_text(
                             verdict, review_rounds, REVIEW_ROUND_CAP))
+                        v = verdict.get("verdict")
+                        has_question = bool(str(
+                            verdict.get("user_question") or "").strip())
+                        # ORCH-050 / CV-050 (D-0001/D-0004/D-0005): review
+                        # dispositions for the bound owned receipt, and the
+                        # mechanical supersession of defeated verification
+                        # challenges. Builder + a current receipt pointer only;
+                        # every other role and every no-receipt path behaves
+                        # exactly as before. A pure read, classified BEFORE
+                        # the verdict is recorded because the strict record
+                        # needs to know which findings are superseded.
+                        receipt_pointer = (
+                            state_store.read_current_receipt_pointer(
+                                session_uuid)
+                            if role == "builder" and session_uuid else None)
+                        blocking_findings = []
+                        defeated_challenges = []
+                        if receipt_pointer and v == "revise":
+                            blocking_findings, defeated_challenges = (
+                                _classify_blocking_verification_challenges(
+                                    verdict, receipt_pointer))
+                        suppress_reopen_for_challenges = bool(
+                            blocking_findings) and len(
+                                defeated_challenges) == len(blocking_findings)
+                        # THE VERDICT BOUNDARY: this usable verdict mints
+                        # exactly one authority-chain round and records its
+                        # typed findings against the candidate the reviewer
+                        # judged, atomically, before anything else observes it.
+                        # A strict failure stops the gate and never approves.
+                        minted = None
+                        if chain_phase is not None:
+                            # Only the all-defeated revise is superseded, and
+                            # only against a real transaction id: a pointer
+                            # without one has nothing to cite.
+                            superseding_tx = (
+                                (receipt_pointer or {}).get("transaction_id")
+                                if suppress_reopen_for_challenges else None)
+                            if not (isinstance(superseding_tx, str)
+                                    and superseding_tx):
+                                superseding_tx = None
+                            try:
+                                minted = _record_verdict_round(
+                                    session_uuid, chain_phase, role,
+                                    reviewer_role, verdict, reviewed_candidate,
+                                    review_path,
+                                    supersede_ids=(
+                                        {id(f) for f in defeated_challenges}
+                                        if superseding_tx else ()),
+                                    supersede_tx=superseding_tx)
+                            except _AuthorityUnavailable as unavailable:
+                                if trace:
+                                    trace.event(
+                                        "gate.decision", decider="runtime",
+                                        role=role,
+                                        reviewer_role=reviewer_role,
+                                        gate="authority_unavailable",
+                                        action="stop",
+                                        reason=unavailable.reason,
+                                        candidate_reason=(
+                                            reviewed_candidate_reason
+                                            if unavailable.reason
+                                            == "candidate_unavailable"
+                                            else None))
+                                review_action = "stop"
+                                stop_payload = _agent_stop_payload(
+                                    "authority_unavailable", role,
+                                    requires="operator",
+                                    reviewer_role=reviewer_role,
+                                    reason=unavailable.reason,
+                                    error_type=unavailable.error_type,
+                                    status_path=status_path,
+                                    review_path=review_path)
+                                break
+                        minted_round = minted["round"] if minted else None
+                        if minted and trace:
+                            reported = minted["reported"]
+                            trace.event(
+                                "review.round.recorded", role=reviewer_role,
+                                phase=chain_phase, round=minted_round,
+                                authority_round=minted_round,
+                                loop_round=review_rounds,
+                                round_id=minted["round_id"],
+                                finding_ids=reported["finding_ids"],
+                                withdrawn_ids=reported["withdrawn_ids"],
+                                duplicate_ids=reported["duplicate_ids"],
+                                reopened_ids=reported["reopened_ids"],
+                                closed_ids=[],
+                                verdict_copy_path=minted["verdict_copy_path"],
+                                verdict_copy_sha256=minted[
+                                    "verdict_copy_sha256"])
+                            for entry_index, ref in minted["unresolved"]:
+                                trace.event(
+                                    "authority.finding_ref_unresolved",
+                                    role=reviewer_role, phase=chain_phase,
+                                    round=minted_round, finding_ref=ref,
+                                    finding_id=minted["new_ids"].get(
+                                        entry_index))
                         if evaluate_fn is not None:
                             # SEAL AND ENQUEUE ONLY — no send, no
                             # wait (P12). Scoring used to run here as an extra
@@ -8792,12 +9427,21 @@ def _role_loop(session, first, status_path, context, io_out,
                             # measurement between the reviewer's verdict and the
                             # fix going back. It now costs a file append; the
                             # queue drains at phase end.
+                            boundary_token = (
+                                _BOUNDARY_ROUND_CTX.set({
+                                    "session_uuid": session_uuid,
+                                    "phase": chain_phase,
+                                    "round": minted_round})
+                                if minted_round is not None else None)
                             try:
                                 evaluate_fn(session, verdict, review_rounds)
                             except Exception:  # noqa: BLE001 - observational only
                                 if trace:
                                     trace.event("eval.error", evaluator=role,
                                                 round=review_rounds)
+                            finally:
+                                if boundary_token is not None:
+                                    _BOUNDARY_ROUND_CTX.reset(boundary_token)
                         if profile_session is not None:
                             # Execution profile: typed finding signals may
                             # promote the profile, and a build-reviewer
@@ -8824,9 +9468,6 @@ def _role_loop(session, first, status_path, context, io_out,
                                     status_path=status_path,
                                     review_path=review_path)
                                 break
-                        v = verdict.get("verdict")
-                        has_question = bool(str(
-                            verdict.get("user_question") or "").strip())
                         if v == "needs_user" and has_question:
                             # A reviewer question needs an answer this process
                             # cannot supply. It is never guessed at and never
@@ -8848,30 +9489,15 @@ def _role_loop(session, first, status_path, context, io_out,
                                 status_path=status_path,
                                 review_path=review_path)
                             break
-                        # ORCH-050 / CV-050 (D-0001/D-0004/D-0005): review
-                        # dispositions for the bound owned receipt, and the
-                        # mechanical supersession of defeated verification
-                        # challenges. Builder + a current receipt pointer only;
-                        # every other role and every no-receipt path behaves
-                        # exactly as before.
-                        receipt_pointer = (
-                            state_store.read_current_receipt_pointer(
-                                session_uuid)
-                            if role == "builder" and session_uuid else None)
-                        blocking_findings = []
-                        defeated_challenges = []
-                        if receipt_pointer and v == "revise":
-                            blocking_findings, defeated_challenges = (
-                                _classify_blocking_verification_challenges(
-                                    verdict, receipt_pointer))
-                        suppress_reopen_for_challenges = bool(
-                            blocking_findings) and len(
-                                defeated_challenges) == len(blocking_findings)
+                        # The round every observation of this verdict joins:
+                        # the chain round when the verdict was recorded, else
+                        # the legacy durable counter.
                         disposition_round = (
-                            state_store.current_phase_round(
+                            minted_round if minted_round is not None else
+                            (state_store.current_phase_round(
                                 session_uuid, phase, reviewer_role,
                                 default=review_rounds)
-                            if session_uuid else None)
+                             if session_uuid else None))
                         if v == "approve" and state_store.fingerprint_status(
                                 status_path)["sha256"] != reviewed_sha256:
                             # The artifact changed while it was under review:
@@ -8934,7 +9560,8 @@ def _role_loop(session, first, status_path, context, io_out,
                                     verdict, defeated_challenges,
                                     receipt_pointer),
                                 reviewer_role, phase, disposition_round,
-                                review_path)
+                                review_path,
+                                **_authority_mirror_kwargs(minted, verdict))
                             if trace:
                                 trace.event(
                                     "verification.challenges_superseded",
@@ -8989,19 +9616,23 @@ def _role_loop(session, first, status_path, context, io_out,
                             # be reconstructed afterwards — "is this the same
                             # finding as last round?" is only answerable while
                             # both are in hand.
-                            _record_findings(session_uuid, verdict,
-                                             reviewer_role, phase,
-                                             state_store.current_phase_round(
-                                                 session_uuid, phase,
-                                                 reviewer_role,
-                                                 default=review_rounds),
-                                             review_path)
+                            _record_findings(
+                                session_uuid, verdict, reviewer_role, phase,
+                                (minted_round if minted_round is not None
+                                 else state_store.current_phase_round(
+                                     session_uuid, phase, reviewer_role,
+                                     default=review_rounds)),
+                                review_path,
+                                **_authority_mirror_kwargs(minted, verdict))
                             if trace:
                                 trace.event(
                                     "review.handoff.recorded", phase=phase,
-                                    round=state_store.current_phase_round(
-                                        session_uuid, phase, role,
-                                        default=review_rounds),
+                                    round=(minted_round
+                                           if minted_round is not None
+                                           else state_store.current_phase_round(
+                                               session_uuid, phase, role,
+                                               default=review_rounds)),
+                                    authority_round=minted_round,
                                     loop_round=review_rounds,
                                     from_role=reviewer_role,
                                     to_role=role, kind="revise")
@@ -9748,7 +10379,10 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
         if reviewed_reference is not None and not _is_review_failure(verdict):
             # The reviewer judged exactly what was captured before it ran.
             _write_reviewed_reference(session_uuid, reviewed_reference)
-        if specs:
+        # A turn that produced no usable verdict mints no round, so it queues
+        # no reviewer-side entry and burns no number: the usable retry is the
+        # round that gets the identity (and carries the once-per-phase bundle).
+        if specs and not _is_review_failure(verdict):
             if len(specs) > 1:
                 holder["consumed_done"] = True
             _enqueue_reviewer_eval(

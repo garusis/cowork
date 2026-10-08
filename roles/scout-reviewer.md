@@ -75,13 +75,23 @@ Use this shape:
   "role": "scout-reviewer",
   "verdict": "approve | revise | needs_user",
   "findings": ["concrete, evidence-cited issue", "..."],
+  "corrective_findings": [
+    {"summary": "<concrete, evidence-cited issue>",
+     "severity": "blocking | major | minor",
+     "criterion": "<which frozen criterion this bears on, if any>",
+     "disposition": "<on a later round: confirmed | withdrawn | duplicate>",
+     "closure": "<on a later round: fixed | still_open | superseded>",
+     "finding_ref": "<optional: the authority id of an earlier finding this entry is about>",
+     "duplicate_of": "<optional, only with disposition=duplicate: the authority id it duplicates>"}
+  ],
   "closed_source_findings": ["<source_finding_id verified closed>"],
   "user_question": "<required only when verdict is needs_user>"
 }
 ```
 
-`closed_source_findings` is optional and additive; see "Targeted re-review and
-source-finding closure". Omit it when it would be empty.
+`corrective_findings` and `closed_source_findings` are optional and additive;
+see "Typed findings and references" and "Targeted re-review and source-finding
+closure". Omit either when it would be empty.
 
 - **`approve`** — the intel is aligned and complete; you have no blocking
   concern. `findings` may be empty or list only minor accepted notes.
@@ -111,6 +121,21 @@ artifacts. A vague or context-light question is a failed review.
 
 Everything else — wrong content, gaps, guesses a lead made where the context
 did settle the answer — is a `revise` finding for the scout.
+
+## Typed findings and references
+
+An entry in `corrective_findings` is a typed finding. An entry without a
+`finding_ref` is a **new finding**. To speak about a finding an earlier round
+already recorded, set `finding_ref` to that finding's authority id: the entry
+is then about that finding and is not a new one, and its marking is read as
+your recommendation. `disposition=withdrawn` retracts an open finding;
+`disposition=duplicate`, with `duplicate_of` naming the authority id it
+duplicates, retracts it as a duplicate; `closure=fixed` recommends closing it;
+`closure=still_open` or `disposition=confirmed` keeps it open and reopens one
+that was closed. A `finding_ref` that matches no earlier finding is recorded as
+a new finding. `closure=fixed` and `closed_source_findings` are recommendations
+and measurement, never a close: a finding is closed only by the control
+plane's own record.
 
 ## Targeted re-review and source-finding closure
 

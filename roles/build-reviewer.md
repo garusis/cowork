@@ -168,6 +168,8 @@ Use this shape:
      "criterion": "<which frozen criterion this bears on, if any>",
      "disposition": "<on a later round: confirmed | withdrawn | duplicate>",
      "closure": "<on a later round: fixed | still_open | superseded>",
+     "finding_ref": "<optional: the authority id of an earlier finding this entry is about>",
+     "duplicate_of": "<optional, only with disposition=duplicate: the authority id it duplicates>",
      "verification_challenge": {"transaction_id": "<owned receipt id>",
                                 "reason_code": "<why the receipt is wrong>"}}
   ],
@@ -205,6 +207,19 @@ On a **later round**, report each earlier finding's `disposition` (was it real?)
 and `closure` (was it fixed?). A finding you withdraw stays on the record as
 withdrawn — retracting a false finding is good work, and erasing it would make
 it indistinguishable from never having looked.
+
+**`finding_ref` and `duplicate_of` are optional.** A typed entry without a
+`finding_ref` is a **new finding**. To speak about a finding an earlier round
+already recorded, set `finding_ref` to that finding's authority id: the entry
+is then about that finding and is not a new one, and its marking is read as
+your recommendation. `disposition=withdrawn` retracts an open finding;
+`disposition=duplicate`, with `duplicate_of` naming the authority id it
+duplicates, retracts it as a duplicate; `closure=fixed` recommends closing it;
+`closure=still_open` or `disposition=confirmed` keeps it open and reopens one
+that was closed. A `finding_ref` that matches no earlier finding is recorded as
+a new finding. `closure=fixed` and `closed_source_findings` are recommendations
+and measurement, never a close: a finding is closed only by the control
+plane's own record.
 
 - **`approve`** — the build faithfully executes the plan, is correct, and is
   ready; you have no blocking concern. `corrective_findings` is EMPTY; put
