@@ -281,7 +281,9 @@ class _Base(unittest.TestCase):
         # session_uuid is set, so the production key has the extradir bit.
         return probe_cache.probe_cache_key(
             "/offline/claude", "claude 0.0.0-offline",
-            cowork.SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], True)
+            cowork.SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], True,
+            probe_contract=json.dumps(bridge.CLAUDE_PROBE_FLAGS),
+            model=None, effort=None, guarded=bridge.nested_guard_active())
 
     def _prime_cache(self, cfg):
         probe_cache.cache_store(self._cache_key(cfg),
@@ -448,7 +450,8 @@ class MetadataVsProofTests(_Base):
                 report=report)
         key = probe_cache.probe_cache_key(
             "/offline/claude", "v1", cowork.SCOUT_PROMPT_PATH, "plan", True,
-            False)
+            False, probe_contract=json.dumps(bridge.CLAUDE_PROBE_FLAGS),
+            model=None, effort=None, guarded=bridge.nested_guard_active())
         return ok, alert, report, _events(tpath), calls, key, cache_path
 
     def test_uncached_probe_401_fails_never_cached_and_classified_auth(self):

@@ -54,6 +54,12 @@ import cowork_profiles as controller_profiles  # noqa: E402
 from cowork_transcript import speaker_label  # noqa: E402,F401
 
 DEFAULT_ROLE_PROMPT = "roles/scout.md"
+CLAUDE_PROBE_PROMPT = (
+    "You are a transport compatibility probe. Reply to ping with pong. "
+    "Do not perform engineering work or use tools.")
+CLAUDE_PROBE_FLAGS = (
+    "--system-prompt", CLAUDE_PROBE_PROMPT,
+    "--tools", "", "--disable-slash-commands")
 _NESTED_GUARD_ACTIVE = False
 
 # ORCH-001: cowork roles never inherit MCP servers. For claude this is a
@@ -296,7 +302,8 @@ def codex_mode_flags(mode, yolo):
 def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
                          resume_id=None, extra_writable_dir=None,
                          model=None, effort=None, guard_settings_path=None,
-                         delegation_allowed=True, external_output_roots=()):
+                         delegation_allowed=True, external_output_roots=(),
+                         startup_probe=False):
     """Full argv for a persistent duplex claude scout process.
 
     Pass `session_id` to pin a known UUID on a fresh session (so it can be saved
@@ -307,7 +314,9 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
     (fresh AND resume), so resumed Claude roles keep the grant.
     `model`/`effort`, when set, pin the session model (`--model`) and thinking
     effort (`--effort`: low|medium|high|xhigh|max); unset means the installed
-    CLI's own defaults, exactly as before."""
+    CLI's own defaults, exactly as before. `startup_probe` replaces the role
+    prompt with a dedicated prompt, removes tools/skills and excludes ambient
+    settings; explicit guard settings still load when present."""
     cmd = [
         "claude",
         "-p",
@@ -323,8 +332,8 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         "--disallowedTools",
         "AskUserQuestion",
         "ExitPlanMode",
-        "--append-system-prompt-file",
-        role_prompt_file,
+        *(CLAUDE_PROBE_FLAGS if startup_probe else
+          ("--append-system-prompt-file", role_prompt_file)),
         # ORCH-001: load ONLY the cowork-owned empty MCP config — no
         # user/project/plugin MCP server schema ever enters a role's context.
         # Unconditional: the probe (guarded and unguarded) and every
@@ -333,6 +342,12 @@ def build_claude_command(role_prompt_file, mode, yolo, session_id=None,
         CLAUDE_EMPTY_MCP_CONFIG_PATH,
         "--strict-mcp-config",
     ] + claude_mode_flags(mode, yolo)
+    if startup_probe:
+        # Replace, rather than append to, the engineering system prompt.
+        # An empty built-in tool set also removes Agent/Task; strict empty
+        # MCP above and disabled skills complete the probe-only tool surface.
+        if not guard_settings_path:
+            cmd += ["--setting-sources", ""]
     if model:
         cmd += ["--model", model]
     if effort:
@@ -1856,8 +1871,10 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     #3 probe cache: when `cache_enabled` (the live launch call sites pass True;
     tests and existing callers default to False, keeping the always-live-probe
     behavior), a conservative cache key is computed over the resolved CLI path,
-    `claude --version`, the role-prompt hash, mode, yolo, and writable-dir
-    presence. On a HIT the live probe is skipped entirely (no spawn) and
+    `claude --version`, the role-prompt hash (conservative invalidation only),
+    mode, yolo, writable-dir presence, dedicated prompt/tool contract,
+    model/effort pins and guardedness. The role prompt is never loaded by a
+    probe. On a HIT the live probe is skipped entirely (no spawn) and
     (True, None) is returned. On a MISS the live probe runs and, on success, the
     key is stored. A version-resolution failure forces always-live (never
     cached). `version_fn`/`cache_path` are injectable for tests.
@@ -1890,7 +1907,10 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         str(uuid.uuid4()) if nested_guard_active() else None)
     command = build_claude_command(role_prompt_file, mode, yolo,
                                    extra_writable_dir=extra_writable_dir,
-                                   session_id=probe_session_id)
+                                   session_id=probe_session_id,
+                                   model=model, effort=effort,
+                                   delegation_allowed=False,
+                                   startup_probe=True)
     cache_key = None
     cache_hit = False
     if cache_enabled:
@@ -1899,7 +1919,9 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         version = resolver(claude_path)
         cache_key = probe_cache.probe_cache_key(
             claude_path, version, role_prompt_file, mode, yolo,
-            bool(extra_writable_dir))
+            bool(extra_writable_dir),
+            probe_contract=json.dumps(CLAUDE_PROBE_FLAGS),
+            model=model, effort=effort, guarded=nested_guard_active())
         cache_hit = bool(
             cache_key and probe_cache.cache_hit(cache_key, path=cache_path))
     # The live probe is a distinct audited work item. Mint and publish its id
@@ -1948,8 +1970,8 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
             role_prompt_file, mode, yolo,
             extra_writable_dir=extra_writable_dir, model=model, effort=effort,
             guard_settings_path=runtime["settings_path"],
-            delegation_allowed=runtime["delegation_allowed"],
-            session_id=probe_session_id)
+            delegation_allowed=False,
+            session_id=probe_session_id, startup_probe=True)
         env_argv = [shutil.which("env") or "/usr/bin/env"]
         env_argv += ["%s=%s" % (key, runtime["env"][key])
                      for key in ("TMPDIR",)]
@@ -1988,6 +2010,9 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
         trace.event("controller.probe.start", controller="claude", role=role,
                     prompt_kind="probe", mode=mode, yolo=yolo, cwd=os.getcwd(),
                     role_prompt_file=role_prompt_file,
+                    role_prompt_loaded=False, tools_available=False,
+                    **trace_store.prompt_meta(CLAUDE_PROBE_PROMPT,
+                                              prefix="system_prompt"),
                     mcp_free=True, mcp_mechanism="claude_empty_mcp_config",
                     **dict(data, **_probe_work()))
     try:
@@ -2046,6 +2071,11 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                             controller_outcome=outcome,
                             live_auth_proven=False,
                             usage=probe_usage, usage_native=probe_usage,
+                            usage_source=("claude.result.usage"
+                                          if probe_usage else None),
+                            usage_interpretation=(
+                                "native_aggregate_not_fresh_generation"
+                                if probe_usage else None),
                             **_probe_work(
                                 usage_scope="turn_native",
                                 duration_ms=_probe_elapsed_ms()))
@@ -2075,6 +2105,11 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
                             role=role, prompt_kind="probe", result="ok",
                             live_auth_proven=True,
                             usage=probe_usage, usage_native=probe_usage,
+                            usage_source=("claude.result.usage"
+                                          if probe_usage else None),
+                            usage_interpretation=(
+                                "native_aggregate_not_fresh_generation"
+                                if probe_usage else None),
                             **_probe_work(
                                 usage_scope="turn_native",
                                 duration_ms=_probe_elapsed_ms()))

@@ -952,8 +952,20 @@ is unchanged.
 
 Before committing the switch, cowork checks the target controller executable and
 uses the existing install guidance if it is missing. When the target is Claude,
-cowork also runs the stream-json probe for that role's prompt/mode/permission
-settings. A failed target check leaves the current controller unchanged.
+cowork also runs the stream-json probe for that role's mode/permission and
+model/effort settings. The probe uses a dedicated minimal system prompt,
+no built-in or MCP tools, and disabled skills, never the engineering-role
+prompt. Guarded probes retain their hooks and kernel boundary; ordinary role
+launches are unchanged. A failed target check leaves the current controller
+unchanged.
+
+Probe-cache identity includes the dedicated prompt/tool contract, model/effort
+pins and guardedness, so legacy full-role successes cannot bypass the isolated
+probe. The role-prompt hash remains a conservative invalidation input only.
+A hit skips the live turn and never claims fresh authentication proof.
+Probe trace usage retains the CLI's native `result.usage` token axes and labels
+them as native aggregates, not fresh-generation totals. Those aggregates do
+not establish which prompt content or retry caused the reported tokens.
 
 Switching is explicit only. There is no automatic rate-limit failover
 (capacity signals pause instead; see

@@ -10,7 +10,11 @@ session and role.
 
 The cache key is deliberately conservative (doc guardrail): any change to the
 resolved CLI, its `--version` string, the role-prompt file, the mode/yolo
-settings, or whether an extra writable dir is granted re-probes. There is no TTL
+settings, or whether an extra writable dir is granted re-probes. Isolated
+startup probes additionally key their prompt/tool contract, model/effort pins
+and guardedness, in a namespace separate from legacy full-role probes. The
+role-prompt hash is only a conservative invalidation input, not loaded context.
+There is no TTL
 — key invalidation alone handles CLI drift.
 
 Storage is a single JSON file. Its root is overridable via COWORK_SESSIONS_ROOT
@@ -91,10 +95,13 @@ def _role_prompt_sha(role_prompt_file):
 
 
 def probe_cache_key(claude_path, version, role_prompt_file, mode, yolo,
-                    has_extra_writable_dir):
+                    has_extra_writable_dir, probe_contract=None, model=None,
+                    effort=None, guarded=False):
     """Conservative sha256 key over the inputs that define probe success:
     resolved CLI path, `--version` string, role-prompt file hash, mode, yolo,
     and whether an extra writable dir is granted (it changes the command shape).
+    When supplied, `probe_contract` also keys prompt/tool shape, pins and
+    guardedness in a separate namespace; omitted inputs preserve legacy keys.
     Returns None when the version is unknown — an unknown version must never be
     cached (it would mask a CLI upgrade)."""
     if not version:
@@ -108,6 +115,11 @@ def probe_cache_key(claude_path, version, role_prompt_file, mode, yolo,
         "yolo" if yolo else "no-yolo",
         "extradir" if has_extra_writable_dir else "no-extradir",
     ]
+    if probe_contract is not None:
+        # A separate namespace cannot hit legacy full-role probe successes.
+        # Include actual prompt/tool flags and pins, not just a version label.
+        parts += ["isolated-probe-v1", probe_contract,
+                  json.dumps([model, effort, bool(guarded)])]
     raw = "\x1f".join(parts).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
