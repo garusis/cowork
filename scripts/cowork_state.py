@@ -4802,6 +4802,48 @@ def write_json_atomic_durable(path, data):
     return True
 
 
+def create_json_exclusive_durable(path, data):
+    """Durably create `path` with `data`, and ONLY if it does not exist yet.
+
+    `write_json_atomic_durable` is last-writer-wins: it renames over whatever
+    is there. For a record that is a one-time, immutable claim -- the package
+    admission marker -- that is wrong, because two concurrent first admissions
+    both believe they are first and the second silently overwrites the first.
+    If the second then dies, or is refused, the surviving marker describes an
+    admission that never took effect.
+
+    So the create is made atomic by the filesystem: the bytes go to a private
+    temp file (fsynced), and `os.link` publishes them under `path`. `link`
+    fails with `FileExistsError` if `path` already exists, and it does so
+    atomically, with no read-then-write window for a racing process to slip
+    into.
+
+    Returns True when THIS call created the file, False when it already
+    existed (nothing is written in that case). Raises OSError on a genuine
+    write failure."""
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    tmp = path + ".new.%d.%d" % (os.getpid(), int(time.time() * 1e6))
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return False
+        _fsync_parent_dir(path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return True
+
+
 def _locked_json_transaction(path, mutate):
     """Serialize a read-check-write sequence against `path` behind a real
     OS-level `fcntl.flock` exclusive lock on `<path>.lock` (bounded by
@@ -4870,6 +4912,779 @@ def _locked_json_transaction(path, mutate):
                 pass
     finally:
         lock_fh.close()
+
+
+# --------------------------------------------------------------------------- #
+# Package dispatch allocation (#116): the durable half of the explicit,       #
+# orchestrator-supplied ceiling on how many REAL PROVIDER LEAD DISPATCHES one #
+# work package may spend per phase. The pure grammar and arithmetic live in   #
+# `cowork_allocation.py`; everything here is admission, readback and ATOMIC   #
+# consumption, all of it on the one locking authority above                   #
+# (`_locked_json_transaction`, a real cross-process `fcntl.flock`).           #
+#                                                                             #
+# Two records, deliberately:                                                  #
+#                                                                             #
+#   * the PACKAGE LEDGER, keyed by a digest of the package/lineage ref and    #
+#     living OUTSIDE any one session's directory. This is what makes the      #
+#     allocation survive a resume, a `--session-file` pointed elsewhere, or a #
+#     brand-new replacement session launched for the same package: all three  #
+#     bind to the SAME ledger and see the SAME consumed counters, so no       #
+#     selector silently resets the budget.                                    #
+#   * the SESSION BINDING, inside the session's own assets dir, naming the    #
+#     package ref and pinning the digest of the limits that were admitted.    #
+#     A session with no binding file has no allocation and behaves exactly as #
+#     it did before this existed.                                             #
+#                                                                             #
+# SUPPORTED SCOPE OF THE BINDING, stated plainly:                             #
+#   - It binds every cowork process that resolves the same `sessions_root()`  #
+#     (i.e. the same `COWORK_SESSIONS_ROOT`, or the same real home) and is    #
+#     given the same package ref. That covers resume, replacement sessions,   #
+#     and concurrent processes on one machine, which is where #116 happened.  #
+#   - It does NOT bind across machines, across different sessions roots, or   #
+#     against an operator who deletes or hand-edits the ledger file. A        #
+#     hand-edit that changes the admitted limits is DETECTED (the session     #
+#     binding pins their digest) and fails closed; an outright deletion is    #
+#     detected the same way for a bound session, but nothing here can stop a  #
+#     fresh package ref being admitted with a larger allocation.              #
+#   - It is not a security boundary. It is a durable accounting boundary      #
+#     against automatic, unsupervised re-dispatch.                            #
+# --------------------------------------------------------------------------- #
+
+DISPATCH_ALLOCATION_SCHEMA = 1
+
+
+def _allocation():
+    """`cowork_allocation`, imported LAZILY rather than at module level.
+
+    The owned-verification worker execs `cowork_verification.py` from a
+    captured snapshot and imports THIS module from alongside it; the isolated
+    worker-boundary fixtures reproduce that by hand-copying only the worker's
+    known dependency closure (`cowork_state`/`cowork_policy`/`cowork_ledger`).
+    A module-level import here would silently add a fourth name to that
+    closure for every caller, when no verification-worker path uses the
+    dispatch allocation at all. Same reasoning, and same shape, as
+    `cowork_policy.py`'s lazy `cowork_state` import and
+    `cowork_verification.py`'s lazy `cowork_action_policy` import.
+
+    An `ImportError` here propagates to the caller, which treats an
+    allocation it cannot evaluate as a refusal -- fail closed, never
+    "unlimited"."""
+    import cowork_allocation
+    return cowork_allocation
+
+# Reserved sibling of the per-session directories under `sessions_root()`.
+# Session uuids must match `[A-Za-z0-9][A-Za-z0-9_\-.]{0,254}`, so a name
+# starting with `_` can never collide with one.
+_ALLOCATIONS_DIR_NAME = "_allocations"
+_BOUND_SESSIONS_DIR_NAME = "sessions"
+_PACKAGE_ADMISSION_DIR_NAME = "admitted"
+
+
+class AllocationConflict(ValueError):
+    """An allocation operation that cannot be honored. `reason` is a closed
+    code: `limits_immutable` (this package ref was admitted with DIFFERENT
+    limits), `ledger_corrupt`, `ledger_invalid`, `binding_mismatch`,
+    `ledger_missing`."""
+
+    def __init__(self, reason, message, record=None):
+        ValueError.__init__(self, message)
+        self.reason = reason
+        self.record = record
+
+
+class AllocationExhausted(ValueError):
+    """The dispatch this consumption would have charged exceeds the admitted
+    allocation. `verdict` is `cowork_allocation.evaluate`'s record, decided
+    inside the lock; `record` is the untouched durable ledger."""
+
+    def __init__(self, verdict, record):
+        ValueError.__init__(
+            self,
+            "the package dispatch allocation for phase %r is exhausted (%s)"
+            % (verdict.get("phase"), verdict.get("refusal_code")))
+        self.verdict = verdict
+        self.record = record
+
+
+def allocations_root():
+    """Directory holding the package-scoped allocation ledgers and the
+    bound-session witness index. Honours `COWORK_SESSIONS_ROOT` exactly like
+    every other session asset."""
+    return os.path.join(sessions_root(), _ALLOCATIONS_DIR_NAME)
+
+
+def bound_sessions_root():
+    """Directory holding the AUTHORITATIVE bound-session witnesses.
+
+    This is what makes "this session has no allocation" a provable fact rather
+    than an inference from a missing file. The per-session sidecar inside the
+    session's own assets directory is a mirror; this index is the witness. A
+    session is BOUND when either record exists, so losing, truncating or
+    deleting one of them is detected as loss of bound state and fails closed --
+    it can never read back as an unbound legacy session."""
+    return os.path.join(allocations_root(), _BOUND_SESSIONS_DIR_NAME)
+
+
+def package_ref_digest(package_ref):
+    """The stable, filesystem-safe key one package/lineage ref hashes to. The
+    raw ref is kept inside the record; only the digest names the file, so an
+    arbitrary operator-chosen ref can never escape `allocations_root()`."""
+    if not isinstance(package_ref, str) or not package_ref.strip():
+        raise ValueError("package_ref must be a nonempty string")
+    return hashlib.sha256(
+        package_ref.strip().encode("utf-8")).hexdigest()
+
+
+def allocation_ledger_path_for(package_ref):
+    return os.path.join(allocations_root(),
+                        package_ref_digest(package_ref) + ".json")
+
+
+def dispatch_allocation_binding_path_for(session_uuid):
+    """The session-local MIRROR of its allocation binding."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(session_assets_dir(session_uuid),
+                        "dispatch_allocation.json")
+
+
+def package_admission_root():
+    """Directory holding the per-package ADMISSION MARKERS.
+
+    The ledger file holds a package's counters; this marker holds the separate,
+    durable fact that the package was admitted at all. Without it, deleting a
+    spent ledger would look exactly like a package that had never been
+    admitted, and the next admission would hand out a brand new budget."""
+    return os.path.join(allocations_root(), _PACKAGE_ADMISSION_DIR_NAME)
+
+
+def package_admission_marker_path_for(package_ref):
+    return os.path.join(package_admission_root(),
+                        package_ref_digest(package_ref) + ".json")
+
+
+def read_package_admission_marker(package_ref):
+    """The package's admission marker, or None when it was never admitted.
+    Raises `AllocationConflict` for a marker that exists but cannot be
+    proven."""
+    path = package_admission_marker_path_for(package_ref)
+    if not os.path.exists(path):
+        return None
+    try:
+        record = _read_json_or_raise_if_corrupt(path)
+    except CorruptRecordError as exc:
+        raise AllocationConflict(
+            "marker_corrupt",
+            "the admission marker for package %r exists but is corrupt: %s"
+            % (package_ref, exc))
+    if record is None:
+        return None
+    _validate_allocation_schema(
+        record, "the package admission marker", "marker_invalid")
+    stored = _exact_package_ref(
+        record.get("package_ref"), "the admission marker's package_ref",
+        "marker_invalid", record=record)
+    if stored.strip() != str(package_ref).strip():
+        raise AllocationConflict(
+            "marker_invalid",
+            "the admission marker at package %r identifies itself as %r"
+            % (package_ref, stored), record=record)
+    _exact_digest(record.get("limits_digest"),
+                  "the admission marker's limits_digest", "marker_invalid",
+                  record=record)
+    return record
+
+
+def dispatch_allocation_witness_path_for(session_uuid):
+    """The AUTHORITATIVE bound-session witness, outside the session's own
+    directory so that deleting the session's assets cannot un-bind it."""
+    _assert_safe_identifier(session_uuid, "session_uuid")
+    return os.path.join(bound_sessions_root(), session_uuid + ".json")
+
+
+def limits_digest(limits):
+    """Digest of a NORMALIZED limits record — the immutability witness every
+    binding pins and every later readback is checked against."""
+    return hashlib.sha256(json.dumps(
+        limits, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Strict schema validation. Everything below REFUSES rather than repairs, and #
+# refuses rather than defaults: there is no tolerant read, no `or 0`, and no  #
+# numeric coercion anywhere on these paths. An allocation record that cannot  #
+# be proven correct has not granted anything.                                 #
+# --------------------------------------------------------------------------- #
+
+def _exact_nonnegative_int(value, label, reason, record=None):
+    """`value` must be a genuine non-negative `int`. A bool is not an int
+    here (`True == 1` would silently read as a spent slot), and a numeric
+    string or float is not coerced -- either would let an edited ledger
+    manufacture capacity."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AllocationConflict(
+            reason,
+            "%s must be a non-negative integer, got %r (%s)"
+            % (label, value, type(value).__name__), record=record)
+    return value
+
+
+def _exact_digest(value, label, reason, record=None):
+    """`value` must be a lowercase 64-hex sha256 digest string."""
+    if (not isinstance(value, str) or len(value) != 64
+            or any(c not in "0123456789abcdef" for c in value)):
+        raise AllocationConflict(
+            reason, "%s must be a sha256 hex digest, got %r" % (label, value),
+            record=record)
+    return value
+
+
+def _exact_package_ref(value, label, reason, record=None):
+    if not isinstance(value, str) or not value.strip():
+        raise AllocationConflict(
+            reason, "%s must be a nonempty string, got %r" % (label, value),
+            record=record)
+    return value
+
+
+def _validate_allocation_schema(record, label, reason):
+    version = (record or {}).get("schema")
+    # `1.0 == 1` in Python, so the TYPE is checked as well as the value: a
+    # float, a numeric string or a bool is not this schema version.
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != DISPATCH_ALLOCATION_SCHEMA):
+        raise AllocationConflict(
+            reason,
+            "%s schema must be exactly %r, got %r"
+            % (label, DISPATCH_ALLOCATION_SCHEMA, version), record=record)
+
+
+def _validate_ledger(record, package_ref):
+    """Fully validate one package ledger. Returns
+    `(limits, consumed_map)` -- both proven -- or raises
+    `AllocationConflict('ledger_invalid')`.
+
+    Every field is mandatory and exactly typed. In particular `consumed` must
+    carry EXACTLY one exact non-negative integer per allocatable phase: a
+    missing, null, string, boolean, float or negative counter is a refusal,
+    never a zero, because reading it as zero would refund dispatches that were
+    genuinely spent."""
+    reason = "ledger_invalid"
+    if not isinstance(record, dict):
+        raise AllocationConflict(
+            reason, "the allocation ledger is not an object", record=record)
+    _validate_allocation_schema(record, "the allocation ledger", reason)
+    stored_ref = _exact_package_ref(
+        record.get("package_ref"), "the allocation ledger's package_ref",
+        reason, record=record)
+    # Package identity: the ledger must name the package it was looked up
+    # under. A ledger moved, copied, or re-pointed at another package is not
+    # this package's budget.
+    if (package_ref is not None
+            and stored_ref.strip() != str(package_ref).strip()):
+        raise AllocationConflict(
+            reason,
+            "the allocation ledger at package %r identifies itself as %r"
+            % (package_ref, stored_ref), record=record)
+    try:
+        limits = _allocation().validate_limits(record.get("limits"))
+    except AllocationConflict:
+        raise
+    except _allocation().AllocationError as exc:
+        raise AllocationConflict(
+            reason, "the allocation ledger's limits are not usable: %s" % exc,
+            record=record)
+    _exact_digest(record.get("limits_digest"),
+                  "the allocation ledger's limits_digest", reason,
+                  record=record)
+    if record["limits_digest"] != limits_digest(limits):
+        raise AllocationConflict(
+            reason,
+            "the allocation ledger's limits_digest does not match its own "
+            "limits", record=record)
+    consumed = record.get("consumed")
+    if not isinstance(consumed, dict):
+        raise AllocationConflict(
+            reason, "the allocation ledger's consumed counters are missing or "
+            "not an object", record=record)
+    phases = tuple(_allocation().PHASES)
+    if set(consumed) != set(phases):
+        raise AllocationConflict(
+            reason,
+            "the allocation ledger must carry exactly one consumed counter "
+            "per phase %s, got %s" % (sorted(phases), sorted(consumed)),
+            record=record)
+    proven = {}
+    for phase in phases:
+        proven[phase] = _exact_nonnegative_int(
+            consumed[phase], "consumed[%r]" % phase, reason, record=record)
+    sessions = record.get("sessions")
+    if not isinstance(sessions, list) or not all(
+            isinstance(entry, str) and entry for entry in sessions):
+        raise AllocationConflict(
+            reason, "the allocation ledger's session lineage is not a list of "
+            "session ids", record=record)
+    return limits, proven
+
+
+def _validate_binding(record, session_uuid, origin):
+    """Fully validate one binding record (witness or sidecar). Returns the
+    record, or raises `AllocationConflict('binding_invalid')`.
+
+    `limits_digest` is MANDATORY: without it nothing downstream can prove that
+    the ledger still carries the limits this session was admitted under, so a
+    binding missing it is not trusted at all."""
+    reason = "binding_invalid"
+    if not isinstance(record, dict):
+        raise AllocationConflict(
+            reason, "the %s allocation binding is not an object" % origin,
+            record=record)
+    _validate_allocation_schema(
+        record, "the %s allocation binding" % origin, reason)
+    _exact_package_ref(record.get("package_ref"),
+                       "the %s binding's package_ref" % origin, reason,
+                       record=record)
+    _exact_digest(record.get("limits_digest"),
+                  "the %s binding's limits_digest" % origin, reason,
+                  record=record)
+    bound_session = record.get("session_uuid")
+    if bound_session != session_uuid:
+        # A binding names the session it was written for, so a record copied
+        # from another session cannot be used to govern this one.
+        raise AllocationConflict(
+            reason,
+            "the %s binding names session %r, not %r"
+            % (origin, bound_session, session_uuid), record=record)
+    return record
+
+
+def _read_binding_record(path, session_uuid, origin):
+    """`(exists, validated_record_or_None)` for one binding record. A path
+    that exists but is corrupt or invalid raises; a path that does not exist
+    reports `(False, None)` and is the ONLY thing that can mean "unbound"."""
+    if not os.path.exists(path):
+        return False, None
+    try:
+        raw = _read_json_or_raise_if_corrupt(path)
+    except CorruptRecordError as exc:
+        raise AllocationConflict(
+            "binding_corrupt",
+            "the %s allocation binding for session %r exists but is corrupt: "
+            "%s" % (origin, session_uuid, exc))
+    if raw is None:
+        # Vanished between the existence check and the read.
+        return False, None
+    return True, _validate_binding(raw, session_uuid, origin)
+
+
+def read_dispatch_allocation_binding(session_uuid):
+    """The session's proven allocation binding, or None ONLY when the session
+    was genuinely never bound.
+
+    Two durable records are consulted: the authoritative witness under
+    `bound_sessions_root()` and the mirror inside the session's own assets
+    directory. The session is unbound only when NEITHER exists. If either
+    exists, this session is bound, and from that point every failure mode --
+    a corrupt record, a record missing its mandatory digest, a record naming
+    another session, a deleted mirror, or two records that disagree -- raises
+    `AllocationConflict` and so refuses dispatch. Losing bound state is never
+    the same as never having been bound."""
+    if not session_uuid:
+        return None
+    try:
+        witness_path = dispatch_allocation_witness_path_for(session_uuid)
+        mirror_path = dispatch_allocation_binding_path_for(session_uuid)
+    except ValueError:
+        # An unsafe session id can never have been bound by this module.
+        return None
+    witness_exists, witness = _read_binding_record(
+        witness_path, session_uuid, "authoritative")
+    mirror_exists, mirror = _read_binding_record(
+        mirror_path, session_uuid, "session-local")
+    if not witness_exists and not mirror_exists:
+        return None
+    if not witness_exists or not mirror_exists:
+        raise AllocationConflict(
+            "binding_incomplete",
+            "session %r is bound to a dispatch allocation but its %s binding "
+            "record is gone; a bound session never degrades to unallocated"
+            % (session_uuid,
+               "authoritative" if mirror_exists else "session-local"))
+    for field in ("package_ref", "limits_digest"):
+        if witness[field] != mirror[field]:
+            raise AllocationConflict(
+                "binding_mismatch",
+                "session %r has two disagreeing allocation binding records "
+                "(%s)" % (session_uuid, field))
+    return witness
+
+
+def read_dispatch_allocation_ledger(package_ref):
+    """The package's ledger, fully validated, or None when none was ever
+    admitted. Raises `AllocationConflict` for a file that exists but is
+    corrupt or does not satisfy the complete schema -- such a ledger fails
+    closed at the call site and is never read as absent or as unlimited."""
+    path = allocation_ledger_path_for(package_ref)
+    try:
+        record = _read_json_or_raise_if_corrupt(path)
+    except CorruptRecordError as exc:
+        raise AllocationConflict(
+            "ledger_corrupt",
+            "the allocation ledger for package %r is corrupt: %s"
+            % (package_ref, exc))
+    if record is None:
+        return None
+    _validate_ledger(record, package_ref)
+    return record
+
+
+def _proven_ledger(binding):
+    """`(record, limits, consumed_map)` for the ledger `binding` names, with
+    the binding's mandatory admitted digest re-checked against it. Raises
+    `AllocationConflict` on any disagreement."""
+    package_ref = binding["package_ref"]
+    path = allocation_ledger_path_for(package_ref)
+    try:
+        record = _read_json_or_raise_if_corrupt(path)
+    except CorruptRecordError as exc:
+        raise AllocationConflict(
+            "ledger_corrupt",
+            "the allocation ledger for package %r is corrupt: %s"
+            % (package_ref, exc))
+    if record is None:
+        raise AllocationConflict(
+            "ledger_missing",
+            "session binding names package %r but its allocation ledger is "
+            "gone" % (package_ref,))
+    return _proven_ledger_record(record, binding)
+
+
+def _proven_ledger_record(record, binding):
+    """The same proof against an already-read ledger record (used inside the
+    locked consume transaction, where the record must be re-read fresh)."""
+    package_ref = binding["package_ref"]
+    limits, consumed = _validate_ledger(record, package_ref)
+    if limits_digest(limits) != binding["limits_digest"]:
+        raise AllocationConflict(
+            "binding_mismatch",
+            "the allocation ledger for package %r no longer carries the "
+            "limits this session was admitted under" % (package_ref,),
+            record=record)
+    return record, limits, consumed
+
+
+def admit_dispatch_allocation(session_uuid, package_ref, limits):
+    """Admit `limits` for `package_ref` and bind `session_uuid` to them.
+
+    Admission is IMMUTABLE in both directions:
+
+      * per PACKAGE -- the first admission of a package ref fixes its limits
+        for every later session naming that ref. A re-admission with
+        byte-identical normalized limits is idempotent and leaves every
+        counter untouched; one with different limits raises
+        `AllocationConflict('limits_immutable')` and writes nothing. That is
+        what stops a replacement selector re-granting a spent budget.
+      * per SESSION -- a session already bound to one package ref can never be
+        rebound to another (`AllocationConflict('session_rebind_refused')`).
+        Otherwise resuming a session under a fresh ref would hand it a brand
+        new budget.
+
+    An existing ledger that does not satisfy the complete schema is REJECTED,
+    never mistaken for a first admission and never rewritten: only a ledger
+    file that does not exist at all is fresh admission.
+
+    Write ordering is deliberately fail-closed. The authoritative witness is
+    written FIRST, so a crash anywhere later leaves a session that is provably
+    BOUND (and therefore refuses, because its ledger or mirror cannot be
+    proven) rather than one that silently reads back as unallocated. The cost
+    is that a crash mid-admission retires that session id for allocation
+    purposes; nothing has dispatched at that point, so a new session is the
+    remedy.
+
+    Returns the durable ledger record."""
+    limits = _allocation().validate_limits(limits)
+    digest = limits_digest(limits)
+    _exact_package_ref(package_ref, "package_ref", "binding_invalid")
+    # Refuse a session rebind BEFORE any write, so a refused rebind leaves
+    # both the existing binding and the existing counters untouched.
+    existing_binding = read_dispatch_allocation_binding(session_uuid)
+    if existing_binding is not None:
+        if existing_binding["package_ref"].strip() != package_ref.strip():
+            raise AllocationConflict(
+                "session_rebind_refused",
+                "session %r is already bound to package %r; it cannot be "
+                "rebound to %r"
+                % (session_uuid, existing_binding["package_ref"],
+                   package_ref), record=existing_binding)
+        if existing_binding["limits_digest"] != digest:
+            raise AllocationConflict(
+                "limits_immutable",
+                "session %r was admitted under a different allocation for "
+                "package %r" % (session_uuid, package_ref),
+                record=existing_binding)
+    # The package's own admission marker is consulted BEFORE any write. It is
+    # what makes "this package was already admitted" survive the deletion of
+    # its ledger: a marker with no ledger is a LOST spent budget, never a
+    # fresh one, so admission refuses instead of recreating zeroed counters.
+    marker = read_package_admission_marker(package_ref)
+    if marker is not None:
+        if marker["limits_digest"] != digest:
+            raise AllocationConflict(
+                "limits_immutable",
+                "package %r was already admitted with a different "
+                "allocation" % (package_ref,), record=marker)
+        if not os.path.exists(allocation_ledger_path_for(package_ref)):
+            raise AllocationConflict(
+                "ledger_missing",
+                "package %r was admitted but its allocation ledger is gone; "
+                "its consumed counts cannot be proven, so it is never "
+                "re-admitted as a fresh budget" % (package_ref,),
+                record=marker)
+
+    binding_record = {
+        "schema": DISPATCH_ALLOCATION_SCHEMA,
+        "session_uuid": session_uuid,
+        "package_ref": package_ref,
+        "limits_digest": digest,
+        "bound": (existing_binding or {}).get("bound") or time.time(),
+    }
+    if marker is None:
+        # First admission of this package ref. The marker is created FIRST, so
+        # a crash before the ledger lands leaves a package that provably WAS
+        # admitted and whose counts cannot be proven -- refused from then on,
+        # rather than silently re-granted. That retires the ref; nothing has
+        # dispatched, so a new ref is the remedy.
+        #
+        # The create is EXCLUSIVE. Two concurrent first admissions both read
+        # no marker, and exactly one of them creates it; the other is told it
+        # lost and re-reads the winner's claim instead of overwriting it. That
+        # is what stops a contender which then dies -- or is refused -- from
+        # leaving behind a marker describing limits the ledger never admitted.
+        if not create_json_exclusive_durable(
+                package_admission_marker_path_for(package_ref),
+                {"schema": DISPATCH_ALLOCATION_SCHEMA,
+                 "package_ref": package_ref,
+                 "limits_digest": digest,
+                 "admitted": time.time()}):
+            marker = read_package_admission_marker(package_ref)
+            if marker is not None and marker["limits_digest"] != digest:
+                raise AllocationConflict(
+                    "limits_immutable",
+                    "package %r was admitted concurrently with a different "
+                    "allocation" % (package_ref,), record=marker)
+            # Same limits as the winner: the locked ledger transaction below
+            # is the authority on who creates the counters, so no ledger
+            # pre-check here -- the winner may not have written it yet.
+    if session_uuid and existing_binding is None:
+        if not write_json_atomic_durable(
+                dispatch_allocation_witness_path_for(session_uuid),
+                binding_record):
+            raise OSError(
+                "the dispatch allocation witness could not be written")
+
+    path = allocation_ledger_path_for(package_ref)
+
+    def mutate(existing):
+        if existing is not None:
+            # Existing durable state, whatever shape: proven or refused, never
+            # overwritten and never treated as a first admission.
+            current_limits, _consumed = _validate_ledger(existing, package_ref)
+            if limits_digest(current_limits) != digest:
+                raise AllocationConflict(
+                    "limits_immutable",
+                    "package %r was already admitted with allocation %r; it "
+                    "cannot be re-admitted as %r"
+                    % (package_ref, _allocation().describe(current_limits),
+                       _allocation().describe(limits)),
+                    record=existing)
+            sessions = list(existing["sessions"])
+            if session_uuid and session_uuid not in sessions:
+                sessions.append(session_uuid)
+                return dict(existing, sessions=sessions)
+            return None
+        return {
+            "schema": DISPATCH_ALLOCATION_SCHEMA,
+            "package_ref": package_ref,
+            "limits": limits,
+            "limits_digest": digest,
+            "admitted": time.time(),
+            "admitted_session_uuid": session_uuid,
+            "sessions": [session_uuid] if session_uuid else [],
+            "consumed": {phase: 0 for phase in _allocation().PHASES},
+        }
+
+    def _reconcile_marker(ledger_record):
+        """Make the marker agree with the LEDGER, which is the single atomic
+        authority on a package's admitted limits.
+
+        The marker is written before the ledger transaction so that a crash
+        cannot make an admitted package look fresh. That ordering means two
+        concurrent first admissions with DIFFERENT limits can both write a
+        marker, and the second write can clobber the first -- leaving the
+        marker carrying the limits of the admission the ledger then REFUSED.
+        Both the winner and the loser therefore reconcile the marker from the
+        ledger before returning or re-raising, so the two records can never
+        disagree about what was admitted."""
+        if not isinstance(ledger_record, dict):
+            return
+        ledger_digest = ledger_record.get("limits_digest")
+        if not isinstance(ledger_digest, str):
+            return
+        try:
+            current = read_package_admission_marker(package_ref)
+        except AllocationConflict:
+            current = None
+        if (isinstance(current, dict)
+                and current.get("limits_digest") == ledger_digest):
+            return
+        write_json_atomic_durable(
+            package_admission_marker_path_for(package_ref),
+            {"schema": DISPATCH_ALLOCATION_SCHEMA,
+             "package_ref": package_ref,
+             "limits_digest": ledger_digest,
+             "admitted": (current or {}).get("admitted") or time.time()})
+
+    try:
+        record = _locked_json_transaction(path, mutate)
+    except CorruptRecordError as exc:
+        raise AllocationConflict(
+            "ledger_corrupt",
+            "the allocation ledger for package %r is corrupt: %s"
+            % (package_ref, exc))
+    except AllocationConflict as exc:
+        if exc.reason == "limits_immutable":
+            _reconcile_marker(exc.record)
+        raise
+    _reconcile_marker(record)
+    if session_uuid:
+        if not write_json_atomic_durable(
+                dispatch_allocation_binding_path_for(session_uuid),
+                binding_record):
+            raise OSError(
+                "the dispatch allocation binding could not be written")
+    return record
+
+
+def dispatch_allocation_state(session_uuid):
+    """The session's complete, proven allocation state, for the run result and
+    for a plain resume that repeats no flags:
+    `{package_ref, limits, limits_digest, consumed}` with `consumed` read
+    FRESH from the durable ledger, or None when the session is unbound.
+
+    Raises `AllocationConflict` when the session is bound but its state cannot
+    be proven -- callers report that as a refusal, never as "no allocation"
+    and never as stale counts presented as current."""
+    binding = read_dispatch_allocation_binding(session_uuid)
+    if binding is None:
+        return None
+    _record, limits, consumed = _proven_ledger(binding)
+    return {
+        "package_ref": binding["package_ref"],
+        "limits": limits,
+        "limits_digest": binding["limits_digest"],
+        "consumed": dict(consumed),
+    }
+
+
+def _phase_is_allocated(limits, phase):
+    entry = limits.get(phase) or {}
+    return not (entry.get("dispatches") is None
+                and entry.get("corrections") is None)
+
+
+def check_dispatch_allocation(session_uuid, loop_phase):
+    """Read-only: what WOULD happen to the next lead dispatch of `loop_phase`.
+
+    Returns None when no allocation applies (the session is unbound, or this
+    phase carries no bound) -- the caller then behaves exactly as before.
+    Otherwise returns the `cowork_allocation.evaluate` verdict with `phase`,
+    `package_ref` and `ledger_path` attached.
+
+    Raises `AllocationConflict` when the session is bound but its state cannot
+    be proven; the caller MUST treat that as a refusal, never as
+    "unallocated".
+
+    This NEVER substitutes for consumption. Every real provider lead dispatch
+    charges its own unit through `consume_dispatch_allocation`; a check is
+    only ever an early, cheap refusal in front of that."""
+    binding = read_dispatch_allocation_binding(session_uuid)
+    if binding is None:
+        return None
+    phase = _allocation().phase_for_loop_phase(loop_phase)
+    if phase is None:
+        return None
+    _record, limits, consumed = _proven_ledger(binding)
+    if not _phase_is_allocated(limits, phase):
+        return None
+    verdict = _allocation().evaluate(limits, phase, consumed[phase])
+    verdict["phase"] = phase
+    verdict["package_ref"] = binding["package_ref"]
+    verdict["ledger_path"] = allocation_ledger_path_for(
+        binding["package_ref"])
+    return verdict
+
+
+def consume_dispatch_allocation(session_uuid, loop_phase):
+    """Charge ONE real lead dispatch of `loop_phase` against the package
+    ledger, atomically. EVERY real provider lead send goes through this,
+    including a capacity-wake replay of an earlier turn -- a paid send is a
+    paid send.
+
+    Returns None when no allocation applies. Otherwise the proof, the decision
+    and the increment all happen inside ONE `fcntl.flock` transaction against
+    a FRESH read of the ledger, so two processes racing the last unit cannot
+    both be admitted: the loser raises `AllocationExhausted` and the ledger is
+    left byte-identical.
+
+    Raises `AllocationConflict` when the session is bound but its state cannot
+    be proven. Every raising path leaves the ledger unchanged and has launched
+    no provider.
+
+    A charged unit is never refunded. A send that then fails, crashes, or is
+    never observed stays spent: recovery cannot prove the provider was not
+    reached, and inventing a refund is the one error that lets a package
+    overspend."""
+    binding = read_dispatch_allocation_binding(session_uuid)
+    if binding is None:
+        return None
+    phase = _allocation().phase_for_loop_phase(loop_phase)
+    if phase is None:
+        return None
+    package_ref = binding["package_ref"]
+    path = allocation_ledger_path_for(package_ref)
+    box = {}
+
+    def mutate(existing):
+        if existing is None:
+            raise AllocationConflict(
+                "ledger_missing",
+                "session binding names package %r but its allocation ledger "
+                "is gone" % (package_ref,))
+        _record, limits, consumed = _proven_ledger_record(existing, binding)
+        if not _phase_is_allocated(limits, phase):
+            box["verdict"] = None
+            return None
+        verdict = _allocation().evaluate(limits, phase, consumed[phase])
+        verdict["phase"] = phase
+        verdict["package_ref"] = package_ref
+        verdict["ledger_path"] = path
+        if not verdict["allowed"]:
+            raise AllocationExhausted(verdict, existing)
+        consumed_map = dict(consumed)
+        consumed_map[phase] = consumed[phase] + 1
+        box["verdict"] = verdict
+        return dict(existing, consumed=consumed_map,
+                    last_consumed=time.time(),
+                    last_consumed_phase=phase,
+                    last_consumed_session_uuid=session_uuid)
+
+    try:
+        _locked_json_transaction(path, mutate)
+    except CorruptRecordError as exc:
+        raise AllocationConflict(
+            "ledger_corrupt",
+            "the allocation ledger for package %r is corrupt: %s"
+            % (package_ref, exc))
+    return box.get("verdict")
 
 
 # --------------------------------------------------------------------------- #

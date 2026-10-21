@@ -283,6 +283,8 @@ closed refusal/failure code, or `null`). A persisted session also carries
 contains the literal placeholder `<answer>`, which the orchestrator replaces
 with the path of a file holding its answer. `decision_ack_failed` appears when
 an accepted decision delivery could not be acknowledged (it is re-sent later).
+`dispatch_allocation` appears for a run bound to a package dispatch allocation
+(see [Package dispatch allocation](#package-dispatch-allocation)).
 
 | rc | `outcome` | meaning |
 | --- | --- | --- |
@@ -455,6 +457,180 @@ runs keeps its paired reviewer; `light` omits the planning pair, not review.
 - A profile exposes a frozen serial concurrency contract
   (`mode: serial`, `max_parallel_vertices: 1`) and a per-vertex policy accessor
   for a later scheduler; nothing here schedules parallel work.
+
+### Package dispatch allocation
+
+A work package may authorize a bounded amount of agent work ("build2 /
+correction1", "discovery2, planning2"). Written only in prose, that ceiling is
+unenforceable: the automatic reopen paths — a reviewer asking for changes, a
+red owned verification transaction, an answered stop, a resumed or recovered
+turn — reopen the lead on their own, with no human attached, and will keep
+going until the review round cap. `--dispatch-allocation` makes the ceiling
+durable and machine-enforced.
+
+```bash
+# the initial builder dispatch plus at most one correction: two turns, total
+cowork --package-ref M6-W3-build \
+       --dispatch-allocation "build=2,correction=1" \
+       --context-file ./package.md
+
+# a planning-only package that may not build at all
+cowork --package-ref M6-W4-plan \
+       --dispatch-allocation "discovery=2,planning=2,build=0" \
+       --context-file ./package.md
+```
+
+**Grammar.** Comma-separated `KEY=N`, `N` a non-negative integer. The keys are
+`discovery`, `planning` and `build` (the per-phase totals, governing the scout,
+planner and builder respectively) and `discovery_corrections`,
+`planning_corrections`, `build_corrections` (the per-phase correction sub-caps;
+`correction` and `corrections` are aliases for the builder one). A phase no key
+mentions is unallocated and keeps its existing behavior. An unknown key, a
+repeated key, a negative or non-integer value, or an empty spec is refused with
+rc 2 before anything is created.
+
+**Counter semantics.** `build=2,correction=1` is **the initial builder
+dispatch plus at most one correction — two real builder dispatches in total**.
+It is not two extra turns, and it is not 2+1. For a phase with `consumed`
+dispatches already charged, the next dispatch is number `consumed + 1`; it is
+the *initial* dispatch when `consumed` is 0 and correction number `consumed`
+otherwise. It is admitted only while `consumed + 1 <= dispatches` and (for a
+correction) `consumed <= corrections`. So `build=2,correction=1` admits turns 1
+and 2 and refuses turn 3; `build=5,correction=0` admits the initial turn only;
+`build=0` refuses the phase entirely, before any controller is launched.
+
+A unit is charged per **attempted** real lead dispatch, not per successful
+turn. A failed send does not refund its unit, and a later plain resume that
+re-sends the same pending turn is a second real dispatch and is charged again.
+The mechanism can only ever permit fewer provider launches than the stated
+ceiling, never more.
+
+**Where it is enforced.** The unit is charged inside the lead loop
+immediately before the turn is sent — the one point every reopen path
+converges on (initial seed, reviewer revise, owned-verification red,
+stale/repair, answer, resume, recovery). **Every** real provider lead send
+charges its own unit, including a capacity-wake replay
+(`cowork resume-trigger`): a replay is a paid send, and being a replay is not
+an exemption. Without that, one package could buy three builder turns at
+`build=2` — initial, then a replay of the paused turn, then a correction.
+The capacity lease keeps its own separate identity and at-most-once
+consumption: it bounds how many times one pending turn may be replayed, while
+the allocation bounds how many real sends the package pays for.
+
+Ahead of each charge, cheap read-only screens refuse an already-spent package
+before anything launches a provider: at each lead launch, before a
+provider-bearing controller update or switch (`--switch-controller` runs a
+real controller probe that spawns the CLI on a cache miss), and before the
+`--worktree` pre-phase role. A screen never substitutes for the charge.
+
+The screen at a controller update has no reviewer-recovery exception, on
+purpose: the authority on whether a run is a genuine reviewer-first recovery
+runs later, and keying an exception off the mere presence of a failed-turn
+record would let a malformed record buy a real probe on a spent package. A
+controller switch requested on a phase whose lead budget is spent is therefore
+refused before any probe. Nothing real is lost — a reviewer-only recovery does
+not need a controller switch, and on a plain resume that screen does not run.
+
+Reviewer turns are never charged; only lead dispatches are. One consequence
+is deliberate: a reviewer-only recovery resume — the lead already produced its
+candidate and its paired reviewer failed to return a usable verdict — is
+**not** refused by a spent lead budget, because it dispatches no lead at all.
+If that reviewer then asks for a real lead correction, the lead loop's own
+gate charges and refuses it there.
+
+**Binding and immutability.** `--package-ref` is the stable package/lineage
+identifier the budget belongs to. The consumed counters live in a durable
+ledger under `~/.cowork/sessions/_allocations/`, keyed by that ref rather than
+by any session, so a resume, a `--session-file` pointed elsewhere, or a fresh
+replacement session naming the same ref all share one budget and inherit its
+spent counts.
+
+Admission is immutable in both directions. Per **package**: re-admitting the
+same ref with different limits is refused and writes nothing. Per **session**:
+a session already bound to one package ref can never be rebound to another, so
+resuming under a renamed ref cannot hand it a fresh budget. Both refusals
+leave every existing record and counter untouched. A run that names the ref
+without `--dispatch-allocation` binds to the already-admitted allocation; a
+run that names neither flag is unaffected in every way. Admission and
+re-binding happen under the session's acquired single-writer owner lease, so a
+losing concurrent invocation cannot rewrite the active owner's binding.
+
+The flags are needed exactly once, at admission. Every later run — including a
+plain `--session-file` resume, which repeats no allocation flags — reads the
+binding back from durable state, enforces it, and reports it.
+
+**Bound state is proven, not inferred.** A bound session is recorded in two
+durable places: an authoritative witness under
+`~/.cowork/sessions/_allocations/sessions/` and a mirror in the session's own
+assets directory. A session counts as unbound only when **neither** exists.
+Once either exists, every failure mode — a corrupt record, one missing its
+mandatory admitted digest, one naming a different session, a deleted mirror,
+or two records that disagree — refuses dispatch. Losing bound state is never
+read as never having been bound.
+
+Ledger and binding records are validated against a complete, exact schema on
+every read. Nothing defaults, coerces or repairs: a missing or null consumed
+counter is a refusal rather than a zero (reading it as zero would refund
+dispatches that were genuinely spent), and `"0"`, `true`, `1.5` and `-1` are
+all refused rather than coerced to an integer. The ledger must also identify
+the package it was looked up under, and its stored digest must match its own
+limits.
+
+Supported scope, stated plainly: the binding holds across every cowork process
+that resolves the same sessions root (the same `COWORK_SESSIONS_ROOT`, or the
+same home directory) and is given the same package ref — resumes, replacement
+sessions and concurrent processes on one machine. Consumption is serialized by
+a real cross-process `fcntl.flock`, so processes racing the last unit cannot
+both be admitted. It does **not** bind across machines or across different
+sessions roots. A ledger that is corrupt, unreadable, deleted, or whose limits
+no longer match the digest the session was admitted under fails **closed** —
+it refuses dispatch and is never read as "unlimited". It is a durable
+accounting boundary against unsupervised automatic re-dispatch, not a security
+boundary against an operator with write access to the ledger.
+
+A package's admission is itself witnessed separately from its counters, by a
+marker under `~/.cowork/sessions/_allocations/admitted/`. Deleting a spent
+ledger would otherwise look exactly like a package that had never been
+admitted, and the next run naming that ref would be handed a brand new budget.
+With the marker, a package whose ledger is gone is a *lost* spent budget: it is
+refused, for the original session and for any replacement session, and the
+ledger is not recreated.
+
+**Crash window, stated plainly.** Admission writes its witnesses before the
+records they vouch for, so a crash part-way through leaves a session (or a
+package) that provably *was* admitted and whose counts cannot be proven — and
+therefore refuses — rather than one that reads back as unallocated or as
+fresh. The cost is that a crash during admission retires that session id, and
+on a first admission that package ref, for allocation purposes. Nothing has
+dispatched at that point, so the remedy is a new session or a new ref.
+
+**Refusal.** Exceeding an allocation ends the phase unapproved with rc 1,
+`outcome: "failed"` and a `stop` of kind `dispatch_allocation_exhausted`
+(`requires: "operator"`) carrying the allocation phase, the attempted ordinal
+and kind, the refusal code, and the exact `limit_dispatches`,
+`limit_corrections`, `consumed_dispatches` and `consumed_corrections`. It is
+not a decision request: no `decision_argv` is offered, no `--answer` can
+resolve it, nothing retries, and no code path raises an admitted limit. The
+only way forward is a new package admitted by an operator. The candidate, the
+status artifacts and every earlier review round are left exactly as they are.
+A package-bound run also carries an additive `dispatch_allocation` object on
+its run result — `package_ref`, `limits`, `limits_digest`, and `consumed` read
+fresh from the ledger as the result line is emitted, so it reflects every unit
+the run actually charged. If that read fails, `consumed` is `null` and
+`consumed_read_failed` is `true`: an admission-time snapshot is never passed
+off as the current state.
+
+A charged unit is never refunded. A send that then fails, crashes, or is never
+observed stays spent — recovery cannot prove the provider was not reached, and
+inventing a refund is the one error that would let a package overspend.
+
+**What it is not.** It is not provider capacity or credits: a quota or
+overload pause (rc 5) is the provider declining to serve a dispatch the
+allocation had already authorized, and the two records never read each other.
+It is not a token or context envelope — those bound the bytes of one turn,
+this bounds the number of turns. It is not controller authentication and not
+an execution profile. And it never approves anything: the paired reviewer gate
+is untouched, and an allocation refusal can only end a phase unapproved.
 
 ### Stops and orchestrator decisions
 

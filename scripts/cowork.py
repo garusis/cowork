@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cowork_bridge as bridge  # noqa: E402
 import cowork_preflight as preflight  # noqa: E402
 import cowork_state as state_store  # noqa: E402
+import cowork_allocation as allocation  # noqa: E402
 import cowork_trace as trace_store  # noqa: E402
 import cowork_report  # noqa: E402
 import cowork_handoff as handoff  # noqa: E402
@@ -188,6 +189,14 @@ ROLE_PROMPT_PATHS = {
 }
 PHASE_LEADS = {"scouting": "scout", "planning": "planner",
                "building": "builder"}
+# #116: the reverse of PHASE_LEADS, for paths that hold only the lead role
+# (the capacity-wake replay) and need the `_role_loop` phase string the
+# package dispatch allocation is keyed by. A role that is not a phase lead --
+# a reviewer, the pre-phase worktree role -- is deliberately absent: those are
+# not charged against a lead allocation.
+_ALLOCATION_PHASE_BY_ROLE = {role: phase
+                             for phase, role in PHASE_LEADS.items()}
+
 PHASE_PAIRS = {"scouting": ("scout", SCOUT_REVIEWER),
                "planning": ("planner", PLANNING_ADVISOR),
                "building": ("builder", BUILD_REVIEWER)}
@@ -346,6 +355,28 @@ def build_parser():
                    metavar="TEXT",
                    help="with --profile on a new session: why this profile "
                         "was chosen, stored on the profile record")
+    p.add_argument("--package-ref", dest="package_ref", metavar="REF",
+                   default=None,
+                   help="agent-only: the stable work-package / lineage "
+                        "identifier this session belongs to. It is what a "
+                        "--dispatch-allocation is bound to, so a resumed "
+                        "session, a --session-file pointed elsewhere and a "
+                        "fresh replacement session launched for the SAME ref "
+                        "all share one durable dispatch budget")
+    p.add_argument("--dispatch-allocation", dest="dispatch_allocation",
+                   metavar="SPEC", default=None,
+                   help="agent-only: bound how many REAL provider lead "
+                        "dispatches this package may spend, per phase. SPEC "
+                        "is comma-separated KEY=N over discovery, planning, "
+                        "build (totals) and discovery_corrections, "
+                        "planning_corrections, build_corrections (alias: "
+                        "correction). `build=2,correction=1` is the initial "
+                        "builder dispatch plus at most one correction -- two "
+                        "builder turns in total, not three. 0 forbids that "
+                        "phase entirely. Requires --package-ref; refused with "
+                        "--no-session. Admission is immutable: the same "
+                        "--package-ref cannot later be re-admitted with "
+                        "different limits, and its counters never reset")
     p.add_argument("--graph-vertex", dest="graph_vertex",
                    metavar="GRAPH_ID:WORK_ID:EPOCH", default=None,
                    help="agent-only: bind this NEW profiled session to the "
@@ -1809,16 +1840,36 @@ def _send(session, text, meta=None):
         # metadata cannot forge, omit, or independently re-infer artifacts.
         meta = dict(meta or {})
         meta["artifacts"] = [dict(rec) for rec in text.descriptors]
+    # #116/F6: exactly ONE real transport call per invocation.
+    #
+    # Signature INSPECTION and the transport CALL are separate steps with
+    # separate exception boundaries. They used to share one `try`, so a
+    # TypeError or ValueError raised INSIDE `session.send` -- after the
+    # provider had already been handed the turn -- was caught as though it
+    # meant "this session does not accept meta", and the fallback issued a
+    # SECOND real send. One reserved dispatch-allocation unit could then pay
+    # for two actual provider sends, and the package would overspend by one
+    # turn per such failure.
+    #
+    # Only `inspect.signature` itself may fall back now. Once
+    # `accepts_meta` is decided, whichever single call it selects is the only
+    # call made; anything it raises is reported as a failed turn by the
+    # handler below.
+    accepts_meta = False
+    if meta is not None:
+        try:
+            accepts_meta = (
+                "meta" in inspect.signature(session.send).parameters)
+        except (ValueError, TypeError):
+            # Un-introspectable callable (a builtin, a C extension, some
+            # wrappers): fall back to the historical `send(text)` signature.
+            accepts_meta = False
     try:
-        if meta is not None:
-            try:
-                if "meta" in inspect.signature(session.send).parameters:
-                    result = session.send(text, meta=meta)
-                    result = result or bridge.turn_result(True, "ok")
-                    _record_role_identity(session, result)
-                    return result
-            except (ValueError, TypeError):
-                pass
+        if accepts_meta:
+            result = session.send(text, meta=meta)
+            result = result or bridge.turn_result(True, "ok")
+            _record_role_identity(session, result)
+            return result
         result = session.send(text)
         if result is None:
             result = bridge.turn_result(True, "ok")
@@ -7847,6 +7898,13 @@ _OUTCOME_STOPPED = "stopped"
 # What a stop needs from the orchestrator (the closed `requires` vocabulary).
 AGENT_STOP_REQUIREMENTS = ("answer", "authorization", "reviewer", "operator")
 
+# #116: the stop kind a refused package dispatch allocation reports. It is
+# deliberately NOT a member of `state_store.DECISION_RESPONSES`, so
+# `build_run_result` offers no `decision_argv` for it: an exhausted allocation
+# cannot be answered, authorized, or otherwise replied into a larger budget.
+# The only way forward is a new package admitted by an operator.
+ALLOCATION_STOP_KIND = "dispatch_allocation_exhausted"
+
 
 def _agent_stop_payload(kind, role, requires, **facts):
     """The structured, non-approving request a stopped phase reports.
@@ -7862,6 +7920,72 @@ def _agent_stop_payload(kind, role, requires, **facts):
         if value is not None:
             out[key] = value
     return out
+
+
+def _allocation_stop_facts(verdict, loop_phase=None):
+    """The orchestrator-facing facts of one allocation decision, with the
+    verdict's own `phase`/`kind`/`ordinal` renamed so they never collide with
+    the trace schema's `phase` or `_agent_stop_payload`'s own `kind`."""
+    verdict = verdict or {}
+    return {
+        "allocation_phase": verdict.get(
+            "phase", allocation.phase_for_loop_phase(loop_phase)),
+        "attempted_ordinal": verdict.get("ordinal"),
+        "attempted_kind": verdict.get("kind"),
+        "refusal_code": verdict.get("refusal_code"),
+        "conflict_reason": verdict.get("conflict_reason"),
+        "package_ref": verdict.get("package_ref"),
+        "ledger_path": verdict.get("ledger_path"),
+        "limit_dispatches": verdict.get("limit_dispatches"),
+        "limit_corrections": verdict.get("limit_corrections"),
+        "consumed_dispatches": verdict.get("consumed_dispatches"),
+        "consumed_corrections": verdict.get("consumed_corrections"),
+    }
+
+
+def _allocation_preflight_stop(session_uuid, loop_phase, role, trace=None,
+                               stage="pre_launch"):
+    """#116: the READ-ONLY allocation screen run before a lead's controller
+    process is constructed at all.
+
+    `_role_loop` is where a dispatch is actually CHARGED, because that is the
+    one place every reopen path converges. But a controller session is spawned
+    by `run_scout`/`run_planner`/`run_builder` BEFORE that loop is entered, so
+    a phase whose budget is already gone would otherwise still start a
+    provider process (even though it would never send it a turn). This screen
+    closes that gap: it consumes nothing, and it returns the same typed stop
+    the loop would have returned, so a refusal here is indistinguishable
+    downstream from a refusal there.
+
+    Returns the stop payload, or None when the phase may proceed (no
+    allocation, or budget remaining)."""
+    try:
+        verdict = state_store.check_dispatch_allocation(
+            session_uuid, loop_phase)
+    except state_store.AllocationConflict as exc:
+        verdict = {
+            "allowed": False,
+            "refusal_code": ("allocation_binding_mismatch"
+                             if exc.reason == "binding_mismatch"
+                             else "allocation_unreadable"),
+            "conflict_reason": exc.reason,
+        }
+    except (OSError, TimeoutError, ValueError) as exc:
+        verdict = {
+            "allowed": False,
+            "refusal_code": "allocation_unreadable",
+            "conflict_reason": type(exc).__name__,
+        }
+    if verdict is None or verdict.get("allowed"):
+        return None
+    facts = _allocation_stop_facts(verdict, loop_phase)
+    if trace:
+        trace.event("gate.decision", decider="runtime", role=role,
+                    gate="dispatch_allocation", action="refuse",
+                    stage=stage,
+                    **{k: v for k, v in facts.items() if v is not None})
+    return _agent_stop_payload(ALLOCATION_STOP_KIND, role,
+                               requires="operator", **facts)
 
 
 def _handoff_request_digest(note):
@@ -9150,6 +9274,90 @@ def _role_loop(session, first, status_path, context, io_out,
                 if on_first_send_rejected:
                     on_first_send_rejected()
             if not skip_lead_send:
+                # #116 -- the package dispatch allocation, checked AND charged
+                # BEFORE anything that could reach a provider. This is the one
+                # gate between an automatic reopen (reviewer revise, owned
+                # verification red, stale/repair, an answered stop, a resumed
+                # or recovered turn) and a real, paid lead turn: every one of
+                # those paths arrives here, because every one of them reaches
+                # this single `not skip_lead_send` send site.
+                #
+                # It is charged per ATTEMPT, not per successful turn, and the
+                # charge happens before the delivery is composed, before the
+                # status artifact is invalidated, before the milestone is
+                # recorded and before the session is touched -- so a refusal
+                # has launched no provider and changed no candidate.
+                #
+                # A session with no allocation binding (`None` below) takes
+                # the unchanged legacy path. A binding that exists but cannot
+                # be trusted -- corrupt ledger, limits edited out from under
+                # the admitted digest, ledger deleted -- FAILS CLOSED and
+                # refuses; it is never read as "unlimited".
+                _alloc_refusal = None
+                try:
+                    _alloc_charged = state_store.consume_dispatch_allocation(
+                        session_uuid, phase)
+                except state_store.AllocationExhausted as _alloc_exc:
+                    _alloc_refusal = dict(_alloc_exc.verdict)
+                except state_store.AllocationConflict as _alloc_exc:
+                    _alloc_refusal = {
+                        "allowed": False,
+                        "refusal_code": (
+                            "allocation_binding_mismatch"
+                            if _alloc_exc.reason == "binding_mismatch"
+                            else "allocation_unreadable"),
+                        "conflict_reason": _alloc_exc.reason,
+                        "phase": allocation.phase_for_loop_phase(phase),
+                    }
+                except (OSError, TimeoutError, ValueError) as _alloc_exc:
+                    # A ledger that cannot be read or written at all is the
+                    # same fail-closed case: a budget that cannot be proven
+                    # has not been granted.
+                    _alloc_refusal = {
+                        "allowed": False,
+                        "refusal_code": "allocation_unreadable",
+                        "conflict_reason": type(_alloc_exc).__name__,
+                        "phase": allocation.phase_for_loop_phase(phase),
+                    }
+                else:
+                    if _alloc_charged is not None and trace:
+                        trace.event(
+                            "gate.decision", decider="runtime", role=role,
+                            gate="dispatch_allocation", action="consume",
+                            allocation_phase=_alloc_charged["phase"],
+                            ordinal=_alloc_charged["ordinal"],
+                            dispatch_kind=_alloc_charged["kind"],
+                            limit_dispatches=_alloc_charged["limit_dispatches"],
+                            limit_corrections=_alloc_charged["limit_corrections"],
+                            consumed_dispatches=(
+                                _alloc_charged["consumed_dispatches"] + 1))
+                if _alloc_refusal is not None:
+                    # Terminal and non-negotiable: the phase ends UNAPPROVED
+                    # (`requires: operator`, a kind no `--answer` can resolve,
+                    # so no decision_argv is offered and no reply can buy more
+                    # budget), nothing retries, and no code path anywhere
+                    # raises a limit. The candidate, the status artifact and
+                    # every earlier round stay exactly as they are.
+                    #
+                    # The verdict's own `phase`/`kind`/`ordinal` are renamed on
+                    # the way out (`allocation_phase`, `attempted_kind`,
+                    # `attempted_ordinal`) so they never collide with the trace
+                    # schema's `phase` or `_agent_stop_payload`'s own `kind`.
+                    _alloc_facts = _allocation_stop_facts(
+                        _alloc_refusal, phase)
+                    if trace:
+                        trace.event(
+                            "gate.decision", decider="runtime", role=role,
+                            gate="dispatch_allocation", action="refuse",
+                            **{k: v for k, v in _alloc_facts.items()
+                               if v is not None})
+                    if (pending is first) and on_first_send_rejected:
+                        on_first_send_rejected()
+                    outcome_kind, payload = _end_unapproved(
+                        _agent_stop_payload(
+                            ALLOCATION_STOP_KIND, role, requires="operator",
+                            **_alloc_facts))
+                    break
                 if lead_block_pending and isinstance(
                         pending, handoff.HandoffBlock):
                     # First real lead send after a reviewer-first revise: the
@@ -14927,6 +15135,28 @@ def build_run_result(rc, result_box):
         # Additive and present ONLY for a graph-bound session: the vertex
         # (graph_id, work_id, lease_epoch) this session holds.
         result["graph_vertex"] = dict(result_box["graph_vertex"])
+    if result_box.get("dispatch_allocation"):
+        # #116, additive and present ONLY for a package-bound session: the
+        # package ref, the immutable admitted limits, and the consumed counts
+        # read FRESH from the durable ledger at the moment the result line is
+        # emitted -- so they reflect every unit this run actually charged, not
+        # what it started with.
+        #
+        # A read that fails must NEVER pass the admission-time snapshot off as
+        # the current state: it reports `consumed: null` plus
+        # `consumed_read_failed`, so a consumer can tell "nothing spent" from
+        # "could not be determined". It still never fails the run.
+        record = dict(result_box["dispatch_allocation"])
+        try:
+            fresh = state_store.dispatch_allocation_state(
+                result_box.get("session_uuid"))
+            if fresh is None:
+                raise ValueError("the session reports no allocation binding")
+            record["consumed"] = dict(fresh["consumed"])
+        except (state_store.AllocationConflict, OSError, ValueError):
+            record["consumed"] = None
+            record["consumed_read_failed"] = True
+        result["dispatch_allocation"] = record
     if session_file:
         resume = ["--session-file", session_file]
         result["resume_argv"] = resume
@@ -14991,6 +15221,36 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                       % " ".join("--" + k.replace("_", "-")
                                  for k, _i in decisions))
     decision = decisions[0] if decisions else None
+    # #116: the package dispatch allocation is parsed and screened HERE, with
+    # every other invalid-invocation check, so a malformed or unbindable
+    # allocation is rc 2 before anything at all is created. The limits it
+    # yields are admitted later, once the session uuid exists.
+    allocation_package_ref = getattr(args, "package_ref", None)
+    allocation_spec = getattr(args, "dispatch_allocation", None)
+    allocation_limits = None
+    if allocation_spec is not None:
+        if not allocation_package_ref:
+            return refuse("allocation_requires_package_ref",
+                          "--dispatch-allocation needs --package-ref: the "
+                          "budget is bound to the package, not to one session")
+        try:
+            allocation_limits = allocation.parse_spec(allocation_spec)
+        except allocation.AllocationError as exc:
+            return refuse("allocation_malformed",
+                          "--dispatch-allocation %r is not usable: %s"
+                          % (allocation_spec, exc))
+    if allocation_package_ref is not None:
+        try:
+            state_store.package_ref_digest(allocation_package_ref)
+        except ValueError as exc:
+            return refuse("package_ref_malformed",
+                          "--package-ref is not usable: %s" % exc)
+        if getattr(args, "no_session", False):
+            return refuse(
+                "allocation_requires_session",
+                "--package-ref/--dispatch-allocation need a saved session: "
+                "an ephemeral --no-session run has no durable state to carry "
+                "the consumed counts")
     if decision and decision[0] == "answer" and not context_supplied:
         return refuse("answer_requires_context",
                       "--answer needs the answer in --context or "
@@ -15402,6 +15662,84 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                 result_box["graph_vertex"] = {
                     k: graph_binding[k]
                     for k in ("graph_id", "work_id", "lease_epoch")}
+
+        # #116/F3: the dispatch allocation is admitted and hydrated INSIDE the
+        # owned region, under the acquired owner lease.
+        #
+        # It used to run before the lease was acquired, so a second, losing
+        # invocation of the same session could rewrite the ACTIVE owner's
+        # binding on its way to being refused for owner conflict. Under the
+        # lease, only the single writer can admit or re-bind, and the store's
+        # own session-rebind refusal plus its locked ledger transaction cover
+        # the rest. A refusal returns from inside this try, so the finally
+        # below still stops the heartbeat and releases the lease.
+        # #116: admit (or re-bind to) the package dispatch allocation BEFORE any
+        # role dispatch, worktree launch or provider construction.
+        #
+        # Admission is immutable in both directions (per package ref and per
+        # session; see `cowork_state.admit_dispatch_allocation`), so neither a
+        # replacement selector nor a resume under a different ref can re-grant a
+        # spent budget. A run that supplies no allocation flags never touches an
+        # existing binding.
+        if allocation_package_ref is not None:
+            try:
+                if allocation_limits is not None:
+                    state_store.admit_dispatch_allocation(
+                        session_uuid, allocation_package_ref, allocation_limits)
+                else:
+                    _alloc_record = state_store.read_dispatch_allocation_ledger(
+                        allocation_package_ref)
+                    if _alloc_record is None:
+                        return refuse(
+                            "allocation_not_admitted",
+                            "--package-ref %s has no admitted dispatch "
+                            "allocation; supply --dispatch-allocation to admit "
+                            "one" % allocation_package_ref, trace_obj=trace)
+                    # A later run naming an already-admitted package binds this
+                    # session to it without changing a single counter.
+                    state_store.admit_dispatch_allocation(
+                        session_uuid, allocation_package_ref,
+                        _alloc_record.get("limits"))
+            except state_store.AllocationConflict as exc:
+                return refuse("allocation_" + exc.reason, str(exc), trace_obj=trace)
+            except allocation.AllocationError as exc:
+                return refuse("allocation_malformed", str(exc), trace_obj=trace)
+            except OSError as exc:
+                return refuse("allocation_unwritable",
+                              "the dispatch allocation could not be recorded: %s"
+                              % exc, trace_obj=trace)
+
+        # #116/F9: hydrate the session's allocation identity and CURRENT counts on
+        # EVERY run, from durable state alone.
+        #
+        # The official `resume_argv` is `["--session-file", PATH]` and repeats no
+        # allocation flags, so keying this off the CLI arguments left every plain
+        # resume reporting no allocation at all -- the orchestrator could not see
+        # which package bounded the run or how much of it was spent. This reads
+        # the proven binding instead, so the flags are needed exactly once, at
+        # admission.
+        #
+        # A session that is BOUND but whose state cannot be proven refuses the
+        # whole run here, before any dispatch: it is never reported as unbound.
+        try:
+            _alloc_state = state_store.dispatch_allocation_state(session_uuid)
+        except state_store.AllocationConflict as exc:
+            return refuse("allocation_" + exc.reason, str(exc), trace_obj=trace)
+        except (OSError, ValueError) as exc:
+            return refuse("allocation_unreadable",
+                          "the dispatch allocation could not be read: %s" % exc,
+                          trace_obj=trace)
+        if _alloc_state is not None:
+            result_box["dispatch_allocation"] = {
+                "package_ref": _alloc_state["package_ref"],
+                "limits": allocation.describe(_alloc_state["limits"]),
+                "limits_digest": _alloc_state["limits_digest"],
+                "consumed": dict(_alloc_state["consumed"]),
+            }
+            trace.event("allocation.active",
+                        package_ref=_alloc_state["package_ref"],
+                        limits=allocation.describe(_alloc_state["limits"]),
+                        consumed=dict(_alloc_state["consumed"]))
         # Orchestrator decisions bind to the ONE open decision request this
         # session recorded when a phase stopped, and are checked here, before
         # anything is written or dispatched. An open answer/authorization
@@ -16230,6 +16568,59 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                             policy.format_allowed(precheck_allowed)),
                         trace_obj=trace)
 
+        # #116/F8: screen the allocation BEFORE any provider-bearing
+        # controller update.
+        #
+        # `apply_controller_update` runs a REAL `_claude_probe(bridge._real_
+        # claude_spawn, ...)` for every role it switches to claude, and that
+        # probe genuinely spawns the CLI on a cache miss. Screening only at
+        # the lead launch sites therefore left a hole in the documented "an
+        # exhausted allocation launches no provider" guarantee: a
+        # `--switch-controller` resume of a spent package probed first and
+        # refused afterwards.
+        #
+        # `ensure_controller_available` is NOT this hole -- it is a tool/
+        # policy check, not a spawn. This screen is.
+        #
+        # The screen is scoped to the roles the update actually TARGETS, and
+        # only to those that are phase leads.
+        #
+        # Preparing a LEAD's controller costs a real probe for a lead that can
+        # never dispatch again, so an exhausted lead budget refuses that
+        # before any spawn. Preparing a REVIEWER's controller is legitimate on
+        # a spent lead budget: reviewer turns are never charged, and the one
+        # case that needs it -- a reviewer-only recovery resume, where the
+        # lead's candidate already exists and its paired reviewer failed --
+        # dispatches no lead at all.
+        #
+        # Scoping by target rather than by recovery route is deliberate. The
+        # authority on route validity (`recovery_route_for`) runs later and
+        # routes a malformed or stale failed-turn record to `stop`, not to
+        # `reviewer_first`; keying an exception here off the mere PRESENCE of
+        # such a record would let a malformed one buy a real probe on a spent
+        # package, and re-deriving the route's validity rules here would be a
+        # second, divergent copy of them.
+        if proposal is not None and session_uuid:
+            for _update_role, _unused_target in (proposal.mappings or ()):
+                _update_phase = _ALLOCATION_PHASE_BY_ROLE.get(_update_role)
+                if _update_phase is None:
+                    continue    # a reviewer or any non-lead role
+                _alloc_stop = _allocation_preflight_stop(
+                    session_uuid, _update_phase, _update_role, trace=trace,
+                    stage="pre_controller_update")
+                if _alloc_stop is not None:
+                    # `record_outcome` is defined further down, and an
+                    # allocation refusal is never a decision request, so the
+                    # phase outcome is recorded directly -- exactly what
+                    # `record_outcome` does for an `_OUTCOME_ENDED` payload
+                    # whose kind is not in `DECISION_RESPONSES`.
+                    result_box["last"] = {"phase": _update_phase,
+                                          "role": _update_role,
+                                          "outcome": _OUTCOME_ENDED,
+                                          "payload": _alloc_stop}
+                    result_box.setdefault("reason", ALLOCATION_STOP_KIND)
+                    trace.event("run.end", rc=1, reason=ALLOCATION_STOP_KIND)
+                    return 1
         if proposal is not None:
             ok, message, rc_reject = apply_controller_update(proposal)
             if not ok:
@@ -16816,6 +17207,22 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     # already have spent, so this is a failed run.
                     return refuse("worktree_policy_blocked", str(exc), rc=1,
                                   trace_obj=trace)
+                # #116/F8: the worktree pre-phase role is a REAL provider
+                # launch. It is never CHARGED against the allocation (only
+                # lead dispatches are), but spending a provider turn to
+                # prepare a worktree for a phase that cannot dispatch at all
+                # would contradict the documented guarantee, so an already
+                # exhausted or unprovable allocation refuses first.
+                _alloc_stop = _allocation_preflight_stop(
+                    session_uuid, phase, PHASE_LEADS.get(phase) or "scout",
+                    trace=trace, stage="pre_worktree")
+                if _alloc_stop is not None:
+                    record_outcome(PHASE_LEADS.get(phase) or "scout",
+                                   {"outcome": _OUTCOME_ENDED,
+                                    "payload": _alloc_stop})
+                    result_box.setdefault("reason", ALLOCATION_STOP_KIND)
+                    trace.event("run.end", rc=1, reason=ALLOCATION_STOP_KIND)
+                    return 1
                 wt_cfg = {"controller": wt_controller,
                           "model": None, "effort": None,
                           "yolo": True, "mode": "implement"}
@@ -17738,6 +18145,18 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     if not ensure_controller_available("scout", reason="lead_launch"):
                         rc = 1
                         break
+                    # #116: the package dispatch allocation is screened here, beside
+                    # the controller-availability check, so an exhausted or untrusted
+                    # budget refuses BEFORE a controller process is constructed. The
+                    # unit is charged later, inside `_role_loop`, where every reopen
+                    # path converges.
+                    _alloc_stop = _allocation_preflight_stop(
+                        session_uuid, "scouting", "scout", trace=trace)
+                    if _alloc_stop is not None:
+                        record_outcome("scout", {"outcome": _OUTCOME_ENDED,
+                                              "payload": _alloc_stop})
+                        rc = 1
+                        break
                     outcome_box = {"outcome": None, "payload": None}
                     (scout_first_send_cb, scout_first_send_rejected_cb,
                      scout_first_send_box) = _first_send_delivery_tracker(
@@ -17863,6 +18282,29 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                         result_box.setdefault("reason", RECOVERY_STOP_KIND)
                         rc = 1
                         break
+                    # #116/F7: screened AFTER the recovery route is known, and NOT at
+                    # all on the `reviewer_first` route.
+                    #
+                    # A `reviewer_first` resume performs ZERO lead dispatches: the lead
+                    # already produced its candidate, its paired reviewer failed to
+                    # return a usable verdict, and this run exists only to re-run that
+                    # reviewer against the exact same candidate. Refusing it on an
+                    # exhausted lead budget would strand the last permitted lead turn's
+                    # work with no way to review it -- the allocation bounds paid LEAD
+                    # turns, and reviewer turns are never charged.
+                    #
+                    # If that reviewer then genuinely asks for a lead correction,
+                    # `_role_loop`'s own gate charges and refuses it there, at the one
+                    # point a real lead send is actually attempted. Nothing is
+                    # un-bounded by skipping the early screen; it is only earlier.
+                    if recovery_route != "reviewer_first":
+                        _alloc_stop = _allocation_preflight_stop(
+                            session_uuid, "planning", "planner", trace=trace)
+                        if _alloc_stop is not None:
+                            record_outcome("planner", {"outcome": _OUTCOME_ENDED,
+                                                     "payload": _alloc_stop})
+                            rc = 1
+                            break
                     recovery_run_kw = {
                         "failed_turn_fn": failed_turn_writer_for("planner")}
                     if recovery_route == "reviewer_first":
@@ -17998,6 +18440,29 @@ def run_flow(args, io_out=None, which=None, run_scout_fn=None,
                     result_box.setdefault("reason", RECOVERY_STOP_KIND)
                     rc = 1
                     break
+                # #116/F7: screened AFTER the recovery route is known, and NOT at
+                # all on the `reviewer_first` route.
+                #
+                # A `reviewer_first` resume performs ZERO lead dispatches: the lead
+                # already produced its candidate, its paired reviewer failed to
+                # return a usable verdict, and this run exists only to re-run that
+                # reviewer against the exact same candidate. Refusing it on an
+                # exhausted lead budget would strand the last permitted lead turn's
+                # work with no way to review it -- the allocation bounds paid LEAD
+                # turns, and reviewer turns are never charged.
+                #
+                # If that reviewer then genuinely asks for a lead correction,
+                # `_role_loop`'s own gate charges and refuses it there, at the one
+                # point a real lead send is actually attempted. Nothing is
+                # un-bounded by skipping the early screen; it is only earlier.
+                if recovery_route != "reviewer_first":
+                    _alloc_stop = _allocation_preflight_stop(
+                        session_uuid, "building", "builder", trace=trace)
+                    if _alloc_stop is not None:
+                        record_outcome("builder", {"outcome": _OUTCOME_ENDED,
+                                                 "payload": _alloc_stop})
+                        rc = 1
+                        break
                 recovery_run_kw = {
                     "failed_turn_fn": failed_turn_writer_for("builder")}
                 if recovery_route == "reviewer_first":
@@ -18977,6 +19442,9 @@ def run_resume_trigger(argv, output=None, session_factory=None):
                 "decision_bound_turn_not_redirectable",
                 RESUME_TRIGGER_EXIT_INVALID_ARGUMENTS)
 
+        # #116: the package dispatch allocation is CHARGED for this replay,
+        # not merely checked. See `_charge_wake_dispatch` below, called
+        # immediately before the controller is constructed.
         _advance_phase(session_uuid, work_id, "preflight_passed",
                        source="resume_trigger")
 
@@ -18987,6 +19455,46 @@ def run_resume_trigger(argv, output=None, session_factory=None):
             write(json.dumps({"outcome": "internal_error",
                               "detail": str(exc)}) + "\n")
             return RESUME_TRIGGER_EXIT_INTERNAL_ERROR
+
+        # #116/F5: ATOMICALLY CHARGE this replay's dispatch unit, here, after
+        # every other precondition has been proven and immediately before the
+        # controller process is constructed.
+        #
+        # A capacity replay performs a REAL provider send, so under the
+        # documented per-attempt contract it costs a real unit. The earlier
+        # design only CHECKED here, which let one package buy three builder
+        # turns at `build=2`: initial (ledger 1) -> capacity pause -> wake
+        # replay (ledger still 1, a second real send) -> correction
+        # (ledger 2, a third real send). A read-only check also raced any
+        # concurrent consumer, because nothing was reserved.
+        #
+        # This is a charge, NOT a redefinition of the capacity lease. The
+        # lease keeps its own identity and its own at-most-once consumption
+        # (`capacity_scheduler.mark_consumed` below): it bounds how many times
+        # THIS pending turn may be replayed, while the allocation bounds how
+        # many real provider sends the PACKAGE may pay for. A paid send is
+        # charged whether it is a first attempt or a replay; being a replay is
+        # not an exemption.
+        #
+        # A charged unit is not refunded if the send then fails -- the same
+        # per-attempt rule the lead loop follows.
+        _wake_phase = _ALLOCATION_PHASE_BY_ROLE.get(effective_role)
+        if _wake_phase is not None:
+            try:
+                state_store.consume_dispatch_allocation(
+                    session_uuid, _wake_phase)
+            except state_store.AllocationExhausted:
+                return _release_and_conflict_terminal(
+                    "dispatch_allocation_exhausted",
+                    RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
+            except (state_store.AllocationConflict, OSError, TimeoutError,
+                    ValueError):
+                # Bound but unprovable state fails closed, exactly as it does
+                # in the lead loop: a budget that cannot be proven has not
+                # been granted.
+                return _release_and_conflict_terminal(
+                    "dispatch_allocation_unreadable",
+                    RESUME_TRIGGER_EXIT_BINDING_MISMATCH)
 
         sessions_dir = state_store.session_assets_dir(session_uuid)
         if session_factory is not None:

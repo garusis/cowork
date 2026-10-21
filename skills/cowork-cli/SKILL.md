@@ -101,6 +101,11 @@ cowork --worktree my-feature --team scout,scout-reviewer,planner,planning-adviso
   controller. The session anchor stays in the **launch** directory.
 - `--evaluation-policy all_rounds|final_round|sampled|off` controls peer
   scoring; its overhead is reported separately.
+- `--package-ref REF` + `--dispatch-allocation SPEC` bound how many **real
+  provider lead dispatches** the package may spend per phase (see [Package
+  dispatch allocation](#package-dispatch-allocation)). Pass them when the work
+  package states a turn budget; omit both to keep the pre-existing unbounded
+  behavior.
 
 ### `--config` grammar
 
@@ -118,6 +123,67 @@ Roles: `scout`, `scout-reviewer`, `planner`, `planning-advisor`, `builder`,
 `build-reviewer`. Defaults: `claude`, controller-default model/effort, yolo on,
 implement mode. Pinning a lead and its reviewer to specific models is the
 supported way to compare their scores and token use.
+
+## Package dispatch allocation
+
+A prose budget in a work package ("build2 / correction1") enforces nothing:
+reviewer-revise, red owned verification, answered stops and resumes all reopen
+the lead automatically with no human attached. `--dispatch-allocation` makes
+the ceiling durable.
+
+```bash
+cowork --package-ref M6-W3-build --dispatch-allocation "build=2,correction=1" \
+       --context-file ./package.md
+```
+
+- **Grammar.** `KEY=N`, comma-separated, `N` a non-negative integer. Keys:
+  `discovery`, `planning`, `build` (per-phase totals) and
+  `discovery_corrections`, `planning_corrections`, `build_corrections`
+  (`correction`/`corrections` alias the builder one). An unmentioned phase is
+  unallocated. Malformed specs are rc 2 before anything is created.
+- **Counting.** `build=2,correction=1` is the initial builder dispatch **plus
+  at most one correction — two dispatches in total**, not 2+1 and not two
+  extras. `build=5,correction=0` admits the initial turn only. `build=0`
+  forbids the phase entirely, before any controller launches. A unit is
+  charged per *attempted* dispatch, so a failed send is not refunded.
+- **Binding.** The counters live in a durable, package-scoped ledger keyed by
+  `--package-ref`, not by the session. A resume, a different `--session-file`,
+  or a fresh replacement session naming the same ref inherits the spent
+  counts — you cannot reset a budget by restarting. Admission is immutable
+  both per package (same ref, different limits → refused) and per session (a
+  bound session can never be rebound to another ref), and both refusals change
+  nothing. Pass the flags **once**, at admission; every later run, including a
+  plain `--session-file` resume, reads the binding back from durable state.
+- **Every real lead send is charged**, including a capacity-wake replay via
+  `cowork resume-trigger`. A replay is a paid send, so it costs a unit; the
+  capacity lease separately bounds how often one pending turn may be replayed.
+  A charged unit is never refunded, even if the send then fails.
+- **Reviewer turns are never charged.** A reviewer-only recovery resume (the
+  lead's candidate exists, its reviewer failed) therefore still runs on a
+  spent lead budget — it dispatches no lead. A lead correction that reviewer
+  then asks for is refused.
+- **Refusal.** Exceeding it ends the phase unapproved with rc 1 and a `stop`
+  of kind `dispatch_allocation_exhausted` (`requires: "operator"`) carrying
+  the exact `limit_*`/`consumed_*` counts. There is **no** `decision_argv`:
+  it cannot be answered, retried or raised, and repeating the run only
+  repeats the refusal. Escalate for a new package instead.
+- **Fail-closed.** A corrupt, deleted or hand-edited ledger or binding —
+  including a missing or null consumed counter — refuses dispatch rather than
+  reading as unlimited or as a fresh budget. A bound session never degrades
+  back to an unallocated legacy one, and a package whose ledger is deleted is
+  refused rather than re-admitted with fresh counters (for the original and
+  any replacement session alike).
+- **No provider is launched once spent**, including the controller probe
+  `--switch-controller` would run and the `--worktree` pre-phase role. A
+  switch requested on a phase whose lead budget is gone is refused with no
+  probe at all.
+- **Not capacity, not tokens.** rc 5 is the provider declining a dispatch the
+  allocation already authorized; the two are independent. An allocation never
+  approves anything.
+- **Reading it back.** A bound run's result carries `dispatch_allocation`
+  (`package_ref`, `limits`, `limits_digest`, `consumed`). If `consumed` is
+  `null` with `consumed_read_failed: true`, the counts could not be
+  determined — do not read that as "nothing spent".
 
 ## Continue a saved session
 

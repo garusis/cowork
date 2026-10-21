@@ -32,6 +32,25 @@ Cowork is the agent transport. Run the package through the `cowork` CLI per the
   security or authority invariants. Do not select by milestone or default to
   `standard` without judgment. Preserve explicit product/user checks and record
   the rationale and preview policy version/digest in package authority.
+- When the package states a turn budget (for example "build2 / correction1",
+  or a planning-only package that may not build), bind it with
+  `--package-ref` + `--dispatch-allocation` at launch; see `cowork-cli`. A
+  budget written only in the package prose enforces nothing — Cowork's
+  automatic reopen paths (reviewer revise, red owned verification, answered
+  stops, resume and recovery) keep dispatching the lead between supervisor
+  wakes. `build=2,correction=1` is the initial builder dispatch plus at most
+  one correction, two dispatches in total; `build=0` forbids building
+  outright, which is how a planning-only package is made enforceable. The
+  budget is bound to the package ref, not the session, so a resume or a
+  replacement session cannot reset it, and admission is immutable.
+- An exhausted allocation ends the phase unapproved with rc 1 and a
+  `dispatch_allocation_exhausted` stop (`requires: "operator"`). It is not an
+  answerable decision: never retry it, never re-admit the package ref with a
+  larger allocation on your own, never rename the ref to get a fresh budget
+  (refused), and never work around it by launching a fresh session. Preserve the candidate and the evidence, and report it as
+  `needs_authority` with the exact consumed counts so the user decides whether
+  to authorize a new package. Keep it distinct from rc 5 (provider capacity)
+  and from token-envelope limits.
 - Investigation-only and planning-only deliverables may use a manual paired
   team: every shipped profile includes building. Record the required stopping
   phase and why a profile exceeds scope; label the session manual/unprofiled.
